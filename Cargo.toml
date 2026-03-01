@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+exclude = ["grammar_dql"]
+members = [
+    "crates/delightql-core",
+    "crates/delightql-cli",
+    "crates/delightql-formatter",
+    "crates/delightql-macros",
+    "crates/delightql-postgres", "crates/delightql-backends", "crates/delightql-types",
+    "crates/delightql-wasm",
+    "crates/delightql-cli-siso",
+    "crates/delightql-protocol",
+    "crates/delightql-sql-adapter",
+    "crates/dql-pack-man",
+    "crates/tree-sitter-highlight",
+    "crates/delightql-cabi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Daniel Eklund"]
+license = "MIT"
+repository = "https://github.com/username/delightql"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rmp-serde = "1.3"
+
+# Databases
+rusqlite = { version = "0.37", features = ["bundled", "column_decltype"] }
+
+# Tree-sitter parsing
+# Using tree-sitter-c2rust - pure Rust port of tree-sitter that works seamlessly with WASM
+# No special build setup, LLVM clang, or WASM stubs needed
+# Works identically on native and WASM targets
+tree-sitter = { package = "tree-sitter-c2rust", version = "0.25" }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Compression
+zstd = "0.13"
+
+# Dev dependencies
+
+
+tempfile = "3.8"
+
+# Custom profile: optimize for maximum speed
+[profile.release-fast]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+
+# Custom profile: optimize for minimum size
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+
+# Custom profile: optimize for size with aggressive settings
+[profile.release-tiny]
+inherits = "release"
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"  # Removes panic formatting code

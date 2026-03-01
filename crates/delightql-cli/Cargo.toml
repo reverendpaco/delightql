@@ -1,0 +1,61 @@
+[package]
+name = "delightql-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dql"
+path = "src/main.rs"
+
+[features]
+default = ["repl", "prettify", "formatter"]
+repl = ["dep:rustyline", "dep:ratatui", "dep:crossterm", "dep:ctrlc", "dep:directories"]
+prettify = ["dep:tree-sitter-highlight"]
+formatter = ["dep:delightql-formatter"]
+duckdb = ["delightql-backends/duckdb"]
+recursion_stats = ["delightql-core/recursion_stats"]
+
+[dependencies]
+delightql-core = { path = "../delightql-core" }
+delightql-formatter = { path = "../delightql-formatter", optional = true }
+delightql-backends = { path = "../delightql-backends", default-features = false, features = ["sqlite"] }
+delightql-types = { path = "../delightql-types" }
+delightql-cli-siso = { path = "../delightql-cli-siso" }
+delightql-protocol = { path = "../delightql-protocol" }
+delightql-sql-adapter = { path = "../delightql-sql-adapter" }
+# Workspace dependencies
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+rusqlite.workspace = true
+tree-sitter.workspace = true
+# CLI-specific dependencies
+toml = "0.8"
+log = "0.4"
+env_logger = "0.11"
+tree-sitter-highlight = { path = "../tree-sitter-highlight", optional = true }
+base64 = "0.22"
+sha2 = "0.10"
+libc = "0.2"
+stacksafe = "1"
+tar = "0.4"
+flate2 = "1"
+# REPL dependencies (optional, enabled via 'repl' feature)
+rustyline = { path = "../rustyline", optional = true }
+directories = { version = "5.0", optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+ctrlc = { version = "3.4", optional = true }
+
+[build-dependencies]
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+escargot = "0.5"

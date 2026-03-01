@@ -1,0 +1,43 @@
+[package]
+name = "delightql-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core DelightQL functionality
+delightql-core = { path = "../delightql-core" }
+delightql-types = { path = "../delightql-types" }
+delightql-protocol = { path = "../delightql-protocol" }
+
+# WASM bindings
+wasm-bindgen = "0.2"
+
+# JavaScript interop
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+
+# Serialization for passing data between JS and Rust
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = "0.6"
+
+# Better panic messages in browser console (optional)
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# Allocators for WASM (fixes tree-sitter memory corruption)
+# dlmalloc is more robust than wee_alloc for complex allocations like tree-sitter
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[features]
+default = ["console_error_panic_hook"]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O4"]

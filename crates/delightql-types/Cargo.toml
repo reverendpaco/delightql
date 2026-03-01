@@ -1,0 +1,20 @@
+[package]
+name = "delightql-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Error handling
+thiserror.workspace = true
+
+# Serialization (for NamespacePath)
+serde.workspace = true
+
+# Tree-sitter errors - only needed for error conversions
+tree-sitter.workspace = true
+
+# NO dependency on delightql-core - this breaks the circular dependency!
+# NO dependency on rusqlite - backend-specific errors belong in delightql-backends!

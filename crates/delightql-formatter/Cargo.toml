@@ -1,0 +1,26 @@
+[package]
+name = "delightql-formatter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "dql-fmt"
+path = "src/main.rs"
+required-features = ["bundled-parser"]
+
+[features]
+default = []
+bundled-parser = ["dep:cc", "dep:clap"]
+
+[dependencies]
+tree-sitter.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, optional = true }
+
+[build-dependencies]
+cc = { version = "1.0", optional = true }

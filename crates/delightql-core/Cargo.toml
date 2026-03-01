@@ -1,0 +1,53 @@
+[package]
+name = "delightql-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+delightql-types = { path = "../delightql-types" }
+delightql-macros = { path = "../delightql-macros" }
+delightql-protocol = { path = "../delightql-protocol" }
+# Workspace dependencies
+tree-sitter.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+# Core-specific dependencies
+sqlparser = "0.34"
+indexmap = "1.9"
+lexpr = "0.2"
+log = "0.4"
+rand = "0.8"
+regex = "1.10"
+bincode = "1.3"  # For serializing AST to BLOB (DDL-LIGHT Phase 2)
+smallvec = { version = "1.13", features = ["serde"] }  # For efficient namespace path storage (0-2 item optimization)
+stacksafe = { version = "1", features = ["serde"] }
+base64 = "0.22"
+
+[features]
+recursion_stats = []
+
+# WASM support: getrandom with js feature for wasm32 targets
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+# Non-WASM: rusqlite for database introspection (WASM uses sql.js in browser)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+insta = "1.0"
+similar = "2.4.0"
+colored = "2.0"
+proptest = "1.4"
+rusqlite.workspace = true  # For tests only
+
+[build-dependencies]
+cc = "1.0"
+
+

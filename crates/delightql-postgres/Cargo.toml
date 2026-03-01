@@ -1,0 +1,15 @@
+[package]
+name = "delightql-postgres"
+version = "0.1.0"
+edition = "2021"
+authors = ["Daniel Eklund"]
+license = "MIT"
+description = "PostgreSQL driver implementation for DelightQL"
+
+[dependencies]
+delightql-core = { path = "../delightql-core" }
+postgres = "0.19"
+
+[dev-dependencies]
+# For integration tests (future)
+# testcontainers = "0.15"

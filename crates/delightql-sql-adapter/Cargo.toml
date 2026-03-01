@@ -1,0 +1,15 @@
+[package]
+name = "delightql-sql-adapter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+delightql-protocol = { path = "../delightql-protocol" }
+delightql-types = { path = "../delightql-types" }
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

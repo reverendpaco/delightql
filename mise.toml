@@ -1,0 +1,179 @@
+# DelightQL mise configuration
+# Tasks for building and running DelightQL components
+
+# Tool requirements
+# Note: tree-sitter CLI is managed via Makefile (cargo install from git)
+# Run `make ensure-tree-sitter` to install the version pinned to Cargo.toml
+[tools]
+rust = "1.90"
+node = "latest"
+bats = "latest"
+
+
+[tasks.build-node]
+description = "Build Node.js binding (koffi + C-ABI)"
+run = "make -C ./hosts/node"
+
+[tasks.build-python-wheel]
+description = "Maturin builds dynlib and wraps in wheel"
+run = "make -C ./hosts/python"
+
+[tasks.launch-python-repl]
+depends = ["build-python-wheel"]
+run = """
+uv venv --quiet /tmp/dql-repl
+uv pip install --quiet --python /tmp/dql-repl hosts/python/dist/*.whl
+/tmp/dql-repl/bin/python || true
+rm -rf /tmp/dql-repl
+"""
+
+[tasks.test-wasm]
+run="""
+cd ./lightweight_webserver/
+ node test_wasm.mjs
+"""
+
+[tasks.test-ball-pack-man-with-colors]
+run="""
+run() {
+  if command -v lumin &>/dev/null; then
+    ./test_suite/test.sh 2>&1 | grep --line-buffered "^Tota"
+  else
+    ./test_suite/test.sh 2>&1  | grep --line-buffered "^Tota" \
+      | rg --passthru "(Failed:|Error:)"
+  fi
+}
+
+another_wrapper(){
+  if command -v lumin &>/dev/null; then
+    run 2>&1 | awk  \
+    'BEGIN{e=0;f=0;p=0;m=0} {print; fflush()} /^Total:/{split($4,es,":"); e+=es[2];split($3,fs,":");f+=fs[2] }END{print "FAIL",f,"ERROR",e}' \
+        | lumin -c darkorange "[0-9]+"\
+        | lumin -c red "Failed:" \
+        | lumin -c red "Error:" \
+        | lumin -c blue "Meh:" \
+        | lumin -c aquamarine1 "Passed:"
+  else
+    run
+  fi
+}
+
+time another_wrapper
+"""
+
+[tasks.test-ball-pack-man]
+run="""
+./test_suite/test.sh
+"""
+
+[tasks.test-manual]
+run="""
+./test_suite/test.sh --manual
+"""
+
+[tasks.cross-test]
+description = "Three-way comparison: ball-mode vs Python C-ABI vs Node.js C-ABI"
+run="""
+./test_suite/cross_test.sh
+"""
+
+# [tasks.test-compare-node-with-pack-man]
+# description = "Run Node.js C-ABI test runner against the test balls"
+# run="""
+# make -C ./hosts/node --no-print-directory
+# node ./hosts/node/test_cabi.js ./test_suite
+# """
+
+
+
+[tasks.test-snapshot]
+run = """
+./test_suite/snapshot.sh
+"""
+
+[tasks.test-dqls]
+run = """
+./test_suite/test.sh
+"""
+
+
+[tasks.build-rust-bins-debug]
+description = "Build the three binaries: dql, dql-pack-man and dql-fmt"
+run = """
+cargo build --bin  dql --bin dql-pack-man --bin dql-fmt --features="bundled-parser"
+"""
+
+[tasks.build-rust-bins-release-tiny]
+description = "Build the three binaries: dql, dql-pack-man and dql-fmt"
+run = """
+cargo build --bin  dql --bin dql-pack-man --bin dql-fmt --features="bundled-parser" --profile release-tiny
+"""
+
+
+
+
+[tasks.build-demo]
+run = """
+./scripts/generate_tutorial_db.py lightweight_webserver/demo.db
+"""
+
+[tasks.build-wasm]
+description = "Build DelightQL WASM bundle"
+run = """
+cd ./lightweight_webserver/
+make build-release
+"""
+
+[tasks.web]
+description = "Start DelightQL WASM demo server"
+run = """
+cd ./lightweight_webserver/
+node server.js
+"""
+
+[tasks.build-release-bundle]
+description = "Build and bundle DelightQL CLI + formatter + parser + highlights.scm into a tarball"
+depends = ["build-rust-bins-release-tiny"]
+run = """
+cd grammar_dql
+cc -o delightql_v2.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
+cd ..
+tar czf untracked/delightql-cli.tar.gz \
+   target/release-tiny/dql \
+   target/release-tiny/dql-fmt \
+  ./grammar_dql/delightql_v2.so \
+  ./config/highlights.scm \
+  ./config/theme-*.toml
+"""
+
+[tasks.build-nvim-ts]
+description = "Build treesitter dynlib for IDEs"
+run = """
+cd grammar_dql
+cc -o delightql_v2.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
+"""
+
+[tasks.build-nvim-ts-fedora]
+depends=["nvim-ts"]
+run = """
+cp ./config/highlights.scm ~/.config/eklund_vim0.11.5/queries/delightql_v2/
+cd grammar_dql
+cc -o delightql_v2.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
+cd ..
+cp ./grammar_dql/delightql_v2.so  ~/.local/share/eklund_vim0.11.5/lazy/nvim-treesitter/parser/
+cd grammar_rules
+cc -o delightqlrules.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
+cd ..
+cp ./grammar_rules/delightqlrules.so  ~/.local/share/eklund_vim0.11.5/lazy/nvim-treesitter/parser/
+cp ./config/highlights.scm ~/.config/eklund_vim0.11.5/queries/delightqlrules/
+"""
+
+# Env variables
+[env]
+RUST_BACKTRACE = "1"
+MISE_ACTIVATE_AGGRESSIVE = "1"
+_.path = ["./scripts", "./target/debug", "."]
+# DuckDB support - downloads to .mise/libs/
+# Run `mise run setup-libs` first if you need DuckDB
+# NOTE: Tree-sitter link order is handled by build-cli task
+# Runtime library path is set via rpath in build.rs

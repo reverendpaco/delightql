@@ -1,0 +1,13 @@
+[package]
+name = "delightql-macros"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "derive", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
