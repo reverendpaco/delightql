@@ -694,3 +694,64 @@ pub(super) fn resolve_interior_drill_down(
 
     Ok((resolved_op, output_columns))
 }
+
+/// Resolve the NarrowingDestructure operator
+///
+/// Iterates a JSON array column via json_each, extracts named fields from
+/// each element via json_extract. No context carry-forward — the output
+/// schema contains only the named fields.
+pub(super) fn resolve_narrowing_destructure(
+    column: String,
+    fields: Vec<String>,
+    available: &[ast_resolved::ColumnMetadata],
+) -> Result<(
+    ast_resolved::UnaryRelationalOperator,
+    Vec<ast_resolved::ColumnMetadata>,
+)> {
+    // 1. Verify column exists in input schema
+    let _col = available
+        .iter()
+        .find(|col| crate::pipeline::resolver::col_name_eq(col.name(), &column))
+        .ok_or_else(|| {
+            crate::error::DelightQLError::validation_error(
+                format!(
+                    "Narrowing destructure: column '{}' not found in input relation. Available: {}",
+                    column,
+                    available
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "Check that the column name matches a column in the input.".to_string(),
+            )
+        })?;
+
+    // 2. Build output columns — just the named fields (no context carry-forward)
+    //    Output name is the last path segment: "name" → "name", "config.host" → "host"
+    let mut output_columns = Vec::new();
+    for (idx, field) in fields.iter().enumerate() {
+        let output_name = field
+            .rsplit('.')
+            .next()
+            .unwrap_or(field)
+            .to_string();
+        let col = ast_resolved::ColumnMetadata::new(
+            ast_resolved::ColumnProvenance::from_column(output_name),
+            ast_resolved::FqTable {
+                parents_path: crate::pipeline::asts::unresolved::NamespacePath::empty(),
+                name: ast_resolved::TableName::Fresh,
+                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
+            },
+            Some(idx + 1),
+        );
+        output_columns.push(col);
+    }
+
+    let resolved_op = ast_resolved::UnaryRelationalOperator::NarrowingDestructure {
+        column,
+        fields,
+    };
+
+    Ok((resolved_op, output_columns))
+}

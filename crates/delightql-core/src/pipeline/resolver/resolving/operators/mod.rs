@@ -128,6 +128,10 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
             available,
         ),
 
+        ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields } => {
+            schema_ops::resolve_narrowing_destructure(column, fields, available)
+        }
+
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. }

@@ -307,6 +307,55 @@ fn parse_unary_operator_core(
     Ok(piped)
 }
 
+/// Parse narrowing destructure: |> .column_name{.field1, .field2}
+fn parse_narrowing_destructure(
+    node: CstNode,
+    input: RelationalExpression,
+) -> Result<RelationalExpression> {
+    let column = node
+        .field_text("column")
+        .ok_or_else(|| {
+            DelightQLError::parse_error("No column name in narrowing_destructure")
+        })?;
+
+    let mut fields = Vec::new();
+    if let Some(members_node) = node.field("members") {
+        for child in members_node.children() {
+            match child.kind() {
+                "path_literal" => {
+                    let text = child.text();
+                    let path = if let Some(stripped) = text.strip_prefix('.') {
+                        stripped.to_string()
+                    } else {
+                        text.to_string()
+                    };
+                    if path.is_empty() {
+                        return Err(DelightQLError::parse_error(
+                            "Narrowing destructure: root path (.) is not meaningful as a field",
+                        ));
+                    }
+                    fields.push(path);
+                }
+                "identifier" => {
+                    fields.push(child.text().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    if fields.is_empty() {
+        return Err(DelightQLError::parse_error(
+            "Narrowing destructure requires at least one field",
+        ));
+    }
+
+    Ok(RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
+        source: input,
+        operator: UnaryRelationalOperator::NarrowingDestructure { column, fields },
+        cpr_schema: PhaseBox::phantom(),
+    }))))
+}
+
 /// Parse pipe operation — dispatches to specific operator parsers
 fn parse_pipe_operation(
     node: CstNode,
@@ -331,6 +380,7 @@ fn parse_pipe_operation(
         "reposition" => parse_reposition(child, input),
         "piped_invocation" => parse_piped_invocation(child, input, features),
         "bang_pipe_operation" => parse_bang_pipe_operation(child, input, features),
+        "narrowing_destructure" => parse_narrowing_destructure(child, input),
         _ => Err(DelightQLError::parse_error(format!(
             "Pipe operation {} not implemented",
             child.kind()

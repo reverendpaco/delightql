@@ -517,6 +517,23 @@ module.exports = grammar({
       ')',
     ),
 
+    // Narrowing destructure: .column_name{.field1, .field2}
+    // Iterates a JSON array column and extracts named fields from each element.
+    // Replaces the entire row with just the extracted fields (no context carry-forward).
+    // Disambiguated from drill_operator by { vs ( after .identifier.
+    narrowing_destructure: $ => seq(
+      '.',
+      field('column', $.identifier),
+      '{',
+      field('members', $.narrowing_member_list),
+      '}',
+    ),
+
+    narrowing_member_list: $ => seq(
+      choice($.path_literal, $.identifier),
+      repeat(seq(',', choice($.path_literal, $.identifier))),
+    ),
+
     // Semantic nodes for pipe operators
     pipe_operator: $ => '|>',
     aggregate_pipe_operator: $ => '~>',
@@ -1880,6 +1897,7 @@ module.exports = grammar({
       $.ordering,
       $.reposition,
       $.piped_invocation,
+      $.narrowing_destructure,
       $.bang_pipe_operation,
     ),
 

@@ -644,6 +644,7 @@ fn walk_unary_operator(op: &UnaryRelationalOperator, refs: &mut Vec<ExtractedRef
         UnaryRelationalOperator::Using { .. } => {}
         UnaryRelationalOperator::DmlTerminal { .. } => {}
         UnaryRelationalOperator::InteriorDrillDown { .. } => {}
+        UnaryRelationalOperator::NarrowingDestructure { .. } => {}
         UnaryRelationalOperator::HoViewApplication { .. }
         | UnaryRelationalOperator::DirectiveTerminal { .. } => {}
     }

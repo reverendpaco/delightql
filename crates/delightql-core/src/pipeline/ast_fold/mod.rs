@@ -865,6 +865,7 @@ pub fn walk_operator<P, F: AstFold<P> + ?Sized>(
         UnaryRelationalOperator::Qualify => Ok(UnaryRelationalOperator::Qualify),
         op @ UnaryRelationalOperator::Using { .. } => Ok(op),
         op @ UnaryRelationalOperator::InteriorDrillDown { .. } => Ok(op),
+        op @ UnaryRelationalOperator::NarrowingDestructure { .. } => Ok(op),
         // DirectiveTerminal: fold arguments, preserve name
         UnaryRelationalOperator::DirectiveTerminal { name, arguments } => {
             Ok(UnaryRelationalOperator::DirectiveTerminal {

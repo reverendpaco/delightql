@@ -750,7 +750,8 @@ fn remap_operator_qualifiers(
         | UnaryRelationalOperator::Qualify
         | UnaryRelationalOperator::Using { .. }
         | UnaryRelationalOperator::DmlTerminal { .. }
-        | UnaryRelationalOperator::InteriorDrillDown { .. } => {}
+        | UnaryRelationalOperator::InteriorDrillDown { .. }
+        | UnaryRelationalOperator::NarrowingDestructure { .. } => {}
     }
 }
 

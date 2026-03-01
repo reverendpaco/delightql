@@ -126,6 +126,11 @@ pub(super) fn bubble_unary_operator(
             },
             BubbledState::resolved(Vec::new()),
         )),
+        // NarrowingDestructure has no expressions to bubble - column/fields are simple strings
+        ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields } => Ok((
+            ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields },
+            BubbledState::resolved(Vec::new()),
+        )),
         // CompanionAccess has no expressions to bubble - consumed at pipe level
         ast_unresolved::UnaryRelationalOperator::CompanionAccess { kind } => Ok((
             ast_unresolved::UnaryRelationalOperator::CompanionAccess { kind },

@@ -203,6 +203,7 @@ fn fix_operator(op: resolved::UnaryRelationalOperator) -> resolved::UnaryRelatio
         | resolved::UnaryRelationalOperator::Using { .. }
         | resolved::UnaryRelationalOperator::DmlTerminal { .. }
         | resolved::UnaryRelationalOperator::InteriorDrillDown { .. }
+        | resolved::UnaryRelationalOperator::NarrowingDestructure { .. }
         | resolved::UnaryRelationalOperator::Reposition { .. }
         | resolved::UnaryRelationalOperator::Transform { .. }
         | resolved::UnaryRelationalOperator::EmbedMapCover { .. }
@@ -825,6 +826,7 @@ fn extract_qualifiers_from_operator(
         | resolved::UnaryRelationalOperator::Using { .. }
         | resolved::UnaryRelationalOperator::DmlTerminal { .. }
         | resolved::UnaryRelationalOperator::InteriorDrillDown { .. }
+        | resolved::UnaryRelationalOperator::NarrowingDestructure { .. }
         | resolved::UnaryRelationalOperator::Reposition { .. }
         | resolved::UnaryRelationalOperator::Transform { .. }
         | resolved::UnaryRelationalOperator::EmbedMapCover { .. }

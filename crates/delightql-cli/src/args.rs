@@ -30,6 +30,7 @@ pub struct CliArgs {
 #[derive(Subcommand)]
 pub enum Command {
     /// Execute a query (from string, file, or stdin)
+    #[command(visible_alias = "q")]
     Query {
         /// Query string to execute (if omitted, reads from stdin or starts REPL)
         query: Option<String>,
@@ -234,6 +235,7 @@ pub enum Command {
     },
 
     /// Tools for ad-hoc data munging and manipulation
+    #[command(visible_alias = "t")]
     Tools {
         #[command(subcommand)]
         tool: ToolCommand,
@@ -259,6 +261,7 @@ pub enum Command {
 #[derive(Subcommand)]
 pub enum ToolCommand {
     /// JSON destructuring from stdin
+    #[command(visible_alias = "j")]
     Jstruct {
         /// DQL query to run against j(j TEXT)
         query: String,

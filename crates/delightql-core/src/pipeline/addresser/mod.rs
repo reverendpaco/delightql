@@ -248,7 +248,8 @@ fn walk_operator_for_tree_groups(
         | ast_addressed::UnaryRelationalOperator::Qualify
         | ast_addressed::UnaryRelationalOperator::Using { .. }
         | ast_addressed::UnaryRelationalOperator::DmlTerminal { .. }
-        | ast_addressed::UnaryRelationalOperator::InteriorDrillDown { .. } => {}
+        | ast_addressed::UnaryRelationalOperator::InteriorDrillDown { .. }
+        | ast_addressed::UnaryRelationalOperator::NarrowingDestructure { .. } => {}
         // Consumed before refined phase:
         ast_addressed::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_addressed::UnaryRelationalOperator::DirectiveTerminal { .. }

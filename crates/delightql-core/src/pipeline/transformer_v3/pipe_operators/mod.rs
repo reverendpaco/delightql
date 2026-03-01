@@ -517,6 +517,18 @@ pub fn apply_pipe_operator_unified(
             )?;
             return Ok(QueryBuildState::Builder(b));
         }
+        UnaryRelationalOperator::NarrowingDestructure { column, fields } => {
+            let select = projection::narrowing_destructure::apply_narrowing_destructure(
+                builder,
+                column,
+                fields,
+                &cpr_schema,
+                ctx_for_operator,
+            )?;
+            Ok(QueryBuildState::Expression(QueryExpression::Select(
+                Box::new(select),
+            )))
+        }
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         UnaryRelationalOperator::HoViewApplication { .. }
         | UnaryRelationalOperator::DirectiveTerminal { .. }
