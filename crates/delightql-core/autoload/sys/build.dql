@@ -1,0 +1,6 @@
+version(
+  sha1sum,command
+  ----------
+  "8ddce8906078687195abff4aff7732428ca42a27",
+  """find crates/ -type f -name "*.rs" | grep "crates/\+delightql-*" | xargs sha1sum  |sort | awk '{print $1}' | sha1sum"""
+  )

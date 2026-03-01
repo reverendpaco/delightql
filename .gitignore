@@ -1,0 +1,15 @@
+*
+!.gitignore
+!*/
+!Cargo.lock
+!Cargo.toml
+!Makefile
+!crates/
+!crates/**/*.rs
+!crates/**/*.dql
+!crates/**/*.sql
+!crates/tree-sitter-highlight/README.md
+!grammar_ddl/grammar.js
+!grammar_dql/grammar.js
+!grammar_rules/grammar.js
+!mise.toml

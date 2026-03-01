@@ -1,0 +1,2 @@
+occurences:(thing,str) :-
+  (length:(str) - length:(replace:(str,thing,""))) / length:(thing)

@@ -1,0 +1,13 @@
+operators(sigil, name, description
+  ---
+  "|>", "pipe", "Pass relation to next operator";
+  "~>", "group-pipe", "Aggregate shorthand";
+  ",", "comma", "Conjunction (AND) / filter / join";
+  ";", "semicolon", "Disjunction (OR) / union all";
+  "|>-(", "project-out", "Drop listed columns";
+  "|>+(", "embed", "Add column, keep all others";
+  "|>$(", "map-cover", "Apply function to listed columns";
+  "|>%(", "distinct/group", "Distinct or GROUP BY";
+  "|>#(", "order", "ORDER BY";
+  "?", "meta-ize", "Schema as relation";
+  "<|", "reverse-pipe", "Binary pipe (equals!, except!, contains!)")

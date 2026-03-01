@@ -1,0 +1,58 @@
+pivot(T(*), V(v))(*) :-
+  (~~docs
+    Crosstab pivot, no aggregation.
+
+    Column contract:
+      |1| = pivot column (values become output headers)
+      |2| = measure column (values fill cells)
+      |3:| = group-by columns (zero or more)
+
+    Assumes one row per group+pivot pair.
+    For duplicates, use pivot_sum, pivot_avg, etc.
+
+    Usage:
+      data(subject, score, name)
+        |> pivot("Maths";"Music")(*)
+  ~~)
+  T(*), |1| in V(*)
+    |> %(|3:| ~> |2| of |1|)
+
+pivot_sum(T(*), V(v))(*) :-
+  (~~docs
+    Crosstab pivot with SUM aggregation.
+    Same column contract as pivot.
+  ~~)
+  T(*), |1| in V(*)
+    |> %(|3:| ~> sum:(|2|) of |1|)
+
+pivot_avg(T(*), V(v))(*) :-
+  (~~docs
+    Crosstab pivot with AVG aggregation.
+    Same column contract as pivot.
+  ~~)
+  T(*), |1| in V(*)
+    |> %(|3:| ~> avg:(|2|) of |1|)
+
+pivot_count(T(*), V(v))(*) :-
+  (~~docs
+    Crosstab pivot with COUNT aggregation.
+    Same column contract as pivot.
+  ~~)
+  T(*), |1| in V(*)
+    |> %(|3:| ~> count:(|2|) of |1|)
+
+pivot_min(T(*), V(v))(*) :-
+  (~~docs
+    Crosstab pivot with MIN aggregation.
+    Same column contract as pivot.
+  ~~)
+  T(*), |1| in V(*)
+    |> %(|3:| ~> min:(|2|) of |1|)
+
+pivot_max(T(*), V(v))(*) :-
+  (~~docs
+    Crosstab pivot with MAX aggregation.
+    Same column contract as pivot.
+  ~~)
+  T(*), |1| in V(*)
+    |> %(|3:| ~> max:(|2|) of |1|)

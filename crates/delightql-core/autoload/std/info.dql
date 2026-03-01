@@ -1,0 +1,30 @@
+tables(*) :-
+  (~~docs All user-visible tables in the current session. ~~)
+  sys::entities.entity(*) as e,
+  sys::entities.entity_type_enum(*) as t,
+  e.type = t.id,
+  t.variant in ("DBPermanentTable"; "DQLTemporaryTableExpression")
+  |> (e.name as table_name, t.variant as table_type, e.doc)
+
+views(*) :-
+  (~~docs All consulted view definitions. ~~)
+  sys::entities.entity(*) as e,
+  sys::entities.entity_type_enum(*) as t,
+  e.type = t.id,
+  t.variant in ("DQLTemporaryViewExpression"; "DQLPermanentViewExpression"; "DQLHOTemporaryViewExpression")
+  |> (e.name as view_name, t.variant as view_type, e.doc)
+
+functions(*) :-
+  (~~docs All consulted function definitions. ~~)
+  sys::entities.entity(*) as e,
+  sys::entities.entity_type_enum(*) as t,
+  e.type = t.id,
+  t.is_fn = 1
+  |> (e.name as function_name, t.variant as function_type, e.doc)
+
+entities(*) :-
+  (~~docs All entities across all types, with human-readable type names. ~~)
+  sys::entities.entity(*) as e,
+  sys::entities.entity_type_enum(*) as t,
+  e.type = t.id
+  |> (e.name, t.variant as type_name, e.doc)
