@@ -44,15 +44,8 @@ pub type StringTemplatePart = crate::pipeline::asts::core::expressions::StringTe
 >;
 pub use crate::pipeline::asts::core::expressions::domain::LvarProvenance;
 pub use crate::pipeline::asts::core::{
-    ContainmentSemantic,
-    JoinType,
-    LiteralValue,
-    PhaseBox,
-    QualifiedName,
-    Refined,
-    ScopedSchema,
-    SetOperator,
-    UsingColumn,
+    ContainmentSemantic, JoinType, LiteralValue, PhaseBox, QualifiedName, Refined, ScopedSchema,
+    SetOperator, UsingColumn,
 };
 
 // ============================================================================

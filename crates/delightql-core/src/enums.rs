@@ -75,7 +75,6 @@ impl SourceType {
             Self::Bin => "Entities that are defined in the code of the delightful engine itself",
         }
     }
-
 }
 
 // =============================================================================
@@ -136,7 +135,6 @@ impl Language {
             Self::SqlSqlite => "3.45.0",
         }
     }
-
 }
 
 // =============================================================================
@@ -390,7 +388,6 @@ impl ConnectionType {
             Self::Pipe => "Pipe-based coprocess connection (osqueryi, sqlite3, etc.)",
         }
     }
-
 }
 
 // =============================================================================

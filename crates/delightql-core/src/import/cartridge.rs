@@ -117,8 +117,7 @@ pub fn install_cartridge(
             // For database connections, introspect to discover tables/views
             introspect_database_cartridge(conn, cartridge_id, source_ns)?;
         }
-        SourceType::File | SourceType::FileBin | SourceType::Bin => {
-        }
+        SourceType::File | SourceType::FileBin | SourceType::Bin => {}
     }
 
     Ok(cartridge_id)

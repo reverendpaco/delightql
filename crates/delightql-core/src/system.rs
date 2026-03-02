@@ -5316,8 +5316,6 @@ impl DelightQLSystem {
         &self,
         path: &delightql_types::namespace::NamespacePath,
     ) -> Result<Option<(Option<String>, i64)>> {
-        
-
         let conn = self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
                 "Failed to acquire bootstrap database lock for namespace resolution",
@@ -6290,9 +6288,7 @@ fn walk_relational_for_tree_groups(
     >,
 ) -> Result<()> {
     use crate::pipeline::asts::core::specs::ModuloSpec;
-    use crate::pipeline::asts::core::{
-        RelationalExpression, UnaryRelationalOperator,
-    };
+    use crate::pipeline::asts::core::{RelationalExpression, UnaryRelationalOperator};
 
     match expr {
         RelationalExpression::Pipe(pipe) => {
@@ -6354,9 +6350,7 @@ fn register_tree_group_from_domain_expr(
     entity_id: i32,
     expr: &crate::pipeline::asts::core::DomainExpression<crate::pipeline::asts::core::Unresolved>,
 ) -> Result<()> {
-    use crate::pipeline::asts::core::{
-        DomainExpression, FunctionExpression,
-    };
+    use crate::pipeline::asts::core::{DomainExpression, FunctionExpression};
 
     if let DomainExpression::Function(FunctionExpression::Curly {
         members,

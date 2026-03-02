@@ -338,10 +338,7 @@ fn test_single_cte() {
             .unwrap(),
     ));
 
-    let stmt = SqlStatement::with_ctes(
-        Some(vec![Cte::new("active_users", cte_query)]),
-        main_query,
-    );
+    let stmt = SqlStatement::with_ctes(Some(vec![Cte::new("active_users", cte_query)]), main_query);
 
     let sql = generator.generate_statement(&stmt).unwrap();
     assert!(sql.starts_with("WITH active_users AS"));

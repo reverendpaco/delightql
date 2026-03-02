@@ -104,7 +104,6 @@ impl SqlStatement {
             query,
         }
     }
-
 }
 
 /// Common Table Expression (CTE) - lives at statement level

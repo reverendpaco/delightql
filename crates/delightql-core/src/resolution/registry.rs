@@ -72,7 +72,6 @@ impl<'a> EntityRegistry<'a> {
             }
         }
     }
-
 }
 
 /// Registry for entities from database catalog

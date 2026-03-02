@@ -124,7 +124,6 @@ impl<'a> CstNode<'a> {
     pub fn raw_node(&self) -> &Node<'a> {
         &self.node
     }
-
 }
 
 /// Wrapper around a tree-sitter Tree

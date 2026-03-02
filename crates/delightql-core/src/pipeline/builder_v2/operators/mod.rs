@@ -6,13 +6,12 @@ mod invocations;
 mod projections;
 
 // Re-export public API
-pub(super) use covers::{parse_embed_cover, parse_embed_map_cover, parse_map_cover};
 pub(super) use covers::parse_rename_cover;
+pub(super) use covers::{parse_embed_cover, parse_embed_map_cover, parse_map_cover};
 pub(super) use grouping::{parse_grouping, parse_metadata_tree_group, parse_transform};
 pub(super) use invocations::parse_ho_argument_list;
 pub(super) use projections::{
-    parse_generalized_projection, parse_ordering, parse_project_out,
-    parse_reposition,
+    parse_generalized_projection, parse_ordering, parse_project_out, parse_reposition,
 };
 
 use invocations::{parse_bang_pipe_operation, parse_piped_invocation};
@@ -314,9 +313,7 @@ fn parse_narrowing_destructure(
 ) -> Result<RelationalExpression> {
     let column = node
         .field_text("column")
-        .ok_or_else(|| {
-            DelightQLError::parse_error("No column name in narrowing_destructure")
-        })?;
+        .ok_or_else(|| DelightQLError::parse_error("No column name in narrowing_destructure"))?;
 
     let mut fields = Vec::new();
     if let Some(members_node) = node.field("members") {
@@ -349,11 +346,13 @@ fn parse_narrowing_destructure(
         ));
     }
 
-    Ok(RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-        source: input,
-        operator: UnaryRelationalOperator::NarrowingDestructure { column, fields },
-        cpr_schema: PhaseBox::phantom(),
-    }))))
+    Ok(RelationalExpression::Pipe(Box::new(
+        stacksafe::StackSafe::new(PipeExpression {
+            source: input,
+            operator: UnaryRelationalOperator::NarrowingDestructure { column, fields },
+            cpr_schema: PhaseBox::phantom(),
+        }),
+    )))
 }
 
 /// Parse pipe operation — dispatches to specific operator parsers

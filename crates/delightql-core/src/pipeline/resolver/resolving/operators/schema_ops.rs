@@ -731,11 +731,7 @@ pub(super) fn resolve_narrowing_destructure(
     //    Output name is the last path segment: "name" → "name", "config.host" → "host"
     let mut output_columns = Vec::new();
     for (idx, field) in fields.iter().enumerate() {
-        let output_name = field
-            .rsplit('.')
-            .next()
-            .unwrap_or(field)
-            .to_string();
+        let output_name = field.rsplit('.').next().unwrap_or(field).to_string();
         let col = ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(output_name),
             ast_resolved::FqTable {
@@ -748,10 +744,8 @@ pub(super) fn resolve_narrowing_destructure(
         output_columns.push(col);
     }
 
-    let resolved_op = ast_resolved::UnaryRelationalOperator::NarrowingDestructure {
-        column,
-        fields,
-    };
+    let resolved_op =
+        ast_resolved::UnaryRelationalOperator::NarrowingDestructure { column, fields };
 
     Ok((resolved_op, output_columns))
 }

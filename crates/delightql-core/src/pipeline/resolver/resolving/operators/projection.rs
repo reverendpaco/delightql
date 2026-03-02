@@ -24,6 +24,64 @@ pub(super) fn resolve_general_with_registry(
     ast_resolved::UnaryRelationalOperator,
     Vec<ast_resolved::ColumnMetadata>,
 )> {
+    // Detect embed duplicate: when a glob is present alongside explicit expressions
+    // whose alias matches an existing column, reject early. This catches +(expr as col)
+    // where col already exists — user should use $$(expr as col) to replace instead.
+    // Only check explicit non-glob expression aliases, NOT glob-on-glob overlap
+    // (which is valid for multi-table joins like (u.*, o.*)).
+    let has_glob = expressions.iter().any(|e| {
+        matches!(
+            e,
+            ast_unresolved::DomainExpression::Projection(ProjectionExpr::Glob { .. })
+        )
+    });
+    if has_glob {
+        for expr in &expressions {
+            // Skip glob/projection expressions — only check explicit value expressions
+            if matches!(
+                expr,
+                ast_unresolved::DomainExpression::Projection(_)
+            ) {
+                continue;
+            }
+            let alias = match expr {
+                ast_unresolved::DomainExpression::Literal { alias, .. } => alias.as_ref(),
+                ast_unresolved::DomainExpression::Lvar { alias, .. } => alias.as_ref(),
+                ast_unresolved::DomainExpression::Function(func) => {
+                    use ast_unresolved::FunctionExpression as FE;
+                    match func {
+                        FE::Regular { alias, .. }
+                        | FE::Bracket { alias, .. }
+                        | FE::Infix { alias, .. }
+                        | FE::Lambda { alias, .. }
+                        | FE::CaseExpression { alias, .. }
+                        | FE::Window { alias, .. }
+                        | FE::Curly { alias, .. }
+                        | FE::Array { alias, .. }
+                        | FE::MetadataTreeGroup { alias, .. }
+                        | FE::JsonPath { alias, .. }
+                        | FE::HigherOrder { alias, .. } => alias.as_ref(),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(alias_name) = alias {
+                if available.iter().any(|col| col.name() == alias_name.as_str()) {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "constraint",
+                        format!(
+                            "Duplicate column '{}' in embed projection: column already exists in source schema. \
+                             Use $$(expr as {}) to replace the existing column instead",
+                            alias_name, alias_name,
+                        ),
+                        "in embed projection",
+                    ));
+                }
+            }
+        }
+    }
+
     let mut resolved_expressions = Vec::new();
     for expr in expressions {
         if matches!(

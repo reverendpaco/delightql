@@ -649,49 +649,70 @@ fn resolve_ground(
         ResolutionResult::CTE(entity_info) => {
             // Extract the CTE schema
             let EntityDefinition::RelationSchema(cte_schema) = entity_info.definition;
-                match &cte_schema {
-                    ast_resolved::CprSchema::Resolved(cols) => {
-                        // Apply alias if present
-                        let base_cols = if let Some(alias_name) = &alias {
-                            cols.iter()
-                                .map(|col| {
-                                    let mut new_col = col.clone();
-                                    new_col.fq_table.name =
-                                        ast_resolved::TableName::Named(alias_name.clone().into());
-                                    // Push SubqueryAlias so the provenance stack
-                                    // carries the alias for qualifier resolution
-                                    let prev = col.info.name().unwrap_or("<unnamed>").to_string();
-                                    new_col.info = new_col.info.clone().with_identity(
-                                        ast_resolved::ColumnIdentity {
-                                            name: prev.clone().into(),
-                                            context: ast_resolved::IdentityContext::SubqueryAlias {
-                                                alias: alias_name.to_string(),
-                                                previous_context: prev,
-                                            },
-                                            phase: ast_resolved::TransformationPhase::Resolved,
-                                            table_qualifier: ast_resolved::TableName::Named(
-                                                alias_name.clone().into(),
-                                            ),
+            match &cte_schema {
+                ast_resolved::CprSchema::Resolved(cols) => {
+                    // Apply alias if present
+                    let base_cols = if let Some(alias_name) = &alias {
+                        cols.iter()
+                            .map(|col| {
+                                let mut new_col = col.clone();
+                                new_col.fq_table.name =
+                                    ast_resolved::TableName::Named(alias_name.clone().into());
+                                // Push SubqueryAlias so the provenance stack
+                                // carries the alias for qualifier resolution
+                                let prev = col.info.name().unwrap_or("<unnamed>").to_string();
+                                new_col.info = new_col.info.clone().with_identity(
+                                    ast_resolved::ColumnIdentity {
+                                        name: prev.clone().into(),
+                                        context: ast_resolved::IdentityContext::SubqueryAlias {
+                                            alias: alias_name.to_string(),
+                                            previous_context: prev,
                                         },
-                                    );
-                                    new_col
-                                })
-                                .collect()
-                        } else {
-                            cols.clone()
-                        };
+                                        phase: ast_resolved::TransformationPhase::Resolved,
+                                        table_qualifier: ast_resolved::TableName::Named(
+                                            alias_name.clone().into(),
+                                        ),
+                                    },
+                                );
+                                new_col
+                            })
+                            .collect()
+                    } else {
+                        cols.clone()
+                    };
 
-                        // Use PatternResolver for column selection
-                        let (mut final_expr, state) = apply_pattern_resolver(
-                            &domain_spec,
-                            &base_cols,
-                            alias.as_deref().unwrap_or(&identifier.name),
-                            registry,
-                            outer_context,
-                        )?;
+                    // Use PatternResolver for column selection
+                    let (mut final_expr, state) = apply_pattern_resolver(
+                        &domain_spec,
+                        &base_cols,
+                        alias.as_deref().unwrap_or(&identifier.name),
+                        registry,
+                        outer_context,
+                    )?;
 
-                        // Update the relation with proper identifier and alias (CTEs have no canonical name)
-                        if let ast_resolved::RelationalExpression::Relation(ref mut r) = final_expr
+                    // Update the relation with proper identifier and alias (CTEs have no canonical name)
+                    if let ast_resolved::RelationalExpression::Relation(ref mut r) = final_expr {
+                        if let ast_resolved::Relation::Ground {
+                            identifier: ref mut rel_id,
+                            canonical_name: ref mut rel_canonical,
+                            alias: ref mut rel_alias,
+                            outer: ref mut rel_outer,
+                            ..
+                        } = r
+                        {
+                            *rel_id = convert_qualified_name(identifier.clone());
+                            *rel_canonical = ast_resolved::PhaseBox::new(None);
+                            *rel_alias = alias.clone();
+                            *rel_outer = outer;
+                        }
+                    } else if let ast_resolved::RelationalExpression::Filter {
+                        ref mut source,
+                        ..
+                    } = final_expr
+                    {
+                        // If it's wrapped in a Filter, update the inner relation
+                        if let ast_resolved::RelationalExpression::Relation(ref mut r) =
+                            source.as_mut()
                         {
                             if let ast_resolved::Relation::Ground {
                                 identifier: ref mut rel_id,
@@ -703,55 +724,33 @@ fn resolve_ground(
                             {
                                 *rel_id = convert_qualified_name(identifier.clone());
                                 *rel_canonical = ast_resolved::PhaseBox::new(None);
-                                *rel_alias = alias.clone();
+                                *rel_alias = alias;
                                 *rel_outer = outer;
                             }
-                        } else if let ast_resolved::RelationalExpression::Filter {
-                            ref mut source,
-                            ..
-                        } = final_expr
-                        {
-                            // If it's wrapped in a Filter, update the inner relation
-                            if let ast_resolved::RelationalExpression::Relation(ref mut r) =
-                                source.as_mut()
-                            {
-                                if let ast_resolved::Relation::Ground {
-                                    identifier: ref mut rel_id,
-                                    canonical_name: ref mut rel_canonical,
-                                    alias: ref mut rel_alias,
-                                    outer: ref mut rel_outer,
-                                    ..
-                                } = r
-                                {
-                                    *rel_id = convert_qualified_name(identifier.clone());
-                                    *rel_canonical = ast_resolved::PhaseBox::new(None);
-                                    *rel_alias = alias;
-                                    *rel_outer = outer;
-                                }
-                            }
                         }
+                    }
 
-                        Ok((final_expr, state))
-                    }
-                    _ => {
-                        // Fallback for non-resolved schemas
-                        let resolved = ast_resolved::Relation::Ground {
-                            identifier: convert_qualified_name(identifier),
-                            canonical_name: ast_resolved::PhaseBox::new(None),
-                            domain_spec: preserve_domain_spec(&domain_spec)?,
-                            alias,
-                            outer,
-                            mutation_target: false,
-                            passthrough: false,
-                            cpr_schema: ast_resolved::PhaseBox::new(cte_schema.clone()),
-                            hygienic_injections: Vec::new(),
-                        };
-                        Ok((
-                            ast_resolved::RelationalExpression::Relation(resolved),
-                            BubbledState::resolved(vec![]),
-                        ))
-                    }
+                    Ok((final_expr, state))
                 }
+                _ => {
+                    // Fallback for non-resolved schemas
+                    let resolved = ast_resolved::Relation::Ground {
+                        identifier: convert_qualified_name(identifier),
+                        canonical_name: ast_resolved::PhaseBox::new(None),
+                        domain_spec: preserve_domain_spec(&domain_spec)?,
+                        alias,
+                        outer,
+                        mutation_target: false,
+                        passthrough: false,
+                        cpr_schema: ast_resolved::PhaseBox::new(cte_schema.clone()),
+                        hygienic_injections: Vec::new(),
+                    };
+                    Ok((
+                        ast_resolved::RelationalExpression::Relation(resolved),
+                        BubbledState::resolved(vec![]),
+                    ))
+                }
+            }
         }
         ResolutionResult::DatabaseEntity(entity_info) => {
             // Extract fields before entity_info is consumed
@@ -759,40 +758,61 @@ fn resolve_ground(
             let resolved_namespace = entity_info.resolved_namespace.clone();
             // Extract the table schema
             let EntityDefinition::RelationSchema(table_schema) = entity_info.definition;
-                match &table_schema {
-                    ast_resolved::CprSchema::Resolved(cols) => {
-                        // Apply alias if present
-                        let base_cols = if let Some(alias_name) = &alias {
-                            cols.iter()
-                                .map(|col| {
-                                    let mut new_col = col.clone();
-                                    new_col.fq_table.name =
-                                        ast_resolved::TableName::Named(alias_name.clone().into());
-                                    new_col
-                                })
-                                .collect()
-                        } else {
-                            cols.clone()
-                        };
+            match &table_schema {
+                ast_resolved::CprSchema::Resolved(cols) => {
+                    // Apply alias if present
+                    let base_cols = if let Some(alias_name) = &alias {
+                        cols.iter()
+                            .map(|col| {
+                                let mut new_col = col.clone();
+                                new_col.fq_table.name =
+                                    ast_resolved::TableName::Named(alias_name.clone().into());
+                                new_col
+                            })
+                            .collect()
+                    } else {
+                        cols.clone()
+                    };
 
-                        // Use PatternResolver for column selection
-                        let (mut final_expr, state) = apply_pattern_resolver(
-                            &domain_spec,
-                            &base_cols,
-                            alias.as_deref().unwrap_or(&identifier.name),
-                            registry,
-                            outer_context,
-                        )?;
+                    // Use PatternResolver for column selection
+                    let (mut final_expr, state) = apply_pattern_resolver(
+                        &domain_spec,
+                        &base_cols,
+                        alias.as_deref().unwrap_or(&identifier.name),
+                        registry,
+                        outer_context,
+                    )?;
 
-                        // Build the resolved identifier, using the discovered
-                        // namespace path so the transformer can emit schema-qualified SQL.
-                        let mut resolved_id = convert_qualified_name(identifier.clone());
-                        if let Some(ref ns) = resolved_namespace {
-                            resolved_id.namespace_path = ns.clone();
+                    // Build the resolved identifier, using the discovered
+                    // namespace path so the transformer can emit schema-qualified SQL.
+                    let mut resolved_id = convert_qualified_name(identifier.clone());
+                    if let Some(ref ns) = resolved_namespace {
+                        resolved_id.namespace_path = ns.clone();
+                    }
+
+                    // Update the relation with proper identifier, alias, and canonical name
+                    if let ast_resolved::RelationalExpression::Relation(ref mut r) = final_expr {
+                        if let ast_resolved::Relation::Ground {
+                            identifier: ref mut rel_id,
+                            canonical_name: ref mut rel_canonical,
+                            alias: ref mut rel_alias,
+                            outer: ref mut rel_outer,
+                            ..
+                        } = r
+                        {
+                            *rel_id = resolved_id.clone();
+                            *rel_canonical = ast_resolved::PhaseBox::new(canonical_name.clone());
+                            *rel_alias = alias.clone();
+                            *rel_outer = outer;
                         }
-
-                        // Update the relation with proper identifier, alias, and canonical name
-                        if let ast_resolved::RelationalExpression::Relation(ref mut r) = final_expr
+                    } else if let ast_resolved::RelationalExpression::Filter {
+                        ref mut source,
+                        ..
+                    } = final_expr
+                    {
+                        // If it's wrapped in a Filter, update the inner relation
+                        if let ast_resolved::RelationalExpression::Relation(ref mut r) =
+                            source.as_mut()
                         {
                             if let ast_resolved::Relation::Ground {
                                 identifier: ref mut rel_id,
@@ -802,63 +822,40 @@ fn resolve_ground(
                                 ..
                             } = r
                             {
-                                *rel_id = resolved_id.clone();
+                                *rel_id = resolved_id;
                                 *rel_canonical =
                                     ast_resolved::PhaseBox::new(canonical_name.clone());
-                                *rel_alias = alias.clone();
+                                *rel_alias = alias;
                                 *rel_outer = outer;
                             }
-                        } else if let ast_resolved::RelationalExpression::Filter {
-                            ref mut source,
-                            ..
-                        } = final_expr
-                        {
-                            // If it's wrapped in a Filter, update the inner relation
-                            if let ast_resolved::RelationalExpression::Relation(ref mut r) =
-                                source.as_mut()
-                            {
-                                if let ast_resolved::Relation::Ground {
-                                    identifier: ref mut rel_id,
-                                    canonical_name: ref mut rel_canonical,
-                                    alias: ref mut rel_alias,
-                                    outer: ref mut rel_outer,
-                                    ..
-                                } = r
-                                {
-                                    *rel_id = resolved_id;
-                                    *rel_canonical =
-                                        ast_resolved::PhaseBox::new(canonical_name.clone());
-                                    *rel_alias = alias;
-                                    *rel_outer = outer;
-                                }
-                            }
                         }
+                    }
 
-                        Ok((final_expr, state))
-                    }
-                    _ => {
-                        // Fallback for non-resolved schemas
-                        let mut fallback_id = convert_qualified_name(identifier);
-                        if let Some(ref ns) = resolved_namespace {
-                            fallback_id.namespace_path = ns.clone();
-                        }
-                        let resolved = ast_resolved::Relation::Ground {
-                            identifier: fallback_id,
-                            canonical_name: ast_resolved::PhaseBox::new(canonical_name.clone()),
-                            domain_spec: preserve_domain_spec(&domain_spec)?,
-                            alias,
-                            outer,
-                            mutation_target: false,
-                            passthrough: false,
-                            cpr_schema: ast_resolved::PhaseBox::new(table_schema.clone()),
-                            hygienic_injections: Vec::new(),
-                        };
-                        Ok((
-                            ast_resolved::RelationalExpression::Relation(resolved),
-                            BubbledState::resolved(vec![]),
-                        ))
-                    }
+                    Ok((final_expr, state))
                 }
+                _ => {
+                    // Fallback for non-resolved schemas
+                    let mut fallback_id = convert_qualified_name(identifier);
+                    if let Some(ref ns) = resolved_namespace {
+                        fallback_id.namespace_path = ns.clone();
+                    }
+                    let resolved = ast_resolved::Relation::Ground {
+                        identifier: fallback_id,
+                        canonical_name: ast_resolved::PhaseBox::new(canonical_name.clone()),
+                        domain_spec: preserve_domain_spec(&domain_spec)?,
+                        alias,
+                        outer,
+                        mutation_target: false,
+                        passthrough: false,
+                        cpr_schema: ast_resolved::PhaseBox::new(table_schema.clone()),
+                        hygienic_injections: Vec::new(),
+                    };
+                    Ok((
+                        ast_resolved::RelationalExpression::Relation(resolved),
+                        BubbledState::resolved(vec![]),
+                    ))
+                }
+            }
         }
         ResolutionResult::ConsultedView {
             name: view_name,
@@ -1068,9 +1065,7 @@ fn resolve_ground(
             // through, or downstream operators (RenameCover, etc.) will see stale
             // source_name() values and generate SQL referencing inner column names
             // that don't exist in the subquery output.
-            fn seal_column_provenance(
-                col: &mut ast_resolved::ColumnMetadata,
-            ) {
+            fn seal_column_provenance(col: &mut ast_resolved::ColumnMetadata) {
                 let display_name = col.info.name().unwrap_or("?").to_string();
                 col.info = ast_resolved::ColumnProvenance::from_column(display_name);
             }

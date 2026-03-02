@@ -14,10 +14,10 @@ use super::asts::core::{DangerSpec, DangerState};
 /// Guardrail dangers (execution policy) may be overridden from the CLI.
 const KNOWN_DANGERS: &[(&str, DangerState, bool)] = &[
     //                                          default           cli_overridable
-    ("dql/cardinality/nulljoin",         DangerState::Off,  false),
-    ("dql/cardinality/cartesian",        DangerState::Off,  true),
-    ("dql/termination/unbounded",        DangerState::Off,  true),
-    ("dql/semantics/min_multiplicity",   DangerState::Off,  false),  // semantic — inline-only
+    ("dql/cardinality/nulljoin", DangerState::Off, false),
+    ("dql/cardinality/cartesian", DangerState::Off, true),
+    ("dql/termination/unbounded", DangerState::Off, true),
+    ("dql/semantics/min_multiplicity", DangerState::Off, false), // semantic — inline-only
 ];
 
 /// A map of danger URIs to their current states, supporting prefix matching.
@@ -52,7 +52,6 @@ impl DangerGateMap {
     pub fn get(&self, uri: &str) -> Option<&DangerState> {
         self.gates.get(uri)
     }
-
 }
 
 /// Check whether a danger URI may be overridden from CLI flags.

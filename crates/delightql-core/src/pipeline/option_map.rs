@@ -46,7 +46,6 @@ impl OptionMap {
     pub fn get(&self, uri: &str) -> Option<&OptionState> {
         self.options.get(uri)
     }
-
 }
 
 impl Default for OptionMap {

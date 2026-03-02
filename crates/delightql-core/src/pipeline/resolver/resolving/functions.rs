@@ -719,7 +719,10 @@ pub(in crate::pipeline::resolver) fn resolve_function_with_schema(
                                         "in tree group key",
                                     ));
                                 }
-                                UnificationResult::Ambiguous { column: col, tables } => {
+                                UnificationResult::Ambiguous {
+                                    column: col,
+                                    tables,
+                                } => {
                                     return Err(DelightQLError::validation_error_categorized(
                                         "resolution/ambiguous",
                                         format!(

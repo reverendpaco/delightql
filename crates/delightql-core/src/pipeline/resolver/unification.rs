@@ -3,9 +3,7 @@
 //! This module handles matching unresolved column references against available columns,
 //! detecting ambiguities, and building the resolved column metadata.
 
-use crate::pipeline::ast_resolved::{
-    ColumnMetadata, TableName,
-};
+use crate::pipeline::ast_resolved::{ColumnMetadata, TableName};
 
 /// Result of unifying a column reference
 #[derive(Debug)]
@@ -258,4 +256,3 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
         }
     }
 }
-

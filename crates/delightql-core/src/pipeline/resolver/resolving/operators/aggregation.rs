@@ -427,8 +427,6 @@ fn capture_interior_schemas(
     reducing_on: &[ast_resolved::DomainExpression],
     output: &mut [ast_resolved::ColumnMetadata],
 ) {
-    
-
     for expr in reducing_on {
         if let Some((alias, schema)) = extract_interior_schema_from_expr(expr) {
             // Find the output column with this alias and attach the schema

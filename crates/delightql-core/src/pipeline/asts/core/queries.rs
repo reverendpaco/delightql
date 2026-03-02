@@ -352,4 +352,3 @@ pub struct PrecompiledCfeDefinition {
     #[lispy("body")]
     pub body: DomainExpression<Refined>,
 }
-

@@ -50,15 +50,8 @@ pub fn handle_jstruct_command(
         &mut *session,
     )?;
 
-    let result = crate::exec_ng::execute_query(
-        query,
-        &mut *session,
-        to,
-        output_format,
-        false,
-        false,
-        false,
-    );
+    let result =
+        crate::exec_ng::execute_query(query, &mut *session, to, output_format, false, false, false);
 
     // Drop SQLite connections before unlinking the temp file
     drop(session);

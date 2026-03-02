@@ -464,7 +464,7 @@ pub fn substitute_value_placeholder(
         AstDomainExpression::ValuePlaceholder { .. } => {
             // Convert the SQL column reference back to AST format
             // For MapCover, this will be a simple column reference
-            
+
             match column_ref {
                 SqlDomainExpression::Column {
                     name, qualifier, ..

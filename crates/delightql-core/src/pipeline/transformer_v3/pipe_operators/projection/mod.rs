@@ -4,8 +4,8 @@
 mod general;
 mod interior_drill_down;
 mod meta_ize;
-pub(crate) mod narrowing_destructure;
 mod modulo;
+pub(crate) mod narrowing_destructure;
 mod pivot_support;
 mod project_out;
 pub(crate) mod tree_group_support;

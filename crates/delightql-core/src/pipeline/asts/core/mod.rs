@@ -17,20 +17,16 @@ pub use expressions::{
 };
 pub use literals::{ColumnOrdinal, ColumnRange, LiteralValue};
 pub use metadata::{ColumnMetadata, CprSchema, FqTable, NamespacePath, ScopedSchema, TableName};
-pub use operators::{
-    FrameBound, FrameMode, JoinType, UnaryRelationalOperator, WindowFrame,
-};
+pub use operators::{FrameBound, FrameMode, JoinType, UnaryRelationalOperator, WindowFrame};
 pub use phase_box::{PhaseBox, PhaseBoxable};
 pub use phases::{Addressed, Refined, Resolved, Unresolved};
-pub use provenance::{
-    ColumnIdentity, ColumnProvenance, IdentityContext, TransformationPhase,
-};
+pub use provenance::{ColumnIdentity, ColumnProvenance, IdentityContext, TransformationPhase};
 pub use queries::{
-    AssertionPredicate, AssertionSpec, CfeDefinition, ContextMode, CteBinding,
-    DangerSpec, DangerState, EmitSpec, ErContextSpec, InlineDdlSpec, OptionSpec, OptionState,
+    AssertionPredicate, AssertionSpec, CfeDefinition, ContextMode, CteBinding, DangerSpec,
+    DangerState, EmitSpec, ErContextSpec, InlineDdlSpec, OptionSpec, OptionState,
     PrecompiledCfeDefinition, Query,
 };
 pub use specs::{
-    ContainmentSemantic, ModuloSpec, OrderDirection, OrderingSpec, RenameSpec,
-    RenameTarget, RepositionSpec, Row, TupleOrdinalClause, TupleOrdinalOperator,
+    ContainmentSemantic, ModuloSpec, OrderDirection, OrderingSpec, RenameSpec, RenameTarget,
+    RepositionSpec, Row, TupleOrdinalClause, TupleOrdinalOperator,
 };

@@ -18,11 +18,7 @@ pub mod connection;
 pub mod namespace;
 
 // Re-export main types and functions for convenience
-pub use activation::{
-    activate_bootstrap_entities, activate_entities_from_cartridge,
-};
+pub use activation::{activate_bootstrap_entities, activate_entities_from_cartridge};
 pub use cartridge::{install_cartridge, SourceType};
 pub use connection::register_connection;
-pub use namespace::{
-    create_bootstrap_namespaces, create_namespace_from_path,
-};
+pub use namespace::{create_bootstrap_namespaces, create_namespace_from_path};

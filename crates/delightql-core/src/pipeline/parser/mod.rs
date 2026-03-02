@@ -1195,7 +1195,6 @@ pub fn setup_errors_table_on_bootstrap(conn: &rusqlite::Connection) -> Result<()
 }
 
 mod tests {
-    
 
     #[test]
     fn test_parse_valid_query() {

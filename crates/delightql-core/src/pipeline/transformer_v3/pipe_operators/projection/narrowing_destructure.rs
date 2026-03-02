@@ -14,14 +14,14 @@
 // FROM source_table, json_each(source_table."col") AS _narrow_0
 // ```
 
+use super::super::super::context::TransformContext;
+use super::super::super::helpers::alias_generator::next_alias;
 use crate::error::Result;
 use crate::pipeline::ast_addressed;
 use crate::pipeline::sql_ast_v3::{
     DomainExpression as SqlExpr, SelectBuilder, SelectItem, SelectStatement, TableExpression,
     TvfArgument,
 };
-use super::super::super::context::TransformContext;
-use super::super::super::helpers::alias_generator::next_alias;
 
 /// Extract the referenceable name from a TableExpression.
 fn table_ref_name(table: &TableExpression) -> Option<String> {
@@ -116,11 +116,11 @@ pub fn apply_narrowing_destructure(
 
     let result = builder.set_select(select_items).from_tables(from_tables);
 
-    result.build().map_err(|e| {
-        crate::error::DelightQLError::ParseError {
+    result
+        .build()
+        .map_err(|e| crate::error::DelightQLError::ParseError {
             message: format!("NarrowingDestructure: failed to build result: {}", e),
             source: None,
             subcategory: None,
-        }
-    })
+        })
 }

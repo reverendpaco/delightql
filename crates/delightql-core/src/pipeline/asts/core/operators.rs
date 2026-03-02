@@ -295,10 +295,7 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
     /// from each element via json_extract. No context carry-forward --
     /// the output schema contains only the named fields.
     #[lispy("unary_relational_operator:narrowing_destructure")]
-    NarrowingDestructure {
-        column: String,
-        fields: Vec<String>,
-    },
+    NarrowingDestructure { column: String, fields: Vec<String> },
     /// Directive pipe terminal: source |> directive!(args)
     ///
     /// Phase 1.X only — consumed by effect executor before resolution.

@@ -7,7 +7,7 @@ pub fn custom_pretty_print(sexp: &str) -> String {
     let mut indent = 0;
     let mut chars = sexp.chars().peekable();
     let mut after_open = false;
-    
+
     while let Some(ch) = chars.next() {
         match ch {
             '(' => {
@@ -43,7 +43,7 @@ pub fn custom_pretty_print(sexp: &str) -> String {
             }
         }
     }
-    
+
     result
 }
 

@@ -217,5 +217,4 @@ impl TableExpression {
             join_condition: JoinCondition::On(on),
         }
     }
-
 }

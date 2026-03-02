@@ -99,7 +99,6 @@ impl BinCartridgeRegistry {
     pub fn cartridges(&self) -> &[Arc<dyn BinCartridge>] {
         &self.cartridges
     }
-
 }
 
 impl Default for BinCartridgeRegistry {

@@ -227,4 +227,3 @@ pub fn open(factory: Box<dyn ConnectionFactory>) -> Result<Box<dyn api::DqlHandl
         initial_backend: Some(created.handler),
     }))
 }
-

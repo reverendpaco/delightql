@@ -232,13 +232,11 @@ fn run() -> Result<()> {
                 )
             }
             Command::Tools { tool } => match tool {
-                ToolCommand::Jstruct {
-                    query,
-                    format,
-                    to,
-                } => delightql_cli::commands::jstruct::handle_jstruct_command(
-                    query, *format, *to, &args,
-                ),
+                ToolCommand::Jstruct { query, format, to } => {
+                    delightql_cli::commands::jstruct::handle_jstruct_command(
+                        query, *format, *to, &args,
+                    )
+                }
                 ToolCommand::Munge { .. } => {
                     anyhow::bail!("dql tools munge is not yet implemented")
                 }

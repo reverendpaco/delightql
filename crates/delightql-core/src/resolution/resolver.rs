@@ -208,4 +208,3 @@ pub fn resolve_entity_with_alias(
     // Level 5: Unknown - passthrough
     ResolutionResult::Unknown(actual_name)
 }
-
