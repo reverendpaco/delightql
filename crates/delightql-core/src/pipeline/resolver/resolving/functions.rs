@@ -697,6 +697,43 @@ pub(in crate::pipeline::resolver) fn resolve_function_with_schema(
                         qualifier,
                         schema,
                     } => {
+                        // Validate shorthand column exists in available schema.
+                        if !available.is_empty() {
+                            use crate::pipeline::resolver::unification::{
+                                unify_columns, ColumnReference, UnificationResult,
+                            };
+                            let col_ref = ColumnReference::Named {
+                                name: column.to_string(),
+                                qualifier: qualifier.as_ref().map(|q| q.to_string()),
+                                schema: None,
+                            };
+                            let result = unify_columns(vec![col_ref], available)
+                                .into_iter()
+                                .next()
+                                .unwrap();
+                            match result {
+                                UnificationResult::Resolved(_) => {}
+                                UnificationResult::Unresolved(col_name) => {
+                                    return Err(DelightQLError::column_not_found_error(
+                                        col_name,
+                                        "in tree group key",
+                                    ));
+                                }
+                                UnificationResult::Ambiguous { column: col, tables } => {
+                                    return Err(DelightQLError::validation_error_categorized(
+                                        "resolution/ambiguous",
+                                        format!(
+                                            "Ambiguous column '{}' in tree group key: found in tables {}. Use a qualifier (e.g., {}.{})",
+                                            col,
+                                            tables.join(", "),
+                                            tables[0],
+                                            col,
+                                        ),
+                                        "in tree group key",
+                                    ));
+                                }
+                            }
+                        }
                         // De-duplicate explicit columns too
                         if seen_columns.insert(column.to_string()) {
                             resolved_members.push(resolved::CurlyMember::Shorthand {
@@ -794,6 +831,8 @@ pub(in crate::pipeline::resolver) fn resolve_function_with_schema(
             cte_requirements: _,
         } => {
             // Tree groups - resolve the constructor function
+            // Note: key_column validation happens via CurlyMember::Shorthand
+            // in the constructor's curly function resolution path.
             Ok(ast_resolved::FunctionExpression::MetadataTreeGroup {
                 key_column,
                 key_qualifier,
