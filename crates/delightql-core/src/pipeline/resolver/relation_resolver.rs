@@ -185,7 +185,7 @@ pub(super) fn resolve_relation_with_registry(
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     match &rel {
         ast_unresolved::Relation::Ground { .. } => {
-            resolve_ground(rel, registry, outer_context, config)
+            resolve_ground(rel, registry, outer_context, config, grounding)
         }
         ast_unresolved::Relation::Anonymous { .. } => {
             resolve_anonymous(rel, registry, outer_context)
@@ -219,6 +219,7 @@ fn resolve_ground(
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
+    grounding: Option<&ast_unresolved::GroundedPath>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     use crate::resolution::{resolve_entity_with_alias, EntityDefinition, ResolutionResult};
 
@@ -622,6 +623,40 @@ fn resolve_ground(
                             identifier.namespace_path.with_table(&identifier.name),
                         )
                     }
+                } else if let Some(grounding) = grounding {
+                    // Fallback: entity not in patched namespace, search grounded namespaces.
+                    // Handles inline DDL views referencing sibling entities: DataNsPatcher
+                    // rewrites sample(*) → main::sample(*), but fact lives in "user".
+                    let mut fallback_result = None;
+                    for ns in &grounding.grounded_ns {
+                        let gfq = super::grounding::namespace_path_to_fq(ns);
+                        if let Some(entity) =
+                            registry.consult.lookup_entity(&identifier.name, &gfq)
+                        {
+                            if entity.entity_type
+                                == BootstrapEntityType::DqlTemporaryViewExpression.as_i32()
+                            {
+                                fallback_result = Some(ResolutionResult::ConsultedView {
+                                    name: entity.name.clone(),
+                                    body_source: entity.definition.clone(),
+                                    namespace: gfq,
+                                });
+                            } else if entity.entity_type
+                                == BootstrapEntityType::DqlFactExpression.as_i32()
+                            {
+                                fallback_result = Some(ResolutionResult::ConsultedFact {
+                                    name: entity.name.clone(),
+                                    body_source: entity.definition.clone(),
+                                });
+                            }
+                            break;
+                        }
+                    }
+                    fallback_result.unwrap_or_else(|| {
+                        ResolutionResult::Unknown(
+                            identifier.namespace_path.with_table(&identifier.name),
+                        )
+                    })
                 } else {
                     ResolutionResult::Unknown(
                         identifier.namespace_path.with_table(&identifier.name),
