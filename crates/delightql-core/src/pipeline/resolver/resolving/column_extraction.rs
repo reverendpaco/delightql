@@ -176,13 +176,15 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
                 if let Some(alias_name) = alias {
                     // If there's an alias, the expression provides a column with that alias name
                     output_col.info = output_col.info.with_alias(alias_name.clone());
-                    output_col.has_user_name = true; // User provided an alias
                 }
-                // Keep the existing has_user_name flag from the source column
+                // Projection establishes column identity: the name is now known,
+                // even if the source was a passthrough table with unnamed columns.
+                output_col.has_user_name = true;
                 Some(output_col)
             } else {
-                // If we can't find the column in input, it might be a new computed column
-                // This happens with aggregates or functions
+                // Column not found in input — either passthrough table (no schema)
+                // or a new computed column. The user explicitly wrote this name in a
+                // projection, so the column is user-named.
                 let final_name = alias.as_ref().unwrap_or(name);
                 let mut info = ast_resolved::ColumnProvenance::from_column(final_name.clone());
 
@@ -199,7 +201,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
                         backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
                     },
                     None,
-                    alias.is_some(), // has_user_name true only if alias provided
+                    true, // Lvar in projection = user explicitly named this column
                 ))
             }
         }
