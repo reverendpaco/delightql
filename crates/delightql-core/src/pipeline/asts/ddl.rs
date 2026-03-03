@@ -60,6 +60,16 @@ impl crate::lispy::ToLispy for CompanionKind {
     }
 }
 
+/// An item in an argumentative view head: either a free variable or a ground literal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewHeadItem {
+    /// Free variable (column name): projected from the body
+    Free(String),
+    /// Ground term (literal value): constant injected into every row.
+    /// String includes quotes for string literals (e.g., `"old"`).
+    Ground(String),
+}
+
 /// Definition head — the structural form of the definition.
 #[derive(Debug, Clone)]
 pub enum DdlHead {
@@ -70,8 +80,14 @@ pub enum DdlHead {
     },
     /// View: `name(*)` — no parameters
     View,
-    /// Higher-order view: `name(T(*), Config(x,y), n)(columns)`
-    HoView { params: Vec<HoParam> },
+    /// Argumentative view: `name(col1, "lit", col2)` — closed schema contract with optional ground terms
+    ArgumentativeView { items: Vec<ViewHeadItem> },
+    /// Higher-order view: `name(T(*), Config(x,y), n)(output)`
+    HoView {
+        params: Vec<HoParam>,
+        /// Output head: None means glob (*) (open schema), Some means argumentative (closed schema contract)
+        output_head: Option<Vec<ViewHeadItem>>,
+    },
     /// Sigma predicate: `name(params)` — boolean-valued, used with +/\+ prefix
     SigmaPredicate { params: Vec<String> },
     /// Fact: `name(values)` — inline data literal, no parameters
@@ -102,6 +118,8 @@ pub enum HoParamKind {
     Argumentative(Vec<String>),
     /// `n` — scalar value parameter, or legacy bare table name
     Scalar,
+    /// `"value"` or `42` — ground scalar literal (constant in this clause)
+    GroundScalar(String),
 }
 
 /// A higher-order view parameter with kind metadata.
@@ -109,6 +127,45 @@ pub enum HoParamKind {
 pub struct HoParam {
     pub name: String,
     pub kind: HoParamKind,
+}
+
+/// Cross-clause analysis of a single HO parameter position.
+/// Computed at consult time from all clauses, stored in sys tables.
+#[derive(Debug, Clone)]
+pub struct HoPositionInfo {
+    pub position: usize,
+    /// Unified column kind across all clauses
+    pub column_kind: HoColumnKind,
+    /// How ground values distribute across clauses
+    pub ground_mode: HoGroundMode,
+    /// Ground constant values (one per clause that has GroundScalar at this pos)
+    pub ground_values: Vec<(usize, String)>, // (clause_ordinal, value)
+    /// Canonical column name (from free-variable clauses; None for PureGround)
+    pub column_name: Option<String>,
+}
+
+/// What kind of HO column this position carries, unified across all clauses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HoColumnKind {
+    /// T(*) in every clause
+    TableGlob,
+    /// T(x,y) in every clause
+    TableArgumentative(Vec<String>),
+    /// Scalar/GroundScalar across clauses
+    Scalar,
+}
+
+/// How ground values distribute across clauses at a single position.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HoGroundMode {
+    /// Every clause: GroundScalar — free+unbound at call site IS valid
+    PureGround,
+    /// Some GroundScalar, some Scalar — call site MUST provide concrete value
+    MixedGround,
+    /// Every clause: Scalar — standard parameter
+    PureUnbound,
+    /// Table parameter (Glob/Argumentative) — always input-moded
+    InputOnly,
 }
 
 /// Definition body — the DQL expression(s) after the neck.
@@ -126,23 +183,61 @@ impl DdlHead {
     /// - `Function { params }` → function parameter names
     /// - `HoView { params }` → higher-order parameter names
     /// - `View` → empty
+    /// Count total parameter positions (including GroundScalar).
+    ///
+    /// Unlike `param_names()` which excludes GroundScalar positions,
+    /// this counts all positions for arity validation across clauses.
+    pub fn param_count(&self) -> usize {
+        match self {
+            DdlHead::Function { params, .. } => params.len(),
+            DdlHead::HoView { params, .. } => params.len(),
+            DdlHead::SigmaPredicate { params } => params.len(),
+            DdlHead::View
+            | DdlHead::ArgumentativeView { .. }
+            | DdlHead::Fact
+            | DdlHead::ErRule { .. }
+            | DdlHead::Companion { .. } => 0,
+        }
+    }
+
     pub fn param_names(&self) -> Vec<&str> {
         match self {
             DdlHead::Function { params, .. } => params.iter().map(|p| p.name.as_str()).collect(),
-            DdlHead::HoView { params } => params.iter().map(|p| p.name.as_str()).collect(),
+            DdlHead::HoView { params, .. } => params
+                .iter()
+                .filter_map(|p| {
+                    if matches!(p.kind, HoParamKind::GroundScalar(_)) {
+                        None
+                    } else {
+                        Some(p.name.as_str())
+                    }
+                })
+                .collect(),
             DdlHead::SigmaPredicate { params } => params.iter().map(|s| s.as_str()).collect(),
-            DdlHead::View | DdlHead::Fact | DdlHead::ErRule { .. } | DdlHead::Companion { .. } => {
-                Vec::new()
-            }
+            DdlHead::View
+            | DdlHead::ArgumentativeView { .. }
+            | DdlHead::Fact
+            | DdlHead::ErRule { .. }
+            | DdlHead::Companion { .. } => Vec::new(),
         }
     }
 
     /// Extract HO parameter names only (empty for non-HO heads).
     pub fn ho_param_names(&self) -> Vec<&str> {
         match self {
-            DdlHead::HoView { params } => params.iter().map(|p| p.name.as_str()).collect(),
+            DdlHead::HoView { params, .. } => params
+                .iter()
+                .filter_map(|p| {
+                    if matches!(p.kind, HoParamKind::GroundScalar(_)) {
+                        None
+                    } else {
+                        Some(p.name.as_str())
+                    }
+                })
+                .collect(),
             DdlHead::Function { .. }
             | DdlHead::View
+            | DdlHead::ArgumentativeView { .. }
             | DdlHead::Fact
             | DdlHead::SigmaPredicate { .. }
             | DdlHead::ErRule { .. }
@@ -154,7 +249,7 @@ impl DdlHead {
     ///
     /// Maps head form → entity_type_enum.id:
     /// - Function → 1 (DqlFunctionExpression)
-    /// - View → 4 (DqlTemporaryViewExpression)
+    /// - View / ArgumentativeView → 4 (DqlTemporaryViewExpression)
     /// - HoView → 8 (DqlHoTemporaryViewExpression)
     /// - SigmaPredicate → 9 (DqlTemporarySigmaRule)
     pub fn entity_type_id(&self) -> i32 {
@@ -166,7 +261,7 @@ impl DdlHead {
                     3
                 }
             }
-            DdlHead::View => 4,
+            DdlHead::View | DdlHead::ArgumentativeView { .. } => 4,
             DdlHead::HoView { .. } => 8,
             DdlHead::SigmaPredicate { .. } => 9,
             DdlHead::Fact => 16,

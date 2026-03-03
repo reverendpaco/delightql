@@ -137,6 +137,11 @@ pub(crate) fn execute_consult(
     namespace: &str,
     _consulting_ns: Option<&str>,
 ) -> Result<usize> {
+    // Resolve relative path against session CWD (for test isolation).
+    let resolved_path = crate::session_cwd::resolve_path(file_path);
+    let file_path = resolved_path.display().to_string();
+    let file_path = file_path.as_str();
+
     // Read the file
     let source = std::fs::read_to_string(file_path).map_err(|e| {
         DelightQLError::database_error(

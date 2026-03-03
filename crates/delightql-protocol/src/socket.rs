@@ -223,6 +223,12 @@ impl Session<SocketTransport> {
     pub fn shutdown(&mut self) -> Result<ControlResult, TransportError> {
         self.transport.control(ControlOp::Shutdown)
     }
+
+    /// Set the session's base path for relative file resolution.
+    /// Cleared by reset(). Only available over socket transport.
+    pub fn cwd(&mut self, path: String) -> Result<ControlResult, TransportError> {
+        self.transport.control(ControlOp::Cwd(path))
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +380,71 @@ mod tests {
         };
 
         // Send Reset
+        let result = session.reset().unwrap();
+        assert_eq!(result, ControlResult::Ok);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn socket_transport_control_cwd() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+
+            // Read version handshake
+            let msg = read_client_message(&mut server_stream, &mut buf).unwrap();
+            assert!(matches!(msg, ClientMessage::Data(ClientTerm::Version { .. })));
+            write_server_message(
+                &mut server_stream,
+                &ServerMessage::Data(ServerTerm::Version {
+                    max_message_size: 1_000_000,
+                    protocol_version: b("relay0"),
+                    lease_ms: 300_000,
+                    orientations: vec![Orientation::Rows],
+                }),
+            )
+            .unwrap();
+
+            // Read Cwd control
+            let msg = read_client_message(&mut server_stream, &mut buf).unwrap();
+            assert_eq!(
+                msg,
+                ClientMessage::Control(ControlOp::Cwd("/tmp/dql-isolate-abc123".into()))
+            );
+            write_server_message(
+                &mut server_stream,
+                &ServerMessage::Control(ControlResult::Ok),
+            )
+            .unwrap();
+
+            // Read Reset (should clear CWD)
+            let msg = read_client_message(&mut server_stream, &mut buf).unwrap();
+            assert_eq!(msg, ClientMessage::Control(ControlOp::Reset));
+            write_server_message(
+                &mut server_stream,
+                &ServerMessage::Control(ControlResult::Ok),
+            )
+            .unwrap();
+        });
+
+        let transport = SocketTransport::new(client_stream);
+        let client = Client::new(transport);
+
+        let mut session = match client
+            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .unwrap()
+        {
+            VersionResult::Accepted(s) => s,
+            VersionResult::Rejected { .. } => panic!("expected Accepted"),
+        };
+
+        // Send Cwd
+        let result = session.cwd("/tmp/dql-isolate-abc123".into()).unwrap();
+        assert_eq!(result, ControlResult::Ok);
+
+        // Reset clears it
         let result = session.reset().unwrap();
         assert_eq!(result, ControlResult::Ok);
 

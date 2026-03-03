@@ -750,6 +750,7 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
             "function_definition"
             | "constant_definition"
             | "view_definition"
+            | "argumentative_view_definition"
             | "ho_view_definition"
             | "sigma_definition"
             | "fact_definition"
@@ -840,8 +841,9 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
             // Constant: zero-arity function with no parens (sugar for name:() :- body)
             (DefinitionType::Function, Vec::new())
         }
-        "view_definition" => {
+        "view_definition" | "argumentative_view_definition" => {
             // View: no params field (uses * instead)
+            // Argumentative views also map to View; head items stored in DDL AST
             (DefinitionType::View, Vec::new())
         }
         "ho_view_definition" => {

@@ -46,8 +46,23 @@ pub(super) fn validate_union_compatible_schemas(
         });
     }
 
-    // For now, just check column count (ordinal matching)
-    // Future: could check type compatibility
+    // Check column names match (not just count).
+    // If names differ, schemas are NOT the same -> caller uses CORRESPONDING.
+    for (c1, c2) in cols1.iter().zip(cols2.iter()) {
+        let n1 = c1.info.original_name().or_else(|| c1.info.alias_name());
+        let n2 = c2.info.original_name().or_else(|| c2.info.alias_name());
+        if n1 != n2 {
+            return Err(DelightQLError::ParseError {
+                message: format!(
+                    "UNION ALL column name mismatch at position: {:?} vs {:?}",
+                    n1, n2
+                ),
+                source: None,
+                subcategory: None,
+            });
+        }
+    }
+
     Ok(())
 }
 

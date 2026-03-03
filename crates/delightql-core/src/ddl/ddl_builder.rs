@@ -11,6 +11,7 @@ use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::ContextMode;
 use crate::pipeline::asts::ddl::{
     CompanionKind, DdlBody, DdlDefinition, DdlHead, DdlNeck, FunctionParam, HoParam, HoParamKind,
+    ViewHeadItem,
 };
 use crate::pipeline::cst::CstNode;
 use crate::pipeline::parser::parse_ddl;
@@ -110,6 +111,10 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
             DdlHead::SigmaPredicate { params }
         }
         "view_definition" => DdlHead::View,
+        "argumentative_view_definition" => {
+            let items = extract_view_head_items(node);
+            DdlHead::ArgumentativeView { items }
+        }
         "ho_view_definition" => {
             let params_nodes = node.children_by_field("ho_params");
             let params = params_nodes
@@ -126,7 +131,26 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                     }
                 })
                 .collect();
-            DdlHead::HoView { params }
+            // Check for argumentative output head: (name, type) vs (*)
+            let output_head_nodes = node.children_by_field("output_head");
+            let output_head = if output_head_nodes.is_empty() {
+                None // glob (*)
+            } else {
+                let items: Vec<ViewHeadItem> = output_head_nodes
+                    .iter()
+                    .filter(|n| n.kind() == "view_head_item")
+                    .map(|n| extract_single_view_head_item(n))
+                    .collect();
+                if items.is_empty() {
+                    None
+                } else {
+                    Some(items)
+                }
+            };
+            DdlHead::HoView {
+                params,
+                output_head,
+            }
         }
         "constant_definition" => {
             // Constant: zero-arity function with no parens (sugar for name:() :- body)
@@ -230,6 +254,7 @@ pub fn build_ddl_definition(node: &CstNode, source: &str) -> Result<DdlDefinitio
         "function_definition" | "constant_definition" => BodyKind::Function,
         "sigma_definition" => BodyKind::Sigma,
         "view_definition"
+        | "argumentative_view_definition"
         | "ho_view_definition"
         | "er_rule_definition"
         | "companion_definition" => BodyKind::Relational,
@@ -353,6 +378,7 @@ pub fn build_ddl_head(source: &str) -> Result<(String, DdlHead)> {
             "function_definition"
             | "constant_definition"
             | "view_definition"
+            | "argumentative_view_definition"
             | "ho_view_definition"
             | "sigma_definition"
             | "fact_definition"
@@ -406,6 +432,7 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
             "function_definition"
             | "constant_definition"
             | "view_definition"
+            | "argumentative_view_definition"
             | "ho_view_definition"
             | "sigma_definition"
             | "fact_definition"
@@ -438,8 +465,18 @@ fn truncate_for_display(text: &str, max_len: usize) -> String {
 /// Determines the kind by inspecting the node structure:
 /// - Has `*` child → Glob: `T(*)`
 /// - Has `columns` field → Argumentative: `T(x, y)`
+/// - Has `ground_value` field → GroundScalar: `"value"` or `42`
 /// - Just `param_name` → Scalar: `n`
 fn extract_ho_param(node: &CstNode) -> HoParam {
+    // Check for ground value first: "value" or 42
+    if let Some(ground_node) = node.field("ground_value") {
+        let text = ground_node.text().to_string();
+        return HoParam {
+            name: text.clone(),
+            kind: HoParamKind::GroundScalar(text),
+        };
+    }
+
     let name = node
         .field("param_name")
         .map(|n| n.text().to_string())
@@ -474,6 +511,26 @@ fn extract_ho_param(node: &CstNode) -> HoParam {
     HoParam {
         name,
         kind: HoParamKind::Scalar,
+    }
+}
+
+/// Extract view head items from an `argumentative_view_definition` CST node.
+fn extract_view_head_items(node: &CstNode) -> Vec<ViewHeadItem> {
+    let head_items_nodes = node.children_by_field("head_items");
+    head_items_nodes
+        .iter()
+        .filter(|n| n.kind() == "view_head_item")
+        .map(|n| extract_single_view_head_item(n))
+        .collect()
+}
+
+/// Extract a single `ViewHeadItem` from a `view_head_item` CST node.
+fn extract_single_view_head_item(node: &CstNode) -> ViewHeadItem {
+    let child = node.child(0).unwrap_or(*node);
+    match child.kind() {
+        "identifier" => ViewHeadItem::Free(child.text().to_string()),
+        "string_literal" | "number_literal" => ViewHeadItem::Ground(child.text().to_string()),
+        _ => ViewHeadItem::Free(child.text().to_string()),
     }
 }
 

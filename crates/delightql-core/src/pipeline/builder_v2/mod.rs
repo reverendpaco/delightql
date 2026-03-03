@@ -649,7 +649,7 @@ pub(crate) fn parse_expression(
         }
         "anonymous_table" => {
             features.mark(QueryFeature::AnonymousTables);
-            RelationalExpression::Relation(parse_anonymous_table(base_child)?)
+            RelationalExpression::Relation(parse_anonymous_table(base_child, features)?)
         }
         "pseudo_predicate_call" => {
             features.mark(QueryFeature::PseudoPredicates);

@@ -458,6 +458,8 @@ pub enum HoParamKind {
     Argumentative(Vec<String>),
     /// `n` — scalar value, or legacy bare table name
     Scalar,
+    /// `"value"` or `42` — ground scalar literal (constant in this clause)
+    GroundScalar(String),
 }
 
 /// A parameter of a consulted entity (function or HO view).
@@ -489,6 +491,9 @@ pub struct ConsultedEntity {
     pub definition: String,
     /// Parameters with kind metadata
     pub params: Vec<HoParamInfo>,
+    /// Cross-clause unified position analysis (populated for HO views with new schema).
+    /// Empty for non-HO entities or when sys tables lack the new columns (backward compat).
+    pub positions: Vec<crate::pipeline::asts::ddl::HoPositionInfo>,
     /// Namespace where entity is activated
     pub namespace: String,
 }
@@ -650,11 +655,119 @@ impl ConsultRegistry {
                         .collect();
                     HoParamKind::Argumentative(columns)
                 }
+                "ground_scalar" => HoParamKind::GroundScalar(name.clone()),
                 _ => HoParamKind::Scalar,
             };
             params.push(HoParamInfo { name, kind });
         }
         Ok(params)
+    }
+
+    /// Read cross-clause position analysis from ho_param + ho_param_ground_value tables.
+    ///
+    /// Returns empty Vec if the new columns (ground_mode, column_name) are not present
+    /// (backward compatibility with older bootstrap schemas).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn query_ho_positions(
+        conn: &rusqlite::Connection,
+        entity_id: i32,
+    ) -> Vec<crate::pipeline::asts::ddl::HoPositionInfo> {
+        use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode, HoPositionInfo};
+
+        let mut stmt = match conn.prepare(
+            "SELECT id, param_name, position, kind, ground_mode, column_name
+             FROM ho_param WHERE entity_id = ?1 ORDER BY position",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(), // Schema doesn't have new columns
+        };
+
+        let rows: Vec<(i32, String, i32, String, Option<String>, Option<String>)> = match stmt
+            .query_map(rusqlite::params![entity_id], |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            }) {
+            Ok(r) => r.filter_map(|r| r.ok()).collect(),
+            Err(_) => return Vec::new(),
+        };
+
+        let mut positions = Vec::new();
+        for (hp_id, _name, position, kind_str, ground_mode_str, column_name) in rows {
+            // Skip rows without ground_mode (old schema)
+            let ground_mode_str = match ground_mode_str {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let column_kind = match kind_str.as_str() {
+                "glob" => HoColumnKind::TableGlob,
+                "argumentative" => {
+                    let columns = Self::query_argumentative_columns(conn, hp_id);
+                    HoColumnKind::TableArgumentative(columns)
+                }
+                _ => HoColumnKind::Scalar,
+            };
+
+            let ground_mode = match ground_mode_str.as_str() {
+                "pure_ground" => HoGroundMode::PureGround,
+                "mixed_ground" => HoGroundMode::MixedGround,
+                "pure_unbound" => HoGroundMode::PureUnbound,
+                "input_only" => HoGroundMode::InputOnly,
+                _ => HoGroundMode::PureUnbound,
+            };
+
+            // Read ground values
+            let ground_values = Self::query_ground_values(conn, hp_id);
+
+            positions.push(HoPositionInfo {
+                position: position as usize,
+                column_kind,
+                ground_mode,
+                ground_values,
+                column_name,
+            });
+        }
+
+        positions
+    }
+
+    /// Read argumentative column names for an ho_param_id.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn query_argumentative_columns(conn: &rusqlite::Connection, hp_id: i32) -> Vec<String> {
+        let mut stmt = match conn.prepare(
+            "SELECT column_name FROM ho_param_column
+             WHERE ho_param_id = ?1 ORDER BY column_position",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(rusqlite::params![hp_id], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Read per-clause ground values for an ho_param_id.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn query_ground_values(conn: &rusqlite::Connection, hp_id: i32) -> Vec<(usize, String)> {
+        let mut stmt = match conn.prepare(
+            "SELECT clause_ordinal, ground_value
+             FROM ho_param_ground_value WHERE ho_param_id = ?1
+             ORDER BY clause_ordinal",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(rusqlite::params![hp_id], |row| {
+            Ok((row.get::<_, i32>(0)? as usize, row.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 
     /// Look up a consulted entity by name and namespace
@@ -715,10 +828,14 @@ impl ConsultRegistry {
         let definition = definition.unwrap_or_default();
 
         // Look up parameters for functions (type 1, 3) and HO views (type 8)
-        let params = if EntityType::from_i32(entity_type).map_or(false, |t| t.is_fn())
-            || entity_type == EntityType::DqlHoTemporaryViewExpression.as_i32()
-        {
+        let is_ho = entity_type == EntityType::DqlHoTemporaryViewExpression.as_i32();
+        let params = if EntityType::from_i32(entity_type).map_or(false, |t| t.is_fn()) || is_ho {
             Self::query_params(&conn, entity_id, entity_type)
+        } else {
+            Vec::new()
+        };
+        let positions = if is_ho {
+            Self::query_ho_positions(&conn, entity_id)
         } else {
             Vec::new()
         };
@@ -728,6 +845,7 @@ impl ConsultRegistry {
             entity_type,
             definition,
             params,
+            positions,
             namespace,
         })
     }
@@ -821,6 +939,7 @@ impl ConsultRegistry {
                     entity_type,
                     definition,
                     params,
+                    positions: Vec::new(),
                     namespace,
                 }))
             }
@@ -935,6 +1054,7 @@ impl ConsultRegistry {
                     entity_type,
                     definition,
                     params,
+                    positions: Vec::new(),
                     namespace,
                 }))
             }
@@ -1046,6 +1166,7 @@ impl ConsultRegistry {
                     entity_type,
                     definition,
                     params,
+                    positions: Vec::new(),
                     namespace,
                 }))
             }
@@ -1149,11 +1270,13 @@ impl ConsultRegistry {
                     rows.into_iter().next().unwrap();
                 let definition = definition.unwrap_or_default();
                 let params = Self::query_params(&conn, entity_id, entity_type);
+                let positions = Self::query_ho_positions(&conn, entity_id);
                 Ok(Some(ConsultedEntity {
                     name: entity_name.into(),
                     entity_type,
                     definition,
                     params,
+                    positions,
                     namespace,
                 }))
             }
@@ -1370,6 +1493,7 @@ impl ConsultRegistry {
                 entity_type,
                 definition: definition.unwrap_or_default(),
                 params: Vec::new(),
+                positions: Vec::new(),
                 namespace,
             })),
         }
@@ -1445,6 +1569,7 @@ impl ConsultRegistry {
                             entity_type,
                             definition: definition.unwrap_or_default(),
                             params: Vec::new(),
+                            positions: Vec::new(),
                             namespace,
                         },
                     )

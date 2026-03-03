@@ -73,12 +73,19 @@ pub fn serve_connection(
                     }
                 }
             }
-            ClientMessage::Control(ControlOp::Reset) => match relay.handle_reset() {
-                Ok(()) => ServerMessage::Control(ControlResult::Ok),
-                Err(e) => ServerMessage::Control(ControlResult::Error {
-                    message: e.to_string(),
-                }),
-            },
+            ClientMessage::Control(ControlOp::Reset) => {
+                delightql_core::session_cwd::set(None);
+                match relay.handle_reset() {
+                    Ok(()) => ServerMessage::Control(ControlResult::Ok),
+                    Err(e) => ServerMessage::Control(ControlResult::Error {
+                        message: e.to_string(),
+                    }),
+                }
+            }
+            ClientMessage::Control(ControlOp::Cwd(path)) => {
+                delightql_core::session_cwd::set(Some(path));
+                ServerMessage::Control(ControlResult::Ok)
+            }
             ClientMessage::Control(ControlOp::Shutdown) => {
                 shutdown.store(true, Ordering::Relaxed);
                 ServerMessage::Control(ControlResult::Ok)

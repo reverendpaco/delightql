@@ -40,8 +40,10 @@ module.exports = grammar({
     [$.frame_bound, $.exists_marker],
     // (removed: view_definition conflicts - definitions belong in grammar_rules)
     // STAR-AS-SCOPE-ASSIGNER: bare * in CTE head vs qualify_operator in body
-    [$.cte_definition, $.qualify_operator],
+    // tvf_argument added: * in HO call parens (e.g., schema(*)(*)  for PureGround enumeration)
+    [$.cte_definition, $.qualify_operator, $.tvf_argument],
     [$.glob, $.qualify_operator],
+    [$.qualify_operator, $.tvf_argument],
     // (removed: glob_spec vs qualify_operator - no longer overlap after functor paren uniformity)
     // (removed: function_definition conflicts - definitions belong in grammar_rules)
     // Namespace paths: identifier could be lvar or start of namespace_path
@@ -1604,7 +1606,10 @@ module.exports = grammar({
       $.number_literal,          // Numeric arguments (e.g., HO view: above_balance(1000)(*))
       $.table_access,            // Functor args: users(*), ns.table(*)
       $.identifier,              // Scalar args: bare name, literal value
-      $.qualified_column         // Support table.column references
+      $.qualified_column,        // Support table.column references
+      $.value_placeholder,       // @ placeholder: marks where piped relation goes
+      $.placeholder,             // _ underscore: skip this position (PatternResolver SKIP)
+      '*',                       // Glob: enumerate all clauses (PureGround only)
     ),
 
     // HO argument list: supports & (parameter group separator) and ; (row separator)

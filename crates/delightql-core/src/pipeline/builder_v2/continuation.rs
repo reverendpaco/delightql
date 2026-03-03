@@ -252,7 +252,7 @@ fn apply_comma(
                     "table_access" => parse_table_access(base_node, features)?,
                     "catalog_functor" => parse_catalog_functor(base_node, features)?,
                     "anonymous_table" => {
-                        RelationalExpression::Relation(parse_anonymous_table(base_node)?)
+                        RelationalExpression::Relation(parse_anonymous_table(base_node, features)?)
                     }
                     "tvf_call" => {
                         RelationalExpression::Relation(parse_tvf_call(base_node, features)?)
@@ -393,7 +393,7 @@ fn apply_comma_to_node(
         }
         "anonymous_table" => {
             // Join with anonymous table
-            let table = RelationalExpression::Relation(parse_anonymous_table(node)?);
+            let table = RelationalExpression::Relation(parse_anonymous_table(node, features)?);
             Ok(RelationalExpression::join_builder(cpr, table).build())
         }
         "tvf_call" => {
@@ -507,7 +507,7 @@ fn parse_right_side(
             let base_expr = match base.kind() {
                 "table_access" => parse_table_access(base, features)?,
                 "catalog_functor" => parse_catalog_functor(base, features)?,
-                "anonymous_table" => RelationalExpression::Relation(parse_anonymous_table(base)?),
+                "anonymous_table" => RelationalExpression::Relation(parse_anonymous_table(base, features)?),
                 "tvf_call" => RelationalExpression::Relation(parse_tvf_call(base, features)?),
                 "relational_expression" => parse_expression(base, features)?,
                 _ => {
@@ -536,7 +536,7 @@ fn parse_right_side(
             let base = match child.kind() {
                 "table_access" => parse_table_access(child, features)?,
                 "catalog_functor" => parse_catalog_functor(child, features)?,
-                "anonymous_table" => RelationalExpression::Relation(parse_anonymous_table(child)?),
+                "anonymous_table" => RelationalExpression::Relation(parse_anonymous_table(child, features)?),
                 "tvf_call" => RelationalExpression::Relation(parse_tvf_call(child, features)?),
                 "relational_expression" => parse_expression(child, features)?,
                 _ => {
@@ -604,7 +604,7 @@ fn parse_base_as_relation(node: CstNode, features: &mut FeatureCollector) -> Res
         }
         "anonymous_table" => {
             features.mark(QueryFeature::AnonymousTables);
-            parse_anonymous_table(child)
+            parse_anonymous_table(child, features)
         }
         _ => Err(DelightQLError::parse_error(format!(
             "ER-join operand must be a table, got: {}",
@@ -693,7 +693,7 @@ fn extract_assertion_from_annotation(
                 "catalog_functor" => parse_catalog_functor(child, features)?,
                 "anonymous_table" => {
                     features.mark(QueryFeature::AnonymousTables);
-                    RelationalExpression::Relation(parse_anonymous_table(child)?)
+                    RelationalExpression::Relation(parse_anonymous_table(child, features)?)
                 }
                 other => {
                     return Err(DelightQLError::parse_error(format!(

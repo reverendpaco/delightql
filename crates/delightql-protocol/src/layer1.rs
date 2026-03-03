@@ -79,6 +79,9 @@ pub fn decode_cell_for_hash(bytes: &[u8]) -> Vec<u8> {
 pub enum ControlOp {
     Reset,
     Shutdown,
+    /// Set per-session base path for relative file resolution (mount!, consult!, etc.).
+    /// Cleared by Reset. Only meaningful over socket transport (pack-man → dql server).
+    Cwd(String),
 }
 
 /// Result of a control operation.
@@ -187,6 +190,15 @@ mod tests {
     #[test]
     fn control_reset_round_trip() {
         let msg = ClientMessage::Control(ControlOp::Reset);
+        let framed = crate::manifest::frame_client_message(&msg).unwrap();
+        let (payload, _) = crate::manifest::read_frame(&framed).unwrap().unwrap();
+        let decoded = crate::manifest::decode_client_message(payload).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn control_cwd_round_trip() {
+        let msg = ClientMessage::Control(ControlOp::Cwd("/tmp/dql-isolate-abc123".into()));
         let framed = crate::manifest::frame_client_message(&msg).unwrap();
         let (payload, _) = crate::manifest::read_frame(&framed).unwrap().unwrap();
         let decoded = crate::manifest::decode_client_message(payload).unwrap();

@@ -38,13 +38,25 @@ module.exports = grammar(dqlGrammar, {
     [$.ho_view_definition, $.sigma_definition, $.lvar],
     [$.ho_view_definition, $.sigma_definition, $.column_header_item],
 
-    // ho_param bare identifier vs sigma params vs lvar
+    // ho_param bare identifier vs sigma params vs lvar vs view_head_item
     [$.ho_param, $.lvar, $.sigma_definition],
     [$.ho_param, $.lvar],
     [$.ho_param, $.sigma_definition],
     [$.ho_param, $.lvar, $.column_header_item],
     [$.ho_param, $.lvar, $.sigma_definition, $.column_header_item],
     [$.column_header_item, $.sigma_definition],
+    // view_head_item identifier conflicts with lvar, ho_param, sigma, column_header_item
+    [$.view_head_item, $.lvar, $.sigma_definition],
+    [$.view_head_item, $.lvar],
+    [$.view_head_item, $.sigma_definition],
+    [$.view_head_item, $.lvar, $.column_header_item],
+    [$.view_head_item, $.lvar, $.sigma_definition, $.column_header_item],
+    [$.view_head_item, $.ho_param, $.lvar, $.sigma_definition],
+    [$.view_head_item, $.ho_param, $.lvar],
+    [$.view_head_item, $.ho_param, $.sigma_definition],
+    [$.view_head_item, $.ho_param, $.lvar, $.column_header_item],
+    [$.view_head_item, $.ho_param, $.lvar, $.sigma_definition, $.column_header_item],
+    [$.view_head_item, $.column_header_item, $.sigma_definition],
 
     // View: name(*) conflicts with table_access and glob_spec
     [$.view_definition, $.table_access],
@@ -52,6 +64,38 @@ module.exports = grammar(dqlGrammar, {
     [$.fact_definition, $.view_definition, $.table_access],
     [$.fact_definition, $.view_definition, $.glob_spec],
     [$.view_definition, $.glob],
+
+    // Argumentative view: name(items) :- query conflicts with sigma, fact, ho_view, table_access
+    [$.argumentative_view_definition, $.sigma_definition, $.table_access],
+    [$.argumentative_view_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
+    [$.argumentative_view_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    [$.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.table_access],
+    [$.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
+    [$.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    // Argumentative view head_item identifier vs sigma/lvar/column_header_item
+    [$.argumentative_view_definition, $.ho_view_definition, $.sigma_definition, $.lvar, $.column_header_item],
+    [$.argumentative_view_definition, $.ho_view_definition, $.sigma_definition, $.lvar],
+    [$.argumentative_view_definition, $.ho_view_definition, $.sigma_definition, $.column_header_item],
+    [$.argumentative_view_definition, $.sigma_definition, $.lvar, $.column_header_item],
+    [$.argumentative_view_definition, $.sigma_definition, $.lvar],
+    [$.argumentative_view_definition, $.sigma_definition, $.column_header_item],
+    // ho_param with argumentative view
+    [$.ho_param, $.lvar, $.sigma_definition, $.argumentative_view_definition],
+    [$.ho_param, $.lvar, $.sigma_definition, $.argumentative_view_definition, $.column_header_item],
+    // Argumentative view vs view (both have query body, differ in head: (*) vs (items))
+    [$.argumentative_view_definition, $.view_definition, $.table_access],
+    [$.argumentative_view_definition, $.view_definition, $.glob_spec],
+    [$.argumentative_view_definition, $.view_definition, $.glob],
+    [$.argumentative_view_definition, $.fact_definition, $.view_definition, $.table_access],
+    [$.argumentative_view_definition, $.fact_definition, $.view_definition, $.glob_spec],
+    // Companion with argumentative view
+    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.table_access],
+    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
+    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.table_access],
+    [$.companion_definition, $.argumentative_view_definition, $.view_definition, $.table_access],
+    [$.companion_definition, $.argumentative_view_definition, $.view_definition, $.glob_spec],
+    [$.companion_definition, $.argumentative_view_definition, $.view_definition, $.glob],
 
     // Companion: name(sigil) could initially look like fact/sigma/table_access
     [$.companion_definition, $.fact_definition, $.sigma_definition, $.table_access],
@@ -67,6 +111,12 @@ module.exports = grammar(dqlGrammar, {
     [$.function_definition, $.cfe_first_param_list],
     [$.function_param, $.cfe_first_param_list],
     [$.function_param, $.cfe_definition],
+
+    // view_head_item and ho_param ground literals conflict with literal in data rows
+    [$.literal, $.ho_param, $.view_head_item],
+    [$.literal, $.ho_param],
+    [$.literal, $.view_head_item],
+    [$.ho_param, $.view_head_item],
   ]),
 
   rules: {
@@ -85,6 +135,7 @@ module.exports = grammar(dqlGrammar, {
       $.fact_definition,
       $.sigma_definition,
       $.ho_view_definition,
+      $.argumentative_view_definition,
       $.view_definition,
       $.er_rule_definition,
     ),
@@ -138,20 +189,26 @@ module.exports = grammar(dqlGrammar, {
       ),
     ),
 
-    // Higher-order view definition: name(params)(*) neck [docs] query
-    // Params can be: T(*) glob functor, T(x,y) argumentative functor, or bare n scalar
+    // Higher-order view definition: name(params)(output) neck [docs] query
+    // Params can be: T(*) glob functor, T(x,y) argumentative functor, bare n scalar, or ground literal
+    // Output can be: (*) glob or (items) argumentative with optional ground terms
     ho_view_definition: $ => seq(
       field('name', $.identifier),
       '(',
       field('ho_params', sep1($._comma, $.ho_param)),
       ')',
-      '(', '*', ')',
+      '(',
+      choice(
+        '*',
+        field('output_head', sep1($._comma, $.view_head_item)),
+      ),
+      ')',
       field('neck', $.definition_neck),
       optional(field('doc', $.annotation_body)),
       field('body', $.query),
     ),
 
-    // HO parameter declaration: T(*), T(x, y), or bare n
+    // HO parameter declaration: T(*), T(x, y), bare n, or ground literal ("x", 42)
     ho_param: $ => choice(
       // Inner glob functor: T(*)
       seq(field('param_name', $.identifier), '(', '*', ')'),
@@ -160,6 +217,28 @@ module.exports = grammar(dqlGrammar, {
           field('columns', sep1($._comma, $.identifier)), ')'),
       // Scalar parameter (or legacy bare table name): n
       field('param_name', $.identifier),
+      // Ground scalar literal: "value" or 42
+      field('ground_value', choice($.string_literal, $.number_literal)),
+    ),
+
+    // Argumentative view definition: name(items) neck [docs] query
+    // Items can be identifiers (free variables → projection) or literals (ground terms → constants)
+    // Disambiguated from sigma_definition by body type (query vs domain_expression)
+    argumentative_view_definition: $ => seq(
+      field('name', $.identifier),
+      '(',
+      field('head_items', sep1($._comma, $.view_head_item)),
+      ')',
+      field('neck', $.definition_neck),
+      optional(field('doc', $.annotation_body)),
+      field('body', $.query),
+    ),
+
+    // View head item: free variable (identifier) or ground term (literal)
+    view_head_item: $ => choice(
+      $.identifier,
+      $.string_literal,
+      $.number_literal,
     ),
 
     // Sigma predicate definition: name(params) neck [docs] domain_expression

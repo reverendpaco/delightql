@@ -6,7 +6,11 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::pipeline::ast_addressed;
-use crate::pipeline::sql_ast_v3::{QueryExpression, SelectItem, SelectStatement, TableExpression};
+use crate::pipeline::sql_ast_v3::{
+    DomainExpression as SqlDomainExpression, QueryExpression, SelectItem, SelectStatement,
+    TableExpression,
+};
+use super::QualifierScope;
 
 use super::context::TransformContext;
 use super::helpers::{alias_generator::next_alias, extract_table_alias};
@@ -90,7 +94,9 @@ pub fn transform_filter(
     // Normal case: transform the source first, then apply filter
     let source_state = transform_relational(relation, ctx)?;
 
-    // Use the filter's cpr_schema so the expression transformer has provenance info
+    // Use the filter's cpr_schema so the expression transformer has provenance info.
+    // Clone before move so we can check for hygienic columns later.
+    let cpr_schema_ref = cpr_schema.clone();
     let mut filter_schema_ctx = crate::pipeline::transformer_v3::SchemaContext::new(cpr_schema);
 
     // Handle different types of sigma conditions
@@ -139,8 +145,19 @@ pub fn transform_filter(
                         &mut filter_schema_ctx,
                     )?;
 
+                    // Strip hygienic columns ONLY for HO ground scalar filters.
+                    // Regular PositionalLiteral filters keep all columns (SELECT *).
+                    let select_items = if matches!(
+                        origin,
+                        ast_addressed::FilterOrigin::HoGroundScalar { .. }
+                    ) {
+                        build_select_items_stripping_hygienic(&cpr_schema_ref, &correlation_alias)
+                    } else {
+                        vec![SelectItem::star()]
+                    };
+
                     let builder = SelectStatement::builder()
-                        .select(SelectItem::star())
+                        .select_all(select_items)
                         .from_tables(vec![table])
                         .where_clause(where_expr);
                     Ok(QueryBuildState::Builder(builder))
@@ -1179,4 +1196,49 @@ fn extract_inner_from_table_names(query: &QueryExpression) -> Vec<String> {
         // SetOperation/Values: no FROM clause with raw table names
         QueryExpression::SetOperation { .. } | QueryExpression::Values { .. } => Vec::new(),
     }
+}
+
+/// Build SELECT items, stripping hygienic columns if any exist.
+/// When no hygienic columns are present, returns `[SELECT *]`.
+/// When hygienic columns exist (e.g., _label_0 from HO ground scalars),
+/// returns explicit column list excluding them (the WHERE can still reference
+/// them because SQL WHERE operates on FROM scope, not SELECT scope).
+fn build_select_items_stripping_hygienic(
+    cpr_schema: &ast_addressed::CprSchema,
+    qualifier: &Option<String>,
+) -> Vec<SelectItem> {
+    let cols = match cpr_schema {
+        ast_addressed::CprSchema::Resolved(cols) => cols,
+        _ => return vec![SelectItem::star()],
+    };
+
+    let has_hygienic = cols.iter().any(|col| col.needs_hygienic_alias);
+    if !has_hygienic {
+        return vec![SelectItem::star()];
+    }
+
+    cols.iter()
+        .filter(|col| !col.needs_hygienic_alias)
+        .map(|col| {
+            // Use original_name for the SQL column reference (what the inner query produces)
+            // and name() for the alias (what the user expects to see)
+            let sql_col_name = col.original_name();
+            let output_name = col.name();
+            let sql_expr = if let Some(qual) = qualifier {
+                SqlDomainExpression::Column {
+                    name: sql_col_name.to_string(),
+                    qualifier: Some(QualifierScope::structural(qual)),
+                }
+            } else {
+                SqlDomainExpression::Column {
+                    name: sql_col_name.to_string(),
+                    qualifier: None,
+                }
+            };
+            SelectItem::Expression {
+                expr: sql_expr,
+                alias: Some(output_name.to_string()),
+            }
+        })
+        .collect()
 }

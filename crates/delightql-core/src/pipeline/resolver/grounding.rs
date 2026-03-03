@@ -25,7 +25,7 @@ use crate::pipeline::asts::core::{
     CfeDefinition, ContextMode, DomainExpression, FunctionExpression, PipeExpression, Relation,
     UnaryRelationalOperator, Unresolved,
 };
-use crate::pipeline::asts::ddl::{DdlDefinition, DdlHead};
+use crate::pipeline::asts::ddl::{DdlDefinition, DdlHead, ViewHeadItem};
 use crate::resolution::registry::ConsultRegistry;
 use delightql_types::SqlIdentifier;
 use log::debug;
@@ -884,6 +884,16 @@ pub(super) fn expand_consulted_view(
         ));
     }
 
+    // Enforce argumentative head contracts by translating to glob heads with projections
+    let has_argumentative = defs
+        .iter()
+        .any(|d| matches!(d.head, DdlHead::ArgumentativeView { .. }));
+    let defs = if has_argumentative {
+        desugar_argumentative_defs(defs)?
+    } else {
+        defs
+    };
+
     if defs.len() == 1 {
         // Fast path: single clause (existing behavior)
         let ddl_def = defs.into_iter().next().unwrap();
@@ -978,6 +988,216 @@ pub(super) fn expand_multi_clause_view(
     })
 }
 
+// ============================================================================
+// Argumentative Head Contract Enforcement
+//
+// Argumentative heads declare a closed schema contract: the entity exposes
+// exactly the named columns, in order. This is semantically different from
+// glob heads, which are open (inherit schema from body, corresponding union).
+//
+// The compiler enforces the contract by translating each clause to a glob-head
+// definition with an appended projection. This is the enforcement mechanism,
+// not the semantics. The head IS the schema declaration; the projection is
+// how we apply it to the body.
+// ============================================================================
+
+/// Compute canonical column names from argumentative view head items across clauses.
+///
+/// For each position, find the free-variable name from any clause.
+/// If all clauses are ground at a position, generate synthetic name `_col{pos+1}`.
+fn compute_canonical_column_names(heads: &[&Vec<ViewHeadItem>]) -> Vec<String> {
+    if heads.is_empty() {
+        return vec![];
+    }
+    let arity = heads[0].len();
+    (0..arity)
+        .map(|pos| {
+            // Find first free variable at this position across all clauses
+            for items in heads {
+                if let Some(ViewHeadItem::Free(name)) = items.get(pos) {
+                    return name.clone();
+                }
+            }
+            // All ground at this position — synthetic name
+            format!("_col{}", pos + 1)
+        })
+        .collect()
+}
+
+/// Extract the body text from a definition's full source by finding the neck `:-`.
+///
+/// Returns the text after `:-`, trimmed.
+fn extract_body_text(full_source: &str) -> Result<&str> {
+    let neck_pos = full_source.find(":-").ok_or_else(|| {
+        DelightQLError::parse_error("Argumentative view definition missing :- neck")
+    })?;
+    Ok(full_source[neck_pos + 2..].trim())
+}
+
+/// Enforce a single argumentative clause's head contract by generating
+/// glob-head DQL with an appended projection.
+///
+/// Generates `name(*) :- body |> (projection_items)` where:
+/// - Free variables become column references (body must produce them)
+/// - Ground terms become `literal as canonical_name` (injected constants)
+fn desugar_single_clause(
+    name: &str,
+    items: &[ViewHeadItem],
+    canonical_names: &[String],
+    body_text: &str,
+) -> String {
+    let proj_items: Vec<String> = items
+        .iter()
+        .zip(canonical_names.iter())
+        .map(|(item, canon_name)| match item {
+            ViewHeadItem::Free(col_name) => {
+                if col_name == canon_name {
+                    col_name.clone()
+                } else {
+                    // Free variable name differs from canonical — use alias
+                    format!("{} as {}", col_name, canon_name)
+                }
+            }
+            ViewHeadItem::Ground(literal) => {
+                format!("{} as {}", literal, canon_name)
+            }
+        })
+        .collect();
+
+    format!(
+        "{}(*) :- {} |> ({})",
+        name,
+        body_text,
+        proj_items.join(", ")
+    )
+}
+
+/// Enforce argumentative head contracts by translating to glob-head definitions
+/// with appended projections.
+///
+/// The argumentative head declares a closed schema contract. This function
+/// validates the contract (arity agreement, name consistency across clauses)
+/// and then enforces it by generating glob-head DQL where each clause body
+/// gets `|> (projection)` appended.
+///
+/// Example: `young(first_name, age) :- users(*), age < 30` compiles as
+/// `young(*) :- users(*), age < 30 |> (first_name, age)`
+///
+/// Ground terms inject constants:
+/// `bracket("young", fn, age) :- users(*), age < 30` compiles as
+/// `bracket(*) :- users(*), age < 30 |> ("young" as status, fn, age)`
+pub(super) fn desugar_argumentative_defs(defs: Vec<DdlDefinition>) -> Result<Vec<DdlDefinition>> {
+    let view_name = defs[0].name.clone();
+
+    // Validate: no mixing glob and argumentative head forms
+    let has_glob = defs.iter().any(|d| matches!(d.head, DdlHead::View));
+    let has_argumentative = defs
+        .iter()
+        .any(|d| matches!(d.head, DdlHead::ArgumentativeView { .. }));
+
+    if has_glob && has_argumentative {
+        return Err(DelightQLError::validation_error_categorized(
+            "ddl/head/mixed_forms",
+            format!(
+                "Entity '{}': cannot mix glob (*) and argumentative head forms \
+                 across clauses. Use all glob or all argumentative.",
+                view_name
+            ),
+            "Head form mismatch",
+        ));
+    }
+
+    // Collect all argumentative head items for canonical name computation
+    let arg_heads: Vec<&Vec<ViewHeadItem>> = defs
+        .iter()
+        .filter_map(|d| match &d.head {
+            DdlHead::ArgumentativeView { items } => Some(items),
+            _ => None,
+        })
+        .collect();
+
+    if arg_heads.is_empty() {
+        // No argumentative heads — nothing to desugar
+        return Ok(defs);
+    }
+
+    // Validate: arity agreement and name agreement across clauses
+    if arg_heads.len() >= 2 {
+        let first_items = arg_heads[0];
+        for (i, items) in arg_heads.iter().enumerate().skip(1) {
+            if items.len() != first_items.len() {
+                return Err(DelightQLError::validation_error_categorized(
+                    "ddl/head/arity",
+                    format!(
+                        "Entity '{}': clause {} has {} head item(s) but clause 1 has {}. \
+                         All argumentative clauses must have the same arity.",
+                        view_name,
+                        i + 1,
+                        items.len(),
+                        first_items.len()
+                    ),
+                    "Head arity mismatch",
+                ));
+            }
+        }
+
+        let arity = first_items.len();
+        for pos in 0..arity {
+            let mut free_name: Option<&str> = None;
+            for (clause_idx, items) in arg_heads.iter().enumerate() {
+                if let ViewHeadItem::Free(name) = &items[pos] {
+                    if let Some(existing) = free_name {
+                        if existing != name.as_str() {
+                            return Err(DelightQLError::validation_error_categorized(
+                                "ddl/head/name_conflict",
+                                format!(
+                                    "Entity '{}': position {} is named '{}' in clause {} \
+                                     but '{}' in an earlier clause. \
+                                     Free variables at each position must agree.",
+                                    view_name,
+                                    pos + 1,
+                                    name,
+                                    clause_idx + 1,
+                                    existing
+                                ),
+                                "Head name conflict",
+                            ));
+                        }
+                    } else {
+                        free_name = Some(name.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    let canonical_names = compute_canonical_column_names(&arg_heads);
+
+    // Build desugared DQL text for each clause
+    let mut desugared_lines = Vec::new();
+    for def in &defs {
+        if let DdlHead::ArgumentativeView { items } = &def.head {
+            let body_text = extract_body_text(&def.full_source)?;
+            desugared_lines.push(desugar_single_clause(
+                &view_name,
+                items,
+                &canonical_names,
+                body_text,
+            ));
+        } else {
+            // Non-argumentative defs pass through (shouldn't happen after validation)
+            desugared_lines.push(def.full_source.clone());
+        }
+    }
+
+    let desugared_source = desugared_lines.join("\n");
+    debug!(
+        "Desugared argumentative view '{}': {}",
+        view_name, desugared_source
+    );
+    ddl_builder::build_ddl_file(&desugared_source)
+}
+
 /// Inline consulted functions in a Query.
 ///
 /// Returns the folded query and any collected context-aware function definitions
@@ -998,246 +1218,888 @@ pub(super) fn inline_in_query_borrowed(
 }
 
 // ============================================================================
-// Kind-aware HO parameter binding
+// Ground scalar expansion for HO views
 // ============================================================================
 
-use crate::resolution::registry::{HoParamInfo, HoParamKind};
+use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode, HoParam, HoPositionInfo};
 
-/// Result of binding call-site arguments to HO view parameters using kind metadata.
-pub(crate) use crate::pipeline::query_features::HoParamBindings;
-
-/// Bind flat call-site arguments to HO view parameters using kind metadata.
+/// Compute cross-clause unified position analysis for all HO parameter positions.
 ///
-/// For **Glob** and **Scalar** params that look like table names (not parseable as expression):
-///   arg goes into `table_params`.
-/// For **Scalar** params that parse as an expression: goes into `scalar_params`.
-/// For **Argumentative** params: consumes N args (where N = column count), synthesizes
-///   anonymous table, goes into `table_expr_params`.
-pub(super) fn bind_ho_params(
-    params: &[HoParamInfo],
-    arguments: &[String],
-) -> Result<HoParamBindings> {
-    let mut bindings = HoParamBindings {
-        table_params: HashMap::new(),
-        table_expr_params: HashMap::new(),
-        scalar_params: HashMap::new(),
-        argumentative_table_refs: Vec::new(),
-    };
+/// For each position 0..max_params across all clauses:
+/// - Determines column_kind: Glob/Argumentative/Scalar
+/// - Determines ground_mode from the Scalar/GroundScalar distribution
+/// - Collects ground_values: Vec<(ordinal, value)>
+/// - Determines column_name: from free-variable clauses (must agree)
+///
+/// This replaces `extract_ground_scalar_info()` + `validate_mixed_ground_params()`
+/// with a single, complete analysis computed at consult time.
+pub(crate) fn build_ho_position_analysis(
+    defs: &[crate::pipeline::asts::ddl::DdlDefinition],
+) -> Vec<HoPositionInfo> {
+    use crate::pipeline::asts::ddl::DdlHead;
 
-    let mut arg_idx = 0;
-    for param in params {
-        match &param.kind {
-            HoParamKind::Glob => {
-                // Glob param: bind the next arg as a table name
-                if arg_idx >= arguments.len() {
-                    return Err(DelightQLError::validation_error(
-                        format!(
-                            "Not enough arguments for HO view: expected table for glob param '{}'",
-                            param.name
-                        ),
-                        "Missing HO view argument",
-                    ));
-                }
-                bindings
-                    .table_params
-                    .insert(param.name.clone(), arguments[arg_idx].clone());
-                arg_idx += 1;
-            }
-            HoParamKind::Argumentative(columns) => {
-                let n_cols = columns.len();
-                // Check if the next argument is a bare identifier (table reference).
-                // If so, bind as a table with positional columns rather than scalar lift.
-                if arg_idx < arguments.len() && looks_like_bare_identifier(&arguments[arg_idx]) {
-                    let table_name = arguments[arg_idx].clone();
-                    let table_rel = build_argumentative_table_ref(&table_name, columns);
-                    bindings
-                        .table_expr_params
-                        .insert(param.name.clone(), table_rel);
-                    bindings.argumentative_table_refs.push((
-                        param.name.clone(),
-                        table_name,
-                        n_cols,
-                        columns.clone(),
-                    ));
-                    arg_idx += 1;
-                } else {
-                    // Scalar lift: consume N args (one per column) and synthesize anonymous table
-                    if arg_idx + n_cols > arguments.len() {
-                        return Err(DelightQLError::validation_error(
-                            format!(
-                                "Not enough arguments for HO view: expected {} values for argumentative param '{}({})', got {}",
-                                n_cols, param.name, columns.join(", "), arguments.len() - arg_idx
-                            ),
-                            "Missing HO view argument",
-                        ));
+    let heads: Vec<&Vec<HoParam>> = defs
+        .iter()
+        .filter_map(|d| match &d.head {
+            DdlHead::HoView { params, .. } => Some(params),
+            _ => None,
+        })
+        .collect();
+
+    build_ho_position_analysis_from_heads(&heads)
+}
+
+/// Build position analysis from a set of HO head param lists.
+///
+/// Accepts pre-extracted heads so callers that only have heads (not full
+/// DdlDefinitions) can use this directly — e.g., the deferred-body HO view
+/// path in system.rs where each clause's head is parsed individually.
+pub(crate) fn build_ho_position_analysis_from_heads(
+    heads: &[&Vec<HoParam>],
+) -> Vec<HoPositionInfo> {
+    use crate::pipeline::asts::ddl::HoParamKind;
+
+    if heads.is_empty() {
+        return Vec::new();
+    }
+
+    let max_params = heads.iter().map(|h| h.len()).max().unwrap_or(0);
+    let mut positions = Vec::with_capacity(max_params);
+
+    for pos in 0..max_params {
+        let mut has_glob = false;
+        let mut has_argumentative = false;
+        let mut arg_columns: Option<Vec<String>> = None;
+        let mut has_scalar = false;
+        let mut has_ground_scalar = false;
+        let mut ground_values: Vec<(usize, String)> = Vec::new();
+        let mut column_name: Option<String> = None;
+
+        for (clause_ordinal, head) in heads.iter().enumerate() {
+            if let Some(param) = head.get(pos) {
+                match &param.kind {
+                    HoParamKind::Glob => {
+                        has_glob = true;
+                        // Glob contributes canonical name (table parameter name, e.g., "T")
+                        if column_name.is_none() {
+                            column_name = Some(param.name.clone());
+                        }
                     }
-                    let values: Vec<String> = arguments[arg_idx..arg_idx + n_cols].to_vec();
-                    let anon_table = lift_scalars_to_anonymous_table(columns, &[values])?;
-                    bindings
-                        .table_expr_params
-                        .insert(param.name.clone(), anon_table);
-                    arg_idx += n_cols;
+                    HoParamKind::Argumentative(cols) => {
+                        has_argumentative = true;
+                        if arg_columns.is_none() {
+                            arg_columns = Some(cols.clone());
+                        }
+                        // Argumentative contributes canonical name (table parameter name)
+                        if column_name.is_none() {
+                            column_name = Some(param.name.clone());
+                        }
+                    }
+                    HoParamKind::Scalar => {
+                        has_scalar = true;
+                        // Free variable — contributes canonical name
+                        if column_name.is_none() {
+                            column_name = Some(param.name.clone());
+                        }
+                    }
+                    HoParamKind::GroundScalar(value) => {
+                        has_ground_scalar = true;
+                        ground_values.push((clause_ordinal, value.clone()));
+                        // GroundScalar doesn't contribute a column name because
+                        // its "name" field is the literal value, not a variable name.
+                        // The canonical name comes from Scalar clauses.
+                    }
                 }
             }
-            HoParamKind::Scalar => {
-                // Scalar param: try to parse as expression, else as table name
-                if arg_idx >= arguments.len() {
-                    return Err(DelightQLError::validation_error(
-                        format!("Not enough arguments for HO view: expected value for scalar param '{}'", param.name),
-                        "Missing HO view argument",
-                    ));
+        }
+
+        let column_kind = if has_glob {
+            HoColumnKind::TableGlob
+        } else if has_argumentative {
+            HoColumnKind::TableArgumentative(arg_columns.unwrap_or_default())
+        } else {
+            HoColumnKind::Scalar
+        };
+
+        let ground_mode = if has_glob || has_argumentative {
+            HoGroundMode::InputOnly
+        } else if has_ground_scalar && !has_scalar {
+            HoGroundMode::PureGround
+        } else if has_ground_scalar && has_scalar {
+            HoGroundMode::MixedGround
+        } else {
+            HoGroundMode::PureUnbound
+        };
+
+        positions.push(HoPositionInfo {
+            position: pos,
+            column_kind,
+            ground_mode,
+            ground_values,
+            column_name,
+        });
+    }
+
+    positions
+}
+
+/// Inject ground scalar constants as real AST columns into a clause body.
+///
+/// For each position where this clause has GroundScalar, wraps the body's
+/// main query expression with a General (embed) operator:
+///   `body |> (*, "ground_value" as column_name)`
+///
+/// Column names come from cross-clause position analysis:
+/// - MixedGround positions: canonical name from Scalar (free-variable) clauses
+/// - PureGround positions: DDL param name
+///
+/// If `output_head` is Some, also applies the argumentative output projection.
+pub(super) fn inject_scalar_columns(
+    query: ast_unresolved::Query,
+    clause_params: &[HoParam],
+    positions: &[HoPositionInfo],
+    output_head: Option<&[ViewHeadItem]>,
+) -> ast_unresolved::Query {
+    use crate::pipeline::asts::core::{ContainmentSemantic, UnaryRelationalOperator};
+
+    // Collect ground scalar injections: (column_name, literal_value)
+    let mut ground_injections: Vec<(String, String)> = Vec::new();
+    for pos_info in positions {
+        if let Some(clause_param) = clause_params.get(pos_info.position) {
+            if let crate::pipeline::asts::ddl::HoParamKind::GroundScalar(ref clause_val) =
+                clause_param.kind
+            {
+                if let Some(name) = pos_info.column_name.clone() {
+                    ground_injections.push((name, clause_val.clone()));
                 }
-                let arg = &arguments[arg_idx];
-                match crate::ddl::body_parser::parse_function_body(arg) {
-                    Ok(domain_expr) => {
-                        bindings
-                            .scalar_params
-                            .insert(param.name.clone(), domain_expr);
-                    }
-                    Err(_) => {}
-                }
-                // Also add to table_params for legacy compatibility
-                bindings
-                    .table_params
-                    .insert(param.name.clone(), arg.clone());
-                arg_idx += 1;
             }
         }
     }
 
-    Ok(bindings)
-}
-
-/// Bind &-separated argument groups to HO view parameters using kind metadata.
-///
-/// Each group maps to one parameter. Within an argumentative group,
-/// `;`-separated rows become multiple rows in the synthesized anonymous table.
-pub(super) fn bind_ho_params_from_groups(
-    params: &[HoParamInfo],
-    groups: &[crate::pipeline::asts::core::operators::HoCallGroup],
-) -> Result<HoParamBindings> {
-    let mut bindings = HoParamBindings {
-        table_params: HashMap::new(),
-        table_expr_params: HashMap::new(),
-        scalar_params: HashMap::new(),
-        argumentative_table_refs: Vec::new(),
-    };
-
-    // If no & separators were used, fall back to flat binding
-    if groups.len() == 1 && params.len() > 1 {
-        // Single group, multiple params → flat binding
-        let flat_values = groups[0].flat_values();
-        let flat_strings: Vec<String> = flat_values.into_iter().map(String::from).collect();
-        return bind_ho_params(params, &flat_strings);
+    if ground_injections.is_empty() && output_head.is_none() {
+        return query;
     }
 
-    for (param, group) in params.iter().zip(groups.iter()) {
-        match &param.kind {
-            HoParamKind::Glob => {
-                // Glob: single value that's a table name
-                if let Some(val) = group.as_single_value() {
-                    bindings
-                        .table_params
-                        .insert(param.name.clone(), val.to_string());
-                } else {
-                    return Err(DelightQLError::validation_error(
-                        format!(
-                            "Glob param '{}' requires a single table name, got {:?}",
-                            param.name, group.rows
-                        ),
-                        "Invalid glob argument",
-                    ));
+    // Build the embed expressions
+    let mut embed_exprs: Vec<ast_unresolved::DomainExpression> = Vec::new();
+
+    if output_head.is_some() {
+        // When there's an output head, inject ground constants as part of the projection
+        // First: ground scalar constants
+        for (col_name, literal_val) in &ground_injections {
+            let literal = parse_literal_value(literal_val);
+            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
+                value: literal,
+                alias: Some(col_name.clone().into()),
+            });
+        }
+        // Then: output head items
+        if let Some(items) = output_head {
+            for item in items {
+                match item {
+                    ViewHeadItem::Free(name) => {
+                        embed_exprs.push(
+                            ast_unresolved::DomainExpression::lvar_builder(name.clone()).build(),
+                        );
+                    }
+                    ViewHeadItem::Ground(literal) => {
+                        let val = parse_literal_value(literal);
+                        embed_exprs.push(ast_unresolved::DomainExpression::Literal {
+                            value: val,
+                            alias: Some("_ground".into()),
+                        });
+                    }
                 }
             }
-            HoParamKind::Argumentative(columns) => {
-                // Check if the group is a single bare identifier (table reference)
-                if let Some(val) = group.as_single_value() {
-                    if looks_like_bare_identifier(val) {
-                        let table_rel = build_argumentative_table_ref(val, columns);
+        }
+    } else {
+        // No output head (glob) — use embed: (*, "value" as name, ...)
+        embed_exprs.push(ast_unresolved::DomainExpression::glob_builder().build());
+        for (col_name, literal_val) in &ground_injections {
+            let literal = parse_literal_value(literal_val);
+            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
+                value: literal,
+                alias: Some(col_name.clone().into()),
+            });
+        }
+    }
+
+    let operator = UnaryRelationalOperator::General {
+        containment_semantic: ContainmentSemantic::Parenthesis,
+        expressions: embed_exprs,
+    };
+
+    // Wrap the main query expression with the pipe operator
+    wrap_query_with_pipe(query, operator)
+}
+
+/// Parse a literal value string (e.g., `"young"` or `42`) into a LiteralValue.
+fn parse_literal_value(s: &str) -> crate::pipeline::asts::core::LiteralValue {
+    use crate::pipeline::asts::core::LiteralValue;
+
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        // Quoted string — strip quotes
+        LiteralValue::String(s[1..s.len() - 1].to_string())
+    } else if s.parse::<f64>().is_ok() {
+        LiteralValue::Number(s.to_string())
+    } else if s == "true" || s == "false" {
+        LiteralValue::Boolean(s == "true")
+    } else if s == "null" {
+        LiteralValue::Null
+    } else {
+        // Treat as string
+        LiteralValue::String(s.to_string())
+    }
+}
+
+/// Wrap a Query's main expression with a pipe operator.
+///
+/// For `Query::Relational(expr)`: produces `Query::Relational(Pipe(expr, op))`
+/// For `Query::WithCtes { ctes, query }`: wraps the main query expression
+fn wrap_query_with_pipe(
+    query: ast_unresolved::Query,
+    operator: ast_unresolved::UnaryRelationalOperator,
+) -> ast_unresolved::Query {
+    use crate::pipeline::asts::core::PipeExpression;
+
+    match query {
+        ast_unresolved::Query::Relational(expr) => {
+            ast_unresolved::Query::Relational(ast_unresolved::RelationalExpression::Pipe(
+                Box::new(stacksafe::StackSafe::new(PipeExpression {
+                    source: expr,
+                    operator,
+                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                })),
+            ))
+        }
+        ast_unresolved::Query::WithCtes { ctes, query: main } => {
+            let wrapped_main = ast_unresolved::RelationalExpression::Pipe(Box::new(
+                stacksafe::StackSafe::new(PipeExpression {
+                    source: main,
+                    operator,
+                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                }),
+            ));
+            ast_unresolved::Query::WithCtes {
+                ctes,
+                query: wrapped_main,
+            }
+        }
+        ast_unresolved::Query::WithErContext { context, query: inner } => {
+            let wrapped_inner = wrap_query_with_pipe(*inner, operator);
+            ast_unresolved::Query::WithErContext {
+                context,
+                query: Box::new(wrapped_inner),
+            }
+        }
+        other => other, // Other query forms pass through unchanged
+    }
+}
+
+/// Split first-parens DomainSpec into table bindings and scalar DomainSpec.
+///
+/// For each position in `entity.params`:
+/// - Table param (Glob/Argumentative): extract value from first_parens, put in HoParamBindings
+/// - Scalar param (Scalar/GroundScalar): leave in the scalar DomainSpec for PatternResolver
+/// - @ (ValuePlaceholder): mark that position as pipe target
+///
+/// Returns: (table_bindings, scalar_domain_spec, pipe_target_index)
+pub(super) fn split_ho_first_parens(
+    first_parens_spec: &ast_unresolved::DomainSpec,
+    entity: &crate::resolution::registry::ConsultedEntity,
+    pipe_source: Option<&ast_unresolved::RelationalExpression>,
+    argument_groups: Option<&[crate::pipeline::asts::core::operators::HoCallGroup]>,
+) -> Result<(
+    HoParamBindings,
+    ast_unresolved::DomainSpec,
+    Option<usize>,
+)> {
+    use crate::resolution::registry::HoParamKind;
+
+    // Compute position analysis for MixedGround detection
+    let positions = if !entity.positions.is_empty() {
+        entity.positions.clone()
+    } else {
+        let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
+        build_ho_position_analysis(&defs)
+    };
+
+    let exprs = match first_parens_spec {
+        ast_unresolved::DomainSpec::Positional(exprs) => exprs,
+        ast_unresolved::DomainSpec::Glob
+        | ast_unresolved::DomainSpec::Bare => {
+            // No explicit args — but if piped, bind first table param to pipe source
+            let mut bindings = HoParamBindings::default();
+            let mut pipe_target_idx = None;
+            if pipe_source.is_some() && !entity.params.is_empty() {
+                pipe_target_idx = Some(0);
+                let first_param = &entity.params[0];
+                let cte_name = "_ho_pipe_src".to_string();
+                match &first_param.kind {
+                    HoParamKind::Argumentative(columns) => {
+                        let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
+                            .iter()
+                            .map(|c| ast_unresolved::DomainExpression::lvar_builder(c.clone()).build())
+                            .collect();
+                        let cte_rel = ast_unresolved::RelationalExpression::Relation(
+                            ast_unresolved::Relation::Ground {
+                                identifier: ast_unresolved::QualifiedName {
+                                    namespace_path: ast_unresolved::NamespacePath::empty(),
+                                    name: cte_name.into(),
+                                    grounding: None,
+                                },
+                                canonical_name: ast_unresolved::PhaseBox::phantom(),
+                                domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
+                                alias: None,
+                                outer: false,
+                                mutation_target: false,
+                                passthrough: false,
+                                cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                                hygienic_injections: Vec::new(),
+                            },
+                        );
                         bindings
                             .table_expr_params
-                            .insert(param.name.clone(), table_rel);
+                            .insert(first_param.name.clone(), cte_rel);
+                    }
+                    _ => {
+                        bindings
+                            .table_params
+                            .insert(first_param.name.clone(), cte_name);
+                    }
+                }
+            }
+            let spec = if matches!(first_parens_spec, ast_unresolved::DomainSpec::Glob) {
+                ast_unresolved::DomainSpec::Glob
+            } else {
+                ast_unresolved::DomainSpec::Bare
+            };
+            return Ok((bindings, spec, pipe_target_idx));
+        }
+        _ => {
+            return Ok((
+                HoParamBindings::default(),
+                first_parens_spec.clone(),
+                None,
+            ));
+        }
+    };
+
+    let mut bindings = HoParamBindings::default();
+    let mut scalar_exprs = Vec::new();
+    let mut pipe_target_idx = None;
+    let mut expr_idx = 0;
+    let mut group_idx = 0usize; // tracks which &-group we're in for Argumentative params
+
+    // Check if any expression is @. If piped with no @, the first table param
+    // gets the pipe source implicitly — we must skip it in the expr-matching loop.
+    let has_at = exprs
+        .iter()
+        .any(|e| matches!(e, ast_unresolved::DomainExpression::ValuePlaceholder { .. }));
+    let implicit_pipe_target = pipe_source.is_some() && !has_at;
+
+    for (param_idx, param) in entity.params.iter().enumerate() {
+        // Implicit pipe target: first table param gets pipe source, skip it
+        if implicit_pipe_target
+            && pipe_target_idx.is_none()
+            && matches!(
+                param.kind,
+                HoParamKind::Glob | HoParamKind::Argumentative(_)
+            )
+        {
+            pipe_target_idx = Some(param_idx);
+            let cte_name = "_ho_pipe_src".to_string();
+            match &param.kind {
+                HoParamKind::Argumentative(columns) => {
+                    let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
+                        .iter()
+                        .map(|c| {
+                            ast_unresolved::DomainExpression::lvar_builder(c.clone()).build()
+                        })
+                        .collect();
+                    let cte_rel = ast_unresolved::RelationalExpression::Relation(
+                        ast_unresolved::Relation::Ground {
+                            identifier: ast_unresolved::QualifiedName {
+                                namespace_path: ast_unresolved::NamespacePath::empty(),
+                                name: cte_name.into(),
+                                grounding: None,
+                            },
+                            canonical_name: ast_unresolved::PhaseBox::phantom(),
+                            domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
+                            alias: None,
+                            outer: false,
+                            mutation_target: false,
+                            passthrough: false,
+                            cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                            hygienic_injections: Vec::new(),
+                        },
+                    );
+                    bindings
+                        .table_expr_params
+                        .insert(param.name.clone(), cte_rel);
+                }
+                _ => {
+                    bindings
+                        .table_params
+                        .insert(param.name.clone(), cte_name);
+                }
+            }
+            continue; // Don't consume an expr for this param
+        }
+
+        if expr_idx >= exprs.len() {
+            break;
+        }
+
+        let expr = &exprs[expr_idx];
+
+        // Check for @ (explicit pipe target)
+        if matches!(expr, ast_unresolved::DomainExpression::ValuePlaceholder { .. }) {
+            pipe_target_idx = Some(param_idx);
+            if pipe_source.is_some() {
+                let cte_name = "_ho_pipe_src".to_string();
+                match &param.kind {
+                    HoParamKind::Argumentative(columns) => {
+                        let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
+                            .iter()
+                            .map(|c| {
+                                ast_unresolved::DomainExpression::lvar_builder(c.clone()).build()
+                            })
+                            .collect();
+                        let cte_rel = ast_unresolved::RelationalExpression::Relation(
+                            ast_unresolved::Relation::Ground {
+                                identifier: ast_unresolved::QualifiedName {
+                                    namespace_path: ast_unresolved::NamespacePath::empty(),
+                                    name: cte_name.into(),
+                                    grounding: None,
+                                },
+                                canonical_name: ast_unresolved::PhaseBox::phantom(),
+                                domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
+                                alias: None,
+                                outer: false,
+                                mutation_target: false,
+                                passthrough: false,
+                                cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                                hygienic_injections: Vec::new(),
+                            },
+                        );
+                        bindings
+                            .table_expr_params
+                            .insert(param.name.clone(), cte_rel);
+                    }
+                    _ => {
+                        bindings
+                            .table_params
+                            .insert(param.name.clone(), cte_name);
+                    }
+                }
+            }
+            expr_idx += 1;
+            continue;
+        }
+
+        match &param.kind {
+            HoParamKind::Glob => {
+                // Glob table param: extract name from expression
+                match expr {
+                    ast_unresolved::DomainExpression::Lvar { name, .. } => {
+                        bindings
+                            .table_params
+                            .insert(param.name.clone(), name.to_string());
+                    }
+                    ast_unresolved::DomainExpression::Literal {
+                        value: crate::pipeline::asts::core::LiteralValue::String(s),
+                        ..
+                    } => {
+                        bindings
+                            .table_params
+                            .insert(param.name.clone(), s.clone());
+                    }
+                    _ => {
+                        return Err(DelightQLError::validation_error(
+                            format!(
+                                "Expected table name at position {} for param '{}', got {:?}",
+                                param_idx, param.name, expr
+                            ),
+                            "Glob table parameter must be a table name or variable",
+                        ));
+                    }
+                }
+                expr_idx += 1;
+                group_idx += 1;
+            }
+            HoParamKind::Argumentative(columns) => {
+                // Argumentative table param: either a table ref (Lvar) or scalar lift
+                match expr {
+                    ast_unresolved::DomainExpression::Lvar { name, .. } => {
+                        // Table reference — bind by name, register for arity check
+                        bindings
+                            .table_params
+                            .insert(param.name.clone(), name.to_string());
                         bindings.argumentative_table_refs.push((
                             param.name.clone(),
-                            val.to_string(),
+                            name.to_string(),
                             columns.len(),
                             columns.clone(),
                         ));
-                        continue;
+                        expr_idx += 1;
+                        group_idx += 1;
+                    }
+                    _ => {
+                        // Scalar lift: consume rows of N exprs each and build anon table.
+                        // Multiple rows arise from `;` separator: pivot_by("Maths";"Music").
+                        let n_cols = columns.len();
+                        let mut all_rows = Vec::new();
+
+                        // When argument_groups are available, use the group's row count
+                        // to bound consumption. This prevents greedy consumption when
+                        // multiple table params have consecutive scalar lifts (& separator).
+                        let max_rows = argument_groups
+                            .and_then(|groups| groups.get(group_idx))
+                            .map(|g| g.rows.len());
+
+                        loop {
+                            if expr_idx >= exprs.len() {
+                                break;
+                            }
+                            // If we know the exact row count from groups, stop when reached
+                            if let Some(max) = max_rows {
+                                if all_rows.len() >= max {
+                                    break;
+                                }
+                            }
+                            // Check if the next expr is a literal (part of this row)
+                            // or an Lvar (next param / end of scalar lift)
+                            let next = &exprs[expr_idx];
+                            let is_literal = matches!(
+                                next,
+                                ast_unresolved::DomainExpression::Literal { .. }
+                            );
+                            if !is_literal && all_rows.is_empty() {
+                                // First value is not a literal — error
+                                return Err(DelightQLError::validation_error(
+                                    format!(
+                                        "Argumentative param '{}' expects literal values for scalar lift, \
+                                         got {:?}",
+                                        param.name, next
+                                    ),
+                                    "Scalar lift values must be literals",
+                                ));
+                            }
+                            if !is_literal {
+                                // Non-literal after at least one row → stop consuming
+                                break;
+                            }
+
+                            let mut row_values = Vec::with_capacity(n_cols);
+                            for col_idx in 0..n_cols {
+                                if expr_idx + col_idx >= exprs.len() {
+                                    return Err(DelightQLError::validation_error(
+                                        format!(
+                                            "Argumentative param '{}' expects {} values per row, \
+                                             but only {} remain at position {}",
+                                            param.name, n_cols, exprs.len() - expr_idx, param_idx
+                                        ),
+                                        "Not enough values for argumentative scalar lift row",
+                                    ));
+                                }
+                                let val_expr = &exprs[expr_idx + col_idx];
+                                let val_str = match val_expr {
+                                    ast_unresolved::DomainExpression::Literal {
+                                        value: crate::pipeline::asts::core::LiteralValue::String(s), ..
+                                    } => format!("\"{}\"", s),
+                                    ast_unresolved::DomainExpression::Literal {
+                                        value: crate::pipeline::asts::core::LiteralValue::Number(n), ..
+                                    } => n.clone(),
+                                    other => {
+                                        return Err(DelightQLError::validation_error(
+                                            format!(
+                                                "Unsupported expression in scalar lift for param '{}' column {}: {:?}",
+                                                param.name, col_idx, other
+                                            ),
+                                            "Scalar lift values must be literals",
+                                        ));
+                                    }
+                                };
+                                row_values.push(val_str);
+                            }
+                            expr_idx += n_cols;
+                            all_rows.push(row_values);
+                        }
+
+                        if all_rows.is_empty() {
+                            return Err(DelightQLError::validation_error(
+                                format!(
+                                    "Argumentative param '{}' got no values for scalar lift",
+                                    param.name,
+                                ),
+                                "No values for argumentative scalar lift",
+                            ));
+                        }
+
+                        let anon_table =
+                            lift_scalars_to_anonymous_table(columns, &all_rows)?;
+                        bindings
+                            .table_expr_params
+                            .insert(param.name.clone(), anon_table);
+                        group_idx += 1;
                     }
                 }
-                // Scalar lift: rows of values → synthesize anonymous table
-                let anon_table = lift_scalars_to_anonymous_table(columns, &group.rows)?;
-                bindings
-                    .table_expr_params
-                    .insert(param.name.clone(), anon_table);
             }
             HoParamKind::Scalar => {
-                // Scalar: single value → parse as expression or table name
-                if let Some(val) = group.as_single_value() {
-                    match crate::ddl::body_parser::parse_function_body(val) {
-                        Ok(domain_expr) => {
-                            bindings
-                                .scalar_params
-                                .insert(param.name.clone(), domain_expr);
-                        }
-                        Err(_) => {}
-                    }
-                    bindings
-                        .table_params
-                        .insert(param.name.clone(), val.to_string());
-                } else {
-                    return Err(DelightQLError::validation_error(
-                        format!(
-                            "Scalar param '{}' requires a single value, got {:?}",
-                            param.name, group.rows
-                        ),
-                        "Invalid scalar argument",
-                    ));
+                // Check if this position is MixedGround — needs BOTH text substitution
+                // AND PatternResolver filtering
+                let is_mixed_ground = positions.iter().any(|pi| {
+                    pi.position == param_idx
+                        && pi.ground_mode == crate::pipeline::asts::ddl::HoGroundMode::MixedGround
+                });
+
+                // Text substitution for free-variable clauses
+                bindings.scalar_params.insert(param.name.clone(), expr.clone());
+
+                if is_mixed_ground {
+                    // MixedGround: also add to scalar_exprs for PatternResolver
+                    scalar_exprs.push(expr.clone());
                 }
+                expr_idx += 1;
+            }
+            HoParamKind::GroundScalar(_) => {
+                // GroundScalar: goes to PatternResolver via scalar_exprs
+                scalar_exprs.push(expr.clone());
+                expr_idx += 1;
             }
         }
     }
 
-    Ok(bindings)
+    let scalar_spec = if scalar_exprs.is_empty() {
+        ast_unresolved::DomainSpec::Glob
+    } else {
+        ast_unresolved::DomainSpec::Positional(scalar_exprs)
+    };
+
+    Ok((bindings, scalar_spec, pipe_target_idx))
 }
 
-/// Check if a string looks like a bare identifier (e.g. a table name) rather than
-/// a literal value suitable for an argumentative HO parameter.
-///
-/// Bare identifiers match `[a-zA-Z_][a-zA-Z0-9_]*` and are NOT:
-/// - Boolean literals (`true`, `false`)
-/// - Null literal (`null`)
-/// - Quoted strings (starting with `"` or `'`)
-/// - Numbers (parseable as f64)
-fn looks_like_bare_identifier(s: &str) -> bool {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // Quoted strings are literal values, not identifiers
-    if trimmed.starts_with('"') || trimmed.starts_with('\'') {
-        return false;
-    }
-    // Numbers are literal values
-    if trimmed.parse::<f64>().is_ok() {
-        return false;
-    }
-    // Check identifier pattern
-    let mut chars = trimmed.chars();
-    let first = match chars.next() {
-        Some(c) => c,
-        None => return false,
-    };
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return false;
-    }
-    // Exclude known literals
-    !matches!(trimmed, "true" | "false" | "null")
+/// Ensure all HO position infos have column names.
+/// For Scalar (free-variable) positions, use the DDL param variable name.
+/// For PureGround (all-literal) positions, generate `_label_N`.
+pub(super) fn ensure_position_column_names(
+    positions: Vec<HoPositionInfo>,
+    defs: &[crate::pipeline::asts::ddl::DdlDefinition],
+) -> Vec<HoPositionInfo> {
+    positions
+        .into_iter()
+        .map(|mut pi| {
+            if pi.column_name.is_none() {
+                for def in defs {
+                    if let DdlHead::HoView { params, .. } = &def.head {
+                        if let Some(p) = params.get(pi.position) {
+                            if matches!(p.kind, crate::pipeline::asts::ddl::HoParamKind::Scalar) {
+                                pi.column_name = Some(p.name.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if pi.column_name.is_none() {
+                    pi.column_name = Some(format!("_label_{}", pi.position));
+                }
+            }
+            pi
+        })
+        .collect()
 }
+
+/// Extract CTE bindings from a clause query, handling WithErContext by unwrapping.
+/// Returns the CTEs and any ER context that needs to wrap the final output.
+fn extract_clause_ctes(
+    clause_query: ast_unresolved::Query,
+    function: &str,
+    all_ctes: &mut Vec<ast_unresolved::CteBinding>,
+    er_context: &mut Option<crate::pipeline::asts::core::ErContextSpec>,
+) -> Result<()> {
+    match clause_query {
+        ast_unresolved::Query::Relational(expr) => {
+            all_ctes.push(ast_unresolved::CteBinding {
+                name: function.to_string(),
+                expression: expr,
+                is_recursive: ast_unresolved::PhaseBox::phantom(),
+            });
+        }
+        ast_unresolved::Query::WithCtes {
+            ctes,
+            query: main_expr,
+        } => {
+            for cte in ctes {
+                all_ctes.push(cte);
+            }
+            all_ctes.push(ast_unresolved::CteBinding {
+                name: function.to_string(),
+                expression: main_expr,
+                is_recursive: ast_unresolved::PhaseBox::phantom(),
+            });
+        }
+        ast_unresolved::Query::WithErContext { context, query: inner } => {
+            // Capture ER context from first clause that has one
+            if er_context.is_none() {
+                *er_context = Some(context);
+            }
+            // Recursively process the inner query
+            extract_clause_ctes(*inner, function, all_ctes, er_context)?;
+        }
+        other => {
+            return Err(DelightQLError::parse_error(format!(
+                "Unsupported query form in squished HO view clause: {:?}",
+                std::mem::discriminant(&other)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build the SQUISHED relation: ALL clauses as a UNION ALL, with scalar
+/// positions injected as columns. No clause pre-filtering — PatternResolver
+/// handles filtering via WHERE constraints after resolution.
+///
+/// Returns an unresolved Query with CTEs: one per clause (named `function`),
+/// plus an optional pipe source CTE. The main query is `function(*)`.
+pub(super) fn build_squished_relation(
+    function: &str,
+    entity: &crate::resolution::registry::ConsultedEntity,
+    table_bindings: crate::pipeline::query_features::HoParamBindings,
+    pipe_source_cte: Option<(String, ast_unresolved::RelationalExpression)>,
+    data_ns: Option<&ast_unresolved::NamespacePath>,
+) -> Result<ast_unresolved::Query> {
+    let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
+
+    let positions = if !entity.positions.is_empty() {
+        entity.positions.clone()
+    } else {
+        build_ho_position_analysis(&defs)
+    };
+
+    let positions = ensure_position_column_names(positions, &defs);
+
+    let mut all_ctes = Vec::new();
+    let mut er_context: Option<crate::pipeline::asts::core::ErContextSpec> = None;
+
+    // Prepend pipe source CTE if present
+    if let Some((cte_name, source_expr)) = pipe_source_cte {
+        all_ctes.push(ast_unresolved::CteBinding {
+            expression: source_expr,
+            name: cte_name,
+            is_recursive: ast_unresolved::PhaseBox::phantom(),
+        });
+    }
+
+    if defs.len() > 1 {
+        // Multi-clause: each clause becomes a CTE
+        for def in &defs {
+            let clause_params = match &def.head {
+                DdlHead::HoView { params, .. } => params.clone(),
+                _ => Vec::new(),
+            };
+            let output_head = match &def.head {
+                DdlHead::HoView { output_head, .. } => output_head.as_deref(),
+                _ => None,
+            };
+
+            // Create per-clause bindings: for GroundScalar positions that are Scalar
+            // in this clause, bind the ground value as a scalar param.
+            let clause_bindings = table_bindings.clone();
+            for (pos, cp) in clause_params.iter().enumerate() {
+                if let crate::pipeline::asts::ddl::HoParamKind::Scalar = &cp.kind {
+                    if !clause_bindings.scalar_params.contains_key(&cp.name) {
+                        if let Some(pos_info) = positions.iter().find(|pi| pi.position == pos) {
+                            if pos_info.ground_mode == crate::pipeline::asts::ddl::HoGroundMode::MixedGround {
+                                // MixedGround: handled by caller providing scalar_params in bindings.
+                            }
+                        }
+                    }
+                }
+            }
+
+            let clause_query = {
+                let q = crate::ddl::body_parser::parse_view_body_with_bindings(
+                    &def.full_source,
+                    clause_bindings,
+                )?;
+                inject_scalar_columns(q, &clause_params, &positions, output_head)
+            };
+            let clause_query = if let Some(dns) = data_ns {
+                patch_data_ns_query(clause_query, dns)
+            } else {
+                clause_query
+            };
+
+            extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context)?;
+        }
+    } else {
+        // Single clause
+        let clause_query = {
+            let q = crate::ddl::body_parser::parse_view_body_with_bindings(
+                &entity.definition,
+                table_bindings,
+            )?;
+            if let Some(def) = defs.first() {
+                let clause_params = match &def.head {
+                    DdlHead::HoView { params, .. } => params.clone(),
+                    _ => Vec::new(),
+                };
+                let output_head = match &def.head {
+                    DdlHead::HoView { output_head, .. } => output_head.as_deref(),
+                    _ => None,
+                };
+                inject_scalar_columns(q, &clause_params, &positions, output_head)
+            } else {
+                q
+            }
+        };
+        let clause_query = if let Some(dns) = data_ns {
+            patch_data_ns_query(clause_query, dns)
+        } else {
+            clause_query
+        };
+
+        extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context)?;
+    }
+
+    // Main query: function(*) referencing the CTE
+    let main_query =
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier: ast_unresolved::QualifiedName {
+                namespace_path: ast_unresolved::NamespacePath::empty(),
+                name: function.into(),
+                grounding: None,
+            },
+            canonical_name: ast_unresolved::PhaseBox::phantom(),
+            domain_spec: ast_unresolved::DomainSpec::Glob,
+            alias: None,
+            outer: false,
+            mutation_target: false,
+            passthrough: false,
+            cpr_schema: ast_unresolved::PhaseBox::phantom(),
+            hygienic_injections: Vec::new(),
+        });
+
+    let result = ast_unresolved::Query::WithCtes {
+        ctes: all_ctes,
+        query: main_query,
+    };
+
+    // If any clause had an ER context, wrap the final query with it
+    if let Some(context) = er_context {
+        Ok(ast_unresolved::Query::WithErContext {
+            context,
+            query: Box::new(result),
+        })
+    } else {
+        Ok(result)
+    }
+}
+
+/// Result of binding call-site arguments to HO view parameters using kind metadata.
+pub(crate) use crate::pipeline::query_features::HoParamBindings;
 
 /// Create synthetic "proffer" bindings for an HO view's parameters.
 ///
@@ -1252,7 +2114,7 @@ pub(crate) fn create_proffer_bindings(
 ) -> HoParamBindings {
     use crate::pipeline::asts::ddl::{DdlHead, HoParamKind};
     match head {
-        DdlHead::HoView { params } => {
+        DdlHead::HoView { params, .. } => {
             let mut bindings = HoParamBindings::default();
             for param in params {
                 match &param.kind {
@@ -1289,6 +2151,19 @@ pub(crate) fn create_proffer_bindings(
                             .table_params
                             .insert(param.name.clone(), format!("__proffer__{}", param.name));
                     }
+                    HoParamKind::GroundScalar(value) => {
+                        // Ground scalars are constants, not parameters — use the literal value
+                        bindings.scalar_params.insert(
+                            param.name.clone(),
+                            ast_unresolved::DomainExpression::Literal {
+                                value: crate::pipeline::asts::core::LiteralValue::Null,
+                                alias: None,
+                            },
+                        );
+                        bindings
+                            .table_params
+                            .insert(param.name.clone(), value.clone());
+                    }
                 }
             }
             bindings
@@ -1323,35 +2198,6 @@ pub(crate) fn lift_scalars_to_anonymous_table(
     }
 }
 
-/// Build a `Relation::Ground` with positional columns for an argumentative param
-/// that received a table reference (bare identifier) instead of scalar values.
-///
-/// Produces e.g. `refs(k, l)` — the positional domain spec maps the param's column
-/// names to the table's columns by position. Arity is validated separately.
-fn build_argumentative_table_ref(
-    table_name: &str,
-    columns: &[String],
-) -> ast_unresolved::RelationalExpression {
-    let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
-        .iter()
-        .map(|c| ast_unresolved::DomainExpression::lvar_builder(c.clone()).build())
-        .collect();
-    ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-        identifier: ast_unresolved::QualifiedName {
-            namespace_path: ast_unresolved::NamespacePath::empty(),
-            name: table_name.to_string().into(),
-            grounding: None,
-        },
-        canonical_name: ast_unresolved::PhaseBox::phantom(),
-        domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
-        alias: None,
-        outer: false,
-        mutation_target: false,
-        passthrough: false,
-        cpr_schema: ast_unresolved::PhaseBox::phantom(),
-        hygienic_injections: Vec::new(),
-    })
-}
 
 /// Validate arity for argumentative params that received table references.
 ///
@@ -1453,6 +2299,7 @@ impl AstFold<Unresolved> for DataNsPatcher<'_> {
                 function,
                 arguments,
                 argument_groups,
+                first_parens_spec,
                 domain_spec,
                 alias,
                 mut namespace,
@@ -1466,6 +2313,7 @@ impl AstFold<Unresolved> for DataNsPatcher<'_> {
                     function,
                     arguments,
                     argument_groups,
+                    first_parens_spec,
                     domain_spec,
                     alias,
                     namespace,

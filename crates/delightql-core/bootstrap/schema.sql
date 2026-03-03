@@ -138,7 +138,9 @@ CREATE TABLE ho_param (
     entity_id INTEGER NOT NULL,
     param_name TEXT NOT NULL,
     position INTEGER NOT NULL,
-    kind TEXT NOT NULL,  -- 'glob', 'argumentative', 'scalar'
+    kind TEXT NOT NULL,  -- 'glob', 'argumentative', 'scalar', 'ground_scalar'
+    ground_mode TEXT,    -- 'pure_ground', 'mixed_ground', 'pure_unbound', 'input_only'
+    column_name TEXT,    -- canonical name from free-var clauses (NULL for table params)
     FOREIGN KEY (entity_id) REFERENCES entity(id)
 );
 
@@ -149,6 +151,15 @@ CREATE TABLE ho_param_column (
     column_name TEXT NOT NULL,
     column_position INTEGER NOT NULL,
     FOREIGN KEY (ho_param_id) REFERENCES ho_param(id)
+);
+
+-- Per-clause ground values for GroundScalar positions
+CREATE TABLE ho_param_ground_value (
+    ho_param_id     INTEGER NOT NULL,
+    clause_ordinal  INTEGER NOT NULL,
+    ground_value    TEXT NOT NULL,
+    FOREIGN KEY (ho_param_id) REFERENCES ho_param(id),
+    PRIMARY KEY (ho_param_id, clause_ordinal)
 );
 
 -- ER-context rule metadata: stores table pair and context for ER-join rules
