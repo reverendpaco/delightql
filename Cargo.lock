@@ -1277,6 +1277,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dql-test-ball-runner"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "clap 4.5.49",
+ "delightql-protocol",
+ "rusqlite",
+ "sha2",
+ "tree-sitter-c2rust",
+ "zstd",
+]
+
+[[package]]
 name = "duckdb"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

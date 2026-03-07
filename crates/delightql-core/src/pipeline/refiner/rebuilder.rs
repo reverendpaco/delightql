@@ -111,7 +111,7 @@ fn apply_filter_predicates(
         for pred in preds {
             match pred.class {
                 PredicateClass::F { .. } | PredicateClass::Fx => {
-                    result = wrap_with_filter(result, pred);
+                    result = wrap_with_filter(result, pred)?;
                 }
                 other => panic!(
                     "catch-all hit in rebuilder.rs apply_filter_predicates: {:?}",
@@ -127,13 +127,15 @@ fn apply_filter_predicates(
 fn wrap_with_filter(
     source: refined::RelationalExpression,
     pred: AnalyzedPredicate,
-) -> refined::RelationalExpression {
-    refined::RelationalExpression::Filter {
+) -> Result<refined::RelationalExpression> {
+    Ok(refined::RelationalExpression::Filter {
         source: Box::new(source.clone()),
-        condition: refined::SigmaCondition::Predicate(pred.expr.clone().into()),
+        condition: refined::SigmaCondition::Predicate(
+            refine_predicate_boolean(pred.expr.clone())?,
+        ),
         origin: pred.origin,
         cpr_schema: compute_filter_schema(&source),
-    }
+    })
 }
 
 /// Rebuild a mixed segment (joins and set operations)
@@ -345,7 +347,7 @@ fn table_to_refined(
     }
 
     for filter_pred in filters_to_apply {
-        result = wrap_with_filter(result, filter_pred);
+        result = wrap_with_filter(result, filter_pred)?;
     }
 
     Ok(result)
@@ -979,6 +981,68 @@ fn create_true_literal() -> refined::BooleanExpression {
             value: LiteralValue::Number("1".to_string()),
             alias: None,
         }),
+    }
+}
+
+/// Convert a resolved boolean expression to refined, refining InnerExists/InRelational
+/// subqueries through the full refiner pipeline. Without this, InnerRelation patterns
+/// inside InnerExists stay as Indeterminate and the transformer can't handle them.
+pub(super) fn refine_predicate_boolean(
+    expr: resolved::BooleanExpression,
+) -> Result<refined::BooleanExpression> {
+    match expr {
+        resolved::BooleanExpression::InnerExists {
+            exists,
+            identifier,
+            subquery,
+            alias,
+            using_columns,
+        } => {
+            // Refine the InnerExists subquery through the full refiner pipeline
+            let refined_subquery =
+                crate::pipeline::refiner::refine_internal(*subquery, false)?;
+            Ok(refined::BooleanExpression::InnerExists {
+                exists,
+                identifier,
+                subquery: Box::new(refined_subquery),
+                alias,
+                using_columns,
+            })
+        }
+        resolved::BooleanExpression::InRelational {
+            value,
+            subquery,
+            identifier,
+            negated,
+        } => {
+            let refined_subquery =
+                crate::pipeline::refiner::refine_internal(*subquery, false)?;
+            Ok(refined::BooleanExpression::InRelational {
+                value: Box::new((*value).into()),
+                subquery: Box::new(refined_subquery),
+                identifier,
+                negated,
+            })
+        }
+        resolved::BooleanExpression::And { left, right } => {
+            Ok(refined::BooleanExpression::And {
+                left: Box::new(refine_predicate_boolean(*left)?),
+                right: Box::new(refine_predicate_boolean(*right)?),
+            })
+        }
+        resolved::BooleanExpression::Or { left, right } => {
+            Ok(refined::BooleanExpression::Or {
+                left: Box::new(refine_predicate_boolean(*left)?),
+                right: Box::new(refine_predicate_boolean(*right)?),
+            })
+        }
+        resolved::BooleanExpression::Not { expr: inner } => {
+            Ok(refined::BooleanExpression::Not {
+                expr: Box::new(refine_predicate_boolean(*inner)?),
+            })
+        }
+        // All other variants: mechanical phase conversion
+        other => Ok(other.into()),
     }
 }
 

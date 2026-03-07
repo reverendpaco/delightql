@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
 use delightql_types::SqlIdentifier;
 
@@ -9,7 +7,7 @@ use crate::pipeline::asts::core::expressions::domain::DomainExpression;
 use crate::pipeline::asts::core::metadata::{FqTable, NamespacePath, TableName};
 use crate::pipeline::asts::core::provenance::ColumnProvenance;
 use crate::pipeline::asts::core::{LiteralValue, PhaseBox, Resolved, Unresolved};
-use crate::pipeline::resolver::resolving::resolve_domain_expr_with_full_context_and_system;
+use crate::pipeline::resolver::resolving::resolve_domain_expr_via_registry;
 use crate::Result;
 
 use super::asts::{ColumnDef, CreateTableDef, DdlConstraint, DdlDefault};
@@ -176,15 +174,12 @@ fn resolve_expr(
     }
 
     let schema = EmptySchema;
-    let mut cte_context = HashMap::new();
-    resolve_domain_expr_with_full_context_and_system(
+    let mut registry = crate::resolution::EntityRegistry::new(&schema);
+    resolve_domain_expr_via_registry(
         expr,
+        &mut registry,
         available,
-        &schema,
-        &mut cte_context,
         false,
-        None,
-        None,
     )
 }
 

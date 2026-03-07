@@ -1,11 +1,12 @@
-/// CFE substitution via AstFold<Addressed>
+/// CFE substitution via AstTransform<Addressed, Addressed>
 ///
 /// Replaces ~1,760 lines of hand-written walkers (old domain.rs + relational.rs)
-/// with a single fold struct and 4 overrides. Structural recursion is handled
-/// by the generic walk_* functions in ast_fold.
+/// with a single transform struct and 4 overrides. Structural recursion is handled
+/// by the generic walk_transform_* functions in ast_transform.
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_fold::{
-    walk_curly_member, walk_domain, walk_function, walk_relation, AstFold,
+use crate::pipeline::ast_transform::{
+    walk_transform_curly_member, walk_transform_domain, walk_transform_function,
+    walk_transform_relation, AstTransform,
 };
 use crate::pipeline::asts::addressed as ast;
 use crate::pipeline::asts::core::{Addressed, SubstitutionExpr};
@@ -36,17 +37,17 @@ pub fn substitute_in_domain_expression_with_curried(
         curried_substitutions,
         regular_substitutions,
     }
-    .fold_domain(expr)
+    .transform_domain(expr)
 }
 
 // =============================================================================
-// AstFold<Addressed> implementation — 4 overrides
+// AstTransform<Addressed, Addressed> implementation — 4 overrides
 // =============================================================================
 
-impl AstFold<Addressed> for CfeSubstituter<'_> {
+impl AstTransform<Addressed, Addressed> for CfeSubstituter<'_> {
     // -- Override 1: Domain leaf interception ----------------------------------
 
-    fn fold_domain(&mut self, e: ast::DomainExpression) -> Result<ast::DomainExpression> {
+    fn transform_domain(&mut self, e: ast::DomainExpression) -> Result<ast::DomainExpression> {
         match e {
             ast::DomainExpression::Substitution(ref sub) => match sub {
                 SubstitutionExpr::Parameter { ref name, .. } => self
@@ -87,13 +88,13 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
                 }),
             },
 
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 
     // -- Override 2: Function expression interception --------------------------
 
-    fn fold_function(&mut self, f: ast::FunctionExpression) -> Result<ast::FunctionExpression> {
+    fn transform_function(&mut self, f: ast::FunctionExpression) -> Result<ast::FunctionExpression> {
         match f {
             // Regular: check if name is a curried parameter → extract_function_from_code
             ast::FunctionExpression::Regular {
@@ -115,9 +116,9 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
                     // Recursively fold the result: extract_function_from_code substitutes
                     // call_site_args but NOT call_site_condition. walk_function handles
                     // any remaining Parameter/CurriedParameter nodes in the condition.
-                    walk_function(self, extracted)
+                    walk_transform_function(self, extracted)
                 } else {
-                    walk_function(
+                    walk_transform_function(
                         self,
                         ast::FunctionExpression::Regular {
                             name,
@@ -146,9 +147,9 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
                         self.curried_substitutions,
                         self.regular_substitutions,
                     )?;
-                    walk_function(self, extracted)
+                    walk_transform_function(self, extracted)
                 } else {
-                    walk_function(
+                    walk_transform_function(
                         self,
                         ast::FunctionExpression::Curried {
                             name,
@@ -183,7 +184,7 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
                     } else {
                         name
                     };
-                walk_function(
+                walk_transform_function(
                     self,
                     ast::FunctionExpression::Window {
                         name: actual_name,
@@ -217,7 +218,7 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
                                 !arguments.is_empty()
                             }
                             ast::FunctionExpression::Lambda { .. } => false,
-                            other => panic!("catch-all hit in cfe_substitution/domain.rs fold_function (FunctionExpression has_args): {:?}", other),
+                            other => panic!("catch-all hit in cfe_substitution/domain.rs transform_function (FunctionExpression has_args): {:?}", other),
                         };
                         if has_args {
                             return Err(DelightQLError::ParseError {
@@ -231,7 +232,7 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
                         }
                     }
                 }
-                walk_function(
+                walk_transform_function(
                     self,
                     ast::FunctionExpression::HigherOrder {
                         name,
@@ -253,14 +254,14 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
             // MetadataTreeGroup: pass through without recursion into constructor
             m @ ast::FunctionExpression::MetadataTreeGroup { .. } => Ok(m),
 
-            // All other variants: structural recursion via walk_function
-            other => walk_function(self, other),
+            // All other variants: structural recursion via walk_transform_function
+            other => walk_transform_function(self, other),
         }
     }
 
     // -- Override 3: Curly member parameter substitution -----------------------
 
-    fn fold_curly_member(&mut self, m: ast::CurlyMember) -> Result<ast::CurlyMember> {
+    fn transform_curly_member(&mut self, m: ast::CurlyMember) -> Result<ast::CurlyMember> {
         match m {
             // Shorthand: if unqualified and name matches a parameter, substitute
             ast::CurlyMember::Shorthand {
@@ -341,13 +342,13 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
 
             // All other variants (Shorthand with qualifier, Comparison, KeyValue, PathLiteral):
             // structural recursion via walk_curly_member
-            other => walk_curly_member(self, other),
+            other => walk_transform_curly_member(self, other),
         }
     }
 
     // -- Override 4: Relation invariant checks --------------------------------
 
-    fn fold_relation(&mut self, r: ast::Relation) -> Result<ast::Relation> {
+    fn transform_relation(&mut self, r: ast::Relation) -> Result<ast::Relation> {
         match r {
             ast::Relation::PseudoPredicate { .. } => {
                 panic!(
@@ -355,7 +356,7 @@ impl AstFold<Addressed> for CfeSubstituter<'_> {
                      Pseudo-predicates are executed and replaced during Phase 1.X (Effect Executor)."
                 )
             }
-            other => walk_relation(self, other),
+            other => walk_transform_relation(self, other),
         }
     }
 }

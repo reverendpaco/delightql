@@ -15,8 +15,9 @@
 use crate::ddl::ddl_builder;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_fold::{
-    walk_domain, walk_inner_relation, walk_operator, walk_relation, AstFold,
+use crate::pipeline::ast_transform::{
+    walk_transform_domain, walk_transform_inner_relation, walk_transform_operator,
+    walk_transform_relation, AstTransform,
 };
 use crate::pipeline::ast_unresolved;
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
@@ -46,7 +47,7 @@ pub(super) fn inline_consulted_functions_in_operator(
     grounding: &GroundedPath,
     consult: &ConsultRegistry,
 ) -> Result<ast_unresolved::UnaryRelationalOperator> {
-    GroundedInliner { grounding, consult }.fold_operator(operator)
+    GroundedInliner { grounding, consult }.transform_operator(operator)
 }
 
 // ============================================================================
@@ -60,7 +61,7 @@ fn inline_entity_body(
     arguments: &[ast_unresolved::DomainExpression],
     alias: Option<SqlIdentifier>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
-    fold: &mut impl AstFold<Unresolved>,
+    fold: &mut impl AstTransform<Unresolved, Unresolved>,
 ) -> Result<ast_unresolved::DomainExpression> {
     let ddl_defs = ddl_builder::build_ddl_file(&entity.definition)?;
     if ddl_defs.is_empty() {
@@ -100,7 +101,7 @@ fn inline_entity_body(
         build_case_from_clauses(ddl_defs, arguments, data_ns)?
     };
 
-    let mut inlined = fold.fold_domain(substituted)?;
+    let mut inlined = fold.transform_domain(substituted)?;
     if let Some(alias_name) = alias {
         apply_alias(&mut inlined, alias_name);
     }
@@ -203,9 +204,9 @@ pub(super) fn consulted_entity_to_cfe_definition(
 // ============================================================================
 
 /// Inlines consulted functions found via borrowed (engaged) namespace lookup.
-/// Overrides fold_domain for function inlining and piped-expression chain
-/// processing, fold_operator for MapCover/EmbedMapCover conversion, and
-/// fold_pipe for conditional operator processing (skip when data_ns is None).
+/// Overrides transform_domain for function inlining and piped-expression chain
+/// processing, transform_operator for MapCover/EmbedMapCover conversion, and
+/// transform_pipe for conditional operator processing (skip when data_ns is None).
 struct BorrowedInliner<'a> {
     consult: &'a ConsultRegistry,
     data_ns: Option<&'a ast_unresolved::NamespacePath>,
@@ -219,8 +220,8 @@ struct BorrowedInliner<'a> {
     discovery_only: bool,
 }
 
-impl AstFold<Unresolved> for BorrowedInliner<'_> {
-    fn fold_domain(
+impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
+    fn transform_domain(
         &mut self,
         expr: DomainExpression<Unresolved>,
     ) -> Result<DomainExpression<Unresolved>> {
@@ -248,7 +249,7 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                     } => (name.to_string(), namespace.clone(), arguments.clone(), None),
                     _ => {
                         // Non-Regular/Curried: recurse into children
-                        return Ok(DomainExpression::Function(self.fold_function(func)?));
+                        return Ok(DomainExpression::Function(self.transform_function(func)?));
                     }
                 };
 
@@ -301,22 +302,22 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                         self.collected_ccafe_cfes.push(cfe_def);
                     }
                     // Don't inline — pass through for CFE substitution after precompilation
-                    return Ok(DomainExpression::Function(self.fold_function(func)?));
+                    return Ok(DomainExpression::Function(self.transform_function(func)?));
                 }
 
                 // Not a consulted function — recurse into children
-                Ok(DomainExpression::Function(self.fold_function(func)?))
+                Ok(DomainExpression::Function(self.transform_function(func)?))
             }
             DomainExpression::PipedExpression {
                 value,
                 transforms,
                 alias,
             } => {
-                let mut current_value = self.fold_domain(*value)?;
+                let mut current_value = self.transform_domain(*value)?;
                 let mut remaining_transforms = Vec::new();
 
                 for transform in transforms {
-                    let transform = self.fold_function(transform)?;
+                    let transform = self.transform_function(transform)?;
                     let (name, namespace, args) = match &transform {
                         FunctionExpression::Curried {
                             name,
@@ -346,7 +347,7 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                         conditioned_on: None,
                     });
 
-                    let inlined = self.fold_domain(synthetic)?;
+                    let inlined = self.transform_domain(synthetic)?;
                     let was_inlined = !matches!(
                         &inlined,
                         DomainExpression::Function(FunctionExpression::Regular { .. })
@@ -369,11 +370,11 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                     })
                 }
             }
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 
-    fn fold_operator(
+    fn transform_operator(
         &mut self,
         op: UnaryRelationalOperator<Unresolved>,
     ) -> Result<UnaryRelationalOperator<Unresolved>> {
@@ -386,7 +387,7 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
             } => {
                 let inlined_cols = columns
                     .into_iter()
-                    .map(|e| self.fold_domain(e))
+                    .map(|e| self.transform_domain(e))
                     .collect::<Result<Vec<_>>>()?;
 
                 // Check if the function is a consulted entity with empty curried args.
@@ -411,7 +412,7 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                                             alias: None,
                                             conditioned_on: None,
                                         });
-                                    let inlined = self.fold_domain(synthetic)?;
+                                    let inlined = self.transform_domain(synthetic)?;
                                     Ok((inlined, col_name, None))
                                 })
                                 .collect();
@@ -424,7 +425,7 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                     }
                 }
 
-                let inlined_func = self.fold_function(function)?;
+                let inlined_func = self.transform_function(function)?;
                 Ok(UnaryRelationalOperator::MapCover {
                     function: inlined_func,
                     columns: inlined_cols,
@@ -480,7 +481,7 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                                             alias: Some(SqlIdentifier::from(alias_str.as_str())),
                                             conditioned_on: None,
                                         });
-                                    self.fold_domain(synthetic)
+                                    self.transform_domain(synthetic)
                                 })
                                 .collect();
 
@@ -501,35 +502,35 @@ impl AstFold<Unresolved> for BorrowedInliner<'_> {
                     ast_unresolved::ColumnSelector::Explicit(exprs) => {
                         let folded = exprs
                             .into_iter()
-                            .map(|e| self.fold_domain(e))
+                            .map(|e| self.transform_domain(e))
                             .collect::<Result<Vec<_>>>()?;
                         ast_unresolved::ColumnSelector::Explicit(folded)
                     }
                     other_sel => other_sel,
                 };
                 Ok(UnaryRelationalOperator::EmbedMapCover {
-                    function: self.fold_function(function)?,
+                    function: self.transform_function(function)?,
                     selector: inlined_selector,
                     alias_template,
                     containment_semantic,
                 })
             }
-            other => walk_operator(self, other),
+            other => walk_transform_operator(self, other),
         }
     }
 
-    fn fold_pipe(&mut self, p: PipeExpression<Unresolved>) -> Result<PipeExpression<Unresolved>> {
-        let source = self.fold_relational(p.source)?;
+    fn transform_pipe(&mut self, p: PipeExpression<Unresolved>) -> Result<PipeExpression<Unresolved>> {
+        let source = self.transform_relational(p.source)?;
         let operator = if self.data_ns.is_some() {
             // With data_ns: full inlining (type=1 with namespace patching + type=3 discovery)
-            self.fold_operator(p.operator)?
+            self.transform_operator(p.operator)?
         } else {
             // Without data_ns: discovery-only mode for type=3 CCAFEs.
             // Type=1 functions in operators are handled by the per-pipe handler
             // in mod.rs which has access to grounding context for data_ns patching.
             let prev = self.discovery_only;
             self.discovery_only = true;
-            let op = self.fold_operator(p.operator)?;
+            let op = self.transform_operator(p.operator)?;
             self.discovery_only = prev;
             op
         };
@@ -553,7 +554,7 @@ pub(super) fn inline_consulted_functions_in_operator_borrowed(
         collected_ccafe_cfes: vec![],
         discovery_only: false,
     };
-    inliner.fold_operator(operator)
+    inliner.transform_operator(operator)
 }
 
 pub(crate) fn inline_in_domain_expr_borrowed(
@@ -567,7 +568,7 @@ pub(crate) fn inline_in_domain_expr_borrowed(
         collected_ccafe_cfes: vec![],
         discovery_only: false,
     };
-    inliner.fold_domain(expr)
+    inliner.transform_domain(expr)
 }
 
 // ============================================================================
@@ -579,8 +580,8 @@ struct GroundedInliner<'a> {
     consult: &'a ConsultRegistry,
 }
 
-impl AstFold<Unresolved> for GroundedInliner<'_> {
-    fn fold_domain(
+impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
+    fn transform_domain(
         &mut self,
         expr: DomainExpression<Unresolved>,
     ) -> Result<DomainExpression<Unresolved>> {
@@ -605,7 +606,7 @@ impl AstFold<Unresolved> for GroundedInliner<'_> {
                         arguments,
                         ..
                     } => (name.clone(), namespace.clone(), arguments.clone(), None),
-                    _ => return walk_domain(self, DomainExpression::Function(func)),
+                    _ => return walk_transform_domain(self, DomainExpression::Function(func)),
                 };
 
                 // Look up consulted entity — explicit namespace or grounded_ns search
@@ -628,10 +629,10 @@ impl AstFold<Unresolved> for GroundedInliner<'_> {
                     let data_ns = self.grounding.data_ns.clone();
                     inline_entity_body(&entity, &arguments, alias, Some(&data_ns), self)
                 } else {
-                    walk_domain(self, DomainExpression::Function(func))
+                    walk_transform_domain(self, DomainExpression::Function(func))
                 }
             }
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 }
@@ -743,8 +744,8 @@ struct ParamSubstituter<'a> {
     param_map: &'a HashMap<&'a str, &'a ast_unresolved::DomainExpression>,
 }
 
-impl AstFold<Unresolved> for ParamSubstituter<'_> {
-    fn fold_domain(
+impl AstTransform<Unresolved, Unresolved> for ParamSubstituter<'_> {
+    fn transform_domain(
         &mut self,
         expr: DomainExpression<Unresolved>,
     ) -> Result<DomainExpression<Unresolved>> {
@@ -764,7 +765,7 @@ impl AstFold<Unresolved> for ParamSubstituter<'_> {
                     Ok(expr)
                 }
             }
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 }
@@ -775,7 +776,7 @@ pub(crate) fn substitute_in_domain_expr(
     param_map: &HashMap<&str, &ast_unresolved::DomainExpression>,
 ) -> ast_unresolved::DomainExpression {
     ParamSubstituter { param_map }
-        .fold_domain(expr)
+        .transform_domain(expr)
         .expect("substitution is infallible")
 }
 
@@ -1213,7 +1214,7 @@ pub(super) fn inline_in_query_borrowed(
         collected_ccafe_cfes: vec![],
         discovery_only: false,
     };
-    let folded = inliner.fold_query(query)?;
+    let folded = inliner.transform_query(query)?;
     Ok((folded, inliner.collected_ccafe_cfes))
 }
 
@@ -2262,8 +2263,8 @@ struct DataNsPatcher<'a> {
     data_ns: &'a ast_unresolved::NamespacePath,
 }
 
-impl AstFold<Unresolved> for DataNsPatcher<'_> {
-    fn fold_relation(&mut self, r: Relation<Unresolved>) -> Result<Relation<Unresolved>> {
+impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
+    fn transform_relation(&mut self, r: Relation<Unresolved>) -> Result<Relation<Unresolved>> {
         match r {
             Relation::Ground {
                 mut identifier,
@@ -2320,12 +2321,12 @@ impl AstFold<Unresolved> for DataNsPatcher<'_> {
                     cpr_schema,
                 })
             }
-            // InnerRelation: delegate to fold_inner_relation for identifier patching
-            other => walk_relation(self, other),
+            // InnerRelation: delegate to transform_inner_relation for identifier patching
+            other => walk_transform_relation(self, other),
         }
     }
 
-    fn fold_inner_relation(
+    fn transform_inner_relation(
         &mut self,
         i: InnerRelationPattern<Unresolved>,
     ) -> Result<InnerRelationPattern<Unresolved>> {
@@ -2339,7 +2340,7 @@ impl AstFold<Unresolved> for DataNsPatcher<'_> {
                 }
                 Ok(InnerRelationPattern::Indeterminate {
                     identifier,
-                    subquery: Box::new(self.fold_relational(*subquery)?),
+                    subquery: Box::new(self.transform_relational(*subquery)?),
                 })
             }
             InnerRelationPattern::UncorrelatedDerivedTable {
@@ -2352,15 +2353,15 @@ impl AstFold<Unresolved> for DataNsPatcher<'_> {
                 }
                 Ok(InnerRelationPattern::UncorrelatedDerivedTable {
                     identifier,
-                    subquery: Box::new(self.fold_relational(*subquery)?),
+                    subquery: Box::new(self.transform_relational(*subquery)?),
                     is_consulted_view,
                 })
             }
-            other => walk_inner_relation(self, other),
+            other => walk_transform_inner_relation(self, other),
         }
     }
 
-    fn fold_domain(
+    fn transform_domain(
         &mut self,
         expr: DomainExpression<Unresolved>,
     ) -> Result<DomainExpression<Unresolved>> {
@@ -2373,14 +2374,14 @@ impl AstFold<Unresolved> for DataNsPatcher<'_> {
                 if identifier.namespace_path.is_empty() {
                     identifier.namespace_path = self.data_ns.clone();
                 }
-                let patched_subquery = self.fold_relational(*subquery)?;
+                let patched_subquery = self.transform_relational(*subquery)?;
                 Ok(DomainExpression::ScalarSubquery {
                     identifier,
                     subquery: Box::new(patched_subquery),
                     alias,
                 })
             }
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 }
@@ -2391,7 +2392,7 @@ pub(super) fn patch_data_ns_query(
     data_ns: &ast_unresolved::NamespacePath,
 ) -> ast_unresolved::Query {
     DataNsPatcher { data_ns }
-        .fold_query(query)
+        .transform_query(query)
         .expect("namespace patching is infallible")
 }
 
@@ -2401,6 +2402,6 @@ fn patch_data_ns_in_domain_expr(
     data_ns: &ast_unresolved::NamespacePath,
 ) -> ast_unresolved::DomainExpression {
     DataNsPatcher { data_ns }
-        .fold_domain(expr)
+        .transform_domain(expr)
         .expect("namespace patching is infallible")
 }

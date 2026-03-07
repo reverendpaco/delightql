@@ -1,0 +1,22 @@
+[package]
+name = "dql-test-ball-runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dql-test-ball-runner"
+path = "src/main.rs"
+
+[dependencies]
+delightql-protocol = { path = "../delightql-protocol" }
+clap.workspace = true
+rusqlite.workspace = true
+sha2 = "0.10"
+zstd.workspace = true
+tree-sitter.workspace = true
+
+[build-dependencies]
+cc = "1.0"

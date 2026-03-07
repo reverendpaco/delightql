@@ -1,13 +1,13 @@
 use crate::error::Result;
+use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
-use super::super::domain_expressions::resolve_expressions_with_schema;
-
-/// Resolve the TupleOrdering operator (ORDER BY)
+/// Resolve the TupleOrdering operator (ORDER BY) via fold-based dispatch
 ///
-/// This handles sorting operations that specify how to order rows.
-/// Does not change the schema - output columns are identical to input.
-pub(super) fn resolve_tuple_ordering(
+/// Same semantics as `resolve_tuple_ordering`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(super) fn resolve_tuple_ordering_via_fold(
+    fold: &mut ResolverFold,
     containment_semantic: ast_unresolved::ContainmentSemantic,
     specs: Vec<ast_unresolved::OrderingSpec>,
     available: &[ast_resolved::ColumnMetadata],
@@ -19,11 +19,11 @@ pub(super) fn resolve_tuple_ordering(
     let resolved_specs = specs
         .into_iter()
         .map(|spec| {
-            resolve_expressions_with_schema(vec![spec.column], available, None, None, None, false)
+            super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, vec![spec.column], available, false)
                 .map(|mut exprs| ast_resolved::OrderingSpec {
                     column: exprs
                         .pop()
-                        .expect("resolve_expressions_with_schema returns same count as input"),
+                        .expect("resolve_expressions_via_fold returns same count as input"),
                     direction: super::super::super::helpers::converters::convert_order_direction(
                         spec.direction,
                     ),

@@ -105,6 +105,26 @@ impl TransformContext {
         }
     }
 
+    /// Clear correlation_alias for FROM-clause subquery contexts (derived tables).
+    /// Prevents outer correlation aliases from leaking into inner pipe columns.
+    pub fn clear_correlation(&self) -> Self {
+        TransformContext {
+            correlation_alias: None,
+            alias_remappings: self.alias_remappings.clone(),
+            force_ctes: self.force_ctes,
+            cte_definitions: self.cte_definitions.clone(),
+            cfe_definitions: self.cfe_definitions.clone(),
+            generated_ctes: self.generated_ctes.clone(),
+            in_aggregate: self.in_aggregate,
+            qualifier_scope: self.qualifier_scope.clone(),
+            dialect: self.dialect,
+            bin_registry: self.bin_registry.clone(),
+            danger_gates: self.danger_gates.clone(),
+            option_map: self.option_map.clone(),
+            drill_column_mappings: self.drill_column_mappings.clone(),
+        }
+    }
+
     /// Set the aggregate mode, returning a new context
     pub fn set_aggregate(&self, in_aggregate: bool) -> Self {
         TransformContext {

@@ -54,7 +54,7 @@ pub(super) fn rebuild_setop_segment(
                     log::debug!("  Predicate class: {:?}, expr: {:?}", pred.class, pred.expr);
                     if matches!(pred.class, PredicateClass::FIC { .. }) {
                         log::debug!("  -> Found FIC predicate: {:?}", pred.expr);
-                        all_fic_predicates.push(pred.expr.into());
+                        all_fic_predicates.push(super::refine_predicate_boolean(pred.expr)?);
                     }
                 }
             }
@@ -115,7 +115,7 @@ pub(super) fn rebuild_setop_segment(
             .into_iter()
             .filter_map(|p| {
                 if matches!(p.class, PredicateClass::FIC { .. }) {
-                    Some(p.expr.into())
+                    Some(super::refine_predicate_boolean(p.expr).ok()?)
                 } else {
                     None
                 }
@@ -687,7 +687,7 @@ pub(super) fn extract_fic_correlation(
         .into_iter()
         .filter_map(|p| {
             if matches!(p.class, PredicateClass::FIC { .. }) {
-                Some(p.expr.into())
+                Some(super::refine_predicate_boolean(p.expr).ok()?)
             } else {
                 None
             }

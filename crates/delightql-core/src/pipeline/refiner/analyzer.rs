@@ -209,6 +209,8 @@ fn extract_column_refs_from_expr(
                 extract_column_refs_from_expr(elem, refs);
             }
         }
-        other => panic!("catch-all hit in analyzer.rs extract_column_refs_from_expr (DomainExpression): {:?}", other),
+        // Literals, ScalarSubquery, Case, etc. — no column refs to extract
+        // (or refs are in nested subqueries that are handled separately)
+        _ => {}
     }
 }

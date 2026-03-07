@@ -256,6 +256,20 @@ pub(super) fn flatten_expression(
             // 3. The rebuilder recognizes __PIPE__ and recursively refines the pipe_expr
             // 4. Alternative (separate pipes list) would complicate position tracking
             // This is a pragmatic choice - slightly hacky but keeps code simple
+            //
+            // SCOPE FIX: When inside a scope context (flatten_with_scope), pre-resolve
+            // ancestor scope aliases in the Pipe's AST. The rebuilder refines pipe_expr
+            // independently with refine_internal (which starts with empty scope), so
+            // ancestor aliases must be resolved before storing.
+            let pipe_as_expr = resolved::RelationalExpression::Pipe(pipe);
+            let pipe_as_expr = super::rewrite::apply_scope_aliases_to_expr(
+                pipe_as_expr,
+                &ctx.scope_aliases,
+            );
+            let schema = match &pipe_as_expr {
+                resolved::RelationalExpression::Pipe(p) => p.cpr_schema.get().clone(),
+                _ => unreachable!(),
+            };
             segment.tables.push(FlatTable {
                 identifier: QualifiedName {
                     namespace_path: NamespacePath::empty(),
@@ -268,12 +282,12 @@ pub(super) fn flatten_expression(
                 _scope_id: ctx.scope_id,
                 domain_spec: resolved::DomainSpec::Glob,
                 operation_context: OperationContext::Direct,
-                schema: pipe.cpr_schema.get().clone(),
+                schema,
                 outer: false,
                 anonymous_data: None,
                 correlation_refs: Vec::new(),
                 inner_relation_pattern: None,
-                pipe_expr: Some(Box::new(resolved::RelationalExpression::Pipe(pipe))),
+                pipe_expr: Some(Box::new(pipe_as_expr)),
                 consulted_view_query: None,
                 _table_filters: vec![],
                 tvf_data: None,

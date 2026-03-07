@@ -16,15 +16,26 @@ pub use types::{
     FlatTable, OperationContext, TvfData,
 };
 
-// Re-export public scope type
+// Re-export alias heuristic for use by correlation_analyzer
+pub(super) use rewrite::could_be_inner_alias;
 
 use crate::error::Result;
 use crate::pipeline::asts::resolved;
 use context::FlattenContext;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Main entry point - flatten a resolved expression
 pub fn flatten(expr: resolved::RelationalExpression) -> Result<FlatSegment> {
+    flatten_with_scope(expr, HashMap::new())
+}
+
+/// Flatten with inherited scope aliases from parent inner-relation depths.
+/// Each depth pushes its own aliases before recursing, so the map grows
+/// inductively: depth N knows about all ancestors 0..N-1.
+pub(super) fn flatten_with_scope(
+    expr: resolved::RelationalExpression,
+    scope_aliases: HashMap<String, String>,
+) -> Result<FlatSegment> {
     let mut segment = FlatSegment {
         tables: Vec::new(),
         predicates: Vec::new(),
@@ -36,11 +47,10 @@ pub fn flatten(expr: resolved::RelationalExpression) -> Result<FlatSegment> {
         scope_id: 0,
         tables_in_scope: HashSet::new(),
         anon_counter: 0,
+        scope_aliases,
     };
 
     expression::flatten_expression(expr, &mut segment, &mut context)?;
-
-    // Analyzer will determine segment type
 
     Ok(segment)
 }

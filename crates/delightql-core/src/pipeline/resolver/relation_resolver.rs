@@ -3,7 +3,6 @@
 //! This module handles the resolution of Relation nodes (Ground, Anonymous, TVF)
 //! and pattern application for positional patterns.
 
-use super::resolving::domain_expressions::resolve_domain_expr_with_schema;
 use super::tvf::get_tvf_schema;
 use super::type_conversion::{
     convert_domain_expression, convert_qualified_name, preserve_domain_spec,
@@ -13,6 +12,7 @@ use crate::enums::EntityType as BootstrapEntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_resolved::NamespacePath;
+use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::ast_unresolved;
 use delightql_types::SqlIdentifier;
 
@@ -178,46 +178,14 @@ pub(super) fn apply_pattern_resolver(
     }
 }
 
-#[stacksafe::stacksafe]
-pub(super) fn resolve_relation_with_registry(
-    rel: ast_unresolved::Relation,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    match &rel {
-        ast_unresolved::Relation::Ground { .. } => {
-            resolve_ground(rel, registry, outer_context, config, grounding)
-        }
-        ast_unresolved::Relation::Anonymous { .. } => {
-            resolve_anonymous(rel, registry, outer_context)
-        }
-        ast_unresolved::Relation::TVF { .. } => resolve_tvf(rel, registry, outer_context, config),
-        ast_unresolved::Relation::InnerRelation { .. } => {
-            resolve_inner_relation(rel, registry, outer_context, config, grounding)
-        }
-
-        ast_unresolved::Relation::ConsultedView { .. } => {
-            panic!(
-                "INTERNAL ERROR: ConsultedView should not appear as input to relation resolution. \
-                 ConsultedView is created by the resolver, not consumed at this point."
-            )
-        }
-        ast_unresolved::Relation::PseudoPredicate { .. } => {
-            panic!(
-                "INTERNAL ERROR: PseudoPredicate should not exist in this phase. \
-                 Pseudo-predicates are executed and replaced during Phase 1.X (Effect Executor)."
-            )
-        }
-    }
-}
+// resolve_relation_with_registry — DELETED (Step 0f). Dispatch absorbed into
+// ResolverFold::resolve_relation_impl (resolver_fold.rs).
 
 /// Resolve a Ground relation variant (named table, view, CTE, or consulted entity).
 ///
 /// This handles passthrough tables, grounded entities, namespace-qualified tables,
 /// unqualified tables, CTEs, consulted views/facts, and unknown entities.
-fn resolve_ground(
+pub(super) fn resolve_ground(
     rel: ast_unresolved::Relation,
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
@@ -1316,9 +1284,9 @@ fn resolve_ground(
 /// Resolve an Anonymous relation variant (inline table with rows/headers).
 ///
 /// Handles header resolution, row value resolution, and QUA schema conformance.
-fn resolve_anonymous(
+pub(super) fn resolve_anonymous(
     rel: ast_unresolved::Relation,
-    registry: &mut crate::resolution::EntityRegistry,
+    fold: &mut super::resolver_fold::ResolverFold,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     let ast_unresolved::Relation::Anonymous {
@@ -1358,8 +1326,14 @@ fn resolve_anonymous(
                         //                       ^^^^^^^^^^      ^^^^^^^
                         _ => {
                             // Use outer_context to resolve column references from joined tables
-                            let available = outer_context.unwrap_or(&[]);
-                            resolve_domain_expr_with_schema(val, available, None)
+                            let saved_available = std::mem::take(&mut fold.available);
+                            let saved_in_correlation = fold.in_correlation;
+                            fold.available = outer_context.unwrap_or(&[]).to_vec();
+                            fold.in_correlation = false;
+                            let result = fold.transform_domain(val);
+                            fold.available = saved_available;
+                            fold.in_correlation = saved_in_correlation;
+                            result
                         }
                     }
                 })
@@ -1548,7 +1522,7 @@ fn resolve_anonymous(
         };
 
         // 2. Lookup target table in database registry
-        let target_schema = match registry.database.lookup_table(target_name.as_str()) {
+        let target_schema = match fold.registry.database.lookup_table(target_name.as_str()) {
             Some(schema) => schema,
             None => {
                 return Err(DelightQLError::TableNotFoundError {
@@ -1697,7 +1671,7 @@ fn resolve_anonymous(
 ///
 /// Handles HO view expansion (grounded, namespace-qualified, and unqualified via engage!),
 /// as well as normal TVF resolution with schema lookup.
-fn resolve_tvf(
+pub(super) fn resolve_tvf(
     rel: ast_unresolved::Relation,
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
@@ -2027,7 +2001,7 @@ fn resolve_tvf(
 /// INNER-RELATION: table(|> pipeline) or table(, correlation |> pipeline)
 /// Resolves the subquery and keeps pattern as Indeterminate.
 /// The refiner will classify it into UDT/CDT-SJ/CDT-GJ/CDT-WJ.
-fn resolve_inner_relation(
+pub(super) fn resolve_inner_relation(
     rel: ast_unresolved::Relation,
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,

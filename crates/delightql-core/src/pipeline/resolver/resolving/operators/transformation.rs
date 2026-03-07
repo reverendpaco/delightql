@@ -1,21 +1,28 @@
 use crate::error::{DelightQLError, Result};
+use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::resolved::NamespacePath;
+use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
-use super::super::domain_expressions::{
-    resolve_expressions_with_schema, resolve_expressions_with_schema_internal,
-};
-use super::super::functions::resolve_function_with_schema;
 use super::super::helpers::{
     build_concat_chain_with_placeholders, convert_column_alias, extract_column_name_from_expr,
 };
 use super::helpers::{emit_validation_warning, expand_column_template};
 
-/// Resolve the MapCover operator
+/// Check if a column's table provenance matches a qualifier string
+fn matches_table_qualifier(col: &ast_resolved::ColumnMetadata, qualifier: &str) -> bool {
+    match &col.fq_table.name {
+        ast_resolved::TableName::Named(name) => name.as_ref() == qualifier,
+        ast_resolved::TableName::Fresh => false,
+    }
+}
+
+/// Resolve the MapCover operator via fold-based dispatch
 ///
-/// This applies a transformation function to matching columns, replacing their values.
-/// Pattern matching can select zero columns (warning but valid - no-op).
-pub(super) fn resolve_map_cover(
+/// Same semantics as `resolve_map_cover`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(super) fn resolve_map_cover_via_fold(
+    fold: &mut ResolverFold,
     function: ast_unresolved::FunctionExpression,
     columns: Vec<ast_unresolved::DomainExpression>,
     containment_semantic: ast_unresolved::ContainmentSemantic,
@@ -38,13 +45,13 @@ pub(super) fn resolve_map_cover(
                 alias,
             }
         } else {
-            // Regular function resolution
-            resolve_function_with_schema(function, available, None)?
+            // Regular function resolution — use fold's transform_function
+            fold.transform_function(function)?
         };
 
     // Resolve columns - allow zero matches for patterns (Transform is safe as no-op)
-    let resolved_columns = resolve_expressions_with_schema_internal(
-        columns, available, true, None, None, None, false,
+    let resolved_columns = super::super::domain_expressions::projection::resolve_expressions_via_fold(
+        fold, columns, available, true,
     )?;
 
     // Check if pattern matched zero columns (warning)
@@ -54,7 +61,7 @@ pub(super) fn resolve_map_cover(
 
     let resolved_condition = conditioned_on
         .map(|cond| {
-            super::super::predicates::resolve_boolean_expression(*cond, available)
+            fold.transform_boolean(*cond)
                 .map(Box::new)
         })
         .transpose()?;
@@ -74,11 +81,12 @@ pub(super) fn resolve_map_cover(
     Ok((resolved_op, available.to_vec()))
 }
 
-/// Resolve the Transform operator
+/// Resolve the Transform operator via fold-based dispatch
 ///
-/// This performs in-place transformations where each expression replaces an existing column.
-/// All aliases must match existing column names.
-pub(super) fn resolve_transform(
+/// Same semantics as `resolve_transform`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(super) fn resolve_transform_via_fold(
+    fold: &mut ResolverFold,
     transformations: Vec<(ast_unresolved::DomainExpression, String, Option<String>)>,
     conditioned_on: Option<Box<ast_unresolved::BooleanExpression>>,
     available: &[ast_resolved::ColumnMetadata],
@@ -90,10 +98,10 @@ pub(super) fn resolve_transform(
     let mut resolved_transformations = Vec::new();
     for (expr, alias, qualifier) in transformations {
         let resolved_expr =
-            resolve_expressions_with_schema(vec![expr], available, None, None, None, false)?
+            super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, vec![expr], available, false)?
                 .into_iter()
                 .next()
-                .expect("resolve_expressions_with_schema returns same count as input");
+                .expect("resolve_expressions_via_fold returns same count as input");
         resolved_transformations.push((resolved_expr, alias.clone(), qualifier));
     }
 
@@ -144,7 +152,7 @@ pub(super) fn resolve_transform(
 
     let resolved_condition = conditioned_on
         .map(|cond| {
-            super::super::predicates::resolve_boolean_expression(*cond, available)
+            fold.transform_boolean(*cond)
                 .map(Box::new)
         })
         .transpose()?;
@@ -158,11 +166,12 @@ pub(super) fn resolve_transform(
     Ok((resolved_op, available.to_vec()))
 }
 
-/// Resolve the EmbedMapCover operator
+/// Resolve the EmbedMapCover operator via fold-based dispatch
 ///
-/// This applies a transformation function to selected columns and adds new columns
-/// to the output, preserving all original columns.
-pub(super) fn resolve_embed_map_cover(
+/// Same semantics as `resolve_embed_map_cover`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(super) fn resolve_embed_map_cover_via_fold(
+    fold: &mut ResolverFold,
     function: ast_unresolved::FunctionExpression,
     selector: ast_unresolved::ColumnSelector,
     alias_template: Option<ast_unresolved::ColumnAlias>,
@@ -183,7 +192,7 @@ pub(super) fn resolve_embed_map_cover(
                 alias,
             }
         } else {
-            resolve_function_with_schema(function, available, None)?
+            fold.transform_function(function)?
         };
 
     // For EmbedMapCover, we need to:
@@ -196,7 +205,7 @@ pub(super) fn resolve_embed_map_cover(
         ast_unresolved::ColumnSelector::Explicit(exprs) => {
             // For explicit columns, keep as explicit (no pattern resolution needed)
             let resolved_exprs =
-                resolve_expressions_with_schema(exprs.clone(), available, None, None, None, false)?;
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, exprs.clone(), available, false)?;
             let column_names = resolved_exprs
                 .iter()
                 .filter_map(extract_column_name_from_expr)
@@ -345,12 +354,4 @@ pub(super) fn resolve_embed_map_cover(
     };
 
     Ok((resolved_op, output_columns))
-}
-
-/// Check if a column's table provenance matches a qualifier string
-fn matches_table_qualifier(col: &ast_resolved::ColumnMetadata, qualifier: &str) -> bool {
-    match &col.fq_table.name {
-        ast_resolved::TableName::Named(name) => name.as_ref() == qualifier,
-        ast_resolved::TableName::Fresh => false,
-    }
 }

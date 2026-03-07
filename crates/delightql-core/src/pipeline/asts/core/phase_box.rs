@@ -83,6 +83,22 @@ impl<D: PhantomAble, Phase> PhaseBox<D, Phase> {
     }
 }
 
+// Phase-change method that preserves data
+impl<T, P> PhaseBox<T, P> {
+    /// Changes the phase tag while preserving the contained data.
+    ///
+    /// For P=Q (same-phase transforms like grounding, CFE substitution), this is
+    /// an identity operation preserving data exactly like AstFold did.
+    /// For P≠Q (cross-phase transforms like the resolver), hooks override the
+    /// result anyway, so data preservation is harmless.
+    pub fn rephase<Q>(self) -> PhaseBox<T, Q> {
+        PhaseBox {
+            data: self.data,
+            _phase: PhantomData,
+        }
+    }
+}
+
 // Generic new method that delegates to the trait
 impl<T: PhaseBoxable> PhaseBox<T, T::Phase> {
     pub fn new(data: T) -> Self {
@@ -165,6 +181,14 @@ impl PhantomAble for ScopedSchema {
 impl PhantomAble for Vec<super::expressions::pipes::DestructureMapping> {
     fn phantom_data() -> Self {
         Vec::new()
+    }
+}
+
+// Implement PhantomAble for Option<BooleanExpression<Phase>> (used by SetOperation correlation)
+// A phantom correlation is always None — correlation predicates are only populated during refinement.
+impl<Phase> PhantomAble for Option<BooleanExpression<Phase>> {
+    fn phantom_data() -> Self {
+        None
     }
 }
 

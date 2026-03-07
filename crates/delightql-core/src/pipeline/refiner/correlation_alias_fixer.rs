@@ -12,522 +12,122 @@
 // before the refiner processes it.
 
 use crate::error::Result;
+use crate::pipeline::ast_transform::{self, AstTransform};
 use crate::pipeline::asts::resolved;
+use crate::pipeline::asts::resolved::Resolved;
 
 /// Apply alias inference to all correlated subqueries in the AST
 pub fn fix_correlation_aliases(
     expr: resolved::RelationalExpression,
 ) -> Result<resolved::RelationalExpression> {
     log::debug!("fix_correlation_aliases: Starting correlation alias fixing");
-    let result = fix_relational_expression(expr);
+    let mut fold = CorrelationAliasFold;
+    let result = fold
+        .transform_relational_action(expr)
+        .map(|a| a.into_inner())
+        .expect("correlation alias fixing is infallible");
     log::debug!("fix_correlation_aliases: Finished correlation alias fixing");
     Ok(result)
 }
 
-/// Fix aliases in a relational expression (recursive)
-#[stacksafe::stacksafe]
-fn fix_relational_expression(
-    expr: resolved::RelationalExpression,
-) -> resolved::RelationalExpression {
-    match expr {
-        resolved::RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema,
-        } => {
-            let fixed_source = Box::new(fix_relational_expression(*source));
-            let fixed_condition = fix_sigma_condition(condition);
-            resolved::RelationalExpression::Filter {
-                source: fixed_source,
-                condition: fixed_condition,
-                origin,
-                cpr_schema,
-            }
-        }
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            join_type,
-            cpr_schema,
-        } => {
-            let fixed_left = Box::new(fix_relational_expression(*left));
-            let fixed_right = Box::new(fix_relational_expression(*right));
-            let fixed_join_condition = join_condition.map(fix_boolean_expression);
-            resolved::RelationalExpression::Join {
-                left: fixed_left,
-                right: fixed_right,
-                join_condition: fixed_join_condition,
-                join_type,
-                cpr_schema,
-            }
-        }
-        resolved::RelationalExpression::Pipe(pipe) => {
-            let pipe = (*pipe).into_inner();
-            let fixed_source = fix_relational_expression(pipe.source);
-            let fixed_operator = fix_operator(pipe.operator);
-            resolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                resolved::PipeExpression {
-                    source: fixed_source,
-                    operator: fixed_operator,
-                    cpr_schema: pipe.cpr_schema,
-                },
-            )))
-        }
-        resolved::RelationalExpression::SetOperation {
-            operator,
-            operands,
-            correlation,
-            cpr_schema,
-        } => {
-            let fixed_operands = operands
-                .into_iter()
-                .map(fix_relational_expression)
-                .collect();
-            resolved::RelationalExpression::SetOperation {
-                operator,
-                operands: fixed_operands,
-                correlation,
-                cpr_schema,
-            }
-        }
-        // Base cases: leaf relations have no subqueries to fix — return unchanged.
-        // Explicit variants so the compiler catches new additions.
-        resolved::RelationalExpression::Relation(
-            resolved::Relation::Ground { .. }
-            | resolved::Relation::Anonymous { .. }
-            | resolved::Relation::TVF { .. }
-            | resolved::Relation::InnerRelation { .. }
-            | resolved::Relation::ConsultedView { .. }
-            | resolved::Relation::PseudoPredicate { .. },
-        ) => expr,
-        // ER chains are consumed by resolver before refiner — should not appear.
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains should be resolved before correlation alias fixing")
-        }
+// =============================================================================
+// CorrelationAliasFold — AstTransform<Resolved, Resolved>
+// =============================================================================
+//
+// A same-phase fold that applies alias inference to ScalarSubquery and
+// InnerExists nodes. The walk infrastructure handles all structural descent;
+// we only intercept the two node types that carry correlation alias payloads.
+//
+// Scope boundaries:
+// - ScalarSubquery/InnerExists: fixed then returned directly (no recursion
+//   into subquery body — separate scope).
+// - All Relation variants (InnerRelation, ConsultedView, Ground, etc.):
+//   treated as leaves — the original code did not recurse into their
+//   subqueries/bodies.
+// - InRelational subqueries ARE recursed into by the walk's default handling,
+//   matching the original behavior.
+
+struct CorrelationAliasFold;
+
+impl AstTransform<Resolved, Resolved> for CorrelationAliasFold {
+    fn transform_relation(
+        &mut self,
+        r: resolved::Relation,
+    ) -> Result<resolved::Relation> {
+        // All Relation variants are leaves for alias fixing — do not recurse
+        // into InnerRelation subqueries or ConsultedView bodies (separate scopes).
+        Ok(r)
     }
-}
 
-/// Fix aliases in a sigma condition
-fn fix_sigma_condition(condition: resolved::SigmaCondition) -> resolved::SigmaCondition {
-    match condition {
-        resolved::SigmaCondition::Predicate(pred) => {
-            resolved::SigmaCondition::Predicate(fix_boolean_expression(pred))
-        }
-        // Leaf-like sigma conditions with no subqueries to fix
-        resolved::SigmaCondition::TupleOrdinal(..) => condition,
-        resolved::SigmaCondition::Destructure {
-            json_column,
-            pattern,
-            mode,
-            destructured_schema,
-        } => resolved::SigmaCondition::Destructure {
-            json_column: Box::new(fix_domain_expression(*json_column)),
-            pattern: Box::new(fix_function_expression(*pattern)),
-            mode,
-            destructured_schema,
-        },
-        resolved::SigmaCondition::SigmaCall {
-            functor,
-            arguments,
-            exists,
-        } => resolved::SigmaCondition::SigmaCall {
-            functor,
-            arguments: arguments.into_iter().map(fix_domain_expression).collect(),
-            exists,
-        },
-    }
-}
-
-/// Fix aliases in an operator
-fn fix_operator(op: resolved::UnaryRelationalOperator) -> resolved::UnaryRelationalOperator {
-    match op {
-        resolved::UnaryRelationalOperator::General {
-            containment_semantic,
-            expressions,
-        } => resolved::UnaryRelationalOperator::General {
-            containment_semantic,
-            expressions: expressions.into_iter().map(fix_domain_expression).collect(),
-        },
-        resolved::UnaryRelationalOperator::Modulo {
-            containment_semantic,
-            spec,
-        } => {
-            let fixed_spec = match spec {
-                resolved::ModuloSpec::Columns(cols) => resolved::ModuloSpec::Columns(
-                    cols.into_iter().map(fix_domain_expression).collect(),
-                ),
-                resolved::ModuloSpec::GroupBy {
-                    reducing_by,
-                    reducing_on,
-                    arbitrary,
-                } => resolved::ModuloSpec::GroupBy {
-                    reducing_by: reducing_by.into_iter().map(fix_domain_expression).collect(),
-                    reducing_on: reducing_on.into_iter().map(fix_domain_expression).collect(),
-                    arbitrary: arbitrary.into_iter().map(fix_domain_expression).collect(),
-                },
-            };
-            resolved::UnaryRelationalOperator::Modulo {
-                containment_semantic,
-                spec: fixed_spec,
-            }
-        }
-        resolved::UnaryRelationalOperator::AggregatePipe { aggregations } => {
-            resolved::UnaryRelationalOperator::AggregatePipe {
-                aggregations: aggregations
-                    .into_iter()
-                    .map(fix_domain_expression)
-                    .collect(),
-            }
-        }
-        resolved::UnaryRelationalOperator::MapCover {
-            function,
-            columns,
-            containment_semantic,
-            conditioned_on,
-        } => resolved::UnaryRelationalOperator::MapCover {
-            function: fix_function_expression(function),
-            columns: columns.into_iter().map(fix_domain_expression).collect(),
-            containment_semantic,
-            conditioned_on: conditioned_on.map(|c| Box::new(fix_boolean_expression(*c))),
-        },
-        // Operators without domain expressions that need subquery fixing
-        resolved::UnaryRelationalOperator::TupleOrdering { .. }
-        | resolved::UnaryRelationalOperator::ProjectOut { .. }
-        | resolved::UnaryRelationalOperator::RenameCover { .. }
-        | resolved::UnaryRelationalOperator::MetaIze { .. }
-        | resolved::UnaryRelationalOperator::Witness { .. }
-        | resolved::UnaryRelationalOperator::Qualify
-        | resolved::UnaryRelationalOperator::Using { .. }
-        | resolved::UnaryRelationalOperator::UsingAll
-        | resolved::UnaryRelationalOperator::DmlTerminal { .. }
-        | resolved::UnaryRelationalOperator::InteriorDrillDown { .. }
-        | resolved::UnaryRelationalOperator::NarrowingDestructure { .. }
-        | resolved::UnaryRelationalOperator::Reposition { .. }
-        | resolved::UnaryRelationalOperator::Transform { .. }
-        | resolved::UnaryRelationalOperator::EmbedMapCover { .. }
-        | resolved::UnaryRelationalOperator::HoViewApplication { .. }
-        | resolved::UnaryRelationalOperator::DirectiveTerminal { .. } => op,
-    }
-}
-
-/// Fix aliases in a domain expression (this is where the magic happens)
-fn fix_domain_expression(expr: resolved::DomainExpression) -> resolved::DomainExpression {
-    match expr {
-        resolved::DomainExpression::ScalarSubquery {
-            identifier,
-            subquery,
-            alias,
-        } => {
-            log::debug!(
-                "fix_domain_expression: Processing ScalarSubquery for table '{}'",
-                identifier.name
-            );
-
-            // Detect HO substitution: identifier name differs from actual inner table name.
-            // When HO-substituted, qualifiers in the condition likely refer to the outer
-            // table, not the inner one, so disable the short-alias heuristic.
-            let inner_name = extract_base_relation_name(&subquery);
-            let allow_short = inner_name
-                .as_deref()
-                .map_or(true, |n| n == identifier.name.as_str());
-
-            // Extract the inferred alias from the subquery
-            let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
-
-            // Apply the inferred alias to the base relation in the subquery
-            let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
-
+    fn transform_domain(
+        &mut self,
+        expr: resolved::DomainExpression,
+    ) -> Result<resolved::DomainExpression> {
+        match expr {
             resolved::DomainExpression::ScalarSubquery {
                 identifier,
-                subquery: Box::new(fixed_subquery),
+                subquery,
                 alias,
-            }
-        }
-        resolved::DomainExpression::Function(func) => {
-            resolved::DomainExpression::Function(fix_function_expression(func))
-        }
-        resolved::DomainExpression::Predicate { expr, alias } => {
-            resolved::DomainExpression::Predicate {
-                expr: Box::new(fix_boolean_expression(*expr)),
-                alias,
-            }
-        }
-        resolved::DomainExpression::PipedExpression {
-            value,
-            transforms,
-            alias,
-        } => resolved::DomainExpression::PipedExpression {
-            value: Box::new(fix_domain_expression(*value)),
-            transforms: transforms
-                .into_iter()
-                .map(fix_function_expression)
-                .collect(),
-            alias,
-        },
-        resolved::DomainExpression::Parenthesized { inner, alias } => {
-            resolved::DomainExpression::Parenthesized {
-                inner: Box::new(fix_domain_expression(*inner)),
-                alias,
-            }
-        }
-        // Leaf domain expressions — no subqueries to fix
-        resolved::DomainExpression::Lvar { .. }
-        | resolved::DomainExpression::Literal { .. }
-        | resolved::DomainExpression::Projection(_)
-        | resolved::DomainExpression::NonUnifiyingUnderscore
-        | resolved::DomainExpression::ValuePlaceholder { .. }
-        | resolved::DomainExpression::Substitution(_)
-        | resolved::DomainExpression::ColumnOrdinal(..)
-        | resolved::DomainExpression::PivotOf { .. } => expr,
-        // Tuple: recurse into elements
-        resolved::DomainExpression::Tuple { elements, alias } => {
-            resolved::DomainExpression::Tuple {
-                elements: elements.into_iter().map(fix_domain_expression).collect(),
-                alias,
-            }
-        }
-    }
-}
+            } => {
+                log::debug!(
+                    "CorrelationAliasFold: Processing ScalarSubquery for table '{}'",
+                    identifier.name
+                );
 
-/// Fix aliases in a function expression
-fn fix_function_expression(func: resolved::FunctionExpression) -> resolved::FunctionExpression {
-    match func {
-        resolved::FunctionExpression::Regular {
-            name,
-            namespace,
-            arguments,
-            alias,
-            conditioned_on,
-        } => resolved::FunctionExpression::Regular {
-            name,
-            namespace,
-            arguments: arguments.into_iter().map(fix_domain_expression).collect(),
-            alias,
-            conditioned_on: conditioned_on.map(|c| Box::new(fix_boolean_expression(*c))),
-        },
-        resolved::FunctionExpression::Curried {
-            name,
-            namespace,
-            arguments,
-            conditioned_on,
-        } => resolved::FunctionExpression::Curried {
-            name,
-            namespace,
-            arguments: arguments.into_iter().map(fix_domain_expression).collect(),
-            conditioned_on: conditioned_on.map(|c| Box::new(fix_boolean_expression(*c))),
-        },
-        resolved::FunctionExpression::Bracket { arguments, alias } => {
-            resolved::FunctionExpression::Bracket {
-                arguments: arguments.into_iter().map(fix_domain_expression).collect(),
-                alias,
-            }
-        }
-        resolved::FunctionExpression::Infix {
-            operator,
-            left,
-            right,
-            alias,
-        } => resolved::FunctionExpression::Infix {
-            operator,
-            left: Box::new(fix_domain_expression(*left)),
-            right: Box::new(fix_domain_expression(*right)),
-            alias,
-        },
-        resolved::FunctionExpression::Lambda { body, alias } => {
-            resolved::FunctionExpression::Lambda {
-                body: Box::new(fix_domain_expression(*body)),
-                alias,
-            }
-        }
-        resolved::FunctionExpression::CaseExpression { arms, alias } => {
-            // TODO: Add case arm fixing if needed for correlated subqueries in CASE
-            resolved::FunctionExpression::CaseExpression { arms, alias }
-        }
-        resolved::FunctionExpression::Window {
-            name,
-            arguments,
-            partition_by,
-            order_by,
-            frame,
-            alias,
-        } => resolved::FunctionExpression::Window {
-            name,
-            arguments: arguments.into_iter().map(fix_domain_expression).collect(),
-            partition_by: partition_by
-                .into_iter()
-                .map(fix_domain_expression)
-                .collect(),
-            order_by,
-            frame,
-            alias,
-        },
-        resolved::FunctionExpression::StringTemplate { parts, alias } => {
-            resolved::FunctionExpression::StringTemplate {
-                parts: parts
-                    .into_iter()
-                    .map(|p| match p {
-                        resolved::StringTemplatePart::Text(_) => p,
-                        resolved::StringTemplatePart::Interpolation(inner) => {
-                            resolved::StringTemplatePart::Interpolation(Box::new(
-                                fix_domain_expression(*inner),
-                            ))
-                        }
-                    })
-                    .collect(),
-                alias,
-            }
-        }
-        resolved::FunctionExpression::HigherOrder {
-            name,
-            curried_arguments,
-            regular_arguments,
-            alias,
-            conditioned_on,
-        } => resolved::FunctionExpression::HigherOrder {
-            name,
-            curried_arguments: curried_arguments
-                .into_iter()
-                .map(fix_domain_expression)
-                .collect(),
-            regular_arguments: regular_arguments
-                .into_iter()
-                .map(fix_domain_expression)
-                .collect(),
-            alias,
-            conditioned_on: conditioned_on.map(|c| Box::new(fix_boolean_expression(*c))),
-        },
-        resolved::FunctionExpression::Curly {
-            members,
-            inner_grouping_keys,
-            cte_requirements,
-            alias,
-        } => resolved::FunctionExpression::Curly {
-            members: members
-                .into_iter()
-                .map(|m| match m {
-                    resolved::CurlyMember::KeyValue {
-                        key,
-                        nested_reduction,
-                        value,
-                    } => resolved::CurlyMember::KeyValue {
-                        key,
-                        nested_reduction,
-                        value: Box::new(fix_domain_expression(*value)),
-                    },
-                    other => other,
+                // Detect HO substitution: identifier name differs from actual inner table name.
+                // When HO-substituted, qualifiers in the condition likely refer to the outer
+                // table, not the inner one, so disable the short-alias heuristic.
+                let inner_name = extract_base_relation_name(&subquery);
+                let allow_short = inner_name
+                    .as_deref()
+                    .map_or(true, |n| n == identifier.name.as_str());
+
+                let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
+                let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
+
+                // Return directly — do NOT recurse into subquery (separate scope)
+                Ok(resolved::DomainExpression::ScalarSubquery {
+                    identifier,
+                    subquery: Box::new(fixed_subquery),
+                    alias,
                 })
-                .collect(),
-            inner_grouping_keys,
-            cte_requirements,
-            alias,
-        },
-        resolved::FunctionExpression::MetadataTreeGroup {
-            key_column,
-            key_qualifier,
-            key_schema,
-            constructor,
-            keys_only,
-            cte_requirements,
-            alias,
-        } => resolved::FunctionExpression::MetadataTreeGroup {
-            key_column,
-            key_qualifier,
-            key_schema,
-            constructor: Box::new(fix_function_expression(*constructor)),
-            keys_only,
-            cte_requirements,
-            alias,
-        },
-        // Array members are path segments, no domain expressions to fix
-        resolved::FunctionExpression::Array { .. } => func,
-        resolved::FunctionExpression::JsonPath {
-            source,
-            path,
-            alias,
-        } => resolved::FunctionExpression::JsonPath {
-            source: Box::new(fix_domain_expression(*source)),
-            path: Box::new(fix_domain_expression(*path)),
-            alias,
-        },
+            }
+            other => ast_transform::walk_transform_domain(self, other),
+        }
     }
-}
 
-/// Fix aliases in a boolean expression
-fn fix_boolean_expression(expr: resolved::BooleanExpression) -> resolved::BooleanExpression {
-    match expr {
-        resolved::BooleanExpression::Comparison {
-            operator,
-            left,
-            right,
-        } => resolved::BooleanExpression::Comparison {
-            operator,
-            left: Box::new(fix_domain_expression(*left)),
-            right: Box::new(fix_domain_expression(*right)),
-        },
-        resolved::BooleanExpression::And { left, right } => resolved::BooleanExpression::And {
-            left: Box::new(fix_boolean_expression(*left)),
-            right: Box::new(fix_boolean_expression(*right)),
-        },
-        resolved::BooleanExpression::Or { left, right } => resolved::BooleanExpression::Or {
-            left: Box::new(fix_boolean_expression(*left)),
-            right: Box::new(fix_boolean_expression(*right)),
-        },
-        resolved::BooleanExpression::Not { expr } => resolved::BooleanExpression::Not {
-            expr: Box::new(fix_boolean_expression(*expr)),
-        },
-        resolved::BooleanExpression::InnerExists {
-            exists,
-            identifier,
-            subquery,
-            alias,
-            using_columns,
-        } => {
-            // Detect HO substitution: identifier name differs from actual inner table name.
-            let inner_name = extract_base_relation_name(&subquery);
-            let allow_short = inner_name
-                .as_deref()
-                .map_or(true, |n| n == identifier.name.as_str());
-
-            let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
-            let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
-
+    fn transform_boolean(
+        &mut self,
+        expr: resolved::BooleanExpression,
+    ) -> Result<resolved::BooleanExpression> {
+        match expr {
             resolved::BooleanExpression::InnerExists {
                 exists,
                 identifier,
-                subquery: Box::new(fixed_subquery),
+                subquery,
                 alias,
                 using_columns,
+            } => {
+                // Detect HO substitution: identifier name differs from actual inner table name.
+                let inner_name = extract_base_relation_name(&subquery);
+                let allow_short = inner_name
+                    .as_deref()
+                    .map_or(true, |n| n == identifier.name.as_str());
+
+                let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
+                let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
+
+                // Return directly — do NOT recurse into subquery (separate scope)
+                Ok(resolved::BooleanExpression::InnerExists {
+                    exists,
+                    identifier,
+                    subquery: Box::new(fixed_subquery),
+                    alias,
+                    using_columns,
+                })
             }
+            other => ast_transform::walk_transform_boolean(self, other),
         }
-        // Leaf-like boolean expressions — no subqueries to fix
-        resolved::BooleanExpression::Using { .. }
-        | resolved::BooleanExpression::BooleanLiteral { .. }
-        | resolved::BooleanExpression::Sigma { .. }
-        | resolved::BooleanExpression::GlobCorrelation { .. }
-        | resolved::BooleanExpression::OrdinalGlobCorrelation { .. } => expr,
-        resolved::BooleanExpression::In {
-            value,
-            set,
-            negated,
-        } => resolved::BooleanExpression::In {
-            value: Box::new(fix_domain_expression(*value)),
-            set: set.into_iter().map(fix_domain_expression).collect(),
-            negated,
-        },
-        resolved::BooleanExpression::InRelational {
-            value,
-            subquery,
-            identifier,
-            negated,
-        } => resolved::BooleanExpression::InRelational {
-            value: Box::new(fix_domain_expression(*value)),
-            subquery: Box::new(fix_relational_expression(*subquery)),
-            identifier,
-            negated,
-        },
     }
 }
 

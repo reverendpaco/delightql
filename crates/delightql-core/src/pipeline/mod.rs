@@ -58,7 +58,7 @@ pub mod resolver; // Phase 2: AST(unresolved) → AST(resolved) // Phase 3: AST(
                   // Only transformer_v3 remains as the production implementation.
                   // pub mod transformer;   // Phase 4: AST(refined) → SQL AST (OLD - v1 - REMOVED)
                   // pub mod transformer_v2; // Phase 4: AST(refined) → SQL AST (OLD - v2 INDUCTIVE REWRITE - REMOVED)
-pub mod ast_fold; // Generic AST fold infrastructure (SKYWALKER Epoch 0)
+pub mod ast_transform; // Unified AST walk infrastructure (JEDI Epoch 0 — replaced ast_fold)
 pub mod sql_optimizer;
 pub mod transformer_v3; // Phase 4: AST(refined) → SQL AST v3 (PURE FUNCTIONAL - PRODUCTION) // Phase 4.5: SQL AST v3 → SQL AST v3 (currently identity pass)
                         // Note: generator v1 and generator_v2 referenced below no longer exist in the codebase.

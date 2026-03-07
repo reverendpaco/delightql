@@ -1,5 +1,4 @@
 use crate::pipeline::ast_resolved;
-use crate::pipeline::ast_resolved::NamespacePath;
 use crate::pipeline::ast_unresolved;
 use delightql_types::error::{DelightQLError, Result};
 use std::collections::HashMap;
@@ -56,7 +55,6 @@ use self::helpers::*;
 mod bubbling;
 use self::bubbling::*;
 pub(crate) mod resolving;
-use self::resolving::*;
 mod cte_validation;
 use self::cte_validation::*;
 mod type_conversion;
@@ -70,8 +68,9 @@ use self::schema_utils::*;
 mod join_resolver;
 use self::join_resolver::*;
 mod relation_resolver;
-use self::relation_resolver::*;
 pub(crate) mod grounding;
+mod resolver_fold;
+use resolver_fold::ResolverFold;
 
 #[derive(Debug, Clone)]
 pub struct BubbledState {
@@ -111,9 +110,9 @@ impl BubbledState {
     }
 }
 
-// Re-export ColumnInfo and DatabaseSchema from delightql-types (Phase 2)
+// Re-export DatabaseSchema from delightql-types (Phase 2)
 // Core no longer defines these - they live in the types crate to avoid circular dependencies
-pub use delightql_types::schema::{ColumnInfo, DatabaseSchema};
+pub use delightql_types::schema::DatabaseSchema;
 
 /// Result of query resolution including connection routing information
 pub struct ResolvedQueryResult {
@@ -167,15 +166,13 @@ pub fn resolve_query(
         query
     };
 
+    // All relational resolution goes through the fold (Step 0b delegation shell).
+    // The fold delegates to existing free functions; later steps absorb them.
+    let mut fold = ResolverFold::new(&mut registry, config.clone(), None, None);
+
     let resolved_query = match query {
         ast_unresolved::Query::Relational(expr) => {
-            let (resolved_expr, _) = resolve_relational_expression_with_registry(
-                expr,
-                &mut registry,
-                None,
-                config,
-                None,
-            )?;
+            let (resolved_expr, _) = fold.resolve_relational(expr)?;
             ast_resolved::Query::Relational(resolved_expr)
         }
         ast_unresolved::Query::ReplTempTable { query, table_name } => {
@@ -183,7 +180,7 @@ pub fn resolve_query(
             let inner_result = resolve_query(*query, schema, system, config)?;
             // Merge connection_ids from inner query
             if let Some(conn_id) = inner_result.connection_id {
-                registry.track_connection_id(conn_id);
+                fold.registry.track_connection_id(conn_id);
             }
             ast_resolved::Query::ReplTempTable {
                 query: Box::new(inner_result.query),
@@ -195,7 +192,7 @@ pub fn resolve_query(
             let inner_result = resolve_query(*query, schema, system, config)?;
             // Merge connection_ids from inner query
             if let Some(conn_id) = inner_result.connection_id {
-                registry.track_connection_id(conn_id);
+                fold.registry.track_connection_id(conn_id);
             }
             ast_resolved::Query::ReplTempView {
                 query: Box::new(inner_result.query),
@@ -237,18 +234,14 @@ pub fn resolve_query(
                         .into_iter()
                         .next()
                         .expect("Group has len==1, must have element - invariant");
-                    let (resolved_expr, _) = resolve_relational_expression_with_registry(
-                        cte.expression,
-                        &mut registry,
-                        None,
-                        config,
-                        None,
-                    )?;
+                    let (resolved_expr, _) = fold.resolve_relational(cte.expression)?;
                     let mut cte_schema = extract_cpr_schema(&resolved_expr)?;
                     // Transform the schema to use the CTE's name as the table name
                     cte_schema = transform_schema_table_names(cte_schema, name);
                     // Register the CTE in the EntityRegistry
-                    registry.query_local.register_cte(name.clone(), cte_schema);
+                    fold.registry
+                        .query_local
+                        .register_cte(name.clone(), cte_schema);
 
                     resolved_ctes.push(ast_resolved::CteBinding {
                         expression: resolved_expr,
@@ -262,13 +255,8 @@ pub fn resolve_query(
                     let mut all_schemas_same = true;
 
                     for (idx, cte) in group.iter().enumerate() {
-                        let (resolved_expr, _) = resolve_relational_expression_with_registry(
-                            cte.expression.clone(),
-                            &mut registry,
-                            None,
-                            config,
-                            None,
-                        )?;
+                        let (resolved_expr, _) =
+                            fold.resolve_relational(cte.expression.clone())?;
                         let expr_schema = extract_cpr_schema(&resolved_expr)?;
 
                         // CRITICAL: After first head, register the CTE so recursive heads can reference it!
@@ -276,7 +264,9 @@ pub fn resolve_query(
                         if idx == 0 {
                             let mut base_schema = expr_schema.clone();
                             base_schema = transform_schema_table_names(base_schema, name);
-                            registry.query_local.register_cte(name.clone(), base_schema);
+                            fold.registry
+                                .query_local
+                                .register_cte(name.clone(), base_schema);
                         }
 
                         // Check if schemas are the same
@@ -309,7 +299,7 @@ pub fn resolve_query(
                     let mut final_schema = final_schema;
                     final_schema = transform_schema_table_names(final_schema, name);
                     // Register the CTE in the EntityRegistry
-                    registry
+                    fold.registry
                         .query_local
                         .register_cte(name.clone(), final_schema.clone());
 
@@ -332,13 +322,7 @@ pub fn resolve_query(
             }
 
             // Now resolve the main query with all CTEs in registry
-            let (resolved_main_query, _) = resolve_relational_expression_with_registry(
-                main_query,
-                &mut registry,
-                None,
-                config,
-                None,
-            )?;
+            let (resolved_main_query, _) = fold.resolve_relational(main_query)?;
 
             ast_resolved::Query::WithCtes {
                 ctes: resolved_ctes,
@@ -357,19 +341,13 @@ pub fn resolve_query(
             // and resolve the main query
             // Register CFE definitions in the existing registry for context validation
             for cfe in &cfes {
-                registry.query_local.register_cfe(cfe.clone());
+                fold.registry.query_local.register_cfe(cfe.clone());
             }
 
             // Resolve the query with the registry that has CFE definitions
             let resolved_inner = match *query {
                 ast_unresolved::Query::Relational(expr) => {
-                    let (resolved_expr, _) = resolve_relational_expression_with_registry(
-                        expr,
-                        &mut registry,
-                        None,
-                        config,
-                        None,
-                    )?;
+                    let (resolved_expr, _) = fold.resolve_relational(expr)?;
                     Box::new(ast_resolved::Query::Relational(resolved_expr))
                 }
                 other => {
@@ -377,7 +355,7 @@ pub fn resolve_query(
                     // (though they shouldn't appear inside WithPrecompiledCfes)
                     let inner_result = resolve_query(other, schema, system, config)?;
                     if let Some(conn_id) = inner_result.connection_id {
-                        registry.track_connection_id(conn_id);
+                        fold.registry.track_connection_id(conn_id);
                     }
                     Box::new(inner_result.query)
                 }
@@ -396,14 +374,14 @@ pub fn resolve_query(
             };
             let inner_result = resolve_query(*query, schema, system, &config_with_ctx)?;
             if let Some(conn_id) = inner_result.connection_id {
-                registry.track_connection_id(conn_id);
+                fold.registry.track_connection_id(conn_id);
             }
             inner_result.query
         }
     };
 
     // Validate that all resolved tables belong to the same connection
-    let connection_id = registry.validate_single_connection()?;
+    let connection_id = fold.registry.validate_single_connection()?;
 
     Ok(ResolvedQueryResult {
         query: resolved_query,
@@ -665,8 +643,9 @@ fn extract_innermost_source(
     }
 }
 
-/// New resolution function using EntityRegistry
-#[stacksafe::stacksafe]
+/// New resolution function using EntityRegistry.
+///
+/// Thin wrapper: delegates to `ResolverFold::resolve_relational_impl`.
 fn resolve_relational_expression_with_registry(
     expr: ast_unresolved::RelationalExpression,
     registry: &mut crate::resolution::EntityRegistry,
@@ -674,1445 +653,13 @@ fn resolve_relational_expression_with_registry(
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    match expr {
-        // Handle Relations specially to use resolve_entity
-        ast_unresolved::RelationalExpression::Relation(rel) => {
-            resolve_relation_with_registry(rel, registry, outer_context, config, grounding)
-        }
-
-        // Handle Filter through registry (but check for EXISTS first)
-        ast_unresolved::RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema: _,
-        } => {
-            // Handle EXISTS filters through registry path
-            // EXISTS filters need outer context passed to subquery for correlation
-            let mut handle_exists_subquery = |subquery: ast_unresolved::RelationalExpression| -> Result<ast_resolved::RelationalExpression> {
-                // Resolve the EXISTS subquery with current context for correlation
-                let combined_context = if let Some(outer) = outer_context {
-                    // Combine outer context with current source columns
-                    let (resolved_source_temp, _source_bubbled_temp) =
-                        resolve_relational_expression_with_registry(*source.clone(), registry, outer_context, config, grounding)?;
-                    let source_schema_temp = extract_cpr_schema(&resolved_source_temp)?;
-                    let source_columns_temp = match &source_schema_temp {
-                        ast_resolved::CprSchema::Resolved(cols) => cols.clone(),
-                        other => panic!("catch-all hit in mod.rs resolve_relational_expression (EXISTS outer+source schema): {:?}", other),
-                    };
-                    let mut combined = outer.to_vec();
-                    combined.extend(source_columns_temp);
-                    Some(combined)
-                } else {
-                    // Just use source columns for context
-                    let (resolved_source_temp, _) =
-                        resolve_relational_expression_with_registry(*source.clone(), registry, None, config, grounding)?;
-                    let source_schema_temp = extract_cpr_schema(&resolved_source_temp)?;
-                    match &source_schema_temp {
-                        ast_resolved::CprSchema::Resolved(cols) => Some(cols.clone()),
-                        other => panic!("catch-all hit in mod.rs resolve_relational_expression (EXISTS source schema): {:?}", other),
-                    }
-                };
-
-                // For EXISTS subqueries, the combined context contains outer
-                // source columns. Interdependent EXISTS (e.g.,
-                // +orders(...), +order_items(...), +products(, order_items.x = products.y))
-                // reference tables from sibling EXISTS scopes. Enrich the
-                // context with columns from all EXISTS tables found in the
-                // source expression so that cross-EXISTS references validate.
-                let mut enriched_context = combined_context.unwrap_or_default();
-                collect_exists_table_columns(&*source, registry, &mut enriched_context)?;
-
-                let exists_config = ResolutionConfig {
-                    validate_in_correlation: true,
-                    ..config.clone()
-                };
-
-                let (resolved_subquery, _) = resolve_relational_expression_with_registry(
-                    subquery,
-                    registry,
-                    Some(&enriched_context),
-                    &exists_config,
-                    grounding,
-                )?;
-
-                Ok(resolved_subquery)
-            };
-
-            // Check for EXISTS in the condition and handle through registry
-            if let ast_unresolved::SigmaCondition::Predicate(pred) = &condition {
-                if let ast_unresolved::BooleanExpression::InnerExists {
-                    subquery,
-                    exists,
-                    identifier,
-                    alias,
-                    using_columns,
-                } = pred
-                {
-                    // Handle EXISTS subquery through registry with proper context
-                    let resolved_subquery = handle_exists_subquery(*subquery.clone())?;
-
-                    // Continue with normal filter processing but with resolved EXISTS
-                    let (resolved_source, source_bubbled) =
-                        resolve_relational_expression_with_registry(
-                            *source,
-                            registry,
-                            outer_context,
-                            config,
-                            grounding,
-                        )?;
-
-                    let source_schema = extract_cpr_schema(&resolved_source)?;
-                    let available_columns = match &source_schema {
-                        ast_resolved::CprSchema::Resolved(cols) => cols.clone(),
-                        other => panic!("catch-all hit in mod.rs resolve_relational_expression (TVF source schema): {:?}", other),
-                    };
-
-                    let resolved_identifier = ast_resolved::QualifiedName {
-                        namespace_path: identifier.namespace_path.clone(),
-                        name: identifier.name.clone(),
-                        grounding: None,
-                    };
-
-                    // Synthesize correlation predicates from USING columns
-                    let final_subquery = resolving::synthesize_using_correlation(
-                        resolved_subquery,
-                        using_columns,
-                        &resolved_identifier,
-                        &available_columns,
-                    );
-
-                    // Create resolved EXISTS condition
-                    let resolved_exists = ast_resolved::BooleanExpression::InnerExists {
-                        exists: *exists,
-                        identifier: resolved_identifier,
-                        subquery: Box::new(final_subquery),
-                        alias: alias.clone(),
-                        using_columns: using_columns.clone(),
-                    };
-                    let resolved_condition =
-                        ast_resolved::SigmaCondition::Predicate(resolved_exists);
-
-                    return Ok((
-                        ast_resolved::RelationalExpression::Filter {
-                            source: Box::new(resolved_source),
-                            condition: resolved_condition,
-                            origin,
-                            cpr_schema: ast_resolved::PhaseBox::new(source_schema),
-                        },
-                        source_bubbled,
-                    ));
-                }
-            }
-
-            let (resolved_source, source_bubbled) = resolve_relational_expression_with_registry(
-                *source,
-                registry,
-                outer_context,
-                config,
-                grounding,
-            )?;
-
-            let source_schema = extract_cpr_schema(&resolved_source)?;
-
-            // Get columns for condition resolution.
-            // Prefer source_bubbled.i_provide — it carries the user alias (e.g., `as a`)
-            // so qualified refs like `a.first_name` can match. The cpr_schema on the
-            // AST node may have internal body names (e.g., from ConsultedView expansion)
-            // that don't reflect the alias.
-            let source_columns = if !source_bubbled.i_provide.is_empty() {
-                source_bubbled.i_provide.clone()
-            } else {
-                match &source_schema {
-                    ast_resolved::CprSchema::Resolved(cols) => cols.clone(),
-                    ast_resolved::CprSchema::Failed {
-                        resolved_columns, ..
-                    } => resolved_columns.clone(),
-                    ast_resolved::CprSchema::Unresolved(cols) => cols.clone(),
-                    ast_resolved::CprSchema::Unknown => vec![],
-                }
-            };
-
-            // Combine outer context with source columns for correlation support
-            // This allows correlated predicates to reference both:
-            // - Columns from the current source (e.g., orders.user_id)
-            // - Columns from outer context (e.g., CFE parameters like buyer_id)
-            let available_columns = if let Some(outer) = outer_context {
-                let mut combined = outer.to_vec();
-                combined.extend(source_columns);
-                combined
-            } else {
-                source_columns
-            };
-
-            // Resolve condition using combined schema (source + outer context)
-            // Use outer_context presence as heuristic for correlation contexts,
-            // unless validate_in_correlation is set (EXISTS subqueries where
-            // the full column set is known and validation is safe)
-            let in_correlation = outer_context.is_some() && !config.validate_in_correlation;
-            let resolved_condition = resolve_sigma_condition_with_registry(
-                condition,
-                &available_columns,
-                registry,
-                in_correlation,
-                config,
-            )?;
-
-            // If this is a destructuring filter, add the destructured columns to the schema
-            let final_schema = match &resolved_condition {
-                ast_resolved::SigmaCondition::Destructure {
-                    destructured_schema,
-                    ..
-                } => {
-                    if std::env::var("DQL_DEBUG").is_ok() {
-                        eprintln!("DESTRUCTURE FILTER DETECTED - adding columns to schema");
-                    }
-                    // Add destructured columns to source schema
-                    let mut updated_columns = match &source_schema {
-                        ast_resolved::CprSchema::Resolved(cols) => {
-                            if std::env::var("DQL_DEBUG").is_ok() {
-                                eprintln!("Source has {} columns:", cols.len());
-                                for col in cols {
-                                    eprintln!(
-                                        "  - {}",
-                                        col.info.original_name().unwrap_or("<no name>")
-                                    );
-                                }
-                            }
-                            cols.clone()
-                        }
-                        other => {
-                            panic!("catch-all hit in mod.rs resolve_relational_expression (destructure filter schema): {:?}", other);
-                        }
-                    };
-                    for mapping in destructured_schema.data() {
-                        if std::env::var("DQL_DEBUG").is_ok() {
-                            eprintln!("Adding destructured column: {}", mapping.column_name);
-                        }
-                        updated_columns.push(ast_resolved::ColumnMetadata {
-                            info: ast_resolved::ColumnProvenance::from_column(
-                                mapping.column_name.clone(),
-                            ),
-                            fq_table: ast_resolved::FqTable {
-                                parents_path: NamespacePath::empty(),
-                                name: ast_resolved::TableName::Fresh,
-                                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                            },
-                            table_position: None,
-                            has_user_name: true,
-                            needs_hygienic_alias: false,
-                            needs_sql_rename: false,
-                            interior_schema: None,
-                        });
-                    }
-                    if std::env::var("DQL_DEBUG").is_ok() {
-                        eprintln!("Final schema has {} columns", updated_columns.len());
-                    }
-                    ast_resolved::CprSchema::Resolved(updated_columns)
-                }
-                _ => source_schema,
-            };
-
-            // Update bubbled state for destructuring filters
-            let final_bubbled = match &resolved_condition {
-                ast_resolved::SigmaCondition::Destructure {
-                    destructured_schema,
-                    ..
-                } => {
-                    // Add destructured columns to bubbled i_provide
-                    let mut updated_bubbled = source_bubbled;
-                    for mapping in destructured_schema.data() {
-                        // Create ColumnMetadata for the destructured column
-                        updated_bubbled
-                            .i_provide
-                            .push(ast_resolved::ColumnMetadata {
-                                info: ast_resolved::ColumnProvenance::from_column(
-                                    mapping.column_name.clone(),
-                                ),
-                                fq_table: ast_resolved::FqTable {
-                                    parents_path: NamespacePath::empty(),
-                                    name: ast_resolved::TableName::Fresh,
-                                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(
-                                        None,
-                                    ),
-                                },
-                                table_position: None,
-                                has_user_name: true,
-                                needs_hygienic_alias: false,
-                                needs_sql_rename: false,
-                                interior_schema: None,
-                            });
-                    }
-                    updated_bubbled
-                }
-                _ => source_bubbled,
-            };
-
-            Ok((
-                ast_resolved::RelationalExpression::Filter {
-                    source: Box::new(resolved_source),
-                    condition: resolved_condition,
-                    origin,
-                    cpr_schema: ast_resolved::PhaseBox::new(final_schema),
-                },
-                final_bubbled,
-            ))
-        }
-
-        // Handle Join through registry
-        ast_unresolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            join_type,
-            cpr_schema: _,
-        } => {
-            let (resolved_left, left_bubbled) = resolve_relational_expression_with_registry(
-                *left,
-                registry,
-                outer_context,
-                config,
-                grounding,
-            )?;
-
-            let left_schema = extract_cpr_schema(&resolved_left)?;
-            let left_columns = match &left_schema {
-                ast_resolved::CprSchema::Resolved(cols) => cols.clone(),
-                other => panic!("catch-all hit in mod.rs resolve_relational_expression (join left_columns): {:?}", other),
-            };
-
-            // For EXISTS joins, we need to combine outer context with left columns
-            let combined_context;
-            let right_context = if let Some(outer) = outer_context {
-                let mut combined = outer.to_vec();
-                combined.extend(left_columns.clone());
-                combined_context = combined;
-                Some(combined_context.as_slice())
-            } else {
-                Some(left_columns.as_slice())
-            };
-
-            // Check if right side uses positional patterns and needs unification
-            let (resolved_right, right_bubbled, positional_join_condition, where_constraints) =
-                if let ast_unresolved::RelationalExpression::Relation(ref rel) = right.as_ref() {
-                    match rel {
-                        ast_unresolved::Relation::Ground {
-                            identifier,
-                            canonical_name: _,
-                            alias,
-                            domain_spec: ast_unresolved::DomainSpec::Positional(patterns),
-                            outer,
-                            mutation_target: _,
-                            passthrough: _,
-                            cpr_schema: _,
-                            hygienic_injections: _,
-                        } => {
-                            // Use the SAME pattern resolver that single tables use!
-                            let table_name = &identifier.name;
-                            let schema = registry.database.schema();
-
-                            // Get table schema — check CTEs first, then database
-                            let maybe_table_columns = if let Some(cte_schema) =
-                                registry.query_local.lookup_cte(table_name)
-                            {
-                                match cte_schema {
-                                    ast_resolved::CprSchema::Resolved(cols) => Some(
-                                        cols.iter()
-                                            .enumerate()
-                                            .map(|(idx, col)| ColumnInfo {
-                                                name: col.name().into(),
-                                                nullable: true,
-                                                position: idx + 1,
-                                            })
-                                            .collect(),
-                                    ),
-                                    _ => {
-                                        return Err(DelightQLError::TableNotFoundError {
-                                            table_name: table_name.to_string(),
-                                            context:
-                                                "CTE schema not resolved for positional pattern"
-                                                    .to_string(),
-                                        });
-                                    }
-                                }
-                            } else {
-                                schema.get_table_columns(None, table_name)
-                            };
-
-                            if let Some(table_columns) = maybe_table_columns {
-                                // CTE or database table — use existing mini-pipeline
-
-                                // VALIDATE: Positional pattern length must match table columns
-                                if patterns.len() != table_columns.len() {
-                                    return Err(DelightQLError::validation_error(
-                                    format!(
-                                        "Positional pattern incomplete - table '{}' has {} columns but pattern specifies {} elements",
-                                        table_name, table_columns.len(), patterns.len()
-                                    ),
-                                    "Pattern references unknown table".to_string()
-                                ));
-                                }
-
-                                // Convert to ColumnMetadata for pattern resolver.
-                                // Use alias as fq_table.name when present — this is the
-                                // SQL-visible name, so qualified refs like `t.val` match.
-                                let visible_name = alias.as_deref().unwrap_or(table_name);
-                                let table_schema: Vec<ast_resolved::ColumnMetadata> = table_columns
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(idx, col)| {
-                                        ast_resolved::ColumnMetadata::new(
-                                            ast_resolved::ColumnProvenance::from_column(
-                                                col.name.clone(),
-                                            ),
-                                            ast_resolved::FqTable {
-                                                parents_path: NamespacePath::empty(),
-                                                name: ast_resolved::TableName::Named(
-                                                    visible_name.into(),
-                                                ),
-                                                backend_schema:
-                                                    ast_resolved::PhaseBox::from_optional_schema(
-                                                        None,
-                                                    ),
-                                            },
-                                            Some(idx + 1),
-                                        )
-                                    })
-                                    .collect();
-
-                                // Create join context with left columns
-                                let join_ctx = JoinContext {
-                                    left_columns: left_columns.clone(),
-                                };
-
-                                // Use the SAME pattern resolver!
-                                let pattern_resolver = PatternResolver::new();
-                                let pattern_result = pattern_resolver.resolve_pattern(
-                                    &ast_unresolved::DomainSpec::Positional(patterns.clone()),
-                                    &table_schema,
-                                    table_name,
-                                    Some(&join_ctx),
-                                )?;
-
-                                // Build the resolved relation from pattern result
-                                // Create positional domain spec with resolved columns as Lvar expressions
-                                let resolved_exprs: Vec<ast_resolved::DomainExpression> =
-                                    pattern_result
-                                        .output_columns
-                                        .iter()
-                                        .map(|col| ast_resolved::DomainExpression::Lvar {
-                                            name: col.name().into(),
-                                            qualifier: Some(table_name.clone()),
-                                            namespace_path: NamespacePath::empty(),
-                                            alias: None,
-                                            provenance: ast_resolved::PhaseBox::phantom(),
-                                        })
-                                        .collect();
-
-                                let resolved_relation = ast_resolved::Relation::Ground {
-                                    identifier: ast_resolved::QualifiedName {
-                                        namespace_path: identifier.namespace_path.clone(),
-                                        name: table_name.clone(),
-                                        grounding: None,
-                                    },
-                                    canonical_name: ast_resolved::PhaseBox::new(None),
-                                    domain_spec: ast_resolved::DomainSpec::Positional(
-                                        resolved_exprs,
-                                    ),
-                                    alias: alias.clone(),
-                                    outer: *outer,
-                                    mutation_target: false,
-                                    passthrough: false,
-                                    cpr_schema: ast_resolved::PhaseBox::new(
-                                        ast_resolved::CprSchema::Resolved(
-                                            pattern_result.output_columns.clone(),
-                                        ),
-                                    ),
-                                    hygienic_injections: Vec::new(),
-                                };
-
-                                let resolved_expr =
-                                    ast_resolved::RelationalExpression::Relation(resolved_relation);
-
-                                // Get bubbled state
-                                let bubbled =
-                                    BubbledState::resolved(pattern_result.output_columns.clone());
-
-                                // Generate USING condition if there are unification columns
-                                let join_cond =
-                                    if let Some(using_cols) = pattern_result.using_columns {
-                                        if !using_cols.is_empty() {
-                                            Some(create_using_condition(using_cols)?)
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                // Return WHERE constraints to be handled at join level
-                                (
-                                    resolved_expr,
-                                    bubbled,
-                                    join_cond,
-                                    pattern_result.where_constraints,
-                                )
-                            } else {
-                                // Not CTE or database — likely a consulted entity.
-                                // Route through the full resolver which handles consulted
-                                // entities (views, facts) and applies positional patterns.
-                                let right_expr =
-                                    ast_unresolved::RelationalExpression::Relation(rel.clone());
-                                let (resolved, bubbled) =
-                                    resolve_relational_expression_with_registry(
-                                        right_expr,
-                                        registry,
-                                        right_context,
-                                        config,
-                                        grounding,
-                                    )?;
-
-                                // Derive join conditions: check which lvar names in the
-                                // positional pattern match left-side column names.
-                                let mut using_cols: Vec<String> = Vec::new();
-                                for pattern in patterns {
-                                    if let ast_unresolved::DomainExpression::Lvar { name, .. } =
-                                        pattern
-                                    {
-                                        let lvar_name = name.as_str();
-                                        let matches_left =
-                                            left_columns.iter().any(|col| col.name() == lvar_name);
-                                        if matches_left
-                                            && !using_cols.iter().any(|c| c == lvar_name)
-                                        {
-                                            using_cols.push(lvar_name.to_string());
-                                        }
-                                    }
-                                }
-                                let join_cond = if using_cols.is_empty() {
-                                    None
-                                } else {
-                                    Some(create_using_condition(using_cols)?)
-                                };
-
-                                (resolved, bubbled, join_cond, vec![])
-                            }
-                        }
-                        ast_unresolved::Relation::Anonymous { column_headers, .. } => {
-                            // Handle anonymous table unification
-                            let (resolved, bubbled) = resolve_relational_expression_with_registry(
-                                *right.clone(),
-                                registry,
-                                right_context,
-                                config,
-                                grounding,
-                            )?;
-
-                            // Extract right-side columns from resolved anonymous table
-                            let right_cpr_schema =
-                                helpers::extraction::extract_cpr_schema(&resolved)?;
-                            let right_columns = match right_cpr_schema {
-                                ast_resolved::CprSchema::Resolved(cols) => cols,
-                                other => panic!("catch-all hit in mod.rs resolve_relational_expression (anonymous table right_columns): {:?}", other),
-                            };
-
-                            // Check for unification opportunities based on column names
-                            let anon_join_condition = if let Some(headers) = column_headers {
-                                detect_anonymous_table_unification(
-                                    headers,
-                                    &left_columns,
-                                    &right_columns,
-                                )?
-                            } else {
-                                None
-                            };
-
-                            (resolved, bubbled, anon_join_condition, vec![])
-                        }
-                        ast_unresolved::Relation::Ground {
-                            domain_spec: ast_unresolved::DomainSpec::GlobWithUsing(ref using_cols),
-                            ..
-                        } => {
-                            // GlobWithUsing on consulted views (or any non-positional entity):
-                            // resolve the entity, then create USING join condition from the
-                            // specified columns.
-                            let using_cols = using_cols.clone();
-                            let (resolved, bubbled) = resolve_relational_expression_with_registry(
-                                *right,
-                                registry,
-                                right_context,
-                                config,
-                                grounding,
-                            )?;
-                            let join_cond = if !using_cols.is_empty() {
-                                Some(join_resolver::create_using_condition(using_cols)?)
-                            } else {
-                                None
-                            };
-                            (resolved, bubbled, join_cond, vec![])
-                        }
-                        ast_unresolved::Relation::Ground {
-                            domain_spec: ast_unresolved::DomainSpec::GlobWithUsingAll,
-                            ..
-                        } => {
-                            // GlobWithUsingAll: resolve the right side, then compute
-                            // shared columns between left and right as USING columns.
-                            let (resolved, bubbled) = resolve_relational_expression_with_registry(
-                                *right,
-                                registry,
-                                right_context,
-                                config,
-                                grounding,
-                            )?;
-                            let right_cols = &bubbled.i_provide;
-                            let shared: Vec<String> = right_cols
-                                .iter()
-                                .filter(|rc| {
-                                    left_columns
-                                        .iter()
-                                        .any(|lc| col_name_eq(lc.name(), rc.name()))
-                                })
-                                .map(|rc| rc.name().to_string())
-                                .collect();
-                            if shared.is_empty() {
-                                return Err(DelightQLError::validation_error_categorized(
-                                    "using/all/no-shared-columns",
-                                    format!(
-                                        "No shared columns between left side and right side for .* (USING all)"
-                                    ),
-                                    ".* requires at least one column name in common",
-                                ));
-                            }
-                            let join_cond = join_resolver::create_using_condition(shared)?;
-                            (resolved, bubbled, Some(join_cond), vec![])
-                        }
-                        _ => {
-                            let (resolved, bubbled) = resolve_relational_expression_with_registry(
-                                *right,
-                                registry,
-                                right_context,
-                                config,
-                                grounding,
-                            )?;
-                            (resolved, bubbled, None, vec![])
-                        }
-                    }
-                } else {
-                    let (resolved, bubbled) = resolve_relational_expression_with_registry(
-                        *right,
-                        registry,
-                        right_context,
-                        config,
-                        grounding,
-                    )?;
-                    (resolved, bubbled, None, vec![])
-                };
-
-            // Join conditions need to be preserved and bubbled
-            let mut join_bubbled = BubbledState::resolved(vec![]);
-            let resolved_condition = if let Some(cond) = join_condition {
-                match cond {
-                    ast_unresolved::BooleanExpression::Using { columns } => {
-                        // USING is structural, not a predicate — pass through directly
-                        Some(ast_resolved::BooleanExpression::Using { columns })
-                    }
-                    _ => {
-                        // For now, keep the condition as None but bubble the needs
-                        // The condition will be resolved later when filters are processed
-                        let schema = registry.database.schema();
-                        let cte_context = &mut registry.query_local.ctes;
-                        let (_unresolved_cond, cond_bubbled) = bubble_predicate_expression(
-                            cond,
-                            schema,
-                            cte_context,
-                            Some(&left_columns),
-                        )?;
-                        join_bubbled = cond_bubbled;
-                        None // Will be attached later via filter-to-join transformation
-                    }
-                }
-            } else {
-                positional_join_condition
-            };
-
-            // Handle USING deduplication if present
-            let using_columns = extract_inline_using_columns(&resolved_right).or_else(|| {
-                // For positional patterns, extract USING columns from the join condition
-                if let Some(ast_resolved::BooleanExpression::Using { columns }) =
-                    &resolved_condition
-                {
-                    Some(
-                        columns
-                            .iter()
-                            .map(|col| match col {
-                                ast_resolved::UsingColumn::Regular(qname) => qname.name.to_string(),
-                                ast_resolved::UsingColumn::Negated(qname) => qname.name.to_string(),
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                }
-            });
-
-            // Combine schemas with USING deduplication.
-            // Use i_provide (which carries user aliases like "a", "s") rather than
-            // extract_cpr_schema (which may have internal body names from ConsultedView).
-            // This ensures the join's cpr_schema reflects the external interface.
-            let combined_schema = {
-                let left_cols = &left_bubbled.i_provide;
-                let right_cols = &right_bubbled.i_provide;
-                if left_cols.is_empty() && right_cols.is_empty() {
-                    ast_resolved::CprSchema::Unknown
-                } else {
-                    let mut combined = left_cols.clone();
-                    if let Some(using_cols) = &using_columns {
-                        let using_names: std::collections::HashSet<String> =
-                            using_cols.iter().cloned().collect();
-                        let filtered_right: Vec<_> = right_cols
-                            .iter()
-                            .filter(|col| !using_names.contains(col.name()))
-                            .cloned()
-                            .collect();
-                        combined.extend(filtered_right);
-                    } else {
-                        combined.extend(right_cols.clone());
-                    }
-                    ast_resolved::CprSchema::Resolved(combined)
-                }
-            };
-
-            // Also deduplicate in the bubbled state
-            let final_right_bubbled = if let Some(using_cols) = using_columns {
-                let using_names: std::collections::HashSet<String> =
-                    using_cols.into_iter().collect();
-                let filtered_i_provide: Vec<_> = right_bubbled
-                    .i_provide
-                    .into_iter()
-                    .filter(|col| !using_names.contains(col.name()))
-                    .collect();
-                BubbledState {
-                    i_provide: filtered_i_provide,
-                    i_need: right_bubbled.i_need,
-                }
-            } else {
-                right_bubbled
-            };
-
-            // Create the join
-            let mut result_expr = ast_resolved::RelationalExpression::Join {
-                left: Box::new(resolved_left),
-                right: Box::new(resolved_right),
-                join_condition: resolved_condition,
-                join_type,
-                cpr_schema: ast_resolved::PhaseBox::new(combined_schema.clone()),
-            };
-
-            // Apply WHERE constraints from positional patterns if any
-            if !where_constraints.is_empty() {
-                // Combine multiple constraints with AND
-                let combined_constraint = if where_constraints.len() == 1 {
-                    where_constraints
-                        .into_iter()
-                        .next()
-                        .expect("Checked len==1 above")
-                } else {
-                    where_constraints
-                        .into_iter()
-                        .reduce(|left, right| ast_resolved::BooleanExpression::And {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        })
-                        .expect("Checked non-empty above, reduce must succeed")
-                };
-
-                // Wrap the join in a Filter
-                // Note: These are combined constraints from multiple tables in a join
-                result_expr = ast_resolved::RelationalExpression::Filter {
-                    source: Box::new(result_expr),
-                    condition: ast_resolved::SigmaCondition::Predicate(combined_constraint),
-                    origin: ast_resolved::FilterOrigin::PositionalLiteral {
-                        source_table: "__join__".to_string(), // Special marker for combined join constraints
-                    },
-                    cpr_schema: ast_resolved::PhaseBox::new(combined_schema),
-                };
-            }
-
-            Ok((
-                result_expr,
-                BubbledState::combine(
-                    BubbledState::combine(left_bubbled, final_right_bubbled),
-                    join_bubbled,
-                ),
-            ))
-        }
-
-        // Handle Pipe through registry — LINEARIZED
-        // Collects the pipe chain into a flat list, resolves the base once,
-        // then iterates operators bottom-up. Eliminates pipe-spine recursion.
-        ast_unresolved::RelationalExpression::Pipe(boxed_pipe_expr) => {
-            let pipe_expr = (*boxed_pipe_expr).into_inner();
-
-            // Early intercept: piped HO view application desugars BEFORE source resolution
-            if let ast_unresolved::UnaryRelationalOperator::HoViewApplication {
-                ref function,
-                ref first_parens_spec,
-                ref arguments,
-                ref namespace,
-                ..
-            } = pipe_expr.operator
-            {
-                // Look up the HO view entity.
-                // When namespace is explicit (e.g., std::json.tg_keys), use
-                // lookup_entity with the FQ namespace — same as the non-piped
-                // TVF path. Otherwise, search enlisted namespaces by bare name.
-                let entity = if let Some(ref ns) = namespace {
-                    let fq = grounding::namespace_path_to_fq(ns);
-                    registry
-                        .consult
-                        .lookup_entity(function, &fq)
-                        .filter(|e| {
-                            e.entity_type
-                                == crate::enums::EntityType::DqlHoTemporaryViewExpression
-                                    .as_i32()
-                        })
-                        .ok_or_else(|| {
-                            crate::error::DelightQLError::validation_error(
-                                format!(
-                                    "Unknown piped HO view '{}.{}'. Ensure the namespace is consulted.",
-                                    fq, function
-                                ),
-                                "Piped HO view not found",
-                            )
-                        })?
-                } else {
-                    registry
-                        .consult
-                        .lookup_enlisted_ho_view(function)?
-                        .ok_or_else(|| {
-                            crate::error::DelightQLError::validation_error(
-                                format!(
-                                    "Unknown piped HO view '{}'. Ensure the namespace is consulted and engaged.",
-                                    function
-                                ),
-                                "Piped HO view not found",
-                            )
-                        })?
-                };
-
-                // Build first_parens_spec if not already set
-                let spec = first_parens_spec.clone().unwrap_or(
-                    ast_unresolved::DomainSpec::Glob,
-                );
-
-                let groups_ref: Option<&[_]> = if arguments.is_empty() {
-                    None
-                } else {
-                    Some(arguments.as_slice())
-                };
-                let (table_bindings, scalar_spec, _pipe_idx) =
-                    grounding::split_ho_first_parens(
-                        &spec,
-                        &entity,
-                        Some(&pipe_expr.source),
-                        groups_ref,
-                    )?;
-
-                // Build grounding context
-                let ns_parts: Vec<String> =
-                    entity.namespace.split("::").map(String::from).collect();
-                let entity_ns =
-                    ast_unresolved::NamespacePath::from_parts(ns_parts).map_err(|e| {
-                        crate::error::DelightQLError::database_error(
-                            format!(
-                                "Invalid namespace '{}' for HO view '{}': {:?}",
-                                entity.namespace, function, e
-                            ),
-                            format!("{:?}", e),
-                        )
-                    })?;
-                let ho_grounding = ast_unresolved::GroundedPath {
-                    data_ns: ast_unresolved::NamespacePath::empty(),
-                    grounded_ns: vec![entity_ns],
-                };
-
-                // Scope ER-rule lookups to the HO-view's namespace
-                let ho_config = if !entity.namespace.is_empty() && entity.namespace != "main" {
-                    ResolutionConfig {
-                        resolution_namespace: Some(entity.namespace.clone()),
-                        ..config.clone()
-                    }
-                } else {
-                    config.clone()
-                };
-
-                return relation_resolver::expand_ho_view(
-                    function,
-                    &entity,
-                    &scalar_spec,
-                    table_bindings,
-                    Some(pipe_expr.source),
-                    None,
-                    &ho_grounding,
-                    registry,
-                    outer_context,
-                    &ho_config,
-                );
-            }
-
-            // Collect the pipe chain into a flat list, stopping at HoViewApplication
-            // (which needs unresolved source for expansion and is handled recursively).
-            let mut segments: Vec<ast_unresolved::UnaryRelationalOperator> = Vec::new();
-            let mut current = ast_unresolved::RelationalExpression::Pipe(Box::new(
-                stacksafe::StackSafe::new(pipe_expr),
-            ));
-            while let ast_unresolved::RelationalExpression::Pipe(pipe) = current {
-                let pipe = (*pipe).into_inner();
-                if matches!(
-                    &pipe.operator,
-                    ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
-                ) {
-                    // Leave this Pipe (and everything below) as the base
-                    // for recursive resolution via resolve_relational_expression_with_registry
-                    current = ast_unresolved::RelationalExpression::Pipe(Box::new(
-                        stacksafe::StackSafe::new(pipe),
-                    ));
-                    break;
-                }
-                segments.push(pipe.operator);
-                current = pipe.source;
-            }
-            segments.reverse(); // source-code order: innermost first
-            let base = current;
-
-            let mut pivot_in_values;
-            let source_grounding;
-            let mutation_targets;
-            let dml_pipe_ops: Vec<DmlPipeKind>;
-            let mut resolved_source;
-            let mut source_bubbled;
-
-            {
-                // Pre-processing extractions from the base (once, not per-pipe).
-                // These functions walk through Pipes/Filters to find data at the Ground level.
-                pivot_in_values = extract_in_predicate_values(&base);
-                source_grounding = extract_grounding_from_source(&base);
-                mutation_targets = find_mutation_targets(&base);
-
-                // Pre-compute DML pipe ops for shape validation.
-                // The DML terminal is always the last segment; classify all preceding
-                // segments in outermost-first order (reversed from source-code order).
-                dml_pipe_ops = if segments.last().map_or(false, |op| {
-                    matches!(
-                        op,
-                        ast_unresolved::UnaryRelationalOperator::DmlTerminal { .. }
-                    )
-                }) {
-                    segments[..segments.len() - 1]
-                        .iter()
-                        .rev()
-                        .map(|op| classify_single_dml_op(op))
-                        .collect()
-                } else {
-                    vec![]
-                };
-
-                // Resolve the base expression through registry.
-                // If base is Pipe(HoView, ...), recursion handles the expansion.
-                let (rs, sb) = resolve_relational_expression_with_registry(
-                    base,
-                    registry,
-                    outer_context,
-                    config,
-                    grounding,
-                )?;
-                resolved_source = rs;
-                source_bubbled = sb;
-
-                // Extract IN values from the resolved base (catches InRelational
-                // with anonymous fact tables, e.g., from HO scalar-lifted params).
-                let resolved_pivot_values =
-                    extract_in_predicate_values_from_resolved(&resolved_source);
-                for (k, v) in resolved_pivot_values {
-                    pivot_in_values.entry(k).or_insert(v);
-                }
-            }
-
-            // Iterate pipe segments bottom-up (innermost operator first)
-            for operator in segments {
-                // Check for unresolved columns before pipe (scope barrier)
-                if !source_bubbled.i_need.is_empty() {
-                    let first_unresolved = &source_bubbled.i_need[0];
-                    let qual_str = match first_unresolved {
-                        ColumnReference::Named {
-                            name, qualifier, ..
-                        } => qualifier
-                            .as_ref()
-                            .map(|q| format!("{}.{}", q, name))
-                            .unwrap_or_else(|| name.clone()),
-                        ColumnReference::Ordinal {
-                            position, reverse, ..
-                        } => {
-                            if *reverse {
-                                format!("|-{}|", position)
-                            } else {
-                                format!("|{}|", position)
-                            }
-                        }
-                    };
-
-                    return Err(DelightQLError::ColumnNotFoundError {
-                        column: qual_str,
-                        context: "Column reference before pipe operator cannot be resolved (scope barrier)".to_string(),
-                    });
-                }
-
-                // Get available columns from source
-                let mut source_has_unknown_schema = false;
-                let available_columns = if source_bubbled.i_provide.is_empty() {
-                    let source_schema = extract_cpr_schema(&resolved_source)?;
-                    if std::env::var("DQL_DEBUG").is_ok() {
-                        eprintln!("PIPE: Extracted schema from source");
-                    }
-                    match &source_schema {
-                        ast_resolved::CprSchema::Resolved(cols) => {
-                            if std::env::var("DQL_DEBUG").is_ok() {
-                                eprintln!("PIPE: Source has {} columns:", cols.len());
-                                for col in cols {
-                                    eprintln!(
-                                        "  PIPE: - {}",
-                                        col.info.original_name().unwrap_or("<no name>")
-                                    );
-                                }
-                            }
-                            cols.clone()
-                        }
-                        ast_resolved::CprSchema::Failed { .. } => {
-                            return Err(DelightQLError::ParseError {
-                                message: "Cannot pipe from a relation with unresolved columns"
-                                    .to_string(),
-                                source: None,
-                                subcategory: None,
-                            });
-                        }
-                        ast_resolved::CprSchema::Unresolved(_) => {
-                            return Err(DelightQLError::ParseError {
-                                message: "Cannot pipe from an unresolved relation".to_string(),
-                                source: None,
-                                subcategory: None,
-                            });
-                        }
-                        ast_resolved::CprSchema::Unknown => {
-                            source_has_unknown_schema = true;
-                            vec![]
-                        }
-                    }
-                } else {
-                    source_bubbled.i_provide.clone()
-                };
-
-                // USING→correlation intercept
-                if let ast_unresolved::UnaryRelationalOperator::Using { ref columns } = operator {
-                    if let Some(outer) = outer_context {
-                        let inner_table_name = extract_base_ground_name(&resolved_source);
-                        let inner_qn = ast_resolved::QualifiedName {
-                            namespace_path: ast_resolved::NamespacePath::empty(),
-                            name: inner_table_name.unwrap_or_else(|| "unknown".into()),
-                            grounding: None,
-                        };
-
-                        let correlation_filters =
-                            resolving::build_using_correlation_filters(columns, &inner_qn, outer);
-
-                        resolved_source =
-                            insert_filters_at_base(resolved_source, correlation_filters);
-                        continue;
-                    }
-                }
-
-                // Validate !! mutation target markers for DML terminals
-                if let ast_unresolved::UnaryRelationalOperator::DmlTerminal {
-                    ref kind,
-                    ref target,
-                    ..
-                } = operator
-                {
-                    use crate::pipeline::asts::core::operators::DmlKind;
-
-                    if mutation_targets.len() > 1 {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "dml/marker/multiple",
-                            format!("DML source has !! on multiple relations: {}", mutation_targets.join(", ")),
-                            "Only one relation can be marked with !! — the mutation target must be unambiguous",
-                        ));
-                    }
-
-                    match kind {
-                        DmlKind::Insert => {
-                            if !mutation_targets.is_empty() {
-                                return Err(DelightQLError::validation_error_categorized(
-                                    "dml/marker/forbidden",
-                                    format!("insert! source must not have !! marker (found on: {})", mutation_targets.join(", ")),
-                                    "Remove !! from the source relation — insert reads from source, it does not mutate it".to_string(),
-                                ));
-                            }
-                        }
-                        DmlKind::Update | DmlKind::Delete | DmlKind::Keep => {
-                            let kind_name = match kind {
-                                DmlKind::Update => "update!",
-                                DmlKind::Delete => "delete!",
-                                DmlKind::Keep => "keep!",
-                                _ => unreachable!(),
-                            };
-                            if mutation_targets.is_empty() {
-                                return Err(DelightQLError::validation_error_categorized(
-                                    "dml/marker/missing",
-                                    format!("{} requires !! on the source relation that will be mutated", kind_name),
-                                    format!("Mark the source with !!: {}!!(*)  — this makes the mutation target explicit", target),
-                                ));
-                            }
-                            if !mutation_targets.iter().any(|t| t == target) {
-                                return Err(DelightQLError::validation_error_categorized(
-                                    "dml/marker/mismatch",
-                                    format!("!! source table '{}' does not match {} target '{}'", mutation_targets[0], kind_name, target),
-                                    format!("The !! marker must be on the same table as the DML target: {}!!(*)  |> {}({}(*))", target, kind_name, target),
-                                ));
-                            }
-                        }
-                    }
-
-                    // Shape validation using pre-computed dml_pipe_ops
-                    let pipe_ops = &dml_pipe_ops;
-
-                    match kind {
-                        DmlKind::Update => {
-                            let has_transform = pipe_ops
-                                .iter()
-                                .any(|op| matches!(op, DmlPipeKind::Transform));
-                            if !has_transform {
-                                let has_non_filter_ops = pipe_ops.iter().any(|op| {
-                                    matches!(
-                                        op,
-                                        DmlPipeKind::ProjectOut
-                                            | DmlPipeKind::RenameCover
-                                            | DmlPipeKind::TupleOrdering
-                                            | DmlPipeKind::General
-                                            | DmlPipeKind::Modulo
-                                            | DmlPipeKind::AggregatePipe
-                                    )
-                                });
-                                if has_non_filter_ops {
-                                    return Err(DelightQLError::validation_error_categorized(
-                                        "dml/shape/update_no_transform",
-                                        "update! requires a Transform ($$) to specify column assignments — embed (+), project-out (-), rename (*), ordering (#), and projection do not produce SET clauses",
-                                        "Use $$(new_value as column_name) before update! to specify what to change",
-                                    ));
-                                }
-                            } else {
-                                let has_aggregate = pipe_ops.iter().any(|op| {
-                                    matches!(op, DmlPipeKind::Modulo | DmlPipeKind::AggregatePipe)
-                                });
-                                if has_aggregate {
-                                    return Err(DelightQLError::validation_error_categorized(
-                                        "dml/source/aggregate",
-                                        "Cannot aggregate/group data before update! — aggregation changes the row identity, making it impossible to map results back to source rows",
-                                        "Remove the aggregate/group-by pipe before the DML operation",
-                                    ));
-                                }
-                                let transform_count = pipe_ops
-                                    .iter()
-                                    .filter(|op| matches!(op, DmlPipeKind::Transform))
-                                    .count();
-                                if transform_count > 1 {
-                                    return Err(DelightQLError::validation_error_categorized(
-                                        "dml/shape/update_no_transform",
-                                        "update! requires exactly one Transform ($$) — multiple covers produce ambiguous SET clauses",
-                                        "Combine the transforms into a single $$(expr1 as col1, expr2 as col2) before update!",
-                                    ));
-                                }
-                                let has_ordering = pipe_ops
-                                    .iter()
-                                    .any(|op| matches!(op, DmlPipeKind::TupleOrdering));
-                                if has_ordering {
-                                    return Err(DelightQLError::validation_error_categorized(
-                                        "dml/shape/update_no_transform",
-                                        "Ordering (#) before update! is meaningless — UPDATE does not preserve row order",
-                                        "Remove the ordering pipe from the DML pipeline",
-                                    ));
-                                }
-                            }
-                        }
-                        DmlKind::Delete | DmlKind::Keep => {
-                            let kind_name = if matches!(kind, DmlKind::Delete) {
-                                "delete!"
-                            } else {
-                                "keep!"
-                            };
-                            let has_transform = pipe_ops
-                                .iter()
-                                .any(|op| matches!(op, DmlPipeKind::Transform));
-                            if has_transform {
-                                let sub = if matches!(kind, DmlKind::Delete) {
-                                    "dml/shape/delete_with_cover"
-                                } else {
-                                    "dml/shape/keep_with_cover"
-                                };
-                                return Err(DelightQLError::validation_error_categorized(
-                                    sub,
-                                    format!("{} discards column data — a Transform ($$) before it is wasted", kind_name),
-                                    format!("Remove the Transform before {} — only filters affect which rows are deleted/kept", kind_name),
-                                ));
-                            }
-                            let has_shape_ops = pipe_ops.iter().any(|op| {
-                                matches!(
-                                    op,
-                                    DmlPipeKind::ProjectOut
-                                        | DmlPipeKind::RenameCover
-                                        | DmlPipeKind::General
-                                )
-                            });
-                            if has_shape_ops {
-                                let sub = if matches!(kind, DmlKind::Delete) {
-                                    "dml/shape/delete_with_cover"
-                                } else {
-                                    "dml/shape/keep_with_cover"
-                                };
-                                return Err(DelightQLError::validation_error_categorized(
-                                    sub,
-                                    format!("{} discards column data — shape-changing operators (embed, project-out, rename, projection) before it are wasted", kind_name),
-                                    format!("Remove shape-changing pipes before {} — only filters affect which rows are deleted/kept", kind_name),
-                                ));
-                            }
-                            let has_aggregate = pipe_ops.iter().any(|op| {
-                                matches!(op, DmlPipeKind::Modulo | DmlPipeKind::AggregatePipe)
-                            });
-                            if has_aggregate {
-                                return Err(DelightQLError::validation_error_categorized(
-                                    "dml/source/aggregate",
-                                    format!("Cannot aggregate/group data before {} — aggregation changes the row identity", kind_name),
-                                    "Remove the aggregate/group-by pipe before the DML operation",
-                                ));
-                            }
-                        }
-                        DmlKind::Insert => {
-                            // Insert is more permissive — projections, transforms, etc. are valid
-                            // for shaping the data before insertion. Aggregates are suspicious but
-                            // not necessarily wrong (e.g., insert aggregated results into a summary table).
-                        }
-                    }
-                }
-
-                // Bubble the operator to collect column needs
-                let schema = registry.database.schema();
-                let cte_context = &mut registry.query_local.ctes;
-                let (unresolved_operator, operator_bubbled) =
-                    bubbling::bubble_unary_operator(operator, schema, cte_context)?;
-
-                // Validate that all operator needs can be satisfied
-                if !operator_bubbled.i_need.is_empty() && !source_has_unknown_schema {
-                    validate_and_get_resolved(
-                        operator_bubbled.i_need.clone(),
-                        &available_columns,
-                        "in pipe operator",
-                    )?;
-                }
-
-                // Inline consulted functions before resolution
-                let unresolved_operator = if let Some(grounding) = grounding {
-                    grounding::inline_consulted_functions_in_operator(
-                        unresolved_operator,
-                        grounding,
-                        &registry.consult,
-                    )?
-                } else {
-                    let source_data_ns = source_grounding.as_ref().map(|g| &g.data_ns);
-                    grounding::inline_consulted_functions_in_operator_borrowed(
-                        unresolved_operator,
-                        &registry.consult,
-                        source_data_ns,
-                    )?
-                };
-
-                // Resolve the operator at the pipe boundary with the source schema
-                let (resolved_operator, mut output_columns) =
-                    resolving::resolve_operator_with_registry(
-                        unresolved_operator,
-                        &available_columns,
-                        registry,
-                        &pivot_in_values,
-                    )?;
-
-                // After a pipe, columns become Fresh (scope barrier).
-                // Exception: value-level covers ($$ and $) preserve table provenance.
-                let preserves_scope = matches!(
-                    &resolved_operator,
-                    ast_resolved::UnaryRelationalOperator::Transform { .. }
-                        | ast_resolved::UnaryRelationalOperator::InteriorDrillDown { .. }
-                );
-
-                for (idx, col) in output_columns.iter_mut().enumerate() {
-                    let previous_table = col.fq_table.name.clone();
-
-                    if !preserves_scope {
-                        col.fq_table.name = ast_resolved::TableName::Fresh;
-                    }
-                    col.table_position = Some(idx + 1);
-
-                    col.info = col
-                        .info
-                        .clone()
-                        .with_identity(ast_resolved::ColumnIdentity {
-                            name: col.info.name().unwrap_or("<unnamed>").into(),
-                            context: ast_resolved::IdentityContext::PipeBarrier {
-                                previous_table,
-                                fresh_scope: idx + 1,
-                            },
-                            phase: ast_resolved::TransformationPhase::Resolved,
-                            table_qualifier: if preserves_scope {
-                                col.fq_table.name.clone()
-                            } else {
-                                ast_resolved::TableName::Fresh
-                            },
-                        });
-
-                    // Seal column identity: after a pipe barrier, the column's
-                    // public name is its effective name. original_name() == name().
-                    col.info = col.info.clone().promote_at_barrier();
-                }
-
-                // Construct resolved pipe, accumulate as new source
-                let pipe = ast_resolved::PipeExpression {
-                    source: resolved_source,
-                    operator: resolved_operator,
-                    cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                        output_columns.clone(),
-                    )),
-                };
-                resolved_source = ast_resolved::RelationalExpression::Pipe(Box::new(
-                    stacksafe::StackSafe::new(pipe),
-                ));
-                source_bubbled = BubbledState::resolved(output_columns);
-            }
-
-            Ok((resolved_source, source_bubbled))
-        }
-
-        // Handle SetOperation through registry
-        ast_unresolved::RelationalExpression::SetOperation {
-            operator,
-            operands,
-            correlation: unresolved_corr,
-            cpr_schema: _,
-        } => {
-            // Resolve each operand
-            let mut resolved_operands = Vec::new();
-            let mut bubbled_states = Vec::new();
-
-            for operand in operands {
-                let (resolved, bubbled) = resolve_relational_expression_with_registry(
-                    operand,
-                    registry,
-                    outer_context,
-                    config,
-                    grounding,
-                )?;
-                resolved_operands.push(resolved);
-                bubbled_states.push(bubbled);
-            }
-
-            // Ensure all operands have compatible schemas
-            if resolved_operands.is_empty() {
-                return Err(DelightQLError::ParseError {
-                    message: "SetOperation requires at least one operand".to_string(),
-                    source: None,
-                    subcategory: None,
-                });
-            }
-
-            // Collect all schemas
-            let mut schemas = Vec::new();
-            for operand in &resolved_operands {
-                schemas.push(extract_cpr_schema(operand)?);
-            }
-
-            // Validate and build final schema based on operator
-            let final_schema = match operator {
-                ast_unresolved::SetOperator::UnionAllPositional => {
-                    // Positional union - use first operand's schema
-                    schemas[0].clone()
-                }
-                ast_unresolved::SetOperator::SmartUnionAll => {
-                    // Smart union - all must have same column names (order can differ)
-                    for i in 1..schemas.len() {
-                        validate_set_operation_schemas(&operator, &schemas[0], &schemas[i])?;
-                    }
-                    schemas[0].clone()
-                }
-                ast_unresolved::SetOperator::UnionCorresponding => {
-                    // Build unified schema for CORRESPONDING
-                    build_corresponding_schema(&schemas)?
-                }
-                ast_unresolved::SetOperator::MinusCorresponding => {
-                    // Minus uses left operand's schema (rows in left not in right)
-                    // Require same column names by name match
-                    for i in 1..schemas.len() {
-                        validate_set_operation_schemas(&operator, &schemas[0], &schemas[i])?;
-                    }
-                    schemas[0].clone()
-                }
-            };
-
-            // Pass through correlation (resolver doesn't set it, refiner will)
-            let resolved_correlation = unresolved_corr.into();
-
-            Ok((
-                ast_resolved::RelationalExpression::SetOperation {
-                    operator,
-                    operands: resolved_operands,
-                    correlation: resolved_correlation,
-                    cpr_schema: ast_resolved::PhaseBox::new(final_schema),
-                },
-                BubbledState::resolved(vec![]), // SetOperations don't bubble anything
-            ))
-        }
-
-        ast_unresolved::RelationalExpression::ErJoinChain { relations } => {
-            let context = config.er_context.as_ref().ok_or_else(|| {
-                DelightQLError::validation_error(
-                    "ER-join operator & requires an 'under context:' directive",
-                    "Missing ER-context",
-                )
-            })?;
-
-            Ok(expand_er_join_chain(
-                relations,
-                context,
-                registry,
-                outer_context,
-                config,
-                grounding,
-            )?)
-        }
-
-        ast_unresolved::RelationalExpression::ErTransitiveJoin { left, right } => {
-            let context = config.er_context.as_ref().ok_or_else(|| {
-                DelightQLError::validation_error(
-                    "ER-transitive-join operator && requires an 'under context:' directive",
-                    "Missing ER-context",
-                )
-            })?;
-
-            Ok(expand_er_transitive_join(
-                *left,
-                *right,
-                context,
-                registry,
-                outer_context,
-                config,
-                grounding,
-            )?)
-        }
-    }
+    let mut fold = ResolverFold::new(
+        registry,
+        config.clone(),
+        outer_context.map(|c| c.to_vec()),
+        grounding.cloned(),
+    );
+    fold.resolve_relational(expr)
 }
 
 // ============================================================================
@@ -3146,14 +1693,40 @@ fn extract_base_ground_name(
             identifier,
             ..
         }) => Some(identifier.name.clone()),
+        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::ConsultedView {
+            identifier,
+            ..
+        }) => Some(identifier.name.clone()),
+        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::InnerRelation {
+            alias,
+            pattern,
+            ..
+        }) => {
+            // InnerRelation: use alias if present, otherwise extract from pattern
+            if let Some(a) = alias {
+                Some(a.clone())
+            } else {
+                match pattern {
+                    ast_resolved::InnerRelationPattern::UncorrelatedDerivedTable {
+                        identifier,
+                        ..
+                    } => Some(identifier.name.clone()),
+                    _ => None,
+                }
+            }
+        }
+        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::Anonymous {
+            alias,
+            ..
+        }) => alias.clone(),
         ast_resolved::RelationalExpression::Pipe(pipe) => extract_base_ground_name(&pipe.source),
         ast_resolved::RelationalExpression::Filter { source, .. } => {
             extract_base_ground_name(source)
         }
-        other => panic!(
-            "catch-all hit in mod.rs extract_base_ground_name: {:?}",
-            other
-        ),
+        ast_resolved::RelationalExpression::Join { left, .. } => {
+            extract_base_ground_name(left)
+        }
+        _ => None,
     }
 }
 

@@ -5,6 +5,19 @@
 // - Replacing qualifiers in predicates
 // - Filtering predicates for specific operand pairs
 // - Collecting qualifiers from domain expressions
+//
+// NOTE: The replace_qualifier_* and collect_qualifiers_* functions are
+// hand-rolled walkers with `_ => expr.clone()` catch-alls. These catch-alls
+// are safe in practice because the only caller (set_operations.rs) feeds
+// simple Comparison/And predicates over Lvars. They are NOT intentional scope
+// boundaries — just omissions that never fire.
+//
+// These were evaluated as AstTransform<Addressed, Addressed> fold candidates
+// (target #3 in documentation/WALKER-TARGETS.md) but deferred: the inputs
+// are narrow, the code works, and the savings (~210 lines) don't justify the
+// risk of a first-ever Addressed-phase fold. If a bug surfaces from a missed
+// variant, the fold technique used in correlation_alias_fixer.rs and
+// flattener/rewrite.rs applies directly here.
 
 use crate::pipeline::ast_addressed;
 

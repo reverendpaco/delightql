@@ -1,6 +1,6 @@
 //! Post-processing: Replace parameter Lvars with Parameter/CurriedParameter/ContextParameter nodes.
 //!
-//! Three modes, each a small `AstFold<Refined>` implementation:
+//! Three modes, each a small `AstTransform<Refined, Refined>` implementation:
 //!
 //! - **Strict** (`StrictParamReplacer`): curried→CurriedParameter, regular→Parameter, else→Error
 //! - **Implicit** (`ImplicitParamReplacer`): curried→CurriedParameter, regular→Parameter,
@@ -8,7 +8,7 @@
 //! - **Explicit** (`ExplicitParamReplacer`): provenance-based dispatch
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_fold::{walk_domain, walk_function, AstFold};
+use crate::pipeline::ast_transform::{walk_transform_domain, walk_transform_function, AstTransform};
 use crate::pipeline::asts::core::expressions::domain::LvarProvenance;
 use crate::pipeline::asts::core::{
     DomainExpression, FunctionExpression, NamespacePath, Refined, SubstitutionExpr,
@@ -29,7 +29,7 @@ pub(super) fn replace_param_lvars_with_param_types(
         curried_params,
         regular_params,
     }
-    .fold_domain(expr)
+    .transform_domain(expr)
 }
 
 /// IMPLICIT MODE: Auto-discover non-parameter Lvars as context parameters.
@@ -44,7 +44,7 @@ pub(super) fn replace_params_with_implicit_context(
         regular_params,
         discovered_context,
     }
-    .fold_domain(expr)
+    .transform_domain(expr)
 }
 
 /// EXPLICIT MODE: Use provenance to dispatch Lvars to typed parameter nodes.
@@ -54,7 +54,7 @@ pub(super) fn replace_params_with_explicit_context(
     _regular_params: &[String],
     _declared_context: &[String],
 ) -> Result<DomainExpression<Refined>> {
-    ExplicitParamReplacer.fold_domain(expr)
+    ExplicitParamReplacer.transform_domain(expr)
 }
 
 // =============================================================================
@@ -66,8 +66,8 @@ struct StrictParamReplacer<'a> {
     regular_params: &'a [String],
 }
 
-impl AstFold<Refined> for StrictParamReplacer<'_> {
-    fn fold_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
+impl AstTransform<Refined, Refined> for StrictParamReplacer<'_> {
+    fn transform_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
         match e {
             DomainExpression::Lvar {
                 name,
@@ -110,11 +110,11 @@ impl AstFold<Refined> for StrictParamReplacer<'_> {
                     })
                 }
             }
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 
-    fn fold_function(
+    fn transform_function(
         &mut self,
         f: FunctionExpression<Refined>,
     ) -> Result<FunctionExpression<Refined>> {
@@ -125,7 +125,7 @@ impl AstFold<Refined> for StrictParamReplacer<'_> {
                 source: None,
                 subcategory: None,
             }),
-            other => walk_function(self, other),
+            other => walk_transform_function(self, other),
         }
     }
 }
@@ -140,8 +140,8 @@ struct ImplicitParamReplacer<'a> {
     discovered_context: &'a mut Vec<String>,
 }
 
-impl AstFold<Refined> for ImplicitParamReplacer<'_> {
-    fn fold_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
+impl AstTransform<Refined, Refined> for ImplicitParamReplacer<'_> {
+    fn transform_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
         match e {
             DomainExpression::Lvar {
                 name,
@@ -177,17 +177,17 @@ impl AstFold<Refined> for ImplicitParamReplacer<'_> {
                     ))
                 }
             }
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 
-    fn fold_function(
+    fn transform_function(
         &mut self,
         f: FunctionExpression<Refined>,
     ) -> Result<FunctionExpression<Refined>> {
         match f {
             FunctionExpression::MetadataTreeGroup { .. } => Ok(f),
-            other => walk_function(self, other),
+            other => walk_transform_function(self, other),
         }
     }
 }
@@ -198,8 +198,8 @@ impl AstFold<Refined> for ImplicitParamReplacer<'_> {
 
 struct ExplicitParamReplacer;
 
-impl AstFold<Refined> for ExplicitParamReplacer {
-    fn fold_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
+impl AstTransform<Refined, Refined> for ExplicitParamReplacer {
+    fn transform_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
         match e {
             DomainExpression::Lvar {
                 name,
@@ -234,7 +234,7 @@ impl AstFold<Refined> for ExplicitParamReplacer {
                     provenance,
                 }),
             },
-            other => walk_domain(self, other),
+            other => walk_transform_domain(self, other),
         }
     }
 }

@@ -1,9 +1,8 @@
 use crate::error::{DelightQLError, Result};
+use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
-use super::super::domain_expressions::{
-    resolve_expressions_with_schema, resolve_expressions_with_schema_internal,
-};
+use super::super::domain_expressions::projection::resolve_expressions_via_fold;
 use super::helpers::{emit_validation_warning, expand_column_template};
 
 /// Resolve the ProjectOut operator
@@ -11,6 +10,7 @@ use super::helpers::{emit_validation_warning, expand_column_template};
 /// This removes specified columns from the schema.
 /// Pattern matching can select zero columns (warning but valid - no-op).
 pub(super) fn resolve_project_out(
+    fold: &mut ResolverFold,
     containment_semantic: ast_unresolved::ContainmentSemantic,
     expressions: Vec<ast_unresolved::DomainExpression>,
     available: &[ast_resolved::ColumnMetadata],
@@ -19,14 +19,11 @@ pub(super) fn resolve_project_out(
     Vec<ast_resolved::ColumnMetadata>,
 )> {
     // Resolve expressions to remove - allow zero matches for patterns
-    let resolved_expressions = resolve_expressions_with_schema_internal(
+    let resolved_expressions = resolve_expressions_via_fold(
+        fold,
         expressions,
         available,
         true,
-        None,
-        None,
-        None,
-        false,
     )?;
 
     // Compute output columns - remove specified columns from input
@@ -91,6 +88,7 @@ pub(super) fn resolve_project_out(
 /// This renames columns based on pattern matching and templates.
 /// Supports template expansion with {@} (column name) and {#} (position).
 pub(super) fn resolve_rename_cover(
+    fold: &mut ResolverFold,
     specs: Vec<ast_unresolved::RenameSpec>,
     available: &[ast_resolved::ColumnMetadata],
 ) -> Result<(
@@ -108,7 +106,7 @@ pub(super) fn resolve_rename_cover(
     for spec in specs {
         // Resolve the 'from' expression (may be pattern, glob, or column name)
         let resolved_columns =
-            resolve_expressions_with_schema(vec![spec.from], available, None, None, None, false)?;
+            resolve_expressions_via_fold(fold, vec![spec.from], available, false)?;
 
         // For each matched column, compute its new name
         for resolved_expr in &resolved_columns {
@@ -205,6 +203,7 @@ pub(super) fn resolve_rename_cover(
 /// Supports both positive (1-based) and negative (from end) positioning.
 /// Critical for CPR Law 0 - returns REORDERED columns.
 pub(super) fn resolve_reposition(
+    fold: &mut ResolverFold,
     moves: Vec<ast_unresolved::RepositionSpec>,
     available: &[ast_resolved::ColumnMetadata],
 ) -> Result<(
@@ -219,17 +218,15 @@ pub(super) fn resolve_reposition(
 
     for spec in moves {
         // Resolve the column reference
-        let resolved_column = resolve_expressions_with_schema(
+        let resolved_column = resolve_expressions_via_fold(
+            fold,
             vec![spec.column.clone()],
             available,
-            None,
-            None,
-            None,
             false,
         )?
         .into_iter()
         .next()
-        .expect("resolve_expressions_with_schema returns same count as input");
+        .expect("resolve_expressions_via_fold returns same count as input");
 
         // Find which column this refers to
         let column_idx = match &spec.column {
@@ -511,19 +508,17 @@ pub(super) fn resolve_using_all(
     ))
 }
 
-/// Resolve the DmlTerminal operator
+/// Resolve the DmlTerminal operator via fold-based dispatch
 ///
-/// DML terminals (delete!, update!, insert!, keep!) transform the upstream query
-/// into a SQL DML statement. At resolution time, we resolve the DQL namespace
-/// to the SQL schema name (via the same path as SELECT table resolution), then
-/// pass through — the transformer handles actual DML statement generation.
-pub(super) fn resolve_dml_terminal(
+/// Same semantics as `resolve_dml_terminal`, but accesses `fold.registry` for
+/// namespace lookups instead of taking a separate `registry` parameter.
+pub(super) fn resolve_dml_terminal_via_fold(
+    fold: &mut ResolverFold,
     kind: crate::pipeline::asts::core::operators::DmlKind,
     target: String,
     target_namespace: Option<String>,
     domain_spec: ast_unresolved::DomainSpec,
     available: &[ast_resolved::ColumnMetadata],
-    registry: &mut crate::resolution::EntityRegistry,
 ) -> Result<(
     ast_resolved::UnaryRelationalOperator,
     Vec<ast_resolved::ColumnMetadata>,
@@ -531,12 +526,12 @@ pub(super) fn resolve_dml_terminal(
     // Resolve DQL namespace → SQL schema (same path as SELECT table resolution)
     // Also track the connection_id so the execution engine routes DML to the correct database
     let resolved_namespace = if let Some(ref ns) = target_namespace {
-        if let Some(system) = registry.database.system {
+        if let Some(system) = fold.registry.database.system {
             let parts: Vec<String> = ns.split("::").map(|s| s.to_string()).collect();
             let ns_path = delightql_types::namespace::NamespacePath::from_parts(parts);
             match system.resolve_namespace_path(&ns_path) {
                 Ok(Some((source_ns, connection_id))) => {
-                    registry.track_connection_id(connection_id);
+                    fold.registry.track_connection_id(connection_id);
                     source_ns
                 }
                 _ => target_namespace,
@@ -558,8 +553,8 @@ pub(super) fn resolve_dml_terminal(
             ast_resolved::DomainSpec::GlobWithUsingAll
         }
         ast_unresolved::DomainSpec::Positional(exprs) => {
-            let resolved = super::super::domain_expressions::resolve_expressions_with_schema(
-                exprs, available, None, None, None, false,
+            let resolved = super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                fold, exprs, available, false,
             )?;
             ast_resolved::DomainSpec::Positional(resolved)
         }

@@ -454,8 +454,9 @@ pub fn transform_relation(
                     // UDT: Uncorrelated Derived Table
                     // Transform: relation(|> pipeline) → (SELECT ... FROM relation ...) AS alias
 
-                    // Step 1: Transform the inner subquery to SQL
-                    let subquery_state = super::transform_relational(*subquery, ctx)?;
+                    // Step 1: Transform the inner subquery to SQL (clear correlation for FROM-clause context)
+                    let inner_ctx = ctx.clear_correlation();
+                    let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
                     let subquery_expr = super::segment_handler::finalize_to_query(subquery_state)?;
 
                     // Step 2: Determine the alias for the derived table
@@ -556,8 +557,11 @@ pub fn transform_relation(
                     hygienic_injections: _,
                 } => {
                     // CDT-SJ: Correlated Derived Table - Scalar Join
-                    // Transform the inner subquery
-                    let subquery_state = super::transform_relational(*subquery, ctx)?;
+                    // Transform the inner subquery with cleared correlation_alias.
+                    // The derived table is a FROM-clause subquery — its Fresh table
+                    // columns must not inherit the outer correlation context.
+                    let inner_ctx = ctx.clear_correlation();
+                    let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
                     let subquery_expr = super::segment_handler::finalize_to_query(subquery_state)?;
 
                     // NOTE: Hygienic columns remain visible in the subquery so JOIN ON can reference them
@@ -588,7 +592,8 @@ pub fn transform_relation(
                 } => {
                     // CDT-GJ: Correlated Derived Table - Group Join
                     // Transform the inner subquery (which has GROUP BY from modulo operator)
-                    let subquery_state = super::transform_relational(*subquery, ctx)?;
+                    let inner_ctx = ctx.clear_correlation();
+                    let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
                     let subquery_expr = super::segment_handler::finalize_to_query(subquery_state)?;
 
                     // NOTE: Hygienic columns remain visible in the subquery so JOIN ON can reference them
@@ -635,8 +640,9 @@ pub fn transform_relation(
                     // We need this to expand SELECT * into explicit columns later
                     let subquery_schema = super::schema_utils::get_relational_schema(&subquery);
 
-                    // Step 2: Transform the subquery
-                    let subquery_state = super::transform_relational(*subquery, ctx)?;
+                    // Step 2: Transform the subquery (clear correlation for FROM-clause context)
+                    let inner_ctx = ctx.clear_correlation();
+                    let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
                     let mut subquery_expr =
                         super::segment_handler::finalize_to_query(subquery_state)?;
 

@@ -208,7 +208,7 @@ pub(super) fn build_join_condition(
                 }
             }
             _ if matches!(p.class, PredicateClass::FJC { .. }) => {
-                join_conditions.push(p.expr.into());
+                join_conditions.push(super::refine_predicate_boolean(p.expr)?);
             }
             // Other predicates (FIC, etc.): not join conditions, skip here
             // They'll be placed as WHERE filters by the predicate placement logic

@@ -9,17 +9,17 @@ mod schema_ops;
 mod transformation;
 
 use crate::error::Result;
+use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
-use crate::resolution::EntityRegistry;
 
-/// Resolve a unary relational operator using the shared registry
+/// Resolve a unary relational operator using the fold-based dispatch
 ///
-/// General (projection) uses the registry for scalar subquery resolution.
-/// All other operators delegate to their schema-only implementations.
-pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
+/// Same semantics as `resolve_operator_with_registry`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
+    fold: &mut ResolverFold,
     operator: ast_unresolved::UnaryRelationalOperator,
     available: &[ast_resolved::ColumnMetadata],
-    registry: &mut EntityRegistry,
     pivot_in_values: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<(
     ast_resolved::UnaryRelationalOperator,
@@ -29,29 +29,30 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
         ast_unresolved::UnaryRelationalOperator::General {
             containment_semantic,
             expressions,
-        } => projection::resolve_general_with_registry(
+        } => projection::resolve_general_via_fold(
+            fold,
             containment_semantic,
             expressions,
             available,
-            registry,
         ),
 
         ast_unresolved::UnaryRelationalOperator::Modulo {
             containment_semantic,
             spec,
-        } => aggregation::resolve_modulo(containment_semantic, spec, available, pivot_in_values),
+        } => aggregation::resolve_modulo_via_fold(fold, containment_semantic, spec, available, pivot_in_values),
 
         ast_unresolved::UnaryRelationalOperator::TupleOrdering {
             containment_semantic,
             specs,
-        } => ordering::resolve_tuple_ordering(containment_semantic, specs, available),
+        } => ordering::resolve_tuple_ordering_via_fold(fold, containment_semantic, specs, available),
 
         ast_unresolved::UnaryRelationalOperator::MapCover {
             function,
             columns,
             containment_semantic,
             conditioned_on,
-        } => transformation::resolve_map_cover(
+        } => transformation::resolve_map_cover_via_fold(
+            fold,
             function,
             columns,
             containment_semantic,
@@ -62,23 +63,23 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
         ast_unresolved::UnaryRelationalOperator::ProjectOut {
             containment_semantic,
             expressions,
-        } => schema_ops::resolve_project_out(containment_semantic, expressions, available),
+        } => schema_ops::resolve_project_out(fold, containment_semantic, expressions, available),
 
         ast_unresolved::UnaryRelationalOperator::RenameCover { specs } => {
-            schema_ops::resolve_rename_cover(specs, available)
+            schema_ops::resolve_rename_cover(fold, specs, available)
         }
 
         ast_unresolved::UnaryRelationalOperator::Transform {
             transformations,
             conditioned_on,
-        } => transformation::resolve_transform(transformations, conditioned_on, available),
+        } => transformation::resolve_transform_via_fold(fold, transformations, conditioned_on, available),
 
         ast_unresolved::UnaryRelationalOperator::AggregatePipe { aggregations } => {
-            aggregation::resolve_aggregate_pipe(aggregations, available)
+            aggregation::resolve_aggregate_pipe_via_fold(fold, aggregations, available)
         }
 
         ast_unresolved::UnaryRelationalOperator::Reposition { moves } => {
-            schema_ops::resolve_reposition(moves, available)
+            schema_ops::resolve_reposition(fold, moves, available)
         }
 
         ast_unresolved::UnaryRelationalOperator::EmbedMapCover {
@@ -86,7 +87,8 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
             selector,
             alias_template,
             containment_semantic,
-        } => transformation::resolve_embed_map_cover(
+        } => transformation::resolve_embed_map_cover_via_fold(
+            fold,
             function,
             selector,
             alias_template,
@@ -111,13 +113,13 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
             target,
             target_namespace,
             domain_spec,
-        } => schema_ops::resolve_dml_terminal(
+        } => schema_ops::resolve_dml_terminal_via_fold(
+            fold,
             kind,
             target,
             target_namespace,
             domain_spec,
             available,
-            registry,
         ),
         ast_unresolved::UnaryRelationalOperator::InteriorDrillDown {
             column,

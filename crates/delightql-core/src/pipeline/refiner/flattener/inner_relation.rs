@@ -2,7 +2,10 @@
 
 use super::context::FlattenContext;
 use super::expression::add_predicate;
-use super::rewrite::{rewrite_inner_qualifiers, rewrite_with_hygienic_names};
+use super::rewrite::{
+    collect_filter_qualifiers, could_be_inner_alias, rewrite_correlation_filter_with_scope,
+    rewrite_subquery_self_references, rewrite_with_hygienic_names,
+};
 use super::types::{FlatSegment, FlatTable, OperationContext};
 use crate::error::Result;
 use crate::pipeline::asts::resolved::{self, CprSchema, InnerRelationPattern, PhaseBox};
@@ -120,18 +123,46 @@ pub(super) fn flatten_inner_relation(
                 cleaned_subquery
             };
 
-            // Flatten the cleaned subquery recursively
-            let flattened_subquery = super::flatten(cleaned_subquery)?;
+            // Rewrite self-reference qualifiers in non-correlation filters
+            // e.g., `o.status = "completed"` → `orders.status = "completed"`
+            let cleaned_subquery =
+                rewrite_subquery_self_references(cleaned_subquery, &identifier.name);
+
+            // INDUCTIVE STEP: Build scope map for recursion.
+            // Start with inherited scope_aliases from parent depths, then add
+            // self-reference aliases from THIS depth's correlation filters.
+            let mut new_scope = ctx.scope_aliases.clone();
+            for filter in correlation_filters.iter() {
+                for q in collect_filter_qualifiers(filter) {
+                    if could_be_inner_alias(&q, &identifier.name) {
+                        new_scope.insert(q, identifier.name.to_string());
+                    }
+                }
+            }
+            // Also add the exact table name so child depths can resolve it
+            new_scope.insert(identifier.name.to_string(), identifier.name.to_string());
+
+            log::debug!(
+                "[SCOPE-INDUCTIVE] table={}, parent_scope={:?}, new_scope={:?}, corr_filters={:?}",
+                identifier.name,
+                ctx.scope_aliases,
+                new_scope,
+                correlation_filters.iter().map(|f| format!("{:?}", f)).collect::<Vec<_>>()
+            );
+
+            // Flatten the cleaned subquery recursively WITH scope context
+            let flattened_subquery = super::flatten_with_scope(cleaned_subquery, new_scope)?;
 
             // Extract correlation filters and add to PARENT segment predicates
             // This hoists them out of the subquery so they become JOIN ON clauses
-            // IMPORTANT: Rewrite inner qualifiers to match the derived table's alias
-            //            AND rewrite column names to use hygienic aliases if injected
+            // IMPORTANT: Use scope-aware rewriting so ancestor aliases (depth N-2+)
+            //            are resolved to their canonical table names.
             for filter in correlation_filters {
-                let mut rewritten_filter = rewrite_inner_qualifiers(
+                let mut rewritten_filter = rewrite_correlation_filter_with_scope(
                     filter.clone(),
                     &identifier.name,
                     &derived_table_alias,
+                    &ctx.scope_aliases,
                 );
 
                 // Apply hygienic column name rewrites if injections exist
@@ -199,9 +230,12 @@ pub(super) fn flatten_inner_relation(
                 }
             };
 
-            // Recursively flatten subquery if present
+            // Recursively flatten subquery if present, passing through inherited scope
             let flattened_subquery_opt = if let Some(subquery) = subquery_opt {
-                Some(Box::new(super::flatten((**subquery).clone())?))
+                Some(Box::new(super::flatten_with_scope(
+                    (**subquery).clone(),
+                    ctx.scope_aliases.clone(),
+                )?))
             } else {
                 None
             };

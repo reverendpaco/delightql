@@ -1379,7 +1379,6 @@ struct AggregateResult {
     any_worker_error: bool,
     all_results: Vec<TestCaseResult>,
 }
-
 fn run_sharded_workers(
     socket_path: &Path,
     db_map: &std::collections::HashMap<i64, String>,

@@ -4,7 +4,6 @@ use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::NamespacePath;
 use crate::pipeline::asts::{resolved, unresolved};
 use crate::pipeline::resolver::{self, DatabaseSchema};
-use std::collections::HashMap;
 
 use super::postprocessing::{
     replace_param_lvars_with_param_types, replace_params_with_explicit_context,
@@ -167,15 +166,16 @@ pub(crate) fn precompile_cfe_definition(
         cfe.context_mode,
         in_correlation
     );
-    let mut empty_cte_context = HashMap::new();
-    let resolved_body = resolver::resolving::resolve_domain_expr_with_full_context_and_system(
+    let mut registry = if let Some(sys) = system {
+        crate::resolution::EntityRegistry::new_with_system(schema, sys)
+    } else {
+        crate::resolution::EntityRegistry::new(schema)
+    };
+    let resolved_body = resolver::resolving::resolve_domain_expr_via_registry(
         body,
+        &mut registry,
         &fake_columns,
-        schema,
-        &mut empty_cte_context,
-        in_correlation, // Only for implicit mode (discovery); explicit mode validates everything
-        None, // No CFE validation during CFE precompilation (can't validate calls to CFEs being compiled)
-        system,
+        in_correlation,
     )?;
 
     // STEP 3: Refine the resolved body (handles embedded subqueries)

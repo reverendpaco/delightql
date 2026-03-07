@@ -470,27 +470,24 @@ pub(super) fn bubble_domain_expression(
                     using_columns: _,
                 } => {
                     let table_name = &identifier.name;
-                    if !schema.table_exists(None, table_name) {
-                        return Err(DelightQLError::TableNotFoundError {
-                            table_name: table_name.to_string(),
-                            context: "Referenced in EXISTS clause".to_string(),
-                        });
-                    }
+                    let state = if schema.table_exists(None, table_name)
+                        || cte_context.contains_key(table_name.as_ref())
+                    {
+                        // Table is in database or CTE context — do full bubbling
+                        let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                            *subquery,
+                            schema,
+                            cte_context,
+                            outer_context,
+                        )?;
+                        *cte_context = bubble_result.updated_cte_context;
+                        BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+                    } else {
+                        // Entity not in DB schema or CTEs — may be a consulted view.
+                        // Skip inner-CPR bubbling; registry-based resolution handles it.
+                        BubbledState::resolved(Vec::new())
+                    };
 
-                    // Use shared inner-CPR double resolution helper
-                    let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
-                        *subquery,
-                        schema,
-                        cte_context,
-                        outer_context,
-                    )?;
-                    *cte_context = bubble_result.updated_cte_context;
-
-                    let state =
-                        BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
-
-                    // For InnerExists, we need special handling - keep it unresolved but track the subquery needs
-                    // Return the original expression since we can't resolve InnerExists yet
                     Ok((expr, state))
                 }
                 other => {
@@ -576,23 +573,24 @@ pub(super) fn bubble_domain_expression(
         } => {
             // Scalar subquery - same pattern as InnerExists but returns a value
             let table_name = &identifier.name;
-            if !schema.table_exists(None, table_name) {
-                return Err(DelightQLError::TableNotFoundError {
-                    table_name: table_name.to_string(),
-                    context: "Referenced in scalar subquery".to_string(),
-                });
-            }
-
-            // Use shared inner-CPR double resolution helper
-            let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
-                *subquery,
-                schema,
-                cte_context,
-                outer_context,
-            )?;
-            *cte_context = bubble_result.updated_cte_context;
-
-            let state = BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
+            let state = if schema.table_exists(None, table_name)
+                || cte_context.contains_key(table_name.as_ref())
+            {
+                // Table is in database or CTE context — do full bubbling
+                let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                    *subquery,
+                    schema,
+                    cte_context,
+                    outer_context,
+                )?;
+                *cte_context = bubble_result.updated_cte_context;
+                BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+            } else {
+                // Entity not in DB schema or CTEs — may be a consulted view.
+                // Skip inner-CPR bubbling; the registry-based resolution
+                // path will handle validation properly.
+                BubbledState::resolved(Vec::new())
+            };
 
             Ok((expr, state))
         }
@@ -845,23 +843,23 @@ pub(super) fn bubble_predicate_expression(
             ..
         } => {
             let table_name = &identifier.name;
-            if !schema.table_exists(None, table_name) {
-                return Err(DelightQLError::TableNotFoundError {
-                    table_name: table_name.to_string(),
-                    context: "Referenced in EXISTS clause".to_string(),
-                });
-            }
-
-            // Use shared inner-CPR double resolution helper
-            let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
-                *subquery,
-                schema,
-                cte_context,
-                outer_context,
-            )?;
-            *cte_context = bubble_result.updated_cte_context;
-
-            let state = BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
+            let state = if schema.table_exists(None, table_name)
+                || cte_context.contains_key(table_name.as_ref())
+            {
+                // Table is in database or CTE context — do full bubbling
+                let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                    *subquery,
+                    schema,
+                    cte_context,
+                    outer_context,
+                )?;
+                *cte_context = bubble_result.updated_cte_context;
+                BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+            } else {
+                // Entity not in DB schema or CTEs — may be a consulted view.
+                // Skip inner-CPR bubbling; registry-based resolution handles it.
+                BubbledState::resolved(Vec::new())
+            };
 
             Ok((pred, state))
         }
@@ -939,26 +937,30 @@ pub(super) fn bubble_predicate_expression(
             ..
         } => {
             let table_name = &identifier.name;
-            if !schema.table_exists(None, table_name) {
-                return Err(DelightQLError::TableNotFoundError {
-                    table_name: table_name.to_string(),
-                    context: "Referenced in IN subquery".to_string(),
-                });
-            }
-
             let (_value_unchanged, value_state) =
                 bubble_domain_expression(*value, schema, cte_context, None)?;
 
-            let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
-                *subquery,
-                schema,
-                cte_context,
-                outer_context,
-            )?;
-            *cte_context = bubble_result.updated_cte_context;
-
-            let mut state = BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
-            state.i_need.extend(value_state.i_need);
+            let state = if schema.table_exists(None, table_name)
+                || cte_context.contains_key(table_name.as_ref())
+            {
+                let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                    *subquery,
+                    schema,
+                    cte_context,
+                    outer_context,
+                )?;
+                *cte_context = bubble_result.updated_cte_context;
+                let mut state =
+                    BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
+                state.i_need.extend(value_state.i_need);
+                state
+            } else {
+                // Entity not in DB schema or CTEs — may be a consulted view.
+                // Skip inner-CPR bubbling; registry-based resolution handles it.
+                let mut state = BubbledState::resolved(Vec::new());
+                state.i_need.extend(value_state.i_need);
+                state
+            };
 
             Ok((pred, state))
         }

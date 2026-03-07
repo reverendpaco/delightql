@@ -1,0 +1,53 @@
+add(T(v))(*) :-
+  (~~docs
+    Sum all values in column v.
+
+    Usage:
+      _(v ---- 10; 3; 2) |> std::math.add(*)
+  ~~)
+  T(*) ~> sum:(v)
+
+sub(T(v))(*) :-
+  (~~docs
+    Left-fold subtract over column v.
+
+    Usage:
+      _(v ---- 10; 3; 2) |> std::math.sub(*)
+      -- result: 5  (i.e. 10 - 3 - 2)
+  ~~)
+  T(*) |> +(row_number:(<~) as pos) : numbered
+  numbered(*), pos = 1 |> (v as acc, 1 as i) : fold
+  fold(*) as f, numbered(*) as n, n.pos = (f.i + 1)
+    |> (f.acc - n.v as acc, f.i + 1 as i) : fold
+  fold(*) |> %(~> max:(i) as max_i) : last_step
+  fold(*), last_step(*), i = max_i |> (acc as result)
+
+div(T(v))(*) :-
+  (~~docs
+    Left-fold divide over column v.
+
+    Usage:
+      _(v ---- 10.0; 3.0; 2.0) |> std::math.div(*)
+      -- result: 1.6667  (i.e. 10 / 3 / 2)
+  ~~)
+  T(*) |> +(row_number:(<~) as pos) : numbered
+  numbered(*), pos = 1 |> (v as acc, 1 as i) : fold
+  fold(*) as f, numbered(*) as n, n.pos = (f.i + 1)
+    |> (f.acc / n.v as acc, f.i + 1 as i) : fold
+  fold(*) |> %(~> max:(i) as max_i) : last_step
+  fold(*), last_step(*), i = max_i |> (acc as result)
+
+mul(T(v))(*) :-
+  (~~docs
+    Left-fold multiply over column v.
+
+    Usage:
+      _(v ---- 2; 3; 4) |> std::math.mul(*)
+      -- result: 24  (i.e. 2 * 3 * 4)
+  ~~)
+  T(*) |> +(row_number:(<~) as pos) : numbered
+  numbered(*), pos = 1 |> (v as acc, 1 as i) : fold
+  fold(*) as f, numbered(*) as n, n.pos = (f.i + 1)
+    |> (f.acc * n.v as acc, f.i + 1 as i) : fold
+  fold(*) |> %(~> max:(i) as max_i) : last_step
+  fold(*), last_step(*), i = max_i |> (acc as result)

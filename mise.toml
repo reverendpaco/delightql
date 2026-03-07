@@ -100,7 +100,7 @@ run = """
 [tasks.build-rust-bins-debug]
 description = "Build the three binaries: dql, dql-pack-man and dql-fmt"
 run = """
-cargo build --bin  dql --bin dql-pack-man --bin dql-fmt --features="bundled-parser"
+cargo build --bin  dql --bin dql-test-ball-runner --bin dql-pack-man --bin dql-fmt --features="bundled-parser"
 """
 
 [tasks.build-rust-bins-release-tiny]

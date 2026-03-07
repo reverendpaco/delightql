@@ -4,7 +4,7 @@ use crate::pipeline::ast_unresolved;
 use crate::pipeline::asts::core::{ProjectionExpr, SubstitutionExpr};
 
 /// Resolve simple expressions (lvars, literals, parameters, etc.)
-pub(super) fn resolve_simple_expr(
+pub(in crate::pipeline::resolver) fn resolve_simple_expr(
     expr: ast_unresolved::DomainExpression,
     available: &[ast_resolved::ColumnMetadata],
     in_correlation: bool,
@@ -145,7 +145,7 @@ pub(super) fn resolve_simple_expr(
 }
 
 /// Resolve expressions that are only valid in projection contexts
-pub(super) fn resolve_projection_only_expr(
+pub(in crate::pipeline::resolver) fn resolve_projection_only_expr(
     expr: ast_unresolved::DomainExpression,
 ) -> Result<ast_resolved::DomainExpression> {
     match expr {

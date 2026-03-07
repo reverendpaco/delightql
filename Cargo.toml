@@ -12,6 +12,7 @@ members = [
     "crates/delightql-protocol",
     "crates/delightql-sql-adapter",
     "crates/dql-pack-man",
+    "crates/dql-test-ball-runner",
     "crates/tree-sitter-highlight",
     "crates/delightql-cabi",
 ]

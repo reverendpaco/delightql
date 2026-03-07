@@ -1,270 +1,10 @@
 use crate::error::Result;
 use crate::pipeline::asts::unresolved::NamespacePath;
+use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
 use super::super::column_extraction::extract_provided_column_from_domain_expr;
-use super::super::domain_expressions::resolve_expressions_with_schema;
 use super::helpers::restructure_tree_groups_for_grouping;
-
-/// Resolve the Modulo operator (GROUP BY / DISTINCT)
-///
-/// This handles grouping and aggregation operations:
-/// - Simple DISTINCT (columns only)
-/// - Complex GROUP BY with aggregations (reducing_by + reducing_on)
-/// - Pivot expressions (PivotOf in reducing_on)
-pub(super) fn resolve_modulo(
-    containment_semantic: ast_unresolved::ContainmentSemantic,
-    spec: ast_unresolved::ModuloSpec,
-    available: &[ast_resolved::ColumnMetadata],
-    pivot_in_values: &std::collections::HashMap<String, Vec<String>>,
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Resolve ModuloSpec (GROUP BY/DISTINCT)
-    let (resolved_spec, output_columns) = match spec {
-        ast_unresolved::ModuloSpec::Columns(cols) => {
-            // Simple distinct/group on columns
-            let resolved_cols =
-                resolve_expressions_with_schema(cols, available, None, None, None, false)?;
-
-            // Compute output columns - only the distinct columns
-            let mut output = Vec::new();
-            for (idx, expr) in resolved_cols.iter().enumerate() {
-                if let Some(col) = extract_provided_column_from_domain_expr(expr, available, idx) {
-                    output.push(col);
-                }
-            }
-
-            (ast_resolved::ModuloSpec::Columns(resolved_cols), output)
-        }
-        ast_unresolved::ModuloSpec::GroupBy {
-            reducing_by,
-            reducing_on,
-            arbitrary,
-        } => {
-            // Complex GROUP BY with aggregations
-            let mut resolved_reducing_by =
-                resolve_expressions_with_schema(reducing_by, available, None, None, None, false)?;
-            let mut resolved_reducing_on =
-                resolve_expressions_with_schema(reducing_on, available, None, None, None, false)?;
-
-            // Populate pivot_values for PivotOf expressions from IN predicates
-            for expr in resolved_reducing_on.iter_mut() {
-                if let ast_resolved::DomainExpression::PivotOf {
-                    pivot_key,
-                    pivot_values,
-                    ..
-                } = expr
-                {
-                    match pivot_key.as_ref() {
-                        ast_resolved::DomainExpression::Lvar { name, .. } => {
-                            // Simple column reference: look up IN values directly
-                            if let Some(values) = pivot_in_values.get(name.as_str()) {
-                                *pivot_values = values.clone();
-                            } else {
-                                return Err(crate::error::DelightQLError::validation_error(
-                                    format!(
-                                        "Pivot 'of' on column '{}' requires a matching IN predicate with literal values",
-                                        name
-                                    ),
-                                    "Add a filter like: column in (\"value1\"; \"value2\")".to_string(),
-                                ));
-                            }
-                        }
-                        _ => {
-                            // Format-string case: pivot_key is a concat chain from StringTemplate
-                            // e.g. :"{subject}_grade" → Infix("concat", Lvar("subject"), Literal("_grade"))
-                            let lvar_names = extract_lvar_names_from_expr(pivot_key.as_ref());
-                            if lvar_names.is_empty() {
-                                return Err(crate::error::DelightQLError::validation_error(
-                                    "Pivot 'of' key must reference a column (directly or via format string)".to_string(),
-                                    "Use a column name or format string like: value of column, value of :\"{column}_suffix\"".to_string(),
-                                ));
-                            }
-
-                            // Find the first referenced column that has IN values
-                            let found = lvar_names.iter().find_map(|name| {
-                                pivot_in_values.get(name).map(|v| (name.clone(), v.clone()))
-                            });
-
-                            if let Some((ref_col, in_values)) = found {
-                                // Expand the concat template for each IN value
-                                let mut expanded = Vec::new();
-                                for value in &in_values {
-                                    let mut subs = std::collections::HashMap::new();
-                                    subs.insert(ref_col.clone(), value.clone());
-                                    expanded
-                                        .push(expand_concat_template(pivot_key.as_ref(), &subs));
-                                }
-                                *pivot_values = expanded;
-                            } else {
-                                let col_list = lvar_names.join(", ");
-                                return Err(crate::error::DelightQLError::validation_error(
-                                    format!(
-                                        "Pivot 'of' format string references column(s) '{}' but none have a matching IN predicate",
-                                        col_list
-                                    ),
-                                    "Add a filter like: column in (\"value1\"; \"value2\")".to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Tree group restructuring: detect nested reductions and promote non-nested columns
-            // If reducing_on contains a tree group with both non-nested and nested members,
-            // move non-nested members to reducing_by
-            restructure_tree_groups_for_grouping(
-                &mut resolved_reducing_by,
-                &mut resolved_reducing_on,
-            )?;
-
-            // Phase R3: Analyze tree groups and populate CTE requirements
-            // This metadata will guide the transformer to generate independent CTEs
-            super::super::tree_group_analysis::analyze_tree_groups_for_ctes(
-                &mut resolved_reducing_by,
-                &mut resolved_reducing_on,
-            )?;
-
-            // Compute output columns - GROUP BY columns plus aggregates
-            let mut output = Vec::new();
-
-            // First add the GROUP BY columns
-            for (idx, expr) in resolved_reducing_by.iter().enumerate() {
-                if let Some(col) = extract_provided_column_from_domain_expr(expr, available, idx) {
-                    output.push(col);
-                }
-            }
-
-            // Then add aggregate/pivot columns
-            let base_idx = resolved_reducing_by.len();
-            for (idx, expr) in resolved_reducing_on.iter().enumerate() {
-                match expr {
-                    ast_resolved::DomainExpression::PivotOf { pivot_values, .. } => {
-                        // Add one output column per pivot value
-                        for value in pivot_values {
-                            let col_name = value.to_lowercase();
-                            output.push(ast_resolved::ColumnMetadata::new_with_name_flag(
-                                ast_resolved::ColumnProvenance::from_column(col_name),
-                                ast_resolved::FqTable {
-                                    parents_path: NamespacePath::empty(),
-                                    name: ast_resolved::TableName::Fresh,
-                                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(
-                                        None,
-                                    ),
-                                },
-                                None,
-                                true,
-                            ));
-                        }
-                    }
-                    _ => {
-                        if let Some(col) = extract_provided_column_from_domain_expr(
-                            expr,
-                            available,
-                            base_idx + idx,
-                        ) {
-                            output.push(col);
-                        }
-                    }
-                }
-            }
-
-            // Check for duplicate pivot column names.
-            // The book requires each `of` expression to produce distinct column names.
-            // e.g. `score of subject, grade of subject` is invalid — use format strings
-            // like `grade of :"{subject}_grade"` to disambiguate.
-            {
-                let pivot_col_names: Vec<String> = output
-                    .iter()
-                    .skip(resolved_reducing_by.len())
-                    .map(|col| col.name().to_string())
-                    .collect();
-                let mut seen = std::collections::HashSet::new();
-                for name in &pivot_col_names {
-                    if !seen.insert(name.as_str()) {
-                        return Err(crate::error::DelightQLError::validation_error(
-                            format!(
-                                "Duplicate pivot column name '{}'. Each 'of' expression must produce distinct column names",
-                                name
-                            ),
-                            "Use a format string to disambiguate, e.g.: grade of :\"{subject}_grade\"".to_string(),
-                        ));
-                    }
-                }
-            }
-
-            // Resolve arbitrary columns
-            let resolved_arbitrary =
-                resolve_expressions_with_schema(arbitrary, available, None, None, None, false)?;
-
-            // Add arbitrary columns to output
-            let base_idx = resolved_reducing_by.len() + resolved_reducing_on.len();
-            for (idx, expr) in resolved_arbitrary.iter().enumerate() {
-                if let Some(col) =
-                    extract_provided_column_from_domain_expr(expr, available, base_idx + idx)
-                {
-                    output.push(col);
-                }
-            }
-
-            // Capture interior schemas for tree group columns
-            // When reducing_on contains a Curly function with an alias (e.g., ~> {name, type} as entities),
-            // attach the interior schema to the corresponding output column so drill-down can use it.
-            capture_interior_schemas(&resolved_reducing_on, &mut output);
-
-            let spec = ast_resolved::ModuloSpec::GroupBy {
-                reducing_by: resolved_reducing_by,
-                reducing_on: resolved_reducing_on,
-                arbitrary: resolved_arbitrary,
-            };
-
-            (spec, output)
-        }
-    };
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::Modulo {
-        containment_semantic:
-            super::super::super::helpers::converters::convert_containment_semantic(
-                containment_semantic,
-            ),
-        spec: resolved_spec,
-    };
-
-    Ok((resolved_op, output_columns))
-}
-
-/// Resolve the AggregatePipe operator
-///
-/// This handles aggregation-only operations (no grouping).
-/// Output schema contains only the aggregated expressions.
-pub(super) fn resolve_aggregate_pipe(
-    aggregations: Vec<ast_unresolved::DomainExpression>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Resolve aggregation expressions
-    let resolved_aggregations =
-        resolve_expressions_with_schema(aggregations, available, None, None, None, false)?;
-
-    // Compute output columns for aggregate pipe - only the aggregations
-    let mut output_columns = Vec::new();
-    for (idx, expr) in resolved_aggregations.iter().enumerate() {
-        if let Some(col) = extract_provided_column_from_domain_expr(expr, available, idx) {
-            output_columns.push(col);
-        }
-    }
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::AggregatePipe {
-        aggregations: resolved_aggregations,
-    };
-
-    Ok((resolved_op, output_columns))
-}
 
 /// Extract all Lvar names from a resolved expression (recursing into concat chains).
 fn extract_lvar_names_from_expr(expr: &ast_resolved::DomainExpression) -> Vec<String> {
@@ -626,4 +366,264 @@ fn extract_curly_members_schema(
         | ast_resolved::DomainExpression::ScalarSubquery { .. }
         | ast_resolved::DomainExpression::PivotOf { .. } => None,
     }
+}
+
+/// Resolve the Modulo operator (GROUP BY / DISTINCT) via fold-based dispatch
+///
+/// Same semantics as `resolve_modulo`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(super) fn resolve_modulo_via_fold(
+    fold: &mut ResolverFold,
+    containment_semantic: ast_unresolved::ContainmentSemantic,
+    spec: ast_unresolved::ModuloSpec,
+    available: &[ast_resolved::ColumnMetadata],
+    pivot_in_values: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<(
+    ast_resolved::UnaryRelationalOperator,
+    Vec<ast_resolved::ColumnMetadata>,
+)> {
+    // Resolve ModuloSpec (GROUP BY/DISTINCT)
+    let (resolved_spec, output_columns) = match spec {
+        ast_unresolved::ModuloSpec::Columns(cols) => {
+            // Simple distinct/group on columns
+            let resolved_cols =
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, cols, available, false)?;
+
+            // Compute output columns - only the distinct columns
+            let mut output = Vec::new();
+            for (idx, expr) in resolved_cols.iter().enumerate() {
+                if let Some(col) = extract_provided_column_from_domain_expr(expr, available, idx) {
+                    output.push(col);
+                }
+            }
+
+            (ast_resolved::ModuloSpec::Columns(resolved_cols), output)
+        }
+        ast_unresolved::ModuloSpec::GroupBy {
+            reducing_by,
+            reducing_on,
+            arbitrary,
+        } => {
+            // Complex GROUP BY with aggregations
+            let mut resolved_reducing_by =
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, reducing_by, available, false)?;
+            let mut resolved_reducing_on =
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, reducing_on, available, false)?;
+
+            // Populate pivot_values for PivotOf expressions from IN predicates
+            for expr in resolved_reducing_on.iter_mut() {
+                if let ast_resolved::DomainExpression::PivotOf {
+                    pivot_key,
+                    pivot_values,
+                    ..
+                } = expr
+                {
+                    match pivot_key.as_ref() {
+                        ast_resolved::DomainExpression::Lvar { name, .. } => {
+                            // Simple column reference: look up IN values directly
+                            if let Some(values) = pivot_in_values.get(name.as_str()) {
+                                *pivot_values = values.clone();
+                            } else {
+                                return Err(crate::error::DelightQLError::validation_error(
+                                    format!(
+                                        "Pivot 'of' on column '{}' requires a matching IN predicate with literal values",
+                                        name
+                                    ),
+                                    "Add a filter like: column in (\"value1\"; \"value2\")".to_string(),
+                                ));
+                            }
+                        }
+                        _ => {
+                            // Format-string case: pivot_key is a concat chain from StringTemplate
+                            // e.g. :"{subject}_grade" → Infix("concat", Lvar("subject"), Literal("_grade"))
+                            let lvar_names = extract_lvar_names_from_expr(pivot_key.as_ref());
+                            if lvar_names.is_empty() {
+                                return Err(crate::error::DelightQLError::validation_error(
+                                    "Pivot 'of' key must reference a column (directly or via format string)".to_string(),
+                                    "Use a column name or format string like: value of column, value of :\"{column}_suffix\"".to_string(),
+                                ));
+                            }
+
+                            // Find the first referenced column that has IN values
+                            let found = lvar_names.iter().find_map(|name| {
+                                pivot_in_values.get(name).map(|v| (name.clone(), v.clone()))
+                            });
+
+                            if let Some((ref_col, in_values)) = found {
+                                // Expand the concat template for each IN value
+                                let mut expanded = Vec::new();
+                                for value in &in_values {
+                                    let mut subs = std::collections::HashMap::new();
+                                    subs.insert(ref_col.clone(), value.clone());
+                                    expanded
+                                        .push(expand_concat_template(pivot_key.as_ref(), &subs));
+                                }
+                                *pivot_values = expanded;
+                            } else {
+                                let col_list = lvar_names.join(", ");
+                                return Err(crate::error::DelightQLError::validation_error(
+                                    format!(
+                                        "Pivot 'of' format string references column(s) '{}' but none have a matching IN predicate",
+                                        col_list
+                                    ),
+                                    "Add a filter like: column in (\"value1\"; \"value2\")".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Tree group restructuring: detect nested reductions and promote non-nested columns
+            // If reducing_on contains a tree group with both non-nested and nested members,
+            // move non-nested members to reducing_by
+            restructure_tree_groups_for_grouping(
+                &mut resolved_reducing_by,
+                &mut resolved_reducing_on,
+            )?;
+
+            // Phase R3: Analyze tree groups and populate CTE requirements
+            // This metadata will guide the transformer to generate independent CTEs
+            super::super::tree_group_analysis::analyze_tree_groups_for_ctes(
+                &mut resolved_reducing_by,
+                &mut resolved_reducing_on,
+            )?;
+
+            // Compute output columns - GROUP BY columns plus aggregates
+            let mut output = Vec::new();
+
+            // First add the GROUP BY columns
+            for (idx, expr) in resolved_reducing_by.iter().enumerate() {
+                if let Some(col) = extract_provided_column_from_domain_expr(expr, available, idx) {
+                    output.push(col);
+                }
+            }
+
+            // Then add aggregate/pivot columns
+            let base_idx = resolved_reducing_by.len();
+            for (idx, expr) in resolved_reducing_on.iter().enumerate() {
+                match expr {
+                    ast_resolved::DomainExpression::PivotOf { pivot_values, .. } => {
+                        // Add one output column per pivot value
+                        for value in pivot_values {
+                            let col_name = value.to_lowercase();
+                            output.push(ast_resolved::ColumnMetadata::new_with_name_flag(
+                                ast_resolved::ColumnProvenance::from_column(col_name),
+                                ast_resolved::FqTable {
+                                    parents_path: NamespacePath::empty(),
+                                    name: ast_resolved::TableName::Fresh,
+                                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(
+                                        None,
+                                    ),
+                                },
+                                None,
+                                true,
+                            ));
+                        }
+                    }
+                    _ => {
+                        if let Some(col) = extract_provided_column_from_domain_expr(
+                            expr,
+                            available,
+                            base_idx + idx,
+                        ) {
+                            output.push(col);
+                        }
+                    }
+                }
+            }
+
+            // Check for duplicate pivot column names.
+            // The book requires each `of` expression to produce distinct column names.
+            // e.g. `score of subject, grade of subject` is invalid — use format strings
+            // like `grade of :"{subject}_grade"` to disambiguate.
+            {
+                let pivot_col_names: Vec<String> = output
+                    .iter()
+                    .skip(resolved_reducing_by.len())
+                    .map(|col| col.name().to_string())
+                    .collect();
+                let mut seen = std::collections::HashSet::new();
+                for name in &pivot_col_names {
+                    if !seen.insert(name.as_str()) {
+                        return Err(crate::error::DelightQLError::validation_error(
+                            format!(
+                                "Duplicate pivot column name '{}'. Each 'of' expression must produce distinct column names",
+                                name
+                            ),
+                            "Use a format string to disambiguate, e.g.: grade of :\"{subject}_grade\"".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            // Resolve arbitrary columns
+            let resolved_arbitrary =
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, arbitrary, available, false)?;
+
+            // Add arbitrary columns to output
+            let base_idx = resolved_reducing_by.len() + resolved_reducing_on.len();
+            for (idx, expr) in resolved_arbitrary.iter().enumerate() {
+                if let Some(col) =
+                    extract_provided_column_from_domain_expr(expr, available, base_idx + idx)
+                {
+                    output.push(col);
+                }
+            }
+
+            // Capture interior schemas for tree group columns
+            // When reducing_on contains a Curly function with an alias (e.g., ~> {name, type} as entities),
+            // attach the interior schema to the corresponding output column so drill-down can use it.
+            capture_interior_schemas(&resolved_reducing_on, &mut output);
+
+            let spec = ast_resolved::ModuloSpec::GroupBy {
+                reducing_by: resolved_reducing_by,
+                reducing_on: resolved_reducing_on,
+                arbitrary: resolved_arbitrary,
+            };
+
+            (spec, output)
+        }
+    };
+
+    let resolved_op = ast_resolved::UnaryRelationalOperator::Modulo {
+        containment_semantic:
+            super::super::super::helpers::converters::convert_containment_semantic(
+                containment_semantic,
+            ),
+        spec: resolved_spec,
+    };
+
+    Ok((resolved_op, output_columns))
+}
+
+/// Resolve the AggregatePipe operator via fold-based dispatch
+///
+/// Same semantics as `resolve_aggregate_pipe`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(super) fn resolve_aggregate_pipe_via_fold(
+    fold: &mut ResolverFold,
+    aggregations: Vec<ast_unresolved::DomainExpression>,
+    available: &[ast_resolved::ColumnMetadata],
+) -> Result<(
+    ast_resolved::UnaryRelationalOperator,
+    Vec<ast_resolved::ColumnMetadata>,
+)> {
+    // Resolve aggregation expressions
+    let resolved_aggregations =
+        super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, aggregations, available, false)?;
+
+    // Compute output columns for aggregate pipe - only the aggregations
+    let mut output_columns = Vec::new();
+    for (idx, expr) in resolved_aggregations.iter().enumerate() {
+        if let Some(col) = extract_provided_column_from_domain_expr(expr, available, idx) {
+            output_columns.push(col);
+        }
+    }
+
+    let resolved_op = ast_resolved::UnaryRelationalOperator::AggregatePipe {
+        aggregations: resolved_aggregations,
+    };
+
+    Ok((resolved_op, output_columns))
 }

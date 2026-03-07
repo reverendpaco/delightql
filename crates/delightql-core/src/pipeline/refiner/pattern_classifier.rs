@@ -6,139 +6,76 @@
 // - CDT-GJ (Correlated Derived Table - Group Join)
 // - CDT-WJ (Correlated Derived Table - Window Join)
 //
-// This runs BEFORE the FAR cycle (similar to correlation_alias_fixer).
+// Classification uses the AstTransform walk infrastructure to descend into
+// all node types (including operators, ConsultedView bodies, ScalarSubquery,
+// InnerExists). This fixes the classify_operator() no-op bug by construction.
 
 use super::correlation_analyzer;
 use crate::error::Result;
+use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::resolved;
 use crate::pipeline::asts::resolved::{InnerRelationPattern, QualifiedName, Resolved};
 use crate::pipeline::asts::unresolved::NamespacePath;
 
-/// Classify all InnerRelation patterns in an AST
-#[stacksafe::stacksafe]
-pub fn classify_patterns(
+// =============================================================================
+// ClassifierFold — AstTransform<Resolved, Resolved>
+// =============================================================================
+//
+// A same-phase fold that classifies Indeterminate InnerRelation patterns.
+// Uses the walk infrastructure to descend into operators, ConsultedView bodies,
+// ScalarSubquery, InnerExists — everywhere the hand-rolled classify_patterns
+// failed to recurse (the "classify_operator no-op" bug).
+//
+// Since this is Resolved→Resolved, it doesn't change the phase or run FAR.
+// It only classifies InnerRelation patterns encountered during the walk.
+
+struct ClassifierFold;
+
+impl AstTransform<Resolved, Resolved> for ClassifierFold {
+    fn transform_inner_relation(
+        &mut self,
+        pattern: InnerRelationPattern<Resolved>,
+    ) -> Result<InnerRelationPattern<Resolved>> {
+        match pattern {
+            InnerRelationPattern::Indeterminate {
+                identifier,
+                subquery,
+            } => {
+                // Recursively classify the subquery first (the walk calls
+                // transform_relational_action on the subquery, which eventually
+                // calls transform_inner_relation for any nested patterns).
+                let classified_subquery = self
+                    .transform_relational_action(*subquery)?
+                    .into_inner();
+
+                // Classify this pattern based on the classified subquery.
+                classify_inner_relation_pattern(identifier, classified_subquery)
+            }
+            // Already classified — let the walk handle recursion into children
+            other => crate::pipeline::ast_transform::walk_transform_inner_relation(self, other),
+        }
+    }
+}
+
+/// Classify all InnerRelation patterns in an AST using the walk infrastructure.
+///
+/// The walk descends into all node types by construction, including operators,
+/// ConsultedView bodies, ScalarSubquery, InnerExists — fixing the
+/// classify_operator() no-op bug.
+pub fn classify_patterns_via_fold(
     ast: resolved::RelationalExpression,
 ) -> Result<resolved::RelationalExpression> {
-    match ast {
-        resolved::RelationalExpression::Relation(rel) => Ok(
-            resolved::RelationalExpression::Relation(classify_relation(rel)?),
-        ),
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            join_type,
-            cpr_schema,
-        } => Ok(resolved::RelationalExpression::Join {
-            left: Box::new(classify_patterns(*left)?),
-            right: Box::new(classify_patterns(*right)?),
-            join_condition,
-            join_type,
-            cpr_schema,
-        }),
-        resolved::RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema,
-        } => {
-            let classified_source = Box::new(classify_patterns(*source)?);
-            let classified_condition = classify_sigma_condition(condition)?;
-            Ok(resolved::RelationalExpression::Filter {
-                source: classified_source,
-                condition: classified_condition,
-                origin,
-                cpr_schema,
-            })
-        }
-        resolved::RelationalExpression::Pipe(pipe_expr) => {
-            let pipe_expr = (*pipe_expr).into_inner();
-            let classified_source = classify_patterns(pipe_expr.source)?;
-            let classified_operator = classify_operator(pipe_expr.operator)?;
-            Ok(resolved::RelationalExpression::Pipe(Box::new(
-                stacksafe::StackSafe::new(resolved::PipeExpression {
-                    source: classified_source,
-                    operator: classified_operator,
-                    cpr_schema: pipe_expr.cpr_schema,
-                }),
-            )))
-        }
-        resolved::RelationalExpression::SetOperation {
-            operator,
-            operands,
-            correlation,
-            cpr_schema,
-        } => {
-            let classified_operands = operands
-                .into_iter()
-                .map(classify_patterns)
-                .collect::<Result<Vec<_>>>()?;
-            Ok(resolved::RelationalExpression::SetOperation {
-                operator,
-                operands: classified_operands,
-                correlation,
-                cpr_schema,
-            })
-        }
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER-join consumed by resolver")
-        }
-    }
+    let mut fold = ClassifierFold;
+    fold.transform_relational_action(ast)
+        .map(|a| a.into_inner())
 }
 
-fn classify_relation(rel: resolved::Relation) -> Result<resolved::Relation> {
-    match rel {
-        resolved::Relation::InnerRelation {
-            pattern,
-            alias,
-            outer,
-            cpr_schema,
-        } => {
-            // Extract identifier and subquery from Indeterminate
-            let (identifier, subquery) = match pattern {
-                resolved::InnerRelationPattern::Indeterminate {
-                    identifier,
-                    subquery,
-                    ..
-                } => (identifier, subquery),
-                // Already classified (UDT, CDT-SJ, CDT-GJ, CDT-WJ): pass through unchanged
-                // This can happen with HO views where the body was pre-classified
-                already_classified => {
-                    return Ok(resolved::Relation::InnerRelation {
-                        pattern: already_classified,
-                        alias,
-                        outer,
-                        cpr_schema,
-                    });
-                }
-            };
+// =============================================================================
+// Core Classification Logic
+// =============================================================================
 
-            // Recursively classify the subquery
-            let classified_subquery = classify_patterns(*subquery)?;
-
-            // Classify the pattern based on subquery structure
-            let classified_pattern =
-                classify_inner_relation_pattern(identifier, classified_subquery)?;
-
-            Ok(resolved::Relation::InnerRelation {
-                pattern: classified_pattern,
-                alias,
-                outer,
-                cpr_schema,
-            })
-        }
-        // Base cases: non-InnerRelation variants have no patterns to classify.
-        resolved::Relation::Ground { .. }
-        | resolved::Relation::Anonymous { .. }
-        | resolved::Relation::TVF { .. }
-        | resolved::Relation::ConsultedView { .. }
-        | resolved::Relation::PseudoPredicate { .. } => Ok(rel),
-    }
-}
-
-/// Core classification logic
-/// Made public for use by flattener to re-classify Indeterminate patterns
+/// Core classification logic for a single InnerRelation pattern.
+/// Inspects the subquery for correlation, aggregation, and limits.
 pub fn classify_inner_relation_pattern(
     identifier: resolved::QualifiedName,
     subquery: resolved::RelationalExpression,
@@ -323,71 +260,6 @@ fn extract_order_by(
             unreachable!("ER chains consumed before pattern classification")
         }
     }
-}
-
-// ============================================================================
-// Recursive Classification for Other AST Nodes
-// ============================================================================
-
-fn classify_sigma_condition(
-    condition: resolved::SigmaCondition,
-) -> Result<resolved::SigmaCondition> {
-    match condition {
-        resolved::SigmaCondition::Predicate(pred) => Ok(resolved::SigmaCondition::Predicate(
-            classify_boolean_expr(pred)?,
-        )),
-        // TupleOrdinal (LIMIT), Destructure (JSON pattern), SigmaCall (+like etc.)
-        // — none contain InnerRelation nodes, pass through unchanged.
-        resolved::SigmaCondition::TupleOrdinal(_)
-        | resolved::SigmaCondition::Destructure { .. }
-        | resolved::SigmaCondition::SigmaCall { .. } => Ok(condition),
-    }
-}
-
-fn classify_boolean_expr(expr: resolved::BooleanExpression) -> Result<resolved::BooleanExpression> {
-    match expr {
-        resolved::BooleanExpression::InnerExists {
-            identifier,
-            subquery,
-            exists,
-            alias,
-            using_columns,
-        } => {
-            // Recursively classify subquery
-            let classified_subquery = classify_patterns(*subquery)?;
-            Ok(resolved::BooleanExpression::InnerExists {
-                identifier,
-                subquery: Box::new(classified_subquery),
-                exists,
-                alias,
-                using_columns,
-            })
-        }
-        // All other boolean expressions (Comparison, And, Or, Not, Using, In,
-        // InRelational, BooleanLiteral, Sigma, GlobCorrelation, OrdinalGlobCorrelation)
-        // don't directly contain relational expressions with InnerRelation.
-        // ScalarSubquery nested inside DomainExpressions is handled at the
-        // relational level by classify_patterns, not here.
-        resolved::BooleanExpression::Comparison { .. }
-        | resolved::BooleanExpression::And { .. }
-        | resolved::BooleanExpression::Or { .. }
-        | resolved::BooleanExpression::Not { .. }
-        | resolved::BooleanExpression::Using { .. }
-        | resolved::BooleanExpression::In { .. }
-        | resolved::BooleanExpression::InRelational { .. }
-        | resolved::BooleanExpression::BooleanLiteral { .. }
-        | resolved::BooleanExpression::Sigma { .. }
-        | resolved::BooleanExpression::GlobCorrelation { .. }
-        | resolved::BooleanExpression::OrdinalGlobCorrelation { .. } => Ok(expr),
-    }
-}
-
-fn classify_operator(
-    op: resolved::UnaryRelationalOperator,
-) -> Result<resolved::UnaryRelationalOperator> {
-    // Most operators don't contain InnerRelation, but check for completeness
-    // TODO: Add cases if any operators can contain subqueries with InnerRelation
-    Ok(op)
 }
 
 // ============================================================================

@@ -1,25 +1,19 @@
 use crate::error::{DelightQLError, Result};
+use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::ProjectionExpr;
+use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
-use crate::resolution::EntityRegistry;
-
 use super::super::column_extraction::extract_provided_column_from_domain_expr;
-use super::super::domain_expressions;
 
-/// Resolve the General projection operator
+/// Resolve the General projection operator via fold-based dispatch
 ///
-/// This handles simple projections (SELECT-like operations) that specify which columns
-/// to include in the output. Supports:
-/// Resolve the General projection operator using the shared registry
-///
-/// ScalarSubquery expressions use `resolve_domain_expr_with_registry` (shared context).
-/// All other expressions (globs, patterns, lvars) use the existing expansion path
-/// with split borrows from the registry.
-pub(super) fn resolve_general_with_registry(
+/// Same semantics as `resolve_general_with_registry`, but expression resolution
+/// goes through the fold's transform hooks instead of free functions + registry.
+pub(super) fn resolve_general_via_fold(
+    fold: &mut ResolverFold,
     containment_semantic: ast_unresolved::ContainmentSemantic,
     expressions: Vec<ast_unresolved::DomainExpression>,
     available: &[ast_resolved::ColumnMetadata],
-    registry: &mut EntityRegistry,
 ) -> Result<(
     ast_resolved::UnaryRelationalOperator,
     Vec<ast_resolved::ColumnMetadata>,
@@ -88,22 +82,15 @@ pub(super) fn resolve_general_with_registry(
             expr,
             ast_unresolved::DomainExpression::ScalarSubquery { .. }
         ) {
-            // ScalarSubquery: use shared registry (preserves all context)
-            let resolved = domain_expressions::resolve_domain_expr_with_registry(
-                expr, available, registry, false,
-            )?;
+            // ScalarSubquery: use fold's transform_domain (preserves all context)
+            let resolved = fold.transform_domain(expr)?;
             resolved_expressions.push(resolved);
         } else {
-            // Normal expressions: split borrows for expansion (globs, patterns, etc.)
-            let cfe_defs = Some(&registry.query_local.cfes);
-            let schema = registry.database.schema();
-            let cte_context = &mut registry.query_local.ctes;
-            let resolved_exprs = domain_expressions::resolve_expressions_with_schema(
+            // Normal expressions: use fold-based expansion (globs, patterns, etc.)
+            let resolved_exprs = super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                fold,
                 vec![expr],
                 available,
-                cfe_defs,
-                Some(schema),
-                Some(cte_context),
                 false,
             )?;
             resolved_expressions.extend(resolved_exprs);
