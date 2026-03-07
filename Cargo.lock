@@ -987,6 +987,7 @@ dependencies = [
  "chrono",
  "clap 4.5.49",
  "crossterm",
+ "csv",
  "ctrlc",
  "delightql-backends",
  "delightql-cli-siso",

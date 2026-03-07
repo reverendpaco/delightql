@@ -125,8 +125,9 @@ pub fn resolve_entity_with_alias(
                             definition: EntityDefinition::RelationSchema(table_schema),
                         });
                     }
-                    Ok(None) => {
-                        // Not a database table — check if it's a consulted view
+                    Ok(None) | Err(_) => {
+                        // Not a database table (or namespace has no database backend,
+                        // e.g. pure-DQL namespaces like std::prelude) — check consult registry.
                         let fq: String = core_namespace_path
                             .items()
                             .iter()
@@ -151,9 +152,6 @@ pub fn resolve_entity_with_alias(
                                 };
                             }
                         }
-                    }
-                    Err(_e) => {
-                        // Schema lookup error - fall through to Unknown
                     }
                 }
             }

@@ -141,75 +141,6 @@ pub enum Command {
         options: Vec<String>,
     },
 
-    /// Read data FROM stdin and query it (JSON, CSV, etc.)
-    From {
-        /// Format of stdin data (json, jsonl, csv, etc.)
-        format: String,
-
-        /// Query to run on ingested data (accesses special.input table)
-        query: Option<String>,
-
-        /// Read query from file
-        #[arg(long, conflicts_with = "query")]
-        file: Option<PathBuf>,
-
-        /// Output format
-        #[arg(short = 'f', long, value_parser = parse_output_format)]
-        format_out: Option<OutputFormat>,
-
-        /// Stop at intermediate stage
-        #[arg(long, value_enum)]
-        to: Option<Stage>,
-
-        /// Assertion queries
-        #[arg(long = "assert")]
-        assert_queries: Vec<String>,
-
-        /// Format errors with DelightQL query
-        #[arg(long = "if-errors")]
-        if_errors_query: Option<String>,
-
-        /// Debug options
-        #[arg(long)]
-        debug: Option<String>,
-
-        /// SQL optimization level
-        #[arg(long = "soptimize", default_value = "0")]
-        sql_optimize: u8,
-
-        /// Inline CTEs
-        #[arg(long)]
-        inline_ctes: bool,
-
-        /// Suppress headers
-        #[arg(long, short = 'n')]
-        no_headers: bool,
-
-        /// Disable output sanitization (allows raw terminal control sequences)
-        #[arg(long)]
-        no_sanitize: bool,
-
-        /// Strict mode
-        #[arg(long)]
-        strict: bool,
-
-        /// Quiet mode
-        #[arg(long, short = 'q')]
-        quiet: bool,
-
-        /// Create new database if missing
-        #[arg(long = "make-new-db-if-missing")]
-        make_new_db_if_missing: bool,
-
-        /// Consult DDL file(s)
-        #[arg(long = "consult")]
-        consult_files: Vec<PathBuf>,
-
-        /// Attach external database
-        #[arg(long = "attach")]
-        attach: Vec<String>,
-    },
-
     /// Format/prettify DelightQL code
     Format {
         /// Source code or file path (if omitted, reads from stdin)
@@ -275,10 +206,48 @@ pub enum ToolCommand {
         to: Option<Stage>,
     },
 
-    /// Multi-source relational munging (not yet implemented)
-    #[allow(dead_code)]
-    Munge {
-        // Placeholder for future implementation
+    /// CSV destructuring from stdin
+    #[command(visible_alias = "c")]
+    Csvstruct {
+        /// DQL query to run against c(...)
+        query: String,
+
+        /// Output format (table, json, csv, tsv)
+        #[arg(short = 'f', long, value_parser = parse_output_format)]
+        format: Option<OutputFormat>,
+
+        /// Stop at intermediate stage for inspection
+        #[arg(long, value_enum)]
+        to: Option<Stage>,
+
+        /// First row is column headers
+        #[arg(long)]
+        has_headers: bool,
+
+        /// Field delimiter (default: comma)
+        #[arg(long, default_value = ",")]
+        delimiter: String,
+    },
+
+    /// Multi-source file munging (load tables from files, then query)
+    #[command(visible_alias = "m")]
+    Filemunge {
+        /// DQL query to run against loaded tables
+        query: String,
+
+        /// Table spec: name:format[:noheader] path
+        /// Formats: csv, tsv, json-singleton
+        /// csv/tsv default to header; add :noheader to override
+        #[arg(long = "table", num_args = 2, value_names = ["SPEC", "PATH"])]
+        tables: Vec<String>,
+
+        /// Output format (table, json, csv, tsv)
+        #[arg(short = 'f', long, value_parser = parse_output_format)]
+        format: Option<OutputFormat>,
+
+        /// Stop at intermediate stage for inspection
+        #[arg(long, value_enum)]
+        to: Option<Stage>,
     },
 }
 

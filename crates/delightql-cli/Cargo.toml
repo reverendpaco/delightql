@@ -43,6 +43,7 @@ base64 = "0.22"
 sha2 = "0.10"
 libc = "0.2"
 stacksafe = "1"
+csv = "1"
 tar = "0.4"
 flate2 = "1"
 # REPL dependencies (optional, enabled via 'repl' feature)

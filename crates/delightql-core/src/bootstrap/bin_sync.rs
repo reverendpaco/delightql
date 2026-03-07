@@ -32,7 +32,8 @@ use rusqlite::{params, Connection};
 pub fn sync_bin_cartridges_to_bootstrap(
     conn: &Connection,
     registry: &BinCartridgeRegistry,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut universal_namespaces = Vec::new();
     for cartridge in registry.cartridges() {
         let metadata = cartridge.metadata();
 
@@ -115,7 +116,26 @@ pub fn sync_bin_cartridges_to_bootstrap(
             activated_count,
             metadata.namespace_path
         );
+
+        // Step 5: Auto-enlist universal namespaces into "main"
+        if metadata.is_universal {
+            let main_ns_id: i32 = conn.query_row(
+                "SELECT id FROM namespace WHERE fq_name = 'main'",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO enlisted_namespace (from_namespace_id, to_namespace_id)
+                 VALUES (?1, ?2)",
+                params![namespace_id, main_ns_id],
+            )?;
+            universal_namespaces.push(metadata.namespace_path.clone());
+            log::debug!(
+                "Auto-enlisted universal namespace '{}' into 'main'",
+                metadata.namespace_path
+            );
+        }
     }
 
-    Ok(())
+    Ok(universal_namespaces)
 }

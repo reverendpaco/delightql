@@ -409,13 +409,14 @@ impl DelightQLSystem {
             .register_cartridge(crate::bin_cartridge::predicates::create_predicates_cartridge());
 
         // Sync all bin cartridges to bootstrap metadata
-        crate::bootstrap::sync_bin_cartridges_to_bootstrap(&bootstrap_conn, &bin_registry)
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to sync bin cartridges to bootstrap: {}", e),
-                    e.to_string(),
-                )
-            })?;
+        let universal_namespaces =
+            crate::bootstrap::sync_bin_cartridges_to_bootstrap(&bootstrap_conn, &bin_registry)
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!("Failed to sync bin cartridges to bootstrap: {}", e),
+                        e.to_string(),
+                    )
+                })?;
         // Register user connection in bootstrap metadata
         // Determine connection type ID from database type string (case-insensitive)
         let db_type_lower = db_type.to_lowercase();
@@ -686,6 +687,11 @@ impl DelightQLSystem {
             catalog_cartridge_id: Cell::new(None),
             db_type: db_type.to_string(),
         };
+
+        // Eagerly load stdlib DQL overlays for universal (auto-enlisted) namespaces
+        for ns in &universal_namespaces {
+            system.ensure_stdlib_loaded(ns);
+        }
 
         Ok(system)
     }
@@ -1366,10 +1372,11 @@ impl DelightQLSystem {
             Err(_) => return false,
         };
 
+        let source_uri = format!("embedded://{}", namespace_fq);
         let already_loaded: bool = bootstrap_conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM namespace WHERE fq_name = ?1",
-                rusqlite::params![namespace_fq],
+                "SELECT COUNT(*) > 0 FROM cartridge WHERE source_uri = ?1 AND source_ns = ?2",
+                rusqlite::params![&source_uri, namespace_fq],
                 |row| row.get(0),
             )
             .unwrap_or(false);

@@ -16,7 +16,6 @@ pub mod output_format;
 pub mod pipe_exec;
 pub mod sanitize;
 pub mod server;
-pub mod stdin_relation;
 pub mod theme;
 pub mod util;
 pub mod version_info;

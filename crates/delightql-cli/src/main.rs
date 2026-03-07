@@ -191,9 +191,6 @@ fn run() -> Result<()> {
             Command::Query { .. } => {
                 delightql_cli::commands::query::handle_query_subcommand(command, &args)
             }
-            Command::From { .. } => {
-                delightql_cli::commands::from::handle_from_subcommand(command, &args)
-            }
             Command::Format { .. } => {
                 delightql_cli::commands::format::handle_format_subcommand(command, &args)
             }
@@ -237,9 +234,28 @@ fn run() -> Result<()> {
                         query, *format, *to, &args,
                     )
                 }
-                ToolCommand::Munge { .. } => {
-                    anyhow::bail!("dql tools munge is not yet implemented")
-                }
+                ToolCommand::Csvstruct {
+                    query,
+                    format,
+                    to,
+                    has_headers,
+                    delimiter,
+                } => delightql_cli::commands::csvstruct::handle_csvstruct_command(
+                    query,
+                    *format,
+                    *to,
+                    *has_headers,
+                    delimiter,
+                    &args,
+                ),
+                ToolCommand::Filemunge {
+                    query,
+                    tables,
+                    format,
+                    to,
+                } => delightql_cli::commands::filemunge::handle_filemunge_command(
+                    query, tables, *format, *to, &args,
+                ),
             },
         };
     }
@@ -258,11 +274,10 @@ fn run() -> Result<()> {
 
     #[cfg(not(feature = "repl"))]
     anyhow::bail!(
-        "No subcommand specified. Use one of: query, from, format, server\n\
+        "No subcommand specified. Use one of: query, format, server\n\
          Examples:\n\
          - dql query \"users(*)\"\n\
          - dql query --file query.dql\n\
-         - echo '[...]' | dql from json 'special.input(*)'\n\
          - dql format < query.dql\n\
          - dql server\n\n\
          Run 'dql --help' for more information.\n\n\
