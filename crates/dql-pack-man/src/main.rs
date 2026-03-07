@@ -19,7 +19,7 @@ use tree_sitter::Language;
 use delightql_protocol::socket::SocketTransport;
 use delightql_protocol::{
     AgreedOrientation, Cell, Client, ControlResult, FetchResponse, Orientation, Projection,
-    QueryResponse, Session, VersionResult, decode_cell_to_text,
+    QueryResponse, Session, VersionResult, cell_content_bytes, decode_cell_to_text,
 };
 
 extern "C" {
@@ -67,7 +67,7 @@ struct Args {
     #[arg(long, requires = "extract")]
     to_dir: Option<PathBuf>,
 
-    /// Output mode (only "hash" is supported)
+    /// Output mode ("hash" or "bhash")
     #[arg(long, default_value = "hash")]
     to: String,
 
@@ -88,6 +88,12 @@ struct Args {
     source_fingerprint: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum HashMode {
+    String,
+    Byte,
+}
+
 #[derive(Clone)]
 enum TestOutcome {
     Pass,
@@ -106,8 +112,8 @@ struct TestCaseResult {
 fn main() {
     let args = Args::parse();
 
-    if args.to != "hash" {
-        eprintln!("dql-pack-man: only --to hash is supported");
+    if args.to != "hash" && args.to != "bhash" {
+        eprintln!("dql-pack-man: only --to hash or --to bhash is supported");
         process::exit(1);
     }
 
@@ -332,6 +338,7 @@ struct TestCase {
     file: String,
     dql: String,
     hash: Option<String>,
+    hash_mode: HashMode,
     dbid: i64,
     should_fail: bool,
     isolate_dbs: Vec<IsolateDb>,
@@ -575,6 +582,19 @@ fn connect_session(
     Ok((session, rows_orientation))
 }
 
+/// Dispatch to send_query_and_hash or send_query_and_bhash based on mode.
+fn send_query_and_hash_dispatch(
+    session: &mut Session<SocketTransport>,
+    query_text: &str,
+    rows_orientation: AgreedOrientation,
+    mode: HashMode,
+) -> Result<String, String> {
+    match mode {
+        HashMode::String => send_query_and_hash(session, query_text, rows_orientation),
+        HashMode::Byte => send_query_and_bhash(session, query_text, rows_orientation),
+    }
+}
+
 /// Run a shard of test cases on its own connection.
 /// Cases should be sorted by dbid to minimize mount switches.
 fn run_worker(
@@ -610,7 +630,7 @@ fn run_worker(
         let label = &tc.file;
 
         if tc.should_fail {
-            match send_query_and_hash(&mut session, &tc.dql, rows_orientation) {
+            match send_query_and_hash_dispatch(&mut session, &tc.dql, rows_orientation, tc.hash_mode) {
                 Err(_) => {
                     result.output.push(format!("  [PASS] {}", label));
                     result.details.push(TestCaseResult { file: label.clone(), outcome: TestOutcome::Pass, run_id: tc.run_id });
@@ -625,7 +645,7 @@ fn run_worker(
                 }
             }
         } else {
-            match send_query_and_hash(&mut session, &tc.dql, rows_orientation) {
+            match send_query_and_hash_dispatch(&mut session, &tc.dql, rows_orientation, tc.hash_mode) {
                 Ok(actual_hex) => match &tc.hash {
                     None => {
                         result.output.push(format!("  [MEH]  {}", label));
@@ -816,7 +836,7 @@ fn run_ses_worker(
         let label = &tc.file;
 
         // Split DQL into individual queries and send sequentially
-        let exec_result = send_sequential_and_hash(&mut session, &tc.dql, rows_orientation);
+        let exec_result = send_sequential_and_hash(&mut session, &tc.dql, rows_orientation, tc.hash_mode);
 
         if tc.should_fail {
             match exec_result {
@@ -880,11 +900,12 @@ fn send_sequential_and_hash(
     session: &mut Session<SocketTransport>,
     dql: &str,
     rows_orientation: AgreedOrientation,
+    mode: HashMode,
 ) -> Result<String, String> {
     let queries = split_queries(dql)?;
     let mut last_hash = String::new();
     for q in &queries {
-        last_hash = send_query_and_hash(session, q, rows_orientation)?;
+        last_hash = send_query_and_hash_dispatch(session, q, rows_orientation, mode)?;
     }
     Ok(last_hash)
 }
@@ -965,8 +986,19 @@ fn run_test_case_db(
         .collect();
 
     // Read test cases (ordered by run_id for grouping)
+    // Detect hash_mode column (new balls have it, old ones don't)
+    let has_hash_mode = conn
+        .prepare("SELECT hash_mode FROM side_effect_free LIMIT 0")
+        .is_ok();
+
+    let sef_query = if has_hash_mode {
+        "SELECT file, dql, hash, run_id, should_fail, hash_mode FROM side_effect_free ORDER BY run_id"
+    } else {
+        "SELECT file, dql, hash, run_id, should_fail, 'string' FROM side_effect_free ORDER BY run_id"
+    };
+
     let mut tc_stmt = conn
-        .prepare("SELECT file, dql, hash, run_id, should_fail FROM side_effect_free ORDER BY run_id")
+        .prepare(sef_query)
         .map_err(|e| format!("prepare side_effect_free: {}", e))?;
 
     let cases: Vec<TestCase> = tc_stmt
@@ -978,18 +1010,21 @@ fn run_test_case_db(
                 row.get::<_, Option<String>>(2)?,
                 run_id,
                 row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })
         .map_err(|e| format!("query side_effect_free: {}", e))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read side_effect_free: {}", e))?
         .into_iter()
-        .map(|(file, dql, hash, run_id, should_fail)| {
+        .map(|(file, dql, hash, run_id, should_fail, hash_mode_str)| {
             let dbid = *run_dbid_map.get(&run_id).unwrap_or(&1);
+            let hash_mode = if hash_mode_str == "bhash" { HashMode::Byte } else { HashMode::String };
             TestCase {
                 file,
                 dql,
                 hash,
+                hash_mode,
                 dbid,
                 should_fail: should_fail != 0,
                 isolate_dbs: Vec::new(),
@@ -1072,14 +1107,24 @@ fn run_ses_test_case_db(
         .collect();
 
     // Read test cases
+    // Detect hash_mode column (new balls have it, old ones don't)
+    let has_ses_hash_mode = conn
+        .prepare("SELECT hash_mode FROM side_effectful_on_system LIMIT 0")
+        .is_ok();
+
+    let ses_query = if has_ses_hash_mode {
+        "SELECT id, file, dql, hash, run_id, dbid, should_fail, hash_mode \
+         FROM side_effectful_on_system ORDER BY id"
+    } else {
+        "SELECT id, file, dql, hash, run_id, dbid, should_fail, 'string' \
+         FROM side_effectful_on_system ORDER BY id"
+    };
+
     let mut tc_stmt = conn
-        .prepare(
-            "SELECT id, file, dql, hash, run_id, dbid, should_fail \
-             FROM side_effectful_on_system ORDER BY id",
-        )
+        .prepare(ses_query)
         .map_err(|e| format!("prepare side_effectful_on_system: {}", e))?;
 
-    let raw_cases: Vec<(i64, String, String, Option<String>, i64, i64, bool)> = tc_stmt
+    let raw_cases: Vec<(i64, String, String, Option<String>, i64, i64, bool, String)> = tc_stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -1089,6 +1134,7 @@ fn run_ses_test_case_db(
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6).unwrap_or(0) != 0,
+                row.get::<_, String>(7)?,
             ))
         })
         .map_err(|e| format!("query side_effectful_on_system: {}", e))?
@@ -1165,17 +1211,19 @@ fn run_ses_test_case_db(
     // Build TestCase structs with isolate data attached
     let cases: Vec<TestCase> = raw_cases
         .into_iter()
-        .map(|(id, file, dql, hash, run_id, dbid, should_fail)| {
+        .map(|(id, file, dql, hash, run_id, dbid, should_fail, hash_mode_str)| {
             let isolate_dbs = isolate_map.remove(&id).unwrap_or_default();
             let ddl_files = if !isolate_dbs.is_empty() {
                 ddl_map.remove(&id).unwrap_or_default()
             } else {
                 Vec::new()
             };
+            let hash_mode = if hash_mode_str == "bhash" { HashMode::Byte } else { HashMode::String };
             TestCase {
                 file,
                 dql,
                 hash,
+                hash_mode,
                 dbid,
                 should_fail,
                 isolate_dbs,
@@ -1734,4 +1782,73 @@ fn compute_data_hash(rows: &[Vec<Cell>]) -> String {
         data_hasher.update(b"\n");
     }
     format!("{:x}", data_hasher.finalize())
+}
+
+/// Byte-level hash. Same algorithm as fingerprint.rs compute_byte_hash().
+/// Per cell: SHA-256 of raw content bytes. Per row: SHA-256 of concatenated cell hashes.
+/// Sort row hashes, concatenate, SHA-256 again. No framing, no tags, no prefixes.
+fn compute_byte_hash(rows: &[Vec<Cell>]) -> String {
+    let mut row_hashes: Vec<String> = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let mut row_hasher = Sha256::new();
+        for cell in row {
+            let mut cell_hasher = Sha256::new();
+            if let Some(bytes) = cell {
+                cell_hasher.update(cell_content_bytes(bytes));
+            }
+            row_hasher.update(cell_hasher.finalize());
+        }
+        row_hashes.push(format!("{:x}", row_hasher.finalize()));
+    }
+
+    row_hashes.sort();
+
+    let mut data_hasher = Sha256::new();
+    for rh in &row_hashes {
+        data_hasher.update(rh.as_bytes());
+    }
+    format!("{:x}", data_hasher.finalize())
+}
+
+/// Send a single query and return its byte-level hash.
+fn send_query_and_bhash(
+    session: &mut Session<SocketTransport>,
+    query_text: &str,
+    rows_orientation: AgreedOrientation,
+) -> Result<String, String> {
+    let handle = match session
+        .query(query_text.as_bytes().to_vec())
+        .map_err(|e| format!("query: {}", e.message))?
+    {
+        QueryResponse::Header { handle, .. } => handle,
+        QueryResponse::Error { message, .. } => {
+            return Err(format!(
+                "query error: {}",
+                String::from_utf8_lossy(&message)
+            ));
+        }
+    };
+
+    let mut all_rows: Vec<Vec<Cell>> = Vec::new();
+    loop {
+        match session
+            .fetch(&handle, Projection::All, 10000, rows_orientation)
+            .map_err(|e| format!("fetch: {}", e.message))?
+        {
+            FetchResponse::Data { cells } => {
+                all_rows.extend(cells);
+            }
+            FetchResponse::End => break,
+            FetchResponse::Error { message, .. } => {
+                return Err(format!(
+                    "fetch error: {}",
+                    String::from_utf8_lossy(&message)
+                ));
+            }
+        }
+    }
+
+    let _ = session.close(handle);
+    Ok(compute_byte_hash(&all_rows))
 }

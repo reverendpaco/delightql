@@ -639,6 +639,7 @@ fn walk_unary_operator(op: &UnaryRelationalOperator, refs: &mut Vec<ExtractedRef
             walk_function(function, refs);
         }
         UnaryRelationalOperator::MetaIze { .. } => {}
+        UnaryRelationalOperator::Witness { .. } => {}
         UnaryRelationalOperator::Qualify => {}
         UnaryRelationalOperator::Using { .. } => {}
         UnaryRelationalOperator::DmlTerminal { .. } => {}

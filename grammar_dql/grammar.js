@@ -486,6 +486,7 @@ module.exports = grammar({
       seq($.aggregate_pipe_operator, $.aggregate_function, optional($.relational_continuation)),  // Allow continuation for CPR
       seq($.materialize_pipe_operator, optional($.relational_continuation)),
       prec.right(1, seq($.meta_ize_operator, optional($.relational_continuation))),  // ^ or ^^ for schema reification
+      prec.right(1, seq($.witness_operator, optional($.relational_continuation))),  // + or \+ for existence witness (postfix/functor)
       prec.right(1, seq($.qualify_operator, optional($.relational_continuation))),  // * for qualification (no pipe needed)
       prec.right(1, seq($.using_operator, optional($.relational_continuation))),    // .(cols) for USING semantics
       prec.right(1, seq($.drill_operator, optional($.relational_continuation))),    // .col(*) for interior drill-down
@@ -495,6 +496,11 @@ module.exports = grammar({
     // ^ returns (colname, colposition, coltype)
     // ^^ returns full DDL metadata (colname, colposition, coltype, nullable, default, pk, fk_table, fk_column)
     meta_ize_operator: $ => choice('^^', '^'),  // ^^ first to avoid prefix match
+
+    // Witness: reify existence as 1r1c relation (column: met)
+    // + returns ExistsWitness, \+ returns DoesNotExistWitness
+    // Reuses exists_marker tokens (+ and \+) in postfix/functor position
+    witness_operator: $ => $.exists_marker,
 
     // Qualify: marks columns as qualified (table-prefixed)
     // Unqualified names from () unify; qualified names from * don't

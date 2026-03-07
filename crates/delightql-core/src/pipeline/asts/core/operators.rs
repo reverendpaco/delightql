@@ -241,6 +241,16 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
         /// True for `^^` (detailed), false for `^` (basic)
         detailed: bool,
     },
+    /// Witness: + or \+ — reifies existence as 1-row, 1-column relation
+    ///
+    /// ExistsWitness (`+`): SELECT EXISTS(SELECT 1 FROM source) AS "met"
+    /// DoesNotExistWitness (`\+`): SELECT NOT EXISTS(SELECT 1 FROM source) AS "met"
+    /// Always produces exactly 1 row. Column `met` = 1 (condition met) or 0 (not met).
+    #[lispy("unary_relational_operator:witness")]
+    Witness {
+        /// True for `+` (ExistsWitness), false for `\+` (DoesNotExistWitness)
+        exists: bool,
+    },
     /// Qualify: * - marks all columns as qualified (table-prefixed)
     ///
     /// Qualified columns don't unify implicitly with same-named columns from other tables.

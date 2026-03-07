@@ -163,6 +163,18 @@ fn parse_unary_operator_core(
             }
             other => panic!("Unknown meta_ize_operator text: {}", other),
         }
+    } else if let Some(witness_node) = node.find_child("witness_operator") {
+        // Witness operator: + or \+ in postfix/functor position
+        // Check exists_marker child for not_exists to determine + vs \+
+        let exists = witness_node
+            .find_child("exists_marker")
+            .map(|marker| !marker.has_child("not_exists"))
+            .unwrap_or(true);
+        RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
+            source: input,
+            operator: UnaryRelationalOperator::Witness { exists },
+            cpr_schema: PhaseBox::phantom(),
+        })))
     } else if node.find_child("qualify_operator").is_some() {
         // Qualify operator: * - marks columns as qualified (table-prefixed)
         RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {

@@ -84,6 +84,11 @@ pub(super) fn bubble_unary_operator(
             ast_unresolved::UnaryRelationalOperator::MetaIze { detailed },
             BubbledState::resolved(Vec::new()),
         )),
+        // Witness has no expressions to bubble - existence check happens at SQL level
+        ast_unresolved::UnaryRelationalOperator::Witness { exists } => Ok((
+            ast_unresolved::UnaryRelationalOperator::Witness { exists },
+            BubbledState::resolved(Vec::new()),
+        )),
         // Qualify has no expressions to bubble - it just marks columns as qualified
         ast_unresolved::UnaryRelationalOperator::Qualify => Ok((
             ast_unresolved::UnaryRelationalOperator::Qualify,

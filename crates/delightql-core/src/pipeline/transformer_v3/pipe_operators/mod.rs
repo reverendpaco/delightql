@@ -490,6 +490,12 @@ pub fn apply_pipe_operator_unified(
                 Box::new(select),
             )))
         }
+        UnaryRelationalOperator::Witness { exists } => {
+            let select = apply_witness(builder, exists, &source_schema)?;
+            Ok(QueryBuildState::Expression(QueryExpression::Select(
+                Box::new(select),
+            )))
+        }
         // Qualify and Using: handled by early return above (no-ops at SQL level)
         UnaryRelationalOperator::Qualify | UnaryRelationalOperator::Using { .. } => {
             unreachable!("Qualify/Using short-circuited above")

@@ -20,6 +20,8 @@ pub const CELL_TAG_INTEGER: u8 = 0x01;
 pub const CELL_TAG_REAL: u8 = 0x02;
 pub const CELL_TAG_BLOB: u8 = 0x03;
 
+
+
 /// Decode a tagged cell to its text representation.
 /// Returns the text for display. Legacy (untagged) cells are treated as raw UTF-8.
 pub fn decode_cell_to_text(bytes: &[u8]) -> String {
@@ -71,6 +73,22 @@ pub fn decode_cell_for_hash(bytes: &[u8]) -> Vec<u8> {
             // Legacy: hash as-is
             bytes.to_vec()
         }
+    }
+}
+
+/// Strip the layer1 cell tag, returning only the raw content bytes.
+/// For bhash: this is what SQLite's C API actually returned before
+/// the relay protocol wrapped it with a type tag.
+pub fn cell_content_bytes(bytes: &[u8]) -> &[u8] {
+    if bytes.is_empty() {
+        return &[];
+    }
+    match bytes[0] {
+        CELL_TAG_INTEGER if bytes.len() == 9 => &bytes[1..9],
+        CELL_TAG_REAL if bytes.len() == 9 => &bytes[1..9],
+        CELL_TAG_BLOB => &bytes[1..],
+        CELL_TAG_TEXT => &bytes[1..],
+        _ => bytes, // Legacy untagged cell
     }
 }
 
@@ -185,6 +203,51 @@ mod tests {
         let mut cell = vec![CELL_TAG_REAL];
         cell.extend_from_slice(&f.to_le_bytes());
         assert_eq!(decode_cell_for_hash(&cell), f.to_string().as_bytes());
+    }
+
+    // --- cell_content_bytes tests ---
+
+    #[test]
+    fn content_bytes_strips_integer_tag() {
+        let mut cell = vec![CELL_TAG_INTEGER];
+        cell.extend_from_slice(&42i64.to_le_bytes());
+        assert_eq!(cell_content_bytes(&cell), &42i64.to_le_bytes());
+    }
+
+    #[test]
+    fn content_bytes_strips_real_tag() {
+        let mut cell = vec![CELL_TAG_REAL];
+        cell.extend_from_slice(&3.14f64.to_le_bytes());
+        assert_eq!(cell_content_bytes(&cell), &3.14f64.to_le_bytes());
+    }
+
+    #[test]
+    fn content_bytes_strips_text_tag() {
+        let mut cell = vec![CELL_TAG_TEXT];
+        cell.extend_from_slice(b"hello");
+        assert_eq!(cell_content_bytes(&cell), b"hello");
+    }
+
+    #[test]
+    fn content_bytes_strips_blob_tag() {
+        let mut cell = vec![CELL_TAG_BLOB];
+        cell.extend_from_slice(&[0xDE, 0xAD]);
+        assert_eq!(cell_content_bytes(&cell), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn content_bytes_empty_is_empty() {
+        assert_eq!(cell_content_bytes(&[]), &[] as &[u8]);
+    }
+
+    #[test]
+    fn content_bytes_integer_vs_text_differ() {
+        let mut int_cell = vec![CELL_TAG_INTEGER];
+        int_cell.extend_from_slice(&1i64.to_le_bytes());
+        let mut text_cell = vec![CELL_TAG_TEXT];
+        text_cell.extend_from_slice(b"1");
+        // i64 LE of 1 = [1,0,0,0,0,0,0,0], text "1" = [0x31]
+        assert_ne!(cell_content_bytes(&int_cell), cell_content_bytes(&text_cell));
     }
 
     #[test]

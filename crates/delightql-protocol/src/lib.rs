@@ -20,3 +20,6 @@ pub use layer1::{
     CELL_TAG_BLOB, CELL_TAG_INTEGER, CELL_TAG_REAL, CELL_TAG_TEXT, decode_cell_for_hash,
     decode_cell_to_text,
 };
+
+// Re-export bhash cell utility
+pub use layer1::cell_content_bytes;

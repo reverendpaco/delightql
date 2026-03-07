@@ -425,12 +425,13 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
                         Some(Stage::Results) => println!("Current output stage: Results"),
                         Some(Stage::Fingerprint) => println!("Current output stage: Fingerprint"),
                         Some(Stage::Hash) => println!("Current output stage: Hash"),
+                        Some(Stage::ByteHash) => println!("Current output stage: ByteHash"),
                         Some(Stage::TotalHash) => println!("Current output stage: TotalHash"),
                         Some(Stage::RecursionDepth) => {
                             println!("Current output stage: RecursionDepth")
                         }
                     }
-                    println!("Available stages: cst, ast-unresolved, ast-resolved, ast-refined, sql-ast, sql, results, hash, totalhash, fingerprint, recursion-depth");
+                    println!("Available stages: cst, ast-unresolved, ast-resolved, ast-refined, sql-ast, sql, results, hash, bhash, totalhash, fingerprint, recursion-depth");
                 }
             }
             Ok(CommandResult::Continue)

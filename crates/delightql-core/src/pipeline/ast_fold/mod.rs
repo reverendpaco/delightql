@@ -863,6 +863,7 @@ pub fn walk_operator<P, F: AstFold<P> + ?Sized>(
         }),
         // Leaf operators — no recursive children
         op @ UnaryRelationalOperator::MetaIze { .. } => Ok(op),
+        op @ UnaryRelationalOperator::Witness { .. } => Ok(op),
         UnaryRelationalOperator::Qualify => Ok(UnaryRelationalOperator::Qualify),
         op @ UnaryRelationalOperator::Using { .. } => Ok(op),
         op @ UnaryRelationalOperator::InteriorDrillDown { .. } => Ok(op),

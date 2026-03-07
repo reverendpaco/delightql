@@ -61,6 +61,39 @@ fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<QueryResults> {
     })
 }
 
+/// Fetch ALL rows preserving raw protocol cells (no string coercion).
+/// Used by `--to bhash` to hash bytes directly.
+fn fetch_all_raw(
+    session: &mut dyn DqlSession,
+    dql: &str,
+) -> Result<(Vec<String>, Vec<Vec<Option<Vec<u8>>>>)> {
+    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+
+    let mut all_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+
+    loop {
+        let fr = session
+            .fetch(&qr.handle, u64::MAX)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        if fr.finished {
+            break;
+        }
+
+        for row in fr.rows {
+            all_rows.push(row);
+        }
+    }
+
+    let _ = session
+        .close(qr.handle)
+        .map_err(|e| anyhow::anyhow!("{}", e));
+
+    Ok((columns, all_rows))
+}
+
 /// Query and stream results to the terminal.
 fn display_results(
     session: &mut dyn DqlSession,
@@ -195,6 +228,15 @@ fn execute_single_query(
         Some(Stage::AstSql) => compile_stage_dql("ast-sql", source_code),
         Some(Stage::Cst) => compile_stage_dql("cst", source_code),
         Some(Stage::RecursionDepth) => compile_stage_dql("recursion-depth", source_code),
+        Some(Stage::ByteHash) => {
+            let (columns, raw_rows) = fetch_all_raw(session, source_code)?;
+            let bhash = crate::util::fingerprint::compute_byte_hash(&raw_rows);
+            println!("{}", bhash);
+            return Ok(Some(ResultMetadata {
+                columns,
+                row_count: raw_rows.len(),
+            }));
+        }
         Some(Stage::Hash) | Some(Stage::TotalHash) | Some(Stage::Fingerprint) => {
             let results = fetch_all(session, source_code)?;
             let fingerprint =

@@ -61,6 +61,7 @@ fn address_query_inner(query: ast_refined::Query) -> Result<ast_addressed::Query
 // DQL AST walk: does an expression reference a name via Ground relations?
 // ---------------------------------------------------------------------------
 
+#[stacksafe::stacksafe]
 fn expression_references_name(expr: &ast_refined::RelationalExpression, name: &str) -> bool {
     match expr {
         ast_refined::RelationalExpression::Relation(rel) => relation_references_name(rel, name),
@@ -245,6 +246,7 @@ fn walk_operator_for_tree_groups(
         | ast_addressed::UnaryRelationalOperator::Transform { .. } => {}
         // Operators with no user expressions at all:
         ast_addressed::UnaryRelationalOperator::MetaIze { .. }
+        | ast_addressed::UnaryRelationalOperator::Witness { .. }
         | ast_addressed::UnaryRelationalOperator::Qualify
         | ast_addressed::UnaryRelationalOperator::Using { .. }
         | ast_addressed::UnaryRelationalOperator::DmlTerminal { .. }

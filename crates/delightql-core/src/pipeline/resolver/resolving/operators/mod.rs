@@ -96,6 +96,9 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
         ast_unresolved::UnaryRelationalOperator::MetaIze { detailed } => {
             schema_ops::resolve_meta_ize(detailed, available)
         }
+        ast_unresolved::UnaryRelationalOperator::Witness { exists } => {
+            schema_ops::resolve_witness(exists, available)
+        }
         ast_unresolved::UnaryRelationalOperator::Qualify => schema_ops::resolve_qualify(available),
         ast_unresolved::UnaryRelationalOperator::Using { columns } => {
             schema_ops::resolve_using(columns, available)

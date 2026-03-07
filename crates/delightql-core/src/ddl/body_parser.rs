@@ -746,6 +746,7 @@ fn remap_operator_qualifiers(
         UnaryRelationalOperator::HoViewApplication { .. }
         | UnaryRelationalOperator::DirectiveTerminal { .. }
         | UnaryRelationalOperator::MetaIze { .. }
+        | UnaryRelationalOperator::Witness { .. }
         | UnaryRelationalOperator::Qualify
         | UnaryRelationalOperator::Using { .. }
         | UnaryRelationalOperator::DmlTerminal { .. }

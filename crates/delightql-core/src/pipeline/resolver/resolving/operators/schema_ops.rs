@@ -341,6 +341,41 @@ pub(super) fn resolve_reposition(
     Ok((resolved_op, output_columns))
 }
 
+/// Resolve the Witness operator (+ or \+)
+///
+/// Witness reifies the input relation's existence as a 1-row, 1-column relation.
+/// - `+` returns ExistsWitness: `met` = 1 if source has rows, 0 otherwise
+/// - `\+` returns DoesNotExistWitness: `met` = 1 if source is empty, 0 otherwise
+///
+/// The output is always a single column named "met" with a single row.
+pub(super) fn resolve_witness(
+    exists: bool,
+    _available: &[ast_resolved::ColumnMetadata],
+) -> Result<(
+    ast_resolved::UnaryRelationalOperator,
+    Vec<ast_resolved::ColumnMetadata>,
+)> {
+    // Helper to create a synthetic column for the witness relation
+    fn make_witness_column(name: &str, position: usize) -> ast_resolved::ColumnMetadata {
+        ast_resolved::ColumnMetadata::new(
+            ast_resolved::ColumnProvenance::from_column(name.to_string()),
+            ast_resolved::FqTable {
+                parents_path: crate::pipeline::asts::unresolved::NamespacePath::empty(),
+                name: ast_resolved::TableName::Fresh,
+                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
+            },
+            Some(position),
+        )
+    }
+
+    // Output: single column "met"
+    let output_columns = vec![make_witness_column("met", 1)];
+
+    let resolved_op = ast_resolved::UnaryRelationalOperator::Witness { exists };
+
+    Ok((resolved_op, output_columns))
+}
+
 /// Resolve the MetaIze operator (^ or ^^)
 ///
 /// MetaIze reifies the input relation's schema as queryable data.

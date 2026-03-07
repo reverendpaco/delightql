@@ -137,6 +137,7 @@ fn extract_table_references(expr: &ast_unresolved::RelationalExpression) -> Vec<
     refs
 }
 
+#[stacksafe::stacksafe]
 fn extract_table_references_recursive(
     expr: &ast_unresolved::RelationalExpression,
     refs: &mut Vec<String>,

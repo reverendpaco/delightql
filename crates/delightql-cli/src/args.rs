@@ -316,6 +316,9 @@ pub enum Stage {
     Fingerprint,
     /// Show just the data hash as plain text (column-name independent)
     Hash,
+    /// Show byte-level data hash (type-preserving, platform-independent)
+    #[value(name = "bhash")]
+    ByteHash,
     /// Show just the total hash as plain text (includes column names)
     #[value(name = "totalhash")]
     TotalHash,
