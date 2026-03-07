@@ -263,11 +263,11 @@ pub fn process_inline_ddl_block(
         return Ok(Vec::new());
     }
 
-    let ddl = parser::parse_ddl_file(body)
+    let mut ddl = parser::parse_ddl_file(body)
         .map_err(|e| anyhow::anyhow!("Inline DDL parse error: {}", e))?;
 
     // Guard: inline DDL must contain definitions, not queries
-    if ddl.definitions.is_empty() {
+    if ddl.definitions.is_empty() && ddl.inline_ddl_blocks.is_empty() {
         return Err(anyhow::anyhow!(
             "Inline DDL block contains no definitions. \
              (~~ddl:\"name\" ~~) expects rules (:-), tables (:=), or function definitions."
@@ -280,6 +280,9 @@ pub fn process_inline_ddl_block(
         ));
     }
 
+    // Extract nested inline DDL blocks before consuming ddl
+    let nested_blocks = std::mem::take(&mut ddl.inline_ddl_blocks);
+
     let result = system
         .consult_file("(inline)", namespace, ddl)
         .map_err(|e| {
@@ -288,6 +291,15 @@ pub fn process_inline_ddl_block(
                 "consult error",
             )
         })?;
+
+    // Recursively process nested inline DDL blocks
+    for block in &nested_blocks {
+        let child_ns = match &block.namespace {
+            Some(suffix) => format!("{}::{}", namespace, suffix),
+            None => namespace.to_string(),
+        };
+        process_inline_ddl_block(&block.body, &child_ns, system)?;
+    }
 
     // Auto-enlist default namespace ("user") so definitions are immediately usable
     if namespace == "user" {

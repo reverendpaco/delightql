@@ -161,24 +161,6 @@ fn parse_unary_operator_core(
                     cpr_schema: PhaseBox::phantom(),
                 })))
             }
-            "+" => {
-                RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-                    source: input,
-                    operator: UnaryRelationalOperator::CompanionAccess {
-                        kind: crate::pipeline::asts::ddl::CompanionKind::Constraint,
-                    },
-                    cpr_schema: PhaseBox::phantom(),
-                })))
-            }
-            "$" => {
-                RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-                    source: input,
-                    operator: UnaryRelationalOperator::CompanionAccess {
-                        kind: crate::pipeline::asts::ddl::CompanionKind::Default,
-                    },
-                    cpr_schema: PhaseBox::phantom(),
-                })))
-            }
             other => panic!("Unknown meta_ize_operator text: {}", other),
         }
     } else if node.find_child("qualify_operator").is_some() {

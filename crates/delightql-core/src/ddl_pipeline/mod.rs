@@ -1,4 +1,4 @@
-pub mod assemble;
+pub mod assemble_manifest;
 pub mod asts;
 pub mod builder;
 pub mod generator;
@@ -8,23 +8,43 @@ pub mod transformer;
 
 use rusqlite::Connection;
 
+use crate::ddl::manifest;
 use crate::Result;
 
-/// Run the full DDL pipeline: assemble → resolve → transform → generate.
+/// Result of reading manifest data and producing CREATE TEMP TABLE SQL.
+pub struct ManifestCreateResult {
+    pub create_sql: String,
+    pub schema_rows: Vec<manifest::SchemaRow>,
+}
+
+/// Read manifest data from `_internal` namespace and produce CREATE TEMP TABLE SQL.
 ///
-/// Reads companion sys tables for the given entity, validates and transforms
-/// the DDL AST, and returns the final CREATE TABLE SQL string.
-pub fn generate_create_table(
+/// Returns `Ok(Some(result))` if the entity has schema rows, `Ok(None)` if not.
+pub fn create_temp_table_from_manifest(
     bootstrap_conn: &Connection,
-    entity_id: i32,
-    table_name: &str,
-    temp: bool,
-) -> Result<String> {
-    let unresolved =
-        assemble::assemble_create_table_def(bootstrap_conn, entity_id, table_name, temp)?;
+    internal_ns_id: i32,
+    entity_name: &str,
+) -> Result<Option<ManifestCreateResult>> {
+    let schema_rows = manifest::read_schema(bootstrap_conn, internal_ns_id, entity_name)?;
+    if schema_rows.is_empty() {
+        return Ok(None);
+    }
+    let constraint_rows =
+        manifest::read_constraints(bootstrap_conn, internal_ns_id, entity_name)?;
+    let default_rows = manifest::read_defaults(bootstrap_conn, internal_ns_id, entity_name)?;
+    let unresolved = assemble_manifest::assemble_from_manifest(
+        entity_name,
+        true,
+        &schema_rows,
+        &constraint_rows,
+        &default_rows,
+    )?;
     let resolved = resolver::resolve(unresolved)?;
     let sql_ast = transformer::transform(resolved)?;
-    Ok(generator::generate(&sql_ast))
+    Ok(Some(ManifestCreateResult {
+        create_sql: generator::generate(&sql_ast),
+        schema_rows,
+    }))
 }
 
 #[cfg(test)]

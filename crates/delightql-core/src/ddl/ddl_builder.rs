@@ -10,7 +10,7 @@ use crate::ddl::body_parser;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::ContextMode;
 use crate::pipeline::asts::ddl::{
-    CompanionKind, DdlBody, DdlDefinition, DdlHead, DdlNeck, FunctionParam, HoParam, HoParamKind,
+    DdlBody, DdlDefinition, DdlHead, DdlNeck, FunctionParam, HoParam, HoParamKind,
     ViewHeadItem,
 };
 use crate::pipeline::cst::CstNode;
@@ -173,27 +173,36 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                 context,
             }
         }
-        "fact_definition" => DdlHead::Fact,
-        "companion_definition" => {
-            let sigil_node = node.field("sigil").ok_or_else(|| {
-                DelightQLError::parse_error("Companion definition missing sigil field")
-            })?;
-            let sigil_kind_node = sigil_node
-                .child(0)
-                .ok_or_else(|| DelightQLError::parse_error("Companion sigil has no child"))?;
-            let kind = match sigil_kind_node.kind() {
-                "schema_sigil" => CompanionKind::Schema,
-                "constraint_sigil" => CompanionKind::Constraint,
-                "default_sigil" => CompanionKind::Default,
-                other => {
-                    return Err(DelightQLError::parse_error(format!(
-                        "Unknown companion sigil kind: {}",
-                        other
-                    )));
-                }
-            };
-            DdlHead::Companion { kind }
+        "ho_fact_definition" => {
+            // Same HO param extraction as ho_view_definition
+            let params_nodes = node.children_by_field("ho_params");
+            let params = params_nodes
+                .iter()
+                .filter(|p| p.kind() == "ho_param" || p.kind() == "identifier")
+                .map(|p| {
+                    if p.kind() == "ho_param" {
+                        extract_ho_param(p)
+                    } else {
+                        HoParam {
+                            name: p.text().to_string(),
+                            kind: HoParamKind::Scalar,
+                        }
+                    }
+                })
+                .collect();
+            // Extract column_headers from second parens as output_head (if present)
+            let output_head = node.find_child("column_headers").map(|ch| {
+                ch.children()
+                    .filter(|c| c.kind() == "column_header_item")
+                    .map(|c| ViewHeadItem::Free(c.text().to_string()))
+                    .collect::<Vec<_>>()
+            }).filter(|items| !items.is_empty());
+            DdlHead::HoView {
+                params,
+                output_head,
+            }
         }
+        "fact_definition" => DdlHead::Fact,
         _ => {
             return Err(DelightQLError::parse_error(format!(
                 "Unknown definition node type: {}",
@@ -211,6 +220,39 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
 /// `ho_view_definition` node from the DDL parser's CST.
 pub fn build_ddl_definition(node: &CstNode, source: &str) -> Result<DdlDefinition> {
     let cst_node_type = node.kind();
+
+    // HO fact sugar: like fact_definition but with HO params in first parens, data in second parens.
+    // No explicit neck in source — defaults to Session (:-) since facts are view-like definitions.
+    if cst_node_type == "ho_fact_definition" {
+        let (name, head) = extract_name_and_head(node, source)?;
+
+        let start = node.raw_node().start_byte();
+        let end = node.raw_node().end_byte();
+        let full_text = &source[start..end];
+
+        // Extract data content from CST nodes rather than scanning raw bytes.
+        // The second parens contain column_headers (optional) + data_rows.
+        let data_start = node.find_child("column_headers")
+            .or_else(|| node.find_child("data_rows"))
+            .ok_or_else(|| DelightQLError::parse_error("HO fact definition has no data content"))?
+            .raw_node().start_byte();
+        let data_end = node.find_child("data_rows")
+            .ok_or_else(|| DelightQLError::parse_error("HO fact definition missing data_rows"))?
+            .raw_node().end_byte();
+        let data_content = &source[data_start..data_end];
+
+        let anon_source = format!("_({})", data_content);
+        let rel = body_parser::parse_view_body(&anon_source)?;
+
+        return Ok(DdlDefinition {
+            name,
+            head,
+            _neck: DdlNeck::Session,
+            body: DdlBody::Relational(rel),
+            full_source: full_text.to_string(),
+            doc: None,
+        });
+    }
 
     // Fact definitions are special — no neck or body, data inside parens
     if cst_node_type == "fact_definition" {
@@ -256,8 +298,7 @@ pub fn build_ddl_definition(node: &CstNode, source: &str) -> Result<DdlDefinitio
         "view_definition"
         | "argumentative_view_definition"
         | "ho_view_definition"
-        | "er_rule_definition"
-        | "companion_definition" => BodyKind::Relational,
+        | "er_rule_definition" => BodyKind::Relational,
         _ => unreachable!("handled by extract_name_and_head"),
     };
 
@@ -380,10 +421,10 @@ pub fn build_ddl_head(source: &str) -> Result<(String, DdlHead)> {
             | "view_definition"
             | "argumentative_view_definition"
             | "ho_view_definition"
+            | "ho_fact_definition"
             | "sigma_definition"
             | "fact_definition"
-            | "er_rule_definition"
-            | "companion_definition" => {
+            | "er_rule_definition" => {
                 return extract_name_and_head(&child, source);
             }
             other => panic!("catch-all hit in ddl/ddl_builder.rs find_definition_in_source: unexpected CST node kind: {}", other),
@@ -434,10 +475,10 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
             | "view_definition"
             | "argumentative_view_definition"
             | "ho_view_definition"
+            | "ho_fact_definition"
             | "sigma_definition"
             | "fact_definition"
-            | "er_rule_definition"
-            | "companion_definition" => {
+            | "er_rule_definition" => {
                 definitions.push(build_ddl_definition(&child, source)?);
             }
             "query_statement" => {}
@@ -907,69 +948,4 @@ mod tests {
         assert!(defs[0].doc.is_none());
     }
 
-    #[test]
-    fn test_build_schema_companion() {
-        let source = r#"employees(^) :- _(name, type ---- "id", "INTEGER"; "name", "TEXT")"#;
-        let defs = build_ddl_file(source).unwrap();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].name, "employees");
-        assert!(matches!(
-            defs[0].head,
-            DdlHead::Companion {
-                kind: CompanionKind::Schema
-            }
-        ));
-        assert_eq!(defs[0].head.entity_type_id(), 18);
-    }
-
-    #[test]
-    fn test_build_constraint_companion() {
-        let source = r#"employees(+) :- _(column, constraint ---- "id", "NOT NULL")"#;
-        let defs = build_ddl_file(source).unwrap();
-        assert!(matches!(
-            defs[0].head,
-            DdlHead::Companion {
-                kind: CompanionKind::Constraint
-            }
-        ));
-    }
-
-    #[test]
-    fn test_build_default_companion() {
-        let source = r#"employees($) :- _(column, default_val ---- "age", 0)"#;
-        let defs = build_ddl_file(source).unwrap();
-        assert!(matches!(
-            defs[0].head,
-            DdlHead::Companion {
-                kind: CompanionKind::Default
-            }
-        ));
-    }
-
-    #[test]
-    fn test_build_companion_block() {
-        let source = "emp(^) :- _(name, type ---- \"id\", \"INTEGER\")\n\
-                      emp(+) :- _(column, constraint ---- \"id\", \"NOT NULL\")\n\
-                      emp($) :- _(column, default_val ---- \"age\", 0)";
-        let defs = build_ddl_file(source).unwrap();
-        assert_eq!(defs.len(), 3);
-        assert!(matches!(
-            defs[0].head,
-            DdlHead::Companion {
-                kind: CompanionKind::Schema
-            }
-        ));
-        assert!(matches!(
-            defs[1].head,
-            DdlHead::Companion {
-                kind: CompanionKind::Constraint
-            }
-        ));
-        assert!(matches!(
-            defs[2].head,
-            DdlHead::Companion {
-                kind: CompanionKind::Default
-            }
-        ));
-    }
 }

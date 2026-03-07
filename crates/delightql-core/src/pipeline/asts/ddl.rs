@@ -39,27 +39,6 @@ pub enum DdlNeck {
     TemporaryTable,
 }
 
-/// Companion table sigil — which metadata aspect this companion defines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum CompanionKind {
-    /// `(^)` — schema: column names and types
-    Schema,
-    /// `(+)` — constraints
-    Constraint,
-    /// `($)` — defaults
-    Default,
-}
-
-impl crate::lispy::ToLispy for CompanionKind {
-    fn to_lispy(&self) -> String {
-        match self {
-            CompanionKind::Schema => "schema".to_string(),
-            CompanionKind::Constraint => "constraint".to_string(),
-            CompanionKind::Default => "default".to_string(),
-        }
-    }
-}
-
 /// An item in an argumentative view head: either a free variable or a ground literal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewHeadItem {
@@ -98,8 +77,6 @@ pub enum DdlHead {
         right_table: String,
         context: String,
     },
-    /// Companion table: `name(sigil)` where sigil is ^, +, or $
-    Companion { kind: CompanionKind },
 }
 
 /// A function parameter with optional guard expression.
@@ -129,6 +106,45 @@ pub struct HoParam {
     pub kind: HoParamKind,
 }
 
+/// Cross-clause analysis of a single HO parameter position.
+/// Computed at consult time from all clauses, stored in sys tables.
+#[derive(Debug, Clone)]
+pub struct HoPositionInfo {
+    pub position: usize,
+    /// Unified column kind across all clauses
+    pub column_kind: HoColumnKind,
+    /// How ground values distribute across clauses
+    pub ground_mode: HoGroundMode,
+    /// Ground constant values (one per clause that has GroundScalar at this pos)
+    pub ground_values: Vec<(usize, String)>, // (clause_ordinal, value)
+    /// Canonical column name (from free-variable clauses; None for PureGround)
+    pub column_name: Option<String>,
+}
+
+/// What kind of HO column this position carries, unified across all clauses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HoColumnKind {
+    /// T(*) in every clause
+    TableGlob,
+    /// T(x,y) in every clause
+    TableArgumentative(Vec<String>),
+    /// Scalar/GroundScalar across clauses
+    Scalar,
+}
+
+/// How ground values distribute across clauses at a single position.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HoGroundMode {
+    /// Every clause: GroundScalar — free+unbound at call site IS valid
+    PureGround,
+    /// Some GroundScalar, some Scalar — call site MUST provide concrete value
+    MixedGround,
+    /// Every clause: Scalar — standard parameter
+    PureUnbound,
+    /// Table parameter (Glob/Argumentative) — always input-moded
+    InputOnly,
+}
+
 /// Definition body — the DQL expression(s) after the neck.
 #[derive(Debug, Clone)]
 pub enum DdlBody {
@@ -156,8 +172,7 @@ impl DdlHead {
             DdlHead::View
             | DdlHead::ArgumentativeView { .. }
             | DdlHead::Fact
-            | DdlHead::ErRule { .. }
-            | DdlHead::Companion { .. } => 0,
+            | DdlHead::ErRule { .. } => 0,
         }
     }
 
@@ -178,8 +193,7 @@ impl DdlHead {
             DdlHead::View
             | DdlHead::ArgumentativeView { .. }
             | DdlHead::Fact
-            | DdlHead::ErRule { .. }
-            | DdlHead::Companion { .. } => Vec::new(),
+            | DdlHead::ErRule { .. } => Vec::new(),
         }
     }
 
@@ -201,8 +215,7 @@ impl DdlHead {
             | DdlHead::ArgumentativeView { .. }
             | DdlHead::Fact
             | DdlHead::SigmaPredicate { .. }
-            | DdlHead::ErRule { .. }
-            | DdlHead::Companion { .. } => vec![],
+            | DdlHead::ErRule { .. } => vec![],
         }
     }
 
@@ -227,7 +240,6 @@ impl DdlHead {
             DdlHead::SigmaPredicate { .. } => 9,
             DdlHead::Fact => 16,
             DdlHead::ErRule { .. } => 17,
-            DdlHead::Companion { .. } => 18,
         }
     }
 }

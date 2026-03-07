@@ -198,7 +198,6 @@ fn fix_operator(op: resolved::UnaryRelationalOperator) -> resolved::UnaryRelatio
         | resolved::UnaryRelationalOperator::ProjectOut { .. }
         | resolved::UnaryRelationalOperator::RenameCover { .. }
         | resolved::UnaryRelationalOperator::MetaIze { .. }
-        | resolved::UnaryRelationalOperator::CompanionAccess { .. }
         | resolved::UnaryRelationalOperator::Qualify
         | resolved::UnaryRelationalOperator::Using { .. }
         | resolved::UnaryRelationalOperator::DmlTerminal { .. }
@@ -821,7 +820,6 @@ fn extract_qualifiers_from_operator(
         | resolved::UnaryRelationalOperator::ProjectOut { .. }
         | resolved::UnaryRelationalOperator::RenameCover { .. }
         | resolved::UnaryRelationalOperator::MetaIze { .. }
-        | resolved::UnaryRelationalOperator::CompanionAccess { .. }
         | resolved::UnaryRelationalOperator::Qualify
         | resolved::UnaryRelationalOperator::Using { .. }
         | resolved::UnaryRelationalOperator::DmlTerminal { .. }

@@ -1498,6 +1498,11 @@ impl DelightQLSystem {
 
         // Plain file path: use the existing ATTACH DATABASE path (SQLite-to-SQLite optimization)
 
+        // Resolve relative path against session CWD (for test isolation).
+        let resolved_path = crate::session_cwd::resolve_path(db_path);
+        let db_path = resolved_path.display().to_string();
+        let db_path = db_path.as_str();
+
         // Guard: file must exist and be a valid SQLite database
         let path = std::path::Path::new(db_path);
         if !path.exists() {
@@ -2207,18 +2212,8 @@ impl DelightQLSystem {
             // may create syntax patterns the body re-parser can't handle
             // until substitution occurs at call time.
             let is_ho_view = first_def.def_type == crate::pipeline::parser::DefinitionType::HoView;
-            let is_companion =
-                first_def.def_type == crate::pipeline::parser::DefinitionType::Companion;
 
-            // Companion bodies need preprocessing before tree-sitter parsing:
-            // strip sigil prefixes (c:"..." → "...") and functional-dependency
-            // arrows (-> → ,) that the DQL grammar doesn't support.
-            let build_source = if is_companion {
-                crate::ddl::companion::preprocess_companion_body(&source_to_store)
-            } else {
-                source_to_store.clone()
-            };
-            let ddl_defs = match crate::ddl::ddl_builder::build_ddl_file(&build_source) {
+            let ddl_defs = match crate::ddl::ddl_builder::build_ddl_file(&source_to_store) {
                 Ok(d) if !d.is_empty() => d,
                 Ok(_) if is_ho_view => {
                     // HO view with empty result — skip validation, proceed
@@ -2392,50 +2387,39 @@ impl DelightQLSystem {
                         })?;
                 }
 
-                // Write HO param metadata
-                if let crate::pipeline::asts::ddl::DdlHead::HoView { ref params, .. } = head {
-                    for (position, ho_param) in params.iter().enumerate() {
-                        let kind_str = match &ho_param.kind {
-                            crate::pipeline::asts::ddl::HoParamKind::Glob => "glob",
-                            crate::pipeline::asts::ddl::HoParamKind::Argumentative(_) => {
-                                "argumentative"
-                            }
-                            crate::pipeline::asts::ddl::HoParamKind::Scalar => "scalar",
-                            crate::pipeline::asts::ddl::HoParamKind::GroundScalar(_) => "ground_scalar",
-                        };
-                        bootstrap_conn
-                            .execute(
-                                "INSERT INTO ho_param (entity_id, param_name, position, kind) VALUES (?1, ?2, ?3, ?4)",
-                                rusqlite::params![entity_id, &ho_param.name, position as i32, kind_str],
-                            )
-                            .map_err(|e| {
-                                DelightQLError::database_error_with_source(
-                                    "Failed to insert ho_param",
-                                    e.to_string(),
-                                    Box::new(e),
-                                )
-                            })?;
-
-                        if let crate::pipeline::asts::ddl::HoParamKind::Argumentative(ref columns) =
-                            ho_param.kind
-                        {
-                            let ho_param_id = bootstrap_conn.last_insert_rowid() as i32;
-                            for (col_pos, col_name) in columns.iter().enumerate() {
-                                bootstrap_conn
-                                    .execute(
-                                        "INSERT INTO ho_param_column (ho_param_id, column_name, column_position) VALUES (?1, ?2, ?3)",
-                                        rusqlite::params![ho_param_id, col_name, col_pos as i32],
-                                    )
-                                    .map_err(|e| {
-                                        DelightQLError::database_error_with_source(
-                                            "Failed to insert ho_param_column",
-                                            e.to_string(),
-                                            Box::new(e),
-                                        )
-                                    })?;
+                // Write HO param metadata with cross-clause position analysis
+                if let crate::pipeline::asts::ddl::DdlHead::HoView { .. } = head {
+                    // Parse each clause's head to get per-clause HO params
+                    let mut clause_heads: Vec<crate::pipeline::asts::ddl::DdlHead> = Vec::new();
+                    for def in defs.iter() {
+                        match crate::ddl::ddl_builder::build_ddl_head(&def.full_source) {
+                            Ok((_name, clause_head)) => clause_heads.push(clause_head),
+                            Err(_) => {
+                                // If head parsing fails, use the primary head for this clause
+                                clause_heads.push(head.clone());
                             }
                         }
                     }
+                    if clause_heads.is_empty() {
+                        clause_heads.push(head.clone());
+                    }
+
+                    // Extract HoParam vecs from heads
+                    let param_vecs: Vec<Vec<crate::pipeline::asts::ddl::HoParam>> = clause_heads
+                        .iter()
+                        .filter_map(|h| match h {
+                            crate::pipeline::asts::ddl::DdlHead::HoView { params, .. } => {
+                                Some(params.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let head_refs: Vec<&Vec<crate::pipeline::asts::ddl::HoParam>> =
+                        param_vecs.iter().collect();
+
+                    let positions = crate::pipeline::resolver::grounding::build_ho_position_analysis_from_heads(&head_refs);
+
+                    Self::write_ho_params_to_bootstrap(bootstrap_conn, entity_id, &positions)?;
                 }
 
                 // Store proffer-extracted references
@@ -2492,7 +2476,6 @@ impl DelightQLSystem {
                         DdlHead::SigmaPredicate { .. } => "sigma predicate",
                         DdlHead::Fact => "fact",
                         DdlHead::ErRule { .. } => "er-context rule",
-                        DdlHead::Companion { .. } => "companion",
                     }
                 }
 
@@ -2636,50 +2619,11 @@ impl DelightQLSystem {
                     })?;
             }
 
-            // For HO views, also write structured param metadata to ho_param / ho_param_column
-            if let crate::pipeline::asts::ddl::DdlHead::HoView { ref params, .. } = first_ddl.head {
-                for (position, ho_param) in params.iter().enumerate() {
-                    let kind_str = match &ho_param.kind {
-                        crate::pipeline::asts::ddl::HoParamKind::Glob => "glob",
-                        crate::pipeline::asts::ddl::HoParamKind::Argumentative(_) => {
-                            "argumentative"
-                        }
-                        crate::pipeline::asts::ddl::HoParamKind::Scalar => "scalar",
-                        crate::pipeline::asts::ddl::HoParamKind::GroundScalar(_) => "ground_scalar",
-                    };
-                    bootstrap_conn
-                        .execute(
-                            "INSERT INTO ho_param (entity_id, param_name, position, kind) VALUES (?1, ?2, ?3, ?4)",
-                            rusqlite::params![entity_id, &ho_param.name, position as i32, kind_str],
-                        )
-                        .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert ho_param",
-                                e.to_string(),
-                                Box::new(e),
-                            )
-                        })?;
-
-                    if let crate::pipeline::asts::ddl::HoParamKind::Argumentative(ref columns) =
-                        ho_param.kind
-                    {
-                        let ho_param_id = bootstrap_conn.last_insert_rowid() as i32;
-                        for (col_pos, col_name) in columns.iter().enumerate() {
-                            bootstrap_conn
-                                .execute(
-                                    "INSERT INTO ho_param_column (ho_param_id, column_name, column_position) VALUES (?1, ?2, ?3)",
-                                    rusqlite::params![ho_param_id, col_name, col_pos as i32],
-                                )
-                                .map_err(|e| {
-                                    DelightQLError::database_error_with_source(
-                                        "Failed to insert ho_param_column",
-                                        e.to_string(),
-                                        Box::new(e),
-                                    )
-                                })?;
-                        }
-                    }
-                }
+            // For HO views, write structured param metadata with cross-clause position analysis
+            if matches!(first_ddl.head, crate::pipeline::asts::ddl::DdlHead::HoView { .. }) {
+                let positions =
+                    crate::pipeline::resolver::grounding::build_ho_position_analysis(&ddl_defs);
+                Self::write_ho_params_to_bootstrap(bootstrap_conn, entity_id, &positions)?;
             }
 
             // For ER-rules, write metadata to er_rule table
@@ -2710,21 +2654,6 @@ impl DelightQLSystem {
                                 Box::new(e),
                             )
                         })?;
-                }
-            }
-
-            // Store companion metadata in sys tables
-            {
-                use crate::pipeline::asts::ddl::DdlHead;
-                for ddl_def in &ddl_defs {
-                    if let DdlHead::Companion { kind } = &ddl_def.head {
-                        crate::ddl::companion::store_companion_data(
-                            bootstrap_conn,
-                            entity_id,
-                            *kind,
-                            &ddl_def.full_source,
-                        )?;
-                    }
                 }
             }
 
@@ -3520,6 +3449,21 @@ impl DelightQLSystem {
                     [cartridge_id],
                 ).map_err(|e| DelightQLError::database_error("Failed to delete interior_entity", e.to_string()))?;
 
+                // ho_param_ground_value (FK to ho_param)
+                bootstrap_conn
+                    .execute(
+                        "DELETE FROM ho_param_ground_value WHERE ho_param_id IN (
+                        SELECT hp.id FROM ho_param hp JOIN entity e ON hp.entity_id = e.id
+                        WHERE e.cartridge_id = ?1)",
+                        [cartridge_id],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            "Failed to delete ho_param_ground_value",
+                            e.to_string(),
+                        )
+                    })?;
+
                 // ho_param_column (FK to ho_param)
                 bootstrap_conn
                     .execute(
@@ -3552,22 +3496,6 @@ impl DelightQLSystem {
                     "DELETE FROM er_rule WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
                 ).map_err(|e| DelightQLError::database_error("Failed to delete er_rule", e.to_string()))?;
-
-                // companion tables
-                bootstrap_conn.execute(
-                    "DELETE FROM companion_schema WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
-                    [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete companion_schema", e.to_string()))?;
-
-                bootstrap_conn.execute(
-                    "DELETE FROM companion_constraint WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
-                    [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete companion_constraint", e.to_string()))?;
-
-                bootstrap_conn.execute(
-                    "DELETE FROM companion_default WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
-                    [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete companion_default", e.to_string()))?;
 
                 // referenced_entity
                 bootstrap_conn.execute(
@@ -3969,6 +3897,97 @@ impl DelightQLSystem {
         Ok(())
     }
 
+    /// Write HO parameter metadata to bootstrap from cross-clause position analysis.
+    ///
+    /// Inserts rows into ho_param, ho_param_column, and ho_param_ground_value
+    /// based on the unified HoPositionInfo computed by `build_ho_position_analysis`.
+    fn write_ho_params_to_bootstrap(
+        bootstrap_conn: &Connection,
+        entity_id: i32,
+        positions: &[crate::pipeline::asts::ddl::HoPositionInfo],
+    ) -> Result<()> {
+        use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
+
+        for pos_info in positions {
+            let kind_str = match &pos_info.column_kind {
+                HoColumnKind::TableGlob => "glob",
+                HoColumnKind::TableArgumentative(_) => "argumentative",
+                HoColumnKind::Scalar => match &pos_info.ground_mode {
+                    HoGroundMode::PureGround => "ground_scalar",
+                    HoGroundMode::MixedGround => "scalar",
+                    _ => "scalar",
+                },
+            };
+
+            let ground_mode_str = match &pos_info.ground_mode {
+                HoGroundMode::PureGround => Some("pure_ground"),
+                HoGroundMode::MixedGround => Some("mixed_ground"),
+                HoGroundMode::PureUnbound => Some("pure_unbound"),
+                HoGroundMode::InputOnly => Some("input_only"),
+            };
+
+            // Use column_name for param_name when available, fall back to position-based name
+            let param_name_owned;
+            let param_name = match &pos_info.column_name {
+                Some(name) => name.as_str(),
+                None => {
+                    param_name_owned = format!("_pos{}", pos_info.position);
+                    &param_name_owned
+                }
+            };
+
+            bootstrap_conn
+                .execute(
+                    "INSERT INTO ho_param (entity_id, param_name, position, kind, ground_mode, column_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![entity_id, param_name, pos_info.position as i32, kind_str, ground_mode_str, &pos_info.column_name],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error_with_source(
+                        "Failed to insert ho_param",
+                        e.to_string(),
+                        Box::new(e),
+                    )
+                })?;
+            let ho_param_id = bootstrap_conn.last_insert_rowid() as i32;
+
+            // Write argumentative columns
+            if let HoColumnKind::TableArgumentative(ref columns) = pos_info.column_kind {
+                for (col_pos, col_name) in columns.iter().enumerate() {
+                    bootstrap_conn
+                        .execute(
+                            "INSERT INTO ho_param_column (ho_param_id, column_name, column_position) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![ho_param_id, col_name, col_pos as i32],
+                        )
+                        .map_err(|e| {
+                            DelightQLError::database_error_with_source(
+                                "Failed to insert ho_param_column",
+                                e.to_string(),
+                                Box::new(e),
+                            )
+                        })?;
+                }
+            }
+
+            // Write per-clause ground values
+            for (clause_ordinal, ground_value) in &pos_info.ground_values {
+                bootstrap_conn
+                    .execute(
+                        "INSERT INTO ho_param_ground_value (ho_param_id, clause_ordinal, ground_value) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![ho_param_id, *clause_ordinal as i32, ground_value],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error_with_source(
+                            "Failed to insert ho_param_ground_value",
+                            e.to_string(),
+                            Box::new(e),
+                        )
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Deep-copy all sub-tables for an entity (clause, attribute, referenced,
     /// ho_param+columns, er_rule, interior_entity+attributes).
     fn copy_entity_subtables(
@@ -4003,16 +4022,23 @@ impl DelightQLSystem {
             rusqlite::params![new_entity_id, old_entity_id],
         ).map_err(|e| DelightQLError::database_error("Failed to copy referenced_entity", e.to_string()))?;
 
-        // ho_param + ho_param_column (FK chain: entity → ho_param → ho_param_column)
+        // ho_param + ho_param_column + ho_param_ground_value (FK chain: entity → ho_param → children)
         {
             let mut stmt = conn
-                .prepare("SELECT id, param_name, position, kind FROM ho_param WHERE entity_id = ?1")
+                .prepare("SELECT id, param_name, position, kind, ground_mode, column_name FROM ho_param WHERE entity_id = ?1")
                 .map_err(|e| {
                     DelightQLError::database_error("Failed to query ho_param", e.to_string())
                 })?;
-            let old_params: Vec<(i32, String, i32, String)> = stmt
+            let old_params: Vec<(i32, String, i32, String, Option<String>, Option<String>)> = stmt
                 .query_map([old_entity_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
                 })
                 .map_err(|e| {
                     DelightQLError::database_error("Failed to query ho_param", e.to_string())
@@ -4020,10 +4046,10 @@ impl DelightQLSystem {
                 .flatten()
                 .collect();
 
-            for (old_hp_id, param_name, position, kind) in &old_params {
+            for (old_hp_id, param_name, position, kind, ground_mode, column_name) in &old_params {
                 conn.execute(
-                    "INSERT INTO ho_param (entity_id, param_name, position, kind) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![new_entity_id, param_name, position, kind],
+                    "INSERT INTO ho_param (entity_id, param_name, position, kind, ground_mode, column_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![new_entity_id, param_name, position, kind, ground_mode, column_name],
                 ).map_err(|e| DelightQLError::database_error("Failed to copy ho_param", e.to_string()))?;
                 let new_hp_id = conn.last_insert_rowid() as i32;
 
@@ -4035,6 +4061,19 @@ impl DelightQLSystem {
                 )
                 .map_err(|e| {
                     DelightQLError::database_error("Failed to copy ho_param_column", e.to_string())
+                })?;
+
+                conn.execute(
+                    "INSERT INTO ho_param_ground_value (ho_param_id, clause_ordinal, ground_value)
+                     SELECT ?1, clause_ordinal, ground_value
+                     FROM ho_param_ground_value WHERE ho_param_id = ?2",
+                    rusqlite::params![new_hp_id, old_hp_id],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        "Failed to copy ho_param_ground_value",
+                        e.to_string(),
+                    )
                 })?;
             }
         }
@@ -4087,25 +4126,9 @@ impl DelightQLSystem {
 
     /// Delete all entity sub-tables and the cartridge row for a single cartridge.
     /// FK-safe deletion order: interior_entity_attribute, interior_entity,
-    /// ho_param_column, entity_resolution, ho_param, er_rule, referenced_entity,
-    /// entity_attribute, entity_clause, activated_entity, entity, cartridge.
+    /// ho_param_ground_value, ho_param_column, entity_resolution, ho_param, er_rule,
+    /// referenced_entity, entity_attribute, entity_clause, activated_entity, entity, cartridge.
     fn clear_cartridge_entities(bootstrap_conn: &Connection, cartridge_id: i64) -> Result<()> {
-        // Companion tables (must come before entity deletion)
-        bootstrap_conn.execute(
-            "DELETE FROM companion_default WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
-            [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete companion_default", e.to_string()))?;
-
-        bootstrap_conn.execute(
-            "DELETE FROM companion_constraint WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
-            [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete companion_constraint", e.to_string()))?;
-
-        bootstrap_conn.execute(
-            "DELETE FROM companion_schema WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
-            [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete companion_schema", e.to_string()))?;
-
         bootstrap_conn
             .execute(
                 "DELETE FROM interior_entity_attribute WHERE interior_entity_id IN (
@@ -4124,6 +4147,20 @@ impl DelightQLSystem {
             "DELETE FROM interior_entity WHERE parent_entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
         ).map_err(|e| DelightQLError::database_error("Failed to delete interior_entity", e.to_string()))?;
+
+        bootstrap_conn
+            .execute(
+                "DELETE FROM ho_param_ground_value WHERE ho_param_id IN (
+                SELECT hp.id FROM ho_param hp JOIN entity e ON hp.entity_id = e.id
+                WHERE e.cartridge_id = ?1)",
+                [cartridge_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to delete ho_param_ground_value",
+                    e.to_string(),
+                )
+            })?;
 
         bootstrap_conn
             .execute(
@@ -4190,35 +4227,6 @@ impl DelightQLSystem {
     /// FK-safe deletion order matching clear_cartridge_entities.
     /// Does NOT delete the parent cartridge (caller may have other entities in it).
     fn clear_single_entity(bootstrap_conn: &Connection, entity_id: i64) -> Result<()> {
-        // Companion tables
-        bootstrap_conn
-            .execute(
-                "DELETE FROM companion_default WHERE entity_id = ?1",
-                [entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete companion_default", e.to_string())
-            })?;
-        bootstrap_conn
-            .execute(
-                "DELETE FROM companion_constraint WHERE entity_id = ?1",
-                [entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete companion_constraint",
-                    e.to_string(),
-                )
-            })?;
-        bootstrap_conn
-            .execute(
-                "DELETE FROM companion_schema WHERE entity_id = ?1",
-                [entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete companion_schema", e.to_string())
-            })?;
-
         bootstrap_conn
             .execute(
                 "DELETE FROM interior_entity_attribute WHERE interior_entity_id IN (
@@ -4646,15 +4654,29 @@ impl DelightQLSystem {
             rows.flatten().collect()
         };
 
-        if entities.is_empty() {
+        // 4b. Discover manifest-only entities from _internal (if lib_ns has none of its own)
+        use crate::ddl::manifest;
+        let internal_ns_id = manifest::find_internal_ns(&bootstrap_conn, lib_ns)?;
+
+        let manifest_entity_names: Vec<String> = if entities.is_empty() {
+            if let Some(int_ns_id) = internal_ns_id {
+                manifest::discover_schema_entities(&bootstrap_conn, int_ns_id)?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if entities.is_empty() && manifest_entity_names.is_empty() {
             return Err(DelightQLError::database_error(
                 format!("Library namespace '{}' has no entities to ground", lib_ns),
                 "Empty namespace",
             ));
         }
 
-        // 5. STRICT VALIDATION: For each entity, check that all referenced entities
-        //    (unqualified free variables) exist in the data namespace
+        // 5. STRICT VALIDATION: For each entity with references, check that all
+        //    referenced entities (unqualified free variables) exist in the data namespace
         for (entity_id, entity_name, _entity_type, _doc) in &entities {
             let refs: Vec<String> = {
                 let mut ref_stmt = bootstrap_conn
@@ -4765,7 +4787,7 @@ impl DelightQLSystem {
         };
 
         // 8. Copy entities from lib_ns into new namespace
-        let count = entities.len();
+        let mut count = entities.len();
         for (old_entity_id, entity_name, entity_type, entity_doc) in &entities {
             bootstrap_conn
                 .execute(
@@ -4782,11 +4804,23 @@ impl DelightQLSystem {
 
             Self::copy_entity_subtables(&bootstrap_conn, *old_entity_id, new_entity_id)?;
 
-            // If entity has companion rows, also copy companion tables and
-            // create a temp table with the DDL-generated schema
-            if Self::has_companion_rows(&bootstrap_conn, *old_entity_id)? {
-                Self::copy_companion_tables(&bootstrap_conn, *old_entity_id, new_entity_id)?;
-                Self::materialize_companion_temp(&bootstrap_conn, new_entity_id, entity_name)?;
+            // If entity has manifest data in _internal, create TEMP table from it
+            if let Some(int_ns_id) = internal_ns_id {
+                if let Some(result) =
+                    crate::ddl_pipeline::create_temp_table_from_manifest(
+                        &bootstrap_conn, int_ns_id, entity_name,
+                    )?
+                {
+                    bootstrap_conn.execute_batch(&result.create_sql).map_err(|e| {
+                        DelightQLError::database_error(
+                            format!(
+                                "Failed to CREATE TEMP TABLE for '{}': {}",
+                                entity_name, result.create_sql
+                            ),
+                            e.to_string(),
+                        )
+                    })?;
+                }
             }
 
             bootstrap_conn
@@ -4802,6 +4836,78 @@ impl DelightQLSystem {
                 })?;
         }
 
+        // 8b. Create manifest-only entities (discovered from _internal, no entity in lib_ns)
+        if let Some(int_ns_id) = internal_ns_id {
+            for entity_name in &manifest_entity_names {
+                let result = match crate::ddl_pipeline::create_temp_table_from_manifest(
+                    &bootstrap_conn, int_ns_id, entity_name,
+                )? {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let crate::ddl_pipeline::ManifestCreateResult { create_sql, schema_rows } = result;
+                bootstrap_conn.execute_batch(&create_sql).map_err(|e| {
+                    DelightQLError::database_error(
+                        format!(
+                            "Failed to CREATE TEMP TABLE for '{}': {}",
+                            entity_name, create_sql
+                        ),
+                        e.to_string(),
+                    )
+                })?;
+
+                // Register entity in bootstrap
+                bootstrap_conn
+                    .execute(
+                        "INSERT INTO entity (name, type, cartridge_id, doc) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            entity_name,
+                            1, // Table entity type
+                            cartridge_id,
+                            format!("Grounded from {} manifest", lib_ns),
+                        ],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            format!("Failed to create grounded entity '{}'", entity_name),
+                            e.to_string(),
+                        )
+                    })?;
+                let new_entity_id = bootstrap_conn.last_insert_rowid() as i32;
+
+                // Register entity attributes from manifest schema rows
+                for (position, sr) in schema_rows.iter().enumerate() {
+                    bootstrap_conn
+                        .execute(
+                            "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
+                             VALUES (?1, ?2, 'output_column', ?3, ?4, 1)",
+                            rusqlite::params![new_entity_id, &sr.name, &sr.col_type, position as i32 + 1],
+                        )
+                        .map_err(|e| {
+                            DelightQLError::database_error(
+                                format!("Failed to register attribute '{}' for '{}'", sr.name, entity_name),
+                                e.to_string(),
+                            )
+                        })?;
+                }
+
+                // Activate entity in grounded namespace
+                bootstrap_conn
+                    .execute(
+                        "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![new_entity_id, new_ns_id, cartridge_id],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            format!("Failed to activate grounded entity '{}'", entity_name),
+                            e.to_string(),
+                        )
+                    })?;
+
+                count += 1;
+            }
+        }
+
         drop(bootstrap_conn);
 
         debug!(
@@ -4812,198 +4918,11 @@ impl DelightQLSystem {
         Ok(count)
     }
 
-    /// Check if an entity has companion schema rows (i.e., is a companion-bearing entity).
-    fn has_companion_rows(conn: &Connection, entity_id: i32) -> Result<bool> {
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM companion_schema WHERE entity_id = ?1)",
-                [entity_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to check companion_schema for entity",
-                    e.to_string(),
-                )
-            })?;
-        Ok(exists)
-    }
-
-    /// Copy companion_schema, companion_constraint, and companion_default rows
-    /// from one entity to another (used during ground! to preserve companion
-    /// queries like entity(^) on the grounded copy).
-    fn copy_companion_tables(
-        conn: &Connection,
-        old_entity_id: i32,
-        new_entity_id: i32,
-    ) -> Result<()> {
-        conn.execute(
-            "INSERT INTO companion_schema (entity_id, column_position, column_name, column_type)
-             SELECT ?1, column_position, column_name, column_type
-             FROM companion_schema WHERE entity_id = ?2",
-            rusqlite::params![new_entity_id, old_entity_id],
-        )
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to copy companion_schema", e.to_string())
-        })?;
-
-        conn.execute(
-            "INSERT INTO companion_constraint (entity_id, column_name, constraint_text, constraint_name)
-             SELECT ?1, column_name, constraint_text, constraint_name
-             FROM companion_constraint WHERE entity_id = ?2",
-            rusqlite::params![new_entity_id, old_entity_id],
-        )
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to copy companion_constraint", e.to_string())
-        })?;
-
-        conn.execute(
-            "INSERT INTO companion_default (entity_id, column_name, default_text, generated)
-             SELECT ?1, column_name, default_text, generated
-             FROM companion_default WHERE entity_id = ?2",
-            rusqlite::params![new_entity_id, old_entity_id],
-        )
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to copy companion_default", e.to_string())
-        })?;
-
-        Ok(())
-    }
-
-    /// Materialize a companion-bearing entity as a physical table.
+    /// Imprint definitions from a library namespace into a data namespace.
     ///
-    /// Reads companion_schema/constraint/default for the given entity_id,
-    /// runs the DDL pipeline to produce CREATE TABLE SQL, and returns it.
-    /// The caller is responsible for executing the SQL on the appropriate connection.
-    ///
-    /// If `temp` is true, generates CREATE TEMP TABLE.
-    fn generate_companion_ddl(
-        bootstrap_conn: &Connection,
-        entity_id: i32,
-        table_name: &str,
-        temp: bool,
-    ) -> Result<String> {
-        crate::ddl_pipeline::generate_create_table(bootstrap_conn, entity_id, table_name, temp)
-    }
-
-    /// Materialize a companion entity as a permanent table in a target database.
-    ///
-    /// 1. Generates CREATE TABLE via the DDL pipeline
-    /// 2. Optionally schema-qualifies for ATTACHed databases
-    /// 3. Executes against the target connection
-    /// 4. If the entity has a `:=` body (CTAS), compiles and executes INSERT INTO ... SELECT
-    ///
-    /// Returns (create_sql, Option<insert_sql>).
-    fn materialize_companion_permanent(
-        bootstrap_conn: &Connection,
-        target_conn: &dyn DatabaseConnection,
-        entity_id: i32,
-        table_name: &str,
-        schema_alias: Option<&str>,
-        schema: &dyn DatabaseSchema,
-    ) -> Result<(String, Option<String>)> {
-        let create_sql =
-            Self::generate_companion_ddl(bootstrap_conn, entity_id, table_name, false)?;
-
-        // Schema-qualify for ATTACHed databases
-        let qualified_create = if let Some(schema_name) = schema_alias {
-            create_sql.replacen(
-                &format!("CREATE TABLE \"{}\"", table_name),
-                &format!("CREATE TABLE \"{}\".\"{}\"", schema_name, table_name),
-                1,
-            )
-        } else {
-            create_sql
-        };
-
-        target_conn.execute(&qualified_create, &[]).map_err(|e| {
-            DelightQLError::database_error(
-                format!(
-                    "Failed to execute CREATE TABLE for '{}': {}",
-                    table_name, qualified_create,
-                ),
-                e.to_string(),
-            )
-        })?;
-
-        // Check for := CTAS body
-        let ctas_body: Option<String> = bootstrap_conn
-            .query_row(
-                "SELECT definition FROM entity_clause WHERE entity_id = ?1 ORDER BY ordinal LIMIT 1",
-                [entity_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|def| {
-                // Look for entity with (*) := pattern (CTAS definition)
-                if let Some(pos) = def.find(":=") {
-                    let body = def[pos + 2..].trim();
-                    if !body.is_empty() {
-                        Some(body.to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            });
-
-        let insert_sql = if let Some(body) = ctas_body {
-            let select_sql = crate::pipeline::compile_source_to_sql(&body, schema)?;
-
-            let qualified_table = if let Some(schema_name) = schema_alias {
-                format!("\"{}\".\"{}\"", schema_name, table_name)
-            } else {
-                format!("\"{}\"", table_name)
-            };
-
-            let insert = format!("INSERT INTO {} {}", qualified_table, select_sql);
-            target_conn.execute(&insert, &[]).map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Failed to execute CTAS INSERT for '{}': {}",
-                        table_name, insert,
-                    ),
-                    e.to_string(),
-                )
-            })?;
-            Some(insert)
-        } else {
-            None
-        };
-
-        Ok((qualified_create, insert_sql))
-    }
-
-    /// Materialize a companion entity as a temporary table in the bootstrap connection.
-    ///
-    /// Used by ground!() — temp tables live in the bootstrap SQLite database.
-    fn materialize_companion_temp(
-        bootstrap_conn: &Connection,
-        entity_id: i32,
-        table_name: &str,
-    ) -> Result<String> {
-        let create_sql = Self::generate_companion_ddl(bootstrap_conn, entity_id, table_name, true)?;
-
-        bootstrap_conn.execute_batch(&create_sql).map_err(|e| {
-            DelightQLError::database_error(
-                format!(
-                    "Failed to execute CREATE TEMP TABLE for '{}': {}",
-                    table_name, create_sql,
-                ),
-                e.to_string(),
-            )
-        })?;
-
-        Ok(create_sql)
-    }
-
-    /// Imprint companion definitions from a library namespace into a data namespace.
-    ///
-    /// For each companion-bearing entity in source_ns:
-    /// 1. Generates CREATE TABLE from companion sys tables
-    /// 2. Executes DDL on target database
-    /// 3. If entity has := body, populates via INSERT INTO ... SELECT
+    /// Reads manifest data from the `_internal` child namespace (schema, constraints,
+    /// defaults, imprinting HO entities), assembles CREATE TABLE DDL, and executes
+    /// on the target database. For CTAS entities, populates via INSERT INTO ... SELECT.
     ///
     /// Returns a list of (entity_name, status, sql) tuples for reporting.
     pub fn imprint_namespace(
@@ -5113,58 +5032,142 @@ impl DelightQLSystem {
             .cloned()
             .unwrap_or_else(|| Arc::clone(&self.connection));
 
-        // 5. Get all companion-bearing entities from source namespace
-        let entities: Vec<(i32, String)> = {
-            let mut stmt = bootstrap_conn
-                .prepare(
-                    "SELECT DISTINCT e.id, e.name
-                     FROM entity e
-                     JOIN activated_entity ae ON ae.entity_id = e.id
-                     WHERE ae.namespace_id = ?1
-                       AND EXISTS(SELECT 1 FROM companion_schema cs WHERE cs.entity_id = e.id)",
+        // 5. Find _internal child namespace for manifest data
+        use crate::ddl::manifest;
+
+        let internal_ns_id =
+            manifest::find_internal_ns(&bootstrap_conn, source_ns)?.ok_or_else(|| {
+                DelightQLError::database_error(
+                    format!(
+                        "imprint!() source '{}' has no _internal namespace \
+                         (no schema/constraints/defaults definitions)",
+                        source_ns
+                    ),
+                    "No _internal namespace",
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query companion entities for imprint",
-                        e.to_string(),
-                    )
-                })?;
-            let rows = stmt
-                .query_map([source_ns_id], |row| {
-                    Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+        // Discover entities: prefer imprinting() manifest, fall back to schema() ground values
+        let imprinting_rows = manifest::read_imprinting(&bootstrap_conn, internal_ns_id)?;
+
+        struct EntityTodo {
+            name: String,
+            materialization: String,
+            extent: String,
+        }
+
+        let entity_todos: Vec<EntityTodo> = if !imprinting_rows.is_empty() {
+            imprinting_rows
+                .into_iter()
+                .map(|row| EntityTodo {
+                    name: row.entity,
+                    materialization: row.materialization,
+                    extent: row.extent,
                 })
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query companion entities",
-                        e.to_string(),
-                    )
-                })?;
-            rows.flatten().collect()
+                .collect()
+        } else {
+            // No imprinting() — discover from schema() ground values
+            let schema_entities =
+                manifest::discover_schema_entities(&bootstrap_conn, internal_ns_id)?;
+            schema_entities
+                .into_iter()
+                .map(|name| EntityTodo {
+                    name,
+                    materialization: "table".to_string(),
+                    extent: "permanent".to_string(),
+                })
+                .collect()
         };
 
-        if entities.is_empty() {
+        if entity_todos.is_empty() {
             return Err(DelightQLError::database_error(
                 format!(
-                    "imprint!() source '{}' has no companion-bearing entities (no (^) schema definitions)",
+                    "imprint!() source '{}' has no manifest entities \
+                     (no schema() or imprinting() definitions in _internal)",
                     source_ns
                 ),
-                "No companion entities",
+                "No manifest entities",
             ));
         }
 
-        // 6. Lock target connection and materialize each entity
-        let target_conn_guard = target_conn.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire target connection lock for imprint",
-                format!("Connection was poisoned: {}", e),
-            )
-        })?;
+        // --- Phase 0: Read ALL manifest data from bootstrap, then drop the lock ---
+        // self.schema is BootstrapBackedSchema which locks self.bootstrap_connection
+        // internally. compile_source_to_sql -> resolver -> schema.get_table_columns()
+        // -> BootstrapBackedSchema::get_table_columns() -> self.bootstrap_conn.lock().
+        // If we still hold bootstrap_conn here, that's a deadlock. So we read
+        // everything we need, drop the lock, then compile in Phase 1.
 
-        // Enable FK enforcement on target
-        let _ = target_conn_guard.execute("PRAGMA foreign_keys = ON", &[]);
+        struct ManifestData {
+            name: String,
+            materialization: String,
+            extent: String,
+            schema_rows: Vec<manifest::SchemaRow>,
+            constraint_rows: Vec<manifest::ConstraintRow>,
+            default_rows: Vec<manifest::DefaultRow>,
+            ctas_body: Option<String>,
+        }
 
-        // Get schema for CTAS compilation
-        let empty_schema = crate::ddl::companion::EmptySchemaForImprint;
+        let mut manifest_items: Vec<ManifestData> = Vec::new();
+
+        for todo in &entity_todos {
+            let entity_name = &todo.name;
+
+            let schema_rows =
+                manifest::read_schema(&bootstrap_conn, internal_ns_id, entity_name)?;
+            let constraint_rows =
+                manifest::read_constraints(&bootstrap_conn, internal_ns_id, entity_name)?;
+            let default_rows =
+                manifest::read_defaults(&bootstrap_conn, internal_ns_id, entity_name)?;
+
+            // Check for CTAS body: entity with :- or := view body in source namespace
+            let ctas_body: Option<String> = {
+                let stmt = bootstrap_conn
+                    .prepare(
+                        "SELECT ec.definition FROM entity_clause ec
+                         JOIN entity e ON ec.entity_id = e.id
+                         JOIN activated_entity ae ON ae.entity_id = e.id
+                         WHERE ae.namespace_id = ?1 AND e.name = ?2
+                         ORDER BY ec.ordinal LIMIT 1",
+                    )
+                    .ok();
+                stmt.and_then(|mut s| {
+                    s.query_row(
+                        rusqlite::params![source_ns_id, entity_name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                })
+                .and_then(|def| {
+                    if let Some(pos) = def.find(":-") {
+                        let body = def[pos + 2..].trim();
+                        if !body.is_empty() { Some(body.to_string()) } else { None }
+                    } else if let Some(pos) = def.find(":=") {
+                        let body = def[pos + 2..].trim();
+                        if !body.is_empty() { Some(body.to_string()) } else { None }
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            manifest_items.push(ManifestData {
+                name: entity_name.clone(),
+                materialization: todo.materialization.clone(),
+                extent: todo.extent.clone(),
+                schema_rows,
+                constraint_rows,
+                default_rows,
+                ctas_body,
+            });
+        }
+
+        // Drop bootstrap lock -- Phase 1 needs schema access which locks bootstrap internally
+        drop(bootstrap_conn);
+
+        // --- Phase 1: Compile (no bootstrap lock held) ---
+        // compile_source_to_sql -> resolver -> schema.get_table_columns()
+        // -> BootstrapBackedSchema -> self.bootstrap_connection.lock(). Safe now.
+        let empty_schema = crate::ddl::manifest::EmptySchema;
         let schema: &dyn DatabaseSchema = if connection_id == 2 {
             self.schema
                 .as_ref()
@@ -5177,7 +5180,133 @@ impl DelightQLSystem {
                 .unwrap_or(&empty_schema)
         };
 
-        // 7. Create a cartridge for the imprinted entities
+        struct PreparedEntity {
+            name: String,
+            materialization: String,
+            temp: bool,
+            qualified_create: String,
+            ctas_insert_sql: Option<String>,
+            effective_schema: Vec<manifest::SchemaRow>,
+        }
+
+        let mut prepared: Vec<PreparedEntity> = Vec::new();
+
+        for item in &manifest_items {
+            let entity_name = &item.name;
+
+            if item.materialization == "view" {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "imprint!() entity '{}' has materialization 'view' which is not yet supported",
+                        entity_name
+                    ),
+                    "View materialization in imprint is deferred",
+                ));
+            }
+
+            let temp = item.extent == "temporary";
+
+            // Compile CTAS body (schema access locks bootstrap internally -- safe now)
+            let ctas_select_sql = if let Some(body) = &item.ctas_body {
+                Some(crate::pipeline::compile_source_to_sql(body, schema)?)
+            } else {
+                None
+            };
+
+            // For CTAS without explicit schema, infer from LIMIT 0 query on target
+            let effective_schema = if item.schema_rows.is_empty() && ctas_select_sql.is_some() {
+                let select_sql = ctas_select_sql.as_ref().unwrap();
+                let limit_sql = format!("SELECT * FROM ({}) LIMIT 0", select_sql);
+                let target_conn_tmp = target_conn.lock().map_err(|e| {
+                    DelightQLError::connection_poison_error(
+                        "Failed to acquire target connection for schema inference",
+                        format!("Connection was poisoned: {}", e),
+                    )
+                })?;
+                let (col_names, _rows) = target_conn_tmp
+                    .query_all_string_rows(&limit_sql, &[])
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            format!(
+                                "Failed to infer schema for CTAS entity '{}': {}",
+                                entity_name, limit_sql
+                            ),
+                            e.to_string(),
+                        )
+                    })?;
+                drop(target_conn_tmp);
+                col_names
+                    .into_iter()
+                    .map(|name| manifest::SchemaRow {
+                        name,
+                        col_type: "TEXT".to_string(),
+                    })
+                    .collect()
+            } else {
+                item.schema_rows.clone()
+            };
+
+            // Assemble CREATE TABLE from manifest via DDL pipeline
+            let unresolved = crate::ddl_pipeline::assemble_manifest::assemble_from_manifest(
+                entity_name,
+                temp,
+                &effective_schema,
+                &item.constraint_rows,
+                &item.default_rows,
+            )?;
+            let resolved = crate::ddl_pipeline::resolver::resolve(unresolved)?;
+            let sql_ast = crate::ddl_pipeline::transformer::transform(resolved)?;
+            let create_sql = crate::ddl_pipeline::generator::generate(&sql_ast);
+
+            // Schema-qualify for ATTACHed databases
+            let qualified_create = if let Some(schema_name) = target_schema_alias.as_deref() {
+                create_sql.replacen(
+                    &format!("CREATE TABLE \"{}\"", entity_name),
+                    &format!("CREATE TABLE \"{}\".\"{}\"", schema_name, entity_name),
+                    1,
+                )
+            } else {
+                create_sql
+            };
+
+            // Build CTAS insert statement
+            let ctas_insert_sql = ctas_select_sql.map(|select_sql| {
+                let qualified_table = if let Some(schema_name) = target_schema_alias.as_deref() {
+                    format!("\"{}\".\"{}\"", schema_name, entity_name)
+                } else {
+                    format!("\"{}\"", entity_name)
+                };
+                format!("INSERT INTO {} {}", qualified_table, select_sql)
+            });
+
+            prepared.push(PreparedEntity {
+                name: entity_name.clone(),
+                materialization: item.materialization.clone(),
+                temp,
+                qualified_create,
+                ctas_insert_sql,
+                effective_schema,
+            });
+        }
+
+        // --- Phase 2: Execute (re-acquire bootstrap + target locks) ---
+        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to re-acquire bootstrap lock for imprint execution",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let target_conn_guard = target_conn.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire target connection lock for imprint",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+
+        // Enable FK enforcement on target
+        let _ = target_conn_guard.execute("PRAGMA foreign_keys = ON", &[]);
+
+        // Create a cartridge for the imprinted entities
         let imprint_cartridge_id = {
             bootstrap_conn
                 .execute(
@@ -5202,23 +5331,43 @@ impl DelightQLSystem {
 
         let mut results = Vec::new();
 
-        for (entity_id, entity_name) in &entities {
-            let (create_sql, insert_sql) = Self::materialize_companion_permanent(
-                &bootstrap_conn,
-                &*target_conn_guard,
-                *entity_id,
-                entity_name,
-                target_schema_alias.as_deref(),
-                schema,
-            )?;
+        for entity in &prepared {
+            let entity_name = &entity.name;
 
-            // Register the new table as an entity in the target namespace
+            target_conn_guard
+                .execute(&entity.qualified_create, &[])
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!(
+                            "Failed to execute CREATE TABLE for '{}': {}",
+                            entity_name, entity.qualified_create,
+                        ),
+                        e.to_string(),
+                    )
+                })?;
+
+            // Execute CTAS INSERT if present
+            if let Some(insert) = &entity.ctas_insert_sql {
+                target_conn_guard.execute(insert, &[]).map_err(|e| {
+                    DelightQLError::database_error(
+                        format!(
+                            "Failed to execute CTAS INSERT for '{}': {}",
+                            entity_name, insert,
+                        ),
+                        e.to_string(),
+                    )
+                })?;
+            }
+
+            // Register the new entity in the target namespace
+            // Entity type: 1 = table, 2 = view
+            let entity_type = if entity.materialization == "view" { 2 } else { 1 };
             bootstrap_conn
                 .execute(
                     "INSERT INTO entity (name, type, cartridge_id, doc) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![
                         entity_name,
-                        1, // Table entity type
+                        entity_type,
                         imprint_cartridge_id,
                         format!("Imprinted from {}", source_ns),
                     ],
@@ -5231,47 +5380,20 @@ impl DelightQLSystem {
                 })?;
             let new_entity_id = bootstrap_conn.last_insert_rowid() as i32;
 
-            // Register entity attributes from companion_schema
-            {
-                let mut attr_stmt = bootstrap_conn
-                    .prepare(
-                        "SELECT column_name, column_type, column_position
-                         FROM companion_schema WHERE entity_id = ?1
-                         ORDER BY column_position",
+            // Register entity attributes from manifest schema rows
+            for (position, sr) in entity.effective_schema.iter().enumerate() {
+                bootstrap_conn
+                    .execute(
+                        "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, data_type, position, is_nullable, default_value)
+                         VALUES (?1, ?2, 'output_column', ?3, ?4, 1, NULL)",
+                        rusqlite::params![new_entity_id, &sr.name, &sr.col_type, position as i32 + 1],
                     )
                     .map_err(|e| {
                         DelightQLError::database_error(
-                            "Failed to query companion_schema for attributes",
+                            format!("Failed to register attribute '{}' for '{}'", sr.name, entity_name),
                             e.to_string(),
                         )
                     })?;
-                let attrs: Vec<(String, String, i32)> = attr_stmt
-                    .query_map([entity_id], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                    .map_err(|e| {
-                        DelightQLError::database_error(
-                            "Failed to read companion_schema",
-                            e.to_string(),
-                        )
-                    })?
-                    .flatten()
-                    .collect();
-
-                for (col_name, col_type, position) in &attrs {
-                    bootstrap_conn
-                        .execute(
-                            "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, data_type, position, is_nullable, default_value)
-                             VALUES (?1, ?2, 'output_column', ?3, ?4, 1, NULL)",
-                            rusqlite::params![new_entity_id, col_name, col_type, position],
-                        )
-                        .map_err(|e| {
-                            DelightQLError::database_error(
-                                format!("Failed to register attribute '{}' for '{}'", col_name, entity_name),
-                                e.to_string(),
-                            )
-                        })?;
-                }
             }
 
             // Activate entity in target namespace
@@ -5287,13 +5409,13 @@ impl DelightQLSystem {
                     )
                 })?;
 
-            let status = if insert_sql.is_some() {
+            let status = if entity.ctas_insert_sql.is_some() {
                 "created+populated"
             } else {
                 "created"
             };
 
-            results.push((entity_name.clone(), status.to_string(), create_sql));
+            results.push((entity_name.clone(), status.to_string(), entity.qualified_create.clone()));
         }
 
         drop(target_conn_guard);
@@ -5986,6 +6108,10 @@ impl DelightQLSystem {
 
         // 3. Read + parse new file
         drop(bootstrap_conn);
+
+        // Resolve relative path against session CWD (for test isolation).
+        let resolved_path = crate::session_cwd::resolve_path(&file_path);
+        let file_path = resolved_path.display().to_string();
 
         let source = std::fs::read_to_string(&file_path).map_err(|e| {
             DelightQLError::database_error(

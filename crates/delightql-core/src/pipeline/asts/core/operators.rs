@@ -226,6 +226,8 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
     HoViewApplication {
         function: String,
         arguments: Vec<HoCallGroup>,
+        /// First-parens as parsed AST (for PatternResolver unification).
+        first_parens_spec: Option<DomainSpec<Phase>>,
         domain_spec: DomainSpec<Phase>,
         namespace: Option<NamespacePath>,
     },
@@ -238,15 +240,6 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
     MetaIze {
         /// True for `^^` (detailed), false for `^` (basic)
         detailed: bool,
-    },
-    /// Companion access: + or $ — query companion constraint/default tables
-    ///
-    /// Unresolved-only: the resolver materializes companion data from bootstrap
-    /// into an inline Anonymous relation. Never survives past resolution.
-    #[lispy("unary_relational_operator:companion_access")]
-    #[phase_convert(unreachable)]
-    CompanionAccess {
-        kind: crate::pipeline::asts::ddl::CompanionKind,
     },
     /// Qualify: * - marks all columns as qualified (table-prefixed)
     ///

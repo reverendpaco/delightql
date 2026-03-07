@@ -840,11 +840,13 @@ pub fn walk_operator<P, F: AstFold<P> + ?Sized>(
         UnaryRelationalOperator::HoViewApplication {
             function,
             arguments,
+            first_parens_spec,
             domain_spec,
             namespace,
         } => Ok(UnaryRelationalOperator::HoViewApplication {
             function,
             arguments,
+            first_parens_spec,
             domain_spec: fold.fold_domain_spec(domain_spec)?,
             namespace,
         }),
@@ -860,7 +862,6 @@ pub fn walk_operator<P, F: AstFold<P> + ?Sized>(
             domain_spec: fold.fold_domain_spec(domain_spec)?,
         }),
         // Leaf operators — no recursive children
-        op @ UnaryRelationalOperator::CompanionAccess { .. } => Ok(op),
         op @ UnaryRelationalOperator::MetaIze { .. } => Ok(op),
         UnaryRelationalOperator::Qualify => Ok(UnaryRelationalOperator::Qualify),
         op @ UnaryRelationalOperator::Using { .. } => Ok(op),
@@ -1027,6 +1028,7 @@ pub fn walk_relation<P, F: AstFold<P> + ?Sized>(
             function,
             arguments,
             argument_groups,
+            first_parens_spec,
             domain_spec,
             alias,
             namespace,
@@ -1036,6 +1038,7 @@ pub fn walk_relation<P, F: AstFold<P> + ?Sized>(
             function,
             arguments,
             argument_groups,
+            first_parens_spec,
             domain_spec: fold.fold_domain_spec(domain_spec)?,
             alias,
             namespace,

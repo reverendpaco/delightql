@@ -9,6 +9,7 @@
 //! Future work: Create an owned CST representation that doesn't borrow from Tree.
 
 use crate::error::{DelightQLError, KnownLimitationType, Result};
+use crate::pipeline::asts::core::queries::InlineDdlSpec;
 use crate::pipeline::cst::{CstNode, CstTree};
 use tree_sitter::{Language, Parser, Tree};
 
@@ -592,6 +593,8 @@ pub struct DDLFile {
     pub definitions: Vec<Definition>,
     /// Query statements (prefixed with ?-) to execute when file is consulted
     pub query_statements: Vec<QueryStatement>,
+    /// Inline DDL blocks from `(~~ddl:...~~)` annotations
+    pub inline_ddl_blocks: Vec<InlineDdlSpec>,
 }
 
 /// A single definition (function or view)
@@ -633,8 +636,6 @@ pub enum DefinitionType {
     Fact,
     /// ER-context rule: left&right(*) within context neck body
     ErRule,
-    /// Companion definition: name(^), name(+), or name($)
-    Companion,
 }
 
 /// Definition neck (determines persistence and type)
@@ -664,23 +665,11 @@ pub struct QueryStatement {
 ///
 /// Returns a DDLFile with extracted definitions and query statements.
 pub fn parse_ddl_file(source: &str) -> Result<DDLFile> {
-    // Companion definitions may use sigil prefixes (c:"...", d:"...") and
-    // functional-dependency arrows (->) that the DQL grammar doesn't support.
-    // Preprocess before tree-sitter parsing if the source contains companions.
-    let preprocessed;
-    let effective_source =
-        if source.contains("(^)") || source.contains("(+)") || source.contains("($)") {
-            preprocessed = crate::ddl::companion::preprocess_companion_body(source);
-            &preprocessed
-        } else {
-            source
-        };
-
     // Parse using DDL parser (ddl_file entry point)
-    let tree = parse_ddl(effective_source)?;
+    let tree = parse_ddl(source)?;
 
-    // Extract DDL components from the tree
-    extract_ddl_file(&tree, effective_source)
+    // Extract definitions and query statements from the tree
+    extract_ddl_file(&tree, source)
 }
 
 /// Extract definitions and query statements from a parsed DDL tree
@@ -711,6 +700,7 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
 
     let mut definitions = Vec::new();
     let mut query_statements = Vec::new();
+    let mut inline_ddl_blocks = Vec::new();
 
     // Walk all children of source_file looking for definitions and query_statements
     for child in root.children() {
@@ -753,8 +743,7 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
             | "argumentative_view_definition"
             | "ho_view_definition"
             | "sigma_definition"
-            | "fact_definition"
-            | "companion_definition" => {
+            | "fact_definition" => {
                 definitions.push(extract_definition(&child, source)?);
             }
             "query_statement" => {
@@ -770,6 +759,21 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
                     source_range: (start, end),
                 });
             }
+            "ddl_annotation" => {
+                let body = child
+                    .field("ddl_body")
+                    .ok_or_else(|| DelightQLError::parse_error("No body in ddl_annotation"))?
+                    .text()
+                    .to_string();
+                let namespace = child
+                    .field("ddl_namespace")
+                    .map(|n| {
+                        let text = n.text();
+                        // Strip surrounding quotes from string literal
+                        text.trim_matches('"').to_string()
+                    });
+                inline_ddl_blocks.push(InlineDdlSpec { body, namespace });
+            }
             // Comments, er_context_block, blank lines: skip silently
             "comment" | "er_context_block" => {}
             other => {
@@ -781,6 +785,7 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
     Ok(DDLFile {
         definitions,
         query_statements,
+        inline_ddl_blocks,
     })
 }
 
@@ -866,6 +871,63 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
                 .collect();
             (DefinitionType::SigmaPredicate, params)
         }
+        "ho_fact_definition" => {
+            // HO fact sugar: desugar to verbose ho_view_definition form.
+            // schema("employees")(name, type ---- "id", "INT"; "name", "TEXT")
+            // → schema("employees")(name, type) :- _(name, type ---- "id", "INT"; "name", "TEXT")
+            let params_nodes = node.children_by_field("ho_params");
+            let params = params_nodes
+                .iter()
+                .filter(|p| p.kind() == "identifier")
+                .map(|p| p.text().to_string())
+                .collect();
+            let start = node.raw_node().start_byte();
+            let end = node.raw_node().end_byte();
+
+            // Extract components from CST node spans — not raw byte scanning.
+            // Name: from node field
+            let name_node = node.field("name").unwrap();
+            let name_text = name_node.text();
+
+            // HO params: extract text of each ho_param, reconstruct paren group
+            let ho_params_text: Vec<&str> = params_nodes
+                .iter()
+                .filter(|p| p.kind() == "ho_param" || p.kind() == "identifier")
+                .map(|p| p.text())
+                .collect();
+            let ho_params_joined = ho_params_text.join(", ");
+
+            // Column headers (output head) from CST child
+            let output_head = node.find_child("column_headers")
+                .map(|ch| ch.text().to_string())
+                .unwrap_or_else(|| "*".to_string());
+
+            // Data content: column_headers (if present) + separator + data_rows
+            let data_start = node.find_child("column_headers")
+                .or_else(|| node.find_child("data_rows"))
+                .unwrap()
+                .raw_node().start_byte();
+            let data_end = node.find_child("data_rows")
+                .unwrap()
+                .raw_node().end_byte();
+            let data_content = &source[data_start..data_end];
+
+            // Construct desugared form: name(ho_params)(headers) :- _(data_content)
+            let full_source = format!(
+                "{}({})({})\n:- _({})", name_text, ho_params_joined, output_head, data_content
+            );
+
+            return Ok(Definition {
+                name,
+                def_type: DefinitionType::HoView,
+                neck: DefinitionNeck::Session,
+                params,
+                full_source: full_source.clone(),
+                body_source: full_source,
+                cst_node_type: "ho_fact_definition".to_string(),
+                source_range: (start, end),
+            });
+        }
         "fact_definition" => {
             // Fact: no neck, no body — the data content IS the definition.
             // Return early since facts don't have neck/body fields.
@@ -886,10 +948,6 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
         "er_rule_definition" => {
             // ER-rule: no params (left/right table names already in entity name)
             (DefinitionType::ErRule, Vec::new())
-        }
-        "companion_definition" => {
-            // Companion: name(sigil) — no params, body is a relational query
-            (DefinitionType::Companion, Vec::new())
         }
         _ => {
             return Err(DelightQLError::parse_error(format!(
@@ -1369,16 +1427,6 @@ high_value_users(*) :- users(*), balance > 500
             result4.unwrap().definitions[0].neck,
             DefinitionNeck::TemporaryTable
         );
-    }
-
-    #[test]
-    fn test_parse_ddl_companion() {
-        let source = r#"employees(^) :- _(name, type ---- "id", "INTEGER")"#;
-        let ddl = parse_ddl_file(source).unwrap();
-        assert_eq!(ddl.definitions.len(), 1);
-        assert_eq!(ddl.definitions[0].name, "employees");
-        assert_eq!(ddl.definitions[0].def_type, DefinitionType::Companion);
-        assert_eq!(ddl.definitions[0].cst_node_type, "companion_definition");
     }
 
     // ========================================================================

@@ -304,6 +304,31 @@ pub(super) fn parse_tvf_call(
         DomainSpec::Glob
     };
 
+    // Parse first-parens as DomainSpec for PatternResolver unification.
+    // Each tvf_argument CST child becomes a DomainExpression.
+    let mut first_parens_spec = if let Some(args_node) = node.field("arguments") {
+        Some(parse_first_parens_as_domain_spec(args_node)?)
+    } else {
+        None
+    };
+
+    // HO param substitution: replace param names in first_parens_spec Lvars.
+    // Table params: Lvar("T") → Lvar("actual_table_name")
+    // Scalar params: Lvar("n") → the bound DomainExpression (e.g., Literal(5))
+    if let Some(ref bindings) = features.ho_bindings {
+        if let Some(DomainSpec::Positional(ref mut exprs)) = first_parens_spec {
+            for expr in exprs.iter_mut() {
+                if let DomainExpression::Lvar { name, .. } = expr {
+                    if let Some(actual_name) = bindings.table_params.get(name.as_str()) {
+                        *name = actual_name.clone().into();
+                    } else if let Some(bound_expr) = bindings.scalar_params.get(name.as_str()) {
+                        *expr = bound_expr.clone();
+                    }
+                }
+            }
+        }
+    }
+
     Ok(Relation::TVF {
         function: function.into(),
         arguments,
@@ -313,6 +338,7 @@ pub(super) fn parse_tvf_call(
         grounding,
         cpr_schema: PhaseBox::phantom(),
         argument_groups,
+        first_parens_spec,
     })
 }
 
@@ -347,6 +373,119 @@ pub(super) fn extract_tvf_argument_text(node: CstNode) -> String {
         }
     }
     node.text().to_string()
+}
+
+/// Parse a tvf_argument CST node into a DomainExpression for PatternResolver unification.
+///
+/// Maps grammar alternatives to DomainExpression variants:
+/// - `string_literal` → Literal(String)
+/// - `number_literal` → Literal(Number)
+/// - `identifier` → Lvar (could be table name or scalar — Step 4 disambiguates)
+/// - `qualified_column` → Lvar with qualifier
+/// - `table_access` → Lvar (table reference — Step 4 separates table params)
+/// - `value_placeholder` (@) → ValuePlaceholder
+/// - `*` → Projection(Glob)
+fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<DomainExpression> {
+    for child in node.children() {
+        match child.kind() {
+            "string_literal" => {
+                let text = child.text();
+                let value = if text.starts_with("b64:") {
+                    super::expressions::literals::decode_string_literal_text(text)
+                        .unwrap_or_else(|| text.to_string())
+                } else {
+                    super::expressions::literals::strip_string_quotes(text).to_string()
+                };
+                return Ok(DomainExpression::literal_builder(LiteralValue::String(value)).build());
+            }
+            "number_literal" => {
+                return Ok(DomainExpression::literal_builder(LiteralValue::Number(
+                    child.text().to_string(),
+                ))
+                .build());
+            }
+            "identifier" => {
+                return Ok(DomainExpression::lvar_builder(crate::pipeline::cst::unstrop(
+                    child.text(),
+                ))
+                .build());
+            }
+            "qualified_column" => {
+                let qualifier = if let Some(table_field) = child.field("table") {
+                    Some(crate::pipeline::cst::unstrop(table_field.text()))
+                } else {
+                    child.field_text("qualifier")
+                };
+                let name = child
+                    .field_text("column")
+                    .unwrap_or_else(|| child.text().to_string());
+                return Ok(DomainExpression::lvar_builder(name)
+                    .with_qualifier(qualifier)
+                    .build());
+            }
+            "table_access" => {
+                // Table reference — represented as Lvar; Step 4 will separate table params
+                let table_name = child.field_text("table").unwrap_or_default();
+                return Ok(DomainExpression::lvar_builder(table_name).build());
+            }
+            "value_placeholder" => {
+                return Ok(DomainExpression::ValuePlaceholder { alias: None });
+            }
+            "placeholder" => {
+                return Ok(DomainExpression::NonUnifiyingUnderscore);
+            }
+            _ => {}
+        }
+    }
+    // `*` appears as a bare token child, not as a named child kind
+    let text = node.text().trim();
+    if text == "*" {
+        return Ok(DomainExpression::glob_builder().build());
+    }
+    Err(DelightQLError::parse_error(format!(
+        "Cannot parse tvf_argument as DomainExpression: '{}'",
+        node.text()
+    )))
+}
+
+/// Parse the first-parens arguments node into a DomainSpec.
+///
+/// Handles all CST structures: ho_argument_list, argument_list, and direct tvf_argument.
+/// Each tvf_argument becomes a DomainExpression. Glob (*) alone produces DomainSpec::Glob.
+/// The `&` group separator is flattened — Step 4 uses entity param types to separate.
+pub(super) fn parse_first_parens_as_domain_spec(args_node: CstNode) -> Result<DomainSpec> {
+    let mut exprs = Vec::new();
+    collect_first_parens_exprs(args_node, &mut exprs)?;
+
+    // Single glob → DomainSpec::Glob (enumerate all PureGround values)
+    if exprs.len() == 1 {
+        if let DomainExpression::Projection(ProjectionExpr::Glob { .. }) = &exprs[0] {
+            return Ok(DomainSpec::Glob);
+        }
+    }
+
+    if exprs.is_empty() {
+        Ok(DomainSpec::Bare)
+    } else {
+        Ok(DomainSpec::Positional(exprs))
+    }
+}
+
+/// Recursively collect DomainExpressions from first-parens CST nodes.
+fn collect_first_parens_exprs(
+    node: CstNode,
+    out: &mut Vec<DomainExpression>,
+) -> Result<()> {
+    for child in node.children() {
+        match child.kind() {
+            "tvf_argument" => out.push(parse_tvf_argument_as_domain_expression(child)?),
+            "ho_argument_list" | "ho_argument_group" | "ho_argument_row" | "argument_list" => {
+                collect_first_parens_exprs(child, out)?;
+            }
+            _ => {} // skip separators (&, ;, ,)
+        }
+    }
+    Ok(())
 }
 
 /// Recursively collect tvf_argument text from potentially nested node structures.

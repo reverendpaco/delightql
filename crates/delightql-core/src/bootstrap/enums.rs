@@ -229,7 +229,7 @@ pub enum EntityType {
     /// DelightQL ER-context rule (entity-relationship join rule)
     DqlErContextRule = 17,
 
-    /// DelightQL companion table definition (schema/constraints/defaults metadata)
+    /// Formerly: companion table definition. Retired — value 18 reserved.
     DqlCompanionDefinition = 18,
 }
 

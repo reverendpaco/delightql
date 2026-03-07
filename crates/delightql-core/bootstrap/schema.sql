@@ -138,7 +138,9 @@ CREATE TABLE ho_param (
     entity_id INTEGER NOT NULL,
     param_name TEXT NOT NULL,
     position INTEGER NOT NULL,
-    kind TEXT NOT NULL,  -- 'glob', 'argumentative', 'scalar'
+    kind TEXT NOT NULL,  -- 'glob', 'argumentative', 'scalar', 'ground_scalar'
+    ground_mode TEXT,    -- 'pure_ground', 'mixed_ground', 'pure_unbound', 'input_only'
+    column_name TEXT,    -- canonical name from free-var clauses (NULL for table params)
     FOREIGN KEY (entity_id) REFERENCES entity(id)
 );
 
@@ -149,6 +151,15 @@ CREATE TABLE ho_param_column (
     column_name TEXT NOT NULL,
     column_position INTEGER NOT NULL,
     FOREIGN KEY (ho_param_id) REFERENCES ho_param(id)
+);
+
+-- Per-clause ground values for GroundScalar positions
+CREATE TABLE ho_param_ground_value (
+    ho_param_id     INTEGER NOT NULL,
+    clause_ordinal  INTEGER NOT NULL,
+    ground_value    TEXT NOT NULL,
+    FOREIGN KEY (ho_param_id) REFERENCES ho_param(id),
+    PRIMARY KEY (ho_param_id, clause_ordinal)
 );
 
 -- ER-context rule metadata: stores table pair and context for ER-join rules
@@ -186,36 +197,6 @@ CREATE TABLE interior_entity_attribute (
 );
 
 -- ============================================================================
--- COMPANION TABLES (DDL metadata: schema, constraints, defaults)
--- ============================================================================
-
--- Companion Schema: column names and types for companion-defined entities
-CREATE TABLE companion_schema (
-    entity_id       INTEGER NOT NULL REFERENCES entity(id),
-    column_position INTEGER NOT NULL,
-    column_name     TEXT NOT NULL,
-    column_type     TEXT NOT NULL,
-    PRIMARY KEY (entity_id, column_position)
-);
-
--- Companion Constraint: constraint definitions for companion-defined entities
-CREATE TABLE companion_constraint (
-    entity_id       INTEGER NOT NULL REFERENCES entity(id),
-    column_name     TEXT,
-    constraint_text TEXT NOT NULL,
-    constraint_name TEXT NOT NULL,
-    PRIMARY KEY (entity_id, constraint_name)
-);
-
--- Companion Default: default values for companion-defined entities
-CREATE TABLE companion_default (
-    entity_id    INTEGER NOT NULL REFERENCES entity(id),
-    column_name  TEXT NOT NULL,
-    default_text TEXT NOT NULL,
-    generated    TEXT,
-    PRIMARY KEY (entity_id, column_name)
-);
-
 -- Entity Resolution: Tracks when a reference resolves to a definition
 CREATE TABLE entity_resolution (
     entity_id INTEGER NOT NULL,

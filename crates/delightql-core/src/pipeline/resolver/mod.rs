@@ -1421,14 +1421,69 @@ fn resolve_relational_expression_with_registry(
             // Early intercept: piped HO view application desugars BEFORE source resolution
             if let ast_unresolved::UnaryRelationalOperator::HoViewApplication {
                 ref function,
+                ref first_parens_spec,
                 ref arguments,
                 ..
             } = pipe_expr.operator
             {
-                return expand_piped_ho_view(
-                    pipe_expr.source,
+                // Look up the HO view entity
+                let entity = registry
+                    .consult
+                    .lookup_enlisted_ho_view(function)?
+                    .ok_or_else(|| {
+                        crate::error::DelightQLError::validation_error(
+                            format!(
+                                "Unknown piped HO view '{}'. Ensure the namespace is consulted and engaged.",
+                                function
+                            ),
+                            "Piped HO view not found",
+                        )
+                    })?;
+
+                // Build first_parens_spec if not already set
+                let spec = first_parens_spec.clone().unwrap_or(
+                    ast_unresolved::DomainSpec::Glob,
+                );
+
+                let groups_ref: Option<&[_]> = if arguments.is_empty() {
+                    None
+                } else {
+                    Some(arguments.as_slice())
+                };
+                let (table_bindings, scalar_spec, _pipe_idx) =
+                    grounding::split_ho_first_parens(
+                        &spec,
+                        &entity,
+                        Some(&pipe_expr.source),
+                        groups_ref,
+                    )?;
+
+                // Build grounding context
+                let ns_parts: Vec<String> =
+                    entity.namespace.split("::").map(String::from).collect();
+                let entity_ns =
+                    ast_unresolved::NamespacePath::from_parts(ns_parts).map_err(|e| {
+                        crate::error::DelightQLError::database_error(
+                            format!(
+                                "Invalid namespace '{}' for HO view '{}': {:?}",
+                                entity.namespace, function, e
+                            ),
+                            format!("{:?}", e),
+                        )
+                    })?;
+                let ho_grounding = ast_unresolved::GroundedPath {
+                    data_ns: ast_unresolved::NamespacePath::empty(),
+                    grounded_ns: vec![entity_ns],
+                };
+
+                return relation_resolver::expand_ho_view(
                     function,
-                    arguments,
+                    &entity,
+                    &scalar_spec,
+                    table_bindings,
+                    Some(pipe_expr.source),
+                    None,
+                    &ho_grounding,
                     registry,
                     outer_context,
                     config,
@@ -1460,15 +1515,6 @@ fn resolve_relational_expression_with_registry(
             segments.reverse(); // source-code order: innermost first
             let base = current;
 
-            // Companion query intercept: entity(^), entity(+), entity($)
-            // If the first operator is a companion query and the base is a Ground
-            // relation with companion data, resolve as inline VALUES table.
-            let companion_intercept = if !segments.is_empty() {
-                try_resolve_companion(&base, &segments[0], registry, grounding)?
-            } else {
-                None
-            };
-
             let mut pivot_in_values;
             let source_grounding;
             let mutation_targets;
@@ -1476,15 +1522,7 @@ fn resolve_relational_expression_with_registry(
             let mut resolved_source;
             let mut source_bubbled;
 
-            if let Some((res, bub)) = companion_intercept {
-                segments.remove(0); // Consume the companion operator
-                resolved_source = res;
-                source_bubbled = bub;
-                pivot_in_values = HashMap::new();
-                source_grounding = None;
-                mutation_targets = vec![];
-                dml_pipe_ops = vec![];
-            } else {
+            {
                 // Pre-processing extractions from the base (once, not per-pipe).
                 // These functions walk through Pipes/Filters to find data at the Ground level.
                 pivot_in_values = extract_in_predicate_values(&base);
@@ -2764,163 +2802,6 @@ fn bfs_path(adjacency: &HashMap<String, Vec<String>>, from: &str, to: &str) -> R
     }
 }
 
-/// Expand a piped HO view invocation: `source |> ho_view(args)(cols)`
-///
-/// Desugars the pipe into the HO view body with the source expression substituted
-/// for the first table parameter, then resolves the result.
-fn expand_piped_ho_view(
-    source: ast_unresolved::RelationalExpression,
-    function: &str,
-    arguments: &[crate::pipeline::asts::core::operators::HoCallGroup],
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
-    config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    // 1. Look up the HO view entity via engaged namespace
-    let entity = registry
-        .consult
-        .lookup_enlisted_ho_view(function)?
-        .ok_or_else(|| {
-            DelightQLError::validation_error(
-                format!(
-                    "Unknown piped HO view '{}'. Ensure the namespace is consulted and engaged.",
-                    function
-                ),
-                "Piped HO view not found",
-            )
-        })?;
-
-    log::debug!(
-        "Expanding piped HO view '{}' from namespace '{}' with {} extra args",
-        function,
-        entity.namespace,
-        arguments.len()
-    );
-
-    // 2. Build bindings for the piped invocation.
-    // The first param binds to a CTE wrapping the pipe source.
-    // Remaining params bind from the call-site argument groups.
-    let first_param = entity.params.first().ok_or_else(|| {
-        DelightQLError::validation_error_categorized(
-            "constraint/ho_param",
-            format!(
-                "HO view '{}' has no parameters but is used in piped invocation",
-                function
-            ),
-            "HO view has no table parameter",
-        )
-    })?;
-
-    let cte_name = "_ho_pipe_src".to_string();
-
-    // Build remaining param bindings (params after the first)
-    let remaining_params = &entity.params[1..];
-    let mut bindings = if !remaining_params.is_empty() && !arguments.is_empty() {
-        grounding::bind_ho_params_from_groups(remaining_params, arguments)?
-    } else {
-        grounding::HoParamBindings::default()
-    };
-
-    // Bind first param to the CTE name.
-    // For Argumentative: build a Ground relation with positional columns (x, y)
-    // For Glob/Scalar: simple table name substitution
-    match &first_param.kind {
-        crate::resolution::registry::HoParamKind::Argumentative(columns) => {
-            // Build _ho_pipe_src(x, y) as a RelationalExpression
-            let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
-                .iter()
-                .map(|c| ast_unresolved::DomainExpression::lvar_builder(c.clone()).build())
-                .collect();
-            let cte_rel =
-                ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-                    identifier: ast_unresolved::QualifiedName {
-                        namespace_path: ast_unresolved::NamespacePath::empty(),
-                        name: cte_name.clone().into(),
-                        grounding: None,
-                    },
-                    canonical_name: ast_unresolved::PhaseBox::phantom(),
-                    domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
-                    alias: None,
-                    outer: false,
-                    mutation_target: false,
-                    passthrough: false,
-                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                    hygienic_injections: Vec::new(),
-                });
-            bindings
-                .table_expr_params
-                .insert(first_param.name.clone(), cte_rel);
-        }
-        crate::resolution::registry::HoParamKind::Glob
-        | crate::resolution::registry::HoParamKind::Scalar
-        | crate::resolution::registry::HoParamKind::GroundScalar(_) => {
-            bindings
-                .table_params
-                .insert(first_param.name.clone(), cte_name.clone());
-        }
-    }
-
-    // Validate arity for argumentative params that received table references.
-    grounding::validate_argumentative_arity(&bindings, registry)?;
-
-    // 3. Parse the body with builder-integrated HO param substitution.
-    let body_query_raw =
-        crate::ddl::body_parser::parse_view_body_with_bindings(&entity.definition, bindings)?;
-
-    // Wrap in WithCtes: the CTE binds the pipe source expression
-    let cte_binding = ast_unresolved::CteBinding {
-        expression: source,
-        name: cte_name,
-        is_recursive: ast_unresolved::PhaseBox::phantom(),
-    };
-    let body_query = match body_query_raw {
-        ast_unresolved::Query::Relational(expr) => ast_unresolved::Query::WithCtes {
-            ctes: vec![cte_binding],
-            query: expr,
-        },
-        ast_unresolved::Query::WithCtes { mut ctes, query } => {
-            ctes.insert(0, cte_binding);
-            ast_unresolved::Query::WithCtes { ctes, query }
-        }
-        other => {
-            return Err(DelightQLError::parse_error(format!(
-                "Unexpected query structure in piped HO view '{}' body: {:?}",
-                function,
-                std::mem::discriminant(&other)
-            )));
-        }
-    };
-
-    // 5. Build grounding context for consulted function inlining during body resolution.
-    //    The pipe source already carries its namespace (e.g., data::test.users), so we
-    //    skip patch_data_ns. The grounding only needs grounded_ns for function lookup.
-    let ns_parts: Vec<String> = entity.namespace.split("::").map(String::from).collect();
-    let entity_ns = ast_unresolved::NamespacePath::from_parts(ns_parts).map_err(|e| {
-        DelightQLError::database_error(
-            format!(
-                "Invalid namespace '{}' for HO view '{}': {:?}",
-                entity.namespace, function, e
-            ),
-            format!("{:?}", e),
-        )
-    })?;
-    let ho_grounding = ast_unresolved::GroundedPath {
-        data_ns: ast_unresolved::NamespacePath::empty(),
-        grounded_ns: vec![entity_ns],
-    };
-
-    // 6. Resolve the full query (handles CTEs) with grounding context
-    let (resolved_query, bubbled) = resolve_query_inline(
-        body_query,
-        registry,
-        outer_context,
-        config,
-        Some(&ho_grounding),
-    )?;
-
-    relation_resolver::ho_view_query_to_relational(resolved_query, bubbled, function)
-}
-
 /// Extract grounding from a pipe source expression.
 /// Walks through Filter/Pipe wrappers to find the root Relation::Ground and
 /// its grounding annotation. Used to extract the data namespace for patching
@@ -3350,199 +3231,3 @@ fn extract_literal_rows_from_resolved(
     }
 }
 
-/// Try to resolve a companion query (entity(^), entity(+), entity($)).
-/// Returns Some((resolved_source, bubbled_state)) if the base is a companion entity
-/// and the operator is MetaIze(^) or CompanionAccess(+/$). Returns None to fall through.
-fn try_resolve_companion(
-    base: &ast_unresolved::RelationalExpression,
-    operator: &ast_unresolved::UnaryRelationalOperator,
-    registry: &mut crate::resolution::EntityRegistry,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<Option<(ast_resolved::RelationalExpression, BubbledState)>> {
-    use crate::pipeline::asts::ddl::CompanionKind;
-
-    // Determine companion kind from operator
-    let kind = match operator {
-        ast_unresolved::UnaryRelationalOperator::MetaIze { detailed: false } => {
-            CompanionKind::Schema
-        }
-        ast_unresolved::UnaryRelationalOperator::CompanionAccess { kind } => *kind,
-        _ => return Ok(None),
-    };
-
-    // Extract entity name and namespace from base Ground relation
-    let identifier = match base {
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier,
-            ..
-        }) => identifier,
-        _ => return Ok(None),
-    };
-
-    // Look up entity — try identifier grounding, then ambient grounding, then namespace path
-    let companion_data = if let Some(grounding) = &identifier.grounding {
-        let mut found = None;
-        for ns in &grounding.grounded_ns {
-            let fq = grounding::namespace_path_to_fq(ns);
-            if let Some(data) = registry
-                .consult
-                .lookup_companion_data(&identifier.name, &fq, kind)
-            {
-                found = Some(data);
-                break;
-            }
-        }
-        found
-    } else if let Some(grounding) = grounding {
-        let mut found = None;
-        for ns in &grounding.grounded_ns {
-            let fq = grounding::namespace_path_to_fq(ns);
-            if let Some(data) = registry
-                .consult
-                .lookup_companion_data(&identifier.name, &fq, kind)
-            {
-                found = Some(data);
-                break;
-            }
-        }
-        found
-    } else if !identifier.namespace_path.is_empty() {
-        let fq = identifier
-            .namespace_path
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect::<Vec<_>>()
-            .join("::");
-        registry
-            .consult
-            .lookup_companion_data(&identifier.name, &fq, kind)
-    } else {
-        // Unqualified — try main namespace
-        registry
-            .consult
-            .lookup_companion_data(&identifier.name, "main", kind)
-    };
-
-    let (_entity_id, rows) = match companion_data {
-        Some(data) => data,
-        None => {
-            // For CompanionAccess (+ / $), error if entity doesn't have companion data
-            if matches!(
-                operator,
-                ast_unresolved::UnaryRelationalOperator::CompanionAccess { .. }
-            ) {
-                return Err(DelightQLError::database_error(
-                    format!(
-                        "No companion {} data found for entity '{}'",
-                        match kind {
-                            CompanionKind::Schema => "schema",
-                            CompanionKind::Constraint => "constraint",
-                            CompanionKind::Default => "default",
-                        },
-                        identifier.name
-                    ),
-                    "Entity may not be a companion or may not have this companion type defined"
-                        .to_string(),
-                ));
-            }
-            // MetaIze on non-companion: fall through to normal meta-ize
-            return Ok(None);
-        }
-    };
-
-    // Build column names and schema for the companion kind
-    let (col_names, schema_columns) = companion_output_schema(kind);
-
-    // Construct resolved Anonymous relation with VALUES
-    let column_headers: Vec<ast_resolved::DomainExpression> = col_names
-        .iter()
-        .map(|name| ast_resolved::DomainExpression::Lvar {
-            name: (*name).into(),
-            qualifier: None,
-            namespace_path: ast_resolved::NamespacePath::empty(),
-            alias: None,
-            provenance: ast_resolved::PhaseBox::phantom(),
-        })
-        .collect();
-
-    let value_rows: Vec<ast_resolved::Row> = rows
-        .iter()
-        .map(|row| ast_resolved::Row {
-            values: row
-                .iter()
-                .map(|val| match val {
-                    Some(s) => ast_resolved::DomainExpression::Literal {
-                        value: ast_resolved::LiteralValue::String(s.clone()),
-                        alias: None,
-                    },
-                    None => ast_resolved::DomainExpression::Literal {
-                        value: ast_resolved::LiteralValue::Null,
-                        alias: None,
-                    },
-                })
-                .collect(),
-        })
-        .collect();
-
-    let resolved =
-        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::Anonymous {
-            column_headers: Some(column_headers),
-            rows: value_rows,
-            alias: Some("_companion".into()),
-            outer: false,
-            exists_mode: false,
-            qua_target: None,
-            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                schema_columns.clone(),
-            )),
-        });
-
-    let bubbled = BubbledState::resolved(schema_columns);
-    Ok(Some((resolved, bubbled)))
-}
-
-/// Output schema for each companion kind
-fn companion_output_schema(
-    kind: crate::pipeline::asts::ddl::CompanionKind,
-) -> (Vec<&'static str>, Vec<ast_resolved::ColumnMetadata>) {
-    use crate::pipeline::asts::ddl::CompanionKind;
-
-    let make_col = |name: &str, pos: usize| -> ast_resolved::ColumnMetadata {
-        ast_resolved::ColumnMetadata::new(
-            ast_resolved::ColumnProvenance::from_column(name.to_string()),
-            ast_resolved::FqTable {
-                parents_path: ast_resolved::NamespacePath::empty(),
-                name: ast_resolved::TableName::Named("_companion".into()),
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-            },
-            Some(pos),
-        )
-    };
-
-    match kind {
-        CompanionKind::Schema => (
-            vec!["name", "type", "position"],
-            vec![
-                make_col("name", 1),
-                make_col("type", 2),
-                make_col("position", 3),
-            ],
-        ),
-        CompanionKind::Constraint => (
-            vec!["column", "constraint", "constraint_name"],
-            vec![
-                make_col("column", 1),
-                make_col("constraint", 2),
-                make_col("constraint_name", 3),
-            ],
-        ),
-        CompanionKind::Default => (
-            vec!["column", "default", "generated"],
-            vec![
-                make_col("column", 1),
-                make_col("default", 2),
-                make_col("generated", 3),
-            ],
-        ),
-    }
-}

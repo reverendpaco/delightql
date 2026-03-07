@@ -131,11 +131,6 @@ pub(super) fn bubble_unary_operator(
             ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields },
             BubbledState::resolved(Vec::new()),
         )),
-        // CompanionAccess has no expressions to bubble - consumed at pipe level
-        ast_unresolved::UnaryRelationalOperator::CompanionAccess { kind } => Ok((
-            ast_unresolved::UnaryRelationalOperator::CompanionAccess { kind },
-            BubbledState::resolved(Vec::new()),
-        )),
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. } => unreachable!(),

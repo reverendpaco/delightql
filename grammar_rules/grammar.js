@@ -88,24 +88,6 @@ module.exports = grammar(dqlGrammar, {
     [$.argumentative_view_definition, $.view_definition, $.glob],
     [$.argumentative_view_definition, $.fact_definition, $.view_definition, $.table_access],
     [$.argumentative_view_definition, $.fact_definition, $.view_definition, $.glob_spec],
-    // Companion with argumentative view
-    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.table_access],
-    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
-    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
-    [$.companion_definition, $.argumentative_view_definition, $.fact_definition, $.table_access],
-    [$.companion_definition, $.argumentative_view_definition, $.view_definition, $.table_access],
-    [$.companion_definition, $.argumentative_view_definition, $.view_definition, $.glob_spec],
-    [$.companion_definition, $.argumentative_view_definition, $.view_definition, $.glob],
-
-    // Companion: name(sigil) could initially look like fact/sigma/table_access
-    [$.companion_definition, $.fact_definition, $.sigma_definition, $.table_access],
-    [$.companion_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
-    [$.companion_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
-    [$.companion_definition, $.fact_definition, $.table_access],
-    [$.companion_definition, $.view_definition, $.table_access],
-    [$.companion_definition, $.view_definition, $.glob_spec],
-    [$.companion_definition, $.view_definition, $.glob],
-
     // Function: name:(params) conflicts with CFE definition
     [$.function_definition, $.cfe_definition],
     [$.function_definition, $.cfe_first_param_list],
@@ -117,6 +99,64 @@ module.exports = grammar(dqlGrammar, {
     [$.literal, $.ho_param],
     [$.literal, $.view_head_item],
     [$.ho_param, $.view_head_item],
+
+    // HO fact sugar: name(ho_params)(data) shares prefix with ho_view/fact/sigma/table
+    [$.ho_fact_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    [$.ho_fact_definition, $.sigma_definition, $.table_access],
+    [$.ho_fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
+    [$.ho_fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    [$.ho_fact_definition, $.fact_definition, $.sigma_definition, $.table_access],
+    [$.ho_fact_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
+    [$.ho_fact_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    [$.ho_fact_definition, $.ho_view_definition, $.sigma_definition, $.lvar, $.column_header_item],
+    [$.ho_fact_definition, $.ho_view_definition, $.sigma_definition, $.lvar],
+    [$.ho_fact_definition, $.ho_view_definition, $.sigma_definition, $.column_header_item],
+    // ho_param/view_head_item inside first parens of ho_fact
+    [$.ho_param, $.lvar, $.sigma_definition, $.ho_fact_definition],
+    [$.ho_param, $.sigma_definition, $.ho_fact_definition],
+    [$.ho_param, $.lvar, $.sigma_definition, $.column_header_item, $.ho_fact_definition],
+    [$.view_head_item, $.ho_param, $.lvar, $.sigma_definition, $.ho_fact_definition],
+    [$.view_head_item, $.ho_param, $.sigma_definition, $.ho_fact_definition],
+    [$.view_head_item, $.ho_param, $.lvar, $.column_header_item, $.ho_fact_definition],
+    [$.view_head_item, $.ho_param, $.lvar, $.sigma_definition, $.column_header_item, $.ho_fact_definition],
+    [$.view_head_item, $.lvar, $.sigma_definition, $.ho_fact_definition],
+    [$.view_head_item, $.sigma_definition, $.ho_fact_definition],
+    [$.view_head_item, $.lvar, $.column_header_item, $.ho_fact_definition],
+    [$.view_head_item, $.lvar, $.sigma_definition, $.column_header_item, $.ho_fact_definition],
+    [$.view_head_item, $.column_header_item, $.sigma_definition, $.ho_fact_definition],
+    // * in second parens: glob (data) vs ho_view_definition (output head)
+    [$.glob, $.ho_view_definition],
+    // Argumentative view combinations with ho_fact
+    [$.argumentative_view_definition, $.ho_fact_definition, $.sigma_definition, $.table_access],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.fact_definition, $.sigma_definition, $.table_access],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.table_access],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.fact_definition, $.sigma_definition, $.ho_view_definition, $.column_spec_item, $.tvf_argument],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.ho_view_definition, $.sigma_definition, $.lvar, $.column_header_item],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.ho_view_definition, $.sigma_definition, $.lvar],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.ho_view_definition, $.sigma_definition, $.column_header_item],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.sigma_definition, $.lvar, $.column_header_item],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.sigma_definition, $.lvar],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.sigma_definition, $.column_header_item],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.fact_definition, $.view_definition, $.table_access],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.fact_definition, $.view_definition, $.glob_spec],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.view_definition, $.table_access],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.view_definition, $.glob_spec],
+    [$.argumentative_view_definition, $.ho_fact_definition, $.view_definition, $.glob],
+    // ho_param with argumentative + ho_fact
+    [$.ho_param, $.lvar, $.sigma_definition, $.argumentative_view_definition, $.ho_fact_definition],
+    [$.ho_param, $.lvar, $.sigma_definition, $.argumentative_view_definition, $.column_header_item, $.ho_fact_definition],
+    // Fact + view + ho_fact
+    [$.ho_fact_definition, $.fact_definition, $.view_definition, $.table_access],
+    [$.ho_fact_definition, $.fact_definition, $.view_definition, $.glob_spec],
+    [$.ho_fact_definition, $.view_definition, $.table_access],
+    [$.ho_fact_definition, $.view_definition, $.glob_spec],
+    [$.ho_fact_definition, $.view_definition, $.glob],
+    // Literal conflicts with ho_fact
+    [$.literal, $.ho_param, $.view_head_item, $.ho_fact_definition],
+    [$.literal, $.ho_param, $.ho_fact_definition],
+    [$.ho_param, $.view_head_item, $.ho_fact_definition],
   ]),
 
   rules: {
@@ -124,14 +164,14 @@ module.exports = grammar(dqlGrammar, {
     // The Rust extraction code (extract_ddl_file) iterates root.children()
     // matching on "definition", "function_definition", "query_statement", etc.
     // — all preserved by this rule.
-    source_file: $ => repeat1(choice($.definition, $.query_statement)),
+    source_file: $ => repeat1(choice($.definition, $.query_statement, $.ddl_annotation)),
 
     // === DDL-specific rules (the only reason this grammar exists) ===
 
     definition: $ => choice(
       $.function_definition,
       $.constant_definition,  // nl :- char:(10) — zero-arity function without parens
-      $.companion_definition, // name(^), name(+), name($) — before fact for priority
+      $.ho_fact_definition,   // name(ho_params)(data) — before fact for priority
       $.fact_definition,
       $.sigma_definition,
       $.ho_view_definition,
@@ -206,6 +246,22 @@ module.exports = grammar(dqlGrammar, {
       field('neck', $.definition_neck),
       optional(field('doc', $.annotation_body)),
       field('body', $.query),
+    ),
+
+    // HO fact-table sugar: name(ho_params)(data) — inline data, no neck/body
+    // Combines HO params (first parens) with fact data (second parens).
+    // Desugars to ho_view_definition head + anonymous table body.
+    ho_fact_definition: $ => seq(
+      field('name', $.identifier),
+      '(',
+      field('ho_params', sep1($._comma, $.ho_param)),
+      ')',
+      '(',
+      choice(
+        seq($.column_headers, $.anonymous_table_separator, $.data_rows),
+        $.data_rows,
+      ),
+      ')',
     ),
 
     // HO parameter declaration: T(*), T(x, y), bare n, or ground literal ("x", 42)
@@ -310,25 +366,6 @@ module.exports = grammar(dqlGrammar, {
       field('neck', $.definition_neck),
       optional(field('doc', $.annotation_body)),
       field('body', $.query),
-    ),
-
-    // Companion table definition: name(sigil) neck [docs] query
-    // Sigil: ^ = schema, + = constraints, $ = defaults
-    // Body is a relational query (same as view_definition).
-    companion_definition: $ => seq(
-      field('name', $.identifier),
-      '(',
-      field('sigil', $.companion_sigil),
-      ')',
-      field('neck', $.definition_neck),
-      optional(field('doc', $.annotation_body)),
-      field('body', $.query),
-    ),
-
-    companion_sigil: $ => choice(
-      alias('^', $.schema_sigil),
-      alias('+', $.constraint_sigil),
-      alias('$', $.default_sigil),
     ),
 
     // Query statement: ?- query

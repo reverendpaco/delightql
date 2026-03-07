@@ -6,5 +6,5 @@
 
 pub mod analyzer;
 pub mod body_parser;
-pub mod companion;
 pub mod ddl_builder;
+pub mod manifest;

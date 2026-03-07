@@ -137,6 +137,11 @@ pub(crate) fn execute_consult(
     namespace: &str,
     _consulting_ns: Option<&str>,
 ) -> Result<usize> {
+    // Resolve relative path against session CWD (for test isolation).
+    let resolved_path = crate::session_cwd::resolve_path(file_path);
+    let file_path = resolved_path.display().to_string();
+    let file_path = file_path.as_str();
+
     // Read the file
     let source = std::fs::read_to_string(file_path).map_err(|e| {
         DelightQLError::database_error(
@@ -322,7 +327,7 @@ pub(crate) fn execute_consult(
     }
 
     // Parse the cleaned source as DDL
-    let ddl = parse_ddl_file(&cleaned_source).map_err(|e| {
+    let mut ddl = parse_ddl_file(&cleaned_source).map_err(|e| {
         DelightQLError::database_error(
             format!("consult!() failed to parse '{}': {}", file_path, e),
             "Parse error",
@@ -359,7 +364,7 @@ pub(crate) fn execute_consult(
     }
 
     // Guard: file must contain DDL definitions, not bare queries
-    if ddl.definitions.is_empty() {
+    if ddl.definitions.is_empty() && ddl.inline_ddl_blocks.is_empty() {
         return Err(DelightQLError::database_error(
             format!(
                 "consult!() failed: '{}' contains no DDL definitions. \
@@ -381,10 +386,27 @@ pub(crate) fn execute_consult(
         ));
     }
 
+    // Extract inline DDL blocks before consuming ddl in consult_file
+    let inline_ddl_blocks = std::mem::take(&mut ddl.inline_ddl_blocks);
+
     // Store in system
     let result = system
         .consult_file(file_path, namespace, ddl)
         .map(|cr| cr.definitions_loaded);
+
+    // Process inline DDL blocks — each creates a child namespace
+    for block in &inline_ddl_blocks {
+        let child_ns = match &block.namespace {
+            Some(suffix) => format!("{}::{}", namespace, suffix),
+            None => namespace.to_string(),
+        };
+        crate::pipeline::sequential::process_inline_ddl_block(
+            &block.body, &child_ns, system
+        ).map_err(|e| DelightQLError::database_error(
+            format!("Inline DDL block failed in consult of '{}': {}", file_path, e),
+            "inline DDL error",
+        ))?;
+    }
 
     // Execute deferred expose directives now that the namespace exists
     for resolved_args in deferred_exposes {

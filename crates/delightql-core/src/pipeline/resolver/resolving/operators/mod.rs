@@ -134,9 +134,8 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
 
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
-        | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. }
-        | ast_unresolved::UnaryRelationalOperator::CompanionAccess { .. } => {
-            unreachable!("CompanionAccess consumed at pipe level before operator resolution")
+        | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. } => {
+            unreachable!("HoViewApplication/DirectiveTerminal consumed before operator resolution")
         }
     }
 }

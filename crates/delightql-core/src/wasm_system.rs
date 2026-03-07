@@ -266,7 +266,7 @@ impl DelightQLSystem {
     ) -> Result<Vec<(String, String, String)>> {
         Err(DelightQLError::validation_error(
             "imprint!() not supported in WASM",
-            "Companion table materialization is only available in native builds",
+            "Table materialization is only available in native builds",
         ))
     }
 

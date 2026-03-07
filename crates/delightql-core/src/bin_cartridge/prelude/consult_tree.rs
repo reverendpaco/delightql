@@ -88,7 +88,9 @@ impl EffectExecutable for ConsultTreePredicate {
             ));
         }
 
-        let dir = Path::new(&dir_path);
+        // Resolve relative path against session CWD (for test isolation).
+        let resolved_dir = crate::session_cwd::resolve_path(&dir_path);
+        let dir = resolved_dir.as_path();
         if !dir.exists() || !dir.is_dir() {
             return Err(DelightQLError::database_error(
                 format!(

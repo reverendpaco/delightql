@@ -531,7 +531,6 @@ pub fn apply_pipe_operator_unified(
         }
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         UnaryRelationalOperator::HoViewApplication { .. }
-        | UnaryRelationalOperator::DirectiveTerminal { .. }
-        | UnaryRelationalOperator::CompanionAccess { .. } => unreachable!(),
+        | UnaryRelationalOperator::DirectiveTerminal { .. } => unreachable!(),
     }
 }
