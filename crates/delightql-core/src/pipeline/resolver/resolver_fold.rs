@@ -11,6 +11,8 @@
 //! The free function in mod.rs remains for callers outside this file
 //! (relation_resolver, predicates, subqueries, etc.).
 
+use super::unification::ColumnReference;
+use super::{BubbledState, DmlPipeKind, ResolutionConfig};
 use crate::pipeline::ast_resolved::NamespacePath;
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::operators::DmlKind;
@@ -19,8 +21,6 @@ use crate::pipeline::asts::core::RelationalExpression;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 use delightql_types::error::{DelightQLError, Result};
 use delightql_types::schema::ColumnInfo;
-use super::unification::ColumnReference;
-use super::{BubbledState, DmlPipeKind, ResolutionConfig};
 
 /// Scope frame — tracks context at recursion boundaries.
 struct ResolverScope {
@@ -73,9 +73,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
     }
 
     pub fn current_outer_context(&self) -> Option<&[ast_resolved::ColumnMetadata]> {
-        self.scope
-            .last()
-            .and_then(|s| s.outer_context.as_deref())
+        self.scope.last().and_then(|s| s.outer_context.as_deref())
     }
 
     pub fn current_grounding(&self) -> Option<&ast_unresolved::GroundedPath> {
@@ -135,8 +133,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
     ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
         let outer_context: Option<Vec<ast_resolved::ColumnMetadata>> =
             self.current_outer_context().map(|s| s.to_vec());
-        let grounding: Option<ast_unresolved::GroundedPath> =
-            self.current_grounding().cloned();
+        let grounding: Option<ast_unresolved::GroundedPath> = self.current_grounding().cloned();
 
         // Borrow as refs for compatibility with existing code
         let outer_context = outer_context.as_deref();
@@ -173,7 +170,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                 // Combine outer context with current source columns
                                 let (resolved_source_temp, _source_bubbled_temp) =
                                     self.resolve_relational(*source.clone())?;
-                                let source_schema_temp = super::extract_cpr_schema(&resolved_source_temp)?;
+                                let source_schema_temp =
+                                    super::extract_cpr_schema(&resolved_source_temp)?;
                                 let source_columns_temp = match &source_schema_temp {
                                     ast_resolved::CprSchema::Resolved(cols) => cols.clone(),
                                     other => panic!("catch-all hit in mod.rs resolve_relational_expression (EXISTS outer+source schema): {:?}", other),
@@ -185,7 +183,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                 // Just use source columns for context
                                 let (resolved_source_temp, _) =
                                     self.resolve_child(*source.clone(), None, grounding.cloned())?;
-                                let source_schema_temp = super::extract_cpr_schema(&resolved_source_temp)?;
+                                let source_schema_temp =
+                                    super::extract_cpr_schema(&resolved_source_temp)?;
                                 match &source_schema_temp {
                                     ast_resolved::CprSchema::Resolved(cols) => Some(cols.clone()),
                                     other => panic!("catch-all hit in mod.rs resolve_relational_expression (EXISTS source schema): {:?}", other),
@@ -199,17 +198,18 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             // context with columns from all EXISTS tables found in the
                             // source expression so that cross-EXISTS references validate.
                             let mut enriched_context = combined_context.unwrap_or_default();
-                            super::collect_exists_table_columns(&*source, self.registry, &mut enriched_context)?;
+                            super::collect_exists_table_columns(
+                                &*source,
+                                self.registry,
+                                &mut enriched_context,
+                            )?;
 
                             // Config swap for EXISTS: validate_in_correlation = true
                             let exists_config = ResolutionConfig {
                                 validate_in_correlation: true,
                                 ..self.config.clone()
                             };
-                            let saved_config = std::mem::replace(
-                                &mut self.config,
-                                exists_config,
-                            );
+                            let saved_config = std::mem::replace(&mut self.config, exists_config);
                             let grounding_for_exists = grounding.cloned();
                             let result = self.resolve_child(
                                 subquery_expr,
@@ -224,8 +224,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                         // === INLINED handle_exists_subquery END ===
 
                         // Continue with normal filter processing but with resolved EXISTS
-                        let (resolved_source, source_bubbled) =
-                            self.resolve_relational(*source)?;
+                        let (resolved_source, source_bubbled) = self.resolve_relational(*source)?;
 
                         let source_schema = super::extract_cpr_schema(&resolved_source)?;
                         let available_columns = match &source_schema {
@@ -308,7 +307,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 // Use outer_context presence as heuristic for correlation contexts,
                 // unless validate_in_correlation is set (EXISTS subqueries where
                 // the full column set is known and validation is safe)
-                self.in_correlation = outer_context.is_some() && !self.config.validate_in_correlation;
+                self.in_correlation =
+                    outer_context.is_some() && !self.config.validate_in_correlation;
                 self.available = available_columns;
                 let resolved_condition = self.transform_sigma(condition)?;
 
@@ -350,7 +350,9 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                 fq_table: ast_resolved::FqTable {
                                     parents_path: NamespacePath::empty(),
                                     name: ast_resolved::TableName::Fresh,
-                                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
+                                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(
+                                        None,
+                                    ),
                                 },
                                 table_position: None,
                                 has_user_name: true,
@@ -386,9 +388,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                     fq_table: ast_resolved::FqTable {
                                         parents_path: NamespacePath::empty(),
                                         name: ast_resolved::TableName::Fresh,
-                                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(
-                                            None,
-                                        ),
+                                        backend_schema:
+                                            ast_resolved::PhaseBox::from_optional_schema(None),
                                     },
                                     table_position: None,
                                     has_user_name: true,
@@ -430,17 +431,19 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 };
 
                 // For EXISTS joins, we need to combine outer context with left columns
-                let right_context: Vec<ast_resolved::ColumnMetadata> = if let Some(outer) = outer_context {
-                    let mut combined = outer.to_vec();
-                    combined.extend(left_columns.clone());
-                    combined
-                } else {
-                    left_columns.clone()
-                };
+                let right_context: Vec<ast_resolved::ColumnMetadata> =
+                    if let Some(outer) = outer_context {
+                        let mut combined = outer.to_vec();
+                        combined.extend(left_columns.clone());
+                        combined
+                    } else {
+                        left_columns.clone()
+                    };
 
                 // Check if right side uses positional patterns and needs unification
                 let (resolved_right, right_bubbled, positional_join_condition, where_constraints) =
-                    if let ast_unresolved::RelationalExpression::Relation(ref rel) = right.as_ref() {
+                    if let ast_unresolved::RelationalExpression::Relation(ref rel) = right.as_ref()
+                    {
                         match rel {
                             ast_unresolved::Relation::Ground {
                                 identifier,
@@ -578,11 +581,14 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                     };
 
                                     let resolved_expr =
-                                        ast_resolved::RelationalExpression::Relation(resolved_relation);
+                                        ast_resolved::RelationalExpression::Relation(
+                                            resolved_relation,
+                                        );
 
                                     // Get bubbled state
-                                    let bubbled =
-                                        BubbledState::resolved(pattern_result.output_columns.clone());
+                                    let bubbled = BubbledState::resolved(
+                                        pattern_result.output_columns.clone(),
+                                    );
 
                                     // Generate USING condition if there are unification columns
                                     let join_cond =
@@ -609,23 +615,24 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                     // entities (views, facts) and applies positional patterns.
                                     let right_expr =
                                         ast_unresolved::RelationalExpression::Relation(rel.clone());
-                                    let (resolved, bubbled) =
-                                        self.resolve_child(
-                                            right_expr,
-                                            Some(right_context.clone()),
-                                            grounding.cloned(),
-                                        )?;
+                                    let (resolved, bubbled) = self.resolve_child(
+                                        right_expr,
+                                        Some(right_context.clone()),
+                                        grounding.cloned(),
+                                    )?;
 
                                     // Derive join conditions: check which lvar names in the
                                     // positional pattern match left-side column names.
                                     let mut using_cols: Vec<String> = Vec::new();
                                     for pattern in patterns {
-                                        if let ast_unresolved::DomainExpression::Lvar { name, .. } =
-                                            pattern
+                                        if let ast_unresolved::DomainExpression::Lvar {
+                                            name, ..
+                                        } = pattern
                                         {
                                             let lvar_name = name.as_str();
-                                            let matches_left =
-                                                left_columns.iter().any(|col| col.name() == lvar_name);
+                                            let matches_left = left_columns
+                                                .iter()
+                                                .any(|col| col.name() == lvar_name);
                                             if matches_left
                                                 && !using_cols.iter().any(|c| c == lvar_name)
                                             {
@@ -672,7 +679,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                 (resolved, bubbled, anon_join_condition, vec![])
                             }
                             ast_unresolved::Relation::Ground {
-                                domain_spec: ast_unresolved::DomainSpec::GlobWithUsing(ref using_cols),
+                                domain_spec:
+                                    ast_unresolved::DomainSpec::GlobWithUsing(ref using_cols),
                                 ..
                             } => {
                                 // GlobWithUsing on consulted views (or any non-positional entity):
@@ -721,7 +729,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                         ".* requires at least one column name in common",
                                     ));
                                 }
-                                let join_cond = super::join_resolver::create_using_condition(shared)?;
+                                let join_cond =
+                                    super::join_resolver::create_using_condition(shared)?;
                                 (resolved, bubbled, Some(join_cond), vec![])
                             }
                             _ => {
@@ -755,12 +764,13 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             // The condition will be resolved later when filters are processed
                             let schema = self.registry.database.schema();
                             let cte_context = &mut self.registry.query_local.ctes;
-                            let (_unresolved_cond, cond_bubbled) = super::bubble_predicate_expression(
-                                cond,
-                                schema,
-                                cte_context,
-                                Some(&left_columns),
-                            )?;
+                            let (_unresolved_cond, cond_bubbled) =
+                                super::bubble_predicate_expression(
+                                    cond,
+                                    schema,
+                                    cte_context,
+                                    Some(&left_columns),
+                                )?;
                             join_bubbled = cond_bubbled;
                             None // Will be attached later via filter-to-join transformation
                         }
@@ -770,24 +780,29 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 };
 
                 // Handle USING deduplication if present
-                let using_columns = super::extract_inline_using_columns(&resolved_right).or_else(|| {
-                    // For positional patterns, extract USING columns from the join condition
-                    if let Some(ast_resolved::BooleanExpression::Using { columns }) =
-                        &resolved_condition
-                    {
-                        Some(
-                            columns
-                                .iter()
-                                .map(|col| match col {
-                                    ast_resolved::UsingColumn::Regular(qname) => qname.name.to_string(),
-                                    ast_resolved::UsingColumn::Negated(qname) => qname.name.to_string(),
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        None
-                    }
-                });
+                let using_columns =
+                    super::extract_inline_using_columns(&resolved_right).or_else(|| {
+                        // For positional patterns, extract USING columns from the join condition
+                        if let Some(ast_resolved::BooleanExpression::Using { columns }) =
+                            &resolved_condition
+                        {
+                            Some(
+                                columns
+                                    .iter()
+                                    .map(|col| match col {
+                                        ast_resolved::UsingColumn::Regular(qname) => {
+                                            qname.name.to_string()
+                                        }
+                                        ast_resolved::UsingColumn::Negated(qname) => {
+                                            qname.name.to_string()
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            None
+                        }
+                    });
 
                 // Combine schemas with USING deduplication.
                 // Use i_provide (which carries user aliases like "a", "s") rather than
@@ -935,9 +950,9 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     };
 
                     // Build first_parens_spec if not already set
-                    let spec = first_parens_spec.clone().unwrap_or(
-                        ast_unresolved::DomainSpec::Glob,
-                    );
+                    let spec = first_parens_spec
+                        .clone()
+                        .unwrap_or(ast_unresolved::DomainSpec::Glob);
 
                     let groups_ref: Option<&[_]> = if arguments.is_empty() {
                         None
@@ -1140,9 +1155,11 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     };
 
                     // USING→correlation intercept
-                    if let ast_unresolved::UnaryRelationalOperator::Using { ref columns } = operator {
+                    if let ast_unresolved::UnaryRelationalOperator::Using { ref columns } = operator
+                    {
                         if let Some(outer) = outer_context {
-                            let inner_table_name = super::extract_base_ground_name(&resolved_source);
+                            let inner_table_name =
+                                super::extract_base_ground_name(&resolved_source);
                             let inner_qn = ast_resolved::QualifiedName {
                                 namespace_path: ast_resolved::NamespacePath::empty(),
                                 name: inner_table_name.unwrap_or_else(|| "unknown".into()),
@@ -1150,7 +1167,9 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             };
 
                             let correlation_filters =
-                                super::resolving::build_using_correlation_filters(columns, &inner_qn, outer);
+                                super::resolving::build_using_correlation_filters(
+                                    columns, &inner_qn, outer,
+                                );
 
                             resolved_source =
                                 super::insert_filters_at_base(resolved_source, correlation_filters);
@@ -1236,7 +1255,10 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                     }
                                 } else {
                                     let has_aggregate = pipe_ops.iter().any(|op| {
-                                        matches!(op, DmlPipeKind::Modulo | DmlPipeKind::AggregatePipe)
+                                        matches!(
+                                            op,
+                                            DmlPipeKind::Modulo | DmlPipeKind::AggregatePipe
+                                        )
                                     });
                                     if has_aggregate {
                                         return Err(DelightQLError::validation_error_categorized(
@@ -1363,7 +1385,9 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     self.available = available_columns.clone();
                     self.pivot_in_values = pivot_in_values.clone();
                     let resolved_operator = self.transform_operator(unresolved_operator)?;
-                    let mut output_columns = self.last_operator_output.take()
+                    let mut output_columns = self
+                        .last_operator_output
+                        .take()
                         .expect("transform_operator must populate last_operator_output");
 
                     // After a pipe, columns become Fresh (scope barrier).
@@ -1456,13 +1480,24 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 // Validate and build final schema based on operator
                 let final_schema = match operator {
                     ast_unresolved::SetOperator::UnionAllPositional => {
-                        // Positional union - use first operand's schema
+                        // Positional union - require same column count
+                        for i in 1..schemas.len() {
+                            super::validate_set_operation_schemas(
+                                &operator,
+                                &schemas[0],
+                                &schemas[i],
+                            )?;
+                        }
                         schemas[0].clone()
                     }
                     ast_unresolved::SetOperator::SmartUnionAll => {
                         // Smart union - all must have same column names (order can differ)
                         for i in 1..schemas.len() {
-                            super::validate_set_operation_schemas(&operator, &schemas[0], &schemas[i])?;
+                            super::validate_set_operation_schemas(
+                                &operator,
+                                &schemas[0],
+                                &schemas[i],
+                            )?;
                         }
                         schemas[0].clone()
                     }
@@ -1474,7 +1509,11 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                         // Minus uses left operand's schema (rows in left not in right)
                         // Require same column names by name match
                         for i in 1..schemas.len() {
-                            super::validate_set_operation_schemas(&operator, &schemas[0], &schemas[i])?;
+                            super::validate_set_operation_schemas(
+                                &operator,
+                                &schemas[0],
+                                &schemas[i],
+                            )?;
                         }
                         schemas[0].clone()
                     }
@@ -1509,6 +1548,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     outer_context,
                     &self.config,
                     grounding,
+                    None,
+                    None,
                 )?)
             }
 
@@ -1543,12 +1584,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         ast_resolved::UnaryRelationalOperator,
         Vec<ast_resolved::ColumnMetadata>,
     )> {
-        super::resolving::resolve_operator_via_fold(
-            self,
-            operator,
-            available,
-            pivot_in_values,
-        )
+        super::resolving::resolve_operator_via_fold(self, operator, available, pivot_in_values)
     }
 
     /// Relation dispatch — formerly the free function `resolve_relation_with_registry`.
@@ -1564,17 +1600,30 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         grounding: Option<&ast_unresolved::GroundedPath>,
     ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
         match &rel {
-            ast_unresolved::Relation::Ground { .. } => {
-                super::relation_resolver::resolve_ground(rel, self.registry, outer_context, &self.config, grounding)
-            }
+            ast_unresolved::Relation::Ground { .. } => super::relation_resolver::resolve_ground(
+                rel,
+                self.registry,
+                outer_context,
+                &self.config,
+                grounding,
+            ),
             ast_unresolved::Relation::Anonymous { .. } => {
                 super::relation_resolver::resolve_anonymous(rel, self, outer_context)
             }
-            ast_unresolved::Relation::TVF { .. } => {
-                super::relation_resolver::resolve_tvf(rel, self.registry, outer_context, &self.config)
-            }
+            ast_unresolved::Relation::TVF { .. } => super::relation_resolver::resolve_tvf(
+                rel,
+                self.registry,
+                outer_context,
+                &self.config,
+            ),
             ast_unresolved::Relation::InnerRelation { .. } => {
-                super::relation_resolver::resolve_inner_relation(rel, self.registry, outer_context, &self.config, grounding)
+                super::relation_resolver::resolve_inner_relation(
+                    rel,
+                    self.registry,
+                    outer_context,
+                    &self.config,
+                    grounding,
+                )
             }
             ast_unresolved::Relation::ConsultedView { .. } => {
                 panic!(
@@ -1619,9 +1668,8 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 for part in parts {
                     match part {
                         ast_unresolved::StringTemplatePart::Text(text) => {
-                            resolved_parts.push(
-                                ast_resolved::StringTemplatePart::<Resolved>::Text(text),
-                            );
+                            resolved_parts
+                                .push(ast_resolved::StringTemplatePart::<Resolved>::Text(text));
                         }
                         ast_unresolved::StringTemplatePart::Interpolation(expr) => {
                             let resolved_expr = self.transform_domain(*expr)?;
@@ -1677,12 +1725,14 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 identifier,
                 subquery,
                 alias,
-            } => super::resolving::domain_expressions::subqueries::resolve_scalar_subquery_via_fold(
-                self,
-                identifier,
-                *subquery,
-                alias.map(|s| s.to_string()),
-            ),
+            } => {
+                super::resolving::domain_expressions::subqueries::resolve_scalar_subquery_via_fold(
+                    self,
+                    identifier,
+                    *subquery,
+                    alias.map(|s| s.to_string()),
+                )
+            }
 
             // Everything else: walk handles structural descent
             // Function(non-StringTemplate) → transform_function
@@ -1727,14 +1777,13 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 let resolved_value = self.transform_domain(*value)?;
                 let available = self.available.clone();
                 let config = self.config.clone();
-                let (resolved_subquery, _) =
-                    super::resolve_relational_expression_with_registry(
-                        *subquery,
-                        self.registry,
-                        Some(&available),
-                        &config,
-                        None,
-                    )?;
+                let (resolved_subquery, _) = super::resolve_relational_expression_with_registry(
+                    *subquery,
+                    self.registry,
+                    Some(&available),
+                    &config,
+                    None,
+                )?;
                 Ok(ast_resolved::BooleanExpression::InRelational {
                     value: Box::new(resolved_value),
                     subquery: Box::new(resolved_subquery),
@@ -1753,21 +1802,19 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
             } => {
                 let available = self.available.clone();
                 let config = self.config.clone();
-                let (resolved_subquery, _) =
-                    super::resolve_relational_expression_with_registry(
-                        *subquery,
-                        self.registry,
-                        Some(&available),
-                        &config,
-                        None,
-                    )?;
-                let final_subquery =
-                    super::resolving::predicates::synthesize_using_correlation(
-                        resolved_subquery,
-                        &using_columns,
-                        &identifier,
-                        &available,
-                    );
+                let (resolved_subquery, _) = super::resolve_relational_expression_with_registry(
+                    *subquery,
+                    self.registry,
+                    Some(&available),
+                    &config,
+                    None,
+                )?;
+                let final_subquery = super::resolving::predicates::synthesize_using_correlation(
+                    resolved_subquery,
+                    &using_columns,
+                    &identifier,
+                    &available,
+                );
                 Ok(ast_resolved::BooleanExpression::InnerExists {
                     exists,
                     identifier,
@@ -1858,12 +1905,12 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                                         }
                                     }
                                     if !missing_params.is_empty() {
-                                        let context_mode =
-                                            if cfe_def.allows_positional_context_call {
-                                                "explicit"
-                                            } else {
-                                                "implicit (auto-discovered)"
-                                            };
+                                        let context_mode = if cfe_def.allows_positional_context_call
+                                        {
+                                            "explicit"
+                                        } else {
+                                            "implicit (auto-discovered)"
+                                        };
                                         return Err(DelightQLError::ParseError {
                                             message: format!(
                                                 "CFE '{}' requires context columns that don't exist in current scope.\n\
@@ -1987,9 +2034,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let resolved_frame = frame
-                    .map(|f| {
-                        super::resolving::functions::resolve_window_frame_via_fold(self, f)
-                    })
+                    .map(|f| super::resolving::functions::resolve_window_frame_via_fold(self, f))
                     .transpose()?;
                 Ok(ast_resolved::FunctionExpression::Window {
                     name,
@@ -2031,16 +2076,13 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 exists,
             } => {
                 // Check if functor matches a consulted sigma predicate (entity_type = 9)
-                if let Some(entity) =
-                    self.registry.consult.lookup_enlisted_sigma(&functor)?
-                {
-                    let expanded =
-                        super::resolving::predicates::expand_consulted_sigma(
-                            &entity.definition,
-                            &functor,
-                            arguments,
-                            exists,
-                        )?;
+                if let Some(entity) = self.registry.consult.lookup_enlisted_sigma(&functor)? {
+                    let expanded = super::resolving::predicates::expand_consulted_sigma(
+                        &entity.definition,
+                        &functor,
+                        arguments,
+                        exists,
+                    )?;
                     let resolved = self.transform_boolean(expanded)?;
                     return Ok(ast_resolved::SigmaCondition::Predicate(resolved));
                 }
@@ -2065,10 +2107,18 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 destructured_schema: _,
             } => {
                 let resolved_col = self.transform_domain(*json_column)?;
-                let key_mappings = super::resolving::predicates::extract_key_mappings_from_unresolved_pattern(&pattern)?;
-                super::resolving::predicates::validate_unresolved_pattern_for_mode(&pattern, &mode)?;
+                let key_mappings =
+                    super::resolving::predicates::extract_key_mappings_from_unresolved_pattern(
+                        &pattern,
+                    )?;
+                super::resolving::predicates::validate_unresolved_pattern_for_mode(
+                    &pattern, &mode,
+                )?;
                 super::resolving::predicates::validate_no_sibling_explosions(&pattern)?;
-                let pattern_func = super::resolving::predicates::convert_destructure_pattern_to_resolved(*pattern)?;
+                let pattern_func =
+                    super::resolving::predicates::convert_destructure_pattern_to_resolved(
+                        *pattern,
+                    )?;
                 Ok(ast_resolved::SigmaCondition::Destructure {
                     json_column: Box::new(resolved_col),
                     pattern: Box::new(pattern_func),

@@ -21,8 +21,11 @@ pub(super) fn extract_references(
                 unqualified
             );
         }
-        resolved::BooleanExpression::InnerExists { subquery, .. } => {
-            extract_refs_from_relational(subquery, &mut qualified, &mut unqualified);
+        resolved::BooleanExpression::InnerExists { .. } => {
+            // Semi-join subquery is self-contained — inner table references
+            // (like anonymous table `_`) must not leak into the predicate's
+            // reference set. Only correlated outer refs matter, and those
+            // are already captured by the resolver on the outer expression.
         }
         resolved::BooleanExpression::And { left, right } => {
             let (l_qual, l_unqual) = extract_references(left);

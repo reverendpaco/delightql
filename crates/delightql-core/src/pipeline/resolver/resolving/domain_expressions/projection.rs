@@ -339,12 +339,12 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                 let name = column.name().to_string();
                 resolved.push(ast_resolved::DomainExpression::Lvar {
                     name: name.into(),
-                    qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(|| {
-                        match &column.fq_table.name {
+                    qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(
+                        || match &column.fq_table.name {
                             ast_resolved::TableName::Named(t) => Some(t.clone().into()),
                             _ => None,
-                        }
-                    }),
+                        },
+                    ),
                     namespace_path: column.fq_table.parents_path.clone(),
                     alias: ordinal.alias.clone().map(|s| s.into()),
                     provenance: ast_resolved::PhaseBox::phantom(),
@@ -374,7 +374,8 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
             }
             ast_unresolved::DomainExpression::Function(func) => {
                 // Delegate through transform_domain which handles StringTemplate→concat
-                resolved.push(fold.transform_domain(ast_unresolved::DomainExpression::Function(func))?);
+                resolved
+                    .push(fold.transform_domain(ast_unresolved::DomainExpression::Function(func))?);
             }
             ast_unresolved::DomainExpression::Literal { value, alias } => {
                 resolved.push(ast_resolved::DomainExpression::Literal { value, alias });

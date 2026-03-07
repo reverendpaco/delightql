@@ -2424,7 +2424,10 @@ impl DelightQLSystem {
                     let head_refs: Vec<&Vec<crate::pipeline::asts::ddl::HoParam>> =
                         param_vecs.iter().collect();
 
-                    let positions = crate::pipeline::resolver::grounding::build_ho_position_analysis_from_heads(&head_refs);
+                    let positions =
+                        crate::pipeline::resolver::grounding::build_ho_position_analysis_from_heads(
+                            &head_refs,
+                        );
 
                     Self::write_ho_params_to_bootstrap(bootstrap_conn, entity_id, &positions)?;
                 }
@@ -2627,7 +2630,10 @@ impl DelightQLSystem {
             }
 
             // For HO views, write structured param metadata with cross-clause position analysis
-            if matches!(first_ddl.head, crate::pipeline::asts::ddl::DdlHead::HoView { .. }) {
+            if matches!(
+                first_ddl.head,
+                crate::pipeline::asts::ddl::DdlHead::HoView { .. }
+            ) {
                 let positions =
                     crate::pipeline::resolver::grounding::build_ho_position_analysis(&ddl_defs);
                 Self::write_ho_params_to_bootstrap(bootstrap_conn, entity_id, &positions)?;
@@ -4813,20 +4819,22 @@ impl DelightQLSystem {
 
             // If entity has manifest data in _internal, create TEMP table from it
             if let Some(int_ns_id) = internal_ns_id {
-                if let Some(result) =
-                    crate::ddl_pipeline::create_temp_table_from_manifest(
-                        &bootstrap_conn, int_ns_id, entity_name,
-                    )?
-                {
-                    bootstrap_conn.execute_batch(&result.create_sql).map_err(|e| {
-                        DelightQLError::database_error(
-                            format!(
-                                "Failed to CREATE TEMP TABLE for '{}': {}",
-                                entity_name, result.create_sql
-                            ),
-                            e.to_string(),
-                        )
-                    })?;
+                if let Some(result) = crate::ddl_pipeline::create_temp_table_from_manifest(
+                    &bootstrap_conn,
+                    int_ns_id,
+                    entity_name,
+                )? {
+                    bootstrap_conn
+                        .execute_batch(&result.create_sql)
+                        .map_err(|e| {
+                            DelightQLError::database_error(
+                                format!(
+                                    "Failed to CREATE TEMP TABLE for '{}': {}",
+                                    entity_name, result.create_sql
+                                ),
+                                e.to_string(),
+                            )
+                        })?;
                 }
             }
 
@@ -4847,12 +4855,17 @@ impl DelightQLSystem {
         if let Some(int_ns_id) = internal_ns_id {
             for entity_name in &manifest_entity_names {
                 let result = match crate::ddl_pipeline::create_temp_table_from_manifest(
-                    &bootstrap_conn, int_ns_id, entity_name,
+                    &bootstrap_conn,
+                    int_ns_id,
+                    entity_name,
                 )? {
                     Some(r) => r,
                     None => continue,
                 };
-                let crate::ddl_pipeline::ManifestCreateResult { create_sql, schema_rows } = result;
+                let crate::ddl_pipeline::ManifestCreateResult {
+                    create_sql,
+                    schema_rows,
+                } = result;
                 bootstrap_conn.execute_batch(&create_sql).map_err(|e| {
                     DelightQLError::database_error(
                         format!(
@@ -5119,8 +5132,7 @@ impl DelightQLSystem {
         for todo in &entity_todos {
             let entity_name = &todo.name;
 
-            let schema_rows =
-                manifest::read_schema(&bootstrap_conn, internal_ns_id, entity_name)?;
+            let schema_rows = manifest::read_schema(&bootstrap_conn, internal_ns_id, entity_name)?;
             let constraint_rows =
                 manifest::read_constraints(&bootstrap_conn, internal_ns_id, entity_name)?;
             let default_rows =
@@ -5138,19 +5150,26 @@ impl DelightQLSystem {
                     )
                     .ok();
                 stmt.and_then(|mut s| {
-                    s.query_row(
-                        rusqlite::params![source_ns_id, entity_name],
-                        |row| row.get::<_, String>(0),
-                    )
+                    s.query_row(rusqlite::params![source_ns_id, entity_name], |row| {
+                        row.get::<_, String>(0)
+                    })
                     .ok()
                 })
                 .and_then(|def| {
                     if let Some(pos) = def.find(":-") {
                         let body = def[pos + 2..].trim();
-                        if !body.is_empty() { Some(body.to_string()) } else { None }
+                        if !body.is_empty() {
+                            Some(body.to_string())
+                        } else {
+                            None
+                        }
                     } else if let Some(pos) = def.find(":=") {
                         let body = def[pos + 2..].trim();
-                        if !body.is_empty() { Some(body.to_string()) } else { None }
+                        if !body.is_empty() {
+                            Some(body.to_string())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -5368,7 +5387,11 @@ impl DelightQLSystem {
 
             // Register the new entity in the target namespace
             // Entity type: 1 = table, 2 = view
-            let entity_type = if entity.materialization == "view" { 2 } else { 1 };
+            let entity_type = if entity.materialization == "view" {
+                2
+            } else {
+                1
+            };
             bootstrap_conn
                 .execute(
                     "INSERT INTO entity (name, type, cartridge_id, doc) VALUES (?1, ?2, ?3, ?4)",
@@ -5422,7 +5445,11 @@ impl DelightQLSystem {
                 "created"
             };
 
-            results.push((entity_name.clone(), status.to_string(), entity.qualified_create.clone()));
+            results.push((
+                entity_name.clone(),
+                status.to_string(),
+                entity.qualified_create.clone(),
+            ));
         }
 
         drop(target_conn_guard);

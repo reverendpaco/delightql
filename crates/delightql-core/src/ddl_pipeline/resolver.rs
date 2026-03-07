@@ -175,12 +175,7 @@ fn resolve_expr(
 
     let schema = EmptySchema;
     let mut registry = crate::resolution::EntityRegistry::new(&schema);
-    resolve_domain_expr_via_registry(
-        expr,
-        &mut registry,
-        available,
-        false,
-    )
+    resolve_domain_expr_via_registry(expr, &mut registry, available, false)
 }
 
 /// Pattern-match `@ != null` → promote to NotNull.

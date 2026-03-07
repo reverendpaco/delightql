@@ -54,8 +54,8 @@ pub(crate) mod helpers;
 use self::helpers::*;
 mod bubbling;
 use self::bubbling::*;
-pub(crate) mod resolving;
 mod cte_validation;
+pub(crate) mod resolving;
 use self::cte_validation::*;
 mod type_conversion;
 use self::type_conversion::*;
@@ -67,8 +67,8 @@ mod schema_utils;
 use self::schema_utils::*;
 mod join_resolver;
 use self::join_resolver::*;
-mod relation_resolver;
 pub(crate) mod grounding;
+mod relation_resolver;
 mod resolver_fold;
 use resolver_fold::ResolverFold;
 
@@ -255,8 +255,7 @@ pub fn resolve_query(
                     let mut all_schemas_same = true;
 
                     for (idx, cte) in group.iter().enumerate() {
-                        let (resolved_expr, _) =
-                            fold.resolve_relational(cte.expression.clone())?;
+                        let (resolved_expr, _) = fold.resolve_relational(cte.expression.clone())?;
                         let expr_schema = extract_cpr_schema(&resolved_expr)?;
 
                         // CRITICAL: After first head, register the CTE so recursive heads can reference it!
@@ -694,6 +693,8 @@ fn expand_er_join_chain(
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
+    left_endpoint_alias: Option<delightql_types::SqlIdentifier>,
+    right_endpoint_alias: Option<delightql_types::SqlIdentifier>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     if relations.len() < 2 {
         return Err(DelightQLError::validation_error(
@@ -1220,9 +1221,26 @@ fn expand_er_transitive_join(
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    // Extract table names from endpoints
-    let left_name = match &left {
-        ast_unresolved::RelationalExpression::Relation(rel) => er_table_name(rel)?,
+    // Extract table names (and alias/domain_spec) from endpoints
+    let (left_name, left_alias, left_domain_spec) = match &left {
+        ast_unresolved::RelationalExpression::Relation(rel) => match rel {
+            ast_unresolved::Relation::Ground {
+                identifier,
+                alias,
+                domain_spec,
+                ..
+            } => (
+                identifier.name.to_string(),
+                alias.clone(),
+                domain_spec.clone(),
+            ),
+            _ => {
+                return Err(DelightQLError::validation_error(
+                    "Left side of && must be a table reference",
+                    "Invalid ER-transitive-join operand",
+                ))
+            }
+        },
         _ => {
             return Err(DelightQLError::validation_error(
                 "Left side of && must be a table reference",
@@ -1230,8 +1248,25 @@ fn expand_er_transitive_join(
             ))
         }
     };
-    let right_name = match &right {
-        ast_unresolved::RelationalExpression::Relation(rel) => er_table_name(rel)?,
+    let (right_name, right_alias, right_domain_spec) = match &right {
+        ast_unresolved::RelationalExpression::Relation(rel) => match rel {
+            ast_unresolved::Relation::Ground {
+                identifier,
+                alias,
+                domain_spec,
+                ..
+            } => (
+                identifier.name.to_string(),
+                alias.clone(),
+                domain_spec.clone(),
+            ),
+            _ => {
+                return Err(DelightQLError::validation_error(
+                    "Right side of && must be a table reference",
+                    "Invalid ER-transitive-join operand",
+                ))
+            }
+        },
         _ => {
             return Err(DelightQLError::validation_error(
                 "Right side of && must be a table reference",
@@ -1335,14 +1370,275 @@ fn expand_er_transitive_join(
         })
         .collect();
 
-    expand_er_join_chain(
+    let (resolved_expr, bubbled) = expand_er_join_chain(
         chain_relations,
         context,
         registry,
         outer_context,
         &effective_config,
         grounding,
-    )
+        None,
+        None,
+    )?;
+
+    // Thread user aliases from the original endpoints onto the resolved result.
+    // We rename the table alias AND all qualifier references in the resolved AST
+    // so that `users_t(*) as u` becomes `users_t AS u` with all `users_t.col`
+    // references rewritten to `u.col`.
+    let mut resolved_expr = resolved_expr;
+    let mut bubbled = bubbled;
+    if let Some(ref la) = left_alias {
+        resolved_expr = rename_in_resolved_expr(resolved_expr, &left_name, la);
+        rename_bubbled_columns(&mut bubbled, &left_name, la);
+    }
+    if let Some(ref ra) = right_alias {
+        resolved_expr = rename_in_resolved_expr(resolved_expr, &right_name, ra);
+        rename_bubbled_columns(&mut bubbled, &right_name, ra);
+    }
+
+    Ok((resolved_expr, bubbled))
+}
+
+/// Rename a table's alias and all qualifier references throughout a resolved
+/// expression tree. Takes ownership and returns the modified expression.
+/// Used to apply user aliases from `&&` endpoints after the chain is resolved.
+fn rename_in_resolved_expr(
+    expr: ast_resolved::RelationalExpression,
+    old_name: &str,
+    new_name: &delightql_types::SqlIdentifier,
+) -> ast_resolved::RelationalExpression {
+    match expr {
+        ast_resolved::RelationalExpression::Relation(rel) => {
+            ast_resolved::RelationalExpression::Relation(match rel {
+                ast_resolved::Relation::Ground {
+                    identifier,
+                    canonical_name,
+                    domain_spec,
+                    alias,
+                    outer,
+                    mutation_target,
+                    passthrough,
+                    cpr_schema,
+                    hygienic_injections,
+                } => {
+                    let current = alias.as_ref().map(|a| a.to_string()).unwrap_or_default();
+                    if current == old_name {
+                        let schema = rename_schema(cpr_schema.get().clone(), old_name, new_name);
+                        ast_resolved::Relation::Ground {
+                            identifier,
+                            canonical_name,
+                            domain_spec,
+                            alias: Some(new_name.clone()),
+                            outer,
+                            mutation_target,
+                            passthrough,
+                            cpr_schema: ast_resolved::PhaseBox::new(schema),
+                            hygienic_injections,
+                        }
+                    } else {
+                        ast_resolved::Relation::Ground {
+                            identifier,
+                            canonical_name,
+                            domain_spec,
+                            alias,
+                            outer,
+                            mutation_target,
+                            passthrough,
+                            cpr_schema,
+                            hygienic_injections,
+                        }
+                    }
+                }
+                ast_resolved::Relation::ConsultedView {
+                    identifier,
+                    body,
+                    scoped,
+                    outer,
+                } => {
+                    let current_alias = scoped.get().alias().to_string();
+                    if current_alias == old_name {
+                        let old_schema = scoped.get().schema().clone();
+                        let renamed_schema = rename_schema(old_schema, old_name, new_name);
+                        let new_scoped = ast_resolved::ScopedSchema::from_parts(
+                            new_name.clone(),
+                            renamed_schema,
+                        );
+                        ast_resolved::Relation::ConsultedView {
+                            identifier,
+                            body,
+                            scoped: ast_resolved::PhaseBox::new(new_scoped),
+                            outer,
+                        }
+                    } else {
+                        ast_resolved::Relation::ConsultedView {
+                            identifier,
+                            body,
+                            scoped,
+                            outer,
+                        }
+                    }
+                }
+                ast_resolved::Relation::InnerRelation {
+                    pattern,
+                    alias,
+                    outer,
+                    cpr_schema,
+                } => {
+                    let current = alias.as_ref().map(|a| a.to_string()).unwrap_or_default();
+                    if current == old_name {
+                        let schema = rename_schema(cpr_schema.get().clone(), old_name, new_name);
+                        ast_resolved::Relation::InnerRelation {
+                            pattern,
+                            alias: Some(new_name.clone()),
+                            outer,
+                            cpr_schema: ast_resolved::PhaseBox::new(schema),
+                        }
+                    } else {
+                        ast_resolved::Relation::InnerRelation {
+                            pattern,
+                            alias,
+                            outer,
+                            cpr_schema,
+                        }
+                    }
+                }
+                other => other,
+            })
+        }
+        ast_resolved::RelationalExpression::Join {
+            left,
+            right,
+            mut join_condition,
+            join_type,
+            cpr_schema,
+        } => {
+            let left = Box::new(rename_in_resolved_expr(*left, old_name, new_name));
+            let right = Box::new(rename_in_resolved_expr(*right, old_name, new_name));
+            if let Some(ref mut cond) = join_condition {
+                rename_qualifier_in_resolved_boolean(cond, old_name, new_name);
+            }
+            let schema = rename_schema(cpr_schema.get().clone(), old_name, new_name);
+            ast_resolved::RelationalExpression::Join {
+                left,
+                right,
+                join_condition,
+                join_type,
+                cpr_schema: ast_resolved::PhaseBox::new(schema),
+            }
+        }
+        ast_resolved::RelationalExpression::Filter {
+            source,
+            mut condition,
+            origin,
+            cpr_schema,
+        } => {
+            let source = Box::new(rename_in_resolved_expr(*source, old_name, new_name));
+            if let ast_resolved::SigmaCondition::Predicate(ref mut pred) = condition {
+                rename_qualifier_in_resolved_boolean(pred, old_name, new_name);
+            }
+            let schema = rename_schema(cpr_schema.get().clone(), old_name, new_name);
+            ast_resolved::RelationalExpression::Filter {
+                source,
+                condition,
+                origin,
+                cpr_schema: ast_resolved::PhaseBox::new(schema),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Rename table references in a CprSchema.
+fn rename_schema(
+    schema: ast_resolved::CprSchema,
+    old_name: &str,
+    new_name: &delightql_types::SqlIdentifier,
+) -> ast_resolved::CprSchema {
+    match schema {
+        ast_resolved::CprSchema::Resolved(cols) => ast_resolved::CprSchema::Resolved(
+            cols.into_iter()
+                .map(|mut col| {
+                    if let ast_resolved::TableName::Named(ref tn) = col.fq_table.name {
+                        if tn.as_str() == old_name {
+                            col.fq_table.name = ast_resolved::TableName::Named(new_name.clone());
+                        }
+                    }
+                    col
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Rename table references in the bubbled state's `i_provide` columns.
+fn rename_bubbled_columns(
+    bubbled: &mut BubbledState,
+    old_name: &str,
+    new_name: &delightql_types::SqlIdentifier,
+) {
+    for col in &mut bubbled.i_provide {
+        if let ast_resolved::TableName::Named(ref tn) = col.fq_table.name {
+            if tn.as_str() == old_name {
+                col.fq_table.name = ast_resolved::TableName::Named(new_name.clone());
+            }
+        }
+    }
+}
+
+/// Rename qualifiers in a resolved boolean expression.
+fn rename_qualifier_in_resolved_boolean(
+    expr: &mut ast_resolved::BooleanExpression,
+    old_name: &str,
+    new_name: &delightql_types::SqlIdentifier,
+) {
+    match expr {
+        ast_resolved::BooleanExpression::Comparison { left, right, .. } => {
+            rename_qualifier_in_resolved_domain(left, old_name, new_name);
+            rename_qualifier_in_resolved_domain(right, old_name, new_name);
+        }
+        ast_resolved::BooleanExpression::And { left, right }
+        | ast_resolved::BooleanExpression::Or { left, right } => {
+            rename_qualifier_in_resolved_boolean(left, old_name, new_name);
+            rename_qualifier_in_resolved_boolean(right, old_name, new_name);
+        }
+        ast_resolved::BooleanExpression::Not { expr } => {
+            rename_qualifier_in_resolved_boolean(expr, old_name, new_name);
+        }
+        _ => {}
+    }
+}
+
+/// Rename qualifiers in a resolved domain expression.
+fn rename_qualifier_in_resolved_domain(
+    expr: &mut ast_resolved::DomainExpression,
+    old_name: &str,
+    new_name: &delightql_types::SqlIdentifier,
+) {
+    match expr {
+        ast_resolved::DomainExpression::Lvar {
+            qualifier: Some(q), ..
+        } if q.as_str() == old_name => {
+            *q = new_name.clone();
+        }
+        ast_resolved::DomainExpression::Function(func) => match func {
+            ast_resolved::FunctionExpression::Infix { left, right, .. } => {
+                rename_qualifier_in_resolved_domain(left, old_name, new_name);
+                rename_qualifier_in_resolved_domain(right, old_name, new_name);
+            }
+            ast_resolved::FunctionExpression::Regular { arguments, .. }
+            | ast_resolved::FunctionExpression::Curried { arguments, .. } => {
+                for arg in arguments {
+                    rename_qualifier_in_resolved_domain(arg, old_name, new_name);
+                }
+            }
+            _ => {}
+        },
+        ast_resolved::DomainExpression::Parenthesized { inner, .. } => {
+            rename_qualifier_in_resolved_domain(inner, old_name, new_name);
+        }
+        _ => {}
+    }
 }
 
 /// BFS path-finding in the ER graph. Returns the shortest path, or an error
@@ -1723,9 +2019,7 @@ fn extract_base_ground_name(
         ast_resolved::RelationalExpression::Filter { source, .. } => {
             extract_base_ground_name(source)
         }
-        ast_resolved::RelationalExpression::Join { left, .. } => {
-            extract_base_ground_name(left)
-        }
+        ast_resolved::RelationalExpression::Join { left, .. } => extract_base_ground_name(left),
         _ => None,
     }
 }
@@ -1875,4 +2169,3 @@ fn extract_literal_rows_from_resolved(
         None
     }
 }
-

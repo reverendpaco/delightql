@@ -6,10 +6,7 @@ use super::asts::{ColumnDef, CreateTableDef, DdlDefault, GeneratedKind};
 use super::builder;
 
 fn db_err(msg: impl std::fmt::Display) -> crate::DelightQLError {
-    crate::DelightQLError::transpilation_error(
-        msg.to_string(),
-        "ddl_pipeline::assemble_manifest",
-    )
+    crate::DelightQLError::transpilation_error(msg.to_string(), "ddl_pipeline::assemble_manifest")
 }
 
 /// Build a `CreateTableDef<Unresolved>` from manifest data.

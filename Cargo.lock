@@ -1264,19 +1264,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
-name = "dql-pack-man"
-version = "0.1.0"
-dependencies = [
- "cc",
- "clap 4.5.49",
- "delightql-protocol",
- "rusqlite",
- "sha2",
- "tree-sitter-c2rust",
- "zstd",
-]
-
-[[package]]
 name = "dql-test-ball-runner"
 version = "0.1.0"
 dependencies = [

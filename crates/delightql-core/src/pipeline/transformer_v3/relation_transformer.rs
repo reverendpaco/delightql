@@ -457,7 +457,24 @@ pub fn transform_relation(
                     // Step 1: Transform the inner subquery to SQL (clear correlation for FROM-clause context)
                     let inner_ctx = ctx.clear_correlation();
                     let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
-                    let subquery_expr = super::segment_handler::finalize_to_query(subquery_state)?;
+                    let mut subquery_expr =
+                        super::segment_handler::finalize_to_query(subquery_state)?;
+
+                    // Harvest any CTEs generated during inner transformation
+                    // (e.g., tree group CTEs) and scope them inside the subquery.
+                    let inner_generated = inner_ctx.generated_ctes.borrow().clone();
+                    if !inner_generated.is_empty() {
+                        subquery_expr = match subquery_expr {
+                            QueryExpression::WithCte { mut ctes, query } => {
+                                ctes.extend(inner_generated);
+                                QueryExpression::WithCte { ctes, query }
+                            }
+                            other => QueryExpression::WithCte {
+                                ctes: inner_generated,
+                                query: Box::new(other),
+                            },
+                        };
+                    }
 
                     // Step 2: Determine the alias for the derived table
                     // If no explicit alias, use the table name (schema shadowing)
@@ -562,7 +579,23 @@ pub fn transform_relation(
                     // columns must not inherit the outer correlation context.
                     let inner_ctx = ctx.clear_correlation();
                     let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
-                    let subquery_expr = super::segment_handler::finalize_to_query(subquery_state)?;
+                    let mut subquery_expr =
+                        super::segment_handler::finalize_to_query(subquery_state)?;
+
+                    // Harvest any CTEs generated during inner transformation
+                    let inner_generated = inner_ctx.generated_ctes.borrow().clone();
+                    if !inner_generated.is_empty() {
+                        subquery_expr = match subquery_expr {
+                            QueryExpression::WithCte { mut ctes, query } => {
+                                ctes.extend(inner_generated);
+                                QueryExpression::WithCte { ctes, query }
+                            }
+                            other => QueryExpression::WithCte {
+                                ctes: inner_generated,
+                                query: Box::new(other),
+                            },
+                        };
+                    }
 
                     // NOTE: Hygienic columns remain visible in the subquery so JOIN ON can reference them
                     // To hide them from final output, wrap the entire top-level query (not implemented yet)
@@ -594,7 +627,24 @@ pub fn transform_relation(
                     // Transform the inner subquery (which has GROUP BY from modulo operator)
                     let inner_ctx = ctx.clear_correlation();
                     let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
-                    let subquery_expr = super::segment_handler::finalize_to_query(subquery_state)?;
+                    let mut subquery_expr =
+                        super::segment_handler::finalize_to_query(subquery_state)?;
+
+                    // Harvest any CTEs generated during inner transformation
+                    // (e.g., tree group CTEs) and scope them inside the subquery.
+                    let inner_generated = inner_ctx.generated_ctes.borrow().clone();
+                    if !inner_generated.is_empty() {
+                        subquery_expr = match subquery_expr {
+                            QueryExpression::WithCte { mut ctes, query } => {
+                                ctes.extend(inner_generated);
+                                QueryExpression::WithCte { ctes, query }
+                            }
+                            other => QueryExpression::WithCte {
+                                ctes: inner_generated,
+                                query: Box::new(other),
+                            },
+                        };
+                    }
 
                     // NOTE: Hygienic columns remain visible in the subquery so JOIN ON can reference them
                     // To hide them from final output, wrap the entire top-level query (not implemented yet)
@@ -645,6 +695,21 @@ pub fn transform_relation(
                     let subquery_state = super::transform_relational(*subquery, &inner_ctx)?;
                     let mut subquery_expr =
                         super::segment_handler::finalize_to_query(subquery_state)?;
+
+                    // Harvest any CTEs generated during inner transformation
+                    let inner_generated = inner_ctx.generated_ctes.borrow().clone();
+                    if !inner_generated.is_empty() {
+                        subquery_expr = match subquery_expr {
+                            QueryExpression::WithCte { mut ctes, query } => {
+                                ctes.extend(inner_generated);
+                                QueryExpression::WithCte { ctes, query }
+                            }
+                            other => QueryExpression::WithCte {
+                                ctes: inner_generated,
+                                query: Box::new(other),
+                            },
+                        };
+                    }
 
                     // Step 3: Add ROW_NUMBER() to the SELECT list
                     // Create schema context from subquery schema for ORDER BY expressions

@@ -94,7 +94,10 @@ impl AstTransform<Addressed, Addressed> for CfeSubstituter<'_> {
 
     // -- Override 2: Function expression interception --------------------------
 
-    fn transform_function(&mut self, f: ast::FunctionExpression) -> Result<ast::FunctionExpression> {
+    fn transform_function(
+        &mut self,
+        f: ast::FunctionExpression,
+    ) -> Result<ast::FunctionExpression> {
         match f {
             // Regular: check if name is a curried parameter → extract_function_from_code
             ast::FunctionExpression::Regular {

@@ -745,7 +745,9 @@ impl PhaseBox<Option<super::expressions::domain::LvarProvenance>, Addressed> {
 impl From<PhaseBox<Option<super::expressions::domain::LvarProvenance>, Refined>>
     for PhaseBox<Option<super::expressions::domain::LvarProvenance>, Addressed>
 {
-    fn from(refined: PhaseBox<Option<super::expressions::domain::LvarProvenance>, Refined>) -> Self {
+    fn from(
+        refined: PhaseBox<Option<super::expressions::domain::LvarProvenance>, Refined>,
+    ) -> Self {
         PhaseBox {
             data: refined.data,
             _phase: PhantomData,

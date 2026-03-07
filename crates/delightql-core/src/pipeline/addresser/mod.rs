@@ -256,9 +256,7 @@ fn walk_operator_for_tree_groups(
         // Consumed before refined phase:
         ast_addressed::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_addressed::UnaryRelationalOperator::DirectiveTerminal { .. } => {
-            unreachable!(
-                "HoViewApplication/DirectiveTerminal consumed before addressing"
-            )
+            unreachable!("HoViewApplication/DirectiveTerminal consumed before addressing")
         }
     }
 }

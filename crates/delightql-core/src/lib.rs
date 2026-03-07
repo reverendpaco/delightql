@@ -1,5 +1,4 @@
 pub mod api;
-pub mod session_cwd;
 pub(crate) mod bin_cartridge;
 pub(crate) mod ddl;
 #[cfg(not(target_arch = "wasm32"))]
@@ -9,6 +8,7 @@ pub(crate) mod lispy;
 pub(crate) mod namespace;
 pub(crate) mod pipeline;
 pub(crate) mod resolution;
+pub mod session_cwd;
 pub(crate) mod sexp_formatter;
 pub(crate) mod stdlib_manifest;
 

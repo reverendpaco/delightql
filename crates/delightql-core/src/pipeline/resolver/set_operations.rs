@@ -144,8 +144,25 @@ pub(super) fn validate_set_operation_schemas(
     match operator {
         ast_resolved::SetOperator::UnionAllPositional
         | ast_resolved::SetOperator::SmartUnionAll => {
-            // Positional union - no validation needed, columns are taken by position
-            // Different column counts are allowed
+            // Positional and smart union require same column count
+            if let (
+                ast_resolved::CprSchema::Resolved(cols1),
+                ast_resolved::CprSchema::Resolved(cols2),
+            ) = (_s1, _s2)
+            {
+                if cols1.len() != cols2.len() {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "set_operation/column_count_mismatch",
+                        format!(
+                            "Set operation requires both sides to have the same number of columns, \
+                             but left has {} and right has {}",
+                            cols1.len(),
+                            cols2.len(),
+                        ),
+                        "Positional union column count mismatch",
+                    ));
+                }
+            }
             Ok(())
         }
         ast_resolved::SetOperator::UnionCorresponding => {

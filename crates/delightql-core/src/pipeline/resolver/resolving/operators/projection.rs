@@ -1,9 +1,9 @@
+use super::super::column_extraction::extract_provided_column_from_domain_expr;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::ProjectionExpr;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
-use super::super::column_extraction::extract_provided_column_from_domain_expr;
 
 /// Resolve the General projection operator via fold-based dispatch
 ///
@@ -32,10 +32,7 @@ pub(super) fn resolve_general_via_fold(
     if has_glob {
         for expr in &expressions {
             // Skip glob/projection expressions — only check explicit value expressions
-            if matches!(
-                expr,
-                ast_unresolved::DomainExpression::Projection(_)
-            ) {
+            if matches!(expr, ast_unresolved::DomainExpression::Projection(_)) {
                 continue;
             }
             let alias = match expr {
@@ -61,7 +58,10 @@ pub(super) fn resolve_general_via_fold(
                 _ => None,
             };
             if let Some(alias_name) = alias {
-                if available.iter().any(|col| col.name() == alias_name.as_str()) {
+                if available
+                    .iter()
+                    .any(|col| col.name() == alias_name.as_str())
+                {
                     return Err(DelightQLError::validation_error_categorized(
                         "constraint",
                         format!(
@@ -87,12 +87,13 @@ pub(super) fn resolve_general_via_fold(
             resolved_expressions.push(resolved);
         } else {
             // Normal expressions: use fold-based expansion (globs, patterns, etc.)
-            let resolved_exprs = super::super::domain_expressions::projection::resolve_expressions_via_fold(
-                fold,
-                vec![expr],
-                available,
-                false,
-            )?;
+            let resolved_exprs =
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold,
+                    vec![expr],
+                    available,
+                    false,
+                )?;
             resolved_expressions.extend(resolved_exprs);
         };
     }

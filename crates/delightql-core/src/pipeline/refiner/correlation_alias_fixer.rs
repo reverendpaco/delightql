@@ -50,10 +50,7 @@ pub fn fix_correlation_aliases(
 struct CorrelationAliasFold;
 
 impl AstTransform<Resolved, Resolved> for CorrelationAliasFold {
-    fn transform_relation(
-        &mut self,
-        r: resolved::Relation,
-    ) -> Result<resolved::Relation> {
+    fn transform_relation(&mut self, r: resolved::Relation) -> Result<resolved::Relation> {
         // All Relation variants are leaves for alias fixing — do not recurse
         // into InnerRelation subqueries or ConsultedView bodies (separate scopes).
         Ok(r)

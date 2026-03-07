@@ -606,8 +606,7 @@ pub(super) fn resolve_ground(
                     let mut fallback_result = None;
                     for ns in &grounding.grounded_ns {
                         let gfq = super::grounding::namespace_path_to_fq(ns);
-                        if let Some(entity) =
-                            registry.consult.lookup_entity(&identifier.name, &gfq)
+                        if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &gfq)
                         {
                             if entity.entity_type
                                 == BootstrapEntityType::DqlTemporaryViewExpression.as_i32()
@@ -1824,13 +1823,12 @@ pub(super) fn resolve_tvf(
                 grounded_ns: vec![entity_ns],
             };
 
-            let (table_bindings, scalar_spec, _pipe_idx) =
-                super::grounding::split_ho_first_parens(
-                    &first_parens_spec,
-                    &entity,
-                    None,
-                    groups_ref,
-                )?;
+            let (table_bindings, scalar_spec, _pipe_idx) = super::grounding::split_ho_first_parens(
+                &first_parens_spec,
+                &entity,
+                None,
+                groups_ref,
+            )?;
             return expand_ho_view(
                 &function,
                 &entity,
@@ -2290,8 +2288,7 @@ pub(super) fn expand_ho_view(
     let (resolved_query, bubbled) = resolve_result?;
 
     // Convert to ConsultedView relation
-    let (resolved_expr, bubbled) =
-        ho_view_query_to_relational(resolved_query, bubbled, function)?;
+    let (resolved_expr, bubbled) = ho_view_query_to_relational(resolved_query, bubbled, function)?;
 
     // Apply PatternResolver to first-parens (scalar positions) via combined DomainSpec.
     //
@@ -2314,10 +2311,14 @@ pub(super) fn expand_ho_view(
     // Identify scalar column names from position analysis
     let scalar_col_names: Vec<Option<&str>> = positions
         .iter()
-        .filter(|p| matches!(p.column_kind, crate::pipeline::asts::ddl::HoColumnKind::Scalar))
+        .filter(|p| {
+            matches!(
+                p.column_kind,
+                crate::pipeline::asts::ddl::HoColumnKind::Scalar
+            )
+        })
         .map(|p| p.column_name.as_deref())
         .collect();
-
 
     // Build WHERE constraints and column filtering for scalar positions.
     // We construct the filter directly rather than going through apply_call_site_pattern,
@@ -2408,7 +2409,6 @@ pub(super) fn expand_ho_view(
 
     Ok((expr, BubbledState::resolved(output_columns)))
 }
-
 
 /// Apply call-site positional patterns to an already-resolved consulted entity expression.
 ///

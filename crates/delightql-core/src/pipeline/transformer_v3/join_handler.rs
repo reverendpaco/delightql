@@ -14,6 +14,31 @@ use super::{
     JoinSpec, QualifierScope, SegmentSource, TransformContext,
 };
 
+/// Wrap a query with CTE definitions if any were generated during transformation.
+/// Used to scope tree group CTEs (and similar) inside join subqueries.
+fn wrap_with_generated_ctes(
+    query: QueryExpression,
+    generated: Vec<crate::pipeline::sql_ast_v3::Cte>,
+) -> QueryExpression {
+    if generated.is_empty() {
+        query
+    } else {
+        match query {
+            QueryExpression::WithCte {
+                mut ctes,
+                query: inner,
+            } => {
+                ctes.extend(generated);
+                QueryExpression::WithCte { ctes, query: inner }
+            }
+            other => QueryExpression::WithCte {
+                ctes: generated,
+                query: Box::new(other),
+            },
+        }
+    }
+}
+
 /// Extract explicit FROM-clause aliases from a finalized QueryExpression.
 /// Only returns aliases from tables with explicit AS clauses, subqueries,
 /// and VALUES — NOT raw table names. This prevents remapping a table name
@@ -78,8 +103,9 @@ fn table_expression_alias(table: &TableExpression) -> Option<String> {
 /// Values and UnionTable always have an alias (user-provided or auto-generated).
 pub(super) fn anon_table_alias(table: &TableExpression) -> String {
     match table {
-        TableExpression::Values { alias, .. }
-        | TableExpression::UnionTable { alias, .. } => alias.clone(),
+        TableExpression::Values { alias, .. } | TableExpression::UnionTable { alias, .. } => {
+            alias.clone()
+        }
         other => panic!(
             "anon_table_alias called on non-anonymous: {:?}",
             std::mem::discriminant(other)
@@ -150,9 +176,19 @@ pub fn transform_join(
     // Get left schema before transforming (needed for melt join to avoid _melt_packet leakage)
     let left_schema = super::schema_utils::get_relational_schema(&left);
 
-    // Transform both sides recursively
+    // Transform left side
     let left_state = transform_relational(left, ctx)?;
+
+    // Scope generated_ctes for right side: any CTEs generated during right-side
+    // transformation (e.g., tree group CTEs) must be placed inside the right-side
+    // subquery, not at the outer level.
+    let saved_ctes = ctx.generated_ctes.borrow().clone();
+    ctx.generated_ctes.borrow_mut().clear();
+
     let right_state = transform_relational(right, ctx)?;
+
+    let right_generated_ctes = ctx.generated_ctes.borrow().clone();
+    *ctx.generated_ctes.borrow_mut() = saved_ctes;
 
     // Create or extend Segment states to accumulate joins flatly
     log::debug!(
@@ -344,6 +380,7 @@ pub fn transform_join(
             // Reuse the alias already stored in the anonymous table
             let right_alias = anon_table_alias(&anon_table);
             let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
+            let query = wrap_with_generated_ctes(query, right_generated_ctes.clone());
             let right_subquery = TableExpression::subquery(query, &right_alias);
 
             // Extract alias from left table so join condition can properly
@@ -391,8 +428,8 @@ pub fn transform_join(
             let left_query = finalize_to_query(QueryBuildState::AnonymousTable(left_anon))?;
             let left_subquery = TableExpression::subquery(left_query, &left_alias);
 
-            let right_query =
-                finalize_to_query(QueryBuildState::AnonymousTable(right_anon))?;
+            let right_query = finalize_to_query(QueryBuildState::AnonymousTable(right_anon))?;
+            let right_query = wrap_with_generated_ctes(right_query, right_generated_ctes.clone());
             let right_subquery = TableExpression::subquery(right_query, &right_alias);
 
             // Determine join type and condition - pass both aliases for CPR replacement
@@ -491,6 +528,7 @@ pub fn transform_join(
             // Reuse the alias already stored in the anonymous table
             let right_alias = anon_table_alias(&anon_table);
             let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
+            let query = wrap_with_generated_ctes(query, right_generated_ctes.clone());
             let right_subquery = TableExpression::subquery(query, &right_alias);
 
             // Determine join type and condition - use remappings from left segment
@@ -528,6 +566,7 @@ pub fn transform_join(
         (QueryBuildState::Table(left_table), right @ QueryBuildState::Segment { .. }) => {
             // Right side is complex segment - finalize it first
             let right_query = finalize_to_query(right)?;
+            let right_query = wrap_with_generated_ctes(right_query, right_generated_ctes.clone());
             let right_alias = next_alias();
             let right_subquery = TableExpression::subquery(right_query, &right_alias);
 
@@ -598,12 +637,14 @@ pub fn transform_join(
                 }
                 QueryBuildState::AnonymousTable(anon_table) => {
                     let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
+                    let query = wrap_with_generated_ctes(query, right_generated_ctes.clone());
                     let alias = next_alias();
                     let table = TableExpression::subquery(query, &alias);
                     (table, Some(alias))
                 }
                 other => {
                     let query = finalize_to_query(other)?;
+                    let query = wrap_with_generated_ctes(query, right_generated_ctes.clone());
                     let ri = extract_inner_from_aliases(&query);
                     let alias = next_alias();
                     let table = TableExpression::subquery(query, &alias);
@@ -683,9 +724,9 @@ pub fn transform_join(
                     (t, alias)
                 }
                 QueryBuildState::AnonymousTable(anon_table) => {
-                    // Anonymous table always becomes a subquery
+                    // Preserve the user's alias (e.g., "b") instead of generating a fresh one
+                    let alias = anon_table_alias(&anon_table);
                     let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
-                    let alias = next_alias();
                     let table = TableExpression::subquery(query, &alias);
                     (table, Some(alias))
                 }
@@ -718,9 +759,10 @@ pub fn transform_join(
                     (t, alias)
                 }
                 QueryBuildState::AnonymousTable(anon_table) => {
-                    // Anonymous table always becomes a subquery
+                    // Preserve the user's alias (e.g., "b") instead of generating a fresh one
+                    let alias = anon_table_alias(&anon_table);
                     let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
-                    let alias = next_alias();
+                    let query = wrap_with_generated_ctes(query, right_generated_ctes.clone());
                     let table = TableExpression::subquery(query, &alias);
                     (table, Some(alias))
                 }
@@ -735,6 +777,7 @@ pub fn transform_join(
                 other => {
                     // Complex state - finalize to subquery
                     let query = finalize_to_query(other)?;
+                    let query = wrap_with_generated_ctes(query, right_generated_ctes.clone());
                     let inner_aliases = extract_inner_from_aliases(&query);
                     let alias = next_alias();
                     let table = TableExpression::subquery(query, &alias);

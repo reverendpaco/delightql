@@ -50,9 +50,10 @@ pub(super) fn resolve_map_cover_via_fold(
         };
 
     // Resolve columns - allow zero matches for patterns (Transform is safe as no-op)
-    let resolved_columns = super::super::domain_expressions::projection::resolve_expressions_via_fold(
-        fold, columns, available, true,
-    )?;
+    let resolved_columns =
+        super::super::domain_expressions::projection::resolve_expressions_via_fold(
+            fold, columns, available, true,
+        )?;
 
     // Check if pattern matched zero columns (warning)
     if resolved_columns.is_empty() && !available.is_empty() {
@@ -60,10 +61,7 @@ pub(super) fn resolve_map_cover_via_fold(
     }
 
     let resolved_condition = conditioned_on
-        .map(|cond| {
-            fold.transform_boolean(*cond)
-                .map(Box::new)
-        })
+        .map(|cond| fold.transform_boolean(*cond).map(Box::new))
         .transpose()?;
 
     let resolved_op = ast_resolved::UnaryRelationalOperator::MapCover {
@@ -98,10 +96,15 @@ pub(super) fn resolve_transform_via_fold(
     let mut resolved_transformations = Vec::new();
     for (expr, alias, qualifier) in transformations {
         let resolved_expr =
-            super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, vec![expr], available, false)?
-                .into_iter()
-                .next()
-                .expect("resolve_expressions_via_fold returns same count as input");
+            super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                fold,
+                vec![expr],
+                available,
+                false,
+            )?
+            .into_iter()
+            .next()
+            .expect("resolve_expressions_via_fold returns same count as input");
         resolved_transformations.push((resolved_expr, alias.clone(), qualifier));
     }
 
@@ -151,10 +154,7 @@ pub(super) fn resolve_transform_via_fold(
     }
 
     let resolved_condition = conditioned_on
-        .map(|cond| {
-            fold.transform_boolean(*cond)
-                .map(Box::new)
-        })
+        .map(|cond| fold.transform_boolean(*cond).map(Box::new))
         .transpose()?;
 
     let resolved_op = ast_resolved::UnaryRelationalOperator::Transform {
@@ -205,7 +205,12 @@ pub(super) fn resolve_embed_map_cover_via_fold(
         ast_unresolved::ColumnSelector::Explicit(exprs) => {
             // For explicit columns, keep as explicit (no pattern resolution needed)
             let resolved_exprs =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, exprs.clone(), available, false)?;
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold,
+                    exprs.clone(),
+                    available,
+                    false,
+                )?;
             let column_names = resolved_exprs
                 .iter()
                 .filter_map(extract_column_name_from_expr)

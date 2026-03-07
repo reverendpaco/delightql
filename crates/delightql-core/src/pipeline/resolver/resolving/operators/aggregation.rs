@@ -387,7 +387,9 @@ pub(super) fn resolve_modulo_via_fold(
         ast_unresolved::ModuloSpec::Columns(cols) => {
             // Simple distinct/group on columns
             let resolved_cols =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, cols, available, false)?;
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold, cols, available, false,
+                )?;
 
             // Compute output columns - only the distinct columns
             let mut output = Vec::new();
@@ -406,9 +408,19 @@ pub(super) fn resolve_modulo_via_fold(
         } => {
             // Complex GROUP BY with aggregations
             let mut resolved_reducing_by =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, reducing_by, available, false)?;
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold,
+                    reducing_by,
+                    available,
+                    false,
+                )?;
             let mut resolved_reducing_on =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, reducing_on, available, false)?;
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold,
+                    reducing_on,
+                    available,
+                    false,
+                )?;
 
             // Populate pivot_values for PivotOf expressions from IN predicates
             for expr in resolved_reducing_on.iter_mut() {
@@ -559,7 +571,9 @@ pub(super) fn resolve_modulo_via_fold(
 
             // Resolve arbitrary columns
             let resolved_arbitrary =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, arbitrary, available, false)?;
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold, arbitrary, available, false,
+                )?;
 
             // Add arbitrary columns to output
             let base_idx = resolved_reducing_by.len() + resolved_reducing_on.len();
@@ -611,7 +625,12 @@ pub(super) fn resolve_aggregate_pipe_via_fold(
 )> {
     // Resolve aggregation expressions
     let resolved_aggregations =
-        super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, aggregations, available, false)?;
+        super::super::domain_expressions::projection::resolve_expressions_via_fold(
+            fold,
+            aggregations,
+            available,
+            false,
+        )?;
 
     // Compute output columns for aggregate pipe - only the aggregations
     let mut output_columns = Vec::new();

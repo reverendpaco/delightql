@@ -19,12 +19,7 @@ pub(super) fn resolve_project_out(
     Vec<ast_resolved::ColumnMetadata>,
 )> {
     // Resolve expressions to remove - allow zero matches for patterns
-    let resolved_expressions = resolve_expressions_via_fold(
-        fold,
-        expressions,
-        available,
-        true,
-    )?;
+    let resolved_expressions = resolve_expressions_via_fold(fold, expressions, available, true)?;
 
     // Compute output columns - remove specified columns from input
     let mut output_columns = available.to_vec();
@@ -218,15 +213,11 @@ pub(super) fn resolve_reposition(
 
     for spec in moves {
         // Resolve the column reference
-        let resolved_column = resolve_expressions_via_fold(
-            fold,
-            vec![spec.column.clone()],
-            available,
-            false,
-        )?
-        .into_iter()
-        .next()
-        .expect("resolve_expressions_via_fold returns same count as input");
+        let resolved_column =
+            resolve_expressions_via_fold(fold, vec![spec.column.clone()], available, false)?
+                .into_iter()
+                .next()
+                .expect("resolve_expressions_via_fold returns same count as input");
 
         // Find which column this refers to
         let column_idx = match &spec.column {
@@ -549,13 +540,12 @@ pub(super) fn resolve_dml_terminal_via_fold(
         ast_unresolved::DomainSpec::GlobWithUsing(cols) => {
             ast_resolved::DomainSpec::GlobWithUsing(cols)
         }
-        ast_unresolved::DomainSpec::GlobWithUsingAll => {
-            ast_resolved::DomainSpec::GlobWithUsingAll
-        }
+        ast_unresolved::DomainSpec::GlobWithUsingAll => ast_resolved::DomainSpec::GlobWithUsingAll,
         ast_unresolved::DomainSpec::Positional(exprs) => {
-            let resolved = super::super::domain_expressions::projection::resolve_expressions_via_fold(
-                fold, exprs, available, false,
-            )?;
+            let resolved =
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold, exprs, available, false,
+                )?;
             ast_resolved::DomainSpec::Positional(resolved)
         }
         ast_unresolved::DomainSpec::Bare => ast_resolved::DomainSpec::Bare,

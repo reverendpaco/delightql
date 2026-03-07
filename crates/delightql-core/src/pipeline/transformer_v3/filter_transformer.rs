@@ -4,13 +4,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::QualifierScope;
 use crate::error::Result;
 use crate::pipeline::ast_addressed;
 use crate::pipeline::sql_ast_v3::{
     DomainExpression as SqlDomainExpression, QueryExpression, SelectItem, SelectStatement,
     TableExpression,
 };
-use super::QualifierScope;
 
 use super::context::TransformContext;
 use super::helpers::{alias_generator::next_alias, extract_table_alias};
@@ -147,14 +147,15 @@ pub fn transform_filter(
 
                     // Strip hygienic columns ONLY for HO ground scalar filters.
                     // Regular PositionalLiteral filters keep all columns (SELECT *).
-                    let select_items = if matches!(
-                        origin,
-                        ast_addressed::FilterOrigin::HoGroundScalar { .. }
-                    ) {
-                        build_select_items_stripping_hygienic(&cpr_schema_ref, &correlation_alias)
-                    } else {
-                        vec![SelectItem::star()]
-                    };
+                    let select_items =
+                        if matches!(origin, ast_addressed::FilterOrigin::HoGroundScalar { .. }) {
+                            build_select_items_stripping_hygienic(
+                                &cpr_schema_ref,
+                                &correlation_alias,
+                            )
+                        } else {
+                            vec![SelectItem::star()]
+                        };
 
                     let builder = SelectStatement::builder()
                         .select_all(select_items)

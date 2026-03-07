@@ -147,7 +147,10 @@ pub(super) fn flatten_inner_relation(
                 identifier.name,
                 ctx.scope_aliases,
                 new_scope,
-                correlation_filters.iter().map(|f| format!("{:?}", f)).collect::<Vec<_>>()
+                correlation_filters
+                    .iter()
+                    .map(|f| format!("{:?}", f))
+                    .collect::<Vec<_>>()
             );
 
             // Flatten the cleaned subquery recursively WITH scope context

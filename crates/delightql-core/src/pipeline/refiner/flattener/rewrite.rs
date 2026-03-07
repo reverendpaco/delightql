@@ -64,14 +64,11 @@ impl LvarRule<'_> {
             } => {
                 let new_q = match qualifier {
                     Some(q)
-                        if q == *inner_table_name
-                            || could_be_inner_alias(q, inner_table_name) =>
+                        if q == *inner_table_name || could_be_inner_alias(q, inner_table_name) =>
                     {
                         Some(derived_table_alias.to_string())
                     }
-                    Some(q) if scope_aliases.contains_key(q) => {
-                        Some(scope_aliases[q].to_string())
-                    }
+                    Some(q) if scope_aliases.contains_key(q) => Some(scope_aliases[q].to_string()),
                     None => {
                         // Unqualified lvar in a correlation filter — qualify with
                         // the derived table alias so the hoisted ON clause is unambiguous.
@@ -231,8 +228,9 @@ impl AstTransform<resolved::Resolved, resolved::Resolved> for SelfReferenceFold<
                 let rewritten = self.transform_relational_action(*subquery)?.into_inner();
                 // 2. Rewrite the InnerExists's own self-refs (its identifier)
                 let rewritten = {
-                    let mut child =
-                        SelfReferenceFold { inner_table_name: identifier.name.as_str() };
+                    let mut child = SelfReferenceFold {
+                        inner_table_name: identifier.name.as_str(),
+                    };
                     child.transform_relational_action(rewritten)?.into_inner()
                 };
                 Ok(resolved::BooleanExpression::InnerExists {
@@ -255,8 +253,9 @@ impl AstTransform<resolved::Resolved, resolved::Resolved> for SelfReferenceFold<
                 let rewritten = self.transform_relational_action(*subquery)?.into_inner();
                 // 2. Rewrite child's own self-refs
                 let rewritten = {
-                    let mut child =
-                        SelfReferenceFold { inner_table_name: identifier.name.as_str() };
+                    let mut child = SelfReferenceFold {
+                        inner_table_name: identifier.name.as_str(),
+                    };
                     child.transform_relational_action(rewritten)?.into_inner()
                 };
                 Ok(resolved::BooleanExpression::InRelational {
@@ -369,6 +368,60 @@ impl AstTransform<resolved::Resolved, resolved::Resolved> for ScopeAliasFold<'_>
             }
             other => ast_transform::walk_transform_domain(self, other),
         }
+    }
+}
+
+pub(super) fn apply_scope_aliases_to_sigma(
+    cond: resolved::SigmaCondition,
+    scope_aliases: &HashMap<String, String>,
+) -> resolved::SigmaCondition {
+    if scope_aliases.is_empty() {
+        return cond;
+    }
+    let mut fold = ScopeAliasFold { scope_aliases };
+    match cond {
+        resolved::SigmaCondition::Predicate(expr) => {
+            let rewritten = fold
+                .transform_boolean(expr)
+                .expect("scope alias rewriting is infallible");
+            resolved::SigmaCondition::Predicate(rewritten)
+        }
+        resolved::SigmaCondition::SigmaCall {
+            functor,
+            arguments,
+            exists,
+        } => {
+            let arguments = arguments
+                .into_iter()
+                .map(|a| {
+                    fold.transform_domain(a)
+                        .expect("scope alias rewriting is infallible")
+                })
+                .collect();
+            resolved::SigmaCondition::SigmaCall {
+                functor,
+                arguments,
+                exists,
+            }
+        }
+        resolved::SigmaCondition::Destructure {
+            json_column,
+            pattern,
+            mode,
+            destructured_schema,
+        } => {
+            let json_column = Box::new(
+                fold.transform_domain(*json_column)
+                    .expect("scope alias rewriting is infallible"),
+            );
+            resolved::SigmaCondition::Destructure {
+                json_column,
+                pattern,
+                mode,
+                destructured_schema,
+            }
+        }
+        other => other, // TupleOrdinal has no Lvars
     }
 }
 

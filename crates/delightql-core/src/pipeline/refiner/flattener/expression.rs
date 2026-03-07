@@ -12,6 +12,7 @@ use crate::pipeline::asts::resolved;
 use crate::pipeline::asts::unresolved::NamespacePath;
 
 /// Recursively flatten an expression
+#[stacksafe::stacksafe]
 pub(super) fn flatten_expression(
     expr: resolved::RelationalExpression,
     segment: &mut FlatSegment,
@@ -245,6 +246,8 @@ pub(super) fn flatten_expression(
             }
 
             flatten_expression(*source, segment, ctx)?;
+            let condition =
+                super::rewrite::apply_scope_aliases_to_sigma(condition, &ctx.scope_aliases);
             add_sigma_condition(condition, origin, segment, ctx);
         }
 
@@ -262,10 +265,8 @@ pub(super) fn flatten_expression(
             // independently with refine_internal (which starts with empty scope), so
             // ancestor aliases must be resolved before storing.
             let pipe_as_expr = resolved::RelationalExpression::Pipe(pipe);
-            let pipe_as_expr = super::rewrite::apply_scope_aliases_to_expr(
-                pipe_as_expr,
-                &ctx.scope_aliases,
-            );
+            let pipe_as_expr =
+                super::rewrite::apply_scope_aliases_to_expr(pipe_as_expr, &ctx.scope_aliases);
             let schema = match &pipe_as_expr {
                 resolved::RelationalExpression::Pipe(p) => p.cpr_schema.get().clone(),
                 _ => unreachable!(),

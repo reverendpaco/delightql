@@ -15,6 +15,7 @@ use crate::pipeline::asts::resolved;
 
 /// Detect (but don't remove!) correlation filters in the subquery
 /// Returns them for metadata purposes only - they stay in the AST
+#[stacksafe::stacksafe]
 pub fn detect_correlation_filters(
     expr: &resolved::RelationalExpression,
 ) -> Result<Vec<resolved::BooleanExpression>> {

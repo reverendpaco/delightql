@@ -19,15 +19,20 @@ pub(super) fn resolve_tuple_ordering_via_fold(
     let resolved_specs = specs
         .into_iter()
         .map(|spec| {
-            super::super::domain_expressions::projection::resolve_expressions_via_fold(fold, vec![spec.column], available, false)
-                .map(|mut exprs| ast_resolved::OrderingSpec {
-                    column: exprs
-                        .pop()
-                        .expect("resolve_expressions_via_fold returns same count as input"),
-                    direction: super::super::super::helpers::converters::convert_order_direction(
-                        spec.direction,
-                    ),
-                })
+            super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                fold,
+                vec![spec.column],
+                available,
+                false,
+            )
+            .map(|mut exprs| ast_resolved::OrderingSpec {
+                column: exprs
+                    .pop()
+                    .expect("resolve_expressions_via_fold returns same count as input"),
+                direction: super::super::super::helpers::converters::convert_order_direction(
+                    spec.direction,
+                ),
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 

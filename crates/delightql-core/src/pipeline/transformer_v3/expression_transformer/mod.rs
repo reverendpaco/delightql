@@ -682,7 +682,7 @@ pub fn transform_domain_expression(
 
             // Convert QueryBuildState to SQL query
             let subquery_sql = match subquery_state {
-                QueryBuildState::Table(table) => {
+                QueryBuildState::Table(table) | QueryBuildState::AnonymousTable(table) => {
                     // Direct table case - wrap in SELECT *
                     let select = SelectStatement::builder()
                         .select(SelectItem::Star)

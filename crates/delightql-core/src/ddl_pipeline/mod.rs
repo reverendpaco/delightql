@@ -29,8 +29,7 @@ pub fn create_temp_table_from_manifest(
     if schema_rows.is_empty() {
         return Ok(None);
     }
-    let constraint_rows =
-        manifest::read_constraints(bootstrap_conn, internal_ns_id, entity_name)?;
+    let constraint_rows = manifest::read_constraints(bootstrap_conn, internal_ns_id, entity_name)?;
     let default_rows = manifest::read_defaults(bootstrap_conn, internal_ns_id, entity_name)?;
     let unresolved = assemble_manifest::assemble_from_manifest(
         entity_name,

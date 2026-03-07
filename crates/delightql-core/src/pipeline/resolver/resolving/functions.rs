@@ -78,14 +78,13 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
-                            ast_resolved::TableName::Named(_)
-                            | ast_resolved::TableName::Fresh => None,
+                            ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => {
+                                None
+                            }
                         };
                         resolved_args.push(resolved::DomainExpression::Lvar {
                             name: column_name.into(),
-                            qualifier: qualifier
-                                .clone()
-                                .or(col_qualifier.map(|s| s.into())),
+                            qualifier: qualifier.clone().or(col_qualifier.map(|s| s.into())),
                             namespace_path: if namespace_path.is_empty() {
                                 col.fq_table.parents_path.clone()
                             } else {
@@ -114,8 +113,9 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
-                            ast_resolved::TableName::Named(_)
-                            | ast_resolved::TableName::Fresh => None,
+                            ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => {
+                                None
+                            }
                         };
                         resolved_args.push(resolved::DomainExpression::Lvar {
                             name: column_name.into(),
@@ -127,9 +127,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                     }
                 }
             }
-            unresolved::DomainExpression::Projection(ProjectionExpr::ColumnRange(
-                range_box,
-            )) => {
+            unresolved::DomainExpression::Projection(ProjectionExpr::ColumnRange(range_box)) => {
                 let range = range_box.get();
                 let candidates: Vec<_> = available.iter().collect();
 
@@ -139,24 +137,15 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                             "|{}:{}|",
                             range
                                 .start
-                                .map(|(p, r)| if r {
-                                    format!("-{}", p)
-                                } else {
-                                    p.to_string()
-                                })
+                                .map(|(p, r)| if r { format!("-{}", p) } else { p.to_string() })
                                 .unwrap_or_default(),
                             range
                                 .end
-                                .map(|(p, r)| if r {
-                                    format!("-{}", p)
-                                } else {
-                                    p.to_string()
-                                })
+                                .map(|(p, r)| if r { format!("-{}", p) } else { p.to_string() })
                                 .unwrap_or_default()
                         ),
-                        context:
-                            "No columns available for range resolution in bracket function"
-                                .to_string(),
+                        context: "No columns available for range resolution in bracket function"
+                            .to_string(),
                     });
                 }
 
@@ -188,8 +177,9 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
-                            ast_resolved::TableName::Named(_)
-                            | ast_resolved::TableName::Fresh => None,
+                            ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => {
+                                None
+                            }
                         };
                         resolved_args.push(resolved::DomainExpression::Lvar {
                             name: column_name.into(),
@@ -263,8 +253,9 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
-                            ast_resolved::TableName::Named(_)
-                            | ast_resolved::TableName::Fresh => None,
+                            ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => {
+                                None
+                            }
                         };
                         resolved_members.push(resolved::CurlyMember::Shorthand {
                             column: column_name.into(),
@@ -292,8 +283,9 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
-                            ast_resolved::TableName::Named(_)
-                            | ast_resolved::TableName::Fresh => None,
+                            ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => {
+                                None
+                            }
                         };
                         resolved_members.push(resolved::CurlyMember::Shorthand {
                             column: column_name.into(),
@@ -315,22 +307,13 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                         column: format!(
                             "|{}:{}|",
                             start
-                                .map(|(p, r)| if r {
-                                    format!("-{}", p)
-                                } else {
-                                    p.to_string()
-                                })
+                                .map(|(p, r)| if r { format!("-{}", p) } else { p.to_string() })
                                 .unwrap_or_default(),
-                            end.map(|(p, r)| if r {
-                                format!("-{}", p)
-                            } else {
-                                p.to_string()
-                            })
-                            .unwrap_or_default()
+                            end.map(|(p, r)| if r { format!("-{}", p) } else { p.to_string() })
+                                .unwrap_or_default()
                         ),
-                        context:
-                            "No columns available for range resolution in curly function"
-                                .to_string(),
+                        context: "No columns available for range resolution in curly function"
+                            .to_string(),
                     });
                 }
 
@@ -362,8 +345,9 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
-                            ast_resolved::TableName::Named(_)
-                            | ast_resolved::TableName::Fresh => None,
+                            ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => {
+                                None
+                            }
                         };
                         resolved_members.push(resolved::CurlyMember::Shorthand {
                             column: column_name.into(),
@@ -473,9 +457,7 @@ pub(in crate::pipeline::resolver) fn resolve_window_frame_via_fold(
     use crate::pipeline::asts::{resolved, unresolved};
 
     let resolve_bound =
-        |fold: &mut ResolverFold,
-         bound: unresolved::FrameBound|
-         -> Result<resolved::FrameBound> {
+        |fold: &mut ResolverFold, bound: unresolved::FrameBound| -> Result<resolved::FrameBound> {
             match bound {
                 unresolved::FrameBound::Unbounded => Ok(resolved::FrameBound::Unbounded),
                 unresolved::FrameBound::CurrentRow => Ok(resolved::FrameBound::CurrentRow),

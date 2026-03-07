@@ -405,10 +405,10 @@ fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<DomainExpres
                 .build());
             }
             "identifier" => {
-                return Ok(DomainExpression::lvar_builder(crate::pipeline::cst::unstrop(
-                    child.text(),
-                ))
-                .build());
+                return Ok(
+                    DomainExpression::lvar_builder(crate::pipeline::cst::unstrop(child.text()))
+                        .build(),
+                );
             }
             "qualified_column" => {
                 let qualifier = if let Some(table_field) = child.field("table") {
@@ -475,10 +475,7 @@ pub(super) fn parse_first_parens_as_domain_spec(args_node: CstNode) -> Result<Do
 }
 
 /// Recursively collect DomainExpressions from first-parens CST nodes.
-fn collect_first_parens_exprs(
-    node: CstNode,
-    out: &mut Vec<DomainExpression>,
-) -> Result<()> {
+fn collect_first_parens_exprs(node: CstNode, out: &mut Vec<DomainExpression>) -> Result<()> {
     for child in node.children() {
         match child.kind() {
             "tvf_argument" => out.push(parse_tvf_argument_as_domain_expression(child)?),
@@ -754,7 +751,10 @@ pub(super) fn parse_table_access(
     }
 }
 
-pub(super) fn parse_anonymous_table(node: CstNode, features: &mut crate::pipeline::query_features::FeatureCollector) -> Result<Relation> {
+pub(super) fn parse_anonymous_table(
+    node: CstNode,
+    features: &mut crate::pipeline::query_features::FeatureCollector,
+) -> Result<Relation> {
     let outer = node.has_child("outer_marker");
 
     // Check for exists_marker prefix (+_() or \+_())
@@ -918,12 +918,19 @@ pub(super) fn parse_anonymous_table(node: CstNode, features: &mut crate::pipelin
 
 /// Parse a data row
 /// EPOCH 7: Updated to handle domain_expression for melt/unpivot (including binary expressions)
-pub(super) fn parse_data_row(node: CstNode, features: &mut crate::pipeline::query_features::FeatureCollector) -> Result<Row> {
+pub(super) fn parse_data_row(
+    node: CstNode,
+    features: &mut crate::pipeline::query_features::FeatureCollector,
+) -> Result<Row> {
     let mut values = Vec::new();
-    for child in node.children().filter(|child| child.kind() == "domain_expression") {
-        let inner = child.children().next().ok_or_else(|| {
-            DelightQLError::parse_error("Empty domain_expression in data row")
-        })?;
+    for child in node
+        .children()
+        .filter(|child| child.kind() == "domain_expression")
+    {
+        let inner = child
+            .children()
+            .next()
+            .ok_or_else(|| DelightQLError::parse_error("Empty domain_expression in data row"))?;
         values.push(parse_expression(inner, features)?);
     }
     Ok(Row { values })
@@ -1156,10 +1163,7 @@ fn try_collapse_to_domain_spec(subquery: &RelationalExpression) -> Option<Domain
 
                 // Pattern 3b: table() *.* → GlobWithUsingAll
                 // UsingAll operator on top of Qualify on a bare Ground relation
-                (
-                    RelationalExpression::Pipe(inner_pipe),
-                    UnaryRelationalOperator::UsingAll,
-                ) => {
+                (RelationalExpression::Pipe(inner_pipe), UnaryRelationalOperator::UsingAll) => {
                     match (&inner_pipe.source, &inner_pipe.operator) {
                         (
                             RelationalExpression::Relation(Relation::Ground {

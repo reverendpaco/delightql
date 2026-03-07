@@ -30,12 +30,10 @@ mod rebuilder;
 mod types;
 
 use crate::error::Result;
-use crate::pipeline::ast_transform::{
-    walk_transform_relation, AstTransform, FoldAction,
-};
-use crate::pipeline::asts::{refined, resolved};
-use crate::pipeline::asts::resolved::Resolved;
+use crate::pipeline::ast_transform::{walk_transform_relation, AstTransform, FoldAction};
 use crate::pipeline::asts::refined::Refined;
+use crate::pipeline::asts::resolved::Resolved;
+use crate::pipeline::asts::{refined, resolved};
 
 // =============================================================================
 // RefinerFold — AstTransform<Resolved, Refined>
@@ -98,15 +96,16 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
                 origin,
                 cpr_schema,
             } if !matches!(condition, resolved::SigmaCondition::Predicate(_)) => {
-                let refined_source = Box::new(
-                    self.transform_relational_action(*source)?.into_inner(),
-                );
-                Ok(FoldAction::Replaced(refined::RelationalExpression::Filter {
-                    source: refined_source,
-                    condition: condition.into(),
-                    origin,
-                    cpr_schema: cpr_schema.into_refined(),
-                }))
+                let refined_source =
+                    Box::new(self.transform_relational_action(*source)?.into_inner());
+                Ok(FoldAction::Replaced(
+                    refined::RelationalExpression::Filter {
+                        source: refined_source,
+                        condition: condition.into(),
+                        origin,
+                        cpr_schema: cpr_schema.into_refined(),
+                    },
+                ))
             }
 
             // Pipe — linearize, refine base, mechanical .into() on operators.
@@ -114,10 +113,8 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
             // the walk's default transform_operator handles Resolved→Refined
             // rephase for all expression children inside operators.
             resolved::RelationalExpression::Pipe(_) => {
-                let (base, segments) =
-                    crate::pipeline::pipe_chain::collect_pipe_chain(expr);
-                let refined_base =
-                    self.transform_relational_action(base)?.into_inner();
+                let (base, segments) = crate::pipeline::pipe_chain::collect_pipe_chain(expr);
+                let refined_base = self.transform_relational_action(base)?.into_inner();
                 let refined_segments = segments
                     .into_iter()
                     .map(|seg| {
@@ -169,10 +166,7 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
     //
     // For already-classified patterns, walk_transform_inner_relation handles
     // recursion into subqueries and correlation filters.
-    fn transform_relation(
-        &mut self,
-        rel: resolved::Relation,
-    ) -> Result<refined::Relation> {
+    fn transform_relation(&mut self, rel: resolved::Relation) -> Result<refined::Relation> {
         match rel {
             resolved::Relation::InnerRelation {
                 pattern,
@@ -194,7 +188,8 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
 
                         // Classify the outer pattern on the classified subquery.
                         let classified = pattern_classifier::classify_inner_relation_pattern(
-                            identifier, classified_subquery,
+                            identifier,
+                            classified_subquery,
                         )?;
 
                         // Mechanical conversion to refined phase. The subquery
@@ -265,9 +260,7 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
                     .collect::<Result<Vec<_>>>()?;
 
                 let mut fold = RefinerFold { is_top_level: true };
-                let refined_main = fold
-                    .transform_relational_action(query)?
-                    .into_inner();
+                let refined_main = fold.transform_relational_action(query)?.into_inner();
 
                 Ok(refined::Query::WithCtes {
                     ctes: refined_ctes,
@@ -321,7 +314,8 @@ pub(crate) fn refine_internal(
     is_top_level: bool,
 ) -> Result<refined::RelationalExpression> {
     let mut fold = RefinerFold { is_top_level };
-    fold.transform_relational_action(ast).map(|a| a.into_inner())
+    fold.transform_relational_action(ast)
+        .map(|a| a.into_inner())
 }
 
 /// Refine a single segment (no pipes) using the FAR cycle

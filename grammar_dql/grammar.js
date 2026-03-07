@@ -399,10 +399,13 @@ module.exports = grammar({
     // Debug points for breakpoint/logging
     debug_point: $ => '>>>',
 
-    // URI path for error hooks: slash-separated identifiers
+    // URI segment: like an identifier but also allows hyphens (e.g. unbound-mixed-param)
+    error_uri_segment: $ => /[a-zA-Z_][a-zA-Z0-9_-]*/,
+
+    // URI path for error hooks: slash-separated segments
     error_uri_path: $ => seq(
-      $.identifier,
-      repeat(seq('/', $.identifier))
+      $.error_uri_segment,
+      repeat(seq('/', $.error_uri_segment))
     ),
 
     // URI path for emit destinations: allows dots, hyphens, underscores, slashes

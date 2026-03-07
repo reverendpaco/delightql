@@ -400,12 +400,16 @@ pub(crate) fn execute_consult(
             Some(suffix) => format!("{}::{}", namespace, suffix),
             None => namespace.to_string(),
         };
-        crate::pipeline::sequential::process_inline_ddl_block(
-            &block.body, &child_ns, system
-        ).map_err(|e| DelightQLError::database_error(
-            format!("Inline DDL block failed in consult of '{}': {}", file_path, e),
-            "inline DDL error",
-        ))?;
+        crate::pipeline::sequential::process_inline_ddl_block(&block.body, &child_ns, system)
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!(
+                        "Inline DDL block failed in consult of '{}': {}",
+                        file_path, e
+                    ),
+                    "inline DDL error",
+                )
+            })?;
     }
 
     // Execute deferred expose directives now that the namespace exists

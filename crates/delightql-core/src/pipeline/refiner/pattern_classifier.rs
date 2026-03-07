@@ -44,9 +44,7 @@ impl AstTransform<Resolved, Resolved> for ClassifierFold {
                 // Recursively classify the subquery first (the walk calls
                 // transform_relational_action on the subquery, which eventually
                 // calls transform_inner_relation for any nested patterns).
-                let classified_subquery = self
-                    .transform_relational_action(*subquery)?
-                    .into_inner();
+                let classified_subquery = self.transform_relational_action(*subquery)?.into_inner();
 
                 // Classify this pattern based on the classified subquery.
                 classify_inner_relation_pattern(identifier, classified_subquery)

@@ -519,7 +519,10 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
         }
     }
 
-    fn transform_pipe(&mut self, p: PipeExpression<Unresolved>) -> Result<PipeExpression<Unresolved>> {
+    fn transform_pipe(
+        &mut self,
+        p: PipeExpression<Unresolved>,
+    ) -> Result<PipeExpression<Unresolved>> {
         let source = self.transform_relational(p.source)?;
         let operator = if self.data_ns.is_some() {
             // With data_ns: full inlining (type=1 with namespace patching + type=3 discovery)
@@ -1465,13 +1468,13 @@ fn wrap_query_with_pipe(
 
     match query {
         ast_unresolved::Query::Relational(expr) => {
-            ast_unresolved::Query::Relational(ast_unresolved::RelationalExpression::Pipe(
-                Box::new(stacksafe::StackSafe::new(PipeExpression {
+            ast_unresolved::Query::Relational(ast_unresolved::RelationalExpression::Pipe(Box::new(
+                stacksafe::StackSafe::new(PipeExpression {
                     source: expr,
                     operator,
                     cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                })),
-            ))
+                }),
+            )))
         }
         ast_unresolved::Query::WithCtes { ctes, query: main } => {
             let wrapped_main = ast_unresolved::RelationalExpression::Pipe(Box::new(
@@ -1486,7 +1489,10 @@ fn wrap_query_with_pipe(
                 query: wrapped_main,
             }
         }
-        ast_unresolved::Query::WithErContext { context, query: inner } => {
+        ast_unresolved::Query::WithErContext {
+            context,
+            query: inner,
+        } => {
             let wrapped_inner = wrap_query_with_pipe(*inner, operator);
             ast_unresolved::Query::WithErContext {
                 context,
@@ -1510,11 +1516,7 @@ pub(super) fn split_ho_first_parens(
     entity: &crate::resolution::registry::ConsultedEntity,
     pipe_source: Option<&ast_unresolved::RelationalExpression>,
     argument_groups: Option<&[crate::pipeline::asts::core::operators::HoCallGroup]>,
-) -> Result<(
-    HoParamBindings,
-    ast_unresolved::DomainSpec,
-    Option<usize>,
-)> {
+) -> Result<(HoParamBindings, ast_unresolved::DomainSpec, Option<usize>)> {
     use crate::resolution::registry::HoParamKind;
 
     // Compute position analysis for MixedGround detection
@@ -1527,8 +1529,7 @@ pub(super) fn split_ho_first_parens(
 
     let exprs = match first_parens_spec {
         ast_unresolved::DomainSpec::Positional(exprs) => exprs,
-        ast_unresolved::DomainSpec::Glob
-        | ast_unresolved::DomainSpec::Bare => {
+        ast_unresolved::DomainSpec::Glob | ast_unresolved::DomainSpec::Bare => {
             // No explicit args — but if piped, bind first table param to pipe source
             let mut bindings = HoParamBindings::default();
             let mut pipe_target_idx = None;
@@ -1540,7 +1541,9 @@ pub(super) fn split_ho_first_parens(
                     HoParamKind::Argumentative(columns) => {
                         let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
                             .iter()
-                            .map(|c| ast_unresolved::DomainExpression::lvar_builder(c.clone()).build())
+                            .map(|c| {
+                                ast_unresolved::DomainExpression::lvar_builder(c.clone()).build()
+                            })
                             .collect();
                         let cte_rel = ast_unresolved::RelationalExpression::Relation(
                             ast_unresolved::Relation::Ground {
@@ -1578,11 +1581,7 @@ pub(super) fn split_ho_first_parens(
             return Ok((bindings, spec, pipe_target_idx));
         }
         _ => {
-            return Ok((
-                HoParamBindings::default(),
-                first_parens_spec.clone(),
-                None,
-            ));
+            return Ok((HoParamBindings::default(), first_parens_spec.clone(), None));
         }
     };
 
@@ -1614,9 +1613,7 @@ pub(super) fn split_ho_first_parens(
                 HoParamKind::Argumentative(columns) => {
                     let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
                         .iter()
-                        .map(|c| {
-                            ast_unresolved::DomainExpression::lvar_builder(c.clone()).build()
-                        })
+                        .map(|c| ast_unresolved::DomainExpression::lvar_builder(c.clone()).build())
                         .collect();
                     let cte_rel = ast_unresolved::RelationalExpression::Relation(
                         ast_unresolved::Relation::Ground {
@@ -1640,9 +1637,7 @@ pub(super) fn split_ho_first_parens(
                         .insert(param.name.clone(), cte_rel);
                 }
                 _ => {
-                    bindings
-                        .table_params
-                        .insert(param.name.clone(), cte_name);
+                    bindings.table_params.insert(param.name.clone(), cte_name);
                 }
             }
             continue; // Don't consume an expr for this param
@@ -1655,7 +1650,10 @@ pub(super) fn split_ho_first_parens(
         let expr = &exprs[expr_idx];
 
         // Check for @ (explicit pipe target)
-        if matches!(expr, ast_unresolved::DomainExpression::ValuePlaceholder { .. }) {
+        if matches!(
+            expr,
+            ast_unresolved::DomainExpression::ValuePlaceholder { .. }
+        ) {
             pipe_target_idx = Some(param_idx);
             if pipe_source.is_some() {
                 let cte_name = "_ho_pipe_src".to_string();
@@ -1689,9 +1687,7 @@ pub(super) fn split_ho_first_parens(
                             .insert(param.name.clone(), cte_rel);
                     }
                     _ => {
-                        bindings
-                            .table_params
-                            .insert(param.name.clone(), cte_name);
+                        bindings.table_params.insert(param.name.clone(), cte_name);
                     }
                 }
             }
@@ -1712,9 +1708,7 @@ pub(super) fn split_ho_first_parens(
                         value: crate::pipeline::asts::core::LiteralValue::String(s),
                         ..
                     } => {
-                        bindings
-                            .table_params
-                            .insert(param.name.clone(), s.clone());
+                        bindings.table_params.insert(param.name.clone(), s.clone());
                     }
                     _ => {
                         return Err(DelightQLError::validation_error(
@@ -1772,10 +1766,8 @@ pub(super) fn split_ho_first_parens(
                             // Check if the next expr is a literal (part of this row)
                             // or an Lvar (next param / end of scalar lift)
                             let next = &exprs[expr_idx];
-                            let is_literal = matches!(
-                                next,
-                                ast_unresolved::DomainExpression::Literal { .. }
-                            );
+                            let is_literal =
+                                matches!(next, ast_unresolved::DomainExpression::Literal { .. });
                             if !is_literal && all_rows.is_empty() {
                                 // First value is not a literal — error
                                 return Err(DelightQLError::validation_error(
@@ -1799,7 +1791,10 @@ pub(super) fn split_ho_first_parens(
                                         format!(
                                             "Argumentative param '{}' expects {} values per row, \
                                              but only {} remain at position {}",
-                                            param.name, n_cols, exprs.len() - expr_idx, param_idx
+                                            param.name,
+                                            n_cols,
+                                            exprs.len() - expr_idx,
+                                            param_idx
                                         ),
                                         "Not enough values for argumentative scalar lift row",
                                     ));
@@ -1807,10 +1802,12 @@ pub(super) fn split_ho_first_parens(
                                 let val_expr = &exprs[expr_idx + col_idx];
                                 let val_str = match val_expr {
                                     ast_unresolved::DomainExpression::Literal {
-                                        value: crate::pipeline::asts::core::LiteralValue::String(s), ..
+                                        value: crate::pipeline::asts::core::LiteralValue::String(s),
+                                        ..
                                     } => format!("\"{}\"", s),
                                     ast_unresolved::DomainExpression::Literal {
-                                        value: crate::pipeline::asts::core::LiteralValue::Number(n), ..
+                                        value: crate::pipeline::asts::core::LiteralValue::Number(n),
+                                        ..
                                     } => n.clone(),
                                     other => {
                                         return Err(DelightQLError::validation_error(
@@ -1838,8 +1835,7 @@ pub(super) fn split_ho_first_parens(
                             ));
                         }
 
-                        let anon_table =
-                            lift_scalars_to_anonymous_table(columns, &all_rows)?;
+                        let anon_table = lift_scalars_to_anonymous_table(columns, &all_rows)?;
                         bindings
                             .table_expr_params
                             .insert(param.name.clone(), anon_table);
@@ -1856,7 +1852,9 @@ pub(super) fn split_ho_first_parens(
                 });
 
                 // Text substitution for free-variable clauses
-                bindings.scalar_params.insert(param.name.clone(), expr.clone());
+                bindings
+                    .scalar_params
+                    .insert(param.name.clone(), expr.clone());
 
                 if is_mixed_ground {
                     // MixedGround: also add to scalar_exprs for PatternResolver
@@ -1940,7 +1938,10 @@ fn extract_clause_ctes(
                 is_recursive: ast_unresolved::PhaseBox::phantom(),
             });
         }
-        ast_unresolved::Query::WithErContext { context, query: inner } => {
+        ast_unresolved::Query::WithErContext {
+            context,
+            query: inner,
+        } => {
             // Capture ER context from first clause that has one
             if er_context.is_none() {
                 *er_context = Some(context);
@@ -2012,7 +2013,9 @@ pub(super) fn build_squished_relation(
                 if let crate::pipeline::asts::ddl::HoParamKind::Scalar = &cp.kind {
                     if !clause_bindings.scalar_params.contains_key(&cp.name) {
                         if let Some(pos_info) = positions.iter().find(|pi| pi.position == pos) {
-                            if pos_info.ground_mode == crate::pipeline::asts::ddl::HoGroundMode::MixedGround {
+                            if pos_info.ground_mode
+                                == crate::pipeline::asts::ddl::HoGroundMode::MixedGround
+                            {
                                 // MixedGround: handled by caller providing scalar_params in bindings.
                             }
                         }
@@ -2169,7 +2172,10 @@ pub(crate) fn create_proffer_bindings(
             }
             bindings
         }
-        other => panic!("catch-all hit in grounding.rs extract_ho_bindings (FunctionExpression): {:?}", other),
+        other => panic!(
+            "catch-all hit in grounding.rs extract_ho_bindings (FunctionExpression): {:?}",
+            other
+        ),
     }
 }
 
@@ -2197,7 +2203,6 @@ pub(crate) fn lift_scalars_to_anonymous_table(
         ))),
     }
 }
-
 
 /// Validate arity for argumentative params that received table references.
 ///

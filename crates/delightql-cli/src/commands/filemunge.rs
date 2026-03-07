@@ -47,7 +47,10 @@ fn parse_table_spec(spec_part: &str, path: &str) -> Result<TableSpec> {
         "csv" => (TableFormat::Csv, true),
         "tsv" => (TableFormat::Tsv, true),
         "json-singleton" => (TableFormat::JsonSingleton, false),
-        other => anyhow::bail!("Unknown format '{}'. Expected: csv, tsv, json-singleton", other),
+        other => anyhow::bail!(
+            "Unknown format '{}'. Expected: csv, tsv, json-singleton",
+            other
+        ),
     };
 
     let has_headers = if parts.len() == 3 {
@@ -71,11 +74,7 @@ fn parse_table_spec(spec_part: &str, path: &str) -> Result<TableSpec> {
     })
 }
 
-fn load_csv_table(
-    conn: &Connection,
-    spec: &TableSpec,
-    delimiter: u8,
-) -> Result<()> {
+fn load_csv_table(conn: &Connection, spec: &TableSpec, delimiter: u8) -> Result<()> {
     let data = read_file(&spec.path)?;
 
     let mut rdr = csv::ReaderBuilder::new()
@@ -84,10 +83,7 @@ fn load_csv_table(
         .from_reader(data.as_slice());
 
     let col_names: Vec<String> = if spec.has_headers {
-        rdr.headers()?
-            .iter()
-            .map(|h| h.to_string())
-            .collect()
+        rdr.headers()?.iter().map(|h| h.to_string()).collect()
     } else {
         let width = match rdr.records().next() {
             Some(Ok(ref rec)) => rec.len(),
@@ -140,10 +136,7 @@ fn load_json_singleton_table(conn: &Connection, spec: &TableSpec) -> Result<()> 
     }
 
     let table_name = strop(&spec.name);
-    conn.execute(
-        &format!("CREATE TABLE {} (j TEXT)", table_name),
-        [],
-    )?;
+    conn.execute(&format!("CREATE TABLE {} (j TEXT)", table_name), [])?;
     conn.execute(
         &format!("INSERT INTO {} (j) VALUES (?1)", table_name),
         [&text],
@@ -155,8 +148,8 @@ fn load_json_singleton_table(conn: &Connection, spec: &TableSpec) -> Result<()> 
 fn read_file(path: &str) -> Result<Vec<u8>> {
     let p = Path::new(path);
     // Support process substitution (/dev/fd/N) and regular files
-    let mut f = std::fs::File::open(p)
-        .map_err(|e| anyhow::anyhow!("Cannot open '{}': {}", path, e))?;
+    let mut f =
+        std::fs::File::open(p).map_err(|e| anyhow::anyhow!("Cannot open '{}': {}", path, e))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     Ok(buf)
@@ -197,8 +190,7 @@ pub fn handle_filemunge_command(
         .map(|pair| parse_table_spec(&pair[0], &pair[1]))
         .collect::<Result<_>>()?;
 
-    let temp_path =
-        std::env::temp_dir().join(format!("dql_filemunge_{}.db", std::process::id()));
+    let temp_path = std::env::temp_dir().join(format!("dql_filemunge_{}.db", std::process::id()));
 
     {
         let conn = Connection::open(&temp_path)?;

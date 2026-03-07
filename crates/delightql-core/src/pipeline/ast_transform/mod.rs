@@ -16,8 +16,7 @@ use crate::pipeline::asts::core::operators::{ColumnSelector, FrameBound, WindowF
 use crate::pipeline::asts::core::{
     ArrayMember, BooleanExpression, CteBinding, CurlyMember, DomainExpression, DomainSpec,
     FunctionExpression, ModuloSpec, OrderingSpec, PhaseBox, PipeExpression, Query, Relation,
-    RelationalExpression, RenameSpec, RepositionSpec, Row, SigmaCondition,
-    UnaryRelationalOperator,
+    RelationalExpression, RenameSpec, RepositionSpec, Row, SigmaCondition, UnaryRelationalOperator,
 };
 
 // =============================================================================
@@ -124,10 +123,7 @@ pub trait AstTransform<P, Q> {
         self.transform_relational(e).map(FoldAction::Continue)
     }
 
-    fn transform_relation_action(
-        &mut self,
-        r: Relation<P>,
-    ) -> Result<FoldAction<Relation<Q>>> {
+    fn transform_relation_action(&mut self, r: Relation<P>) -> Result<FoldAction<Relation<Q>>> {
         self.transform_relation(r).map(FoldAction::Continue)
     }
 
@@ -306,9 +302,7 @@ pub fn walk_transform_column_selector<P, Q, F: AstTransform<P, Q> + ?Sized>(
         }
         ColumnSelector::Regex(r) => Ok(ColumnSelector::Regex(r)),
         ColumnSelector::All => Ok(ColumnSelector::All),
-        ColumnSelector::Positional { start, end } => {
-            Ok(ColumnSelector::Positional { start, end })
-        }
+        ColumnSelector::Positional { start, end } => Ok(ColumnSelector::Positional { start, end }),
         ColumnSelector::MultipleRegex(rs) => Ok(ColumnSelector::MultipleRegex(rs)),
         ColumnSelector::Resolved {
             columns,
@@ -357,9 +351,9 @@ pub fn walk_transform_string_template_part<P, Q, F: AstTransform<P, Q> + ?Sized>
 ) -> Result<StringTemplatePart<Q>> {
     match part {
         StringTemplatePart::Text(s) => Ok(StringTemplatePart::Text(s)),
-        StringTemplatePart::Interpolation(expr) => Ok(StringTemplatePart::Interpolation(
-            Box::new(t.transform_domain(*expr)?),
-        )),
+        StringTemplatePart::Interpolation(expr) => Ok(StringTemplatePart::Interpolation(Box::new(
+            t.transform_domain(*expr)?,
+        ))),
     }
 }
 
@@ -391,9 +385,7 @@ pub fn walk_transform_curly_member<P, Q, F: AstTransform<P, Q> + ?Sized>(
         }),
         CurlyMember::Glob => Ok(CurlyMember::Glob),
         CurlyMember::Pattern { pattern } => Ok(CurlyMember::Pattern { pattern }),
-        CurlyMember::OrdinalRange { start, end } => {
-            Ok(CurlyMember::OrdinalRange { start, end })
-        }
+        CurlyMember::OrdinalRange { start, end } => Ok(CurlyMember::OrdinalRange { start, end }),
         CurlyMember::Placeholder => Ok(CurlyMember::Placeholder),
         CurlyMember::Comparison { condition } => Ok(CurlyMember::Comparison {
             condition: Box::new(t.transform_boolean(*condition)?),
@@ -481,9 +473,7 @@ pub fn walk_transform_domain<P, Q, F: AstTransform<P, Q> + ?Sized>(
         }
 
         // Recursive variants
-        DomainExpression::Function(f) => {
-            Ok(DomainExpression::Function(t.transform_function(f)?))
-        }
+        DomainExpression::Function(f) => Ok(DomainExpression::Function(t.transform_function(f)?)),
         DomainExpression::Predicate { expr, alias } => Ok(DomainExpression::Predicate {
             expr: Box::new(t.transform_boolean(*expr)?),
             alias,
@@ -500,12 +490,10 @@ pub fn walk_transform_domain<P, Q, F: AstTransform<P, Q> + ?Sized>(
                 .collect::<Result<Vec<_>>>()?,
             alias,
         }),
-        DomainExpression::Parenthesized { inner, alias } => {
-            Ok(DomainExpression::Parenthesized {
-                inner: Box::new(t.transform_domain(*inner)?),
-                alias,
-            })
-        }
+        DomainExpression::Parenthesized { inner, alias } => Ok(DomainExpression::Parenthesized {
+            inner: Box::new(t.transform_domain(*inner)?),
+            alias,
+        }),
         DomainExpression::Tuple { elements, alias } => Ok(DomainExpression::Tuple {
             elements: elements
                 .into_iter()
@@ -920,14 +908,12 @@ pub fn walk_transform_operator<P, Q, F: AstTransform<P, Q> + ?Sized>(
                     .collect::<Result<Vec<_>>>()?,
             })
         }
-        UnaryRelationalOperator::Reposition { moves } => {
-            Ok(UnaryRelationalOperator::Reposition {
-                moves: moves
-                    .into_iter()
-                    .map(|m| t.transform_reposition_spec(m))
-                    .collect::<Result<Vec<_>>>()?,
-            })
-        }
+        UnaryRelationalOperator::Reposition { moves } => Ok(UnaryRelationalOperator::Reposition {
+            moves: moves
+                .into_iter()
+                .map(|m| t.transform_reposition_spec(m))
+                .collect::<Result<Vec<_>>>()?,
+        }),
         UnaryRelationalOperator::EmbedMapCover {
             function,
             selector,
@@ -1215,9 +1201,9 @@ pub fn walk_transform_relational<P, Q, F: AstTransform<P, Q> + ?Sized>(
     expr: RelationalExpression<P>,
 ) -> Result<RelationalExpression<Q>> {
     match expr {
-        RelationalExpression::Relation(rel) => {
-            Ok(RelationalExpression::Relation(t.transform_relation_action(rel)?.into_inner()))
-        }
+        RelationalExpression::Relation(rel) => Ok(RelationalExpression::Relation(
+            t.transform_relation_action(rel)?.into_inner(),
+        )),
         RelationalExpression::Join {
             left,
             right,
@@ -1227,9 +1213,7 @@ pub fn walk_transform_relational<P, Q, F: AstTransform<P, Q> + ?Sized>(
         } => Ok(RelationalExpression::Join {
             left: Box::new(t.transform_relational_action(*left)?.into_inner()),
             right: Box::new(t.transform_relational_action(*right)?.into_inner()),
-            join_condition: join_condition
-                .map(|c| t.transform_boolean(c))
-                .transpose()?,
+            join_condition: join_condition.map(|c| t.transform_boolean(c)).transpose()?,
             join_type,
             cpr_schema: cpr_schema.rephase(),
         }),
@@ -1261,14 +1245,12 @@ pub fn walk_transform_relational<P, Q, F: AstTransform<P, Q> + ?Sized>(
             correlation: PhaseBox::phantom(),
             cpr_schema: cpr_schema.rephase(),
         }),
-        RelationalExpression::ErJoinChain { relations } => {
-            Ok(RelationalExpression::ErJoinChain {
-                relations: relations
-                    .into_iter()
-                    .map(|r| Ok(t.transform_relation_action(r)?.into_inner()))
-                    .collect::<Result<Vec<_>>>()?,
-            })
-        }
+        RelationalExpression::ErJoinChain { relations } => Ok(RelationalExpression::ErJoinChain {
+            relations: relations
+                .into_iter()
+                .map(|r| Ok(t.transform_relation_action(r)?.into_inner()))
+                .collect::<Result<Vec<_>>>()?,
+        }),
         RelationalExpression::ErTransitiveJoin { left, right } => {
             Ok(RelationalExpression::ErTransitiveJoin {
                 left: Box::new(t.transform_relational_action(*left)?.into_inner()),
@@ -1298,7 +1280,9 @@ pub fn walk_transform_query<P, Q, F: AstTransform<P, Q> + ?Sized>(
     query: Query<P>,
 ) -> Result<Query<Q>> {
     match query {
-        Query::Relational(expr) => Ok(Query::Relational(t.transform_relational_action(expr)?.into_inner())),
+        Query::Relational(expr) => Ok(Query::Relational(
+            t.transform_relational_action(expr)?.into_inner(),
+        )),
         Query::WithCtes { ctes, query } => Ok(Query::WithCtes {
             ctes: ctes
                 .into_iter()

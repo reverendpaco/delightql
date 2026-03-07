@@ -793,7 +793,7 @@ fn walk_for_error_hook(
             let mut segments = Vec::new();
             let mut cursor = uri_node.walk();
             for child in uri_node.children(&mut cursor) {
-                if child.kind() == "identifier" {
+                if child.kind() == "error_uri_segment" {
                     if let Ok(text) = child.utf8_text(source.as_bytes()) {
                         segments.push(text.to_string());
                     }

@@ -419,7 +419,9 @@ pub(in crate::pipeline::resolver) fn validate_unresolved_pattern_for_mode(
 
 /// EPOCH 5: Validate no sibling explosions (multiple ~> at same pattern level)
 /// Sibling explosions create ambiguous cartesian products
-pub(in crate::pipeline::resolver) fn validate_no_sibling_explosions(pattern: &ast_unresolved::FunctionExpression) -> Result<()> {
+pub(in crate::pipeline::resolver) fn validate_no_sibling_explosions(
+    pattern: &ast_unresolved::FunctionExpression,
+) -> Result<()> {
     match pattern {
         ast_unresolved::FunctionExpression::MetadataTreeGroup { constructor, .. } => {
             // Recurse into the nested constructor

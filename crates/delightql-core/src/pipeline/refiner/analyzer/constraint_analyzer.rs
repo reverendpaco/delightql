@@ -25,6 +25,16 @@ pub(super) fn create_anonymous_table_join_predicates(
             table.anonymous_data.is_some()
         );
         if let Some(ref anon_data) = table.anonymous_data {
+            // EXISTS-mode anonymous tables (from IN literal desugaring) are self-contained
+            // subqueries — their qualified column headers are correlation references to the
+            // outer scope, not join conditions within this segment.
+            if anon_data.exists_mode {
+                log::debug!(
+                    "Skipping exists-mode anonymous table at index {}",
+                    table_idx
+                );
+                continue;
+            }
             log::debug!("Processing anonymous table at index {}", table_idx);
             if let Some(ref headers) = anon_data.column_headers {
                 log::debug!("Anonymous table has {} headers", headers.len());

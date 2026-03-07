@@ -29,22 +29,27 @@ pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
         ast_unresolved::UnaryRelationalOperator::General {
             containment_semantic,
             expressions,
-        } => projection::resolve_general_via_fold(
-            fold,
-            containment_semantic,
-            expressions,
-            available,
-        ),
+        } => {
+            projection::resolve_general_via_fold(fold, containment_semantic, expressions, available)
+        }
 
         ast_unresolved::UnaryRelationalOperator::Modulo {
             containment_semantic,
             spec,
-        } => aggregation::resolve_modulo_via_fold(fold, containment_semantic, spec, available, pivot_in_values),
+        } => aggregation::resolve_modulo_via_fold(
+            fold,
+            containment_semantic,
+            spec,
+            available,
+            pivot_in_values,
+        ),
 
         ast_unresolved::UnaryRelationalOperator::TupleOrdering {
             containment_semantic,
             specs,
-        } => ordering::resolve_tuple_ordering_via_fold(fold, containment_semantic, specs, available),
+        } => {
+            ordering::resolve_tuple_ordering_via_fold(fold, containment_semantic, specs, available)
+        }
 
         ast_unresolved::UnaryRelationalOperator::MapCover {
             function,
@@ -72,7 +77,12 @@ pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
         ast_unresolved::UnaryRelationalOperator::Transform {
             transformations,
             conditioned_on,
-        } => transformation::resolve_transform_via_fold(fold, transformations, conditioned_on, available),
+        } => transformation::resolve_transform_via_fold(
+            fold,
+            transformations,
+            conditioned_on,
+            available,
+        ),
 
         ast_unresolved::UnaryRelationalOperator::AggregatePipe { aggregations } => {
             aggregation::resolve_aggregate_pipe_via_fold(fold, aggregations, available)

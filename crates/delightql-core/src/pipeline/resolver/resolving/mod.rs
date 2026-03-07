@@ -10,8 +10,8 @@ pub(super) mod predicates;
 pub(super) mod tree_group_analysis;
 
 // Re-export the public interface functions for use by the resolver
-pub(in crate::pipeline::resolver) use predicates::synthesize_using_correlation;
 pub(in crate::pipeline::resolver) use predicates::build_using_correlation_filters;
+pub(in crate::pipeline::resolver) use predicates::synthesize_using_correlation;
 
 pub(in crate::pipeline::resolver) use operators::resolve_operator_via_fold;
 

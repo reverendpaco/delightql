@@ -10,8 +10,7 @@ use crate::ddl::body_parser;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::ContextMode;
 use crate::pipeline::asts::ddl::{
-    DdlBody, DdlDefinition, DdlHead, DdlNeck, FunctionParam, HoParam, HoParamKind,
-    ViewHeadItem,
+    DdlBody, DdlDefinition, DdlHead, DdlNeck, FunctionParam, HoParam, HoParamKind, ViewHeadItem,
 };
 use crate::pipeline::cst::CstNode;
 use crate::pipeline::parser::parse_ddl;
@@ -105,8 +104,8 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
             let params_nodes = node.children_by_field("params");
             let params = params_nodes
                 .iter()
-                .filter(|p| p.kind() == "identifier")
-                .map(|p| p.text().to_string())
+                .filter(|p| p.kind() == "identifier" || p.kind() == "stropped_identifier")
+                .map(|p| crate::pipeline::cst::unstrop(p.text()))
                 .collect();
             DdlHead::SigmaPredicate { params }
         }
@@ -119,13 +118,17 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
             let params_nodes = node.children_by_field("ho_params");
             let params = params_nodes
                 .iter()
-                .filter(|p| p.kind() == "ho_param" || p.kind() == "identifier")
+                .filter(|p| {
+                    p.kind() == "ho_param"
+                        || p.kind() == "identifier"
+                        || p.kind() == "stropped_identifier"
+                })
                 .map(|p| {
                     if p.kind() == "ho_param" {
                         extract_ho_param(p)
                     } else {
                         HoParam {
-                            name: p.text().to_string(),
+                            name: crate::pipeline::cst::unstrop(p.text()),
                             kind: HoParamKind::Scalar,
                         }
                     }
@@ -191,12 +194,15 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                 })
                 .collect();
             // Extract column_headers from second parens as output_head (if present)
-            let output_head = node.find_child("column_headers").map(|ch| {
-                ch.children()
-                    .filter(|c| c.kind() == "column_header_item")
-                    .map(|c| ViewHeadItem::Free(c.text().to_string()))
-                    .collect::<Vec<_>>()
-            }).filter(|items| !items.is_empty());
+            let output_head = node
+                .find_child("column_headers")
+                .map(|ch| {
+                    ch.children()
+                        .filter(|c| c.kind() == "column_header_item")
+                        .map(|c| ViewHeadItem::Free(c.text().to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty());
             DdlHead::HoView {
                 params,
                 output_head,
@@ -232,13 +238,17 @@ pub fn build_ddl_definition(node: &CstNode, source: &str) -> Result<DdlDefinitio
 
         // Extract data content from CST nodes rather than scanning raw bytes.
         // The second parens contain column_headers (optional) + data_rows.
-        let data_start = node.find_child("column_headers")
+        let data_start = node
+            .find_child("column_headers")
             .or_else(|| node.find_child("data_rows"))
             .ok_or_else(|| DelightQLError::parse_error("HO fact definition has no data content"))?
-            .raw_node().start_byte();
-        let data_end = node.find_child("data_rows")
+            .raw_node()
+            .start_byte();
+        let data_end = node
+            .find_child("data_rows")
             .ok_or_else(|| DelightQLError::parse_error("HO fact definition missing data_rows"))?
-            .raw_node().end_byte();
+            .raw_node()
+            .end_byte();
         let data_content = &source[data_start..data_end];
 
         let anon_source = format!("_({})", data_content);
@@ -947,5 +957,4 @@ mod tests {
         let defs = build_ddl_file(source).unwrap();
         assert!(defs[0].doc.is_none());
     }
-
 }

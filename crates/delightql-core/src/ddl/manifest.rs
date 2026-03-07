@@ -128,11 +128,7 @@ pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<Imp
 ///
 /// Uses HO clause matching: finds clauses where the first ground parameter
 /// matches the given entity name.
-pub fn read_schema(
-    conn: &Connection,
-    internal_ns_id: i32,
-    entity: &str,
-) -> Result<Vec<SchemaRow>> {
+pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Result<Vec<SchemaRow>> {
     let clauses = read_ho_clauses_by_ground_value(conn, internal_ns_id, "schema", entity)?;
     if clauses.is_empty() {
         return Ok(Vec::new());
@@ -250,11 +246,7 @@ pub fn read_defaults(
                 Ok(DefaultRow {
                     column: row.get(0)?,
                     default_val,
-                    generated: if col_count >= 3 {
-                        row.get(2)?
-                    } else {
-                        None
-                    },
+                    generated: if col_count >= 3 { row.get(2)? } else { None },
                 })
             })
             .map_err(|e| {
@@ -274,10 +266,7 @@ pub fn read_defaults(
 ///
 /// Used as fallback when `imprinting()` is absent — we discover entities
 /// from the ground values of `schema()` HO clauses.
-pub fn discover_schema_entities(
-    conn: &Connection,
-    internal_ns_id: i32,
-) -> Result<Vec<String>> {
+pub fn discover_schema_entities(conn: &Connection, internal_ns_id: i32) -> Result<Vec<String>> {
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT hpgv.ground_value
@@ -290,10 +279,7 @@ pub fn discover_schema_entities(
                AND hp.position = 0",
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                "Failed to query schema entity names",
-                e.to_string(),
-            )
+            DelightQLError::database_error("Failed to query schema entity names", e.to_string())
         })?;
 
     let rows = stmt

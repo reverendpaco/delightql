@@ -523,7 +523,9 @@ fn parse_right_side(
             let base_expr = match base.kind() {
                 "table_access" => parse_table_access(base, features)?,
                 "catalog_functor" => parse_catalog_functor(base, features)?,
-                "anonymous_table" => RelationalExpression::Relation(parse_anonymous_table(base, features)?),
+                "anonymous_table" => {
+                    RelationalExpression::Relation(parse_anonymous_table(base, features)?)
+                }
                 "tvf_call" => RelationalExpression::Relation(parse_tvf_call(base, features)?),
                 "relational_expression" => parse_expression(base, features)?,
                 _ => {
@@ -552,7 +554,9 @@ fn parse_right_side(
             let base = match child.kind() {
                 "table_access" => parse_table_access(child, features)?,
                 "catalog_functor" => parse_catalog_functor(child, features)?,
-                "anonymous_table" => RelationalExpression::Relation(parse_anonymous_table(child, features)?),
+                "anonymous_table" => {
+                    RelationalExpression::Relation(parse_anonymous_table(child, features)?)
+                }
                 "tvf_call" => RelationalExpression::Relation(parse_tvf_call(child, features)?),
                 "relational_expression" => parse_expression(child, features)?,
                 _ => {
@@ -1199,7 +1203,10 @@ fn apply_using_all_to_rel_expr(expr: RelationalExpression) -> RelationalExpressi
             hygienic_injections,
         }),
         other => {
-            panic!("catch-all hit in builder_v2/continuation.rs apply_using_all_to_rel_expr: {:?}", other)
+            panic!(
+                "catch-all hit in builder_v2/continuation.rs apply_using_all_to_rel_expr: {:?}",
+                other
+            )
         }
     }
 }

@@ -362,6 +362,9 @@ mod tests {
         let empty_text = vec![CELL_TAG_TEXT]; // tag only, no content
         let empty_rows = vec![vec![Some(empty_text)]];
 
-        assert_eq!(compute_byte_hash(&null_rows), compute_byte_hash(&empty_rows));
+        assert_eq!(
+            compute_byte_hash(&null_rows),
+            compute_byte_hash(&empty_rows)
+        );
     }
 }

@@ -772,13 +772,11 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
                     .ok_or_else(|| DelightQLError::parse_error("No body in ddl_annotation"))?
                     .text()
                     .to_string();
-                let namespace = child
-                    .field("ddl_namespace")
-                    .map(|n| {
-                        let text = n.text();
-                        // Strip surrounding quotes from string literal
-                        text.trim_matches('"').to_string()
-                    });
+                let namespace = child.field("ddl_namespace").map(|n| {
+                    let text = n.text();
+                    // Strip surrounding quotes from string literal
+                    text.trim_matches('"').to_string()
+                });
                 inline_ddl_blocks.push(InlineDdlSpec { body, namespace });
             }
             // Comments, er_context_block, blank lines: skip silently
@@ -863,8 +861,8 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
             let params_nodes = node.children_by_field("ho_params");
             let params = params_nodes
                 .iter()
-                .filter(|p| p.kind() == "identifier")
-                .map(|p| p.text().to_string())
+                .filter(|p| p.kind() == "identifier" || p.kind() == "stropped_identifier")
+                .map(|p| crate::pipeline::cst::unstrop(p.text()))
                 .collect();
             (DefinitionType::HoView, params)
         }
@@ -873,8 +871,8 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
             let params_nodes = node.children_by_field("params");
             let params = params_nodes
                 .iter()
-                .filter(|p| p.kind() == "identifier")
-                .map(|p| p.text().to_string())
+                .filter(|p| p.kind() == "identifier" || p.kind() == "stropped_identifier")
+                .map(|p| crate::pipeline::cst::unstrop(p.text()))
                 .collect();
             (DefinitionType::SigmaPredicate, params)
         }
@@ -885,8 +883,8 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
             let params_nodes = node.children_by_field("ho_params");
             let params = params_nodes
                 .iter()
-                .filter(|p| p.kind() == "identifier")
-                .map(|p| p.text().to_string())
+                .filter(|p| p.kind() == "identifier" || p.kind() == "stropped_identifier")
+                .map(|p| crate::pipeline::cst::unstrop(p.text()))
                 .collect();
             let start = node.raw_node().start_byte();
             let end = node.raw_node().end_byte();
@@ -905,23 +903,25 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
             let ho_params_joined = ho_params_text.join(", ");
 
             // Column headers (output head) from CST child
-            let output_head = node.find_child("column_headers")
+            let output_head = node
+                .find_child("column_headers")
                 .map(|ch| ch.text().to_string())
                 .unwrap_or_else(|| "*".to_string());
 
             // Data content: column_headers (if present) + separator + data_rows
-            let data_start = node.find_child("column_headers")
+            let data_start = node
+                .find_child("column_headers")
                 .or_else(|| node.find_child("data_rows"))
                 .unwrap()
-                .raw_node().start_byte();
-            let data_end = node.find_child("data_rows")
-                .unwrap()
-                .raw_node().end_byte();
+                .raw_node()
+                .start_byte();
+            let data_end = node.find_child("data_rows").unwrap().raw_node().end_byte();
             let data_content = &source[data_start..data_end];
 
             // Construct desugared form: name(ho_params)(headers) :- _(data_content)
             let full_source = format!(
-                "{}({})({})\n:- _({})", name_text, ho_params_joined, output_head, data_content
+                "{}({})({})\n:- _({})",
+                name_text, ho_params_joined, output_head, data_content
             );
 
             return Ok(Definition {

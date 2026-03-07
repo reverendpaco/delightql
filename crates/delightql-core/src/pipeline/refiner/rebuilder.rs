@@ -130,9 +130,7 @@ fn wrap_with_filter(
 ) -> Result<refined::RelationalExpression> {
     Ok(refined::RelationalExpression::Filter {
         source: Box::new(source.clone()),
-        condition: refined::SigmaCondition::Predicate(
-            refine_predicate_boolean(pred.expr.clone())?,
-        ),
+        condition: refined::SigmaCondition::Predicate(refine_predicate_boolean(pred.expr.clone())?),
         origin: pred.origin,
         cpr_schema: compute_filter_schema(&source),
     })
@@ -999,8 +997,7 @@ pub(super) fn refine_predicate_boolean(
             using_columns,
         } => {
             // Refine the InnerExists subquery through the full refiner pipeline
-            let refined_subquery =
-                crate::pipeline::refiner::refine_internal(*subquery, false)?;
+            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false)?;
             Ok(refined::BooleanExpression::InnerExists {
                 exists,
                 identifier,
@@ -1015,8 +1012,7 @@ pub(super) fn refine_predicate_boolean(
             identifier,
             negated,
         } => {
-            let refined_subquery =
-                crate::pipeline::refiner::refine_internal(*subquery, false)?;
+            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false)?;
             Ok(refined::BooleanExpression::InRelational {
                 value: Box::new((*value).into()),
                 subquery: Box::new(refined_subquery),
@@ -1024,23 +1020,17 @@ pub(super) fn refine_predicate_boolean(
                 negated,
             })
         }
-        resolved::BooleanExpression::And { left, right } => {
-            Ok(refined::BooleanExpression::And {
-                left: Box::new(refine_predicate_boolean(*left)?),
-                right: Box::new(refine_predicate_boolean(*right)?),
-            })
-        }
-        resolved::BooleanExpression::Or { left, right } => {
-            Ok(refined::BooleanExpression::Or {
-                left: Box::new(refine_predicate_boolean(*left)?),
-                right: Box::new(refine_predicate_boolean(*right)?),
-            })
-        }
-        resolved::BooleanExpression::Not { expr: inner } => {
-            Ok(refined::BooleanExpression::Not {
-                expr: Box::new(refine_predicate_boolean(*inner)?),
-            })
-        }
+        resolved::BooleanExpression::And { left, right } => Ok(refined::BooleanExpression::And {
+            left: Box::new(refine_predicate_boolean(*left)?),
+            right: Box::new(refine_predicate_boolean(*right)?),
+        }),
+        resolved::BooleanExpression::Or { left, right } => Ok(refined::BooleanExpression::Or {
+            left: Box::new(refine_predicate_boolean(*left)?),
+            right: Box::new(refine_predicate_boolean(*right)?),
+        }),
+        resolved::BooleanExpression::Not { expr: inner } => Ok(refined::BooleanExpression::Not {
+            expr: Box::new(refine_predicate_boolean(*inner)?),
+        }),
         // All other variants: mechanical phase conversion
         other => Ok(other.into()),
     }

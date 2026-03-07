@@ -1828,5 +1828,4 @@ impl ConsultRegistry {
     /// WASM stub
     #[cfg(target_arch = "wasm32")]
     pub fn deactivate_namespace_local_aliases(&self, _activated: &[(String, i32)]) {}
-
 }

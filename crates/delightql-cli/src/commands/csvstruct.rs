@@ -50,10 +50,7 @@ pub fn handle_csvstruct_command(
 
     // Determine column names
     let col_names: Vec<String> = if has_headers {
-        rdr.headers()?
-            .iter()
-            .map(|h| h.to_string())
-            .collect()
+        rdr.headers()?.iter().map(|h| h.to_string()).collect()
     } else {
         // Peek first record to get width
         let width = match rdr.records().next() {
@@ -126,9 +123,7 @@ fn insert_records(
     let mut stmt = conn.prepare(insert_sql)?;
     for rec in records {
         let rec = rec?;
-        let params: Vec<Option<&str>> = (0..ncols)
-            .map(|i| rec.get(i))
-            .collect();
+        let params: Vec<Option<&str>> = (0..ncols).map(|i| rec.get(i)).collect();
         stmt.execute(rusqlite::params_from_iter(params.iter()))?;
     }
     Ok(())

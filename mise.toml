@@ -33,83 +33,25 @@ cd ./lightweight_webserver/
  node test_wasm.mjs
 """
 
-[tasks.test-ball-pack-man-with-colors]
-run="""
-run() {
-  if command -v lumin &>/dev/null; then
-    ./test_suite/test.sh 2>&1 | grep --line-buffered "^Tota"
-  else
-    ./test_suite/test.sh 2>&1  | grep --line-buffered "^Tota" \
-      | rg --passthru "(Failed:|Error:)"
-  fi
-}
-
-another_wrapper(){
-  if command -v lumin &>/dev/null; then
-    run 2>&1 | awk  \
-    'BEGIN{e=0;f=0;p=0;m=0} {print; fflush()} /^Total:/{split($4,es,":"); e+=es[2];split($3,fs,":");f+=fs[2] }END{print "FAIL",f,"ERROR",e}' \
-        | lumin -c darkorange "[0-9]+"\
-        | lumin -c red "Failed:" \
-        | lumin -c red "Error:" \
-        | lumin -c blue "Meh:" \
-        | lumin -c aquamarine1 "Passed:"
-  else
-    run
-  fi
-}
-
-time another_wrapper
-"""
-
-[tasks.test-ball-pack-man]
-run="""
-./test_suite/test.sh
-"""
-
-[tasks.test-manual]
-run="""
-./test_suite/test.sh --manual
-"""
+[tasks.test]
+description = "Run the test suite"
+run = "./new_test_suite/test.sh"
 
 [tasks.cross-test]
 description = "Three-way comparison: ball-mode vs Python C-ABI vs Node.js C-ABI"
-run="""
-./test_suite/cross_test.sh
-"""
-
-# [tasks.test-compare-node-with-pack-man]
-# description = "Run Node.js C-ABI test runner against the test balls"
-# run="""
-# make -C ./hosts/node --no-print-directory
-# node ./hosts/node/test_cabi.js ./test_suite
-# """
-
-
-
-[tasks.test-snapshot]
-run = """
-./test_suite/snapshot.sh
-"""
-
-[tasks.test-dqls]
-run = """
-./test_suite/test.sh
-"""
-
+run = "./new_test_suite/cross_test.sh"
 
 [tasks.build-rust-bins-debug]
-description = "Build the three binaries: dql, dql-pack-man and dql-fmt"
+description = "Build the binaries: dql, dql-test-ball-runner and dql-fmt"
 run = """
-cargo build --bin  dql --bin dql-test-ball-runner --bin dql-pack-man --bin dql-fmt --features="bundled-parser"
+cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="bundled-parser"
 """
 
 [tasks.build-rust-bins-release-tiny]
-description = "Build the three binaries: dql, dql-pack-man and dql-fmt"
+description = "Build the binaries: dql, dql-test-ball-runner and dql-fmt"
 run = """
-cargo build --bin  dql --bin dql-pack-man --bin dql-fmt --features="bundled-parser" --profile release-tiny
+cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="bundled-parser" --profile release-tiny
 """
-
-
 
 
 [tasks.build-demo]

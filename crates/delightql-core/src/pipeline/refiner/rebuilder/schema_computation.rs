@@ -5,6 +5,7 @@ use crate::pipeline::refiner::rebuilder::collect_columns_from_schema;
 use delightql_types::SqlIdentifier;
 
 /// Extract schema from a refined relational expression
+#[stacksafe::stacksafe]
 pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema {
     match expr {
         refined::RelationalExpression::Relation(rel) => {
@@ -15,12 +16,19 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
                 }
                 refined::Relation::Anonymous {
                     column_headers,
+                    alias,
                     cpr_schema,
                     ..
                 } => {
                     // Anonymous tables have explicit headers
                     // column_headers is Option<Vec<DomainExpression>>, need to extract names
                     if let Some(headers) = column_headers {
+                        // Use the alias as table name so qualified references (b.a)
+                        // resolve correctly in joins/filters. Without alias → Fresh.
+                        let table_name = match alias {
+                            Some(a) => TableName::Named(a.clone()),
+                            None => TableName::Fresh,
+                        };
                         let cols: Vec<ColumnMetadata> = headers
                             .iter()
                             .enumerate()
@@ -35,7 +43,7 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
                                     resolved::ColumnProvenance::from_column(col_name),
                                     FqTable {
                                         parents_path: NamespacePath::empty(),
-                                        name: TableName::Fresh,
+                                        name: table_name.clone(),
                                         backend_schema: PhaseBox::from_optional_schema(None),
                                     },
                                     Some(i),

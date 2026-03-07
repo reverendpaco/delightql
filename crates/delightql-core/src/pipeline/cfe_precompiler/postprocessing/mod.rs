@@ -8,7 +8,9 @@
 //! - **Explicit** (`ExplicitParamReplacer`): provenance-based dispatch
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_transform::{walk_transform_domain, walk_transform_function, AstTransform};
+use crate::pipeline::ast_transform::{
+    walk_transform_domain, walk_transform_function, AstTransform,
+};
 use crate::pipeline::asts::core::expressions::domain::LvarProvenance;
 use crate::pipeline::asts::core::{
     DomainExpression, FunctionExpression, NamespacePath, Refined, SubstitutionExpr,
@@ -67,7 +69,10 @@ struct StrictParamReplacer<'a> {
 }
 
 impl AstTransform<Refined, Refined> for StrictParamReplacer<'_> {
-    fn transform_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
+    fn transform_domain(
+        &mut self,
+        e: DomainExpression<Refined>,
+    ) -> Result<DomainExpression<Refined>> {
         match e {
             DomainExpression::Lvar {
                 name,
@@ -141,7 +146,10 @@ struct ImplicitParamReplacer<'a> {
 }
 
 impl AstTransform<Refined, Refined> for ImplicitParamReplacer<'_> {
-    fn transform_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
+    fn transform_domain(
+        &mut self,
+        e: DomainExpression<Refined>,
+    ) -> Result<DomainExpression<Refined>> {
         match e {
             DomainExpression::Lvar {
                 name,
@@ -199,7 +207,10 @@ impl AstTransform<Refined, Refined> for ImplicitParamReplacer<'_> {
 struct ExplicitParamReplacer;
 
 impl AstTransform<Refined, Refined> for ExplicitParamReplacer {
-    fn transform_domain(&mut self, e: DomainExpression<Refined>) -> Result<DomainExpression<Refined>> {
+    fn transform_domain(
+        &mut self,
+        e: DomainExpression<Refined>,
+    ) -> Result<DomainExpression<Refined>> {
         match e {
             DomainExpression::Lvar {
                 name,
