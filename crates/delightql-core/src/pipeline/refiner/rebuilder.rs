@@ -402,7 +402,6 @@ fn build_tvf_relation(
         grounding: tvf_data.grounding.clone(),
         cpr_schema: schema_box,
         argument_groups: None,
-        first_parens_spec: None,
     })
 }
 

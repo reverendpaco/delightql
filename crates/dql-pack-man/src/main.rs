@@ -334,21 +334,8 @@ struct TestCase {
     hash: Option<String>,
     dbid: i64,
     should_fail: bool,
-    isolate_dbs: Vec<IsolateDb>,
-    ddl_files: Vec<DdlFile>,
-    run_id: i64,
-}
-
-struct IsolateDb {
-    name: String,
-    source: String,
     setup_sql: Option<String>,
-    fixture_dbid: Option<i64>,
-}
-
-struct DdlFile {
-    filename: String,
-    content: String,
+    run_id: i64,
 }
 
 /// Convert a hex SHA-256 string to the 8-char filename-safe base64 used by .hash baselines.
@@ -399,7 +386,11 @@ fn hex2hash(hex: &str) -> String {
     safe[..8.min(safe.len())].to_string()
 }
 
-fn send_reset(session: &mut Session<SocketTransport>) -> Result<(), String> {
+fn reset_and_mount(
+    session: &mut Session<SocketTransport>,
+    db_filename: &str,
+    rows_orientation: AgreedOrientation,
+) -> Result<(), String> {
     match session
         .reset()
         .map_err(|e| format!("reset: {}", e.message))?
@@ -409,27 +400,7 @@ fn send_reset(session: &mut Session<SocketTransport>) -> Result<(), String> {
             return Err(format!("reset: {}", message));
         }
     }
-    Ok(())
-}
 
-fn send_cwd(session: &mut Session<SocketTransport>, path: &str) -> Result<(), String> {
-    match session
-        .cwd(path.to_string())
-        .map_err(|e| format!("cwd: {}", e.message))?
-    {
-        ControlResult::Ok => {}
-        ControlResult::Error { message } => {
-            return Err(format!("cwd: {}", message));
-        }
-    }
-    Ok(())
-}
-
-fn send_mount(
-    session: &mut Session<SocketTransport>,
-    db_filename: &str,
-    rows_orientation: AgreedOrientation,
-) -> Result<(), String> {
     let mount_query = format!("mount!(\"{}\",\"main\")", db_filename);
     let handle = match session
         .query(mount_query.as_bytes().to_vec())
@@ -460,15 +431,6 @@ fn send_mount(
     }
     let _ = session.close(handle);
     Ok(())
-}
-
-fn reset_and_mount(
-    session: &mut Session<SocketTransport>,
-    db_filename: &str,
-    rows_orientation: AgreedOrientation,
-) -> Result<(), String> {
-    send_reset(session)?;
-    send_mount(session, db_filename, rows_orientation)
 }
 
 /// Check if the data_database_contents table exists in the test-case db.
@@ -660,113 +622,23 @@ fn run_worker(
     Ok(result)
 }
 
-/// Provision an isolate directory for a .mut test case.
-/// Creates temp dir, copies/creates DBs, writes DDL files.
-/// Returns the isolate directory path.
-fn provision_isolate(
-    tc: &TestCase,
-    blob_cache: &std::collections::HashMap<i64, PathBuf>,
-    unique_id: u64,
-) -> Result<PathBuf, String> {
+/// Create a temporary SQLite database from setup SQL, returning the absolute path.
+fn create_temp_db(sql: &str, unique_id: u64) -> Result<PathBuf, String> {
     let pid = std::process::id();
-    let isolate = PathBuf::from(format!("/tmp/dql-isolate-{}-{}", pid, unique_id));
-    let _ = std::fs::remove_dir_all(&isolate);
-    std::fs::create_dir_all(&isolate)
-        .map_err(|e| format!("create isolate dir: {}", e))?;
-
-    for idb in &tc.isolate_dbs {
-        let dest = isolate.join(&idb.name);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
-        }
-        match idb.source.as_str() {
-            "fixture" => {
-                let dbid = idb.fixture_dbid.ok_or("fixture isolate missing dbid")?;
-                let cached = blob_cache
-                    .get(&dbid)
-                    .ok_or_else(|| format!("no cached blob for dbid {}", dbid))?;
-                std::fs::copy(cached, &dest)
-                    .map_err(|e| format!("copy fixture to {}: {}", dest.display(), e))?;
-            }
-            "setup" => {
-                let sql = idb.setup_sql.as_ref().ok_or("setup isolate missing SQL")?;
-                let conn = Connection::open(&dest)
-                    .map_err(|e| format!("create isolate db {}: {}", dest.display(), e))?;
-                conn.execute_batch("CREATE TABLE _dql_init(x); DROP TABLE _dql_init;")
-                    .map_err(|e| format!("init isolate db: {}", e))?;
-                conn.execute_batch(sql)
-                    .map_err(|e| format!("setup isolate db: {}", e))?;
-            }
-            other => return Err(format!("unknown isolate source: {}", other)),
-        }
-    }
-
-    for ddl in &tc.ddl_files {
-        let dest = isolate.join(&ddl.filename);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
-        }
-        std::fs::write(&dest, &ddl.content)
-            .map_err(|e| format!("write DDL {}: {}", dest.display(), e))?;
-    }
-
-    Ok(isolate)
-}
-
-/// Pre-decompress unique fixture blobs from the ball into a temp cache.
-/// Returns dbid → cached file path.
-fn pre_decompress_blobs(
-    conn: &Connection,
-    isolate_dbs: &[&IsolateDb],
-) -> Result<std::collections::HashMap<i64, PathBuf>, String> {
-    let mut cache = std::collections::HashMap::new();
-    let mut seen = std::collections::HashSet::new();
-    let pid = std::process::id();
-
-    for idb in isolate_dbs {
-        if idb.source != "fixture" {
-            continue;
-        }
-        let dbid = match idb.fixture_dbid {
-            Some(id) => id,
-            None => continue,
-        };
-        if !seen.insert(dbid) {
-            continue;
-        }
-
-        let blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM data_database_contents WHERE dbid = ?1",
-                [dbid],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("read blob for dbid {}: {}", dbid, e))?;
-
-        let decompressed = zstd::decode_all(&blob[..])
-            .map_err(|e| format!("decompress blob for dbid {}: {}", dbid, e))?;
-
-        let path = PathBuf::from(format!("/tmp/dql-blob-cache-{}-{}.db", pid, dbid));
-        std::fs::write(&path, &decompressed)
-            .map_err(|e| format!("write blob cache {}: {}", path.display(), e))?;
-
-        cache.insert(dbid, path);
-    }
-
-    Ok(cache)
-}
-
-/// Determine mount path for an isolated test.
-fn determine_isolate_mount_path(
-    tc: &TestCase,
-    db_map: &std::collections::HashMap<i64, String>,
-) -> String {
-    if tc.isolate_dbs.iter().any(|db| db.name == "main.db") {
-        return "main.db".to_string();
-    }
-    db_map.get(&tc.dbid).cloned().unwrap_or_else(|| "main.db".to_string())
+    let path = PathBuf::from(format!("/tmp/dql-dml-{}-{}.db", pid, unique_id));
+    // Remove any stale file first to avoid WAL/journal contamination
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("/tmp/dql-dml-{}-{}.db-wal", pid, unique_id));
+    let _ = std::fs::remove_file(format!("/tmp/dql-dml-{}-{}.db-shm", pid, unique_id));
+    let _ = std::fs::remove_file(format!("/tmp/dql-dml-{}-{}.db-journal", pid, unique_id));
+    let conn = Connection::open(&path).map_err(|e| format!("create temp db: {}", e))?;
+    // Force SQLite to write a valid database header (even if setup_sql is empty/comments)
+    conn.execute_batch("CREATE TABLE _dql_init(x); DROP TABLE _dql_init;")
+        .map_err(|e| format!("init temp db: {}", e))?;
+    conn.execute_batch(sql)
+        .map_err(|e| format!("setup temp db: {}", e))?;
+    drop(conn);
+    Ok(path)
 }
 
 /// SES worker: each test gets a fresh reset_and_mount, then sends queries sequentially.
@@ -775,7 +647,6 @@ fn run_ses_worker(
     socket_path: &Path,
     db_map: &std::collections::HashMap<i64, String>,
     cases: Vec<TestCase>,
-    blob_cache: &std::collections::HashMap<i64, PathBuf>,
 ) -> Result<WorkerResult, String> {
     let (mut session, rows_orientation) = connect_session(socket_path)?;
 
@@ -788,30 +659,25 @@ fn run_ses_worker(
         details: Vec::new(),
     };
 
-    static ISOLATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Thread-local counter for unique temp DB names
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     for tc in &cases {
-        let isolate_dir = if !tc.isolate_dbs.is_empty() {
-            let uid = ISOLATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(provision_isolate(tc, blob_cache, uid)?)
+        // Determine mount path: use temp DB from setup_sql if present, else shared fixture
+        let (mount_path, temp_db) = if let Some(ref sql) = tc.setup_sql {
+            let uid = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = create_temp_db(sql, uid)?;
+            let path = tmp.to_string_lossy().into_owned();
+            (path, Some(tmp))
         } else {
-            None
-        };
-
-        // Reset session state
-        send_reset(&mut session)?;
-
-        if let Some(ref isolate) = isolate_dir {
-            // Set CWD to isolate directory so mount!/consult! resolve relative paths
-            send_cwd(&mut session, &isolate.to_string_lossy())?;
-            let mount_path = determine_isolate_mount_path(tc, db_map);
-            send_mount(&mut session, &mount_path, rows_orientation)?;
-        } else {
-            let mount_path = db_map
+            let path = db_map
                 .get(&tc.dbid)
                 .ok_or_else(|| format!("unknown dbid {} in side_effectful_on_system", tc.dbid))?;
-            send_mount(&mut session, mount_path, rows_orientation)?;
-        }
+            (path.clone(), None)
+        };
+
+        // Every SES test gets a fresh session state
+        reset_and_mount(&mut session, &mount_path, rows_orientation)?;
 
         let label = &tc.file;
 
@@ -865,9 +731,9 @@ fn run_ses_worker(
             }
         }
 
-        // Clean up isolate directory
-        if let Some(ref isolate) = isolate_dir {
-            let _ = std::fs::remove_dir_all(isolate);
+        // Clean up temp DB if we created one
+        if let Some(ref tmp) = temp_db {
+            let _ = std::fs::remove_file(tmp);
         }
     }
 
@@ -992,8 +858,7 @@ fn run_test_case_db(
                 hash,
                 dbid,
                 should_fail: should_fail != 0,
-                isolate_dbs: Vec::new(),
-                ddl_files: Vec::new(),
+                setup_sql: None,
                 run_id,
             }
         })
@@ -1004,7 +869,7 @@ fn run_test_case_db(
         return Ok(true);
     }
 
-    let result = run_sharded_workers(socket_path, &db_map, cases, num_workers, false, None)?;
+    let result = run_sharded_workers(socket_path, &db_map, cases, num_workers, false)?;
 
     // Clean up temp files
     for tmp_path in blob_paths.values() {
@@ -1074,150 +939,37 @@ fn run_ses_test_case_db(
     // Read test cases
     let mut tc_stmt = conn
         .prepare(
-            "SELECT id, file, dql, hash, run_id, dbid, should_fail \
+            "SELECT id, file, dql, hash, run_id, dbid, should_fail, setup_sql \
              FROM side_effectful_on_system ORDER BY id",
         )
         .map_err(|e| format!("prepare side_effectful_on_system: {}", e))?;
 
-    let raw_cases: Vec<(i64, String, String, Option<String>, i64, i64, bool)> = tc_stmt
+    let cases: Vec<TestCase> = tc_stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6).unwrap_or(0) != 0,
-            ))
+            Ok(TestCase {
+                file: row.get(1)?,
+                dql: row.get(2)?,
+                hash: row.get(3)?,
+                dbid: row.get(5)?,
+                should_fail: row.get::<_, i64>(6).unwrap_or(0) != 0,
+                setup_sql: row.get(7)?,
+                run_id: row.get(4)?,
+            })
         })
         .map_err(|e| format!("query side_effectful_on_system: {}", e))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read side_effectful_on_system: {}", e))?;
-
-    // Load test_isolate_database rows (if table exists)
-    let has_isolate_table = conn
-        .prepare("SELECT 1 FROM test_isolate_database LIMIT 0")
-        .is_ok();
-
-    let mut isolate_map: std::collections::HashMap<i64, Vec<IsolateDb>> =
-        std::collections::HashMap::new();
-    if has_isolate_table {
-        let mut iso_stmt = conn
-            .prepare(
-                "SELECT test_id, name, source, setup_sql, fixture_dbid \
-                 FROM test_isolate_database ORDER BY test_id, id",
-            )
-            .map_err(|e| format!("prepare test_isolate_database: {}", e))?;
-
-        let iso_rows: Vec<(i64, String, String, Option<String>, Option<i64>)> = iso_stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|e| format!("query test_isolate_database: {}", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read test_isolate_database: {}", e))?;
-
-        for (test_id, name, source, setup_sql, fixture_dbid) in iso_rows {
-            isolate_map.entry(test_id).or_default().push(IsolateDb {
-                name,
-                source,
-                setup_sql,
-                fixture_dbid,
-            });
-        }
-    }
-
-    // Load DDL files per test for isolated tests
-    let has_ddl_table = conn
-        .prepare("SELECT 1 FROM side_effectful_on_system_ddl LIMIT 0")
-        .is_ok();
-
-    let mut ddl_map: std::collections::HashMap<i64, Vec<DdlFile>> =
-        std::collections::HashMap::new();
-    if has_ddl_table {
-        let mut ddl_stmt = conn
-            .prepare(
-                "SELECT test_id, filename, content FROM side_effectful_on_system_ddl ORDER BY test_id",
-            )
-            .map_err(|e| format!("prepare ddl: {}", e))?;
-
-        let ddl_rows: Vec<(i64, String, String)> = ddl_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| format!("query ddl: {}", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read ddl: {}", e))?;
-
-        for (test_id, filename, content) in ddl_rows {
-            ddl_map.entry(test_id).or_default().push(DdlFile {
-                filename,
-                content,
-            });
-        }
-    }
-
-    // Build TestCase structs with isolate data attached
-    let cases: Vec<TestCase> = raw_cases
-        .into_iter()
-        .map(|(id, file, dql, hash, run_id, dbid, should_fail)| {
-            let isolate_dbs = isolate_map.remove(&id).unwrap_or_default();
-            let ddl_files = if !isolate_dbs.is_empty() {
-                ddl_map.remove(&id).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            TestCase {
-                file,
-                dql,
-                hash,
-                dbid,
-                should_fail,
-                isolate_dbs,
-                ddl_files,
-                run_id,
-            }
-        })
-        .collect();
 
     if cases.is_empty() {
         eprintln!("dql-pack-man: no test cases in {}", db_path.display());
         return Ok(true);
     }
 
-    // Count isolated tests
-    let isolated_count = cases.iter().filter(|tc| !tc.isolate_dbs.is_empty()).count();
-    eprintln!(
-        "dql-pack-man: ses mode, {} test cases ({} isolated)",
-        cases.len(),
-        isolated_count
-    );
-
-    // Pre-decompress fixture blobs needed by isolated tests (dedup by dbid)
-    let all_isolate_refs: Vec<&IsolateDb> = cases
-        .iter()
-        .flat_map(|tc| tc.isolate_dbs.iter())
-        .collect();
-    let blob_cache = if has_blob_table(conn) && !all_isolate_refs.is_empty() {
-        pre_decompress_blobs(conn, &all_isolate_refs)?
-    } else {
-        std::collections::HashMap::new()
-    };
-    let blob_cache = Arc::new(blob_cache);
+    eprintln!("dql-pack-man: ses mode, {} test cases", cases.len());
 
     // SES tests are side-effectful: each test needs reset_and_mount before execution.
     // We still shard across workers — each worker resets before every test.
-    let result = run_sharded_workers(socket_path, &db_map, cases, num_workers, true, Some(&blob_cache))?;
-
-    // Clean up blob cache
-    for path in blob_cache.values() {
-        let _ = std::fs::remove_file(path);
-    }
+    let result = run_sharded_workers(socket_path, &db_map, cases, num_workers, true)?;
 
     print_summary(&result, db_path.display());
 
@@ -1338,7 +1090,6 @@ fn run_sharded_workers(
     cases: Vec<TestCase>,
     num_workers: usize,
     sequential_queries: bool,
-    blob_cache: Option<&Arc<std::collections::HashMap<i64, PathBuf>>>,
 ) -> Result<AggregateResult, String> {
     let num_workers = num_workers.min(cases.len()).max(1);
     let mut shards: Vec<Vec<TestCase>> = (0..num_workers).map(|_| Vec::new()).collect();
@@ -1354,17 +1105,15 @@ fn run_sharded_workers(
 
     let db_map_arc = Arc::new(db_map.clone());
     let socket_owned = socket_path.to_owned();
-    let blob_cache_arc = blob_cache.cloned().unwrap_or_else(|| Arc::new(std::collections::HashMap::new()));
     let handles: Vec<_> = shards
         .into_iter()
         .map(|shard| {
             let socket = socket_owned.clone();
             let db_map = Arc::clone(&db_map_arc);
-            let cache = Arc::clone(&blob_cache_arc);
             let seq = sequential_queries;
             std::thread::spawn(move || {
                 if seq {
-                    run_ses_worker(&socket, &db_map, shard, &cache)
+                    run_ses_worker(&socket, &db_map, shard)
                 } else {
                     run_worker(&socket, &db_map, shard)
                 }

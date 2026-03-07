@@ -1421,69 +1421,14 @@ fn resolve_relational_expression_with_registry(
             // Early intercept: piped HO view application desugars BEFORE source resolution
             if let ast_unresolved::UnaryRelationalOperator::HoViewApplication {
                 ref function,
-                ref first_parens_spec,
                 ref arguments,
                 ..
             } = pipe_expr.operator
             {
-                // Look up the HO view entity
-                let entity = registry
-                    .consult
-                    .lookup_enlisted_ho_view(function)?
-                    .ok_or_else(|| {
-                        crate::error::DelightQLError::validation_error(
-                            format!(
-                                "Unknown piped HO view '{}'. Ensure the namespace is consulted and engaged.",
-                                function
-                            ),
-                            "Piped HO view not found",
-                        )
-                    })?;
-
-                // Build first_parens_spec if not already set
-                let spec = first_parens_spec.clone().unwrap_or(
-                    ast_unresolved::DomainSpec::Glob,
-                );
-
-                let groups_ref: Option<&[_]> = if arguments.is_empty() {
-                    None
-                } else {
-                    Some(arguments.as_slice())
-                };
-                let (table_bindings, scalar_spec, _pipe_idx) =
-                    grounding::split_ho_first_parens(
-                        &spec,
-                        &entity,
-                        Some(&pipe_expr.source),
-                        groups_ref,
-                    )?;
-
-                // Build grounding context
-                let ns_parts: Vec<String> =
-                    entity.namespace.split("::").map(String::from).collect();
-                let entity_ns =
-                    ast_unresolved::NamespacePath::from_parts(ns_parts).map_err(|e| {
-                        crate::error::DelightQLError::database_error(
-                            format!(
-                                "Invalid namespace '{}' for HO view '{}': {:?}",
-                                entity.namespace, function, e
-                            ),
-                            format!("{:?}", e),
-                        )
-                    })?;
-                let ho_grounding = ast_unresolved::GroundedPath {
-                    data_ns: ast_unresolved::NamespacePath::empty(),
-                    grounded_ns: vec![entity_ns],
-                };
-
-                return relation_resolver::expand_ho_view(
+                return expand_piped_ho_view(
+                    pipe_expr.source,
                     function,
-                    &entity,
-                    &scalar_spec,
-                    table_bindings,
-                    Some(pipe_expr.source),
-                    None,
-                    &ho_grounding,
+                    arguments,
                     registry,
                     outer_context,
                     config,
@@ -2817,6 +2762,163 @@ fn bfs_path(adjacency: &HashMap<String, Vec<String>>, from: &str, to: &str) -> R
             ))
         }
     }
+}
+
+/// Expand a piped HO view invocation: `source |> ho_view(args)(cols)`
+///
+/// Desugars the pipe into the HO view body with the source expression substituted
+/// for the first table parameter, then resolves the result.
+fn expand_piped_ho_view(
+    source: ast_unresolved::RelationalExpression,
+    function: &str,
+    arguments: &[crate::pipeline::asts::core::operators::HoCallGroup],
+    registry: &mut crate::resolution::EntityRegistry,
+    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    config: &ResolutionConfig,
+) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+    // 1. Look up the HO view entity via engaged namespace
+    let entity = registry
+        .consult
+        .lookup_enlisted_ho_view(function)?
+        .ok_or_else(|| {
+            DelightQLError::validation_error(
+                format!(
+                    "Unknown piped HO view '{}'. Ensure the namespace is consulted and engaged.",
+                    function
+                ),
+                "Piped HO view not found",
+            )
+        })?;
+
+    log::debug!(
+        "Expanding piped HO view '{}' from namespace '{}' with {} extra args",
+        function,
+        entity.namespace,
+        arguments.len()
+    );
+
+    // 2. Build bindings for the piped invocation.
+    // The first param binds to a CTE wrapping the pipe source.
+    // Remaining params bind from the call-site argument groups.
+    let first_param = entity.params.first().ok_or_else(|| {
+        DelightQLError::validation_error_categorized(
+            "constraint/ho_param",
+            format!(
+                "HO view '{}' has no parameters but is used in piped invocation",
+                function
+            ),
+            "HO view has no table parameter",
+        )
+    })?;
+
+    let cte_name = "_ho_pipe_src".to_string();
+
+    // Build remaining param bindings (params after the first)
+    let remaining_params = &entity.params[1..];
+    let mut bindings = if !remaining_params.is_empty() && !arguments.is_empty() {
+        grounding::bind_ho_params_from_groups(remaining_params, arguments)?
+    } else {
+        grounding::HoParamBindings::default()
+    };
+
+    // Bind first param to the CTE name.
+    // For Argumentative: build a Ground relation with positional columns (x, y)
+    // For Glob/Scalar: simple table name substitution
+    match &first_param.kind {
+        crate::resolution::registry::HoParamKind::Argumentative(columns) => {
+            // Build _ho_pipe_src(x, y) as a RelationalExpression
+            let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
+                .iter()
+                .map(|c| ast_unresolved::DomainExpression::lvar_builder(c.clone()).build())
+                .collect();
+            let cte_rel =
+                ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+                    identifier: ast_unresolved::QualifiedName {
+                        namespace_path: ast_unresolved::NamespacePath::empty(),
+                        name: cte_name.clone().into(),
+                        grounding: None,
+                    },
+                    canonical_name: ast_unresolved::PhaseBox::phantom(),
+                    domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
+                    alias: None,
+                    outer: false,
+                    mutation_target: false,
+                    passthrough: false,
+                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                    hygienic_injections: Vec::new(),
+                });
+            bindings
+                .table_expr_params
+                .insert(first_param.name.clone(), cte_rel);
+        }
+        crate::resolution::registry::HoParamKind::Glob
+        | crate::resolution::registry::HoParamKind::Scalar
+        | crate::resolution::registry::HoParamKind::GroundScalar(_) => {
+            bindings
+                .table_params
+                .insert(first_param.name.clone(), cte_name.clone());
+        }
+    }
+
+    // Validate arity for argumentative params that received table references.
+    grounding::validate_argumentative_arity(&bindings, registry)?;
+
+    // 3. Parse the body with builder-integrated HO param substitution.
+    let body_query_raw =
+        crate::ddl::body_parser::parse_view_body_with_bindings(&entity.definition, bindings)?;
+
+    // Wrap in WithCtes: the CTE binds the pipe source expression
+    let cte_binding = ast_unresolved::CteBinding {
+        expression: source,
+        name: cte_name,
+        is_recursive: ast_unresolved::PhaseBox::phantom(),
+    };
+    let body_query = match body_query_raw {
+        ast_unresolved::Query::Relational(expr) => ast_unresolved::Query::WithCtes {
+            ctes: vec![cte_binding],
+            query: expr,
+        },
+        ast_unresolved::Query::WithCtes { mut ctes, query } => {
+            ctes.insert(0, cte_binding);
+            ast_unresolved::Query::WithCtes { ctes, query }
+        }
+        other => {
+            return Err(DelightQLError::parse_error(format!(
+                "Unexpected query structure in piped HO view '{}' body: {:?}",
+                function,
+                std::mem::discriminant(&other)
+            )));
+        }
+    };
+
+    // 5. Build grounding context for consulted function inlining during body resolution.
+    //    The pipe source already carries its namespace (e.g., data::test.users), so we
+    //    skip patch_data_ns. The grounding only needs grounded_ns for function lookup.
+    let ns_parts: Vec<String> = entity.namespace.split("::").map(String::from).collect();
+    let entity_ns = ast_unresolved::NamespacePath::from_parts(ns_parts).map_err(|e| {
+        DelightQLError::database_error(
+            format!(
+                "Invalid namespace '{}' for HO view '{}': {:?}",
+                entity.namespace, function, e
+            ),
+            format!("{:?}", e),
+        )
+    })?;
+    let ho_grounding = ast_unresolved::GroundedPath {
+        data_ns: ast_unresolved::NamespacePath::empty(),
+        grounded_ns: vec![entity_ns],
+    };
+
+    // 6. Resolve the full query (handles CTEs) with grounding context
+    let (resolved_query, bubbled) = resolve_query_inline(
+        body_query,
+        registry,
+        outer_context,
+        config,
+        Some(&ho_grounding),
+    )?;
+
+    relation_resolver::ho_view_query_to_relational(resolved_query, bubbled, function)
 }
 
 /// Extract grounding from a pipe source expression.

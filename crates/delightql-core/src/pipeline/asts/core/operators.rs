@@ -226,8 +226,6 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
     HoViewApplication {
         function: String,
         arguments: Vec<HoCallGroup>,
-        /// First-parens as parsed AST (for PatternResolver unification).
-        first_parens_spec: Option<DomainSpec<Phase>>,
         domain_spec: DomainSpec<Phase>,
         namespace: Option<NamespacePath>,
     },

@@ -129,45 +129,6 @@ pub struct HoParam {
     pub kind: HoParamKind,
 }
 
-/// Cross-clause analysis of a single HO parameter position.
-/// Computed at consult time from all clauses, stored in sys tables.
-#[derive(Debug, Clone)]
-pub struct HoPositionInfo {
-    pub position: usize,
-    /// Unified column kind across all clauses
-    pub column_kind: HoColumnKind,
-    /// How ground values distribute across clauses
-    pub ground_mode: HoGroundMode,
-    /// Ground constant values (one per clause that has GroundScalar at this pos)
-    pub ground_values: Vec<(usize, String)>, // (clause_ordinal, value)
-    /// Canonical column name (from free-variable clauses; None for PureGround)
-    pub column_name: Option<String>,
-}
-
-/// What kind of HO column this position carries, unified across all clauses.
-#[derive(Debug, Clone, PartialEq)]
-pub enum HoColumnKind {
-    /// T(*) in every clause
-    TableGlob,
-    /// T(x,y) in every clause
-    TableArgumentative(Vec<String>),
-    /// Scalar/GroundScalar across clauses
-    Scalar,
-}
-
-/// How ground values distribute across clauses at a single position.
-#[derive(Debug, Clone, PartialEq)]
-pub enum HoGroundMode {
-    /// Every clause: GroundScalar — free+unbound at call site IS valid
-    PureGround,
-    /// Some GroundScalar, some Scalar — call site MUST provide concrete value
-    MixedGround,
-    /// Every clause: Scalar — standard parameter
-    PureUnbound,
-    /// Table parameter (Glob/Argumentative) — always input-moded
-    InputOnly,
-}
-
 /// Definition body — the DQL expression(s) after the neck.
 #[derive(Debug, Clone)]
 pub enum DdlBody {

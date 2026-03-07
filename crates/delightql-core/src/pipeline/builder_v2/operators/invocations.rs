@@ -38,30 +38,11 @@ pub(in crate::pipeline::builder_v2) fn parse_piped_invocation(
     };
 
     // Collect arguments if present (for multi-param HO views: |> mask_ssn("***")(*))
-    let (arguments, mut first_parens_spec) = if let Some(args_node) = node.field("arguments") {
-        let groups = parse_ho_argument_list(args_node);
-        let spec = relations::parse_first_parens_as_domain_spec(args_node)?;
-        (groups, Some(spec))
+    let arguments = if let Some(args_node) = node.field("arguments") {
+        parse_ho_argument_list(args_node)
     } else {
-        (Vec::new(), None)
+        Vec::new()
     };
-
-    // HO param substitution: replace param names in first_parens_spec Lvars.
-    // Table params: Lvar("T") → Lvar("actual_table_name")
-    // Scalar params: Lvar("n") → the bound DomainExpression (e.g., Literal(5))
-    if let Some(ref bindings) = features.ho_bindings {
-        if let Some(DomainSpec::Positional(ref mut exprs)) = first_parens_spec {
-            for expr in exprs.iter_mut() {
-                if let DomainExpression::Lvar { name, .. } = expr {
-                    if let Some(actual_name) = bindings.table_params.get(name.as_str()) {
-                        *name = actual_name.clone().into();
-                    } else if let Some(bound_expr) = bindings.scalar_params.get(name.as_str()) {
-                        *expr = bound_expr.clone();
-                    }
-                }
-            }
-        }
-    }
 
     // Parse column spec (output columns)
     let domain_spec = if let Some(columns_node) = node.field("columns") {
@@ -76,7 +57,6 @@ pub(in crate::pipeline::builder_v2) fn parse_piped_invocation(
             operator: UnaryRelationalOperator::HoViewApplication {
                 function,
                 arguments,
-                first_parens_spec,
                 domain_spec,
                 namespace,
             },

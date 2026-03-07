@@ -1704,7 +1704,6 @@ fn resolve_tvf(
         function,
         arguments,
         argument_groups,
-        first_parens_spec,
         domain_spec,
         alias,
         namespace,
@@ -1715,46 +1714,6 @@ fn resolve_tvf(
         unreachable!("resolve_tvf called with non-TVF variant");
     };
 
-    // Build first_parens_spec from existing arguments if not already set.
-    // This handles TVFs built outside the parser (e.g., by the effect executor).
-    let first_parens_spec = first_parens_spec.unwrap_or_else(|| {
-        if arguments.is_empty() {
-            ast_unresolved::DomainSpec::Glob
-        } else {
-            // Fallback: convert flat string args to Lvars
-            ast_unresolved::DomainSpec::Positional(
-                arguments
-                    .iter()
-                    .map(|a| {
-                        // Quoted strings → Literal, bare identifiers → Lvar
-                        if (a.starts_with('"') && a.ends_with('"'))
-                            || (a.starts_with('\'') && a.ends_with('\''))
-                        {
-                            let val = a[1..a.len() - 1].to_string();
-                            ast_unresolved::DomainExpression::literal_builder(
-                                ast_unresolved::LiteralValue::String(val),
-                            )
-                            .build()
-                        } else if a.parse::<f64>().is_ok() {
-                            ast_unresolved::DomainExpression::literal_builder(
-                                ast_unresolved::LiteralValue::Number(a.clone()),
-                            )
-                            .build()
-                        } else if a == "*" {
-                            ast_unresolved::DomainExpression::glob_builder().build()
-                        } else if a == "@" {
-                            ast_unresolved::DomainExpression::ValuePlaceholder { alias: None }
-                        } else {
-                            ast_unresolved::DomainExpression::lvar_builder(a.clone()).build()
-                        }
-                    })
-                    .collect(),
-            )
-        }
-    });
-
-    let groups_ref = argument_groups.as_deref();
-
     // Check if this TVF is actually a higher-order view invocation
     if let Some(ref grounding) = grounding {
         for ns in &grounding.grounded_ns {
@@ -1762,19 +1721,11 @@ fn resolve_tvf(
             if let Some(entity) = registry.consult.lookup_entity(&function, &fq) {
                 if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression.as_i32()
                 {
-                    let (table_bindings, scalar_spec, _pipe_idx) =
-                        super::grounding::split_ho_first_parens(
-                            &first_parens_spec,
-                            &entity,
-                            None,
-                            groups_ref,
-                        )?;
-                    return expand_ho_view(
+                    return expand_direct_ho_view(
                         &function,
                         &entity,
-                        &scalar_spec,
-                        table_bindings,
-                        None,
+                        &arguments,
+                        argument_groups.as_deref(),
                         Some(&grounding.data_ns),
                         grounding,
                         registry,
@@ -1808,19 +1759,11 @@ fn resolve_tvf(
                         config.clone()
                     };
 
-                    let (table_bindings, scalar_spec, _pipe_idx) =
-                        super::grounding::split_ho_first_parens(
-                            &first_parens_spec,
-                            &entity,
-                            None,
-                            groups_ref,
-                        )?;
-                    return expand_ho_view(
+                    return expand_direct_ho_view(
                         &function,
                         &entity,
-                        &scalar_spec,
-                        table_bindings,
-                        None,
+                        &arguments,
+                        argument_groups.as_deref(),
                         None,
                         &ho_grounding,
                         registry,
@@ -1847,19 +1790,11 @@ fn resolve_tvf(
                 grounded_ns: vec![entity_ns],
             };
 
-            let (table_bindings, scalar_spec, _pipe_idx) =
-                super::grounding::split_ho_first_parens(
-                    &first_parens_spec,
-                    &entity,
-                    None,
-                    groups_ref,
-                )?;
-            return expand_ho_view(
+            return expand_direct_ho_view(
                 &function,
                 &entity,
-                &scalar_spec,
-                table_bindings,
-                None,
+                &arguments,
+                argument_groups.as_deref(),
                 None,
                 &ho_grounding,
                 registry,
@@ -1931,7 +1866,6 @@ fn resolve_tvf(
         grounding: None,
         cpr_schema: ast_resolved::PhaseBox::new(schema),
         argument_groups: None,
-        first_parens_spec: None,
     };
 
     Ok((
@@ -2086,84 +2020,15 @@ pub(super) fn relabel_bubbled_with_alias(
     super::BubbledState::resolved(relabeled)
 }
 
-/// Unified HO view expansion: handles both direct and piped invocations.
+/// Expand a direct HO view call (text substitution → parse → resolve → wrap).
 ///
-/// Uses PatternResolver for first-parens (scalar params) instead of per-clause
-/// pre-filtering. The squished relation includes ALL clauses; PatternResolver
-/// applies WHERE constraints from call-site literals.
-///
-/// Validate that scalar expressions at MixedGround positions are ground values,
-/// not unbound identifiers. MixedGround positions have free variables in some
-/// clauses — the caller must provide a literal or expression, not a bare lvar.
-fn validate_scalar_spec_mixed_ground(
-    scalar_spec: &ast_unresolved::DomainSpec,
-    positions: &[crate::pipeline::asts::ddl::HoPositionInfo],
-    function: &str,
-    has_outer_context: bool,
-) -> Result<()> {
-    use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
-
-    let exprs = match scalar_spec {
-        ast_unresolved::DomainSpec::Positional(exprs) => exprs,
-        ast_unresolved::DomainSpec::Glob => return Ok(()),
-        _ => return Ok(()),
-    };
-
-    // Get scalar positions from position analysis
-    let scalar_positions: Vec<_> = positions
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| matches!(p.column_kind, HoColumnKind::Scalar))
-        .collect();
-
-    for (idx, expr) in exprs.iter().enumerate() {
-        let Some((abs_pos, pos_info)) = scalar_positions.get(idx) else {
-            continue;
-        };
-        if pos_info.ground_mode != HoGroundMode::MixedGround {
-            continue;
-        }
-        // Check if the expression is a bare identifier (lvar) — not a literal
-        let is_ground = match expr {
-            ast_unresolved::DomainExpression::Literal { .. } => true,
-            ast_unresolved::DomainExpression::Lvar { .. } => false,
-            ast_unresolved::DomainExpression::Projection(_) => false,
-            // Function calls, expressions, etc. are considered ground
-            _ => true,
-        };
-
-        if !is_ground && !has_outer_context {
-            let expr_text = format!("{:?}", expr);
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "ho/unbound-mixed-param",
-                format!(
-                    "Unbound scalar at MixedGroundParam position {} of HO view '{}'. \
-                     This position has free variables in some clauses — the caller must \
-                     provide a ground value (literal or expression), not a bare identifier. \
-                     Got: {}",
-                    abs_pos, function, expr_text
-                ),
-                "HO parameter validation",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Logic:
-/// 1. Build pipe source CTE if pipe_source is Some
-/// 2. Call build_squished_relation() → unresolved Query with all clauses
-/// 3. Activate namespace-local enlists
-/// 4. resolve_query_inline(squished_query, ...) → resolved ConsultedView
-/// 5. Deactivate namespace-local enlists
-/// 6. ho_view_query_to_relational() → ConsultedView + BubbledState
-/// 7. apply_call_site_pattern(scalar_spec, resolved_expr, schema, ...) for scalar filtering
-pub(super) fn expand_ho_view(
+/// Shared by both grounded (`data::test^lib.ho_view(args)(*)`) and
+/// unqualified (`ho_view(args)(*)` after `engage!`) code paths.
+fn expand_direct_ho_view(
     function: &str,
     entity: &crate::resolution::registry::ConsultedEntity,
-    scalar_spec: &ast_unresolved::DomainSpec,
-    table_bindings: crate::pipeline::query_features::HoParamBindings,
-    pipe_source: Option<ast_unresolved::RelationalExpression>,
+    arguments: &[String],
+    argument_groups: Option<&[crate::pipeline::asts::core::operators::HoCallGroup]>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
     grounding: &ast_unresolved::GroundedPath,
     registry: &mut crate::resolution::EntityRegistry,
@@ -2171,44 +2036,224 @@ pub(super) fn expand_ho_view(
     config: &ResolutionConfig,
 ) -> Result<(ast_resolved::RelationalExpression, super::BubbledState)> {
     log::debug!(
-        "Expanding HO view '{}' (unified) from namespace '{}'",
+        "Expanding HO view '{}' from namespace '{}' with arguments {:?}",
         function,
         entity.namespace,
+        arguments
     );
 
-    // Validate arity for argumentative params that received table references.
-    super::grounding::validate_argumentative_arity(&table_bindings, registry)?;
-
-    // Validate mixed ground params from position analysis.
-    let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
-    let positions = if !entity.positions.is_empty() {
-        entity.positions.clone()
+    // Build structured bindings from call-site arguments.
+    // Prefer structured groups (from &-separated call site) over flat args.
+    let bindings = if let Some(groups) = argument_groups {
+        super::grounding::bind_ho_params_from_groups(&entity.params, groups)
     } else {
-        super::grounding::build_ho_position_analysis(&defs)
+        super::grounding::bind_ho_params(&entity.params, arguments)
+    }?;
+
+    // Validate arity for argumentative params that received table references.
+    super::grounding::validate_argumentative_arity(&bindings, registry)?;
+
+    // Extract ground scalar call info for per-clause filtering/injection.
+    let ground_info = super::grounding::extract_ground_scalar_info(&bindings);
+
+    // Check if this is a multi-clause (disjunctive) HO view.
+    // Multi-clause definitions are stored as concatenated source text
+    // (e.g., "f(T(*))(*) :- T(*), age > 50\nf(T(*))(*) :- T(*), bal > 5000").
+    // Split into individual clauses, substitute HO params in each, then
+    // synthesize a UNION ALL via the same CTE pattern used for non-HO disjunctive views.
+    let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
+
+    // Reject unbound identifiers at MixedGroundParam positions.
+    super::grounding::validate_mixed_ground_params(
+        &defs,
+        &ground_info,
+        function,
+        outer_context.is_some(),
+    )?;
+
+    let body_query = if defs.len() > 1 {
+        // Multi-clause: parse each clause individually with HO substitutions,
+        // then synthesize CTE-based UNION ALL.
+        let mut all_ctes = Vec::new();
+        for def in &defs {
+            // Extract per-clause HO params from this clause's head
+            let clause_params = match &def.head {
+                crate::pipeline::asts::ddl::DdlHead::HoView { params, .. } => {
+                    params.clone()
+                }
+                _ => Vec::new(),
+            };
+
+            // Extract output_head from this clause's HoView head (for argumentative output)
+            let output_head = match &def.head {
+                crate::pipeline::asts::ddl::DdlHead::HoView { output_head, .. } => {
+                    output_head.as_deref()
+                }
+                _ => None,
+            };
+
+            // Filter: if a ground call-site arg doesn't match this clause's ground value, skip
+            if !ground_info.is_empty()
+                && !super::grounding::clause_matches_ground_args(&clause_params, &ground_info)
+            {
+                continue;
+            }
+
+            // Determine if we need to enforce head contract (inject constants or apply output head)
+            let needs_desugar = (!ground_info.is_empty()
+                && ground_info.iter().any(|gi| !gi.is_ground_call))
+                || output_head.is_some();
+
+            let clause_source = if needs_desugar {
+                super::grounding::desugar_ho_clause_body(
+                    &def.full_source,
+                    &clause_params,
+                    &ground_info,
+                    function,
+                    output_head,
+                )?
+            } else {
+                def.full_source.clone()
+            };
+
+            // Create per-clause bindings: for positions where THIS clause has Scalar
+            // but the first clause had GroundScalar, add scalar_params entries.
+            let mut clause_bindings = bindings.clone();
+            for (pos, cp) in clause_params.iter().enumerate() {
+                if let crate::pipeline::asts::ddl::HoParamKind::Scalar = &cp.kind {
+                    if !clause_bindings.scalar_params.contains_key(&cp.name) {
+                        // This position is Scalar in this clause but wasn't in the first clause.
+                        // Find the call-site arg at this position and bind it.
+                        if let Some(info) = ground_info.iter().find(|gi| gi.position == pos) {
+                            if let Ok(domain_expr) =
+                                crate::ddl::body_parser::parse_function_body(&info.call_value)
+                            {
+                                clause_bindings
+                                    .scalar_params
+                                    .insert(cp.name.clone(), domain_expr);
+                            }
+                            clause_bindings
+                                .table_params
+                                .insert(cp.name.clone(), info.call_value.clone());
+                        }
+                    }
+                }
+            }
+
+            let clause_query = crate::ddl::body_parser::parse_view_body_with_bindings(
+                &clause_source,
+                clause_bindings,
+            )?;
+            let clause_query = if let Some(dns) = data_ns {
+                super::grounding::patch_data_ns_query(clause_query, dns)
+            } else {
+                clause_query
+            };
+            match clause_query {
+                ast_unresolved::Query::Relational(expr) => {
+                    all_ctes.push(ast_unresolved::CteBinding {
+                        name: function.to_string(),
+                        expression: expr,
+                        is_recursive: ast_unresolved::PhaseBox::phantom(),
+                    });
+                }
+                ast_unresolved::Query::WithCtes {
+                    ctes,
+                    query: main_expr,
+                } => {
+                    for cte in ctes {
+                        all_ctes.push(cte);
+                    }
+                    all_ctes.push(ast_unresolved::CteBinding {
+                        name: function.to_string(),
+                        expression: main_expr,
+                        is_recursive: ast_unresolved::PhaseBox::phantom(),
+                    });
+                }
+                other => {
+                    return Err(DelightQLError::parse_error(format!(
+                        "Unsupported query form in disjunctive HO view clause: {:?}",
+                        std::mem::discriminant(&other)
+                    )));
+                }
+            }
+        }
+
+        // If all clauses were filtered out (ground mismatch), produce an empty result.
+        // Use the first clause's structure but with a WHERE FALSE.
+        if all_ctes.is_empty() {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "No clause in HO view '{}' matches the ground argument(s)",
+                    function
+                ),
+                "Ground scalar mismatch",
+            ));
+        }
+
+        // Main query: function(*) referencing the CTE
+        let main_query =
+            ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+                identifier: ast_unresolved::QualifiedName {
+                    namespace_path: ast_unresolved::NamespacePath::empty(),
+                    name: function.into(),
+                    grounding: None,
+                },
+                canonical_name: ast_unresolved::PhaseBox::phantom(),
+                domain_spec: ast_unresolved::DomainSpec::Glob,
+                alias: None,
+                outer: false,
+                mutation_target: false,
+                passthrough: false,
+                cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                hygienic_injections: Vec::new(),
+            });
+
+        ast_unresolved::Query::WithCtes {
+            ctes: all_ctes,
+            query: main_query,
+        }
+    } else {
+        // Single clause: original path (may still need ground scalar injection or head enforcement)
+        let single_source = if !ground_info.is_empty() && defs.len() == 1 {
+            let clause_params = match &defs[0].head {
+                crate::pipeline::asts::ddl::DdlHead::HoView { params, .. } => params.clone(),
+                _ => Vec::new(),
+            };
+            let output_head = match &defs[0].head {
+                crate::pipeline::asts::ddl::DdlHead::HoView { output_head, .. } => {
+                    output_head.as_deref()
+                }
+                _ => None,
+            };
+            let needs_desugar = ground_info.iter().any(|gi| !gi.is_ground_call)
+                || output_head.is_some();
+            if needs_desugar {
+                Some(super::grounding::desugar_ho_clause_body(
+                    &defs[0].full_source,
+                    &clause_params,
+                    &ground_info,
+                    function,
+                    output_head,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let source = single_source.as_deref().unwrap_or(&entity.definition);
+        let body_query =
+            crate::ddl::body_parser::parse_view_body_with_bindings(source, bindings)?;
+        if let Some(dns) = data_ns {
+            super::grounding::patch_data_ns_query(body_query, dns)
+        } else {
+            body_query
+        }
     };
-    let positions = super::grounding::ensure_position_column_names(positions, &defs);
 
-    // Validate scalar_spec against positions: reject unbound identifiers at MixedGround positions.
-    validate_scalar_spec_mixed_ground(
-        scalar_spec,
-        &positions,
-        function,
-        pipe_source.is_some() || outer_context.is_some(),
-    )?;
-
-    // Build pipe source CTE if piped
-    let pipe_source_cte = pipe_source.map(|source| ("_ho_pipe_src".to_string(), source));
-
-    // Build the squished relation (ALL clauses, no pre-filtering)
-    let squished_query = super::grounding::build_squished_relation(
-        function,
-        entity,
-        table_bindings,
-        pipe_source_cte,
-        data_ns,
-    )?;
-
-    // Activate namespace-local enlists and aliases
+    // Temporarily activate namespace-local enlists and aliases for the HO-view's namespace
     let activated_enlists = registry
         .consult
         .activate_namespace_local_enlists(&entity.namespace);
@@ -2216,13 +2261,8 @@ pub(super) fn expand_ho_view(
         .consult
         .activate_namespace_local_aliases(&entity.namespace);
 
-    let resolve_result = super::resolve_query_inline(
-        squished_query,
-        registry,
-        outer_context,
-        config,
-        Some(grounding),
-    );
+    let resolve_result =
+        super::resolve_query_inline(body_query, registry, outer_context, config, Some(grounding));
 
     registry
         .consult
@@ -2233,126 +2273,8 @@ pub(super) fn expand_ho_view(
 
     let (resolved_query, bubbled) = resolve_result?;
 
-    // Convert to ConsultedView relation
-    let (resolved_expr, bubbled) =
-        ho_view_query_to_relational(resolved_query, bubbled, function)?;
-
-    // Apply PatternResolver to first-parens (scalar positions) via combined DomainSpec.
-    //
-    // The squished relation has schema [output_cols..., scalar_cols...] (glob-head)
-    // or [scalar_cols..., output_cols...] (argumentative-head).
-    // We build a combined DomainSpec covering ALL columns:
-    //   - Scalar positions: expressions from scalar_spec (Literal → WHERE, Lvar → rename)
-    //   - Output positions: pass-through Lvars (keep original name)
-    // One PatternResolver call handles everything.
-    if matches!(scalar_spec, ast_unresolved::DomainSpec::Glob) {
-        return Ok((resolved_expr, bubbled));
-    }
-
-    let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr)?;
-    let scalar_exprs = match scalar_spec {
-        ast_unresolved::DomainSpec::Positional(exprs) => exprs,
-        _ => return Ok((resolved_expr, bubbled)),
-    };
-
-    // Identify scalar column names from position analysis
-    let scalar_col_names: Vec<Option<&str>> = positions
-        .iter()
-        .filter(|p| matches!(p.column_kind, crate::pipeline::asts::ddl::HoColumnKind::Scalar))
-        .map(|p| p.column_name.as_deref())
-        .collect();
-
-
-    // Build WHERE constraints and column filtering for scalar positions.
-    // We construct the filter directly rather than going through apply_call_site_pattern,
-    // because HO ConsultedViews get CTE-wrapped and the qualifier would be wrong.
-    let schema_cols = match &body_schema {
-        ast_resolved::CprSchema::Resolved(cols) => cols,
-        _ => return Ok((resolved_expr, bubbled)),
-    };
-
-    let mut where_constraints = Vec::new();
-    let mut output_columns = Vec::new();
-    let mut scalar_idx = 0;
-
-    for col in schema_cols {
-        let col_name = col.name();
-        let is_scalar = scalar_col_names
-            .iter()
-            .any(|n| n.map_or(false, |n| n == col_name));
-        if is_scalar && scalar_idx < scalar_exprs.len() {
-            let scalar_expr = &scalar_exprs[scalar_idx];
-            scalar_idx += 1;
-            match scalar_expr {
-                ast_unresolved::DomainExpression::Literal { value, .. } => {
-                    // Literal → WHERE constraint + hide column (hygienic)
-                    // Use unqualified column ref to avoid qualifier mismatch with CTE wrapping
-                    let col_ref = ast_resolved::DomainExpression::Lvar {
-                        name: col_name.into(),
-                        qualifier: None,
-                        namespace_path: ast_resolved::NamespacePath::empty(),
-                        alias: None,
-                        provenance: ast_resolved::PhaseBox::phantom(),
-                    };
-                    let lit_val = ast_resolved::DomainExpression::Literal {
-                        value: value.clone(),
-                        alias: None,
-                    };
-                    where_constraints.push(ast_resolved::BooleanExpression::Comparison {
-                        operator: "traditional_eq".to_string(),
-                        left: Box::new(col_ref),
-                        right: Box::new(lit_val),
-                    });
-                    // Hide scalar column (don't add to output)
-                    let mut hidden = col.clone();
-                    hidden.needs_hygienic_alias = true;
-                    output_columns.push(hidden);
-                }
-                ast_unresolved::DomainExpression::Lvar { name, .. } => {
-                    // Lvar → rename column (project with new name)
-                    let mut renamed = col.clone();
-                    renamed.info = renamed.info.with_alias(name.to_string());
-                    renamed.needs_sql_rename = true;
-                    output_columns.push(renamed);
-                }
-                ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
-                    // Underscore → skip (hide) column
-                    let mut hidden = col.clone();
-                    hidden.needs_hygienic_alias = true;
-                    output_columns.push(hidden);
-                }
-                _ => {
-                    // Pass through
-                    output_columns.push(col.clone());
-                }
-            }
-        } else {
-            output_columns.push(col.clone());
-        }
-    }
-
-    // Update schema on the inner relation
-    let mut expr = resolved_expr;
-    update_relation_cpr_schema(&mut expr, &output_columns);
-
-    // Wrap in Filter if there are WHERE constraints
-    if !where_constraints.is_empty() {
-        let combined = combine_where_constraints(where_constraints);
-        expr = ast_resolved::RelationalExpression::Filter {
-            source: Box::new(expr),
-            condition: ast_resolved::SigmaCondition::Predicate(combined),
-            origin: ast_resolved::FilterOrigin::HoGroundScalar {
-                source_table: function.to_string(),
-            },
-            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                output_columns.clone(),
-            )),
-        };
-    }
-
-    Ok((expr, BubbledState::resolved(output_columns)))
+    ho_view_query_to_relational(resolved_query, bubbled, function)
 }
-
 
 /// Apply call-site positional patterns to an already-resolved consulted entity expression.
 ///

@@ -312,12 +312,6 @@ pub enum Relation<Phase = Unresolved> {
         /// Preferred over flat `arguments` for HO view binding.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         argument_groups: Option<Vec<super::super::operators::HoCallGroup>>,
-        /// First-parens as parsed AST (for PatternResolver unification).
-        /// Mirrors how second parens use `domain_spec`. None for normal TVFs.
-        /// Consumed by the resolver during HO expansion; always None after resolution.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        #[phase_convert(verbatim)]
-        first_parens_spec: Option<DomainSpec<super::super::Unresolved>>,
         domain_spec: DomainSpec<Phase>,
         alias: Option<SqlIdentifier>,
         /// Namespace qualification for namespace-qualified TVFs / HO view invocations

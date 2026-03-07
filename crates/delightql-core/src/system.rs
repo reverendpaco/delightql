@@ -1498,11 +1498,6 @@ impl DelightQLSystem {
 
         // Plain file path: use the existing ATTACH DATABASE path (SQLite-to-SQLite optimization)
 
-        // Resolve relative path against session CWD (for test isolation).
-        let resolved_path = crate::session_cwd::resolve_path(db_path);
-        let db_path = resolved_path.display().to_string();
-        let db_path = db_path.as_str();
-
         // Guard: file must exist and be a valid SQLite database
         let path = std::path::Path::new(db_path);
         if !path.exists() {
@@ -2397,39 +2392,50 @@ impl DelightQLSystem {
                         })?;
                 }
 
-                // Write HO param metadata with cross-clause position analysis
-                if let crate::pipeline::asts::ddl::DdlHead::HoView { .. } = head {
-                    // Parse each clause's head to get per-clause HO params
-                    let mut clause_heads: Vec<crate::pipeline::asts::ddl::DdlHead> = Vec::new();
-                    for def in defs.iter() {
-                        match crate::ddl::ddl_builder::build_ddl_head(&def.full_source) {
-                            Ok((_name, clause_head)) => clause_heads.push(clause_head),
-                            Err(_) => {
-                                // If head parsing fails, use the primary head for this clause
-                                clause_heads.push(head.clone());
+                // Write HO param metadata
+                if let crate::pipeline::asts::ddl::DdlHead::HoView { ref params, .. } = head {
+                    for (position, ho_param) in params.iter().enumerate() {
+                        let kind_str = match &ho_param.kind {
+                            crate::pipeline::asts::ddl::HoParamKind::Glob => "glob",
+                            crate::pipeline::asts::ddl::HoParamKind::Argumentative(_) => {
+                                "argumentative"
+                            }
+                            crate::pipeline::asts::ddl::HoParamKind::Scalar => "scalar",
+                            crate::pipeline::asts::ddl::HoParamKind::GroundScalar(_) => "ground_scalar",
+                        };
+                        bootstrap_conn
+                            .execute(
+                                "INSERT INTO ho_param (entity_id, param_name, position, kind) VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![entity_id, &ho_param.name, position as i32, kind_str],
+                            )
+                            .map_err(|e| {
+                                DelightQLError::database_error_with_source(
+                                    "Failed to insert ho_param",
+                                    e.to_string(),
+                                    Box::new(e),
+                                )
+                            })?;
+
+                        if let crate::pipeline::asts::ddl::HoParamKind::Argumentative(ref columns) =
+                            ho_param.kind
+                        {
+                            let ho_param_id = bootstrap_conn.last_insert_rowid() as i32;
+                            for (col_pos, col_name) in columns.iter().enumerate() {
+                                bootstrap_conn
+                                    .execute(
+                                        "INSERT INTO ho_param_column (ho_param_id, column_name, column_position) VALUES (?1, ?2, ?3)",
+                                        rusqlite::params![ho_param_id, col_name, col_pos as i32],
+                                    )
+                                    .map_err(|e| {
+                                        DelightQLError::database_error_with_source(
+                                            "Failed to insert ho_param_column",
+                                            e.to_string(),
+                                            Box::new(e),
+                                        )
+                                    })?;
                             }
                         }
                     }
-                    if clause_heads.is_empty() {
-                        clause_heads.push(head.clone());
-                    }
-
-                    // Extract HoParam vecs from heads
-                    let param_vecs: Vec<Vec<crate::pipeline::asts::ddl::HoParam>> = clause_heads
-                        .iter()
-                        .filter_map(|h| match h {
-                            crate::pipeline::asts::ddl::DdlHead::HoView { params, .. } => {
-                                Some(params.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    let head_refs: Vec<&Vec<crate::pipeline::asts::ddl::HoParam>> =
-                        param_vecs.iter().collect();
-
-                    let positions = crate::pipeline::resolver::grounding::build_ho_position_analysis_from_heads(&head_refs);
-
-                    Self::write_ho_params_to_bootstrap(bootstrap_conn, entity_id, &positions)?;
                 }
 
                 // Store proffer-extracted references
@@ -2630,11 +2636,50 @@ impl DelightQLSystem {
                     })?;
             }
 
-            // For HO views, write structured param metadata with cross-clause position analysis
-            if matches!(first_ddl.head, crate::pipeline::asts::ddl::DdlHead::HoView { .. }) {
-                let positions =
-                    crate::pipeline::resolver::grounding::build_ho_position_analysis(&ddl_defs);
-                Self::write_ho_params_to_bootstrap(bootstrap_conn, entity_id, &positions)?;
+            // For HO views, also write structured param metadata to ho_param / ho_param_column
+            if let crate::pipeline::asts::ddl::DdlHead::HoView { ref params, .. } = first_ddl.head {
+                for (position, ho_param) in params.iter().enumerate() {
+                    let kind_str = match &ho_param.kind {
+                        crate::pipeline::asts::ddl::HoParamKind::Glob => "glob",
+                        crate::pipeline::asts::ddl::HoParamKind::Argumentative(_) => {
+                            "argumentative"
+                        }
+                        crate::pipeline::asts::ddl::HoParamKind::Scalar => "scalar",
+                        crate::pipeline::asts::ddl::HoParamKind::GroundScalar(_) => "ground_scalar",
+                    };
+                    bootstrap_conn
+                        .execute(
+                            "INSERT INTO ho_param (entity_id, param_name, position, kind) VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![entity_id, &ho_param.name, position as i32, kind_str],
+                        )
+                        .map_err(|e| {
+                            DelightQLError::database_error_with_source(
+                                "Failed to insert ho_param",
+                                e.to_string(),
+                                Box::new(e),
+                            )
+                        })?;
+
+                    if let crate::pipeline::asts::ddl::HoParamKind::Argumentative(ref columns) =
+                        ho_param.kind
+                    {
+                        let ho_param_id = bootstrap_conn.last_insert_rowid() as i32;
+                        for (col_pos, col_name) in columns.iter().enumerate() {
+                            bootstrap_conn
+                                .execute(
+                                    "INSERT INTO ho_param_column (ho_param_id, column_name, column_position) VALUES (?1, ?2, ?3)",
+                                    rusqlite::params![ho_param_id, col_name, col_pos as i32],
+                                )
+                                .map_err(|e| {
+                                    DelightQLError::database_error_with_source(
+                                        "Failed to insert ho_param_column",
+                                        e.to_string(),
+                                        Box::new(e),
+                                    )
+                                })?;
+                        }
+                    }
+                }
             }
 
             // For ER-rules, write metadata to er_rule table
@@ -3475,21 +3520,6 @@ impl DelightQLSystem {
                     [cartridge_id],
                 ).map_err(|e| DelightQLError::database_error("Failed to delete interior_entity", e.to_string()))?;
 
-                // ho_param_ground_value (FK to ho_param)
-                bootstrap_conn
-                    .execute(
-                        "DELETE FROM ho_param_ground_value WHERE ho_param_id IN (
-                        SELECT hp.id FROM ho_param hp JOIN entity e ON hp.entity_id = e.id
-                        WHERE e.cartridge_id = ?1)",
-                        [cartridge_id],
-                    )
-                    .map_err(|e| {
-                        DelightQLError::database_error(
-                            "Failed to delete ho_param_ground_value",
-                            e.to_string(),
-                        )
-                    })?;
-
                 // ho_param_column (FK to ho_param)
                 bootstrap_conn
                     .execute(
@@ -3939,97 +3969,6 @@ impl DelightQLSystem {
         Ok(())
     }
 
-    /// Write HO parameter metadata to bootstrap from cross-clause position analysis.
-    ///
-    /// Inserts rows into ho_param, ho_param_column, and ho_param_ground_value
-    /// based on the unified HoPositionInfo computed by `build_ho_position_analysis`.
-    fn write_ho_params_to_bootstrap(
-        bootstrap_conn: &Connection,
-        entity_id: i32,
-        positions: &[crate::pipeline::asts::ddl::HoPositionInfo],
-    ) -> Result<()> {
-        use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
-
-        for pos_info in positions {
-            let kind_str = match &pos_info.column_kind {
-                HoColumnKind::TableGlob => "glob",
-                HoColumnKind::TableArgumentative(_) => "argumentative",
-                HoColumnKind::Scalar => match &pos_info.ground_mode {
-                    HoGroundMode::PureGround => "ground_scalar",
-                    HoGroundMode::MixedGround => "scalar",
-                    _ => "scalar",
-                },
-            };
-
-            let ground_mode_str = match &pos_info.ground_mode {
-                HoGroundMode::PureGround => Some("pure_ground"),
-                HoGroundMode::MixedGround => Some("mixed_ground"),
-                HoGroundMode::PureUnbound => Some("pure_unbound"),
-                HoGroundMode::InputOnly => Some("input_only"),
-            };
-
-            // Use column_name for param_name when available, fall back to position-based name
-            let param_name_owned;
-            let param_name = match &pos_info.column_name {
-                Some(name) => name.as_str(),
-                None => {
-                    param_name_owned = format!("_pos{}", pos_info.position);
-                    &param_name_owned
-                }
-            };
-
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO ho_param (entity_id, param_name, position, kind, ground_mode, column_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![entity_id, param_name, pos_info.position as i32, kind_str, ground_mode_str, &pos_info.column_name],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert ho_param",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
-            let ho_param_id = bootstrap_conn.last_insert_rowid() as i32;
-
-            // Write argumentative columns
-            if let HoColumnKind::TableArgumentative(ref columns) = pos_info.column_kind {
-                for (col_pos, col_name) in columns.iter().enumerate() {
-                    bootstrap_conn
-                        .execute(
-                            "INSERT INTO ho_param_column (ho_param_id, column_name, column_position) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![ho_param_id, col_name, col_pos as i32],
-                        )
-                        .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert ho_param_column",
-                                e.to_string(),
-                                Box::new(e),
-                            )
-                        })?;
-                }
-            }
-
-            // Write per-clause ground values
-            for (clause_ordinal, ground_value) in &pos_info.ground_values {
-                bootstrap_conn
-                    .execute(
-                        "INSERT INTO ho_param_ground_value (ho_param_id, clause_ordinal, ground_value) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![ho_param_id, *clause_ordinal as i32, ground_value],
-                    )
-                    .map_err(|e| {
-                        DelightQLError::database_error_with_source(
-                            "Failed to insert ho_param_ground_value",
-                            e.to_string(),
-                            Box::new(e),
-                        )
-                    })?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Deep-copy all sub-tables for an entity (clause, attribute, referenced,
     /// ho_param+columns, er_rule, interior_entity+attributes).
     fn copy_entity_subtables(
@@ -4064,23 +4003,16 @@ impl DelightQLSystem {
             rusqlite::params![new_entity_id, old_entity_id],
         ).map_err(|e| DelightQLError::database_error("Failed to copy referenced_entity", e.to_string()))?;
 
-        // ho_param + ho_param_column + ho_param_ground_value (FK chain: entity → ho_param → children)
+        // ho_param + ho_param_column (FK chain: entity → ho_param → ho_param_column)
         {
             let mut stmt = conn
-                .prepare("SELECT id, param_name, position, kind, ground_mode, column_name FROM ho_param WHERE entity_id = ?1")
+                .prepare("SELECT id, param_name, position, kind FROM ho_param WHERE entity_id = ?1")
                 .map_err(|e| {
                     DelightQLError::database_error("Failed to query ho_param", e.to_string())
                 })?;
-            let old_params: Vec<(i32, String, i32, String, Option<String>, Option<String>)> = stmt
+            let old_params: Vec<(i32, String, i32, String)> = stmt
                 .query_map([old_entity_id], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })
                 .map_err(|e| {
                     DelightQLError::database_error("Failed to query ho_param", e.to_string())
@@ -4088,10 +4020,10 @@ impl DelightQLSystem {
                 .flatten()
                 .collect();
 
-            for (old_hp_id, param_name, position, kind, ground_mode, column_name) in &old_params {
+            for (old_hp_id, param_name, position, kind) in &old_params {
                 conn.execute(
-                    "INSERT INTO ho_param (entity_id, param_name, position, kind, ground_mode, column_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![new_entity_id, param_name, position, kind, ground_mode, column_name],
+                    "INSERT INTO ho_param (entity_id, param_name, position, kind) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![new_entity_id, param_name, position, kind],
                 ).map_err(|e| DelightQLError::database_error("Failed to copy ho_param", e.to_string()))?;
                 let new_hp_id = conn.last_insert_rowid() as i32;
 
@@ -4103,19 +4035,6 @@ impl DelightQLSystem {
                 )
                 .map_err(|e| {
                     DelightQLError::database_error("Failed to copy ho_param_column", e.to_string())
-                })?;
-
-                conn.execute(
-                    "INSERT INTO ho_param_ground_value (ho_param_id, clause_ordinal, ground_value)
-                     SELECT ?1, clause_ordinal, ground_value
-                     FROM ho_param_ground_value WHERE ho_param_id = ?2",
-                    rusqlite::params![new_hp_id, old_hp_id],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to copy ho_param_ground_value",
-                        e.to_string(),
-                    )
                 })?;
             }
         }
@@ -4168,8 +4087,8 @@ impl DelightQLSystem {
 
     /// Delete all entity sub-tables and the cartridge row for a single cartridge.
     /// FK-safe deletion order: interior_entity_attribute, interior_entity,
-    /// ho_param_ground_value, ho_param_column, entity_resolution, ho_param, er_rule,
-    /// referenced_entity, entity_attribute, entity_clause, activated_entity, entity, cartridge.
+    /// ho_param_column, entity_resolution, ho_param, er_rule, referenced_entity,
+    /// entity_attribute, entity_clause, activated_entity, entity, cartridge.
     fn clear_cartridge_entities(bootstrap_conn: &Connection, cartridge_id: i64) -> Result<()> {
         // Companion tables (must come before entity deletion)
         bootstrap_conn.execute(
@@ -4205,20 +4124,6 @@ impl DelightQLSystem {
             "DELETE FROM interior_entity WHERE parent_entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
         ).map_err(|e| DelightQLError::database_error("Failed to delete interior_entity", e.to_string()))?;
-
-        bootstrap_conn
-            .execute(
-                "DELETE FROM ho_param_ground_value WHERE ho_param_id IN (
-                SELECT hp.id FROM ho_param hp JOIN entity e ON hp.entity_id = e.id
-                WHERE e.cartridge_id = ?1)",
-                [cartridge_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete ho_param_ground_value",
-                    e.to_string(),
-                )
-            })?;
 
         bootstrap_conn
             .execute(
@@ -6081,10 +5986,6 @@ impl DelightQLSystem {
 
         // 3. Read + parse new file
         drop(bootstrap_conn);
-
-        // Resolve relative path against session CWD (for test isolation).
-        let resolved_path = crate::session_cwd::resolve_path(&file_path);
-        let file_path = resolved_path.display().to_string();
 
         let source = std::fs::read_to_string(&file_path).map_err(|e| {
             DelightQLError::database_error(

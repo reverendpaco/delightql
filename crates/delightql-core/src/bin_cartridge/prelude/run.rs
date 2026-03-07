@@ -84,13 +84,8 @@ impl EffectExecutable for RunPredicate {
             ));
         }
 
-        // Resolve relative path against session CWD (for test isolation).
-        let resolved_path = crate::session_cwd::resolve_path(&file_path);
-        let file_path = resolved_path.display().to_string();
-        let file_path = file_path.as_str();
-
         // Read file contents
-        let source_code = std::fs::read_to_string(file_path).map_err(|e| {
+        let source_code = std::fs::read_to_string(&file_path).map_err(|e| {
             DelightQLError::database_error(
                 format!("run!() failed to read file '{}': {}", file_path, e),
                 "File read error",
