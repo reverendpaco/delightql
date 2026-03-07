@@ -21,6 +21,9 @@ pub(super) fn preserve_domain_spec(
         ast_unresolved::DomainSpec::GlobWithUsing(cols) => {
             Ok(ast_resolved::DomainSpec::GlobWithUsing(cols.clone()))
         }
+        ast_unresolved::DomainSpec::GlobWithUsingAll => {
+            Ok(ast_resolved::DomainSpec::GlobWithUsingAll)
+        }
         ast_unresolved::DomainSpec::Positional(exprs) => {
             let resolved_exprs = exprs
                 .iter()

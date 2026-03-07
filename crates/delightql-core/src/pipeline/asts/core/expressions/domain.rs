@@ -222,6 +222,9 @@ pub enum DomainSpec<Phase = Unresolved> {
     /// Glob with inline USING: *{col1, col2}
     #[lispy("domain_spec:glob_with_using")]
     GlobWithUsing(Vec<String>),
+    /// Glob with USING all shared columns: .* or *.*
+    #[lispy("domain_spec:glob_with_using_all")]
+    GlobWithUsingAll,
     /// Positional/explicit columns: (id, name)
     #[lispy("domain_spec:positional")]
     Positional(Vec<DomainExpression<Phase>>),

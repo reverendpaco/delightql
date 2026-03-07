@@ -1251,6 +1251,41 @@ fn resolve_relational_expression_with_registry(
                             };
                             (resolved, bubbled, join_cond, vec![])
                         }
+                        ast_unresolved::Relation::Ground {
+                            domain_spec: ast_unresolved::DomainSpec::GlobWithUsingAll,
+                            ..
+                        } => {
+                            // GlobWithUsingAll: resolve the right side, then compute
+                            // shared columns between left and right as USING columns.
+                            let (resolved, bubbled) = resolve_relational_expression_with_registry(
+                                *right,
+                                registry,
+                                right_context,
+                                config,
+                                grounding,
+                            )?;
+                            let right_cols = &bubbled.i_provide;
+                            let shared: Vec<String> = right_cols
+                                .iter()
+                                .filter(|rc| {
+                                    left_columns
+                                        .iter()
+                                        .any(|lc| col_name_eq(lc.name(), rc.name()))
+                                })
+                                .map(|rc| rc.name().to_string())
+                                .collect();
+                            if shared.is_empty() {
+                                return Err(DelightQLError::validation_error_categorized(
+                                    "using/all/no-shared-columns",
+                                    format!(
+                                        "No shared columns between left side and right side for .* (USING all)"
+                                    ),
+                                    ".* requires at least one column name in common",
+                                ));
+                            }
+                            let join_cond = join_resolver::create_using_condition(shared)?;
+                            (resolved, bubbled, Some(join_cond), vec![])
+                        }
                         _ => {
                             let (resolved, bubbled) = resolve_relational_expression_with_registry(
                                 *right,
@@ -1423,22 +1458,47 @@ fn resolve_relational_expression_with_registry(
                 ref function,
                 ref first_parens_spec,
                 ref arguments,
+                ref namespace,
                 ..
             } = pipe_expr.operator
             {
-                // Look up the HO view entity
-                let entity = registry
-                    .consult
-                    .lookup_enlisted_ho_view(function)?
-                    .ok_or_else(|| {
-                        crate::error::DelightQLError::validation_error(
-                            format!(
-                                "Unknown piped HO view '{}'. Ensure the namespace is consulted and engaged.",
-                                function
-                            ),
-                            "Piped HO view not found",
-                        )
-                    })?;
+                // Look up the HO view entity.
+                // When namespace is explicit (e.g., std::json.tg_keys), use
+                // lookup_entity with the FQ namespace — same as the non-piped
+                // TVF path. Otherwise, search enlisted namespaces by bare name.
+                let entity = if let Some(ref ns) = namespace {
+                    let fq = grounding::namespace_path_to_fq(ns);
+                    registry
+                        .consult
+                        .lookup_entity(function, &fq)
+                        .filter(|e| {
+                            e.entity_type
+                                == crate::enums::EntityType::DqlHoTemporaryViewExpression
+                                    .as_i32()
+                        })
+                        .ok_or_else(|| {
+                            crate::error::DelightQLError::validation_error(
+                                format!(
+                                    "Unknown piped HO view '{}.{}'. Ensure the namespace is consulted.",
+                                    fq, function
+                                ),
+                                "Piped HO view not found",
+                            )
+                        })?
+                } else {
+                    registry
+                        .consult
+                        .lookup_enlisted_ho_view(function)?
+                        .ok_or_else(|| {
+                            crate::error::DelightQLError::validation_error(
+                                format!(
+                                    "Unknown piped HO view '{}'. Ensure the namespace is consulted and engaged.",
+                                    function
+                                ),
+                                "Piped HO view not found",
+                            )
+                        })?
+                };
 
                 // Build first_parens_spec if not already set
                 let spec = first_parens_spec.clone().unwrap_or(
@@ -1476,6 +1536,16 @@ fn resolve_relational_expression_with_registry(
                     grounded_ns: vec![entity_ns],
                 };
 
+                // Scope ER-rule lookups to the HO-view's namespace
+                let ho_config = if !entity.namespace.is_empty() && entity.namespace != "main" {
+                    ResolutionConfig {
+                        resolution_namespace: Some(entity.namespace.clone()),
+                        ..config.clone()
+                    }
+                } else {
+                    config.clone()
+                };
+
                 return relation_resolver::expand_ho_view(
                     function,
                     &entity,
@@ -1486,7 +1556,7 @@ fn resolve_relational_expression_with_registry(
                     &ho_grounding,
                     registry,
                     outer_context,
-                    config,
+                    &ho_config,
                 );
             }
 
@@ -3067,6 +3137,7 @@ fn unwrap_resolved_pipe(
 /// would break qualifier resolution for correlated references.
 /// Walk a resolved expression to find the base Ground relation's table name.
 /// Traverses through Pipes and Filters to reach the Ground node.
+#[stacksafe::stacksafe]
 fn extract_base_ground_name(
     expr: &ast_resolved::RelationalExpression,
 ) -> Option<delightql_types::SqlIdentifier> {
@@ -3167,6 +3238,7 @@ fn classify_single_dml_op(op: &ast_unresolved::UnaryRelationalOperator) -> DmlPi
 /// Insert correlation filters at the base of a pipe chain, directly above
 /// the innermost non-Pipe expression (typically a Ground relation).
 /// This ensures the filter's qualifiers match the Ground table name.
+#[stacksafe::stacksafe]
 fn insert_filters_at_base(
     expr: ast_resolved::RelationalExpression,
     filters: Vec<ast_resolved::SigmaCondition>,

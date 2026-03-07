@@ -13,6 +13,7 @@ pub enum OutputFormat {
     Csv,  // Comma-separated values
     Tsv,  // Tab-separated values
     List, // Key=value pairs
+    Raw,  // Raw bytes (no formatting, no text conversion)
 }
 
 impl OutputFormat {
@@ -48,12 +49,13 @@ impl OutputFormat {
             "csv" => Some(OutputFormat::Csv),
             "tsv" => Some(OutputFormat::Tsv),
             "list" => Some(OutputFormat::List),
+            "raw" => Some(OutputFormat::Raw),
             _ => None,
         }
     }
 
     pub fn all_formats() -> &'static [&'static str] {
-        &["table", "box", "json", "csv", "tsv", "list"]
+        &["table", "box", "json", "csv", "tsv", "list", "raw"]
     }
 }
 
@@ -117,6 +119,7 @@ fn format_output_inner(
         OutputFormat::Csv => format_as_csv(columns, rows, no_headers),
         OutputFormat::Tsv => format_as_tsv(columns, rows, no_headers),
         OutputFormat::List => format_as_list_with_zebra(columns, rows, zebra_mode),
+        OutputFormat::Raw => unreachable!("Raw format handled before display_results"),
     }
 }
 
@@ -563,6 +566,8 @@ mod tests {
         assert_eq!(OutputFormat::from_str("TSV"), Some(OutputFormat::Tsv));
         assert_eq!(OutputFormat::from_str("list"), Some(OutputFormat::List));
         assert_eq!(OutputFormat::from_str("LIST"), Some(OutputFormat::List));
+        assert_eq!(OutputFormat::from_str("raw"), Some(OutputFormat::Raw));
+        assert_eq!(OutputFormat::from_str("RAW"), Some(OutputFormat::Raw));
         assert_eq!(OutputFormat::from_str("invalid"), None);
         assert_eq!(OutputFormat::from_str(""), None);
     }
@@ -570,7 +575,7 @@ mod tests {
     #[test]
     fn test_output_format_all_formats() {
         let formats = OutputFormat::all_formats();
-        assert_eq!(formats.len(), 6);
+        assert_eq!(formats.len(), 7);
         assert!(formats.contains(&"table"));
         assert!(formats.contains(&"box"));
         assert!(formats.contains(&"json"));

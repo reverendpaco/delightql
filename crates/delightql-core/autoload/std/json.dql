@@ -1,0 +1,12 @@
+
+
+tg_keys(T(*))(*) :-
+  T(*) ,json_type:(|1|)=="array", json_each(|1|)(*) as j1, json_each(j1.value)(*) as j2 |> %(j2.key)
+
+keys(T(*))(*) :-
+  T(*) ,json_type:(|1|)=="object", json_each(|1|)(*) as j |> %(j.key)
+
+type(T(*))(*) :-
+  _type(*) : T(*) , json_valid:(T|1|)==1 |> (json_type:(|1|) as type)
+  _type(*) : T(*) , json_valid:(T|1|)!=1 |> ("invalid" as type)
+  _type(*)

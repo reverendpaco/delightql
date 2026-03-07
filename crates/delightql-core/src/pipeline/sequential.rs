@@ -83,6 +83,21 @@ pub fn compile_sequential(
         .collect();
 
     if query_spans.is_empty() {
+        // DDL-only input: no query nodes, but ddl_annotation nodes present.
+        // Feed entire source to the builder, which creates a synthetic query
+        // and attaches DDL blocks for processing during resolution.
+        let mut cursor2 = root.walk();
+        let has_ddl = root
+            .children(&mut cursor2)
+            .any(|c| c.kind() == "ddl_annotation");
+        if has_ddl {
+            let outcome = compile_single_query(source, system, config)?;
+            return Ok(vec![PerQueryResult {
+                outcome,
+                index: 0,
+                _source: source.to_string(),
+            }]);
+        }
         return Err(anyhow::anyhow!("No queries found in source"));
     }
 
@@ -301,9 +316,9 @@ pub fn process_inline_ddl_block(
         process_inline_ddl_block(&block.body, &child_ns, system)?;
     }
 
-    // Auto-enlist default namespace ("user") so definitions are immediately usable
-    if namespace == "user" {
-        let _ = system.enlist_namespace("user");
+    // Auto-enlist default namespace ("main::user") so definitions are immediately usable
+    if namespace == "main::user" {
+        let _ = system.enlist_namespace("main::user");
     }
 
     Ok(result.replaced_entities)

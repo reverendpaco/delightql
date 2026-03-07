@@ -83,6 +83,7 @@ pub fn extract_references_from_domain(expr: &DomainExpression) -> Vec<ExtractedR
 
 // --- Walkers ---
 
+#[stacksafe::stacksafe]
 fn walk_relational(expr: &RelationalExpression, refs: &mut Vec<ExtractedReference>) {
     match expr {
         RelationalExpression::Relation(rel) => walk_relation(rel, refs),
@@ -576,6 +577,7 @@ fn walk_domain_spec(spec: &DomainSpec, refs: &mut Vec<ExtractedReference>) {
     match spec {
         DomainSpec::Glob => {}
         DomainSpec::GlobWithUsing(_) => {}
+        DomainSpec::GlobWithUsingAll => {}
         DomainSpec::Positional(exprs) => {
             for expr in exprs {
                 walk_domain(expr, refs);
@@ -642,6 +644,7 @@ fn walk_unary_operator(op: &UnaryRelationalOperator, refs: &mut Vec<ExtractedRef
         UnaryRelationalOperator::Witness { .. } => {}
         UnaryRelationalOperator::Qualify => {}
         UnaryRelationalOperator::Using { .. } => {}
+        UnaryRelationalOperator::UsingAll => {}
         UnaryRelationalOperator::DmlTerminal { .. } => {}
         UnaryRelationalOperator::InteriorDrillDown { .. } => {}
         UnaryRelationalOperator::NarrowingDestructure { .. } => {}

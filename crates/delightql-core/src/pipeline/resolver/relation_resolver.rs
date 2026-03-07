@@ -37,6 +37,9 @@ pub(super) fn apply_pattern_resolver(
         }
     }
 
+    // GlobWithUsingAll: no per-column validation needed (shared cols computed at join time)
+    // — just proceed to pattern resolver which treats it like Glob
+
     // VALIDATE: GlobWithUsing columns must exist in the table
     if let ast_unresolved::DomainSpec::GlobWithUsing(using_cols) = domain_spec {
         for col_name in using_cols {
@@ -631,7 +634,7 @@ fn resolve_ground(
                 } else if let Some(grounding) = grounding {
                     // Fallback: entity not in patched namespace, search grounded namespaces.
                     // Handles inline DDL views referencing sibling entities: DataNsPatcher
-                    // rewrites sample(*) → main::sample(*), but fact lives in "user".
+                    // rewrites sample(*) → main::sample(*), but fact lives in "main::user".
                     let mut fallback_result = None;
                     for ns in &grounding.grounded_ns {
                         let gfq = super::grounding::namespace_path_to_fq(ns);
@@ -1866,6 +1869,85 @@ fn resolve_tvf(
                 outer_context,
                 config,
             );
+        }
+    }
+
+    // Resolve column ordinals in TVF arguments against outer context.
+    // Ordinals like |1| in `json_each(|1|)` must be resolved to actual column
+    // names before SQL generation, since SQL doesn't understand ordinal syntax.
+    let mut arguments = arguments;
+    if let ast_unresolved::DomainSpec::Positional(ref exprs) = first_parens_spec {
+        if let Some(context) = outer_context {
+            for (i, expr) in exprs.iter().enumerate() {
+                if let ast_unresolved::DomainExpression::ColumnOrdinal(ref ordinal_box) = expr {
+                    let ordinal = ordinal_box.get();
+                    let candidates: Vec<_> = if let Some(ref qual) = ordinal.qualifier {
+                        context
+                            .iter()
+                            .filter(|col| {
+                                matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual)
+                            })
+                            .collect()
+                    } else {
+                        context.iter().collect()
+                    };
+
+                    if candidates.is_empty() {
+                        return Err(DelightQLError::ColumnNotFoundError {
+                            column: format!("|{}|", ordinal.position),
+                            context: "No columns available for ordinal resolution in TVF argument"
+                                .to_string(),
+                        });
+                    }
+
+                    let idx = if ordinal.reverse {
+                        if ordinal.position as usize > candidates.len() {
+                            return Err(DelightQLError::ColumnNotFoundError {
+                                column: format!("|-{}|", ordinal.position),
+                                context: format!(
+                                    "Position {} from end exceeds {} available columns",
+                                    ordinal.position,
+                                    candidates.len()
+                                ),
+                            });
+                        }
+                        candidates.len() - ordinal.position as usize
+                    } else {
+                        if ordinal.position == 0 {
+                            return Err(DelightQLError::ColumnNotFoundError {
+                                column: "|0|".to_string(),
+                                context: "Column positions start at 1".to_string(),
+                            });
+                        }
+                        let pos = (ordinal.position - 1) as usize;
+                        if pos >= candidates.len() {
+                            return Err(DelightQLError::ColumnNotFoundError {
+                                column: format!("|{}|", ordinal.position),
+                                context: format!(
+                                    "Position {} exceeds {} available columns",
+                                    ordinal.position,
+                                    candidates.len()
+                                ),
+                            });
+                        }
+                        pos
+                    };
+
+                    let column = candidates[idx];
+                    let col_name = column.name().to_string();
+                    let resolved_arg = if let Some(ref qual) = ordinal.qualifier {
+                        format!("{}.{}", qual, col_name)
+                    } else if let ast_resolved::TableName::Named(ref t) = column.fq_table.name {
+                        format!("{}.{}", t, col_name)
+                    } else {
+                        col_name
+                    };
+
+                    if i < arguments.len() {
+                        arguments[i] = resolved_arg;
+                    }
+                }
+            }
         }
     }
 

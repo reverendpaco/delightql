@@ -67,6 +67,7 @@ pub(super) fn detect_interdependent_exists(predicates: &[FlatPredicate]) -> Exis
     deps
 }
 
+#[stacksafe::stacksafe]
 fn extract_table_references_from_exists(
     expr: &resolved::RelationalExpression,
     references: &mut HashSet<String>,

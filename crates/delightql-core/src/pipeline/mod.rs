@@ -536,8 +536,9 @@ impl<'a> Pipeline<'a> {
         // (skipped in sequential mode — sequential handles DDL upfront for cross-query visibility)
         if !self.skip_ddl_processing {
             for ddl in std::mem::take(&mut self.ddl_blocks) {
-                let namespace = ddl.namespace.as_deref().unwrap_or("user");
-                sequential::process_inline_ddl_block(&ddl.body, namespace, self.system).map_err(
+                let suffix = ddl.namespace.as_deref().unwrap_or("user");
+                let namespace = format!("main::{}", suffix);
+                sequential::process_inline_ddl_block(&ddl.body, &namespace, self.system).map_err(
                     |e| {
                         crate::error::DelightQLError::database_error(
                             format!("Inline DDL error: {}", e),

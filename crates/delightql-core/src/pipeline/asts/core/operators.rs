@@ -265,6 +265,12 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
     /// 3. Deduplication: remove one copy of unified column (USING semantics, not ON)
     #[lispy("unary_relational_operator:using")]
     Using { columns: Vec<String> },
+    /// Using all shared columns: .* - USING all columns shared between left and right
+    ///
+    /// Resolved at join time by computing the column-name intersection.
+    /// After resolution, expanded into explicit GlobWithUsing/Using.
+    #[lispy("unary_relational_operator:using_all")]
+    UsingAll,
     /// DML terminal: update!(table)(*), delete!(table)(*), insert!(table)(*), keep!(table)(*)
     ///
     /// The final pipe operator in a DML pipeline. Converts the upstream query

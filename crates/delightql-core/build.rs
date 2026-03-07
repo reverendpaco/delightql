@@ -145,18 +145,24 @@ fn main() {
     }
 
     // Regenerate rules parser if needed
+    // Rules grammar extends DQL grammar via require('../grammar_dql/grammar'),
+    // so changes to grammar_dql/grammar.js also invalidate grammar_rules/src/parser.c.
     let rules_parser_h = grammar_rules_src_dir.join("tree_sitter").join("parser.h");
     let should_regenerate_rules = if !grammar_rules_parser_c.exists() || !rules_parser_h.exists() {
         println!("cargo:warning=Rules parser.c or tree_sitter headers missing, generating from grammar.js");
         true
-    } else if let (Ok(js_meta), Ok(c_meta)) = (
+    } else if let (Ok(rules_js_meta), Ok(dql_js_meta), Ok(c_meta)) = (
         std::fs::metadata(&grammar_rules_js),
+        std::fs::metadata(&grammar_dql_js),
         std::fs::metadata(&grammar_rules_parser_c),
     ) {
-        let js_mod = js_meta.modified().unwrap();
+        let rules_js_mod = rules_js_meta.modified().unwrap();
+        let dql_js_mod = dql_js_meta.modified().unwrap();
         let c_mod = c_meta.modified().unwrap();
-        if js_mod > c_mod {
-            println!("cargo:warning=Rules grammar.js is newer than parser.c, regenerating");
+        // Regenerate if either the rules grammar.js or the base DQL grammar.js is newer
+        let newest_source = std::cmp::max(rules_js_mod, dql_js_mod);
+        if newest_source > c_mod {
+            println!("cargo:warning=Rules grammar source (own or DQL base) is newer than parser.c, regenerating");
             true
         } else {
             false
@@ -190,20 +196,26 @@ fn main() {
     }
 
     // Regenerate DDL parser if needed
+    // DDL grammar extends DQL grammar via require('../grammar_dql/grammar'),
+    // so changes to grammar_dql/grammar.js also invalidate grammar_ddl/src/parser.c.
     let ddl_parser_h = grammar_ddl_src_dir.join("tree_sitter").join("parser.h");
     let should_regenerate_ddl = if !grammar_ddl_parser_c.exists() || !ddl_parser_h.exists() {
         println!(
             "cargo:warning=DDL parser.c or tree_sitter headers missing, generating from grammar.js"
         );
         true
-    } else if let (Ok(js_meta), Ok(c_meta)) = (
+    } else if let (Ok(ddl_js_meta), Ok(dql_js_meta), Ok(c_meta)) = (
         std::fs::metadata(&grammar_ddl_js),
+        std::fs::metadata(&grammar_dql_js),
         std::fs::metadata(&grammar_ddl_parser_c),
     ) {
-        let js_mod = js_meta.modified().unwrap();
+        let ddl_js_mod = ddl_js_meta.modified().unwrap();
+        let dql_js_mod = dql_js_meta.modified().unwrap();
         let c_mod = c_meta.modified().unwrap();
-        if js_mod > c_mod {
-            println!("cargo:warning=DDL grammar.js is newer than parser.c, regenerating");
+        // Regenerate if either the DDL grammar.js or the base DQL grammar.js is newer
+        let newest_source = std::cmp::max(ddl_js_mod, dql_js_mod);
+        if newest_source > c_mod {
+            println!("cargo:warning=DDL grammar source (own or DQL base) is newer than parser.c, regenerating");
             true
         } else {
             false

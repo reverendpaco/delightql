@@ -82,7 +82,12 @@ pub(super) fn resolve_simple_expr(
             let name = column.name().to_string();
             Ok(ast_resolved::DomainExpression::Lvar {
                 name: name.into(),
-                qualifier: ordinal.qualifier.clone().map(|s| s.into()),
+                qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(|| {
+                    match &column.fq_table.name {
+                        ast_resolved::TableName::Named(t) => Some(t.clone().into()),
+                        _ => None,
+                    }
+                }),
                 namespace_path: crate::pipeline::asts::resolved::NamespacePath::empty(),
                 alias: ordinal.alias.clone().map(|s| s.into()),
                 provenance: ast_resolved::PhaseBox::phantom(),

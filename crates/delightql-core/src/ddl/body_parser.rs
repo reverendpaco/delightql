@@ -245,6 +245,7 @@ fn remap_query_qualifiers(query: &mut Query, remap: &HashMap<String, SqlIdentifi
     }
 }
 
+#[stacksafe::stacksafe]
 fn remap_relexpr_qualifiers(
     expr: &mut RelationalExpression,
     remap: &HashMap<String, SqlIdentifier>,
@@ -431,12 +432,19 @@ fn remap_domexpr_qualifiers(expr: &mut DomainExpression, remap: &HashMap<String,
             remap_domexpr_qualifiers(value_column, remap);
             remap_domexpr_qualifiers(pivot_key, remap);
         }
+        DomainExpression::ColumnOrdinal(ordinal_box) => {
+            let ordinal = ordinal_box.get_mut();
+            if let Some(q) = &mut ordinal.qualifier {
+                if let Some(new_q) = remap.get(q.as_str()) {
+                    *q = new_q.to_string();
+                }
+            }
+        }
         // Leaf nodes: no qualifiers to remap
         DomainExpression::Literal { .. }
         | DomainExpression::NonUnifiyingUnderscore
         | DomainExpression::ValuePlaceholder { .. }
         | DomainExpression::Substitution(_)
-        | DomainExpression::ColumnOrdinal(_)
         | DomainExpression::Projection(_) => {}
     }
 }
@@ -749,6 +757,7 @@ fn remap_operator_qualifiers(
         | UnaryRelationalOperator::Witness { .. }
         | UnaryRelationalOperator::Qualify
         | UnaryRelationalOperator::Using { .. }
+        | UnaryRelationalOperator::UsingAll
         | UnaryRelationalOperator::DmlTerminal { .. }
         | UnaryRelationalOperator::InteriorDrillDown { .. }
         | UnaryRelationalOperator::NarrowingDestructure { .. } => {}

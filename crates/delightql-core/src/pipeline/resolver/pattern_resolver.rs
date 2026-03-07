@@ -157,6 +157,9 @@ impl PatternResolver {
                 Ok(NormalizedColumnSpec::AllWithUsing(cols.clone()))
             }
 
+            // GlobWithUsingAll: USING expansion happens at the join level, not here
+            ast_unresolved::DomainSpec::GlobWithUsingAll => Ok(NormalizedColumnSpec::All),
+
             ast_unresolved::DomainSpec::Positional(exprs) => {
                 // Convert positional patterns to explicit selections
                 let selections = self.positional_to_selections(exprs, table_schema)?;

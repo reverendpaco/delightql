@@ -201,6 +201,7 @@ fn fix_operator(op: resolved::UnaryRelationalOperator) -> resolved::UnaryRelatio
         | resolved::UnaryRelationalOperator::Witness { .. }
         | resolved::UnaryRelationalOperator::Qualify
         | resolved::UnaryRelationalOperator::Using { .. }
+        | resolved::UnaryRelationalOperator::UsingAll
         | resolved::UnaryRelationalOperator::DmlTerminal { .. }
         | resolved::UnaryRelationalOperator::InteriorDrillDown { .. }
         | resolved::UnaryRelationalOperator::NarrowingDestructure { .. }
@@ -618,6 +619,7 @@ fn extract_base_relation_name(expr: &resolved::RelationalExpression) -> Option<S
 }
 
 /// Apply the inferred alias to the base relation in the subquery
+#[stacksafe::stacksafe]
 fn apply_alias_to_base_relation(
     expr: resolved::RelationalExpression,
     inferred_alias: Option<String>,
@@ -728,6 +730,7 @@ fn apply_alias_to_base_relation(
 }
 
 /// Extract all qualifiers from a relational expression
+#[stacksafe::stacksafe]
 fn extract_qualifiers_from_relational(
     expr: &resolved::RelationalExpression,
     qualifiers: &mut Vec<String>,
@@ -824,6 +827,7 @@ fn extract_qualifiers_from_operator(
         | resolved::UnaryRelationalOperator::Witness { .. }
         | resolved::UnaryRelationalOperator::Qualify
         | resolved::UnaryRelationalOperator::Using { .. }
+        | resolved::UnaryRelationalOperator::UsingAll
         | resolved::UnaryRelationalOperator::DmlTerminal { .. }
         | resolved::UnaryRelationalOperator::InteriorDrillDown { .. }
         | resolved::UnaryRelationalOperator::NarrowingDestructure { .. }

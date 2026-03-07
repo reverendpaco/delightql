@@ -137,7 +137,12 @@ pub(super) fn resolve_expressions_with_schema_internal(
                 let name = column.name().to_string();
                 resolved.push(ast_resolved::DomainExpression::Lvar {
                     name: name.into(),
-                    qualifier: ordinal.qualifier.clone().map(|s| s.into()),
+                    qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(|| {
+                        match &column.fq_table.name {
+                            ast_resolved::TableName::Named(t) => Some(t.clone().into()),
+                            _ => None,
+                        }
+                    }),
                     namespace_path: column.fq_table.parents_path.clone(),
                     alias: ordinal.alias.clone().map(|s| s.into()),
                     provenance: ast_resolved::PhaseBox::phantom(),

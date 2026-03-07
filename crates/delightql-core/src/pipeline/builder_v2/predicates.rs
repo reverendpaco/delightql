@@ -257,7 +257,15 @@ pub(super) fn parse_predicate(
         // Extract USING columns from the continuation (e.g., +orders(*.(status)))
         let (using_cols, remaining_cont) =
             super::continuation::extract_using_from_continuation(continuation_node);
-        let using_columns = using_cols.unwrap_or_default();
+        let using_columns = match using_cols {
+            Some(super::continuation::ExtractedUsing::Columns(cols)) => cols,
+            Some(super::continuation::ExtractedUsing::All) => {
+                return Err(crate::error::DelightQLError::parse_error(
+                    ".* (USING all shared columns) is not supported in inner exists predicates; use explicit .(col1, col2) instead"
+                ));
+            }
+            None => Vec::new(),
+        };
 
         let mut dummy_features = FeatureCollector::inheriting_ho_bindings(features);
         let subquery = if let Some(remaining) = remaining_cont {
@@ -516,7 +524,15 @@ pub(super) fn parse_inner_exists_as_boolean(
     // Extract USING columns from the continuation (e.g., +orders(*.(status)))
     let (using_cols, remaining_cont) =
         super::continuation::extract_using_from_continuation(continuation_node);
-    let using_columns = using_cols.unwrap_or_default();
+    let using_columns = match using_cols {
+        Some(super::continuation::ExtractedUsing::Columns(cols)) => cols,
+        Some(super::continuation::ExtractedUsing::All) => {
+            return Err(crate::error::DelightQLError::parse_error(
+                ".* (USING all shared columns) is not supported in inner exists predicates; use explicit .(col1, col2) instead"
+            ));
+        }
+        None => Vec::new(),
+    };
 
     let mut dummy_features = FeatureCollector::inheriting_ho_bindings(features);
     let subquery = if let Some(remaining) = remaining_cont {

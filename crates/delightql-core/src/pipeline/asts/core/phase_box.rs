@@ -561,6 +561,9 @@ impl PhaseBox<ColumnOrdinal, Unresolved> {
     pub fn get(&self) -> &ColumnOrdinal {
         &self.data
     }
+    pub fn get_mut(&mut self) -> &mut ColumnOrdinal {
+        &mut self.data
+    }
 }
 
 // =============================================================================

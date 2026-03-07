@@ -149,7 +149,7 @@ impl TvfArgument {
             TvfArgument::NumberLiteral(n) => n.clone(),
             TvfArgument::Identifier(id) => id.clone(),
             TvfArgument::QualifiedRef { qualifier, column } => {
-                format!("{}.{}", qualifier, column)
+                format!("\"{}\".\"{}\"", qualifier, column)
             }
         }
     }

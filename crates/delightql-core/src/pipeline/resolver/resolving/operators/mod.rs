@@ -103,6 +103,9 @@ pub(in crate::pipeline::resolver) fn resolve_operator_with_registry(
         ast_unresolved::UnaryRelationalOperator::Using { columns } => {
             schema_ops::resolve_using(columns, available)
         }
+        ast_unresolved::UnaryRelationalOperator::UsingAll => {
+            schema_ops::resolve_using_all(available)
+        }
         ast_unresolved::UnaryRelationalOperator::DmlTerminal {
             kind,
             target,

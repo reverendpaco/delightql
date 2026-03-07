@@ -105,8 +105,9 @@ pub fn transform_relation(
                         ast_addressed::DomainSpec::Glob | ast_addressed::DomainSpec::Bare => {
                             return Ok(QueryBuildState::Table(table_expr));
                         }
-                        ast_addressed::DomainSpec::GlobWithUsing(_) => {
-                            panic!("BUG: GlobWithUsing should be converted by refiner!");
+                        ast_addressed::DomainSpec::GlobWithUsing(_)
+                        | ast_addressed::DomainSpec::GlobWithUsingAll => {
+                            panic!("BUG: GlobWithUsing/GlobWithUsingAll should be converted by refiner!");
                         }
                     }
                 }
@@ -260,9 +261,9 @@ pub fn transform_relation(
                     // distinction is handled in resolver name tracking
                     Ok(QueryBuildState::Table(table_expr))
                 }
-                ast_addressed::DomainSpec::GlobWithUsing(_) => {
-                    panic!("BUG: GlobWithUsing should be converted by refiner!");
-                    // This should NEVER be reached if refiner does its job
+                ast_addressed::DomainSpec::GlobWithUsing(_)
+                | ast_addressed::DomainSpec::GlobWithUsingAll => {
+                    panic!("BUG: GlobWithUsing/GlobWithUsingAll should be converted by refiner!");
                 }
             }
         }

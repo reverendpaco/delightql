@@ -508,11 +508,9 @@ module.exports = grammar({
 
     // USING operator: .(cols) - leftward search, unify, dedupe
     // Replaces *{cols} syntax to avoid conflict with tree group {}
-    using_operator: $ => seq(
-      '.',
-      '(',
-      $.using_column_list,
-      ')'
+    using_operator: $ => choice(
+      seq('.', '(', $.using_column_list, ')'),  // .(col1, col2) — explicit USING
+      seq('.', '*'),                             // .* — USING all shared columns
     ),
 
     using_column_list: $ => seq(
@@ -1622,6 +1620,7 @@ module.exports = grammar({
       $.table_access,            // Functor args: users(*), ns.table(*)
       $.identifier,              // Scalar args: bare name, literal value
       $.qualified_column,        // Support table.column references
+      $.column_ordinal,          // Ordinal addressing: |1|, |-1|, T|2|
       $.value_placeholder,       // @ placeholder: marks where piped relation goes
       $.placeholder,             // _ underscore: skip this position (PatternResolver SKIP)
       '*',                       // Glob: enumerate all clauses (PureGround only)

@@ -6416,6 +6416,7 @@ fn register_interior_schemas_from_query(
     Ok(())
 }
 
+#[stacksafe::stacksafe]
 fn walk_relational_for_tree_groups(
     conn: &Connection,
     entity_id: i32,

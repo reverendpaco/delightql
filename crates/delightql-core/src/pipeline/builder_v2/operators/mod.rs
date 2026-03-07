@@ -183,21 +183,27 @@ fn parse_unary_operator_core(
             cpr_schema: PhaseBox::phantom(),
         })))
     } else if let Some(using_node) = node.find_child("using_operator") {
-        // Using operator: .(cols) - USING semantics (leftward search, unify, dedupe)
-        let columns = if let Some(col_list) = using_node.find_child("using_column_list") {
-            col_list
+        // Using operator: .(cols) or .* - USING semantics
+        if let Some(col_list) = using_node.find_child("using_column_list") {
+            // .(cols) — explicit USING columns
+            let columns = col_list
                 .children()
                 .filter(|c| c.kind() == "identifier")
                 .map(|c| crate::pipeline::cst::unstrop(c.text()))
-                .collect()
+                .collect();
+            RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
+                source: input,
+                operator: UnaryRelationalOperator::Using { columns },
+                cpr_schema: PhaseBox::phantom(),
+            })))
         } else {
-            Vec::new()
-        };
-        RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-            source: input,
-            operator: UnaryRelationalOperator::Using { columns },
-            cpr_schema: PhaseBox::phantom(),
-        })))
+            // .* — USING all shared columns
+            RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
+                source: input,
+                operator: UnaryRelationalOperator::UsingAll,
+                cpr_schema: PhaseBox::phantom(),
+            })))
+        }
     } else if let Some(drill_node) = node.find_child("drill_operator") {
         // Interior drill-down: .column_name(*) or .column_name(col1, col2)
         let column = drill_node

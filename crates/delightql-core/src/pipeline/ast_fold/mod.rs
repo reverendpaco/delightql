@@ -159,6 +159,7 @@ pub fn walk_domain_spec<P, F: AstFold<P> + ?Sized>(
     match spec {
         DomainSpec::Glob => Ok(DomainSpec::Glob),
         DomainSpec::GlobWithUsing(cols) => Ok(DomainSpec::GlobWithUsing(cols)),
+        DomainSpec::GlobWithUsingAll => Ok(DomainSpec::GlobWithUsingAll),
         DomainSpec::Positional(exprs) => {
             let folded = exprs
                 .into_iter()
@@ -866,6 +867,7 @@ pub fn walk_operator<P, F: AstFold<P> + ?Sized>(
         op @ UnaryRelationalOperator::Witness { .. } => Ok(op),
         UnaryRelationalOperator::Qualify => Ok(UnaryRelationalOperator::Qualify),
         op @ UnaryRelationalOperator::Using { .. } => Ok(op),
+        UnaryRelationalOperator::UsingAll => Ok(UnaryRelationalOperator::UsingAll),
         op @ UnaryRelationalOperator::InteriorDrillDown { .. } => Ok(op),
         op @ UnaryRelationalOperator::NarrowingDestructure { .. } => Ok(op),
         // DirectiveTerminal: fold arguments, preserve name

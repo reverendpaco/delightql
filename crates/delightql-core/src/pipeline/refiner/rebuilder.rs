@@ -925,9 +925,11 @@ fn build_ground_relation(
     schema_box: PhaseBox<CprSchema, refined::Refined>,
 ) -> refined::RelationalExpression {
     let domain_spec = match &table.domain_spec {
-        // GlobWithUsing: USING columns already extracted into join predicates by analyzer.
-        // Revert to plain Glob for SQL generation.
-        resolved::DomainSpec::GlobWithUsing(_) => resolved::DomainSpec::Glob,
+        // GlobWithUsing/GlobWithUsingAll: USING columns already extracted into join
+        // predicates by analyzer. Revert to plain Glob for SQL generation.
+        resolved::DomainSpec::GlobWithUsing(_) | resolved::DomainSpec::GlobWithUsingAll => {
+            resolved::DomainSpec::Glob
+        }
         // Glob/Positional/Bare: pass through unchanged.
         // Positional must survive — transformer uses it to generate column renames.
         resolved::DomainSpec::Glob => resolved::DomainSpec::Glob,

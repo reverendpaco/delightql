@@ -3,6 +3,7 @@ pub const STDLIB_MODULES: &[(&str, &str)] = &[
     ("std::constants", include_str!("../autoload/std/constants.dql")),
     ("std::help", include_str!("../autoload/std/help.dql")),
     ("std::info", include_str!("../autoload/std/info.dql")),
+    ("std::json", include_str!("../autoload/std/json.dql")),
     ("std::reshape", include_str!("../autoload/std/reshape.dql")),
     ("std::string", include_str!("../autoload/std/string.dql")),
     ("sys::build", include_str!("../autoload/sys/build.dql")),

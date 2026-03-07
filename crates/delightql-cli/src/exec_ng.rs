@@ -158,6 +158,48 @@ fn display_results(
     })
 }
 
+/// Stream raw cell bytes to stdout (no text conversion, no formatting).
+fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<ResultMetadata> {
+    use delightql_protocol::cell_content_bytes;
+    use std::io::Write;
+
+    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+    let mut stdout = std::io::stdout().lock();
+    let mut total_rows = 0usize;
+
+    loop {
+        let fr = session
+            .fetch(&qr.handle, 100)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        if fr.finished {
+            break;
+        }
+
+        for row in &fr.rows {
+            for cell in row {
+                if let Some(bytes) = cell {
+                    stdout.write_all(cell_content_bytes(bytes))?;
+                }
+                // NULL → zero bytes (nothing written)
+            }
+        }
+        total_rows += fr.rows.len();
+    }
+
+    stdout.flush()?;
+
+    let _ = session
+        .close(qr.handle)
+        .map_err(|e| anyhow::anyhow!("{}", e));
+
+    Ok(ResultMetadata {
+        columns,
+        row_count: total_rows,
+    })
+}
+
 /// Run a DQL query and return structured results (no display).
 pub fn run_dql_query(dql: &str, session: &mut dyn DqlSession) -> Result<QueryResults> {
     fetch_all(session, dql)
@@ -251,6 +293,11 @@ fn execute_single_query(
         None | Some(Stage::Results) => source_code.to_string(),
     };
 
+    if output_format == OutputFormat::Raw {
+        let meta = display_results_raw(session, &dql)?;
+        return Ok(Some(meta));
+    }
+
     let meta = display_results(
         session,
         &dql,
@@ -266,5 +313,8 @@ fn execute_single_query(
 fn compile_stage_dql(stage: &str, source: &str) -> String {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(source.as_bytes());
-    format!("sys::execution.compile(\"{}\", b64:\"{}\")", stage, encoded)
+    format!(
+        "sys::execution.compile(\"{}\", b64:\"{}\") |> (representation)",
+        stage, encoded
+    )
 }

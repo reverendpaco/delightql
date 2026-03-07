@@ -228,6 +228,7 @@ pub(super) fn process_using_operators(
 }
 
 /// Recursively search a pipe expression for a Using operator and extract its columns
+#[stacksafe::stacksafe]
 fn extract_using_columns_from_pipe(expr: &resolved::RelationalExpression) -> Option<Vec<String>> {
     match expr {
         resolved::RelationalExpression::Pipe(pipe) => {

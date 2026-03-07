@@ -19,6 +19,7 @@ pub struct PipeSegment<Phase> {
 ///
 /// The returned segments are in source-code order (left-to-right): `[B, C]`.
 /// The base expression `A` is the non-Pipe root.
+#[stacksafe::stacksafe]
 pub fn collect_pipe_chain<Phase>(
     expr: RelationalExpression<Phase>,
 ) -> (RelationalExpression<Phase>, Vec<PipeSegment<Phase>>) {

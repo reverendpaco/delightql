@@ -73,6 +73,7 @@ pub(in super::super) fn extract_inline_using_columns(
                 // Glob: table(*), Positional: table(a, b), Bare: natural join marker.
                 // None of these carry USING columns.
                 ast_resolved::DomainSpec::Glob
+                | ast_resolved::DomainSpec::GlobWithUsingAll
                 | ast_resolved::DomainSpec::Positional(_)
                 | ast_resolved::DomainSpec::Bare => None,
             },

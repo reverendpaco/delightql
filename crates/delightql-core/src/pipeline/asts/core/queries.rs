@@ -175,7 +175,7 @@ pub struct OptionSpec {
 pub struct InlineDdlSpec {
     /// The raw DDL body text (view definitions, rules, etc.)
     pub body: String,
-    /// Optional namespace for the definitions (default: "user")
+    /// Optional namespace suffix for the definitions (default: "user", resolved to "main::user")
     pub namespace: Option<String>,
 }
 

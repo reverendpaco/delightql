@@ -1002,6 +1002,7 @@ pub fn wrap_with_explicit_columns_unified(
 }
 
 /// Extract the alias from an operand
+#[stacksafe::stacksafe]
 pub fn extract_operand_alias(operand: &ast_addressed::RelationalExpression) -> Option<String> {
     match operand {
         ast_addressed::RelationalExpression::Relation(rel) => match rel {
@@ -1017,6 +1018,7 @@ pub fn extract_operand_alias(operand: &ast_addressed::RelationalExpression) -> O
 }
 
 /// Recursively collect all aliases from an operand (including nested SetOperations)
+#[stacksafe::stacksafe]
 pub fn collect_all_aliases_from_operand(
     operand: &ast_addressed::RelationalExpression,
 ) -> Vec<String> {

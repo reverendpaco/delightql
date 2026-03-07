@@ -495,6 +495,22 @@ pub(super) fn resolve_using(
     ))
 }
 
+/// Resolve the UsingAll operator: .*
+///
+/// At the pipe level, UsingAll is a pass-through — the actual shared-column
+/// computation happens at join time in the resolver's join handler.
+pub(super) fn resolve_using_all(
+    available: &[ast_resolved::ColumnMetadata],
+) -> Result<(
+    ast_resolved::UnaryRelationalOperator,
+    Vec<ast_resolved::ColumnMetadata>,
+)> {
+    Ok((
+        ast_resolved::UnaryRelationalOperator::UsingAll,
+        available.to_vec(),
+    ))
+}
+
 /// Resolve the DmlTerminal operator
 ///
 /// DML terminals (delete!, update!, insert!, keep!) transform the upstream query
@@ -537,6 +553,9 @@ pub(super) fn resolve_dml_terminal(
         ast_unresolved::DomainSpec::Glob => ast_resolved::DomainSpec::Glob,
         ast_unresolved::DomainSpec::GlobWithUsing(cols) => {
             ast_resolved::DomainSpec::GlobWithUsing(cols)
+        }
+        ast_unresolved::DomainSpec::GlobWithUsingAll => {
+            ast_resolved::DomainSpec::GlobWithUsingAll
         }
         ast_unresolved::DomainSpec::Positional(exprs) => {
             let resolved = super::super::domain_expressions::resolve_expressions_with_schema(

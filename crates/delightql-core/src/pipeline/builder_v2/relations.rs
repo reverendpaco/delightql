@@ -428,6 +428,9 @@ fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<DomainExpres
                 let table_name = child.field_text("table").unwrap_or_default();
                 return Ok(DomainExpression::lvar_builder(table_name).build());
             }
+            "column_ordinal" => {
+                return super::expressions::parse_column_ordinal(child);
+            }
             "value_placeholder" => {
                 return Ok(DomainExpression::ValuePlaceholder { alias: None });
             }
@@ -1079,6 +1082,7 @@ fn parse_sparse_fill_node(
 ///
 /// Returns None if the subquery is too complex to collapse (e.g., pipes,
 /// filters, projections, meta-ize).
+#[stacksafe::stacksafe]
 fn try_collapse_to_domain_spec(subquery: &RelationalExpression) -> Option<DomainSpec> {
     match subquery {
         RelationalExpression::Pipe(pipe) => {
@@ -1102,6 +1106,15 @@ fn try_collapse_to_domain_spec(subquery: &RelationalExpression) -> Option<Domain
                     }),
                     UnaryRelationalOperator::Using { columns },
                 ) => Some(DomainSpec::GlobWithUsing(columns.clone())),
+
+                // Pattern 2b: table() .* → GlobWithUsingAll
+                (
+                    RelationalExpression::Relation(Relation::Ground {
+                        domain_spec: DomainSpec::Bare,
+                        ..
+                    }),
+                    UnaryRelationalOperator::UsingAll,
+                ) => Some(DomainSpec::GlobWithUsingAll),
 
                 // Pattern 3: table() *.(cols) → GlobWithUsing(cols)
                 // Using operator on top of Qualify on a bare Ground relation
@@ -1131,12 +1144,31 @@ fn try_collapse_to_domain_spec(subquery: &RelationalExpression) -> Option<Domain
                                     // Glob, Positional, Bare can't be extended with USING columns
                                     DomainSpec::Glob
                                     | DomainSpec::Positional(_)
-                                    | DomainSpec::Bare => None,
+                                    | DomainSpec::Bare
+                                    | DomainSpec::GlobWithUsingAll => None,
                                 }
                             } else {
                                 None
                             }
                         }
+                    }
+                }
+
+                // Pattern 3b: table() *.* → GlobWithUsingAll
+                // UsingAll operator on top of Qualify on a bare Ground relation
+                (
+                    RelationalExpression::Pipe(inner_pipe),
+                    UnaryRelationalOperator::UsingAll,
+                ) => {
+                    match (&inner_pipe.source, &inner_pipe.operator) {
+                        (
+                            RelationalExpression::Relation(Relation::Ground {
+                                domain_spec: DomainSpec::Bare,
+                                ..
+                            }),
+                            UnaryRelationalOperator::Qualify,
+                        ) => Some(DomainSpec::GlobWithUsingAll),
+                        _ => None,
                     }
                 }
 
@@ -1161,6 +1193,7 @@ fn try_collapse_to_domain_spec(subquery: &RelationalExpression) -> Option<Domain
 
 /// Apply an alias to a `RelationalExpression` by setting the alias field
 /// on the innermost `Relation` variant.
+#[stacksafe::stacksafe]
 fn apply_alias_to_relational_expr(expr: &mut RelationalExpression, alias: String) {
     match expr {
         RelationalExpression::Relation(rel) => match rel {

@@ -74,6 +74,19 @@ fn table_expression_alias(table: &TableExpression) -> Option<String> {
     }
 }
 
+/// Extract the alias from an anonymous table's TableExpression.
+/// Values and UnionTable always have an alias (user-provided or auto-generated).
+pub(super) fn anon_table_alias(table: &TableExpression) -> String {
+    match table {
+        TableExpression::Values { alias, .. }
+        | TableExpression::UnionTable { alias, .. } => alias.clone(),
+        other => panic!(
+            "anon_table_alias called on non-anonymous: {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
 /// Convert join condition to SQL, handling both ON and USING
 pub fn convert_join_condition(
     join_condition: Option<ast_addressed::BooleanExpression>,
@@ -284,31 +297,14 @@ pub fn transform_join(
 
         // Case 1b: Anonymous table on left with regular table on right
         (QueryBuildState::AnonymousTable(anon_table), QueryBuildState::Table(mut right_table)) => {
-            // Anonymous table needs to be wrapped as subquery
-            let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table.clone()))?;
-            let left_alias = next_alias();
+            // Reuse the alias already stored in the anonymous table
+            let left_alias = anon_table_alias(&anon_table);
+            let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
             let left_subquery = TableExpression::subquery(query, &left_alias);
 
-            // Build local remappings for anonymous table alias
-            let mut local_remaps = HashMap::new();
-            if let Some(orig) = match &anon_table {
-                TableExpression::Values { alias, .. }
-                | TableExpression::UnionTable { alias, .. } => Some(alias.clone()),
-                other => panic!(
-                    "catch-all hit in join_handler.rs apply_join Case 1b (anon_table alias): {:?}",
-                    other
-                ),
-            } {
-                local_remaps.insert(orig, left_alias.clone());
-            }
-
-            // Resolve TVF argument qualifiers through local + context remappings
+            // Resolve TVF argument qualifiers through context remappings
             if let TableExpression::TVF { arguments, .. } = &mut right_table {
-                let all_remaps = {
-                    let mut m = (*ctx.alias_remappings).clone();
-                    m.extend(local_remaps.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    m
-                };
+                let all_remaps = (*ctx.alias_remappings).clone();
                 *arguments = arguments
                     .iter()
                     .map(|arg| arg.resolve_qualifier(|q| all_remaps.get(q).cloned()))
@@ -316,14 +312,13 @@ pub fn transform_join(
             }
 
             // Determine join type and condition - pass left alias for CPR replacement
-            let join_ctx = ctx.with_additional_remappings(&local_remaps);
             let (sql_join_type, sql_condition) = convert_join_condition(
                 join_condition,
                 &join_type,
                 Some(&left_alias),
                 None,
                 &cpr_schema,
-                &join_ctx,
+                ctx,
             )?;
 
             // Create JoinChain with subquery and table
@@ -340,29 +335,16 @@ pub fn transform_join(
                 limit_offset: None,
                 cpr_schema: cpr_schema.clone(),
                 dialect: ctx.dialect,
-                remappings: local_remaps,
+                remappings: HashMap::new(),
             })
         }
 
         // Case 1c: Regular table on left with anonymous table on right
         (QueryBuildState::Table(left_table), QueryBuildState::AnonymousTable(anon_table)) => {
-            // Anonymous table needs to be wrapped as subquery
-            let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table.clone()))?;
-            let right_alias = next_alias();
+            // Reuse the alias already stored in the anonymous table
+            let right_alias = anon_table_alias(&anon_table);
+            let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
             let right_subquery = TableExpression::subquery(query, &right_alias);
-
-            // Build local remappings if anonymous table had an alias
-            let mut local_remaps = HashMap::new();
-            if let Some(orig) = match &anon_table {
-                TableExpression::Values { alias, .. }
-                | TableExpression::UnionTable { alias, .. } => Some(alias.clone()),
-                other => panic!(
-                    "catch-all hit in join_handler.rs apply_join Case 1c (anon_table alias): {:?}",
-                    other
-                ),
-            } {
-                local_remaps.insert(orig, right_alias.clone());
-            }
 
             // Extract alias from left table so join condition can properly
             // qualify left-side columns (important when left is a subquery
@@ -370,14 +352,13 @@ pub fn transform_join(
             let left_alias = table_expression_alias(&left_table);
 
             // Determine join type and condition
-            let join_ctx = ctx.with_additional_remappings(&local_remaps);
             let (sql_join_type, sql_condition) = convert_join_condition(
                 join_condition,
                 &join_type,
                 left_alias.as_deref(),
                 Some(&right_alias),
                 &cpr_schema,
-                &join_ctx,
+                ctx,
             )?;
 
             // Create JoinChain with table and subquery
@@ -394,7 +375,7 @@ pub fn transform_join(
                 limit_offset: None,
                 cpr_schema: cpr_schema.clone(),
                 dialect: ctx.dialect,
-                remappings: local_remaps,
+                remappings: HashMap::new(),
             })
         }
 
@@ -403,14 +384,15 @@ pub fn transform_join(
             QueryBuildState::AnonymousTable(left_anon),
             QueryBuildState::AnonymousTable(right_anon),
         ) => {
-            // Both anonymous tables need to be wrapped as subqueries
-            let left_query = finalize_to_query(QueryBuildState::AnonymousTable(left_anon.clone()))?;
-            let left_alias = next_alias();
+            // Reuse the aliases already stored in both anonymous tables
+            let left_alias = anon_table_alias(&left_anon);
+            let right_alias = anon_table_alias(&right_anon);
+
+            let left_query = finalize_to_query(QueryBuildState::AnonymousTable(left_anon))?;
             let left_subquery = TableExpression::subquery(left_query, &left_alias);
 
             let right_query =
-                finalize_to_query(QueryBuildState::AnonymousTable(right_anon.clone()))?;
-            let right_alias = next_alias();
+                finalize_to_query(QueryBuildState::AnonymousTable(right_anon))?;
             let right_subquery = TableExpression::subquery(right_query, &right_alias);
 
             // Determine join type and condition - pass both aliases for CPR replacement
@@ -506,9 +488,9 @@ pub fn transform_join(
             },
             QueryBuildState::AnonymousTable(anon_table),
         ) => {
-            // Anonymous table needs to be wrapped as subquery
-            let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table.clone()))?;
-            let right_alias = next_alias();
+            // Reuse the alias already stored in the anonymous table
+            let right_alias = anon_table_alias(&anon_table);
+            let query = finalize_to_query(QueryBuildState::AnonymousTable(anon_table))?;
             let right_subquery = TableExpression::subquery(query, &right_alias);
 
             // Determine join type and condition - use remappings from left segment

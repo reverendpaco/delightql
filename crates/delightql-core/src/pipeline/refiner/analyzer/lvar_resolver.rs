@@ -82,6 +82,7 @@ fn extract_lvars_from_domain_spec(spec: &resolved::DomainSpec) -> Vec<(String, u
         // GlobWithUsing's columns are handled separately via the USING join mechanism.
         resolved::DomainSpec::Glob
         | resolved::DomainSpec::GlobWithUsing(_)
+        | resolved::DomainSpec::GlobWithUsingAll
         | resolved::DomainSpec::Bare => Vec::new(),
     }
 }

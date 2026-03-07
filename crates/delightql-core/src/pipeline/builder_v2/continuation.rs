@@ -266,14 +266,30 @@ fn apply_comma(
                 let remaining_cont = if let Some(cont) = right.find_child("relational_continuation")
                 {
                     let (using_columns, remaining) = extract_using_from_continuation(cont);
-                    if let Some(cols) = using_columns {
-                        if matches!(
-                            &table_expr,
-                            RelationalExpression::Relation(Relation::Ground { .. })
-                        ) {
-                            table_expr = apply_using_columns_to_rel_expr(table_expr, cols);
-                        } else {
-                            using_for_join = Some(cols);
+                    if let Some(extracted) = using_columns {
+                        match extracted {
+                            ExtractedUsing::Columns(cols) => {
+                                if matches!(
+                                    &table_expr,
+                                    RelationalExpression::Relation(Relation::Ground { .. })
+                                ) {
+                                    table_expr = apply_using_columns_to_rel_expr(table_expr, cols);
+                                } else {
+                                    using_for_join = Some(cols);
+                                }
+                            }
+                            ExtractedUsing::All => {
+                                if matches!(
+                                    &table_expr,
+                                    RelationalExpression::Relation(Relation::Ground { .. })
+                                ) {
+                                    table_expr = apply_using_all_to_rel_expr(table_expr);
+                                } else {
+                                    return Err(DelightQLError::parse_error(
+                                        ".* (USING all shared columns) is only supported on table references, not subqueries or anonymous tables"
+                                    ));
+                                }
+                            }
                         }
                     }
                     remaining
@@ -1039,18 +1055,35 @@ fn count_terminal_pred_filters(expr: &RelationalExpression) -> usize {
 ///   `users() *.(id).(name)` → USING (id, name)
 pub(super) fn extract_using_from_continuation(
     cont: CstNode,
-) -> (Option<Vec<String>>, Option<CstNode>) {
+) -> (Option<ExtractedUsing>, Option<CstNode>) {
     let mut all_columns: Vec<String> = Vec::new();
     extract_using_inductive(cont, &mut all_columns)
+}
+
+/// Distinguishes explicit USING columns from USING-all (.*)
+pub(super) enum ExtractedUsing {
+    Columns(Vec<String>),
+    All,
 }
 
 /// Recursive helper: walk the continuation chain, collecting Using columns.
 fn extract_using_inductive<'a>(
     cont: CstNode<'a>,
     accumulated: &mut Vec<String>,
-) -> (Option<Vec<String>>, Option<CstNode<'a>>) {
+) -> (Option<ExtractedUsing>, Option<CstNode<'a>>) {
     if let Some(unary) = cont.find_child("unary_operator_expression") {
         if let Some(using_node) = unary.find_child("using_operator") {
+            // Check for .* form (no using_column_list child)
+            if using_node.find_child("using_column_list").is_none() {
+                // .* — USING all shared columns
+                // Recurse to consume remaining continuations
+                if let Some(nested_cont) = unary.find_child("relational_continuation") {
+                    // Any further .(cols) after .* is unusual but we return All
+                    return (Some(ExtractedUsing::All), Some(nested_cont));
+                }
+                return (Some(ExtractedUsing::All), None);
+            }
+
             // Extract column names from this .(cols) operator
             if let Some(col_list) = using_node.find_child("using_column_list") {
                 for child in col_list.children() {
@@ -1069,7 +1102,7 @@ fn extract_using_inductive<'a>(
             let cols = if accumulated.is_empty() {
                 None
             } else {
-                Some(accumulated.clone())
+                Some(ExtractedUsing::Columns(accumulated.clone()))
             };
             return (cols, None);
         }
@@ -1088,7 +1121,7 @@ fn extract_using_inductive<'a>(
     let cols = if accumulated.is_empty() {
         None
     } else {
-        Some(accumulated.clone())
+        Some(ExtractedUsing::Columns(accumulated.clone()))
     };
     (cols, Some(cont))
 }
@@ -1137,6 +1170,36 @@ fn apply_using_columns_to_rel_expr(
         // For other expression types, panic to surface unexpected variant
         other => {
             panic!("catch-all hit in builder_v2/continuation.rs apply_using_to_expr RelationalExpression: {:?}", other)
+        }
+    }
+}
+
+/// Apply USING-all (.* ) to a Ground relation by setting domain_spec to GlobWithUsingAll
+fn apply_using_all_to_rel_expr(expr: RelationalExpression) -> RelationalExpression {
+    match expr {
+        RelationalExpression::Relation(Relation::Ground {
+            identifier,
+            canonical_name,
+            domain_spec: _,
+            alias,
+            cpr_schema,
+            outer,
+            mutation_target,
+            passthrough,
+            hygienic_injections,
+        }) => RelationalExpression::Relation(Relation::Ground {
+            identifier,
+            canonical_name,
+            domain_spec: DomainSpec::GlobWithUsingAll,
+            alias,
+            cpr_schema,
+            outer,
+            mutation_target,
+            passthrough,
+            hygienic_injections,
+        }),
+        other => {
+            panic!("catch-all hit in builder_v2/continuation.rs apply_using_all_to_rel_expr: {:?}", other)
         }
     }
 }

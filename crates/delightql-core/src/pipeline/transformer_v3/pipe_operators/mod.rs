@@ -152,7 +152,9 @@ pub fn apply_pipe_operator_unified(
     // and .(cols) accumulates at the builder level, so if a Qualify/Using pipe
     // reaches the transformer, just pass through without wrapping in a subquery.
     match &operator {
-        UnaryRelationalOperator::Qualify | UnaryRelationalOperator::Using { .. } => {
+        UnaryRelationalOperator::Qualify
+        | UnaryRelationalOperator::Using { .. }
+        | UnaryRelationalOperator::UsingAll => {
             return finalize_to_query(source_state).map(QueryBuildState::Expression);
         }
         UnaryRelationalOperator::DmlTerminal {
@@ -193,8 +195,9 @@ pub fn apply_pipe_operator_unified(
         QueryBuildState::AnonymousTable(table) => {
             // Anonymous tables should be wrapped when used as pipe source
             // This ensures they maintain their subquery structure
+            // Extract alias before the table is moved into finalize_to_query
+            let alias = super::join_handler::anon_table_alias(&table);
             let query = finalize_to_query(QueryBuildState::AnonymousTable(table))?;
-            let alias = next_alias();
             (
                 SelectStatement::builder()
                     .select(SelectItem::star())
@@ -496,9 +499,11 @@ pub fn apply_pipe_operator_unified(
                 Box::new(select),
             )))
         }
-        // Qualify and Using: handled by early return above (no-ops at SQL level)
-        UnaryRelationalOperator::Qualify | UnaryRelationalOperator::Using { .. } => {
-            unreachable!("Qualify/Using short-circuited above")
+        // Qualify, Using, UsingAll: handled by early return above (no-ops at SQL level)
+        UnaryRelationalOperator::Qualify
+        | UnaryRelationalOperator::Using { .. }
+        | UnaryRelationalOperator::UsingAll => {
+            unreachable!("Qualify/Using/UsingAll short-circuited above")
         }
         UnaryRelationalOperator::DmlTerminal { .. } => {
             unreachable!("DmlTerminal short-circuited above")

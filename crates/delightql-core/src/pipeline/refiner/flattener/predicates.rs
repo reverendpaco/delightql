@@ -270,6 +270,7 @@ pub(super) fn extract_from_domain(
 }
 
 /// Extract references from a RelationalExpression (for InnerExists)
+#[stacksafe::stacksafe]
 pub(super) fn extract_refs_from_relational(
     expr: &resolved::RelationalExpression,
     qualified: &mut HashSet<String>,

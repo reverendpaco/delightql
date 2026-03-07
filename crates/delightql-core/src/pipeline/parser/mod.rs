@@ -127,6 +127,13 @@ pub fn split_queries(source: &str) -> Result<Vec<String>> {
         .collect();
 
     if queries.is_empty() {
+        let mut cursor2 = root.walk();
+        let has_ddl = root
+            .children(&mut cursor2)
+            .any(|c| c.kind() == "ddl_annotation");
+        if has_ddl {
+            return Ok(vec![source.to_string()]);
+        }
         return Err(DelightQLError::parse_error("no queries found in source"));
     }
     Ok(queries)

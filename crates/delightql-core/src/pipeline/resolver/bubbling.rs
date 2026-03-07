@@ -99,6 +99,11 @@ pub(super) fn bubble_unary_operator(
             ast_unresolved::UnaryRelationalOperator::Using { columns },
             BubbledState::resolved(Vec::new()),
         )),
+        // UsingAll has no expressions to bubble - validated at join time
+        ast_unresolved::UnaryRelationalOperator::UsingAll => Ok((
+            ast_unresolved::UnaryRelationalOperator::UsingAll,
+            BubbledState::resolved(Vec::new()),
+        )),
         // DmlTerminal has no expressions to bubble - target is a string literal
         ast_unresolved::UnaryRelationalOperator::DmlTerminal {
             kind,
