@@ -9,6 +9,13 @@ use crate::pipeline::sql_ast_v3::{ColumnQualifier, DomainExpression};
 pub struct QualifierMint(());
 
 impl QualifierMint {
+    /// Escape hatch for DML statement construction (DELETE/UPDATE/INSERT).
+    /// DML builders need to construct qualified column references for
+    /// generated subqueries (e.g., EXISTS ... IS NOT DISTINCT FROM).
+    pub(in crate::pipeline) fn for_dml() -> Self {
+        QualifierMint(())
+    }
+
     /// Test-only escape hatch for code outside transformer_v3.
     #[cfg(test)]
     pub fn for_test() -> Self {

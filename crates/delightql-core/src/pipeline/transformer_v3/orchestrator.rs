@@ -227,12 +227,10 @@ pub fn transform_query_with_options(
                         })),
                 );
                 let state = transform_relational(main_query, &ctx)?;
-                let main_sql = finalize_to_query(state)?;
 
                 // Check if main query generated intermediate CTEs (e.g., premelt for melt patterns)
                 let generated_ctes = ctx.generated_ctes.borrow().clone();
                 let combined_ctes = if !generated_ctes.is_empty() {
-                    // Combine user CTEs and generated CTEs into a single list
                     let mut all_ctes = sql_ctes;
                     all_ctes.extend(generated_ctes);
                     all_ctes
@@ -240,6 +238,21 @@ pub fn transform_query_with_options(
                     sql_ctes
                 };
 
+                // DML statements (delete!/keep!/insert!/update!) are already
+                // SqlStatements — attach CTEs directly instead of finalizing.
+                if let QueryBuildState::DmlStatement(mut dml_stmt) = state {
+                    match &mut dml_stmt {
+                        SqlStatement::Delete { with_clause, .. }
+                        | SqlStatement::Update { with_clause, .. }
+                        | SqlStatement::Insert { with_clause, .. } => {
+                            *with_clause = Some(combined_ctes);
+                        }
+                        _ => {}
+                    }
+                    return Ok(dml_stmt);
+                }
+
+                let main_sql = finalize_to_query(state)?;
                 Ok(SqlStatement::with_ctes(Some(combined_ctes), main_sql))
             } else {
                 // New behavior: inline CTEs as subqueries
@@ -276,6 +289,13 @@ pub fn transform_query_with_options(
                         })),
                 );
                 let state = transform_relational(main_query, &ctx)?;
+
+                // DML statements are already SqlStatements — return directly
+                // (inlined CTEs are already resolved in the subqueries)
+                if let QueryBuildState::DmlStatement(dml_stmt) = state {
+                    return Ok(dml_stmt);
+                }
+
                 let main_query_expr = finalize_to_query(state)?;
 
                 // Wrap in SqlStatement - no WITH clause since CTEs are inlined
@@ -354,6 +374,11 @@ pub fn transform_query_with_options(
                             })),
                     );
                     let state = transform_relational(expr, &ctx)?;
+
+                    if let QueryBuildState::DmlStatement(dml_stmt) = state {
+                        return Ok(dml_stmt);
+                    }
+
                     let query = finalize_to_query(state)?;
 
                     // Apply post-processing steps (same as transform() function)
@@ -397,12 +422,10 @@ pub fn transform_query_with_options(
                                 })),
                         );
                         let state = transform_relational(main_query, &ctx)?;
-                        let main_sql = finalize_to_query(state)?;
 
                         // Check if main query generated intermediate CTEs (e.g., premelt for melt patterns)
                         let generated_ctes = ctx.generated_ctes.borrow().clone();
                         let combined_ctes = if !generated_ctes.is_empty() {
-                            // Combine user CTEs and generated CTEs into a single list
                             let mut all_ctes = sql_ctes;
                             all_ctes.extend(generated_ctes);
                             all_ctes
@@ -410,6 +433,19 @@ pub fn transform_query_with_options(
                             sql_ctes
                         };
 
+                        if let QueryBuildState::DmlStatement(mut dml_stmt) = state {
+                            match &mut dml_stmt {
+                                SqlStatement::Delete { with_clause, .. }
+                                | SqlStatement::Update { with_clause, .. }
+                                | SqlStatement::Insert { with_clause, .. } => {
+                                    *with_clause = Some(combined_ctes);
+                                }
+                                _ => {}
+                            }
+                            return Ok(dml_stmt);
+                        }
+
+                        let main_sql = finalize_to_query(state)?;
                         Ok(SqlStatement::with_ctes(Some(combined_ctes), main_sql))
                     } else {
                         let mut cte_map = std::collections::HashMap::new();
@@ -439,6 +475,11 @@ pub fn transform_query_with_options(
                                 })),
                         );
                         let state = transform_relational(main_query, &ctx)?;
+
+                        if let QueryBuildState::DmlStatement(dml_stmt) = state {
+                            return Ok(dml_stmt);
+                        }
+
                         let main_query_expr = finalize_to_query(state)?;
 
                         Ok(SqlStatement::Query {

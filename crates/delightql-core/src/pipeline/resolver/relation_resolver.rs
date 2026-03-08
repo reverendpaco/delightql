@@ -1675,7 +1675,8 @@ pub(super) fn resolve_tvf(
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+    mut join_input: Option<ast_unresolved::RelationalExpression>,
+) -> Result<(ast_resolved::RelationalExpression, BubbledState, bool)> {
     let ast_unresolved::Relation::TVF {
         function,
         arguments,
@@ -1751,11 +1752,13 @@ pub(super) fn resolve_tvf(
                         &scalar_spec,
                         table_bindings,
                         None,
+                        join_input.take(),
                         Some(&grounding.data_ns),
                         grounding,
                         registry,
                         outer_context,
                         config,
+                        alias.clone(),
                     );
                 }
             }
@@ -1797,11 +1800,13 @@ pub(super) fn resolve_tvf(
                         &scalar_spec,
                         table_bindings,
                         None,
+                        join_input.take(),
                         None,
                         &ho_grounding,
                         registry,
                         outer_context,
                         &ho_config,
+                        alias.clone(),
                     );
                 }
             }
@@ -1835,11 +1840,13 @@ pub(super) fn resolve_tvf(
                 &scalar_spec,
                 table_bindings,
                 None,
+                join_input.take(),
                 None,
                 &ho_grounding,
                 registry,
                 outer_context,
                 config,
+                alias.clone(),
             );
         }
     }
@@ -1991,6 +1998,7 @@ pub(super) fn resolve_tvf(
     Ok((
         ast_resolved::RelationalExpression::Relation(resolved),
         state,
+        false,
     ))
 }
 
@@ -2097,13 +2105,22 @@ pub(super) fn ho_view_query_to_relational(
     resolved_query: ast_resolved::Query,
     bubbled: super::BubbledState,
     view_name: &str,
+    user_alias: Option<SqlIdentifier>,
 ) -> crate::error::Result<(ast_resolved::RelationalExpression, super::BubbledState)> {
     match resolved_query {
-        ast_resolved::Query::Relational(expr) => Ok((expr, bubbled)),
+        ast_resolved::Query::Relational(expr) => {
+            if let Some(ref alias) = user_alias {
+                let bubbled = relabel_bubbled_with_alias(bubbled, alias);
+                Ok((expr, bubbled))
+            } else {
+                Ok((expr, bubbled))
+            }
+        }
         query_with_ctes => {
             let body_schema =
                 super::helpers::extraction::extract_cpr_schema_from_query(&query_with_ctes)?;
-            let alias: SqlIdentifier = crate::pipeline::transformer_v3::next_alias().into();
+            let alias: SqlIdentifier =
+                user_alias.unwrap_or_else(|| crate::pipeline::transformer_v3::next_alias().into());
             let bubbled = relabel_bubbled_with_alias(bubbled, &alias);
             let scoped = ast_resolved::ScopedSchema::bind(body_schema, alias.clone());
             Ok((
@@ -2216,14 +2233,20 @@ pub(super) fn expand_ho_view(
     function: &str,
     entity: &crate::resolution::registry::ConsultedEntity,
     scalar_spec: &ast_unresolved::DomainSpec,
-    table_bindings: crate::pipeline::query_features::HoParamBindings,
+    mut table_bindings: crate::pipeline::query_features::HoParamBindings,
     pipe_source: Option<ast_unresolved::RelationalExpression>,
+    join_input: Option<ast_unresolved::RelationalExpression>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
     grounding: &ast_unresolved::GroundedPath,
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, super::BubbledState)> {
+    user_alias: Option<SqlIdentifier>,
+) -> Result<(
+    ast_resolved::RelationalExpression,
+    super::BubbledState,
+    bool,
+)> {
     log::debug!(
         "Expanding HO view '{}' (unified) from namespace '{}'",
         function,
@@ -2232,6 +2255,11 @@ pub(super) fn expand_ho_view(
 
     // Validate arity for argumentative params that received table references.
     super::grounding::validate_argumentative_arity(&table_bindings, registry)?;
+
+    // Build remap from argumentative lvar names to actual column names.
+    // E.g., V(k, l) bound to refs(key, label) → {k → key, l → label}.
+    table_bindings.argumentative_column_remap =
+        super::grounding::build_argumentative_column_remap(&table_bindings, registry);
 
     // Validate mixed ground params from position analysis.
     let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
@@ -2253,12 +2281,30 @@ pub(super) fn expand_ho_view(
     // Build pipe source CTE if piped
     let pipe_source_cte = pipe_source.map(|source| ("_ho_pipe_src".to_string(), source));
 
+    // Detect free scalar params: call-site Lvar expressions at Scalar positions.
+    // These need the inverted CTE strategy — the caller's join input is hoisted
+    // into the view body's CTE scope so free vars can resolve.
+    let has_free_scalars = table_bindings
+        .scalar_params
+        .values()
+        .any(|expr| matches!(expr, ast_unresolved::DomainExpression::Lvar { .. }));
+    let (join_input_cte, absorbed_join_input) = if has_free_scalars {
+        if let Some(input_expr) = join_input {
+            (Some(("_ho_scalar_input".to_string(), input_expr)), true)
+        } else {
+            (None, false)
+        }
+    } else {
+        (None, false)
+    };
+
     // Build the squished relation (ALL clauses, no pre-filtering)
     let squished_query = super::grounding::build_squished_relation(
         function,
         entity,
         table_bindings,
         pipe_source_cte,
+        join_input_cte,
         data_ns,
     )?;
 
@@ -2288,7 +2334,8 @@ pub(super) fn expand_ho_view(
     let (resolved_query, bubbled) = resolve_result?;
 
     // Convert to ConsultedView relation
-    let (resolved_expr, bubbled) = ho_view_query_to_relational(resolved_query, bubbled, function)?;
+    let (resolved_expr, bubbled) =
+        ho_view_query_to_relational(resolved_query, bubbled, function, user_alias)?;
 
     // Apply PatternResolver to first-parens (scalar positions) via combined DomainSpec.
     //
@@ -2299,13 +2346,13 @@ pub(super) fn expand_ho_view(
     //   - Output positions: pass-through Lvars (keep original name)
     // One PatternResolver call handles everything.
     if matches!(scalar_spec, ast_unresolved::DomainSpec::Glob) {
-        return Ok((resolved_expr, bubbled));
+        return Ok((resolved_expr, bubbled, absorbed_join_input));
     }
 
     let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr)?;
     let scalar_exprs = match scalar_spec {
         ast_unresolved::DomainSpec::Positional(exprs) => exprs,
-        _ => return Ok((resolved_expr, bubbled)),
+        _ => return Ok((resolved_expr, bubbled, absorbed_join_input)),
     };
 
     // Identify scalar column names from position analysis
@@ -2325,7 +2372,7 @@ pub(super) fn expand_ho_view(
     // because HO ConsultedViews get CTE-wrapped and the qualifier would be wrong.
     let schema_cols = match &body_schema {
         ast_resolved::CprSchema::Resolved(cols) => cols,
-        _ => return Ok((resolved_expr, bubbled)),
+        _ => return Ok((resolved_expr, bubbled, absorbed_join_input)),
     };
 
     let mut where_constraints = Vec::new();
@@ -2407,7 +2454,11 @@ pub(super) fn expand_ho_view(
         };
     }
 
-    Ok((expr, BubbledState::resolved(output_columns)))
+    Ok((
+        expr,
+        BubbledState::resolved(output_columns),
+        absorbed_join_input,
+    ))
 }
 
 /// Apply call-site positional patterns to an already-resolved consulted entity expression.

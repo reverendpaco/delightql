@@ -198,6 +198,7 @@ fn run() -> Result<()> {
                 socket,
                 workers,
                 idle_timeout,
+                socket_idle_timeout,
             } => {
                 let db_path = args
                     .database
@@ -221,11 +222,17 @@ fn run() -> Result<()> {
                 } else {
                     None
                 };
+                let socket_idle = if *socket_idle_timeout > 0 {
+                    Some(*socket_idle_timeout)
+                } else {
+                    None
+                };
                 delightql_cli::server::start_server(
                     db_path.as_deref(),
                     &socket_path,
                     num_workers,
                     idle,
+                    socket_idle,
                 )
             }
             Command::Tools { tool } => match tool {

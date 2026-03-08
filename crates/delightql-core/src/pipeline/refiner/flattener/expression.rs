@@ -206,6 +206,22 @@ pub(super) fn flatten_expression(
             origin,
             cpr_schema,
         } => {
+            // HoGroundScalar filters must stay bound to their source ConsultedView.
+            // Don't pool them into the segment's global predicates — that would
+            // lose which ConsultedView each _label_0 constraint belongs to,
+            // causing qualifier mismatches when multiple HO views are joined.
+            if matches!(origin, resolved::FilterOrigin::HoGroundScalar { .. }) {
+                if let resolved::SigmaCondition::Predicate(pred) = condition {
+                    flatten_expression(*source, segment, ctx)?;
+                    // Attach the filter to the last-added table (the ConsultedView)
+                    if let Some(last_table) = segment.tables.last_mut() {
+                        last_table._table_filters.push((pred, origin));
+                        last_table.schema = cpr_schema.get().clone();
+                    }
+                    return Ok(());
+                }
+            }
+
             // TupleOrdinal (LIMIT/OFFSET) must stay with its source as a unit
             // Don't flatten through it - treat it as a derived table
             // This preserves CPR LTR semantics: users(*), #<5, products(*)

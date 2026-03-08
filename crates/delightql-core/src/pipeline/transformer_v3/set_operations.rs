@@ -1007,7 +1007,8 @@ pub fn extract_operand_alias(operand: &ast_addressed::RelationalExpression) -> O
     match operand {
         ast_addressed::RelationalExpression::Relation(rel) => match rel {
             ast_addressed::Relation::Ground { alias, .. }
-            | ast_addressed::Relation::Anonymous { alias, .. } => {
+            | ast_addressed::Relation::Anonymous { alias, .. }
+            | ast_addressed::Relation::InnerRelation { alias, .. } => {
                 alias.as_deref().map(String::from)
             }
             other => panic!("catch-all hit in set_operations.rs extract_operand_alias (inner Relation): {:?}", other),
@@ -1025,7 +1026,8 @@ pub fn collect_all_aliases_from_operand(
     match operand {
         ast_addressed::RelationalExpression::Relation(rel) => match rel {
             ast_addressed::Relation::Ground { alias, .. }
-            | ast_addressed::Relation::Anonymous { alias, .. } => alias
+            | ast_addressed::Relation::Anonymous { alias, .. }
+            | ast_addressed::Relation::InnerRelation { alias, .. } => alias
                 .as_ref()
                 .map(|a| vec![a.to_string()])
                 .unwrap_or_default(),

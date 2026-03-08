@@ -2095,10 +2095,19 @@ fn classify_single_dml_op(op: &ast_unresolved::UnaryRelationalOperator) -> DmlPi
         ast_unresolved::UnaryRelationalOperator::TupleOrdering { .. } => DmlPipeKind::TupleOrdering,
         ast_unresolved::UnaryRelationalOperator::Modulo { .. } => DmlPipeKind::Modulo,
         ast_unresolved::UnaryRelationalOperator::AggregatePipe { .. } => DmlPipeKind::AggregatePipe,
-        other => panic!(
-            "catch-all hit in mod.rs classify_single_dml_op (UnaryRelationalOperator): {:?}",
-            other
-        ),
+        ast_unresolved::UnaryRelationalOperator::MapCover { .. }
+        | ast_unresolved::UnaryRelationalOperator::EmbedMapCover { .. }
+        | ast_unresolved::UnaryRelationalOperator::Reposition { .. }
+        | ast_unresolved::UnaryRelationalOperator::MetaIze { .. }
+        | ast_unresolved::UnaryRelationalOperator::Witness { .. }
+        | ast_unresolved::UnaryRelationalOperator::Qualify
+        | ast_unresolved::UnaryRelationalOperator::Using { .. }
+        | ast_unresolved::UnaryRelationalOperator::UsingAll
+        | ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
+        | ast_unresolved::UnaryRelationalOperator::InteriorDrillDown { .. }
+        | ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { .. }
+        | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. }
+        | ast_unresolved::UnaryRelationalOperator::DmlTerminal { .. } => DmlPipeKind::General,
     }
 }
 

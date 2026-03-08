@@ -1534,6 +1534,21 @@ pub(super) fn split_ho_first_parens(
             let mut bindings = HoParamBindings::default();
             let mut pipe_target_idx = None;
             if pipe_source.is_some() && !entity.params.is_empty() {
+                // Find the first table-value parameter (Glob or Argumentative)
+                let first_table_param = entity.params.iter().enumerate().find(|(_, p)| {
+                    matches!(p.kind, HoParamKind::Glob | HoParamKind::Argumentative(_))
+                });
+                if first_table_param.is_none() {
+                    return Err(DelightQLError::validation_error(
+                        format!(
+                            "Higher-order view '{}' has no table-value parameter to receive pipe input \
+                             (all parameters are scalar)",
+                            entity.name
+                        ),
+                        "A piped HO view must have at least one table-value parameter (e.g. T(*)) \
+                         as the target for the pipe input",
+                    ));
+                }
                 pipe_target_idx = Some(0);
                 let first_param = &entity.params[0];
                 let cte_name = "_ho_pipe_src".to_string();
@@ -1870,6 +1885,19 @@ pub(super) fn split_ho_first_parens(
         }
     }
 
+    // If piped but no table-value parameter was found, error out
+    if pipe_source.is_some() && pipe_target_idx.is_none() {
+        return Err(DelightQLError::validation_error(
+            format!(
+                "Higher-order view '{}' has no table-value parameter to receive pipe input \
+                 (all parameters are scalar)",
+                entity.name
+            ),
+            "A piped HO view must have at least one table-value parameter (e.g. T(*)) \
+             as the target for the pipe input",
+        ));
+    }
+
     let scalar_spec = if scalar_exprs.is_empty() {
         ast_unresolved::DomainSpec::Glob
     } else {
@@ -1959,6 +1987,59 @@ fn extract_clause_ctes(
     Ok(())
 }
 
+/// Inject a cross-join with the input table into a clause body's FROM clause.
+/// Used by the inverted CTE strategy: when a clause body has free scalar params,
+/// the input source (caller's data) must be in the FROM so the free vars resolve.
+///
+/// Wraps: `body` → `_input(*), body`
+fn inject_input_table_into_query(
+    clause_query: ast_unresolved::Query,
+    input_table_name: &str,
+) -> ast_unresolved::Query {
+    let input_table =
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier: ast_unresolved::QualifiedName {
+                namespace_path: ast_unresolved::NamespacePath::empty(),
+                name: input_table_name.into(),
+                grounding: None,
+            },
+            canonical_name: ast_unresolved::PhaseBox::phantom(),
+            domain_spec: ast_unresolved::DomainSpec::Glob,
+            alias: None,
+            outer: false,
+            mutation_target: false,
+            passthrough: false,
+            cpr_schema: ast_unresolved::PhaseBox::phantom(),
+            hygienic_injections: Vec::new(),
+        });
+
+    match clause_query {
+        ast_unresolved::Query::Relational(expr) => {
+            ast_unresolved::Query::Relational(ast_unresolved::RelationalExpression::Join {
+                left: Box::new(input_table),
+                right: Box::new(expr),
+                join_condition: None,
+                join_type: Some(crate::pipeline::asts::core::JoinType::Inner),
+                cpr_schema: ast_unresolved::PhaseBox::phantom(),
+            })
+        }
+        ast_unresolved::Query::WithCtes { ctes, query } => {
+            // If the body has its own CTEs, inject into the main query part
+            ast_unresolved::Query::WithCtes {
+                ctes,
+                query: ast_unresolved::RelationalExpression::Join {
+                    left: Box::new(input_table),
+                    right: Box::new(query),
+                    join_condition: None,
+                    join_type: Some(crate::pipeline::asts::core::JoinType::Inner),
+                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                },
+            }
+        }
+        other => other, // ErContext etc. — pass through unchanged
+    }
+}
+
 /// Build the SQUISHED relation: ALL clauses as a UNION ALL, with scalar
 /// positions injected as columns. No clause pre-filtering — PatternResolver
 /// handles filtering via WHERE constraints after resolution.
@@ -1970,6 +2051,7 @@ pub(super) fn build_squished_relation(
     entity: &crate::resolution::registry::ConsultedEntity,
     table_bindings: crate::pipeline::query_features::HoParamBindings,
     pipe_source_cte: Option<(String, ast_unresolved::RelationalExpression)>,
+    join_input_cte: Option<(String, ast_unresolved::RelationalExpression)>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
 ) -> Result<ast_unresolved::Query> {
     let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
@@ -1993,6 +2075,33 @@ pub(super) fn build_squished_relation(
             is_recursive: ast_unresolved::PhaseBox::phantom(),
         });
     }
+
+    // Prepend join input CTE if present (inverted CTE strategy for free scalar params).
+    // The join_input_cte_name is used to inject a FROM reference into correlated clause bodies.
+    let join_input_cte_name = if let Some((cte_name, source_expr)) = join_input_cte {
+        let name = cte_name.clone();
+        all_ctes.push(ast_unresolved::CteBinding {
+            expression: source_expr,
+            name: cte_name,
+            is_recursive: ast_unresolved::PhaseBox::phantom(),
+        });
+        Some(name)
+    } else {
+        None
+    };
+
+    // Detect which scalar params are free (Lvar call-site expressions).
+    // These need the _input table injected into correlated clause bodies.
+    let free_scalar_param_names: Vec<String> = if join_input_cte_name.is_some() {
+        table_bindings
+            .scalar_params
+            .iter()
+            .filter(|(_, expr)| matches!(expr, ast_unresolved::DomainExpression::Lvar { .. }))
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     if defs.len() > 1 {
         // Multi-clause: each clause becomes a CTE
@@ -2028,6 +2137,23 @@ pub(super) fn build_squished_relation(
                     &def.full_source,
                     clause_bindings,
                 )?;
+                // Inverted CTE: inject _input table BEFORE inject_scalar_columns,
+                // so the embed pipe wraps the join (not vice versa). This ensures
+                // anonymous tables with column refs are on the right side of a join
+                // where the MeltTable/json_each strategy can handle them.
+                let q = if let Some(ref input_name) = join_input_cte_name {
+                    let clause_uses_free_scalar = clause_params.iter().any(|cp| {
+                        matches!(cp.kind, crate::pipeline::asts::ddl::HoParamKind::Scalar)
+                            && free_scalar_param_names.contains(&cp.name)
+                    });
+                    if clause_uses_free_scalar {
+                        inject_input_table_into_query(q, input_name)
+                    } else {
+                        q
+                    }
+                } else {
+                    q
+                };
                 inject_scalar_columns(q, &clause_params, &positions, output_head)
             };
             let clause_query = if let Some(dns) = data_ns {
@@ -2053,6 +2179,23 @@ pub(super) fn build_squished_relation(
                 let output_head = match &def.head {
                     DdlHead::HoView { output_head, .. } => output_head.as_deref(),
                     _ => None,
+                };
+                // Inverted CTE: inject _input table BEFORE inject_scalar_columns,
+                // so the embed pipe wraps the join (not vice versa). This ensures
+                // anonymous tables with column refs are on the right side of a join
+                // where the MeltTable/json_each strategy can handle them.
+                let q = if let Some(ref input_name) = join_input_cte_name {
+                    let clause_uses_free_scalar = clause_params.iter().any(|cp| {
+                        matches!(cp.kind, crate::pipeline::asts::ddl::HoParamKind::Scalar)
+                            && free_scalar_param_names.contains(&cp.name)
+                    });
+                    if clause_uses_free_scalar {
+                        inject_input_table_into_query(q, input_name)
+                    } else {
+                        q
+                    }
+                } else {
+                    q
                 };
                 inject_scalar_columns(q, &clause_params, &positions, output_head)
             } else {
@@ -2254,6 +2397,49 @@ pub(super) fn validate_argumentative_arity(
         }
     }
     Ok(())
+}
+
+/// Build a remap from argumentative lvar names to (table_name, actual_column_name).
+///
+/// For `V(k, l)` bound to `refs(key, label)`, produces `{k → ("refs", "key"), l → ("refs", "label")}`.
+/// This allows the body parser to substitute bare lvars with qualified column references.
+pub(super) fn build_argumentative_column_remap(
+    bindings: &crate::pipeline::query_features::HoParamBindings,
+    registry: &crate::resolution::EntityRegistry,
+) -> HashMap<String, (String, String)> {
+    use crate::pipeline::ast_resolved::CprSchema;
+
+    let mut remap = HashMap::new();
+    for (_param_name, table_name, _expected_cols, col_names) in &bindings.argumentative_table_refs {
+        let actual_col_names = if let Some(schema) = registry.query_local.lookup_cte(table_name) {
+            match schema {
+                CprSchema::Resolved(cols) => Some(
+                    cols.iter()
+                        .map(|c| c.info.name().unwrap_or("?").to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            }
+        } else if let Some(schema) = registry.database.lookup_table(table_name) {
+            match schema {
+                CprSchema::Resolved(cols) => Some(
+                    cols.iter()
+                        .map(|c| c.info.name().unwrap_or("?").to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(actual_names) = actual_col_names {
+            for (lvar_name, actual_name) in col_names.iter().zip(actual_names.iter()) {
+                remap.insert(lvar_name.clone(), (table_name.clone(), actual_name.clone()));
+            }
+        }
+    }
+    remap
 }
 
 // ============================================================================

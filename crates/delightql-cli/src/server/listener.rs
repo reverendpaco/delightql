@@ -5,7 +5,7 @@
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ pub fn start_server(
     socket_path: &Path,
     num_workers: usize,
     idle_timeout: Option<u64>,
+    socket_idle_timeout: Option<u64>,
 ) -> Result<()> {
     // Linux: auto-kill this process when our parent dies.
     // Prevents orphan server processes when the test harness crashes.
@@ -66,16 +67,21 @@ pub fn start_server(
     println!("{}", socket_path.display());
 
     eprintln!(
-        "dql server: listening on {} ({} workers, db={}, idle_timeout={})",
+        "dql server: listening on {} ({} workers, db={}, idle_timeout={}, socket_idle_timeout={})",
         socket_path.display(),
         num_workers,
         db_path.unwrap_or("<none>"),
         idle_timeout.map_or("disabled".to_string(), |t| format!("{}s", t)),
+        socket_idle_timeout.map_or("disabled".to_string(), |t| format!("{}s", t)),
     );
 
     // Shared state for idle timeout and shutdown
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let active_connections = Arc::new(AtomicU32::new(0));
+    // Timestamp when active_connections last dropped to zero.
+    // Initialized to now so the timer doesn't fire immediately on startup.
+    let disconnected_since = Arc::new(AtomicU64::new(now_secs()));
 
     // Channel for dispatching connections to workers
     let (tx, rx) = mpsc::channel::<UnixStream>();
@@ -94,11 +100,21 @@ pub fn start_server(
         let db = db_path_owned.clone();
         let last_activity = Arc::clone(&last_activity);
         let shutdown = Arc::clone(&shutdown);
+        let active_connections = Arc::clone(&active_connections);
+        let disconnected_since = Arc::clone(&disconnected_since);
 
         let handle = std::thread::Builder::new()
             .name(format!("dql-worker-{}", worker_id))
             .spawn(move || {
-                worker_loop(worker_id, db.as_deref(), rx, last_activity, shutdown);
+                worker_loop(
+                    worker_id,
+                    db.as_deref(),
+                    rx,
+                    last_activity,
+                    shutdown,
+                    active_connections,
+                    disconnected_since,
+                );
             })?;
         workers.push(handle);
     }
@@ -126,6 +142,18 @@ pub fn start_server(
                     if elapsed >= timeout {
                         eprintln!("dql server: idle timeout ({}s)", timeout);
                         break;
+                    }
+                }
+                if let Some(timeout) = socket_idle_timeout {
+                    if active_connections.load(Ordering::Relaxed) == 0 {
+                        let elapsed = now_secs() - disconnected_since.load(Ordering::Relaxed);
+                        if elapsed >= timeout {
+                            eprintln!(
+                                "dql server: socket idle timeout ({}s, no active connections)",
+                                timeout
+                            );
+                            break;
+                        }
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -156,6 +184,8 @@ fn worker_loop(
     rx: Arc<std::sync::Mutex<mpsc::Receiver<UnixStream>>>,
     last_activity: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    active_connections: Arc<AtomicU32>,
+    disconnected_since: Arc<AtomicU64>,
 ) {
     let conn_manager = match ConnectionManager::new_memory() {
         Ok(c) => c,
@@ -203,7 +233,13 @@ fn worker_loop(
         };
         match stream {
             Ok(stream) => {
+                active_connections.fetch_add(1, Ordering::Relaxed);
                 handler::serve_connection(stream, &mut *handle, &last_activity, &shutdown);
+                let prev = active_connections.fetch_sub(1, Ordering::Relaxed);
+                if prev == 1 {
+                    // We were the last active connection — start the socket idle clock
+                    disconnected_since.store(now_secs(), Ordering::Relaxed);
+                }
             }
             Err(_) => break,
         }

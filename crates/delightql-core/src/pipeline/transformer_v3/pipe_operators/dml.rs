@@ -4,12 +4,14 @@ use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_addressed;
 use crate::pipeline::asts::core::operators::DmlKind;
 use crate::pipeline::sql_ast_v3::{
-    DomainExpression, QueryExpression, SelectItem, SqlStatement, UnaryOperator,
+    ColumnQualifier, DomainExpression, QueryExpression, SelectItem, SelectStatement, SqlStatement,
+    TableExpression,
 };
 
 use super::super::context::TransformContext;
 use super::super::segment_handler::finalize_to_query;
 use super::super::types::QueryBuildState;
+use super::super::QualifierMint;
 
 /// Apply a DML terminal operator: convert the source query into a DML SqlStatement
 pub(in crate::pipeline::transformer_v3) fn apply_dml_terminal(
@@ -21,23 +23,29 @@ pub(in crate::pipeline::transformer_v3) fn apply_dml_terminal(
     _ctx: &TransformContext,
 ) -> Result<QueryBuildState> {
     match kind {
-        DmlKind::Delete => build_delete(source, target, target_namespace),
-        DmlKind::Keep => build_keep(source, target, target_namespace),
+        DmlKind::Delete => build_delete(source, target, target_namespace, source_schema),
+        DmlKind::Keep => build_keep(source, target, target_namespace, source_schema),
         DmlKind::Insert => build_insert(source, target, target_namespace, source_schema),
         DmlKind::Update => build_update(source, target, target_namespace),
     }
 }
 
-/// DELETE FROM target WHERE <source predicates>
+/// DELETE FROM target WHERE EXISTS (SELECT 1 FROM (<source>) AS _del WHERE target.c IS NOT DISTINCT FROM _del.c AND ...)
 ///
-/// The source query's WHERE clause becomes the DELETE's WHERE clause.
-/// If the source has no WHERE (e.g., `table(*) |> delete!(table)(*)`), deletes all rows.
+/// Uses the full source query as a subquery. The EXISTS + IS NOT DISTINCT FROM
+/// pattern correctly handles ORDER BY, LIMIT, and any other pipe operators
+/// that the source query may include. IS NOT DISTINCT FROM provides NULL-safe
+/// matching without requiring a primary key.
 fn build_delete(
     source: QueryBuildState,
     target: String,
     target_namespace: Option<String>,
+    source_schema: &ast_addressed::CprSchema,
 ) -> Result<QueryBuildState> {
-    let where_clause = extract_where_clause(&source)?;
+    let columns = columns_from_schema(source_schema);
+    let source_query = finalize_to_query(source)?;
+
+    let where_clause = build_exists_match(&target, &columns, source_query, false)?;
 
     Ok(QueryBuildState::DmlStatement(SqlStatement::Delete {
         target_table: target,
@@ -47,26 +55,26 @@ fn build_delete(
     }))
 }
 
-/// KEEP is DELETE with negated WHERE: DELETE FROM target WHERE NOT (<source predicates>)
+/// KEEP is DELETE with NOT EXISTS: DELETE FROM target WHERE NOT EXISTS (SELECT 1 FROM (<source>) AS _keep WHERE ...)
 ///
-/// keep!(table)(*) means "keep rows matching the predicate, delete the rest"
+/// keep!(table)(*) means "keep rows matching the predicate, delete the rest".
+/// Rows that ARE in the source query are kept; rows NOT in it are deleted.
 fn build_keep(
     source: QueryBuildState,
     target: String,
     target_namespace: Option<String>,
+    source_schema: &ast_addressed::CprSchema,
 ) -> Result<QueryBuildState> {
-    let where_clause = extract_where_clause(&source)?;
+    let columns = columns_from_schema(source_schema);
+    let source_query = finalize_to_query(source)?;
 
-    let negated_where = where_clause.map(|wc| DomainExpression::Unary {
-        op: UnaryOperator::Not,
-        expr: Box::new(DomainExpression::Parens(Box::new(wc))),
-    });
+    let where_clause = build_exists_match(&target, &columns, source_query, true)?;
 
     Ok(QueryBuildState::DmlStatement(SqlStatement::Delete {
         target_table: target,
         target_namespace,
         with_clause: None,
-        where_clause: negated_where,
+        where_clause,
     }))
 }
 
@@ -127,28 +135,68 @@ fn build_update(
     }))
 }
 
-/// Extract WHERE clause from a QueryBuildState
-fn extract_where_clause(source: &QueryBuildState) -> Result<Option<DomainExpression>> {
-    match source {
-        QueryBuildState::Builder(builder) => Ok(builder.get_where_clause().cloned()),
-        QueryBuildState::Expression(QueryExpression::Select(select)) => {
-            Ok(select.where_clause().cloned())
-        }
-        QueryBuildState::Segment { filters, .. } => {
-            if filters.is_empty() {
-                Ok(None)
-            } else if filters.len() == 1 {
-                Ok(Some(filters[0].clone()))
-            } else {
-                Ok(Some(DomainExpression::and(filters.clone())))
-            }
-        }
-        QueryBuildState::Table(_) | QueryBuildState::AnonymousTable(_) => {
-            // No WHERE clause — delete all rows
-            Ok(None)
-        }
-        _other => panic!("catch-all hit in dml.rs extract_where_clause (QueryBuildState)"),
+/// Build an EXISTS/NOT EXISTS expression that matches rows between the target table
+/// and a source subquery using IS NOT DISTINCT FROM on all columns.
+///
+/// Generates:
+///   EXISTS (SELECT 1 FROM (<source>) AS _del WHERE target.c1 IS NOT DISTINCT FROM _del.c1 AND ...)
+///
+/// When `negate` is true, generates NOT EXISTS instead (used by keep!).
+fn build_exists_match(
+    target_table: &str,
+    columns: &[String],
+    source_query: QueryExpression,
+    negate: bool,
+) -> Result<Option<DomainExpression>> {
+    if columns.is_empty() {
+        // No columns to match on — delete all rows (degenerate case)
+        return Ok(None);
     }
+
+    let mint = QualifierMint::for_dml();
+    let del_alias = "_del";
+
+    // Build the IS NOT DISTINCT FROM conditions for each column
+    let conditions: Vec<DomainExpression> = columns
+        .iter()
+        .map(|col| {
+            let target_col = DomainExpression::with_qualifier(
+                ColumnQualifier::table(target_table, &mint),
+                col.as_str(),
+            );
+            let del_col = DomainExpression::with_qualifier(
+                ColumnQualifier::table(del_alias, &mint),
+                col.as_str(),
+            );
+            target_col.is_not_distinct_from(del_col)
+        })
+        .collect();
+
+    let where_expr = DomainExpression::and(conditions);
+
+    // Build: SELECT 1 FROM (<source>) AS _del WHERE <conditions>
+    let inner_select = SelectStatement::builder()
+        .select(SelectItem::expression(DomainExpression::literal(
+            crate::pipeline::ast_refined::LiteralValue::Number("1".to_string()),
+        )))
+        .from_tables(vec![TableExpression::subquery(source_query, del_alias)])
+        .where_clause(where_expr)
+        .build()
+        .map_err(|e| DelightQLError::ParseError {
+            message: e,
+            source: None,
+            subcategory: None,
+        })?;
+
+    let inner_query = QueryExpression::Select(Box::new(inner_select));
+
+    let exists_expr = if negate {
+        DomainExpression::not_exists(inner_query)
+    } else {
+        DomainExpression::exists(inner_query)
+    };
+
+    Ok(Some(exists_expr))
 }
 
 /// Extract column names from a resolved CprSchema.

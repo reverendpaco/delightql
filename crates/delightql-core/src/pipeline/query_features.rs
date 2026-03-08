@@ -151,6 +151,10 @@ pub struct HoParamBindings {
     /// Pending arity checks for argumentative params that received table references.
     /// (param_name, table_name, expected_column_count, column_names)
     pub argumentative_table_refs: Vec<(String, String, usize, Vec<String>)>,
+    /// Remap from argumentative lvar names to (table_name, actual_column_name).
+    /// E.g., V(k, l) bound to refs(key, label) → {k → ("refs", "key"), l → ("refs", "label")}.
+    /// Built after arity validation when actual column names are known.
+    pub argumentative_column_remap: HashMap<String, (String, String)>,
 }
 
 impl HoParamBindings {

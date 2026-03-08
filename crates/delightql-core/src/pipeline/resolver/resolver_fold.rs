@@ -48,6 +48,12 @@ pub(super) struct ResolverFold<'reg, 'db> {
     pivot_in_values: std::collections::HashMap<String, Vec<String>>,
     /// Output columns from the last operator resolution (sidecar like last_bubbled).
     last_operator_output: Option<Vec<ast_resolved::ColumnMetadata>>,
+    /// Pending join input for inverted CTE strategy.
+    /// Set by the Join handler when the right side is an HO TVF; consumed by resolve_tvf
+    /// if the HO view has free scalar params.
+    pub(super) pending_ho_join_input: Option<ast_unresolved::RelationalExpression>,
+    /// Set to true when resolve_tvf absorbed the pending join input via inverted CTE.
+    pub(super) ho_join_input_absorbed: bool,
 }
 
 impl<'reg, 'db> ResolverFold<'reg, 'db> {
@@ -69,6 +75,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             in_correlation: false,
             pivot_in_values: std::collections::HashMap::new(),
             last_operator_output: None,
+            pending_ho_join_input: None,
+            ho_join_input_absorbed: false,
         }
     }
 
@@ -422,6 +430,19 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 join_type,
                 cpr_schema: _,
             } => {
+                // Inverted CTE strategy: if right side is a TVF (potential HO view),
+                // stash the unresolved left so resolve_tvf can absorb it if needed.
+                let right_is_tvf = matches!(
+                    right.as_ref(),
+                    ast_unresolved::RelationalExpression::Relation(
+                        ast_unresolved::Relation::TVF { .. }
+                    )
+                );
+                if right_is_tvf {
+                    self.pending_ho_join_input = Some((*left).clone());
+                    self.ho_join_input_absorbed = false;
+                }
+
                 let (resolved_left, left_bubbled) = self.resolve_relational(*left)?;
 
                 let left_schema = super::extract_cpr_schema(&resolved_left)?;
@@ -487,6 +508,20 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                 } else {
                                     schema.get_table_columns(None, table_name)
                                 };
+
+                                // Track connection_id for namespace-qualified tables
+                                // (the positional-pattern shortcut bypasses resolve_ground,
+                                // so we must track manually to catch cross-connection joins)
+                                if !identifier.namespace_path.is_empty() {
+                                    if let Ok(Some((_, connection_id, _))) =
+                                        self.registry.database.lookup_table_with_namespace(
+                                            &identifier.namespace_path,
+                                            table_name,
+                                        )
+                                    {
+                                        self.registry.track_connection_id(connection_id);
+                                    }
+                                }
 
                                 if let Some(table_columns) = maybe_table_columns {
                                     // CTE or database table — use existing mini-pipeline
@@ -751,6 +786,19 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                         (resolved, bubbled, None, vec![])
                     };
 
+                // Inverted CTE: if the right side absorbed the left, skip join assembly.
+                // The right side's ConsultedView already contains the left as an internal CTE.
+                if self.ho_join_input_absorbed {
+                    self.ho_join_input_absorbed = false;
+                    self.pending_ho_join_input = None;
+                    return Ok((resolved_right, right_bubbled));
+                }
+                // Clean up pending state if not absorbed
+                if right_is_tvf {
+                    self.pending_ho_join_input = None;
+                    self.ho_join_input_absorbed = false;
+                }
+
                 // Join conditions need to be preserved and bubbled
                 let mut join_bubbled = BubbledState::resolved(vec![]);
                 let resolved_condition = if let Some(cond) = join_condition {
@@ -995,18 +1043,21 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                         self.config.clone()
                     };
 
-                    return super::relation_resolver::expand_ho_view(
+                    let (expr, bubbled, _absorbed) = super::relation_resolver::expand_ho_view(
                         function,
                         &entity,
                         &scalar_spec,
                         table_bindings,
                         Some(pipe_expr.source),
+                        None, // no join_input for pipes
                         None,
                         &ho_grounding,
                         self.registry,
                         outer_context,
                         &ho_config,
-                    );
+                        None,
+                    )?;
+                    return Ok((expr, bubbled));
                 }
 
                 // Collect the pipe chain into a flat list, stopping at HoViewApplication
@@ -1610,12 +1661,18 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             ast_unresolved::Relation::Anonymous { .. } => {
                 super::relation_resolver::resolve_anonymous(rel, self, outer_context)
             }
-            ast_unresolved::Relation::TVF { .. } => super::relation_resolver::resolve_tvf(
-                rel,
-                self.registry,
-                outer_context,
-                &self.config,
-            ),
+            ast_unresolved::Relation::TVF { .. } => {
+                let join_input = self.pending_ho_join_input.take();
+                let (expr, bubbled, absorbed) = super::relation_resolver::resolve_tvf(
+                    rel,
+                    self.registry,
+                    outer_context,
+                    &self.config,
+                    join_input,
+                )?;
+                self.ho_join_input_absorbed = absorbed;
+                Ok((expr, bubbled))
+            }
             ast_unresolved::Relation::InnerRelation { .. } => {
                 super::relation_resolver::resolve_inner_relation(
                     rel,

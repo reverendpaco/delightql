@@ -185,6 +185,10 @@ pub enum Command {
         /// Shut down after N seconds of no messages (0 = disabled)
         #[arg(long, default_value = "0")]
         idle_timeout: u64,
+
+        /// Shut down after N seconds with zero active connections (0 = disabled)
+        #[arg(long, default_value = "0")]
+        socket_idle_timeout: u64,
     },
 }
 

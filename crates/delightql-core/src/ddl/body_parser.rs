@@ -173,6 +173,10 @@ pub fn parse_view_body_with_bindings(source: &str, bindings: HoParamBindings) ->
     // Argumentative params: V → refs (same remap, different source)
     let qualifier_remap = build_qualifier_remap(&bindings);
 
+    // Extract argumentative column remap BEFORE consuming bindings.
+    // Maps bare lvar names from definition (k, l) to actual column names (key, label).
+    let arg_column_remap = bindings.argumentative_column_remap.clone();
+
     let (mut query, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
         parse_query_with_bindings(&tree, &body_source, bindings).map_err(|e| {
             DelightQLError::database_error(
@@ -186,6 +190,12 @@ pub fn parse_view_body_with_bindings(source: &str, bindings: HoParamBindings) ->
     // (e.g., V.key) are NOT rewritten. Walk the AST and remap them.
     if !qualifier_remap.is_empty() {
         remap_query_qualifiers(&mut query, &qualifier_remap);
+    }
+
+    // Remap bare lvar names from argumentative table param bindings.
+    // E.g., V(k, l) bound to refs(key, label) → bare `k` becomes `key`.
+    if !arg_column_remap.is_empty() {
+        remap_argumentative_lvar_names(&mut query, &arg_column_remap);
     }
 
     match &query {
@@ -762,6 +772,85 @@ fn remap_operator_qualifiers(
         | UnaryRelationalOperator::InteriorDrillDown { .. }
         | UnaryRelationalOperator::NarrowingDestructure { .. } => {}
     }
+}
+
+// ============================================================================
+// Argumentative Column Name Remap
+// ============================================================================
+//
+// When V(k, l) is bound to refs(key, label), bare lvar `k` in the body needs
+// to become `key`. This uses AstTransform to walk the tree and rename lvar
+// names (not qualifiers) that match the remap.
+
+fn remap_argumentative_lvar_names(query: &mut Query, remap: &HashMap<String, (String, String)>) {
+    use crate::pipeline::ast_transform::AstTransform;
+    use crate::pipeline::asts::core::Unresolved;
+
+    struct ArgColRemap<'a> {
+        remap: &'a HashMap<String, (String, String)>,
+    }
+
+    impl AstTransform<Unresolved, Unresolved> for ArgColRemap<'_> {
+        fn transform_domain(
+            &mut self,
+            e: DomainExpression,
+        ) -> crate::error::Result<DomainExpression> {
+            match e {
+                DomainExpression::Lvar {
+                    name,
+                    qualifier,
+                    namespace_path,
+                    alias,
+                    provenance,
+                } if qualifier.is_none() => {
+                    if let Some((table_name, col_name)) = self.remap.get(name.as_str()) {
+                        Ok(DomainExpression::Lvar {
+                            name: SqlIdentifier::from(col_name.clone()),
+                            qualifier: Some(SqlIdentifier::from(table_name.clone())),
+                            namespace_path,
+                            alias,
+                            provenance,
+                        })
+                    } else {
+                        Ok(DomainExpression::Lvar {
+                            name,
+                            qualifier,
+                            namespace_path,
+                            alias,
+                            provenance,
+                        })
+                    }
+                }
+                other => crate::pipeline::ast_transform::walk_transform_domain(self, other),
+            }
+        }
+    }
+
+    let mut transformer = ArgColRemap { remap };
+    // Take ownership, transform, put back
+    let owned = std::mem::replace(
+        query,
+        Query::Relational(RelationalExpression::Relation(Relation::Anonymous {
+            column_headers: None,
+            rows: vec![],
+            alias: None,
+            outer: false,
+            exists_mode: false,
+            qua_target: None,
+            cpr_schema: crate::pipeline::asts::unresolved::PhaseBox::phantom(),
+        })),
+    );
+    *query = transformer.transform_query(owned).unwrap_or_else(|_| {
+        Query::Relational(RelationalExpression::Relation(Relation::Anonymous {
+            column_headers: None,
+            rows: vec![],
+            alias: None,
+            outer: false,
+            exists_mode: false,
+            qua_target: None,
+            cpr_schema: crate::pipeline::asts::unresolved::PhaseBox::phantom(),
+        }))
+    });
 }
 
 /// Extract a DomainExpression from an anonymous-table query.

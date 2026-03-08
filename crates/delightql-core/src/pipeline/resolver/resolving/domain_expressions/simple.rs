@@ -230,10 +230,32 @@ fn resolve_lvar(
     } else {
         // In correlation, qualified - validate only if qualifier is in available
         let qual_name = qualifier.as_ref().unwrap();
-        available.iter().any(|col| match &col.fq_table.name {
+        let qualifier_known = available.iter().any(|col| match &col.fq_table.name {
             ast_resolved::TableName::Named(t) => t == qual_name,
             ast_resolved::TableName::Fresh => false,
-        })
+        });
+        if !qualifier_known {
+            // Qualifier doesn't match any table in scope. Check if the column
+            // name exists unqualified under a *Named* table — if so, the
+            // qualifier is definitely bogus. If the column only exists under
+            // Fresh tables, the qualifier might be the original table name that
+            // the resolver doesn't track; let it through for SQL-level resolution.
+            let col_under_named = available.iter().any(|col| {
+                col.info.original_name() == Some(&name)
+                    && matches!(col.fq_table.name, ast_resolved::TableName::Named(_))
+            });
+            if col_under_named {
+                return Err(DelightQLError::ColumnNotFoundError {
+                    column: format!("{}.{}", qual_name, name),
+                    context: format!(
+                        "Qualifier '{}' does not match any table in scope. \
+                         Column '{}' exists but not under that qualifier",
+                        qual_name, name
+                    ),
+                });
+            }
+        }
+        qualifier_known
     };
 
     if should_validate {

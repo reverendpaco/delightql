@@ -61,7 +61,8 @@ impl<'a> EntityRegistry<'a> {
             1 => Ok(self.connection_ids.iter().next().copied()),
             _ => {
                 let ids: Vec<_> = self.connection_ids.iter().collect();
-                Err(DelightQLError::validation_error(
+                Err(DelightQLError::validation_error_categorized(
+                    "operational/federation-prohibited",
                     format!(
                         "Query references tables from multiple database connections ({:?}). \
                          Cross-connection joins are not supported.",

@@ -256,14 +256,28 @@ fn table_to_refined(
             .unwrap_or_else(|| table.identifier.name.to_string())
             .into();
         let scoped = refined::ScopedSchema::from_parts(alias, table.schema.clone());
-        return Ok(refined::RelationalExpression::Relation(
-            refined::Relation::ConsultedView {
+        let mut result =
+            refined::RelationalExpression::Relation(refined::Relation::ConsultedView {
                 identifier: table.identifier.clone(),
                 body: Box::new(refined_body),
                 scoped: PhaseBox::new(scoped).into_refined(),
                 outer: table.outer,
-            },
-        ));
+            });
+
+        // Apply table-specific filters (e.g., HoGroundScalar _label_0 constraints).
+        // These were kept bound to this table during flattening to preserve
+        // the association between each filter and its source ConsultedView.
+        for (filter_expr, origin) in &table._table_filters {
+            let refined_condition = refine_predicate_boolean(filter_expr.clone())?;
+            result = refined::RelationalExpression::Filter {
+                source: Box::new(result),
+                condition: refined::SigmaCondition::Predicate(refined_condition),
+                origin: origin.clone(),
+                cpr_schema: PhaseBox::new(table.schema.clone()).into_refined(),
+            };
+        }
+
+        return Ok(result);
     }
 
     // Check if this is a pipe expression

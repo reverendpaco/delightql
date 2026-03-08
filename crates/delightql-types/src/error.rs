@@ -332,6 +332,7 @@ impl DelightQLError {
                 ..
             } => match subcategory {
                 Some(sub) if sub.starts_with("dml/") => format!("dql/{}", sub),
+                Some(sub) if sub.starts_with("operational/") => format!("dql/{}", sub),
                 Some(sub) => format!("dql/semantic/{}", sub),
                 None => format!("dql/semantic/{}", Self::semantic_subcategory(message)),
             },
