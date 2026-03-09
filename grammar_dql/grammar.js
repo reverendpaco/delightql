@@ -191,13 +191,19 @@ module.exports = grammar({
       field('body', $.domain_expression)
     ),
 
-    // First parameter list: can be curried (callable) or regular (identifiers)
-    // When second parens present: these are curried params (must be callable)
-    // When second parens absent: these are regular params (identifiers)
-    // CCAFE: Can optionally start with context marker (..) or (..{list})
+    // Parameter list for CFE definitions (single-parens):
+    // Supports callable params (f:()), regular params (x), and context markers (.., ..{list})
+    // Context marker can appear at any position in the list
     cfe_first_param_list: $ => choice(
-      // Context marker followed by params: .., param1, param2
+      // Context marker at the start: .., param1, param2  OR  ..{ctx}, param1
       seq(
+        field('context_marker', $.context_marker),
+        optional(seq(',', field('params_after_context', sep1(',', choice($.callable_param, $.identifier)))))
+      ),
+      // Params before context marker: param1, .., param2  OR  param1, ..{ctx}, param2
+      seq(
+        field('params_before_context', sep1(',', choice($.callable_param, $.identifier))),
+        ',',
         field('context_marker', $.context_marker),
         optional(seq(',', field('params_after_context', sep1(',', choice($.callable_param, $.identifier)))))
       ),
@@ -626,6 +632,7 @@ module.exports = grammar({
         $.string_template,  // String template with interpolation: :"Hello {name}"
         $.piped_expression,  // Value-level functional pipe: (expr /-> func /-> func)
         $.case_expression,  // CASE expression: _:(cond -> result; ...)
+        $.anonymous_scalar_subquery,  // Anonymous scalar subquery: _:(, body)
         $.scalar_subquery,  // Scalar subquery: relation:(inner-cpr)
         $.metadata_tree_group,  // Metadata tree group: column:~> {...}
         $.pivot_expression,     // Pivot: score of subject
@@ -667,6 +674,7 @@ module.exports = grammar({
         $.pattern_literal,  // Pattern for column matching: /_name/
         $.string_template,  // String template allowed in operands
         $.case_expression,  // CASE expression allowed in operands
+        $.anonymous_scalar_subquery,  // Anonymous scalar subquery: _:(, body)
         $.scalar_subquery,  // EPOCH 7: Scalar subqueries allowed (e.g., in IN lists)
         $.metadata_tree_group,  // EPOCH 4: Metadata tree groups allowed in destructuring
         $.array_destructure_pattern,  // ARRAY DESTRUCTURING: Allow [.0, .1, .2] after ~=
@@ -1253,7 +1261,7 @@ module.exports = grammar({
     )),
 
     function_arguments: $ => choice(
-      // CCAFE context-aware call: .., arg1, arg2
+      // CCAFE context-aware call: .., arg1, arg2 (context at start)
       // Higher precedence to match this first
       prec(1, seq(
         field('context_call_marker', '..'),
@@ -1262,6 +1270,35 @@ module.exports = grammar({
           $.path_literal,        // PATH FIRST-CLASS: Allow paths as CFE arguments
           $.distinct_expression
         )))),
+        // Optional filter condition with pipe
+        optional(seq(
+          '|',
+          field('filter_condition', $.predicate)
+        ))
+      )),
+      // CCAFE context-aware call: arg1, .., arg2 (context in middle)
+      prec(1, seq(
+        choice(
+          $.domain_expression,
+          $.path_literal,
+          $.distinct_expression
+        ),
+        repeat(seq($._comma, choice(
+          $.domain_expression,
+          $.path_literal,
+          $.distinct_expression
+        ))),
+        $._comma,
+        field('context_call_marker', '..'),
+        optional(seq($._comma, choice(
+          $.domain_expression,
+          $.path_literal,
+          $.distinct_expression
+        ), repeat(seq($._comma, choice(
+          $.domain_expression,
+          $.path_literal,
+          $.distinct_expression
+        ))))),
         // Optional filter condition with pipe
         optional(seq(
           '|',
@@ -1849,6 +1886,17 @@ module.exports = grammar({
         repeat(seq(';', $.case_arm)),
         optional(seq(';', $.case_default))
       )),
+      ')'
+    ),
+
+    // Anonymous scalar subquery: _:(, body)
+    // The comma discriminates from case_expression _:(arm -> result; ...)
+    // No inner table — body resolves against outer pipe context only.
+    // The comma is part of the relational_continuation (binary comma operator),
+    // making the base table a no-op and the body the real content.
+    anonymous_scalar_subquery: $ => seq(
+      token('_:('),
+      $.relational_continuation,
       ')'
     ),
 

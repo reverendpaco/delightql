@@ -788,6 +788,9 @@ fn remap_argumentative_lvar_names(query: &mut Query, remap: &HashMap<String, (St
 
     struct ArgColRemap<'a> {
         remap: &'a HashMap<String, (String, String)>,
+        /// Depth inside pipe operators. When > 0, qualifiers are stale
+        /// because pipe barriers strip table scope.
+        pipe_depth: usize,
     }
 
     impl AstTransform<Unresolved, Unresolved> for ArgColRemap<'_> {
@@ -804,9 +807,16 @@ fn remap_argumentative_lvar_names(query: &mut Query, remap: &HashMap<String, (St
                     provenance,
                 } if qualifier.is_none() => {
                     if let Some((table_name, col_name)) = self.remap.get(name.as_str()) {
+                        // Add qualifier only when NOT inside a pipe continuation.
+                        // Inside pipes, qualifiers become stale after the pipe barrier.
+                        let qualifier = if self.pipe_depth == 0 {
+                            Some(SqlIdentifier::from(table_name.clone()))
+                        } else {
+                            None
+                        };
                         Ok(DomainExpression::Lvar {
                             name: SqlIdentifier::from(col_name.clone()),
-                            qualifier: Some(SqlIdentifier::from(table_name.clone())),
+                            qualifier,
                             namespace_path,
                             alias,
                             provenance,
@@ -824,9 +834,39 @@ fn remap_argumentative_lvar_names(query: &mut Query, remap: &HashMap<String, (St
                 other => crate::pipeline::ast_transform::walk_transform_domain(self, other),
             }
         }
+
+        fn transform_relational(
+            &mut self,
+            r: RelationalExpression,
+        ) -> crate::error::Result<RelationalExpression> {
+            match r {
+                RelationalExpression::Pipe(pipe_box) => {
+                    let pipe = pipe_box.into_inner();
+                    // Transform the source at current depth
+                    let source = self.transform_relational(pipe.source)?;
+                    // Transform the operator at increased depth (inside pipe)
+                    self.pipe_depth += 1;
+                    let operator = self.transform_operator(pipe.operator)?;
+                    self.pipe_depth -= 1;
+                    Ok(RelationalExpression::Pipe(Box::new(
+                        stacksafe::StackSafe::new(
+                            crate::pipeline::asts::unresolved::PipeExpression {
+                                source,
+                                operator,
+                                cpr_schema: pipe.cpr_schema,
+                            },
+                        ),
+                    )))
+                }
+                other => crate::pipeline::ast_transform::walk_transform_relational(self, other),
+            }
+        }
     }
 
-    let mut transformer = ArgColRemap { remap };
+    let mut transformer = ArgColRemap {
+        remap,
+        pipe_depth: 0,
+    };
     // Take ownership, transform, put back
     let owned = std::mem::replace(
         query,

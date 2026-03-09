@@ -1,9 +1,12 @@
 // CFE definition precompilation - query-level and single CFE processing
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::asts::unresolved::NamespacePath;
+use crate::pipeline::asts::core::{DomainExpression, FunctionExpression, Unresolved};
+use crate::pipeline::asts::unresolved::{self as ast_unresolved, NamespacePath};
 use crate::pipeline::asts::{resolved, unresolved};
+use crate::pipeline::ast_transform::{self, AstTransform};
 use crate::pipeline::resolver::{self, DatabaseSchema};
+use crate::resolution::registry::ConsultRegistry;
 
 use super::postprocessing::{
     replace_param_lvars_with_param_types, replace_params_with_explicit_context,
@@ -25,8 +28,18 @@ pub fn precompile_query_cfes(
             query: inner_query,
         } => {
             log::debug!("🎯 Precompiling {} CFE definitions", cfes.len());
+
+            // Discover nested consulted function references in CFE bodies.
+            // E.g. if inline CFE `d:(x) : double:(x)` references consulted `double`,
+            // we need to collect `double` as a CfeDefinition too.
+            let mut all_cfes = cfes;
+            if let Some(sys) = system {
+                let consult = ConsultRegistry::new_with_system(sys);
+                discover_nested_consulted_functions(&mut all_cfes, &consult)?;
+            }
+
             // Precompile each CFE body
-            let precompiled_cfes: Vec<unresolved::PrecompiledCfeDefinition> = cfes
+            let precompiled_cfes: Vec<unresolved::PrecompiledCfeDefinition> = all_cfes
                 .into_iter()
                 .map(|cfe| {
                     log::debug!("  → CFE '{}' with params {:?}", cfe.name, cfe.parameters);
@@ -146,15 +159,12 @@ pub(crate) fn precompile_cfe_definition(
         }
     }
 
-    // STEP 1.5: Inline borrowed functions in the CFE body before resolution.
-    // Without this, references to consulted functions (e.g. `double:(x)` from a
-    // borrowed namespace) would pass through as literal SQL function calls.
-    let body = if let Some(sys) = system {
-        let consult = crate::resolution::registry::ConsultRegistry::new_with_system(sys);
-        resolver::grounding::inline_in_domain_expr_borrowed(cfe.body, &consult, None)?
-    } else {
-        cfe.body
-    };
+    // Nested function refs (e.g. `double:(x)` in `doubled_value:(x) :- double:(x)`)
+    // are handled by two discovery mechanisms:
+    // - For DDL functions: discover_nested_cfes in grounding.rs (transitive walk)
+    // - For inline CFEs: discover_nested_consulted_functions above (precompiler walk)
+    // Both collect nested functions as CfeDefinitions so the transformer can substitute them.
+    let body = cfe.body;
 
     // STEP 2: Resolve the body with fake parameter context
     // For explicit context modes, let resolver validate everything using fake schema
@@ -176,7 +186,10 @@ pub(crate) fn precompile_cfe_definition(
         &mut registry,
         &fake_columns,
         in_correlation,
-    )?;
+    ).map_err(|e| {
+        log::debug!("CFE '{}' resolution failed: {}", cfe.name, e);
+        e
+    })?;
 
     // STEP 3: Refine the resolved body (handles embedded subqueries)
     // Pass parameter lists to populate provenance
@@ -258,4 +271,89 @@ pub(crate) fn precompile_cfe_definition(
         allows_positional_context_call: allows_positional,
         body: final_body,
     })
+}
+
+/// Walk all CFE bodies to discover consulted function references and add them
+/// as additional CfeDefinitions. Uses AstTransform to walk the full AST.
+fn discover_nested_consulted_functions(
+    cfes: &mut Vec<unresolved::CfeDefinition>,
+    consult: &ConsultRegistry,
+) -> Result<()> {
+    let mut seen: std::collections::HashSet<String> =
+        cfes.iter().map(|c| c.name.clone()).collect();
+    let mut i = 0;
+    // Process existing + newly added CFEs (list grows as we discover)
+    while i < cfes.len() {
+        let refs = collect_function_refs(&cfes[i].body);
+        for (name, namespace) in refs {
+            if seen.contains(&name) {
+                continue;
+            }
+            let entity = if let Some(ns) = &namespace {
+                let fq = crate::pipeline::resolver::grounding::namespace_path_to_fq(ns);
+                consult
+                    .lookup_entity(&name, &fq)
+                    .filter(|e| {
+                        e.entity_type
+                            == crate::enums::EntityType::DqlFunctionExpression.as_i32()
+                            || e.entity_type
+                                == crate::enums::EntityType::DqlContextAwareFunctionExpression
+                                    .as_i32()
+                    })
+            } else {
+                let e = consult.lookup_enlisted_function(&name)?;
+                if e.is_some() {
+                    e
+                } else {
+                    consult.lookup_enlisted_context_aware_function(&name)?
+                }
+            };
+            if let Some(entity) = entity {
+                seen.insert(name);
+                let cfe_def =
+                    crate::pipeline::resolver::grounding::consulted_entity_to_cfe_definition(
+                        &entity,
+                    )?;
+                cfes.push(cfe_def);
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Collect all function name references from a domain expression using AstTransform.
+/// Walks the full AST (including scalar subqueries, pipes, operators, etc.).
+fn collect_function_refs(
+    body: &unresolved::DomainExpression,
+) -> Vec<(String, Option<ast_unresolved::NamespacePath>)> {
+    struct Collector {
+        refs: Vec<(String, Option<ast_unresolved::NamespacePath>)>,
+    }
+    impl AstTransform<Unresolved, Unresolved> for Collector {
+        fn transform_function(
+            &mut self,
+            f: FunctionExpression<Unresolved>,
+        ) -> Result<FunctionExpression<Unresolved>> {
+            match &f {
+                FunctionExpression::Regular {
+                    name, namespace, ..
+                }
+                | FunctionExpression::Curried {
+                    name, namespace, ..
+                } => {
+                    self.refs.push((name.to_string(), namespace.clone()));
+                }
+                FunctionExpression::HigherOrder { name, .. } => {
+                    self.refs.push((name.to_string(), None));
+                }
+                _ => {}
+            }
+            ast_transform::walk_transform_function(self, f)
+        }
+    }
+    let mut collector = Collector { refs: Vec::new() };
+    // Clone body since AstTransform is consuming; CFE bodies are small.
+    let _ = collector.transform_domain(body.clone());
+    collector.refs
 }

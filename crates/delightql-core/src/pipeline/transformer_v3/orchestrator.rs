@@ -488,14 +488,62 @@ pub fn transform_query_with_options(
                         })
                     }
                 }
-                // Nested CFEs or REPL commands - recursively call transform_query_with_options
+                // Nested WithPrecompiledCfes - unwrap and process inner query
+                // (all CFEs already collected by collect_cfes at top level)
+                ast_addressed::Query::WithPrecompiledCfes { query: inner, .. } => {
+                    // Recursively unwrap until we reach a non-WithPrecompiledCfes query
+                    let mut current = *inner;
+                    loop {
+                        match current {
+                            ast_addressed::Query::WithPrecompiledCfes { query: deeper, .. } => {
+                                current = *deeper;
+                            }
+                            ast_addressed::Query::Relational(expr) => {
+                                let ctx = apply_gates(
+                                    TransformContext::new(dialect)
+                                        .with_cfe_definitions(all_cfes.clone())
+                                        .with_bin_registry(bin_registry.clone().unwrap_or_else(|| {
+                                            std::sync::Arc::new(
+                                                crate::bin_cartridge::registry::BinCartridgeRegistry::new(),
+                                            )
+                                        })),
+                                );
+                                let state = transform_relational(expr, &ctx)?;
+                                if let QueryBuildState::DmlStatement(dml_stmt) = state {
+                                    return Ok(dml_stmt);
+                                }
+                                let query = finalize_to_query(state)?;
+                                let query = hide_hygienic_columns_from_output(query)?;
+                                return extract_ctes(query);
+                            }
+                            other => {
+                                // For WithCtes or other query types, wrap back in
+                                // WithPrecompiledCfes with all accumulated CFEs so
+                                // the top-level handler can process it with full context.
+                                let wrapped = ast_addressed::Query::WithPrecompiledCfes {
+                                    cfes: all_cfes.clone(),
+                                    query: Box::new(other),
+                                };
+                                return transform_query_with_options(
+                                    wrapped,
+                                    force_ctes,
+                                    dialect,
+                                    bin_registry.clone(),
+                                    Some((*danger_gate_map).clone()),
+                                    Some((*option_map).clone()),
+                                );
+                            }
+                        }
+                    }
+                }
+                // Other cases (REPL commands, etc.)
                 _ => transform_query_with_options(
                     *query,
                     force_ctes,
                     dialect,
                     bin_registry.clone(),
-                    None,
-                    None,
+                    Some((*danger_gate_map).clone()),
+                    Some((*option_map).clone()),
                 ),
             }
         }

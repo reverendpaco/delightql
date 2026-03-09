@@ -78,41 +78,47 @@ impl AstTransform<Refined, Refined> for StrictParamReplacer<'_> {
                 name,
                 qualifier: None,
                 alias,
+                provenance,
                 ..
             } => {
-                let name_str = name.to_string();
-                let alias_str = alias.map(|a| a.to_string());
-                if self.curried_params.iter().any(|p| name_str == *p) {
-                    Ok(DomainExpression::Substitution(
-                        SubstitutionExpr::CurriedParameter {
-                            name: name_str,
-                            alias: alias_str,
-                        },
-                    ))
-                } else if self.regular_params.iter().any(|p| name_str == *p) {
-                    Ok(DomainExpression::Substitution(
+                // Use provenance when available (set by CfeRefiner + provenance fixer).
+                // In strict mode with in_correlation=false, the resolver already rejects
+                // unknown references. Any Lvar reaching here with None provenance is a
+                // legitimate table column (e.g. inside a scalar subquery body).
+                match provenance.get() {
+                    Some(LvarProvenance::CfeCurriedParameter) => {
+                        Ok(DomainExpression::Substitution(
+                            SubstitutionExpr::CurriedParameter {
+                                name: name.to_string(),
+                                alias: alias.map(|a| a.to_string()),
+                            },
+                        ))
+                    }
+                    Some(LvarProvenance::CfeParameter) => Ok(DomainExpression::Substitution(
                         SubstitutionExpr::Parameter {
-                            name: name_str,
-                            alias: alias_str,
+                            name: name.to_string(),
+                            alias: alias.map(|a| a.to_string()),
                         },
-                    ))
-                } else {
-                    Err(DelightQLError::ParseError {
+                    )),
+                    Some(LvarProvenance::RealTable { .. }) | None => {
+                        // Real table column or unprovenanced Lvar — leave as-is.
+                        // The resolver already validated this reference.
+                        Ok(DomainExpression::Lvar {
+                            name,
+                            qualifier: None,
+                            namespace_path: NamespacePath::empty(),
+                            alias,
+                            provenance,
+                        })
+                    }
+                    Some(LvarProvenance::CfeContext) => Err(DelightQLError::ParseError {
                         message: format!(
-                            "CFE body references '{}' which is not a parameter.\n\
-                             \n\
-                             CFE bodies can only reference their declared parameters, \
-                             not columns from call-site scope.\n\
-                             \n\
-                             Solutions:\n\
-                             1. Add '{}' as a parameter: name:(..., {}) : ...\n\
-                             2. Use implicit context (future): name:(.., ...) : ...\n\
-                             3. Use explicit context (future): name:(..{{{}}}, ...) : ...",
-                            name_str, name_str, name_str, name_str
+                            "CFE body references context parameter '{}' but CFE uses strict (no-context) mode.",
+                            name
                         ),
                         source: None,
                         subcategory: None,
-                    })
+                    }),
                 }
             }
             other => walk_transform_domain(self, other),

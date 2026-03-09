@@ -147,7 +147,12 @@ pub fn resolve_query(
     // grounding, etc.) — not just inside pipe operators.
     let (query, ccafe_cfes) = grounding::inline_in_query_borrowed(query, &registry.consult, None)?;
 
-    // If any context-aware DDL functions (type=3) were discovered during inlining,
+    log::debug!("inline_in_query_borrowed collected {} CFE definitions", ccafe_cfes.len());
+    for cfe in &ccafe_cfes {
+        log::debug!("  CFE: '{}' params={:?} curried={:?}", cfe.name, cfe.parameters, cfe.curried_params);
+    }
+
+    // If any DDL functions were discovered during inlining,
     // precompile them and inject as WithPrecompiledCfes so the resolver can handle them.
     let query = if !ccafe_cfes.is_empty() {
         let precompiled: Vec<_> = ccafe_cfes
@@ -343,20 +348,25 @@ pub fn resolve_query(
                 fold.registry.query_local.register_cfe(cfe.clone());
             }
 
-            // Resolve the query with the registry that has CFE definitions
+            // Resolve the inner query. We avoid calling resolve_query() here to prevent
+            // re-running inline_in_query_borrowed (which would cause infinite recursion).
+            // For Relational inner queries, resolve using the OUTER fold so that any
+            // pipe-collected CFEs are preserved (resolve_query_inline creates a fresh fold
+            // whose collected_pipe_cfes would be silently lost).
             let resolved_inner = match *query {
-                ast_unresolved::Query::Relational(expr) => {
-                    let (resolved_expr, _) = fold.resolve_relational(expr)?;
-                    Box::new(ast_resolved::Query::Relational(resolved_expr))
+                ast_unresolved::Query::Relational(rel_expr) => {
+                    let (resolved, _bubbled) = fold.resolve_relational(rel_expr)?;
+                    Box::new(ast_resolved::Query::Relational(resolved))
                 }
                 other => {
-                    // For non-relational queries, fall back to regular resolution
-                    // (though they shouldn't appear inside WithPrecompiledCfes)
-                    let inner_result = resolve_query(other, schema, system, config)?;
-                    if let Some(conn_id) = inner_result.connection_id {
-                        fold.registry.track_connection_id(conn_id);
-                    }
-                    Box::new(inner_result.query)
+                    let (inner, _bubbled) = resolve_query_inline(
+                        other,
+                        fold.registry,
+                        None,
+                        &config,
+                        None,
+                    )?;
+                    Box::new(inner)
                 }
             };
 
@@ -377,6 +387,54 @@ pub fn resolve_query(
             }
             inner_result.query
         }
+    };
+
+    // If any DDL functions were collected during per-pipe inlining,
+    // precompile them and merge into the resolved query's WithPrecompiledCfes
+    // (or create a new wrapper if none exists).
+    let pipe_cfes = std::mem::take(&mut fold.collected_pipe_cfes);
+    log::debug!("pipe_cfes after resolution: {} entries", pipe_cfes.len());
+    let resolved_query = if !pipe_cfes.is_empty() {
+        // Deduplicate by name (top-level pass may have already collected some)
+        let mut seen = std::collections::HashSet::new();
+        let unique_cfes: Vec<_> = pipe_cfes
+            .into_iter()
+            .filter(|c| seen.insert(c.name.clone()))
+            .collect();
+
+        log::debug!(
+            "Precompiling {} pipe-collected DDL function CFEs",
+            unique_cfes.len()
+        );
+
+        let mut precompiled: Vec<_> = unique_cfes
+            .into_iter()
+            .map(|cfe| {
+                crate::pipeline::cfe_precompiler::definition::precompile_cfe_definition(
+                    cfe, schema, system,
+                )
+            })
+            .collect::<Result<_>>()?;
+
+        // Merge into existing WithPrecompiledCfes to avoid nesting
+        match resolved_query {
+            ast_resolved::Query::WithPrecompiledCfes {
+                mut cfes,
+                query: inner,
+            } => {
+                cfes.append(&mut precompiled);
+                ast_resolved::Query::WithPrecompiledCfes {
+                    cfes,
+                    query: inner,
+                }
+            }
+            other => ast_resolved::Query::WithPrecompiledCfes {
+                cfes: precompiled,
+                query: Box::new(other),
+            },
+        }
+    } else {
+        resolved_query
     };
 
     // Validate that all resolved tables belong to the same connection
@@ -541,6 +599,21 @@ pub(crate) fn resolve_query_inline(
                 bubbled,
             ))
         }
+        ast_unresolved::Query::WithPrecompiledCfes { cfes, query } => {
+            // Register CFE definitions in the registry for resolution
+            for cfe in &cfes {
+                registry.query_local.register_cfe(cfe.clone());
+            }
+            let (resolved_inner, bubbled) =
+                resolve_query_inline(*query, registry, outer_context, config, grounding)?;
+            Ok((
+                ast_resolved::Query::WithPrecompiledCfes {
+                    cfes,
+                    query: Box::new(resolved_inner),
+                },
+                bubbled,
+            ))
+        }
         ast_unresolved::Query::WithErContext { context, query } => {
             // Thread ER-context into config, same as top-level resolve_query.
             let config_with_ctx = ResolutionConfig {
@@ -659,6 +732,31 @@ fn resolve_relational_expression_with_registry(
         grounding.cloned(),
     );
     fold.resolve_relational(expr)
+}
+
+/// Like `resolve_relational_expression_with_registry` but also returns any
+/// pipe-collected CFE definitions from the sub-fold. Used by interior relation
+/// resolution to propagate CFEs back to the outer fold.
+fn resolve_relational_expression_with_pipe_cfes(
+    expr: ast_unresolved::RelationalExpression,
+    registry: &mut crate::resolution::EntityRegistry,
+    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    config: &ResolutionConfig,
+    grounding: Option<&ast_unresolved::GroundedPath>,
+) -> Result<(
+    ast_resolved::RelationalExpression,
+    BubbledState,
+    Vec<ast_unresolved::CfeDefinition>,
+)> {
+    let mut fold = ResolverFold::new(
+        registry,
+        config.clone(),
+        outer_context.map(|c| c.to_vec()),
+        grounding.cloned(),
+    );
+    let (resolved, bubbled) = fold.resolve_relational(expr)?;
+    let pipe_cfes = std::mem::take(&mut fold.collected_pipe_cfes);
+    Ok((resolved, bubbled, pipe_cfes))
 }
 
 // ============================================================================

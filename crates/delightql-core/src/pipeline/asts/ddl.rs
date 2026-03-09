@@ -84,6 +84,8 @@ pub enum DdlHead {
 pub struct FunctionParam {
     pub name: String,
     pub guard: Option<DomainExpression<Unresolved>>,
+    /// True if declared with f:() syntax (higher-order function parameter)
+    pub callable: bool,
 }
 
 /// HO parameter kind — declares how a parameter is bound at call sites.

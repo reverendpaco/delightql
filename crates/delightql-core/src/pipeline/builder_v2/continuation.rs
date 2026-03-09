@@ -500,7 +500,7 @@ fn apply_comma_to_node(
 }
 
 /// Parse the right side of a binary operator
-fn parse_right_side(
+pub(super) fn parse_right_side(
     node: CstNode,
     features: &mut FeatureCollector,
 ) -> Result<RelationalExpression> {

@@ -33,79 +33,27 @@ use log::debug;
 use std::collections::HashMap;
 
 /// Convert a NamespacePath to a namespace FQ string for ConsultRegistry lookup
-pub(super) fn namespace_path_to_fq(ns: &ast_unresolved::NamespacePath) -> String {
+pub(crate) fn namespace_path_to_fq(ns: &ast_unresolved::NamespacePath) -> String {
     let parts: Vec<&str> = ns.iter().map(|i| i.name.as_str()).collect();
     parts.join("::")
 }
 
-/// Inline consulted functions in a unary relational operator.
+/// Inline consulted functions in a unary relational operator (grounded path).
 ///
-/// Walks the operator's domain expressions, replacing function calls
-/// that match consulted definitions with their inlined bodies.
+/// Walks the operator's domain expressions, collecting DDL function definitions
+/// as CfeDefinitions for precompilation. Returns the operator and collected CFEs.
 pub(super) fn inline_consulted_functions_in_operator(
     operator: ast_unresolved::UnaryRelationalOperator,
     grounding: &GroundedPath,
     consult: &ConsultRegistry,
-) -> Result<ast_unresolved::UnaryRelationalOperator> {
-    GroundedInliner { grounding, consult }.transform_operator(operator)
-}
-
-// ============================================================================
-// Shared inlining helper
-// ============================================================================
-
-/// Inline a consulted entity body: parse DDL, substitute params, patch namespace,
-/// re-fold the result, and apply alias. Used by both BorrowedInliner and GroundedInliner.
-fn inline_entity_body(
-    entity: &crate::resolution::registry::ConsultedEntity,
-    arguments: &[ast_unresolved::DomainExpression],
-    alias: Option<SqlIdentifier>,
-    data_ns: Option<&ast_unresolved::NamespacePath>,
-    fold: &mut impl AstTransform<Unresolved, Unresolved>,
-) -> Result<ast_unresolved::DomainExpression> {
-    let ddl_defs = ddl_builder::build_ddl_file(&entity.definition)?;
-    if ddl_defs.is_empty() {
-        return Err(DelightQLError::parse_error(format!(
-            "No definitions found for function '{}'",
-            entity.name
-        )));
-    }
-
-    let substituted = if ddl_defs.len() == 1 {
-        let body = ddl_defs
-            .into_iter()
-            .next()
-            .unwrap()
-            .into_domain_expr()
-            .ok_or_else(|| {
-                DelightQLError::parse_error(format!(
-                    "Expected scalar body for function '{}', got relational",
-                    entity.name
-                ))
-            })?;
-
-        let param_map: HashMap<&str, &ast_unresolved::DomainExpression> = entity
-            .params
-            .iter()
-            .zip(arguments.iter())
-            .map(|(p, a)| (p.name.as_str(), a))
-            .collect();
-
-        let substituted = substitute_in_domain_expr(body, &param_map);
-        if let Some(ns) = data_ns {
-            patch_data_ns_in_domain_expr(substituted, ns)
-        } else {
-            substituted
-        }
-    } else {
-        build_case_from_clauses(ddl_defs, arguments, data_ns)?
+) -> Result<(ast_unresolved::UnaryRelationalOperator, Vec<CfeDefinition>)> {
+    let mut inliner = GroundedInliner {
+        grounding,
+        consult,
+        collected_cfes: vec![],
     };
-
-    let mut inlined = fold.transform_domain(substituted)?;
-    if let Some(alias_name) = alias {
-        apply_alias(&mut inlined, alias_name);
-    }
-    Ok(inlined)
+    let op = inliner.transform_operator(operator)?;
+    Ok((op, inliner.collected_cfes))
 }
 
 /// Extract function name and namespace from a Curried function with empty arguments.
@@ -161,61 +109,254 @@ fn lookup_borrowed_context_aware_function(
     }
 }
 
-/// Convert a consulted entity (type=3) into a CfeDefinition for precompilation.
+/// Convert a consulted entity (type=1 or type=3) into a CfeDefinition for
+/// precompilation.
 ///
 /// Re-parses the stored definition text to extract the context_mode and body,
 /// then assembles a CfeDefinition that the CFE precompiler can process.
-pub(super) fn consulted_entity_to_cfe_definition(
+/// For multi-clause definitions (disjunctive functions), synthesizes a CASE
+/// expression with parameter Lvars intact for the precompiler.
+pub(crate) fn consulted_entity_to_cfe_definition(
     entity: &crate::resolution::registry::ConsultedEntity,
 ) -> Result<CfeDefinition> {
     let ddl_defs = ddl_builder::build_ddl_file(&entity.definition)?;
-    let def = ddl_defs.into_iter().next().ok_or_else(|| {
-        DelightQLError::parse_error(format!(
-            "No definition found for context-aware function '{}'",
+    if ddl_defs.is_empty() {
+        return Err(DelightQLError::parse_error(format!(
+            "No definition found for function '{}'",
             entity.name
-        ))
-    })?;
+        )));
+    }
 
-    // Extract context_mode BEFORE consuming def
-    let context_mode = match &def.head {
-        DdlHead::Function { context_mode, .. } => context_mode.clone(),
-        _ => ContextMode::None,
+    // Split params into curried (callable) and regular based on FunctionParam.callable
+    let (curried_params, parameters) = match &ddl_defs[0].head {
+        DdlHead::Function { params, .. } => {
+            let curried: Vec<String> = params.iter().filter(|p| p.callable).map(|p| p.name.clone()).collect();
+            let regular: Vec<String> = params.iter().filter(|p| !p.callable).map(|p| p.name.clone()).collect();
+            (curried, regular)
+        }
+        _ => (vec![], entity.params.iter().map(|p| p.name.clone()).collect()),
     };
 
-    let body = def.into_domain_expr().ok_or_else(|| {
-        DelightQLError::parse_error(format!(
-            "Expected scalar body for context-aware function '{}', got relational",
-            entity.name
-        ))
-    })?;
-    let parameters: Vec<String> = entity.params.iter().map(|p| p.name.clone()).collect();
+    if ddl_defs.len() == 1 {
+        let def = ddl_defs.into_iter().next().unwrap();
 
-    Ok(CfeDefinition {
-        name: entity.name.to_string(),
-        curried_params: vec![],
-        parameters,
-        context_mode,
-        body,
-    })
+        // Extract context_mode BEFORE consuming def
+        let context_mode = match &def.head {
+            DdlHead::Function { context_mode, .. } => context_mode.clone(),
+            _ => ContextMode::None,
+        };
+
+        let body = def.into_domain_expr().ok_or_else(|| {
+            DelightQLError::parse_error(format!(
+                "Expected scalar body for function '{}', got relational",
+                entity.name
+            ))
+        })?;
+
+        Ok(CfeDefinition {
+            name: entity.name.to_string(),
+            curried_params,
+            parameters,
+            context_mode,
+            body,
+            source_namespace: Some(entity.namespace.clone()),
+        })
+    } else {
+        // Multi-clause: synthesize CASE expression with parameter Lvars intact
+        let context_mode = match &ddl_defs[0].head {
+            DdlHead::Function { context_mode, .. } => context_mode.clone(),
+            _ => ContextMode::None,
+        };
+        let body = build_case_body_from_clauses(ddl_defs)?;
+
+        Ok(CfeDefinition {
+            name: entity.name.to_string(),
+            curried_params,
+            parameters,
+            context_mode,
+            body,
+            source_namespace: Some(entity.namespace.clone()),
+        })
+    }
+}
+
+// ============================================================================
+// Recursive discovery of nested function references in CFE bodies
+// ============================================================================
+
+/// Walk a domain expression looking for function calls to consulted entities.
+/// For each found, create a CfeDefinition and recursively discover in that
+/// entity's body too. Returns all transitively discovered CfeDefinitions.
+///
+/// This lets us collect `double` when `doubled_value:(x) :- double:(x)` is
+/// collected — even though `double` isn't directly referenced in the user query.
+fn discover_nested_cfes(
+    body: &DomainExpression<Unresolved>,
+    source_ns: &str,
+    consult: &ConsultRegistry,
+    data_ns: Option<&ast_unresolved::NamespacePath>,
+    already_collected: &[CfeDefinition],
+) -> Result<Vec<CfeDefinition>> {
+    let mut seen: std::collections::HashSet<String> = already_collected
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let mut result = Vec::new();
+    discover_nested_cfes_inner(body, source_ns, consult, data_ns, &mut seen, &mut result)?;
+    Ok(result)
+}
+
+fn discover_nested_cfes_inner(
+    body: &DomainExpression<Unresolved>,
+    source_ns: &str,
+    consult: &ConsultRegistry,
+    data_ns: Option<&ast_unresolved::NamespacePath>,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<CfeDefinition>,
+) -> Result<()> {
+    match body {
+        DomainExpression::Function(func) => {
+            match func {
+                FunctionExpression::Regular {
+                    name, namespace, arguments, ..
+                }
+                | FunctionExpression::Curried {
+                    name, namespace, arguments, ..
+                } => {
+                    let name_str = name.to_string();
+                    if !seen.contains(&name_str) {
+                        // Activate namespace-local enlistments for the source namespace
+                        let activated =
+                            consult.activate_namespace_local_enlists_into_main(source_ns);
+                        let entity = lookup_borrowed_function(
+                            &name_str,
+                            namespace.as_ref(),
+                            consult,
+                        );
+                        // Also try context-aware functions
+                        let ccafe_entity = if entity.as_ref().ok().and_then(|e| e.as_ref()).is_none() {
+                            lookup_borrowed_context_aware_function(
+                                &name_str,
+                                namespace.as_ref(),
+                                consult,
+                            )
+                        } else {
+                            Ok(None)
+                        };
+                        consult.deactivate_namespace_local_enlists(&activated);
+
+                        let entity = entity?.or(ccafe_entity?);
+                        if let Some(entity) = entity {
+                            seen.insert(name_str);
+                            let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
+                            if let Some(ns) = data_ns {
+                                cfe_def.body =
+                                    patch_data_ns_in_domain_expr(cfe_def.body, ns);
+                            }
+                            // Recurse into this entity's body
+                            discover_nested_cfes_inner(
+                                &cfe_def.body,
+                                &entity.namespace,
+                                consult,
+                                data_ns,
+                                seen,
+                                out,
+                            )?;
+                            out.push(cfe_def);
+                        }
+                    }
+                    // Recurse into arguments
+                    for arg in arguments {
+                        discover_nested_cfes_inner(arg, source_ns, consult, data_ns, seen, out)?;
+                    }
+                }
+                FunctionExpression::CaseExpression { arms, .. } => {
+                    for arm in arms {
+                        match arm {
+                            ast_unresolved::CaseArm::Searched { result, .. } => {
+                                discover_nested_cfes_inner(result, source_ns, consult, data_ns, seen, out)?;
+                            }
+                            ast_unresolved::CaseArm::Simple { test_expr, result, .. } => {
+                                discover_nested_cfes_inner(test_expr, source_ns, consult, data_ns, seen, out)?;
+                                discover_nested_cfes_inner(result, source_ns, consult, data_ns, seen, out)?;
+                            }
+                            ast_unresolved::CaseArm::Default { result } => {
+                                discover_nested_cfes_inner(result, source_ns, consult, data_ns, seen, out)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                FunctionExpression::Infix { left, right, .. } => {
+                    discover_nested_cfes_inner(left, source_ns, consult, data_ns, seen, out)?;
+                    discover_nested_cfes_inner(right, source_ns, consult, data_ns, seen, out)?;
+                }
+                FunctionExpression::Window { arguments, .. } => {
+                    for arg in arguments {
+                        discover_nested_cfes_inner(arg, source_ns, consult, data_ns, seen, out)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        DomainExpression::PipedExpression { value, .. } => {
+            discover_nested_cfes_inner(value, source_ns, consult, data_ns, seen, out)?;
+        }
+        DomainExpression::Parenthesized { inner, .. } => {
+            discover_nested_cfes_inner(inner, source_ns, consult, data_ns, seen, out)?;
+        }
+        DomainExpression::ScalarSubquery { .. } => {
+            // Scalar subqueries reference tables — we still collect nested function refs
+            // but the subquery itself will be resolved by the precompiler with the real schema.
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn discover_nested_cfes_inner_func(
+    func: &FunctionExpression<Unresolved>,
+    source_ns: &str,
+    consult: &ConsultRegistry,
+    data_ns: Option<&ast_unresolved::NamespacePath>,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<CfeDefinition>,
+) -> Result<()> {
+    // Wrap as DomainExpression::Function for uniform handling
+    let as_domain = DomainExpression::Function(func.clone());
+    discover_nested_cfes_inner(&as_domain, source_ns, consult, data_ns, seen, out)
+}
+
+fn discover_nested_cfes_in_boolean(
+    _cond: &ast_unresolved::BooleanExpression,
+    _source_ns: &str,
+    _consult: &ConsultRegistry,
+    _data_ns: Option<&ast_unresolved::NamespacePath>,
+    _seen: &mut std::collections::HashSet<String>,
+    _out: &mut Vec<CfeDefinition>,
+) -> Result<()> {
+    // Boolean conditions in CASE arms rarely contain function calls to consulted entities.
+    // Skip for now — can be extended if needed.
+    Ok(())
 }
 
 // ============================================================================
 // Borrowed inlining — BorrowedInliner fold
 // ============================================================================
 
-/// Inlines consulted functions found via borrowed (engaged) namespace lookup.
-/// Overrides transform_domain for function inlining and piped-expression chain
+/// Collects consulted functions as CfeDefinitions for precompilation.
+/// Overrides transform_domain for function collection and piped-expression chain
 /// processing, transform_operator for MapCover/EmbedMapCover conversion, and
 /// transform_pipe for conditional operator processing (skip when data_ns is None).
 struct BorrowedInliner<'a> {
     consult: &'a ConsultRegistry,
     data_ns: Option<&'a ast_unresolved::NamespacePath>,
-    /// Context-aware functions (type=3) discovered during fold, to be
-    /// precompiled and injected as WithPrecompiledCfes by the resolver.
+    /// Functions discovered during fold, to be precompiled and injected
+    /// as WithPrecompiledCfes by the resolver.
     collected_ccafe_cfes: Vec<CfeDefinition>,
-    /// When true, skip type=1 inlining but still discover type=3 CCAFEs.
+    /// When true, skip type=1 collection but still discover type=3 CCAFEs.
     /// Used inside pipe operators when data_ns is None: we need to discover
-    /// CCAFEs for precompilation but can't inline type=1 functions without
+    /// CCAFEs for precompilation but can't collect type=1 functions without
     /// data_ns patching (that's handled by the per-pipe handler in mod.rs).
     discovery_only: bool,
 }
@@ -260,29 +401,35 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
 
                     if let Some(entity) = entity {
                         debug!(
-                            "Inlining engaged consulted function '{}' from namespace '{}'",
+                            "Collecting DDL function '{}' from namespace '{}' for precompilation",
                             name_str, entity.namespace
                         );
-                        // Activate namespace-local enlists/aliases into "main" so the
-                        // function body can resolve entities from namespaces enlisted
-                        // inside its DDL (lookup_enlisted_function searches main).
-                        let activated_enlists = self
-                            .consult
-                            .activate_namespace_local_enlists_into_main(&entity.namespace);
-                        let activated_aliases = self
-                            .consult
-                            .activate_namespace_local_aliases(&entity.namespace);
-                        let data_ns = self.data_ns;
-                        let result = inline_entity_body(&entity, &arguments, alias, data_ns, self);
-                        self.consult
-                            .deactivate_namespace_local_aliases(&activated_aliases);
-                        self.consult
-                            .deactivate_namespace_local_enlists(&activated_enlists);
-                        return result;
+                        let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
+                        if let Some(ns) = self.data_ns {
+                            cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
+                        }
+                        if !self
+                            .collected_ccafe_cfes
+                            .iter()
+                            .any(|c| c.name == cfe_def.name)
+                        {
+                            // Recursively discover nested function refs in the body
+                            let nested = discover_nested_cfes(
+                                &cfe_def.body,
+                                &entity.namespace,
+                                self.consult,
+                                self.data_ns,
+                                &self.collected_ccafe_cfes,
+                            )?;
+                            self.collected_ccafe_cfes.extend(nested);
+                            self.collected_ccafe_cfes.push(cfe_def);
+                        }
+                        // Pass through — will be substituted after precompilation
+                        return Ok(DomainExpression::Function(self.transform_function(func)?));
                     }
                 }
 
-                // Try context-aware function (type=3) — don't inline, collect for CFE precompilation
+                // Try context-aware function (type=3) — same treatment
                 let ccafe_entity = lookup_borrowed_context_aware_function(
                     &name_str,
                     namespace.as_ref(),
@@ -525,12 +672,12 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
     ) -> Result<PipeExpression<Unresolved>> {
         let source = self.transform_relational(p.source)?;
         let operator = if self.data_ns.is_some() {
-            // With data_ns: full inlining (type=1 with namespace patching + type=3 discovery)
+            // With data_ns: full processing
             self.transform_operator(p.operator)?
         } else {
             // Without data_ns: discovery-only mode for type=3 CCAFEs.
-            // Type=1 functions in operators are handled by the per-pipe handler
-            // in mod.rs which has access to grounding context for data_ns patching.
+            // Type=1 functions in pipe operators are collected by the
+            // per-pipe handler in resolver_fold.rs which has grounding context.
             let prev = self.discovery_only;
             self.discovery_only = true;
             let op = self.transform_operator(p.operator)?;
@@ -546,32 +693,22 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
 }
 
 /// Inline consulted functions from borrowed namespaces in a unary relational operator.
+///
+/// Returns the transformed operator and any collected CfeDefinitions (type=1 and type=3)
+/// that need precompilation before the transformer can substitute them.
 pub(super) fn inline_consulted_functions_in_operator_borrowed(
     operator: ast_unresolved::UnaryRelationalOperator,
     consult: &ConsultRegistry,
     data_ns: Option<&ast_unresolved::NamespacePath>,
-) -> Result<ast_unresolved::UnaryRelationalOperator> {
+) -> Result<(ast_unresolved::UnaryRelationalOperator, Vec<CfeDefinition>)> {
     let mut inliner = BorrowedInliner {
         consult,
         data_ns,
         collected_ccafe_cfes: vec![],
         discovery_only: false,
     };
-    inliner.transform_operator(operator)
-}
-
-pub(crate) fn inline_in_domain_expr_borrowed(
-    expr: ast_unresolved::DomainExpression,
-    consult: &ConsultRegistry,
-    data_ns: Option<&ast_unresolved::NamespacePath>,
-) -> Result<ast_unresolved::DomainExpression> {
-    let mut inliner = BorrowedInliner {
-        consult,
-        data_ns,
-        collected_ccafe_cfes: vec![],
-        discovery_only: false,
-    };
-    inliner.transform_domain(expr)
+    let op = inliner.transform_operator(operator)?;
+    Ok((op, inliner.collected_ccafe_cfes))
 }
 
 // ============================================================================
@@ -581,6 +718,7 @@ pub(crate) fn inline_in_domain_expr_borrowed(
 struct GroundedInliner<'a> {
     grounding: &'a GroundedPath,
     consult: &'a ConsultRegistry,
+    collected_cfes: Vec<CfeDefinition>,
 }
 
 impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
@@ -628,9 +766,26 @@ impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
                 };
 
                 if let Some(entity) = entity {
-                    debug!("Inlining consulted function '{}' (grounded path)", name);
-                    let data_ns = self.grounding.data_ns.clone();
-                    inline_entity_body(&entity, &arguments, alias, Some(&data_ns), self)
+                    debug!(
+                        "Collecting DDL function '{}' from grounded path for precompilation",
+                        name
+                    );
+                    let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
+                    let data_ns = &self.grounding.data_ns;
+                    cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, data_ns);
+                    if !self.collected_cfes.iter().any(|c| c.name == cfe_def.name) {
+                        let nested = discover_nested_cfes(
+                            &cfe_def.body,
+                            &entity.namespace,
+                            self.consult,
+                            Some(data_ns),
+                            &self.collected_cfes,
+                        )?;
+                        self.collected_cfes.extend(nested);
+                        self.collected_cfes.push(cfe_def);
+                    }
+                    // Pass through — will be substituted after precompilation
+                    Ok(DomainExpression::Function(self.transform_function(func)?))
                 } else {
                     walk_transform_domain(self, DomainExpression::Function(func))
                 }
@@ -661,15 +816,13 @@ fn domain_expr_to_boolean(
     }
 }
 
-/// Synthesize a `CaseExpression` from multiple guarded function clauses.
+/// Synthesize a `CaseExpression` from multiple guarded function clauses,
+/// leaving parameter Lvars intact (no substitution).
 ///
-/// Each clause's guard becomes a `CaseArm::Searched` condition, and the clause
-/// body becomes the result. An unguarded clause becomes `CaseArm::Default`.
-/// Parameters are substituted with the call-site arguments before building arms.
-fn build_case_from_clauses(
+/// Used when converting multi-clause DDL functions into CfeDefinitions. The
+/// precompiler will handle parameter resolution via fake columns.
+fn build_case_body_from_clauses(
     clauses: Vec<DdlDefinition>,
-    arguments: &[ast_unresolved::DomainExpression],
-    data_ns: Option<&ast_unresolved::NamespacePath>,
 ) -> Result<ast_unresolved::DomainExpression> {
     let mut arms: Vec<ast_unresolved::CaseArm> = Vec::new();
 
@@ -690,43 +843,21 @@ fn build_case_from_clauses(
             ))
         })?;
 
-        // Build param → argument substitution map
-        let param_map: HashMap<&str, &ast_unresolved::DomainExpression> = params
-            .iter()
-            .map(|p| p.name.as_str())
-            .zip(arguments.iter())
-            .collect();
-
-        let substituted_body = substitute_in_domain_expr(body.clone(), &param_map);
-        let substituted_body = if let Some(ns) = data_ns {
-            patch_data_ns_in_domain_expr(substituted_body, ns)
-        } else {
-            substituted_body
-        };
-
         let has_guard = params.iter().any(|p| p.guard.is_some());
         if has_guard {
-            // Find the guard expression and substitute params in it too
             let guard_expr = params
                 .iter()
                 .find_map(|p| p.guard.as_ref())
                 .unwrap()
                 .clone();
-            let guard_substituted = substitute_in_domain_expr(guard_expr, &param_map);
-            let guard_substituted = if let Some(ns) = data_ns {
-                patch_data_ns_in_domain_expr(guard_substituted, ns)
-            } else {
-                guard_substituted
-            };
-            let guard_bool = domain_expr_to_boolean(guard_substituted)?;
+            let guard_bool = domain_expr_to_boolean(guard_expr)?;
             arms.push(ast_unresolved::CaseArm::Searched {
                 condition: Box::new(guard_bool),
-                result: Box::new(substituted_body),
+                result: Box::new(body.clone()),
             });
         } else {
-            // No guard → default case (ELSE)
             arms.push(ast_unresolved::CaseArm::Default {
-                result: Box::new(substituted_body),
+                result: Box::new(body.clone()),
             });
         }
     }
@@ -734,53 +865,6 @@ fn build_case_from_clauses(
     Ok(ast_unresolved::DomainExpression::Function(
         ast_unresolved::FunctionExpression::CaseExpression { arms, alias: None },
     ))
-}
-
-// ============================================================================
-// Parameter substitution — ParamSubstituter fold
-// ============================================================================
-
-/// Replaces `Lvar` nodes whose names appear in `param_map` with the
-/// corresponding argument expression. All other nodes are structurally
-/// descended by the default `walk_*` functions.
-struct ParamSubstituter<'a> {
-    param_map: &'a HashMap<&'a str, &'a ast_unresolved::DomainExpression>,
-}
-
-impl AstTransform<Unresolved, Unresolved> for ParamSubstituter<'_> {
-    fn transform_domain(
-        &mut self,
-        expr: DomainExpression<Unresolved>,
-    ) -> Result<DomainExpression<Unresolved>> {
-        match expr {
-            DomainExpression::Lvar {
-                ref name,
-                ref alias,
-                ..
-            } => {
-                if let Some(&replacement) = self.param_map.get(name.as_str()) {
-                    let mut result = replacement.clone();
-                    if let Some(a) = alias.clone() {
-                        apply_alias(&mut result, a);
-                    }
-                    Ok(result)
-                } else {
-                    Ok(expr)
-                }
-            }
-            other => walk_transform_domain(self, other),
-        }
-    }
-}
-
-/// Substitute parameter Lvars in a domain expression with argument expressions.
-pub(crate) fn substitute_in_domain_expr(
-    expr: ast_unresolved::DomainExpression,
-    param_map: &HashMap<&str, &ast_unresolved::DomainExpression>,
-) -> ast_unresolved::DomainExpression {
-    ParamSubstituter { param_map }
-        .transform_domain(expr)
-        .expect("substitution is infallible")
 }
 
 // ============================================================================
@@ -863,6 +947,54 @@ fn apply_alias_to_func(func: &mut ast_unresolved::FunctionExpression, alias: Sql
             other
         ),
     }
+}
+
+// ============================================================================
+// Parameter substitution (used by sigma predicates)
+// ============================================================================
+
+/// Replaces `Lvar` nodes whose names appear in `param_map` with the
+/// corresponding argument expression. All other nodes are structurally
+/// descended by the default `walk_*` functions.
+struct ParamSubstituter<'a> {
+    param_map: &'a HashMap<&'a str, &'a ast_unresolved::DomainExpression>,
+}
+
+impl AstTransform<Unresolved, Unresolved> for ParamSubstituter<'_> {
+    fn transform_domain(
+        &mut self,
+        expr: DomainExpression<Unresolved>,
+    ) -> Result<DomainExpression<Unresolved>> {
+        match expr {
+            DomainExpression::Lvar {
+                ref name,
+                ref alias,
+                ..
+            } => {
+                if let Some(&replacement) = self.param_map.get(name.as_str()) {
+                    let mut result = replacement.clone();
+                    if let Some(a) = alias.clone() {
+                        apply_alias(&mut result, a);
+                    }
+                    Ok(result)
+                } else {
+                    Ok(expr)
+                }
+            }
+            other => walk_transform_domain(self, other),
+        }
+    }
+}
+
+/// Substitute parameter Lvars in a domain expression with argument expressions.
+/// Used by sigma predicate inlining in predicates.rs.
+pub(crate) fn substitute_in_domain_expr(
+    expr: ast_unresolved::DomainExpression,
+    param_map: &HashMap<&str, &ast_unresolved::DomainExpression>,
+) -> ast_unresolved::DomainExpression {
+    ParamSubstituter { param_map }
+        .transform_domain(expr)
+        .expect("substitution is infallible")
 }
 
 // ============================================================================

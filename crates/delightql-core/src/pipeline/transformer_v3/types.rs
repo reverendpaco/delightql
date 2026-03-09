@@ -37,9 +37,10 @@ pub enum QueryBuildState {
     /// Melt table - needs special CTE + json_each handling
     /// EPOCH 7: Signals that this anonymous table should generate premelt CTE
     MeltTable {
-        melt_packet_sql: String, // json_array(json_array(...), ...) SQL string
-        headers: Vec<String>,    // Column names for json_extract mapping
-        alias: String,           // Alias for the melt table
+        melt_packet_sql: String,      // json_array(json_array(...), ...) SQL string
+        headers: Vec<String>,         // Column names for json_extract mapping
+        alias: String,                // Alias for the melt table
+        row_values: Vec<Vec<String>>, // SQL strings per row for UNION ALL fallback
     },
     /// A completed DML statement (DELETE, UPDATE, INSERT)
     DmlStatement(crate::pipeline::sql_ast_v3::SqlStatement),

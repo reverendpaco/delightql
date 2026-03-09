@@ -38,6 +38,7 @@ pub struct InnerCprBubbleResult {
 ///
 /// - `subquery`: The unresolved subquery to analyze
 /// - `schema`: Database schema for table lookups
+/// - `system`: Optional system reference for consulted namespace resolution
 /// - `cte_context`: Current CTE definitions (will be updated with any changes)
 /// - `outer_context`: Optional outer query columns for correlation support
 ///
@@ -48,11 +49,16 @@ pub struct InnerCprBubbleResult {
 pub(in crate::pipeline::resolver) fn resolve_inner_cpr_during_bubbling(
     subquery: ast_unresolved::RelationalExpression,
     schema: &dyn DatabaseSchema,
+    system: Option<&crate::system::DelightQLSystem>,
     cte_context: &HashMap<String, ast_resolved::CprSchema>,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
 ) -> Result<InnerCprBubbleResult> {
-    // Create temporary registry for resolution
-    let mut temp_registry = EntityRegistry::new(schema);
+    // Create temporary registry for resolution, preserving system reference
+    // so consulted namespaces (std::math, etc.) remain visible.
+    let mut temp_registry = match system {
+        Some(sys) => EntityRegistry::new_with_system(schema, sys),
+        None => EntityRegistry::new(schema),
+    };
 
     // Copy CTE context to temporary registry
     temp_registry.query_local.ctes = cte_context.clone();

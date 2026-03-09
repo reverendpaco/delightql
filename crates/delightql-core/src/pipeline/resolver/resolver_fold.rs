@@ -54,6 +54,9 @@ pub(super) struct ResolverFold<'reg, 'db> {
     pub(super) pending_ho_join_input: Option<ast_unresolved::RelationalExpression>,
     /// Set to true when resolve_tvf absorbed the pending join input via inverted CTE.
     pub(super) ho_join_input_absorbed: bool,
+    /// DDL function definitions collected during per-pipe inlining.
+    /// These need precompilation and injection as WithPrecompiledCfes.
+    pub(super) collected_pipe_cfes: Vec<crate::pipeline::asts::core::CfeDefinition>,
 }
 
 impl<'reg, 'db> ResolverFold<'reg, 'db> {
@@ -77,6 +80,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             last_operator_output: None,
             pending_ho_join_input: None,
             ho_join_input_absorbed: false,
+            collected_pipe_cfes: vec![],
         }
     }
 
@@ -811,11 +815,13 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             // For now, keep the condition as None but bubble the needs
                             // The condition will be resolved later when filters are processed
                             let schema = self.registry.database.schema();
+                            let system = self.registry.database.system;
                             let cte_context = &mut self.registry.query_local.ctes;
                             let (_unresolved_cond, cond_bubbled) =
                                 super::bubble_predicate_expression(
                                     cond,
                                     schema,
+                                    system,
                                     cte_context,
                                     Some(&left_columns),
                                 )?;
@@ -1403,9 +1409,15 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
 
                     // Bubble the operator to collect column needs
                     let schema = self.registry.database.schema();
+                    let system = self.registry.database.system;
                     let cte_context = &mut self.registry.query_local.ctes;
                     let (unresolved_operator, operator_bubbled) =
-                        super::bubbling::bubble_unary_operator(operator, schema, cte_context)?;
+                        super::bubbling::bubble_unary_operator(
+                            operator,
+                            schema,
+                            system,
+                            cte_context,
+                        )?;
 
                     // Validate that all operator needs can be satisfied
                     if !operator_bubbled.i_need.is_empty() && !source_has_unknown_schema {
@@ -1418,18 +1430,24 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
 
                     // Inline consulted functions before resolution
                     let unresolved_operator = if let Some(grounding) = grounding {
-                        super::grounding::inline_consulted_functions_in_operator(
-                            unresolved_operator,
-                            grounding,
-                            &self.registry.consult,
-                        )?
+                        let (op, grounded_cfes) =
+                            super::grounding::inline_consulted_functions_in_operator(
+                                unresolved_operator,
+                                grounding,
+                                &self.registry.consult,
+                            )?;
+                        self.collected_pipe_cfes.extend(grounded_cfes);
+                        op
                     } else {
                         let source_data_ns = source_grounding.as_ref().map(|g| &g.data_ns);
-                        super::grounding::inline_consulted_functions_in_operator_borrowed(
-                            unresolved_operator,
-                            &self.registry.consult,
-                            source_data_ns,
-                        )?
+                        let (op, pipe_cfes) =
+                            super::grounding::inline_consulted_functions_in_operator_borrowed(
+                                unresolved_operator,
+                                &self.registry.consult,
+                                source_data_ns,
+                            )?;
+                        self.collected_pipe_cfes.extend(pipe_cfes);
+                        op
                     };
 
                     // Resolve the operator at the pipe boundary with the source schema
@@ -1674,13 +1692,17 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 Ok((expr, bubbled))
             }
             ast_unresolved::Relation::InnerRelation { .. } => {
-                super::relation_resolver::resolve_inner_relation(
-                    rel,
-                    self.registry,
-                    outer_context,
-                    &self.config,
-                    grounding,
-                )
+                let (resolved, bubbled, inner_pipe_cfes) =
+                    super::relation_resolver::resolve_inner_relation(
+                        rel,
+                        self.registry,
+                        outer_context,
+                        &self.config,
+                        grounding,
+                    )?;
+                // Propagate pipe-collected CFEs from interior relation's sub-fold
+                self.collected_pipe_cfes.extend(inner_pipe_cfes);
+                Ok((resolved, bubbled))
             }
             ast_unresolved::Relation::ConsultedView { .. } => {
                 panic!(

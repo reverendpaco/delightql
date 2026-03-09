@@ -294,11 +294,16 @@ pub fn apply_pipe_operator_unified(
             }
         }
         QueryBuildState::MeltTable { .. } => {
-            return Err(crate::error::DelightQLError::ParseError {
-                message: "Melt tables can only appear as the right side of a join".to_string(),
-                source: None,
-                subcategory: None,
-            })
+            // Standalone melt table (e.g. inside anonymous scalar subquery).
+            // Finalize to UNION ALL query, then wrap as subquery source.
+            let melt_query = finalize_to_query(source_state)?;
+            let alias = next_alias();
+            (
+                SelectStatement::builder()
+                    .select(SelectItem::star())
+                    .from_subquery(melt_query, &alias),
+                ctx,
+            )
         }
         QueryBuildState::DmlStatement(_) => {
             return Err(crate::error::DelightQLError::ParseError {

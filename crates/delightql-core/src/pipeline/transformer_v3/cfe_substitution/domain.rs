@@ -14,6 +14,32 @@ use std::collections::HashMap;
 
 use super::curried::extract_function_from_code;
 
+/// Replace all `ValuePlaceholder` (`@`) nodes in an expression with `replacement`.
+fn replace_value_placeholder(
+    expr: ast::DomainExpression,
+    replacement: &ast::DomainExpression,
+) -> ast::DomainExpression {
+    struct PlaceholderReplacer<'a> {
+        replacement: &'a ast::DomainExpression,
+    }
+    impl AstTransform<Addressed, Addressed> for PlaceholderReplacer<'_> {
+        fn transform_domain(
+            &mut self,
+            e: ast::DomainExpression,
+        ) -> Result<ast::DomainExpression> {
+            match e {
+                ast::DomainExpression::ValuePlaceholder { .. } => {
+                    Ok(self.replacement.clone())
+                }
+                other => walk_transform_domain(self, other),
+            }
+        }
+    }
+    let mut replacer = PlaceholderReplacer { replacement };
+    // ValuePlaceholder replacement cannot fail
+    replacer.transform_domain(expr).unwrap()
+}
+
 // =============================================================================
 // Fold struct
 // =============================================================================
@@ -87,6 +113,40 @@ impl AstTransform<Addressed, Addressed> for CfeSubstituter<'_> {
                     subcategory: None,
                 }),
             },
+
+            // Intercept f:(args) where f is a curried lambda — apply lambda inline
+            ast::DomainExpression::Function(ast::FunctionExpression::Regular {
+                ref name,
+                ref arguments,
+                ..
+            }) if self.curried_substitutions.get(name.as_ref()).is_some_and(|code| {
+                matches!(code, ast::DomainExpression::Function(ast::FunctionExpression::Lambda { .. }))
+            }) => {
+                let curried_code = self.curried_substitutions[name.as_ref()].clone();
+                if let ast::DomainExpression::Function(ast::FunctionExpression::Lambda { body, .. }) = curried_code {
+                    // Substitute @ in the lambda body with the call-site argument(s)
+                    // Lambdas are unary: the single @ is replaced with the first argument
+                    let arg = if arguments.len() == 1 {
+                        // First, substitute any parameters in the argument itself
+                        self.transform_domain(arguments[0].clone())?
+                    } else {
+                        return Err(DelightQLError::ParseError {
+                            message: format!(
+                                "Lambda expects 1 argument (via @), got {}",
+                                arguments.len()
+                            ),
+                            source: None,
+                            subcategory: None,
+                        });
+                    };
+                    // Replace ValuePlaceholder (@) with the argument in the lambda body
+                    let substituted = replace_value_placeholder(*body, &arg);
+                    // Recursively transform the result (it may contain more parameters)
+                    self.transform_domain(substituted)
+                } else {
+                    unreachable!()
+                }
+            }
 
             other => walk_transform_domain(self, other),
         }

@@ -322,6 +322,11 @@ pub struct CfeDefinition {
     /// The unresolved body expression
     #[lispy("body")]
     pub body: DomainExpression<Unresolved>,
+    /// Source namespace of a DDL-consulted function (for activating local enlistments during precompilation).
+    /// None for inline CFEs (defined in user query text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[lispy(skip)]
+    pub source_namespace: Option<String>,
 }
 
 /// Precompiled CFE definition (after resolver + refiner)

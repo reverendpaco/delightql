@@ -315,12 +315,13 @@ pub fn transform_filter(
                     })
                 }
                 QueryBuildState::MeltTable { .. } => {
-                    Err(crate::error::DelightQLError::ParseError {
-                        message: "Melt tables can only appear as the right side of a join"
-                            .to_string(),
-                        source: None,
-                        subcategory: None,
-                    })
+                    // Standalone melt table — materialize to query, wrap, continue.
+                    let melt_query = super::segment_handler::finalize_to_query(source_state)?;
+                    let alias = super::helpers::alias_generator::next_alias();
+                    let builder = crate::pipeline::sql_ast_v3::SelectStatement::builder()
+                        .select(crate::pipeline::sql_ast_v3::SelectItem::star())
+                        .from_subquery(melt_query, &alias);
+                    Ok(QueryBuildState::Builder(builder))
                 }
                 QueryBuildState::DmlStatement(_) => Err(crate::error::DelightQLError::ParseError {
                     message: "Cannot apply filter after DML terminal operator".to_string(),
@@ -824,11 +825,13 @@ pub fn transform_filter(
                     })
                 }
                 QueryBuildState::MeltTable { .. } => {
-                    Err(crate::error::DelightQLError::ParseError {
-                        message: "Sigma predicates cannot be applied to melt tables".to_string(),
-                        source: None,
-                        subcategory: None,
-                    })
+                    // Standalone melt table — materialize to query, wrap, continue.
+                    let melt_query = super::segment_handler::finalize_to_query(source_state)?;
+                    let alias = super::helpers::alias_generator::next_alias();
+                    let builder = crate::pipeline::sql_ast_v3::SelectStatement::builder()
+                        .select(crate::pipeline::sql_ast_v3::SelectItem::star())
+                        .from_subquery(melt_query, &alias);
+                    Ok(QueryBuildState::Builder(builder))
                 }
                 QueryBuildState::DmlStatement(_) => Err(crate::error::DelightQLError::ParseError {
                     message: "Cannot apply filter after DML terminal operator".to_string(),

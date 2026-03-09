@@ -382,6 +382,28 @@ pub fn transform_domain_expression(
                                     source: None,
                                     subcategory: None,
                                 });
+                            } else if !cfe_def.curried_params.is_empty() {
+                                // Single-parens call to HO CFE: split args into curried + regular
+                                let curried_count = cfe_def.curried_params.len();
+                                let expected = curried_count + cfe_def.parameters.len();
+                                if arguments.len() != expected {
+                                    return Err(DelightQLError::ParseError {
+                                        message: format!(
+                                            "CFE '{}' expects {} arguments ({} function + {} value), got {}",
+                                            name, expected, curried_count, cfe_def.parameters.len(), arguments.len()
+                                        ),
+                                        source: None,
+                                        subcategory: None,
+                                    });
+                                }
+                                let (curried_args, regular_args) = arguments.split_at(curried_count);
+                                crate::pipeline::transformer_v3::cfe_substitution::substitute_cfe_parameters_with_curried(
+                                    cfe_def.body.clone().into(),
+                                    curried_args.to_vec(),
+                                    regular_args.to_vec(),
+                                    &cfe_def.curried_params,
+                                    &cfe_def.parameters,
+                                )?
                             } else {
                                 log::debug!("Curried CFE {} is a positional call, using regular substitution", name);
                                 crate::pipeline::transformer_v3::cfe_substitution::substitute_cfe_parameters(
@@ -482,6 +504,28 @@ pub fn transform_domain_expression(
                                     source: None,
                                     subcategory: None,
                                 });
+                            } else if !cfe_def.curried_params.is_empty() {
+                                // Single-parens call to HO CFE: split args into curried + regular
+                                let curried_count = cfe_def.curried_params.len();
+                                let expected = curried_count + cfe_def.parameters.len();
+                                if arguments.len() != expected {
+                                    return Err(DelightQLError::ParseError {
+                                        message: format!(
+                                            "CFE '{}' expects {} arguments ({} function + {} value), got {}",
+                                            name, expected, curried_count, cfe_def.parameters.len(), arguments.len()
+                                        ),
+                                        source: None,
+                                        subcategory: None,
+                                    });
+                                }
+                                let (curried_args, regular_args) = arguments.split_at(curried_count);
+                                crate::pipeline::transformer_v3::cfe_substitution::substitute_cfe_parameters_with_curried(
+                                    cfe_def.body.clone().into(),
+                                    curried_args.to_vec(),
+                                    regular_args.to_vec(),
+                                    &cfe_def.curried_params,
+                                    &cfe_def.parameters,
+                                )?
                             } else {
                                 log::debug!("CFE {} is a positional call, using regular substitution", name);
                                 crate::pipeline::transformer_v3::cfe_substitution::substitute_cfe_parameters(

@@ -873,6 +873,53 @@ pub fn transform_relation(
                         query: Box::new(main_sql),
                     }
                 }
+                ast_addressed::Query::WithPrecompiledCfes {
+                    cfes: view_cfes,
+                    query: inner,
+                } => {
+                    // Add view body's CFEs to context for substitution
+                    let mut merged_cfes: Vec<_> = (*ctx.cfe_definitions).clone();
+                    merged_cfes.extend(view_cfes);
+                    let view_ctx = ctx.clone().with_cfe_definitions(merged_cfes);
+                    match *inner {
+                        ast_addressed::Query::Relational(expr) => {
+                            let state = super::transform_relational(expr, &view_ctx)?;
+                            super::segment_handler::finalize_to_query(state)?
+                        }
+                        ast_addressed::Query::WithCtes {
+                            ctes,
+                            query: main_query,
+                        } => {
+                            let sql_ctes = ctes
+                                .into_iter()
+                                .map(|cte| {
+                                    let state =
+                                        super::transform_relational(cte.expression, &view_ctx)?;
+                                    let cte_sql =
+                                        super::segment_handler::finalize_to_query(state)?;
+                                    Ok(Cte::new(cte.name, cte_sql))
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let state = super::transform_relational(main_query, &view_ctx)?;
+                            let main_sql = super::segment_handler::finalize_to_query(state)?;
+                            QueryExpression::WithCte {
+                                ctes: sql_ctes,
+                                query: Box::new(main_sql),
+                            }
+                        }
+                        other => {
+                            return Err(crate::error::DelightQLError::ParseError {
+                                message: format!(
+                                    "ConsultedView '{}' has unexpected inner Query variant: {:?}",
+                                    identifier.name,
+                                    std::mem::discriminant(&other)
+                                ),
+                                source: None,
+                                subcategory: None,
+                            });
+                        }
+                    }
+                }
                 other => {
                     return Err(crate::error::DelightQLError::ParseError {
                         message: format!(
@@ -1426,6 +1473,7 @@ fn generate_json_melt(
 ) -> Result<QueryBuildState> {
     // Build json_array(json_array(val1, val2, ...), json_array(...)) as a SQL string
     let mut row_array_strs = Vec::new();
+    let mut row_values = Vec::new();
 
     for row in rows {
         let mut value_strs = Vec::new();
@@ -1445,6 +1493,7 @@ fn generate_json_melt(
         // Build json_array(val1, val2, ...) for this row
         let row_array_str = format!("json_array({})", value_strs.join(", "));
         row_array_strs.push(row_array_str);
+        row_values.push(value_strs);
     }
 
     // Build outer json_array containing all row arrays
@@ -1455,5 +1504,6 @@ fn generate_json_melt(
         melt_packet_sql,
         headers,
         alias: alias_name,
+        row_values,
     })
 }

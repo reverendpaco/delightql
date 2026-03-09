@@ -217,11 +217,58 @@ pub(crate) fn finalize_to_query(state: QueryBuildState) -> Result<QueryExpressio
 
             finalize_segment_to_query(source, filters, order_by, limit_offset)
         }
-        QueryBuildState::MeltTable { .. } => Err(crate::error::DelightQLError::ParseError {
-            message: "Melt tables can only appear as the right side of a join".to_string(),
-            source: None,
-            subcategory: None,
-        }),
+        QueryBuildState::MeltTable {
+            row_values,
+            headers,
+            ..
+        } => {
+            // Standalone melt table (e.g., inside anonymous scalar subquery _:(, ...)).
+            // No join context available — emit as UNION ALL of SELECTs.
+            // Each row becomes: SELECT val1 AS col1, val2 AS col2, ...
+            use crate::pipeline::sql_ast_v3::SetOperator;
+
+            let mut selects = Vec::new();
+            for (i, row) in row_values.iter().enumerate() {
+                let items: Vec<SelectItem> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(j, sql_str)| {
+                        let expr = DomainExpression::RawSql(sql_str.clone());
+                        if i == 0 {
+                            // First SELECT: alias columns
+                            let col_name = headers
+                                .get(j)
+                                .cloned()
+                                .unwrap_or_else(|| format!("column{}", j + 1));
+                            SelectItem::expression_with_alias(expr, col_name)
+                        } else {
+                            SelectItem::expression(expr)
+                        }
+                    })
+                    .collect();
+                let select = SelectStatement::builder()
+                    .select_all(items)
+                    .build()
+                    .map_err(|e| crate::error::DelightQLError::ParseError {
+                        message: e,
+                        source: None,
+                        subcategory: None,
+                    })?;
+                selects.push(QueryExpression::Select(Box::new(select)));
+            }
+            if selects.len() == 1 {
+                Ok(selects.into_iter().next().unwrap())
+            } else {
+                Ok(selects
+                    .into_iter()
+                    .reduce(|acc, q| QueryExpression::SetOperation {
+                        op: SetOperator::UnionAll,
+                        left: Box::new(acc),
+                        right: Box::new(q),
+                    })
+                    .unwrap())
+            }
+        }
         QueryBuildState::DmlStatement(_) => Err(crate::error::DelightQLError::ParseError {
             message: "DML statements should be intercepted before finalize_to_query".to_string(),
             source: None,

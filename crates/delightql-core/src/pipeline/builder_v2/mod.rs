@@ -498,36 +498,46 @@ fn parse_cfe_definition(
 
         (curried, regular)
     } else {
-        // Lower-order CFE: first_params are regular parameters (backward compat)
-        // Need to filter out context_marker and params_after_context
-        let regular = if let Some(first_params_node) = cfe_node.field("first_params") {
-            // If there's a params_after_context field, use that; otherwise use identifiers
-            if let Some(params_after_ctx) = first_params_node.field("params_after_context") {
-                // params_after_context can be either a single identifier or contain multiple identifiers
-                if params_after_ctx.kind() == "identifier" {
-                    // Single parameter case
-                    vec![params_after_ctx.text().to_string()]
-                } else {
-                    // Multiple parameters case
-                    params_after_ctx
-                        .children()
-                        .filter(|child| child.kind() == "identifier")
-                        .map(|id_node| id_node.text().to_string())
-                        .collect()
+        // Single-parens CFE: sort params into curried (function) vs regular (scalar)
+        // Function params are marked with f:() syntax (parsed as callable_param/function_call)
+        // Scalar params are bare identifiers
+        if let Some(first_params_node) = cfe_node.field("first_params") {
+            let mut curried = vec![];
+            let mut regular = vec![];
+
+            // Gather all param nodes from before_context, after_context, or the whole list
+            let has_context = first_params_node.find_child("context_marker").is_some();
+            let mut param_nodes: Vec<CstNode> = vec![];
+            if has_context {
+                for field_name in &["params_before_context", "params_after_context"] {
+                    if let Some(node) = first_params_node.field(field_name) {
+                        if node.kind() == "identifier" || node.kind() == "callable_param" {
+                            param_nodes.push(node);
+                        } else {
+                            param_nodes.extend(node.children().filter(|c| c.kind() == "identifier" || c.kind() == "callable_param"));
+                        }
+                    }
                 }
             } else {
-                // No context marker - just get identifiers (backward compat)
-                first_params_node
-                    .children()
-                    .filter(|child| child.kind() == "identifier")
-                    .map(|id_node| id_node.text().to_string())
-                    .collect()
-            }
-        } else {
-            vec![]
-        };
+                param_nodes.extend(first_params_node.children().filter(|c| c.kind() == "identifier" || c.kind() == "callable_param"));
+            };
 
-        (vec![], regular)
+            for child in param_nodes {
+                if child.kind() == "identifier" {
+                    regular.push(child.text().to_string());
+                } else if child.kind() == "callable_param" {
+                    if let Some(func_call) = child.find_child("function_call") {
+                        if let Some(name_node) = func_call.field("name") {
+                            curried.push(name_node.text().to_string());
+                        }
+                    }
+                }
+            }
+
+            (curried, regular)
+        } else {
+            (vec![], vec![])
+        }
     };
 
     // Get the body expression
@@ -544,6 +554,7 @@ fn parse_cfe_definition(
         parameters,
         context_mode,
         body,
+        source_namespace: None,
     })
 }
 

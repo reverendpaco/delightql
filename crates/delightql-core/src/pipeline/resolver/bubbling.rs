@@ -1,26 +1,36 @@
 use super::*;
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
+use crate::system::DelightQLSystem;
 use std::collections::HashMap;
 
 pub(super) fn bubble_unary_operator(
     operator: ast_unresolved::UnaryRelationalOperator,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     match operator {
         ast_unresolved::UnaryRelationalOperator::General {
             containment_semantic,
             expressions,
-        } => bubble_general_operator(containment_semantic, expressions, schema, cte_context),
+        } => bubble_general_operator(
+            containment_semantic,
+            expressions,
+            schema,
+            system,
+            cte_context,
+        ),
         ast_unresolved::UnaryRelationalOperator::Modulo {
             containment_semantic,
             spec,
-        } => bubble_modulo_operator(containment_semantic, spec, schema, cte_context),
+        } => bubble_modulo_operator(containment_semantic, spec, schema, system, cte_context),
         ast_unresolved::UnaryRelationalOperator::TupleOrdering {
             containment_semantic,
             specs,
-        } => bubble_tupleordering_operator(containment_semantic, specs, schema, cte_context),
+        } => {
+            bubble_tupleordering_operator(containment_semantic, specs, schema, system, cte_context)
+        }
         ast_unresolved::UnaryRelationalOperator::MapCover {
             function,
             columns,
@@ -32,24 +42,33 @@ pub(super) fn bubble_unary_operator(
             containment_semantic,
             conditioned_on,
             schema,
+            system,
             cte_context,
         ),
         ast_unresolved::UnaryRelationalOperator::ProjectOut {
             containment_semantic,
             expressions,
-        } => bubble_projectout_operator(containment_semantic, expressions, schema, cte_context),
+        } => bubble_projectout_operator(
+            containment_semantic,
+            expressions,
+            schema,
+            system,
+            cte_context,
+        ),
         ast_unresolved::UnaryRelationalOperator::RenameCover { specs } => {
-            bubble_renamecover_operator(specs, schema, cte_context)
+            bubble_renamecover_operator(specs, schema, system, cte_context)
         }
         ast_unresolved::UnaryRelationalOperator::Transform {
             transformations,
             conditioned_on,
-        } => bubble_transform_operator(transformations, conditioned_on, schema, cte_context),
+        } => {
+            bubble_transform_operator(transformations, conditioned_on, schema, system, cte_context)
+        }
         ast_unresolved::UnaryRelationalOperator::AggregatePipe { aggregations } => {
-            bubble_aggregatepipe_operator(aggregations, schema, cte_context)
+            bubble_aggregatepipe_operator(aggregations, schema, system, cte_context)
         }
         ast_unresolved::UnaryRelationalOperator::Reposition { moves } => {
-            bubble_reposition_operator(moves, schema, cte_context)
+            bubble_reposition_operator(moves, schema, system, cte_context)
         }
         ast_unresolved::UnaryRelationalOperator::EmbedMapCover {
             function,
@@ -59,11 +78,11 @@ pub(super) fn bubble_unary_operator(
         } => {
             // Bubble function and selector components
             let (bubbled_function, func_state) =
-                bubble_function_expression(function, schema, cte_context)?;
+                bubble_function_expression(function, schema, system, cte_context)?;
 
             // Bubble the selector if it contains expressions
             let (bubbled_selector, selector_state) =
-                bubble_column_selector(selector, schema, cte_context)?;
+                bubble_column_selector(selector, schema, system, cte_context)?;
 
             // Combine states
             let mut combined_state = func_state;
@@ -151,13 +170,14 @@ pub(super) fn bubble_general_operator(
     containment_semantic: ast_unresolved::ContainmentSemantic,
     expressions: Vec<ast_unresolved::DomainExpression>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
 
     for expr in &expressions {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(expr.clone(), schema, cte_context, None)?;
+            bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
     }
 
@@ -175,6 +195,7 @@ pub(super) fn bubble_modulo_operator(
     containment_semantic: ast_unresolved::ContainmentSemantic,
     spec: ast_unresolved::ModuloSpec,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
@@ -184,7 +205,7 @@ pub(super) fn bubble_modulo_operator(
             // Simple columns for distinct/group
             for expr in cols {
                 let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, cte_context, None)?;
+                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
                 merged_i_need.extend(bubbled.i_need);
             }
         }
@@ -195,19 +216,19 @@ pub(super) fn bubble_modulo_operator(
         } => {
             for expr in reducing_by {
                 let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, cte_context, None)?;
+                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
                 merged_i_need.extend(bubbled.i_need);
             }
 
             for expr in reducing_on {
                 let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, cte_context, None)?;
+                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
                 merged_i_need.extend(bubbled.i_need);
             }
 
             for expr in arbitrary {
                 let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, cte_context, None)?;
+                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
                 merged_i_need.extend(bubbled.i_need);
             }
         }
@@ -226,13 +247,14 @@ pub(super) fn bubble_tupleordering_operator(
     containment_semantic: ast_unresolved::ContainmentSemantic,
     specs: Vec<ast_unresolved::OrderingSpec>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
 
     for spec in &specs {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(spec.column.clone(), schema, cte_context, None)?;
+            bubble_domain_expression(spec.column.clone(), schema, system, cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
     }
 
@@ -251,17 +273,18 @@ pub(super) fn bubble_mapcover_operator(
     containment_semantic: ast_unresolved::ContainmentSemantic,
     conditioned_on: Option<Box<ast_unresolved::BooleanExpression>>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
 
     let (_unchanged_func, func_bubbled) =
-        bubble_function_expression(function.clone(), schema, cte_context)?;
+        bubble_function_expression(function.clone(), schema, system, cte_context)?;
     merged_i_need.extend(func_bubbled.i_need);
 
     for col in &columns {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(col.clone(), schema, cte_context, None)?;
+            bubble_domain_expression(col.clone(), schema, system, cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
     }
 
@@ -280,13 +303,14 @@ pub(super) fn bubble_projectout_operator(
     containment_semantic: ast_unresolved::ContainmentSemantic,
     expressions: Vec<ast_unresolved::DomainExpression>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     _cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
 
     for expr in &expressions {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(expr.clone(), schema, _cte_context, None)?;
+            bubble_domain_expression(expr.clone(), schema, system, _cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
     }
 
@@ -302,13 +326,14 @@ pub(super) fn bubble_projectout_operator(
 pub(super) fn bubble_renamecover_operator(
     specs: Vec<ast_unresolved::RenameSpec>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
 
     for spec in &specs {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(spec.from.clone(), schema, cte_context, None)?;
+            bubble_domain_expression(spec.from.clone(), schema, system, cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
     }
 
@@ -322,6 +347,7 @@ pub(super) fn bubble_transform_operator(
     transformations: Vec<(ast_unresolved::DomainExpression, String, Option<String>)>,
     conditioned_on: Option<Box<ast_unresolved::BooleanExpression>>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     _cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
@@ -329,7 +355,7 @@ pub(super) fn bubble_transform_operator(
 
     for (expr, alias, qual) in transformations {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(expr.clone(), schema, _cte_context, None)?;
+            bubble_domain_expression(expr.clone(), schema, system, _cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
         bubbled_transformations.push((expr, alias, qual));
     }
@@ -346,13 +372,14 @@ pub(super) fn bubble_transform_operator(
 pub(super) fn bubble_aggregatepipe_operator(
     aggregations: Vec<ast_unresolved::DomainExpression>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     _cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
 
     for agg in &aggregations {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(agg.clone(), schema, _cte_context, None)?;
+            bubble_domain_expression(agg.clone(), schema, system, _cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
     }
 
@@ -365,6 +392,7 @@ pub(super) fn bubble_aggregatepipe_operator(
 pub(super) fn bubble_reposition_operator(
     moves: Vec<ast_unresolved::RepositionSpec>,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
     let mut merged_i_need = Vec::new();
@@ -372,7 +400,7 @@ pub(super) fn bubble_reposition_operator(
 
     for spec in moves {
         let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(spec.column.clone(), schema, cte_context, None)?;
+            bubble_domain_expression(spec.column.clone(), schema, system, cte_context, None)?;
         merged_i_need.extend(bubbled.i_need);
         bubbled_moves.push(ast_unresolved::RepositionSpec {
             column: spec.column,
@@ -391,6 +419,7 @@ pub(super) fn bubble_reposition_operator(
 pub(super) fn bubble_domain_expression(
     expr: ast_unresolved::DomainExpression,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
 ) -> Result<(ast_unresolved::DomainExpression, BubbledState)> {
@@ -457,7 +486,7 @@ pub(super) fn bubble_domain_expression(
         }
         ast_unresolved::DomainExpression::Function(f) => {
             let (_func_unchanged, func_bubbled) =
-                bubble_function_expression(f, schema, cte_context)?;
+                bubble_function_expression(f, schema, system, cte_context)?;
             Ok((expr, func_bubbled))
         }
         ast_unresolved::DomainExpression::Predicate { expr: p, alias: _ } => {
@@ -473,15 +502,26 @@ pub(super) fn bubble_domain_expression(
                     let state = if schema.table_exists(None, table_name)
                         || cte_context.contains_key(table_name.as_ref())
                     {
-                        // Table is in database or CTE context — do full bubbling
-                        let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                        // Table is in database or CTE context — do full bubbling.
+                        // Bubbling operates with incomplete context (no outer columns),
+                        // so correlated subqueries may fail here.  Fall back to empty
+                        // deps; the real resolution phase has the full picture.
+                        match super::helpers::resolve_inner_cpr_during_bubbling(
                             *subquery,
                             schema,
+                            system,
                             cte_context,
                             outer_context,
-                        )?;
-                        *cte_context = bubble_result.updated_cte_context;
-                        BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+                        ) {
+                            Ok(bubble_result) => {
+                                *cte_context = bubble_result.updated_cte_context;
+                                BubbledState::with_unresolved(
+                                    Vec::new(),
+                                    bubble_result.dependencies,
+                                )
+                            }
+                            Err(_) => BubbledState::resolved(Vec::new()),
+                        }
                     } else {
                         // Entity not in DB schema or CTEs — may be a consulted view.
                         // Skip inner-CPR bubbling; registry-based resolution handles it.
@@ -491,8 +531,13 @@ pub(super) fn bubble_domain_expression(
                     Ok((expr, state))
                 }
                 other => {
-                    let (_pred_unchanged, pred_bubbled) =
-                        bubble_predicate_expression(other, schema, cte_context, outer_context)?;
+                    let (_pred_unchanged, pred_bubbled) = bubble_predicate_expression(
+                        other,
+                        schema,
+                        system,
+                        cte_context,
+                        outer_context,
+                    )?;
                     Ok((expr, pred_bubbled))
                 }
             }
@@ -525,13 +570,13 @@ pub(super) fn bubble_domain_expression(
         } => {
             // Bubble the value expression
             let (_, value_state) =
-                bubble_domain_expression(*value, schema, cte_context, outer_context)?;
+                bubble_domain_expression(*value, schema, system, cte_context, outer_context)?;
 
             // Bubble each transform and merge states
             let mut merged_state = value_state;
             for transform in transforms {
                 let (_, transform_state) =
-                    bubble_function_expression(transform, schema, cte_context)?;
+                    bubble_function_expression(transform, schema, system, cte_context)?;
                 merged_state.i_need.extend(transform_state.i_need);
             }
 
@@ -539,7 +584,7 @@ pub(super) fn bubble_domain_expression(
         }
         ast_unresolved::DomainExpression::Parenthesized { inner, alias } => {
             let (bubbled_inner, state) =
-                bubble_domain_expression(*inner, schema, cte_context, outer_context)?;
+                bubble_domain_expression(*inner, schema, system, cte_context, outer_context)?;
             Ok((
                 ast_unresolved::DomainExpression::Parenthesized {
                     inner: Box::new(bubbled_inner),
@@ -553,7 +598,7 @@ pub(super) fn bubble_domain_expression(
                 .into_iter()
                 .map(|e| {
                     let (bubbled, _state) =
-                        bubble_domain_expression(e, schema, cte_context, outer_context)?;
+                        bubble_domain_expression(e, schema, system, cte_context, outer_context)?;
                     Ok(bubbled)
                 })
                 .collect::<Result<_>>()?;
@@ -571,20 +616,25 @@ pub(super) fn bubble_domain_expression(
             subquery,
             alias: _,
         } => {
-            // Scalar subquery - same pattern as InnerExists but returns a value
+            // Scalar subquery - same pattern as InnerExists but returns a value.
+            // See comment above re: incomplete bubbling context.
             let table_name = &identifier.name;
             let state = if schema.table_exists(None, table_name)
                 || cte_context.contains_key(table_name.as_ref())
             {
-                // Table is in database or CTE context — do full bubbling
-                let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                match super::helpers::resolve_inner_cpr_during_bubbling(
                     *subquery,
                     schema,
+                    system,
                     cte_context,
                     outer_context,
-                )?;
-                *cte_context = bubble_result.updated_cte_context;
-                BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+                ) {
+                    Ok(bubble_result) => {
+                        *cte_context = bubble_result.updated_cte_context;
+                        BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+                    }
+                    Err(_) => BubbledState::resolved(Vec::new()),
+                }
             } else {
                 // Entity not in DB schema or CTEs — may be a consulted view.
                 // Skip inner-CPR bubbling; the registry-based resolution
@@ -610,10 +660,15 @@ pub(super) fn bubble_domain_expression(
             pivot_key,
             ..
         } => {
-            let (_, value_state) =
-                bubble_domain_expression(*value_column, schema, cte_context, outer_context)?;
+            let (_, value_state) = bubble_domain_expression(
+                *value_column,
+                schema,
+                system,
+                cte_context,
+                outer_context,
+            )?;
             let (_, key_state) =
-                bubble_domain_expression(*pivot_key, schema, cte_context, outer_context)?;
+                bubble_domain_expression(*pivot_key, schema, system, cte_context, outer_context)?;
             let mut merged_state = value_state;
             merged_state.i_need.extend(key_state.i_need);
             Ok((expr, merged_state))
@@ -624,6 +679,7 @@ pub(super) fn bubble_domain_expression(
 pub(super) fn bubble_function_expression(
     func: ast_unresolved::FunctionExpression,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::FunctionExpression, BubbledState)> {
     match func.clone() {
@@ -636,14 +692,14 @@ pub(super) fn bubble_function_expression(
 
             for arg in arguments {
                 let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, cte_context, None)?;
+                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(arg_state.i_need);
             }
 
             // Also bubble filter condition if present
             if let Some(cond) = conditioned_on {
                 let (_cond_unchanged, cond_state) =
-                    bubble_predicate_expression(*cond, schema, cte_context, None)?;
+                    bubble_predicate_expression(*cond, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(cond_state.i_need);
             }
 
@@ -659,13 +715,13 @@ pub(super) fn bubble_function_expression(
 
             for arg in arguments {
                 let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, cte_context, None)?;
+                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(arg_state.i_need);
             }
 
             if let Some(cond) = conditioned_on {
                 let (_cond_unchanged, cond_state) =
-                    bubble_predicate_expression(*cond, schema, cte_context, None)?;
+                    bubble_predicate_expression(*cond, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(cond_state.i_need);
             }
 
@@ -676,7 +732,7 @@ pub(super) fn bubble_function_expression(
 
             for arg in arguments {
                 let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, cte_context, None)?;
+                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(arg_state.i_need);
             }
 
@@ -684,9 +740,9 @@ pub(super) fn bubble_function_expression(
         }
         ast_unresolved::FunctionExpression::Infix { left, right, .. } => {
             let (_left_unchanged, left_state) =
-                bubble_domain_expression(*left, schema, cte_context, None)?;
+                bubble_domain_expression(*left, schema, system, cte_context, None)?;
             let (_right_unchanged, right_state) =
-                bubble_domain_expression(*right, schema, cte_context, None)?;
+                bubble_domain_expression(*right, schema, system, cte_context, None)?;
 
             let mut merged_state = BubbledState::resolved(Vec::new());
             merged_state.i_need.extend(left_state.i_need);
@@ -697,7 +753,7 @@ pub(super) fn bubble_function_expression(
         ast_unresolved::FunctionExpression::Lambda { body, .. } => {
             // Bubble the lambda body expression
             let (_body_unchanged, body_state) =
-                bubble_domain_expression(*body, schema, cte_context, None)?;
+                bubble_domain_expression(*body, schema, system, cte_context, None)?;
 
             Ok((func, body_state))
         }
@@ -708,7 +764,7 @@ pub(super) fn bubble_function_expression(
             for part in parts {
                 if let ast_unresolved::StringTemplatePart::Interpolation(expr) = part {
                     let (_expr_unchanged, expr_state) =
-                        bubble_domain_expression(*expr, schema, cte_context, None)?;
+                        bubble_domain_expression(*expr, schema, system, cte_context, None)?;
                     merged_state.i_need.extend(expr_state.i_need);
                 }
             }
@@ -730,21 +786,21 @@ pub(super) fn bubble_function_expression(
             // Bubble curried arguments
             for arg in curried_arguments {
                 let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, cte_context, None)?;
+                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(arg_state.i_need);
             }
 
             // Bubble regular arguments
             for arg in regular_arguments {
                 let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, cte_context, None)?;
+                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(arg_state.i_need);
             }
 
             // Bubble filter condition if present
             if let Some(cond) = conditioned_on {
                 let (_cond_unchanged, cond_state) =
-                    bubble_predicate_expression(*cond, schema, cte_context, None)?;
+                    bubble_predicate_expression(*cond, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(cond_state.i_need);
             }
 
@@ -774,19 +830,19 @@ pub(super) fn bubble_function_expression(
 
             for arg in arguments {
                 let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, cte_context, None)?;
+                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(arg_state.i_need);
             }
 
             for expr in partition_by {
                 let (_expr_unchanged, expr_state) =
-                    bubble_domain_expression(expr, schema, cte_context, None)?;
+                    bubble_domain_expression(expr, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(expr_state.i_need);
             }
 
             for spec in order_by {
                 let (_col_unchanged, col_state) =
-                    bubble_domain_expression(spec.column, schema, cte_context, None)?;
+                    bubble_domain_expression(spec.column, schema, system, cte_context, None)?;
                 merged_state.i_need.extend(col_state.i_need);
             }
 
@@ -797,7 +853,7 @@ pub(super) fn bubble_function_expression(
             let mut merged_state = BubbledState::resolved(Vec::new());
 
             let (_source_unchanged, source_state) =
-                bubble_domain_expression(*source, schema, cte_context, None)?;
+                bubble_domain_expression(*source, schema, system, cte_context, None)?;
             merged_state.i_need.extend(source_state.i_need);
 
             Ok((func, merged_state))
@@ -808,15 +864,16 @@ pub(super) fn bubble_function_expression(
 pub(super) fn bubble_predicate_expression(
     pred: ast_unresolved::BooleanExpression,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
 ) -> Result<(ast_unresolved::BooleanExpression, BubbledState)> {
     match pred.clone() {
         ast_unresolved::BooleanExpression::Comparison { left, right, .. } => {
             let (_left_unchanged, left_state) =
-                bubble_domain_expression(*left, schema, cte_context, None)?;
+                bubble_domain_expression(*left, schema, system, cte_context, None)?;
             let (_right_unchanged, right_state) =
-                bubble_domain_expression(*right, schema, cte_context, None)?;
+                bubble_domain_expression(*right, schema, system, cte_context, None)?;
 
             let mut merged_state = BubbledState::resolved(Vec::new());
             merged_state.i_need.extend(left_state.i_need);
@@ -846,15 +903,21 @@ pub(super) fn bubble_predicate_expression(
             let state = if schema.table_exists(None, table_name)
                 || cte_context.contains_key(table_name.as_ref())
             {
-                // Table is in database or CTE context — do full bubbling
-                let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                // See comment in bubble_domain_expression/InnerExists re:
+                // incomplete bubbling context.
+                match super::helpers::resolve_inner_cpr_during_bubbling(
                     *subquery,
                     schema,
+                    system,
                     cte_context,
                     outer_context,
-                )?;
-                *cte_context = bubble_result.updated_cte_context;
-                BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+                ) {
+                    Ok(bubble_result) => {
+                        *cte_context = bubble_result.updated_cte_context;
+                        BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
+                    }
+                    Err(_) => BubbledState::resolved(Vec::new()),
+                }
             } else {
                 // Entity not in DB schema or CTEs — may be a consulted view.
                 // Skip inner-CPR bubbling; registry-based resolution handles it.
@@ -865,9 +928,9 @@ pub(super) fn bubble_predicate_expression(
         }
         ast_unresolved::BooleanExpression::And { left, right } => {
             let (left_pred, left_state) =
-                bubble_predicate_expression(*left, schema, cte_context, outer_context)?;
+                bubble_predicate_expression(*left, schema, system, cte_context, outer_context)?;
             let (right_pred, right_state) =
-                bubble_predicate_expression(*right, schema, cte_context, outer_context)?;
+                bubble_predicate_expression(*right, schema, system, cte_context, outer_context)?;
 
             let mut merged_state = BubbledState::resolved(Vec::new());
             merged_state.i_need.extend(left_state.i_need);
@@ -883,9 +946,9 @@ pub(super) fn bubble_predicate_expression(
         }
         ast_unresolved::BooleanExpression::Or { left, right } => {
             let (left_pred, left_state) =
-                bubble_predicate_expression(*left, schema, cte_context, outer_context)?;
+                bubble_predicate_expression(*left, schema, system, cte_context, outer_context)?;
             let (right_pred, right_state) =
-                bubble_predicate_expression(*right, schema, cte_context, outer_context)?;
+                bubble_predicate_expression(*right, schema, system, cte_context, outer_context)?;
 
             let mut merged_state = BubbledState::resolved(Vec::new());
             merged_state.i_need.extend(left_state.i_need);
@@ -901,7 +964,7 @@ pub(super) fn bubble_predicate_expression(
         }
         ast_unresolved::BooleanExpression::Not { expr } => {
             let (inner_pred, inner_state) =
-                bubble_predicate_expression(*expr, schema, cte_context, outer_context)?;
+                bubble_predicate_expression(*expr, schema, system, cte_context, outer_context)?;
 
             Ok((
                 ast_unresolved::BooleanExpression::Not {
@@ -917,14 +980,14 @@ pub(super) fn bubble_predicate_expression(
         } => {
             // Epoch 2 stub: Just bubble through value and set expressions
             let (_value_unchanged, value_state) =
-                bubble_domain_expression(*value.clone(), schema, cte_context, None)?;
+                bubble_domain_expression(*value.clone(), schema, system, cte_context, None)?;
 
             let mut merged_state = BubbledState::resolved(Vec::new());
             merged_state.i_need.extend(value_state.i_need);
 
             for set_expr in &set {
                 let (_set_unchanged, set_state) =
-                    bubble_domain_expression(set_expr.clone(), schema, cte_context, None)?;
+                    bubble_domain_expression(set_expr.clone(), schema, system, cte_context, None)?;
                 merged_state.i_need.extend(set_state.i_need);
             }
 
@@ -938,22 +1001,33 @@ pub(super) fn bubble_predicate_expression(
         } => {
             let table_name = &identifier.name;
             let (_value_unchanged, value_state) =
-                bubble_domain_expression(*value, schema, cte_context, None)?;
+                bubble_domain_expression(*value, schema, system, cte_context, None)?;
 
             let state = if schema.table_exists(None, table_name)
                 || cte_context.contains_key(table_name.as_ref())
             {
-                let bubble_result = super::helpers::resolve_inner_cpr_during_bubbling(
+                // See comment in bubble_domain_expression/InnerExists re:
+                // incomplete bubbling context.
+                match super::helpers::resolve_inner_cpr_during_bubbling(
                     *subquery,
                     schema,
+                    system,
                     cte_context,
                     outer_context,
-                )?;
-                *cte_context = bubble_result.updated_cte_context;
-                let mut state =
-                    BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
-                state.i_need.extend(value_state.i_need);
-                state
+                ) {
+                    Ok(bubble_result) => {
+                        *cte_context = bubble_result.updated_cte_context;
+                        let mut state =
+                            BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
+                        state.i_need.extend(value_state.i_need);
+                        state
+                    }
+                    Err(_) => {
+                        let mut state = BubbledState::resolved(Vec::new());
+                        state.i_need.extend(value_state.i_need);
+                        state
+                    }
+                }
             } else {
                 // Entity not in DB schema or CTEs — may be a consulted view.
                 // Skip inner-CPR bubbling; registry-based resolution handles it.
@@ -979,6 +1053,7 @@ pub(super) fn bubble_predicate_expression(
 fn bubble_column_selector(
     selector: ast_unresolved::ColumnSelector,
     schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::ColumnSelector, BubbledState)> {
     match selector {
@@ -988,7 +1063,7 @@ fn bubble_column_selector(
 
             for expr in exprs {
                 let (bubbled_expr, expr_state) =
-                    bubble_domain_expression(expr, schema, cte_context, None)?;
+                    bubble_domain_expression(expr, schema, system, cte_context, None)?;
                 bubbled_exprs.push(bubbled_expr);
                 combined_state.i_need.extend(expr_state.i_need);
             }

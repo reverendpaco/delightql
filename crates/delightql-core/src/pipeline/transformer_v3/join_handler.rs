@@ -207,6 +207,7 @@ pub fn transform_join(
                 melt_packet_sql,
                 headers,
                 alias: melt_alias,
+                row_values: _,
             },
         ) => {
             use crate::pipeline::sql_ast_v3::{Cte, DomainExpression, SelectItem, SelectStatement};
@@ -1120,7 +1121,28 @@ fn qualify_with_aliases(
         }
         ast_addressed::DomainExpression::Function(func) => {
             log::debug!("DEBUG: Qualifying function expression arguments");
-            // For function expressions, we need to recursively qualify the arguments
+            // Check if this is a CFE invocation — route through expression transformer
+            // which handles CFE substitution (replacing the call with the precompiled body).
+            let is_cfe = match &func {
+                ast_addressed::FunctionExpression::Regular { name, .. }
+                | ast_addressed::FunctionExpression::Curried { name, .. } => {
+                    crate::pipeline::transformer_v3::cfe_substitution::is_cfe_invocation(
+                        name,
+                        &ctx.cfe_definitions,
+                    )
+                }
+                _ => false,
+            };
+            if is_cfe {
+                let mut join_schema_ctx =
+                    crate::pipeline::transformer_v3::SchemaContext::new(join_schema.clone());
+                return expression_transformer::transform_domain_expression(
+                    ast_addressed::DomainExpression::Function(func),
+                    ctx,
+                    &mut join_schema_ctx,
+                );
+            }
+            // For non-CFE functions, qualify arguments recursively
             match func {
                 ast_addressed::FunctionExpression::Regular {
                     name,

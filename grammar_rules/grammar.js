@@ -219,14 +219,22 @@ module.exports = grammar(dqlGrammar, {
       seq('..', '{', optional(field('context_params', sep1(',', $.identifier))), '}')
     ),
 
-    // Function parameter: identifier with optional guard expression
+    // Function parameter: identifier, guarded, or callable (higher-order)
     function_param: $ => choice(
-      $.identifier,
+      // Callable function param: f:() — marks this param as a function reference
+      seq(
+        field('param_name', $.identifier),
+        token.immediate(':('),
+        ')',
+      ),
+      // Guarded param: name | guard_expr
       seq(
         field('param_name', $.identifier),
         '|',
         field('guard', $.domain_expression),
       ),
+      // Regular scalar param
+      $.identifier,
     ),
 
     // Higher-order view definition: name(params)(output) neck [docs] query

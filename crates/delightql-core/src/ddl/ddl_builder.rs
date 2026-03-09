@@ -76,21 +76,24 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                         let param_name_node = p.field("param_name");
                         if let Some(name_node) = param_name_node {
                             let name = name_node.text().to_string();
+                            // Callable param: f:() — has param_name but no guard, text contains :(
+                            let callable = p.field("guard").is_none() && p.text().contains(":(");
                             let guard = p.field("guard").and_then(|g| {
                                 let bs = g.raw_node().start_byte();
                                 let be = g.raw_node().end_byte();
                                 let guard_text = &source[bs..be];
                                 body_parser::parse_guard_expression(guard_text).ok()
                             });
-                            FunctionParam { name, guard }
+                            FunctionParam { name, guard, callable }
                         } else {
                             let name = p.text().to_string();
-                            FunctionParam { name, guard: None }
+                            FunctionParam { name, guard: None, callable: false }
                         }
                     } else {
                         FunctionParam {
                             name: p.text().to_string(),
                             guard: None,
+                            callable: false,
                         }
                     }
                 })

@@ -2013,7 +2013,11 @@ pub(super) fn resolve_inner_relation(
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+) -> Result<(
+    ast_resolved::RelationalExpression,
+    BubbledState,
+    Vec<crate::pipeline::asts::unresolved::CfeDefinition>,
+)> {
     let ast_unresolved::Relation::InnerRelation {
         pattern,
         alias,
@@ -2040,17 +2044,16 @@ pub(super) fn resolve_inner_relation(
         }
     };
 
-    // Resolve the inner subquery.
-    // Using pipes inside the subquery are converted to correlation Filters
-    // automatically by the Pipe handler in resolve_relational_expression_with_registry
-    // when outer_context is available — no per-site extraction needed.
-    let (resolved_subquery, bubbled) = super::resolve_relational_expression_with_registry(
-        (*subquery).clone(),
-        registry,
-        outer_context,
-        config,
-        grounding,
-    )?;
+    // Resolve the inner subquery, also collecting any pipe-level CFEs
+    // from the sub-fold so the caller can propagate them to the outer fold.
+    let (resolved_subquery, bubbled, inner_pipe_cfes) =
+        super::resolve_relational_expression_with_pipe_cfes(
+            (*subquery).clone(),
+            registry,
+            outer_context,
+            config,
+            grounding,
+        )?;
 
     // Extract schema from resolved subquery
     let schema = super::helpers::extraction::extract_cpr_schema(&resolved_subquery)?;
@@ -2086,6 +2089,7 @@ pub(super) fn resolve_inner_relation(
     Ok((
         ast_resolved::RelationalExpression::Relation(resolved),
         bubbled,
+        inner_pipe_cfes,
     ))
 }
 

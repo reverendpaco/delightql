@@ -405,3 +405,58 @@ pub(in crate::pipeline::builder_v2) fn parse_scalar_subquery(
         alias: alias.map(|s| s.into()),
     })
 }
+
+/// Parse anonymous scalar subquery: _:(, body)
+/// No inner table — body resolves against outer pipe context only.
+/// The continuation starts with a comma operator; we extract the right side
+/// (the actual body) and build a ScalarSubquery with identifier "_".
+pub(in crate::pipeline::builder_v2) fn parse_anonymous_scalar_subquery(
+    node: CstNode,
+    features: &mut crate::pipeline::query_features::FeatureCollector,
+) -> Result<DomainExpression> {
+    features.mark(crate::pipeline::query_features::QueryFeature::ScalarSubquery);
+
+    let identifier = QualifiedName {
+        namespace_path: NamespacePath::empty(),
+        name: "_".into(),
+        grounding: None,
+    };
+
+    // The relational_continuation contains a binary_operator_expression with
+    // a comma_operator and the body as the right side. We extract just the body.
+    let continuation_node = node.find_child("relational_continuation").ok_or_else(|| {
+        DelightQLError::parse_error("No continuation in anonymous_scalar_subquery")
+    })?;
+
+    let binary_op = continuation_node
+        .find_child("binary_operator_expression")
+        .ok_or_else(|| {
+            DelightQLError::parse_error(
+                "Expected comma operator in anonymous scalar subquery _:(, ...)",
+            )
+        })?;
+
+    // Find the right-hand side of the comma (the body)
+    let body_node = binary_op
+        .find_first_of(&[
+            "relational_expression",
+            "continuation_expression",
+            "base_expression",
+        ])
+        .ok_or_else(|| {
+            DelightQLError::parse_error("No body after comma in anonymous scalar subquery")
+        })?;
+
+    // Parse the body as a standalone relational expression
+    let mut dummy_features = FeatureCollector::inheriting_ho_bindings(features);
+    let subquery = crate::pipeline::builder_v2::continuation::parse_right_side(
+        body_node,
+        &mut dummy_features,
+    )?;
+
+    Ok(DomainExpression::ScalarSubquery {
+        identifier,
+        subquery: Box::new(subquery),
+        alias: None,
+    })
+}

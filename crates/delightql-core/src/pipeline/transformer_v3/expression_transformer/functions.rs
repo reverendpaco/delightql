@@ -788,7 +788,10 @@ fn escape_json_string(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
-/// Helper to transform an operand of an infix expression, adding parentheses if needed
+/// Helper to transform an operand of an infix expression, adding parentheses if needed.
+///
+/// Checks the RESULTING SQL expression (not the AST input) for precedence, because
+/// CFE expansion can turn a function call into an infix expression at transform time.
 fn transform_infix_operand(
     expr: AstDomainExpression,
     parent_op: &str,
@@ -796,22 +799,35 @@ fn transform_infix_operand(
     ctx: &TransformContext,
     schema_ctx: &mut crate::pipeline::transformer_v3::SchemaContext,
 ) -> Result<SqlDomainExpression> {
-    // Check if this operand is also an infix expression
-    let needs_parens = match &expr {
-        AstDomainExpression::Function(FunctionExpression::Infix { operator, .. }) => {
-            // Determine if parentheses are needed based on operator precedence
-            needs_parentheses(operator.as_str(), parent_op, is_left)
-        }
-        // Non-infix expressions never need precedence parentheses
-        _ => false,
-    };
-
     let transformed = super::transform_domain_expression(expr, ctx, schema_ctx)?;
+
+    let needs_parens = sql_expr_needs_parens(&transformed, parent_op, is_left);
 
     if needs_parens {
         Ok(SqlDomainExpression::Parens(Box::new(transformed)))
     } else {
         Ok(transformed)
+    }
+}
+
+/// Check if a SQL expression needs parentheses when used as an operand of `parent_op`.
+fn sql_expr_needs_parens(expr: &SqlDomainExpression, parent_op: &str, is_left: bool) -> bool {
+    match expr {
+        SqlDomainExpression::Binary { op, .. } => {
+            let child_op = match op {
+                BinaryOperator::Add => "add",
+                BinaryOperator::Subtract => "subtract",
+                BinaryOperator::Multiply => "multiply",
+                BinaryOperator::Divide => "divide",
+                BinaryOperator::Concatenate => "concat",
+                // Non-arithmetic binary ops (comparisons, logical) have lower SQL
+                // precedence than arithmetic, so they never need parens when appearing
+                // as operands of arithmetic ops — SQL will parse correctly.
+                _ => return false,
+            };
+            needs_parentheses(child_op, parent_op, is_left)
+        }
+        _ => false,
     }
 }
 
