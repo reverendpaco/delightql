@@ -140,7 +140,7 @@ pub fn parse_view_body(source: &str) -> Result<Query> {
     // Return the full query as-is. Consumer sites use the same CTE resolution
     // logic as the main pipeline (resolver::resolve_query_with_registry).
     match &query {
-        Query::Relational(_) | Query::WithCtes { .. } | Query::WithErContext { .. } => Ok(query),
+        Query::Relational(_) | Query::WithCtes { .. } | Query::WithErContext { .. } | Query::WithCfes { .. } | Query::WithPrecompiledCfes { .. } => Ok(query),
         other => Err(DelightQLError::database_error(
             format!(
                 "View body '{}' parsed as {:?}, expected relational expression (with optional CTEs)",
@@ -199,7 +199,7 @@ pub fn parse_view_body_with_bindings(source: &str, bindings: HoParamBindings) ->
     }
 
     match &query {
-        Query::Relational(_) | Query::WithCtes { .. } | Query::WithErContext { .. } => Ok(query),
+        Query::Relational(_) | Query::WithCtes { .. } | Query::WithErContext { .. } | Query::WithCfes { .. } | Query::WithPrecompiledCfes { .. } => Ok(query),
         other => Err(DelightQLError::database_error(
             format!(
                 "View body '{}' parsed as {:?}, expected relational expression (with optional CTEs)",

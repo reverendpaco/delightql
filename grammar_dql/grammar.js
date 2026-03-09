@@ -44,14 +44,16 @@ module.exports = grammar({
     [$.cte_definition, $.qualify_operator, $.tvf_argument],
     [$.glob, $.qualify_operator],
     [$.qualify_operator, $.tvf_argument],
+    // HO scalar subquery: * inside :( could be glob, qualify_operator, or tvf_argument
+    [$.qualify_operator, $.glob, $.tvf_argument],
     // (removed: glob_spec vs qualify_operator - no longer overlap after functor paren uniformity)
     // (removed: function_definition conflicts - definitions belong in grammar_rules)
     // Namespace paths: identifier could be lvar or start of namespace_path
     [$.lvar, $.namespace_path],
     // Passthrough/divide ambiguity: identifier followed by / could be lvar (for binary divide)
     // or scalar_subquery namespace (for passthrough separator). GLR forks and prunes.
-    [$.scalar_subquery, $.lvar, $.table_access],
-    [$.scalar_subquery, $.lvar],
+    [$.scalar_subquery, $.ho_scalar_subquery, $.lvar, $.table_access],
+    [$.scalar_subquery, $.ho_scalar_subquery, $.lvar],
     // Grounded namespace: identifier could start namespace_path or grounded_namespace
     [$.grounded_namespace, $.namespace_path],
     // Grounded namespace vs lvar: identifier at start could be either
@@ -72,9 +74,12 @@ module.exports = grammar({
     // [$.table_access, $.pseudo_predicate_argument_list],  // unnecessary per tree-sitter
     // Anonymous table in DML pipe: data_rows vs sparse_fill inside anonymous_table
     [$.data_rows, $.sparse_fill],
-    // Namespace-qualified function call vs scalar subquery: both share ns.identifier:( prefix
-    // Disambiguation happens at first token inside parens (domain expr vs relational continuation)
-    [$.function_call, $.scalar_subquery],
+    // Namespace-qualified function call vs scalar subquery vs HO scalar subquery:
+    // all share ns.identifier:( prefix. Disambiguation via content inside parens.
+    [$.function_call, $.scalar_subquery, $.ho_scalar_subquery],
+    // HO scalar subquery: tvf_argument overlaps with domain_expression/lvar inside :(
+    [$.domain_expression, $.tvf_argument],
+    [$.lvar, $.tvf_argument],
     // HO argument list: ho_argument_row has same structure as argument_list (comma-separated tvf_args)
     [$.argument_list, $.ho_argument_row],
     // Catalog functor: identifier could start catalog_functor (main::) or table_access (main. or main/) or CTE
@@ -634,6 +639,7 @@ module.exports = grammar({
         $.case_expression,  // CASE expression: _:(cond -> result; ...)
         $.anonymous_scalar_subquery,  // Anonymous scalar subquery: _:(, body)
         $.scalar_subquery,  // Scalar subquery: relation:(inner-cpr)
+        $.ho_scalar_subquery,  // HO scalar subquery: ho_view:(table_args)(, corr ~> agg)
         $.metadata_tree_group,  // Metadata tree group: column:~> {...}
         $.pivot_expression,     // Pivot: score of subject
         $.sparse_fill,          // Sparse fill: _(col @ val) in sparse anonymous table rows
@@ -676,6 +682,7 @@ module.exports = grammar({
         $.case_expression,  // CASE expression allowed in operands
         $.anonymous_scalar_subquery,  // Anonymous scalar subquery: _:(, body)
         $.scalar_subquery,  // EPOCH 7: Scalar subqueries allowed (e.g., in IN lists)
+        $.ho_scalar_subquery,  // HO scalar subquery: ho_view:(table_args)(, corr ~> agg)
         $.metadata_tree_group,  // EPOCH 4: Metadata tree groups allowed in destructuring
         $.array_destructure_pattern,  // ARRAY DESTRUCTURING: Allow [.0, .1, .2] after ~=
         $.citation                    // Citation: :nl, :tab (zero-arity call via :name)
@@ -1082,6 +1089,32 @@ module.exports = grammar({
       field('table', $.identifier),
       token.immediate(':('),  // Compound token - requires both : and ( with no space
       $.relational_continuation,
+      ')'
+    )),
+
+    // HO scalar subquery: ho_view:(ho_args)(, correlation ~> aggregate)
+    // Colon-ized HO view as correlated scalar subquery.
+    // First parens: HO arguments (table expressions + scalars).
+    // Second parens: interior notation (relational continuation).
+    // Produces a ScalarSubquery wrapping a TVF in the AST.
+    ho_scalar_subquery: $ => prec.dynamic(10, seq(
+      optional(seq(
+        field('namespace_path', choice(
+          $.grounded_namespace,
+          $.namespace_path,
+          $.identifier
+        )),
+        choice(
+          token.immediate('.'),
+          alias(token.immediate('/'), $.passthrough_separator)
+        )
+      )),
+      field('function', $.identifier),
+      token.immediate(':('),  // Compound token - colon-functor
+      field('arguments', $.ho_argument_list),
+      ')',
+      '(',
+      field('continuation', $.relational_continuation),
       ')'
     )),
 

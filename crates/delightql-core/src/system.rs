@@ -1126,13 +1126,14 @@ impl DelightQLSystem {
         })?;
 
         // 6. Sync bin cartridges
-        crate::bootstrap::sync_bin_cartridges_to_bootstrap(&bootstrap_conn, &self.bin_registry)
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to sync bin cartridges during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
+        let universal_namespaces =
+            crate::bootstrap::sync_bin_cartridges_to_bootstrap(&bootstrap_conn, &self.bin_registry)
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!("Failed to sync bin cartridges during reinit: {}", e),
+                        e.to_string(),
+                    )
+                })?;
 
         // 7. Leave "main" namespace EMPTY — caller is expected to mount! the db they need.
         //    This allows pack-man to reset + mount a different db each time.
@@ -1334,6 +1335,12 @@ impl DelightQLSystem {
             crate::bootstrap_schema::BootstrapBackedSchema::new(self.bootstrap_connection.clone()),
         )); // Empty until mount! runs again
         self.catalog_cartridge_id.set(None);
+
+        // 11. Eagerly load stdlib DQL overlays for universal namespaces
+        //     (mirrors the same step in DelightQLSystem::new)
+        for ns in &universal_namespaces {
+            self.ensure_stdlib_loaded(ns);
+        }
 
         Ok(())
     }

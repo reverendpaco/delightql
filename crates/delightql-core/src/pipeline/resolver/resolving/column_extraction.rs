@@ -167,8 +167,8 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
             {
                 let mut output_col = col.clone();
 
-                // CRITICAL FIX: Preserve the qualification status from the resolved expression
-                // If the expression had a qualifier (e.g., users.id), mark the column as qualified
+                // Preserve the qualification status from the resolved expression.
+                // If the expression had a qualifier (e.g., users.id), mark the column as qualified.
                 if qualifier.is_some() {
                     output_col.info = output_col.info.with_updated_qualification(true);
                 }

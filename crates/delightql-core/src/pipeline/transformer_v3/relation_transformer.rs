@@ -16,6 +16,27 @@ use super::helpers::alias_generator::next_alias;
 use super::query_wrapper::update_query_provenance;
 use super::types::QueryBuildState;
 
+/// Convert an addressed domain expression to string for TVF argument SQL generation.
+fn ho_argument_to_string(dom: &DqlDomainExpression) -> String {
+    match dom {
+        DqlDomainExpression::Literal {
+            value: LiteralValue::String(s),
+            ..
+        } => format!("\"{}\"", s),
+        DqlDomainExpression::Literal {
+            value: LiteralValue::Number(n),
+            ..
+        } => n.clone(),
+        DqlDomainExpression::Lvar {
+            name,
+            qualifier: Some(ref qual),
+            ..
+        } => format!("{}.{}", qual, name),
+        DqlDomainExpression::Lvar { name, .. } => name.to_string(),
+        _ => format!("{:?}", dom),
+    }
+}
+
 /// Transform a base relation (table or anonymous)
 /// BASE CASE of our recursion - returns Table state
 pub fn transform_relation(
@@ -390,7 +411,7 @@ pub fn transform_relation(
         }
         ast_addressed::Relation::TVF {
             function,
-            arguments,
+            ho_arguments,
             alias,
             namespace,
             cpr_schema,
@@ -413,9 +434,24 @@ pub fn transform_relation(
                 None
             };
 
-            let typed_arguments = arguments
+            let typed_arguments = ho_arguments
                 .iter()
-                .map(|s| crate::pipeline::sql_ast_v3::TvfArgument::parse(s))
+                .map(|arg| {
+                    let s = match arg {
+                        crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => {
+                            ho_argument_to_string(dom)
+                        }
+                        crate::pipeline::asts::core::operators::HoArgument::Table(rel) => {
+                            match rel {
+                                ast_addressed::RelationalExpression::Relation(
+                                    ast_addressed::Relation::Ground { identifier, .. },
+                                ) => identifier.name.to_string(),
+                                _ => "_unknown_".to_string(),
+                            }
+                        }
+                    };
+                    crate::pipeline::sql_ast_v3::TvfArgument::parse(&s)
+                })
                 .collect();
             let table_expr = TableExpression::TVF {
                 schema: backend_schema,
@@ -905,6 +941,57 @@ pub fn transform_relation(
                             QueryExpression::WithCte {
                                 ctes: sql_ctes,
                                 query: Box::new(main_sql),
+                            }
+                        }
+                        ast_addressed::Query::WithPrecompiledCfes {
+                            cfes: nested_cfes,
+                            query: nested_inner,
+                        } => {
+                            // Nested WithPrecompiledCfes: merge CFEs and recurse
+                            let mut all_cfes: Vec<_> = (*view_ctx.cfe_definitions).clone();
+                            all_cfes.extend(nested_cfes);
+                            let nested_ctx = view_ctx.clone().with_cfe_definitions(all_cfes);
+                            match *nested_inner {
+                                ast_addressed::Query::Relational(expr) => {
+                                    let state = super::transform_relational(expr, &nested_ctx)?;
+                                    super::segment_handler::finalize_to_query(state)?
+                                }
+                                ast_addressed::Query::WithCtes {
+                                    ctes,
+                                    query: main_query,
+                                } => {
+                                    let sql_ctes = ctes
+                                        .into_iter()
+                                        .map(|cte| {
+                                            let state = super::transform_relational(
+                                                cte.expression,
+                                                &nested_ctx,
+                                            )?;
+                                            let cte_sql =
+                                                super::segment_handler::finalize_to_query(state)?;
+                                            Ok(Cte::new(cte.name, cte_sql))
+                                        })
+                                        .collect::<Result<Vec<_>>>()?;
+                                    let state =
+                                        super::transform_relational(main_query, &nested_ctx)?;
+                                    let main_sql =
+                                        super::segment_handler::finalize_to_query(state)?;
+                                    QueryExpression::WithCte {
+                                        ctes: sql_ctes,
+                                        query: Box::new(main_sql),
+                                    }
+                                }
+                                other => {
+                                    return Err(crate::error::DelightQLError::ParseError {
+                                        message: format!(
+                                            "ConsultedView '{}' has unexpected nested inner Query variant: {:?}",
+                                            identifier.name,
+                                            std::mem::discriminant(&other)
+                                        ),
+                                        source: None,
+                                        subcategory: None,
+                                    });
+                                }
                             }
                         }
                         other => {

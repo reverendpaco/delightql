@@ -153,6 +153,21 @@ pub fn apply_project_out(
             None
         });
 
+        // Respect the output column's provenance: if the resolver assigned Fresh
+        // AND the source column originates from a CTE (which may be aliased in a
+        // JOIN, making the CTE name invalid as a qualifier), emit unqualified refs.
+        // For non-CTE sources (regular table aliases in JOINs), preserve qualifiers
+        // even when output is Fresh — they're needed for disambiguation.
+        let effective_source =
+            if matches!(&col.fq_table.name, ast_addressed::TableName::Fresh)
+                && matched_source
+                    .map_or(false, |s| s.info.referenceable_cte_name().is_some())
+            {
+                None
+            } else {
+                matched_source
+            };
+
         let (expr, alias) = if let Some(sql_alias) = mapped_alias {
             (
                 crate::pipeline::sql_ast_v3::DomainExpression::RawSql(sql_alias.to_string()),
@@ -160,7 +175,7 @@ pub fn apply_project_out(
             )
         } else {
             (
-                source_column_ref(&effective_name, matched_source),
+                source_column_ref(&effective_name, effective_source),
                 &effective_name,
             )
         };

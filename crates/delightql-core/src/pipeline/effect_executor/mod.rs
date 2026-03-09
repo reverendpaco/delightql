@@ -283,7 +283,7 @@ fn execute_effects_in_relation(
         // (e.g., sys::execution.compile("sql", "users(*)")(*)  → Relation::TVF)
         Relation::TVF {
             ref function,
-            ref arguments,
+            ref ho_arguments,
             ref alias,
             ref namespace,
             ..
@@ -295,22 +295,13 @@ fn execute_effects_in_relation(
                 .lookup_qualified_entity(&ns_strs, function.as_str())
             {
                 if let Some(executable) = entity.as_effect_executable() {
-                    let dom_args: Vec<DomainExpression> = arguments
+                    let dom_args: Vec<DomainExpression> = ho_arguments
                         .iter()
-                        .map(|s| {
-                            // TVF argument strings may still have enclosing quotes
-                            // (b64 strings are already decoded by the builder).
-                            let value = if (s.starts_with('"') && s.ends_with('"'))
-                                || (s.starts_with('\'') && s.ends_with('\''))
-                            {
-                                s[1..s.len() - 1].to_string()
-                            } else {
-                                s.clone()
-                            };
-                            DomainExpression::Literal {
-                                value: LiteralValue::String(value),
-                                alias: None,
+                        .filter_map(|arg| match arg {
+                            crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => {
+                                Some(dom.clone())
                             }
+                            _ => None,
                         })
                         .collect();
                     let alias_str = alias.as_ref().map(|s| s.to_string());

@@ -1019,6 +1019,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             &entity,
                             Some(&pipe_expr.source),
                             groups_ref,
+                            &[], // piped path: no ho_arguments (pipe source handled separately)
                         )?;
 
                     // Build grounding context

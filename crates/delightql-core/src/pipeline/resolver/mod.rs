@@ -461,19 +461,48 @@ pub(crate) fn resolve_query_inline(
 ) -> Result<(ast_resolved::Query, BubbledState)> {
     match query {
         ast_unresolved::Query::Relational(expr) => {
-            let (resolved_expr, bubbled) = resolve_relational_expression_with_registry(
-                expr,
-                registry,
-                outer_context,
-                config,
-                grounding,
-            )?;
-            Ok((ast_resolved::Query::Relational(resolved_expr), bubbled))
+            // Discover consulted function references (e.g. dbl:(x) calling a
+            // DDL-defined functional view) before resolution. Without this,
+            // such calls pass through as literal SQL function calls.
+            let wrapper_query = ast_unresolved::Query::Relational(expr);
+            let (wrapper_query, ccafe_cfes) =
+                grounding::inline_in_query_borrowed(wrapper_query, &registry.consult, None)?;
+            let expr = match wrapper_query {
+                ast_unresolved::Query::Relational(e) => e,
+                _ => unreachable!("inline_in_query_borrowed preserves Relational variant"),
+            };
+            let (resolved_expr, bubbled, mut pipe_cfes) =
+                resolve_relational_expression_with_pipe_cfes(
+                    expr,
+                    registry,
+                    outer_context,
+                    config,
+                    grounding,
+                )?;
+            // Merge query-level CFEs (from inline_in_query_borrowed) with
+            // pipe-level CFEs (from inline_consulted_functions_in_operator)
+            pipe_cfes.extend(ccafe_cfes);
+            let resolved_query = ast_resolved::Query::Relational(resolved_expr);
+            let resolved_query =
+                wrap_with_pipe_cfes(resolved_query, pipe_cfes, registry)?;
+            Ok((resolved_query, bubbled))
         }
         ast_unresolved::Query::WithCtes {
             ctes,
             query: main_query,
         } => {
+            // Discover consulted function references in the WithCtes query
+            let wrapper_query = ast_unresolved::Query::WithCtes {
+                ctes,
+                query: main_query,
+            };
+            let (wrapper_query, ccafe_cfes) =
+                grounding::inline_in_query_borrowed(wrapper_query, &registry.consult, None)?;
+            let (ctes, main_query) = match wrapper_query {
+                ast_unresolved::Query::WithCtes { ctes, query } => (ctes, query),
+                _ => unreachable!("inline_in_query_borrowed preserves WithCtes variant"),
+            };
+
             // Group CTEs by name for merging (same logic as resolve_query)
             let mut cte_groups: HashMap<String, Vec<ast_unresolved::CteBinding>> = HashMap::new();
             let mut cte_order: Vec<String> = Vec::new();
@@ -490,6 +519,7 @@ pub(crate) fn resolve_query_inline(
             validate_grouped_cte_dependencies(&cte_groups, &cte_order)?;
 
             let mut resolved_ctes = Vec::new();
+            let mut all_pipe_cfes = Vec::new();
 
             for name in &cte_order {
                 let group = cte_groups
@@ -500,13 +530,15 @@ pub(crate) fn resolve_query_inline(
                         .into_iter()
                         .next()
                         .expect("Group has len==1, must have element - invariant");
-                    let (resolved_expr, _) = resolve_relational_expression_with_registry(
-                        cte.expression,
-                        registry,
-                        outer_context,
-                        config,
-                        grounding,
-                    )?;
+                    let (resolved_expr, _, pipe_cfes) =
+                        resolve_relational_expression_with_pipe_cfes(
+                            cte.expression,
+                            registry,
+                            outer_context,
+                            config,
+                            grounding,
+                        )?;
+                    all_pipe_cfes.extend(pipe_cfes);
                     let mut cte_schema = extract_cpr_schema(&resolved_expr)?;
                     cte_schema = transform_schema_table_names(cte_schema, name);
                     registry.query_local.register_cte(name.clone(), cte_schema);
@@ -523,13 +555,15 @@ pub(crate) fn resolve_query_inline(
                     let mut all_schemas_same = true;
 
                     for (idx, cte) in group.iter().enumerate() {
-                        let (resolved_expr, _) = resolve_relational_expression_with_registry(
-                            cte.expression.clone(),
-                            registry,
-                            outer_context,
-                            config,
-                            grounding,
-                        )?;
+                        let (resolved_expr, _, pipe_cfes) =
+                            resolve_relational_expression_with_pipe_cfes(
+                                cte.expression.clone(),
+                                registry,
+                                outer_context,
+                                config,
+                                grounding,
+                            )?;
+                        all_pipe_cfes.extend(pipe_cfes);
                         let expr_schema = extract_cpr_schema(&resolved_expr)?;
 
                         if idx == 0 {
@@ -583,21 +617,24 @@ pub(crate) fn resolve_query_inline(
             }
 
             // Resolve the main query with all CTEs registered
-            let (resolved_main, bubbled) = resolve_relational_expression_with_registry(
-                main_query,
-                registry,
-                outer_context,
-                config,
-                grounding,
-            )?;
+            let (resolved_main, bubbled, main_pipe_cfes) =
+                resolve_relational_expression_with_pipe_cfes(
+                    main_query,
+                    registry,
+                    outer_context,
+                    config,
+                    grounding,
+                )?;
+            all_pipe_cfes.extend(main_pipe_cfes);
+            all_pipe_cfes.extend(ccafe_cfes);
 
-            Ok((
-                ast_resolved::Query::WithCtes {
-                    ctes: resolved_ctes,
-                    query: resolved_main,
-                },
-                bubbled,
-            ))
+            let resolved_query = ast_resolved::Query::WithCtes {
+                ctes: resolved_ctes,
+                query: resolved_main,
+            };
+            let resolved_query =
+                wrap_with_pipe_cfes(resolved_query, all_pipe_cfes, registry)?;
+            Ok((resolved_query, bubbled))
         }
         ast_unresolved::Query::WithPrecompiledCfes { cfes, query } => {
             // Register CFE definitions in the registry for resolution
@@ -614,6 +651,16 @@ pub(crate) fn resolve_query_inline(
                 bubbled,
             ))
         }
+        ast_unresolved::Query::WithCfes { .. } => {
+            // WithCfes needs precompilation before resolution.
+            // This happens when a DDL view body contains local CFE definitions
+            // (e.g. `v(*) :- dbl:(a) : a * 2  T(dbl:(x))`).
+            let schema = registry.database.schema();
+            let system = registry.database.system;
+            let precompiled =
+                crate::pipeline::cfe_precompiler::precompile_query_cfes(query, schema, system)?;
+            resolve_query_inline(precompiled, registry, outer_context, config, grounding)
+        }
         ast_unresolved::Query::WithErContext { context, query } => {
             // Thread ER-context into config, same as top-level resolve_query.
             let config_with_ctx = ResolutionConfig {
@@ -629,6 +676,57 @@ pub(crate) fn resolve_query_inline(
             ),
             source: None,
             subcategory: None,
+        }),
+    }
+}
+
+/// If any pipe-collected CFE definitions were gathered during resolution,
+/// precompile them and wrap the query in WithPrecompiledCfes. This ensures
+/// that DDL-defined functional views referenced inside view bodies (e.g.
+/// `dbl:(x)` called from another view's body) are available for substitution
+/// during the transformer phase.
+fn wrap_with_pipe_cfes(
+    resolved_query: ast_resolved::Query,
+    pipe_cfes: Vec<ast_unresolved::CfeDefinition>,
+    registry: &crate::resolution::EntityRegistry,
+) -> Result<ast_resolved::Query> {
+    if pipe_cfes.is_empty() {
+        return Ok(resolved_query);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let unique_cfes: Vec<_> = pipe_cfes
+        .into_iter()
+        .filter(|c| seen.insert(c.name.clone()))
+        .collect();
+
+    let schema = registry.database.schema();
+    let system = registry.database.system;
+
+    let mut precompiled: Vec<_> = unique_cfes
+        .into_iter()
+        .map(|cfe| {
+            crate::pipeline::cfe_precompiler::definition::precompile_cfe_definition(
+                cfe, schema, system,
+            )
+        })
+        .collect::<Result<_>>()?;
+
+    // Merge into existing WithPrecompiledCfes to avoid nesting
+    match resolved_query {
+        ast_resolved::Query::WithPrecompiledCfes {
+            mut cfes,
+            query: inner,
+        } => {
+            cfes.append(&mut precompiled);
+            Ok(ast_resolved::Query::WithPrecompiledCfes {
+                cfes,
+                query: inner,
+            })
+        }
+        other => Ok(ast_resolved::Query::WithPrecompiledCfes {
+            cfes: precompiled,
+            query: Box::new(other),
         }),
     }
 }

@@ -406,6 +406,106 @@ pub(in crate::pipeline::builder_v2) fn parse_scalar_subquery(
     })
 }
 
+/// Parse HO scalar subquery: ho_view:(ho_args)(, corr ~> agg)
+/// Colon-ized HO view as correlated scalar subquery.
+/// Produces ScalarSubquery wrapping a TVF with ho_arguments.
+pub(in crate::pipeline::builder_v2) fn parse_ho_scalar_subquery(
+    node: CstNode,
+    features: &mut crate::pipeline::query_features::FeatureCollector,
+) -> Result<DomainExpression> {
+    features.mark(crate::pipeline::query_features::QueryFeature::ScalarSubquery);
+
+    let function_name = node
+        .field_text("function")
+        .ok_or_else(|| DelightQLError::parse_error("No function name in ho_scalar_subquery"))?;
+
+    let (namespace, grounding) = if let Some(ns_node) = node.field("namespace_path") {
+        let (ns, gr) = super::super::relations::parse_namespace_qualification(ns_node)?;
+        (Some(ns), gr)
+    } else {
+        (None, None)
+    };
+
+    let identifier = QualifiedName {
+        namespace_path: namespace.clone().unwrap_or_else(NamespacePath::empty),
+        name: function_name.clone().into(),
+        grounding: grounding.clone(),
+    };
+
+    // Parse ho_argument_list → ho_arguments (reuses TVF argument parsing)
+    let mut ho_arguments = if let Some(args_node) = node.field("arguments") {
+        let mut ho_args = Vec::new();
+        super::super::relations::collect_ho_arguments(args_node, features, &mut ho_args)?;
+        ho_args
+    } else {
+        vec![]
+    };
+
+    // HO param substitution (same as TVF)
+    if let Some(ref bindings) = features.ho_bindings {
+        for ho_arg in ho_arguments.iter_mut() {
+            match ho_arg {
+                crate::pipeline::asts::core::operators::HoArgument::Table(ref mut rel_expr) => {
+                    if let RelationalExpression::Relation(Relation::Ground {
+                        ref mut identifier,
+                        ..
+                    }) = rel_expr
+                    {
+                        if let Some(actual_name) =
+                            bindings.table_params.get(identifier.name.as_str())
+                        {
+                            identifier.name = actual_name.clone().into();
+                        }
+                    }
+                }
+                crate::pipeline::asts::core::operators::HoArgument::Scalar(ref mut dom_expr) => {
+                    if let DomainExpression::Lvar { name, .. } = dom_expr {
+                        if let Some(actual_name) = bindings.table_params.get(name.as_str()) {
+                            *name = actual_name.clone().into();
+                        } else if let Some(bound_expr) =
+                            bindings.scalar_params.get(name.as_str())
+                        {
+                            *dom_expr = bound_expr.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build the TVF as the base relation (domain_spec: Glob — continuation adds filters/aggs)
+    let base = RelationalExpression::Relation(Relation::TVF {
+        function: function_name.into(),
+        domain_spec: DomainSpec::Glob,
+        alias: None,
+        namespace,
+        grounding,
+        cpr_schema: PhaseBox::phantom(),
+        argument_groups: None,
+        ho_arguments,
+    });
+
+    // Parse the relational continuation (second parens: , corr ~> agg)
+    let continuation_node = node.find_child("relational_continuation").ok_or_else(|| {
+        DelightQLError::parse_error(
+            "No continuation in ho_scalar_subquery - interior notation required",
+        )
+    })?;
+
+    let mut dummy_features = FeatureCollector::inheriting_ho_bindings(features);
+    let subquery = crate::pipeline::builder_v2::continuation::handle_continuation(
+        continuation_node,
+        base,
+        &mut dummy_features,
+    )?;
+
+    Ok(DomainExpression::ScalarSubquery {
+        identifier,
+        subquery: Box::new(subquery),
+        alias: None,
+    })
+}
+
 /// Parse anonymous scalar subquery: _:(, body)
 /// No inner table — body resolves against outer pipe context only.
 /// The continuation starts with a comma operator; we extract the right side

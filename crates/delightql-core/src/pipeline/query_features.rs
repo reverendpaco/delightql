@@ -155,6 +155,10 @@ pub struct HoParamBindings {
     /// E.g., V(k, l) bound to refs(key, label) → {k → ("refs", "key"), l → ("refs", "label")}.
     /// Built after arity validation when actual column names are known.
     pub argumentative_column_remap: HashMap<String, (String, String)>,
+    /// Interior CTEs: table arguments with interior conditions (filters, pipes, etc.)
+    /// that need to be materialized as CTEs before the view body is expanded.
+    /// (cte_name, relational_expression)
+    pub interior_ctes: Vec<(String, crate::pipeline::asts::unresolved::RelationalExpression)>,
 }
 
 impl HoParamBindings {

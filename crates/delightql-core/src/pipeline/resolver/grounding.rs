@@ -1648,6 +1648,7 @@ pub(super) fn split_ho_first_parens(
     entity: &crate::resolution::registry::ConsultedEntity,
     pipe_source: Option<&ast_unresolved::RelationalExpression>,
     argument_groups: Option<&[crate::pipeline::asts::core::operators::HoCallGroup]>,
+    ho_arguments: &[ast_unresolved::HoArgument],
 ) -> Result<(HoParamBindings, ast_unresolved::DomainSpec, Option<usize>)> {
     use crate::resolution::registry::HoParamKind;
 
@@ -1844,27 +1845,49 @@ pub(super) fn split_ho_first_parens(
 
         match &param.kind {
             HoParamKind::Glob => {
-                // Glob table param: extract name from expression
-                match expr {
-                    ast_unresolved::DomainExpression::Lvar { name, .. } => {
+                // Check ho_arguments for interior table expressions that need CTE materialization.
+                // If the HoArgument::Table has interior (not a bare Ground), materialize as CTE.
+                if let Some(ast_unresolved::HoArgument::Table(ref rel_expr)) =
+                    ho_arguments.get(expr_idx)
+                {
+                    if is_bare_table_ref(rel_expr) {
+                        // Bare table reference — extract name (same as legacy path)
+                        let name = extract_table_name(rel_expr);
+                        bindings.table_params.insert(param.name.clone(), name);
+                    } else {
+                        // Interior table expression — materialize as CTE.
+                        // Normalize: unwrap InnerRelation, patch Bare→Glob so
+                        // columns are visible for filter/projection resolution.
+                        let cte_name = format!("_ho_arg_{}", param.name);
                         bindings
                             .table_params
-                            .insert(param.name.clone(), name.to_string());
+                            .insert(param.name.clone(), cte_name.clone());
+                        let normalized = normalize_interior_for_cte(rel_expr.clone());
+                        bindings.interior_ctes.push((cte_name, normalized));
                     }
-                    ast_unresolved::DomainExpression::Literal {
-                        value: crate::pipeline::asts::core::LiteralValue::String(s),
-                        ..
-                    } => {
-                        bindings.table_params.insert(param.name.clone(), s.clone());
-                    }
-                    _ => {
-                        return Err(DelightQLError::validation_error(
-                            format!(
-                                "Expected table name at position {} for param '{}', got {:?}",
-                                param_idx, param.name, expr
-                            ),
-                            "Glob table parameter must be a table name or variable",
-                        ));
+                } else {
+                    // Fallback: use legacy DomainExpression path
+                    match expr {
+                        ast_unresolved::DomainExpression::Lvar { name, .. } => {
+                            bindings
+                                .table_params
+                                .insert(param.name.clone(), name.to_string());
+                        }
+                        ast_unresolved::DomainExpression::Literal {
+                            value: crate::pipeline::asts::core::LiteralValue::String(s),
+                            ..
+                        } => {
+                            bindings.table_params.insert(param.name.clone(), s.clone());
+                        }
+                        _ => {
+                            return Err(DelightQLError::validation_error(
+                                format!(
+                                    "Expected table name at position {} for param '{}', got {:?}",
+                                    param_idx, param.name, expr
+                                ),
+                                "Glob table parameter must be a table name or variable",
+                            ));
+                        }
                     }
                 }
                 expr_idx += 1;
@@ -2039,6 +2062,146 @@ pub(super) fn split_ho_first_parens(
     Ok((bindings, scalar_spec, pipe_target_idx))
 }
 
+/// Check if a relational expression is a bare table reference (just a table name with Glob or Bare domain spec).
+/// Returns false for InnerRelation, Filter, Pipe, and Ground with Positional domain spec
+/// (which represents a projection that needs CTE materialization).
+fn is_bare_table_ref(expr: &ast_unresolved::RelationalExpression) -> bool {
+    matches!(
+        expr,
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            domain_spec: ast_unresolved::DomainSpec::Glob | ast_unresolved::DomainSpec::Bare,
+            ..
+        })
+    )
+}
+
+/// Extract the table name from a bare Ground relational expression.
+fn extract_table_name(expr: &ast_unresolved::RelationalExpression) -> String {
+    match expr {
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier,
+            ..
+        }) => identifier.name.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Normalize an interior table expression for use as a CTE source.
+///
+/// Handles three cases:
+/// 1. InnerRelation(Indeterminate { subquery }) → the subquery directly,
+///    patching the innermost Ground from Bare to Glob.
+/// 2. Ground with Positional domain spec → Ground(Glob) piped through
+///    a projection (SELECT col1, col2 FROM table).
+/// 3. Everything else → pass through unchanged.
+fn normalize_interior_for_cte(
+    expr: ast_unresolved::RelationalExpression,
+) -> ast_unresolved::RelationalExpression {
+    match expr {
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::InnerRelation {
+            pattern:
+                ast_unresolved::InnerRelationPattern::Indeterminate {
+                    subquery,
+                    ..
+                },
+            ..
+        }) => {
+            // Unwrap the InnerRelation and patch the base to Glob
+            patch_bare_to_glob(*subquery)
+        }
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier,
+            canonical_name,
+            domain_spec: ast_unresolved::DomainSpec::Positional(ref exprs),
+            alias,
+            outer,
+            mutation_target,
+            passthrough,
+            cpr_schema,
+            hygienic_injections,
+        }) => {
+            // Convert Positional to Glob + Projection pipe:
+            // users(first_name, age) → users(*) |> (first_name, age)
+            let projection_exprs = exprs.clone();
+            let base = ast_unresolved::RelationalExpression::Relation(
+                ast_unresolved::Relation::Ground {
+                    identifier,
+                    canonical_name,
+                    domain_spec: ast_unresolved::DomainSpec::Glob,
+                    alias,
+                    outer,
+                    mutation_target,
+                    passthrough,
+                    cpr_schema,
+                    hygienic_injections,
+                },
+            );
+            ast_unresolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
+                ast_unresolved::PipeExpression {
+                    source: base,
+                    operator: ast_unresolved::UnaryRelationalOperator::General {
+                        containment_semantic: ast_unresolved::ContainmentSemantic::Parenthesis,
+                        expressions: projection_exprs,
+                    },
+                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                },
+            )))
+        }
+        other => other,
+    }
+}
+
+/// Recursively patch Ground relations with DomainSpec::Bare to DomainSpec::Glob.
+fn patch_bare_to_glob(
+    expr: ast_unresolved::RelationalExpression,
+) -> ast_unresolved::RelationalExpression {
+    match expr {
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier,
+            canonical_name,
+            domain_spec: ast_unresolved::DomainSpec::Bare,
+            alias,
+            outer,
+            mutation_target,
+            passthrough,
+            cpr_schema,
+            hygienic_injections,
+        }) => ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier,
+            canonical_name,
+            domain_spec: ast_unresolved::DomainSpec::Glob,
+            alias,
+            outer,
+            mutation_target,
+            passthrough,
+            cpr_schema,
+            hygienic_injections,
+        }),
+        ast_unresolved::RelationalExpression::Filter {
+            source,
+            condition,
+            origin,
+            cpr_schema,
+        } => ast_unresolved::RelationalExpression::Filter {
+            source: Box::new(patch_bare_to_glob(*source)),
+            condition,
+            origin,
+            cpr_schema,
+        },
+        ast_unresolved::RelationalExpression::Pipe(pipe) => {
+            let inner = (*pipe).into_inner();
+            ast_unresolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
+                ast_unresolved::PipeExpression {
+                    source: patch_bare_to_glob(inner.source),
+                    operator: inner.operator,
+                    cpr_schema: inner.cpr_schema,
+                },
+            )))
+        }
+        other => other,
+    }
+}
+
 /// Ensure all HO position infos have column names.
 /// For Scalar (free-variable) positions, use the DDL param variable name.
 /// For PureGround (all-literal) positions, generate `_label_N`.
@@ -2076,6 +2239,7 @@ fn extract_clause_ctes(
     function: &str,
     all_ctes: &mut Vec<ast_unresolved::CteBinding>,
     er_context: &mut Option<crate::pipeline::asts::core::ErContextSpec>,
+    collected_cfes: &mut Vec<ast_unresolved::CfeDefinition>,
 ) -> Result<()> {
     match clause_query {
         ast_unresolved::Query::Relational(expr) => {
@@ -2098,6 +2262,19 @@ fn extract_clause_ctes(
                 is_recursive: ast_unresolved::PhaseBox::phantom(),
             });
         }
+        ast_unresolved::Query::WithCfes {
+            cfes,
+            query: inner,
+        } => {
+            collected_cfes.extend(cfes);
+            extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
+        }
+        ast_unresolved::Query::WithPrecompiledCfes {
+            query: inner, ..
+        } => {
+            // Already precompiled — just unwrap and recurse
+            extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
+        }
         ast_unresolved::Query::WithErContext {
             context,
             query: inner,
@@ -2107,7 +2284,7 @@ fn extract_clause_ctes(
                 *er_context = Some(context);
             }
             // Recursively process the inner query
-            extract_clause_ctes(*inner, function, all_ctes, er_context)?;
+            extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
         }
         other => {
             return Err(DelightQLError::parse_error(format!(
@@ -2208,6 +2385,21 @@ pub(super) fn build_squished_relation(
         });
     }
 
+    // Prepend interior CTEs for table arguments with interior conditions.
+    // Apply data namespace patching so table refs inside resolve correctly.
+    for (cte_name, source_expr) in &table_bindings.interior_ctes {
+        let patched_expr = if let Some(dns) = data_ns {
+            patch_data_ns_in_relational_expr(source_expr.clone(), dns)
+        } else {
+            source_expr.clone()
+        };
+        all_ctes.push(ast_unresolved::CteBinding {
+            expression: patched_expr,
+            name: cte_name.clone(),
+            is_recursive: ast_unresolved::PhaseBox::phantom(),
+        });
+    }
+
     // Prepend join input CTE if present (inverted CTE strategy for free scalar params).
     // The join_input_cte_name is used to inject a FROM reference into correlated clause bodies.
     let join_input_cte_name = if let Some((cte_name, source_expr)) = join_input_cte {
@@ -2234,6 +2426,8 @@ pub(super) fn build_squished_relation(
     } else {
         Vec::new()
     };
+
+    let mut collected_cfes: Vec<ast_unresolved::CfeDefinition> = Vec::new();
 
     if defs.len() > 1 {
         // Multi-clause: each clause becomes a CTE
@@ -2294,7 +2488,7 @@ pub(super) fn build_squished_relation(
                 clause_query
             };
 
-            extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context)?;
+            extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context, &mut collected_cfes)?;
         }
     } else {
         // Single clause
@@ -2340,7 +2534,7 @@ pub(super) fn build_squished_relation(
             clause_query
         };
 
-        extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context)?;
+        extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context, &mut collected_cfes)?;
     }
 
     // Main query: function(*) referencing the CTE
@@ -2361,10 +2555,18 @@ pub(super) fn build_squished_relation(
             hygienic_injections: Vec::new(),
         });
 
-    let result = ast_unresolved::Query::WithCtes {
+    let mut result = ast_unresolved::Query::WithCtes {
         ctes: all_ctes,
         query: main_query,
     };
+
+    // Wrap with collected CFE definitions from view body
+    if !collected_cfes.is_empty() {
+        result = ast_unresolved::Query::WithCfes {
+            cfes: collected_cfes,
+            query: Box::new(result),
+        };
+    }
 
     // If any clause had an ER context, wrap the final query with it
     if let Some(context) = er_context {
@@ -2600,7 +2802,10 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
                 cpr_schema,
                 hygienic_injections,
             } => {
-                if identifier.namespace_path.is_empty() {
+                // Skip namespace patching for HO-generated CTE names (_ho_pipe_src, _ho_arg_T, etc.)
+                if identifier.namespace_path.is_empty()
+                    && !identifier.name.starts_with("_ho_")
+                {
                     identifier.namespace_path = self.data_ns.clone();
                 }
                 // Don't recurse further — Ground's children (domain_spec) don't
@@ -2620,28 +2825,26 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
             }
             Relation::TVF {
                 function,
-                arguments,
                 argument_groups,
-                first_parens_spec,
                 domain_spec,
                 alias,
                 mut namespace,
                 grounding,
                 cpr_schema,
+                ho_arguments,
             } => {
                 if namespace.is_none() {
                     namespace = Some(self.data_ns.clone());
                 }
                 Ok(Relation::TVF {
                     function,
-                    arguments,
                     argument_groups,
-                    first_parens_spec,
                     domain_spec,
                     alias,
                     namespace,
                     grounding,
                     cpr_schema,
+                    ho_arguments,
                 })
             }
             // InnerRelation: delegate to transform_inner_relation for identifier patching
@@ -2716,6 +2919,16 @@ pub(super) fn patch_data_ns_query(
 ) -> ast_unresolved::Query {
     DataNsPatcher { data_ns }
         .transform_query(query)
+        .expect("namespace patching is infallible")
+}
+
+/// Patch data_ns on table references within a relational expression.
+fn patch_data_ns_in_relational_expr(
+    expr: ast_unresolved::RelationalExpression,
+    data_ns: &ast_unresolved::NamespacePath,
+) -> ast_unresolved::RelationalExpression {
+    DataNsPatcher { data_ns }
+        .transform_relational(expr)
         .expect("namespace patching is infallible")
 }
 

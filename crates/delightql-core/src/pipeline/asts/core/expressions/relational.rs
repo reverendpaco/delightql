@@ -307,17 +307,14 @@ pub enum Relation<Phase = Unresolved> {
     #[lispy("relation:tvf")]
     TVF {
         function: SqlIdentifier,
-        arguments: Vec<String>, // Start simple with strings
         /// Structured &-separated groups from HO call site (when present).
-        /// Preferred over flat `arguments` for HO view binding.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         argument_groups: Option<Vec<super::super::operators::HoCallGroup>>,
-        /// First-parens as parsed AST (for PatternResolver unification).
-        /// Mirrors how second parens use `domain_spec`. None for normal TVFs.
-        /// Consumed by the resolver during HO expansion; always None after resolution.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        #[phase_convert(verbatim)]
-        first_parens_spec: Option<DomainSpec<super::super::Unresolved>>,
+        /// Rich HO argument list — single source of truth for TVF arguments.
+        /// Table args carry full relational expressions (preserving interior filters,
+        /// projections, pipes). Scalar args carry domain expressions.
+        #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
+        ho_arguments: Vec<super::super::operators::HoArgument<Phase>>,
         domain_spec: DomainSpec<Phase>,
         alias: Option<SqlIdentifier>,
         /// Namespace qualification for namespace-qualified TVFs / HO view invocations

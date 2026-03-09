@@ -63,6 +63,21 @@ impl HoCallGroup {
     }
 }
 
+/// A single argument in an HO view invocation.
+///
+/// Each position in the first-parens of `ho_view(arg1, arg2)(output)` is either:
+/// - A table argument: `users(*)`, `users(, age < 30)`, `users(|> (a, b))`
+/// - A scalar argument: `"active"`, `42`, or a domain expression
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
+pub enum HoArgument<Phase = Unresolved> {
+    /// Table argument — a full relational expression (may include interior filters, projections, pipes)
+    #[lispy("ho_argument:table")]
+    Table(super::RelationalExpression<Phase>),
+    /// Scalar argument — a domain expression (literal, lvar, function call, etc.)
+    #[lispy("ho_argument:scalar")]
+    Scalar(super::DomainExpression<Phase>),
+}
+
 /// Window frame specification for window functions
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
 #[lispy("window_frame")]

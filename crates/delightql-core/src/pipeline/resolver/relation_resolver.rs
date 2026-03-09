@@ -16,6 +16,81 @@ use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::ast_unresolved;
 use delightql_types::SqlIdentifier;
 
+/// Derive a DomainSpec from ho_arguments (replaces the former `first_parens_spec` field).
+/// Table arguments → Lvar with the table name.
+/// Scalar arguments → the domain expression directly.
+fn ho_arguments_to_domain_spec(
+    ho_args: &[ast_unresolved::HoArgument],
+) -> ast_unresolved::DomainSpec {
+    let exprs: Vec<ast_unresolved::DomainExpression> = ho_args
+        .iter()
+        .map(|arg| match arg {
+            crate::pipeline::asts::core::operators::HoArgument::Table(rel) => {
+                // Extract table name as Lvar
+                match rel {
+                    ast_unresolved::RelationalExpression::Relation(
+                        ast_unresolved::Relation::Ground { identifier, .. },
+                    ) => ast_unresolved::DomainExpression::lvar_builder(
+                        identifier.name.to_string(),
+                    )
+                    .build(),
+                    _ => ast_unresolved::DomainExpression::lvar_builder("_ho_derived_").build(),
+                }
+            }
+            crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => dom.clone(),
+        })
+        .collect();
+
+    // Single glob → DomainSpec::Glob
+    if exprs.len() == 1 {
+        if let ast_unresolved::DomainExpression::Projection(
+            ast_unresolved::ProjectionExpr::Glob { .. },
+        ) = &exprs[0]
+        {
+            return ast_unresolved::DomainSpec::Glob;
+        }
+    }
+
+    if exprs.is_empty() {
+        ast_unresolved::DomainSpec::Glob
+    } else {
+        ast_unresolved::DomainSpec::Positional(exprs)
+    }
+}
+
+/// Convert a scalar HoArgument's domain expression to a string for SQL generation.
+fn ho_argument_scalar_to_string(dom: &ast_unresolved::DomainExpression) -> String {
+    match dom {
+        ast_unresolved::DomainExpression::Literal {
+            value: ast_unresolved::LiteralValue::String(s),
+            ..
+        } => format!("\"{}\"", s),
+        ast_unresolved::DomainExpression::Literal {
+            value: ast_unresolved::LiteralValue::Number(n),
+            ..
+        } => n.clone(),
+        ast_unresolved::DomainExpression::Lvar {
+            name,
+            qualifier: Some(ref qual),
+            ..
+        } => format!("{}.{}", qual, name),
+        ast_unresolved::DomainExpression::Lvar { name, .. } => name.to_string(),
+        ast_unresolved::DomainExpression::Projection(ast_unresolved::ProjectionExpr::Glob {
+            ..
+        }) => "*".to_string(),
+        ast_unresolved::DomainExpression::ValuePlaceholder { .. } => "@".to_string(),
+        ast_unresolved::DomainExpression::ColumnOrdinal(ord) => {
+            let o = ord.get();
+            if o.reverse {
+                format!("|-{}|", o.position)
+            } else {
+                format!("|{}|", o.position)
+            }
+        }
+        _ => format!("{:?}", dom),
+    }
+}
+
 /// Helper to apply PatternResolver for column selection
 pub(super) fn apply_pattern_resolver(
     domain_spec: &ast_unresolved::DomainSpec,
@@ -1679,56 +1754,20 @@ pub(super) fn resolve_tvf(
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState, bool)> {
     let ast_unresolved::Relation::TVF {
         function,
-        arguments,
         argument_groups,
-        first_parens_spec,
         domain_spec,
         alias,
         namespace,
         grounding,
+        ho_arguments,
         ..
     } = rel
     else {
         unreachable!("resolve_tvf called with non-TVF variant");
     };
 
-    // Build first_parens_spec from existing arguments if not already set.
-    // This handles TVFs built outside the parser (e.g., by the effect executor).
-    let first_parens_spec = first_parens_spec.unwrap_or_else(|| {
-        if arguments.is_empty() {
-            ast_unresolved::DomainSpec::Glob
-        } else {
-            // Fallback: convert flat string args to Lvars
-            ast_unresolved::DomainSpec::Positional(
-                arguments
-                    .iter()
-                    .map(|a| {
-                        // Quoted strings → Literal, bare identifiers → Lvar
-                        if (a.starts_with('"') && a.ends_with('"'))
-                            || (a.starts_with('\'') && a.ends_with('\''))
-                        {
-                            let val = a[1..a.len() - 1].to_string();
-                            ast_unresolved::DomainExpression::literal_builder(
-                                ast_unresolved::LiteralValue::String(val),
-                            )
-                            .build()
-                        } else if a.parse::<f64>().is_ok() {
-                            ast_unresolved::DomainExpression::literal_builder(
-                                ast_unresolved::LiteralValue::Number(a.clone()),
-                            )
-                            .build()
-                        } else if a == "*" {
-                            ast_unresolved::DomainExpression::glob_builder().build()
-                        } else if a == "@" {
-                            ast_unresolved::DomainExpression::ValuePlaceholder { alias: None }
-                        } else {
-                            ast_unresolved::DomainExpression::lvar_builder(a.clone()).build()
-                        }
-                    })
-                    .collect(),
-            )
-        }
-    });
+    // Derive first_parens_spec from ho_arguments.
+    let first_parens_spec = ho_arguments_to_domain_spec(&ho_arguments);
 
     let groups_ref = argument_groups.as_deref();
 
@@ -1745,6 +1784,7 @@ pub(super) fn resolve_tvf(
                             &entity,
                             None,
                             groups_ref,
+                            &ho_arguments,
                         )?;
                     return expand_ho_view(
                         &function,
@@ -1793,6 +1833,7 @@ pub(super) fn resolve_tvf(
                             &entity,
                             None,
                             groups_ref,
+                            &ho_arguments,
                         )?;
                     return expand_ho_view(
                         &function,
@@ -1833,6 +1874,7 @@ pub(super) fn resolve_tvf(
                 &entity,
                 None,
                 groups_ref,
+                &ho_arguments,
             )?;
             return expand_ho_view(
                 &function,
@@ -1854,78 +1896,84 @@ pub(super) fn resolve_tvf(
     // Resolve column ordinals in TVF arguments against outer context.
     // Ordinals like |1| in `json_each(|1|)` must be resolved to actual column
     // names before SQL generation, since SQL doesn't understand ordinal syntax.
-    let mut arguments = arguments;
-    if let ast_unresolved::DomainSpec::Positional(ref exprs) = first_parens_spec {
-        if let Some(context) = outer_context {
-            for (i, expr) in exprs.iter().enumerate() {
-                if let ast_unresolved::DomainExpression::ColumnOrdinal(ref ordinal_box) = expr {
-                    let ordinal = ordinal_box.get();
-                    let candidates: Vec<_> = if let Some(ref qual) = ordinal.qualifier {
-                        context
-                            .iter()
-                            .filter(|col| {
-                                matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual)
-                            })
-                            .collect()
-                    } else {
-                        context.iter().collect()
-                    };
+    // Mutate ho_arguments in place, replacing ColumnOrdinal with resolved Lvar.
+    let mut ho_arguments = ho_arguments;
+    if let Some(context) = outer_context {
+        for ho_arg in ho_arguments.iter_mut() {
+            if let crate::pipeline::asts::core::operators::HoArgument::Scalar(
+                ast_unresolved::DomainExpression::ColumnOrdinal(ref ordinal_box),
+            ) = ho_arg
+            {
+                let ordinal = ordinal_box.get();
+                let candidates: Vec<_> = if let Some(ref qual) = ordinal.qualifier {
+                    context
+                        .iter()
+                        .filter(|col| {
+                            matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual)
+                        })
+                        .collect()
+                } else {
+                    context.iter().collect()
+                };
 
-                    if candidates.is_empty() {
+                if candidates.is_empty() {
+                    return Err(DelightQLError::ColumnNotFoundError {
+                        column: format!("|{}|", ordinal.position),
+                        context: "No columns available for ordinal resolution in TVF argument"
+                            .to_string(),
+                    });
+                }
+
+                let idx = if ordinal.reverse {
+                    if ordinal.position as usize > candidates.len() {
                         return Err(DelightQLError::ColumnNotFoundError {
-                            column: format!("|{}|", ordinal.position),
-                            context: "No columns available for ordinal resolution in TVF argument"
-                                .to_string(),
+                            column: format!("|-{}|", ordinal.position),
+                            context: format!(
+                                "Position {} from end exceeds {} available columns",
+                                ordinal.position,
+                                candidates.len()
+                            ),
                         });
                     }
-
-                    let idx = if ordinal.reverse {
-                        if ordinal.position as usize > candidates.len() {
-                            return Err(DelightQLError::ColumnNotFoundError {
-                                column: format!("|-{}|", ordinal.position),
-                                context: format!(
-                                    "Position {} from end exceeds {} available columns",
-                                    ordinal.position,
-                                    candidates.len()
-                                ),
-                            });
-                        }
-                        candidates.len() - ordinal.position as usize
-                    } else {
-                        if ordinal.position == 0 {
-                            return Err(DelightQLError::ColumnNotFoundError {
-                                column: "|0|".to_string(),
-                                context: "Column positions start at 1".to_string(),
-                            });
-                        }
-                        let pos = (ordinal.position - 1) as usize;
-                        if pos >= candidates.len() {
-                            return Err(DelightQLError::ColumnNotFoundError {
-                                column: format!("|{}|", ordinal.position),
-                                context: format!(
-                                    "Position {} exceeds {} available columns",
-                                    ordinal.position,
-                                    candidates.len()
-                                ),
-                            });
-                        }
-                        pos
-                    };
-
-                    let column = candidates[idx];
-                    let col_name = column.name().to_string();
-                    let resolved_arg = if let Some(ref qual) = ordinal.qualifier {
-                        format!("{}.{}", qual, col_name)
-                    } else if let ast_resolved::TableName::Named(ref t) = column.fq_table.name {
-                        format!("{}.{}", t, col_name)
-                    } else {
-                        col_name
-                    };
-
-                    if i < arguments.len() {
-                        arguments[i] = resolved_arg;
+                    candidates.len() - ordinal.position as usize
+                } else {
+                    if ordinal.position == 0 {
+                        return Err(DelightQLError::ColumnNotFoundError {
+                            column: "|0|".to_string(),
+                            context: "Column positions start at 1".to_string(),
+                        });
                     }
+                    let pos = (ordinal.position - 1) as usize;
+                    if pos >= candidates.len() {
+                        return Err(DelightQLError::ColumnNotFoundError {
+                            column: format!("|{}|", ordinal.position),
+                            context: format!(
+                                "Position {} exceeds {} available columns",
+                                ordinal.position,
+                                candidates.len()
+                            ),
+                        });
+                    }
+                    pos
+                };
+
+                let column = candidates[idx];
+                let col_name = column.name().to_string();
+                let qualifier = if let Some(ref qual) = ordinal.qualifier {
+                    Some(qual.clone())
+                } else if let ast_resolved::TableName::Named(ref t) = column.fq_table.name {
+                    Some(t.to_string())
+                } else {
+                    None
+                };
+
+                let mut builder = ast_unresolved::DomainExpression::lvar_builder(&col_name);
+                if let Some(q) = qualifier {
+                    builder = builder.with_qualifier(q);
                 }
+                *ho_arg = crate::pipeline::asts::core::operators::HoArgument::Scalar(
+                    builder.build(),
+                );
             }
         }
     }
@@ -1983,16 +2031,26 @@ pub(super) fn resolve_tvf(
         None
     };
 
+    // Convert ho_arguments from Unresolved to Resolved phase for non-HO TVFs.
+    let resolved_ho_arguments: Vec<crate::pipeline::asts::core::operators::HoArgument<crate::pipeline::asts::core::Resolved>> = ho_arguments
+        .iter()
+        .filter_map(|arg| match arg {
+            crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => {
+                convert_domain_expression(dom).ok().map(crate::pipeline::asts::core::operators::HoArgument::Scalar)
+            }
+            crate::pipeline::asts::core::operators::HoArgument::Table(_) => None, // HO table args consumed by expand_ho_view
+        })
+        .collect();
+
     let resolved = ast_resolved::Relation::TVF {
         function,
-        arguments,
         domain_spec: preserve_domain_spec(&domain_spec)?,
         alias,
         namespace: resolved_namespace,
         grounding: None,
         cpr_schema: ast_resolved::PhaseBox::new(schema),
         argument_groups: None,
-        first_parens_spec: None,
+        ho_arguments: resolved_ho_arguments,
     };
 
     Ok((

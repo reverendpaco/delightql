@@ -687,23 +687,6 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
     let cst_tree = CstTree::new(tree, source);
     let root = cst_tree.root();
 
-    // Early detection: reject CFE-style `:` neck definitions in DDL files.
-    // The DQL grammar's `cfe_definition` (name:(params): body) uses `:` neck,
-    // but DDL files require `:-` or `:=`. Tree-sitter error recovery can
-    // silently accept these, producing broken function bodies (e.g. Lambda
-    // nodes from grouping parens). Detect and reject early with a clear message.
-    if let Some(name) = find_cfe_neck_in_ddl_source(source) {
-        return Err(DelightQLError::ParseError {
-            message: format!(
-                "DDL function '{}' uses CFE-style ':' neck. \
-                 DDL files require ':-' (rule neck). \
-                 Change '{}:(...): ' to '{}:(...) :- '.",
-                name, name, name,
-            ),
-            source: None,
-            subcategory: Some("ddl"),
-        });
-    }
 
     let mut definitions = Vec::new();
     let mut query_statements = Vec::new();
@@ -1005,93 +988,6 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
 /// This text-level check is more robust than tree-sitter node inspection
 /// because tree-sitter's error recovery can produce various node shapes
 /// depending on the surrounding context.
-fn find_cfe_neck_in_ddl_source(source: &str) -> Option<String> {
-    // Pattern: identifier followed by `:(<anything>)` then `:` but NOT `:-` or `:=`
-    // We scan for `):<not - or =>` after a `:(` sequence
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Look for `:(`
-        if bytes[i] == b':' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            // Found `:(` — now find the name before it
-            let colon_pos = i;
-            let name_end = colon_pos;
-            let mut name_start = name_end;
-            while name_start > 0
-                && (bytes[name_start - 1].is_ascii_alphanumeric() || bytes[name_start - 1] == b'_')
-            {
-                name_start -= 1;
-            }
-            if name_start == name_end {
-                i += 2;
-                continue;
-            }
-            let fn_name = &source[name_start..name_end];
-
-            // Now find matching `)` (handle nested parens)
-            let mut depth = 1;
-            let mut j = i + 2; // skip `:`  and `(`
-            while j < bytes.len() && depth > 0 {
-                match bytes[j] {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    b'\'' => {
-                        // Skip string literal
-                        j += 1;
-                        while j < bytes.len() && bytes[j] != b'\'' {
-                            j += 1;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            if depth == 0 {
-                // j is now one past the closing `)`.
-                // Check for optional second param list: `(...)`
-                let mut k = j;
-                // Skip whitespace
-                while k < bytes.len() && bytes[k] == b' ' {
-                    k += 1;
-                }
-                // Check for second param list
-                if k < bytes.len() && bytes[k] == b'(' {
-                    let mut depth2 = 1;
-                    k += 1;
-                    while k < bytes.len() && depth2 > 0 {
-                        match bytes[k] {
-                            b'(' => depth2 += 1,
-                            b')' => depth2 -= 1,
-                            _ => {}
-                        }
-                        k += 1;
-                    }
-                    if depth2 == 0 {
-                        j = k; // advance past second param list
-                    }
-                }
-                // Skip whitespace after `)`
-                let mut after = j;
-                while after < bytes.len() && bytes[after] == b' ' {
-                    after += 1;
-                }
-                // Check: is the next char `:` but NOT `:-` or `:=`?
-                if after < bytes.len() && bytes[after] == b':' {
-                    let next_after = after + 1;
-                    if next_after >= bytes.len()
-                        || (bytes[next_after] != b'-' && bytes[next_after] != b'=')
-                    {
-                        return Some(fn_name.to_string());
-                    }
-                }
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
 
 /// Extract the neck type from a neck node
 fn extract_neck(neck_node: &CstNode) -> Result<DefinitionNeck> {

@@ -11,6 +11,27 @@ use crate::pipeline::asts::refined::QualifiedName;
 use crate::pipeline::asts::resolved;
 use crate::pipeline::asts::unresolved::NamespacePath;
 
+/// Convert a resolved scalar domain expression to a string for SQL generation.
+fn ho_argument_scalar_to_string(dom: &resolved::DomainExpression) -> String {
+    match dom {
+        resolved::DomainExpression::Literal {
+            value: resolved::LiteralValue::String(s),
+            ..
+        } => format!("\"{}\"", s),
+        resolved::DomainExpression::Literal {
+            value: resolved::LiteralValue::Number(n),
+            ..
+        } => n.clone(),
+        resolved::DomainExpression::Lvar {
+            name,
+            qualifier: Some(ref qual),
+            ..
+        } => format!("{}.{}", qual, name),
+        resolved::DomainExpression::Lvar { name, .. } => name.to_string(),
+        _ => format!("{:?}", dom),
+    }
+}
+
 /// Recursively flatten an expression
 #[stacksafe::stacksafe]
 pub(super) fn flatten_expression(
@@ -415,13 +436,34 @@ pub(super) fn flatten_relation(
 
         resolved::Relation::TVF {
             function,
-            arguments,
+            ho_arguments,
             domain_spec,
             alias,
             namespace,
             grounding,
             ..
         } => {
+            // Derive flat string arguments from ho_arguments for TvfData.
+            // INVARIANT: Only non-HO (SQL-native) TVFs reach the flattener — HO TVFs
+            // are consumed by grounding and replaced with the rule body. SQL-native TVFs
+            // (json_each, generate_series, etc.) only have Scalar arguments, so the
+            // string round-trip through TvfData is lossless. The Table arm is defensive.
+            let arguments: Vec<String> = ho_arguments
+                .iter()
+                .map(|arg| match arg {
+                    crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => {
+                        ho_argument_scalar_to_string(dom)
+                    }
+                    crate::pipeline::asts::core::operators::HoArgument::Table(rel) => {
+                        match rel {
+                            resolved::RelationalExpression::Relation(
+                                resolved::Relation::Ground { identifier, .. },
+                            ) => identifier.name.to_string(),
+                            _ => "_unknown_".to_string(),
+                        }
+                    }
+                })
+                .collect();
             segment.tables.push(FlatTable {
                 identifier: QualifiedName {
                     namespace_path: NamespacePath::empty(),
@@ -444,7 +486,7 @@ pub(super) fn flatten_relation(
                 _table_filters: vec![],
                 tvf_data: Some(TvfData {
                     function: function.to_string(),
-                    arguments: arguments.clone(),
+                    arguments,
                     domain_spec: domain_spec.clone(),
                     namespace: namespace.clone(),
                     grounding: grounding.clone(),

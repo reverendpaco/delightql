@@ -407,16 +407,45 @@ fn build_tvf_relation(
     alias: &Option<String>,
     schema_box: PhaseBox<CprSchema, refined::Refined>,
 ) -> refined::RelationalExpression {
+    // Reconstruct ho_arguments from TvfData string arguments.
+    // Only non-HO (SQL-native) TVFs reach this point, so all args are Scalar.
+    // See flattener INVARIANT comment for why this string round-trip is safe.
+    let ho_arguments = tvf_data
+        .arguments
+        .iter()
+        .map(|s| {
+            let dom_expr = if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+                refined::DomainExpression::Literal {
+                    value: refined::LiteralValue::String(s[1..s.len() - 1].to_string()),
+                    alias: None,
+                }
+            } else if s.parse::<f64>().is_ok() {
+                refined::DomainExpression::Literal {
+                    value: refined::LiteralValue::Number(s.clone()),
+                    alias: None,
+                }
+            } else if let Some(dot_pos) = s.find('.') {
+                let qualifier = s[..dot_pos].to_string();
+                let name = &s[dot_pos + 1..];
+                refined::DomainExpression::lvar_builder(name)
+                    .with_qualifier(qualifier)
+                    .build()
+            } else {
+                refined::DomainExpression::lvar_builder(s).build()
+            };
+            crate::pipeline::asts::core::operators::HoArgument::Scalar(dom_expr)
+        })
+        .collect();
+
     refined::RelationalExpression::Relation(refined::Relation::TVF {
         function: tvf_data.function.clone().into(),
-        arguments: tvf_data.arguments.clone(),
         domain_spec: tvf_data.domain_spec.clone().into(),
         alias: alias.clone().map(|s| s.into()),
         namespace: tvf_data.namespace.clone(),
         grounding: tvf_data.grounding.clone(),
         cpr_schema: schema_box,
         argument_groups: None,
-        first_parens_spec: None,
+        ho_arguments,
     })
 }
 

@@ -219,6 +219,7 @@ pub(super) fn parse_expression(
         "case_expression" => case_and_subqueries::parse_case_expression(node),
         "anonymous_scalar_subquery" => case_and_subqueries::parse_anonymous_scalar_subquery(node, features),
         "scalar_subquery" => case_and_subqueries::parse_scalar_subquery(node, features),
+        "ho_scalar_subquery" => case_and_subqueries::parse_ho_scalar_subquery(node, features),
         "metadata_tree_group" => super::operators::parse_metadata_tree_group(node),
         "path_literal" => functions::parse_path_literal(node),
         "array_destructure_pattern" => functions::parse_array_destructure_pattern(node),

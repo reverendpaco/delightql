@@ -261,26 +261,17 @@ pub(super) fn parse_tvf_call(
         (None, None)
     };
 
-    // Collect arguments as flat strings AND structured groups.
-    let mut arguments = Vec::new();
+    // Collect structured argument groups (preserves & and ; boundaries).
     let mut argument_groups = None;
     if let Some(args_node) = node.field("arguments") {
-        collect_tvf_arguments_recursive(args_node, &mut arguments);
-        // Also extract structured groups (preserves & and ; boundaries)
         let groups = super::operators::parse_ho_argument_list(args_node);
         if !groups.is_empty() {
-            // Store groups whenever present (even single group with ; rows)
             argument_groups = Some(groups);
         }
     }
 
-    // HO param substitution: replace table param names in TVF arguments
+    // HO param substitution for argument_groups
     if let Some(ref bindings) = features.ho_bindings {
-        for arg in &mut arguments {
-            if let Some(actual_name) = bindings.table_params.get(arg.as_str()) {
-                *arg = actual_name.clone();
-            }
-        }
         if let Some(ref mut groups) = argument_groups {
             for group in groups.iter_mut() {
                 for row in group.rows.iter_mut() {
@@ -304,25 +295,43 @@ pub(super) fn parse_tvf_call(
         DomainSpec::Glob
     };
 
-    // Parse first-parens as DomainSpec for PatternResolver unification.
-    // Each tvf_argument CST child becomes a DomainExpression.
-    let mut first_parens_spec = if let Some(args_node) = node.field("arguments") {
-        Some(parse_first_parens_as_domain_spec(args_node)?)
+    // Populate ho_arguments from CST (single source of truth for argument data).
+    let mut ho_arguments = if let Some(args_node) = node.field("arguments") {
+        let mut ho_args = Vec::new();
+        collect_ho_arguments(args_node, features, &mut ho_args)?;
+        ho_args
     } else {
-        None
+        vec![]
     };
 
-    // HO param substitution: replace param names in first_parens_spec Lvars.
-    // Table params: Lvar("T") → Lvar("actual_table_name")
+    // HO param substitution: replace param names in ho_arguments.
+    // Table params: table name → actual table name
     // Scalar params: Lvar("n") → the bound DomainExpression (e.g., Literal(5))
     if let Some(ref bindings) = features.ho_bindings {
-        if let Some(DomainSpec::Positional(ref mut exprs)) = first_parens_spec {
-            for expr in exprs.iter_mut() {
-                if let DomainExpression::Lvar { name, .. } = expr {
-                    if let Some(actual_name) = bindings.table_params.get(name.as_str()) {
-                        *name = actual_name.clone().into();
-                    } else if let Some(bound_expr) = bindings.scalar_params.get(name.as_str()) {
-                        *expr = bound_expr.clone();
+        for ho_arg in ho_arguments.iter_mut() {
+            match ho_arg {
+                HoArgument::Table(ref mut rel_expr) => {
+                    if let RelationalExpression::Relation(Relation::Ground {
+                        ref mut identifier,
+                        ..
+                    }) = rel_expr
+                    {
+                        if let Some(actual_name) =
+                            bindings.table_params.get(identifier.name.as_str())
+                        {
+                            identifier.name = actual_name.clone().into();
+                        }
+                    }
+                }
+                HoArgument::Scalar(ref mut dom_expr) => {
+                    if let DomainExpression::Lvar { name, .. } = dom_expr {
+                        if let Some(actual_name) = bindings.table_params.get(name.as_str()) {
+                            *name = actual_name.clone().into();
+                        } else if let Some(bound_expr) =
+                            bindings.scalar_params.get(name.as_str())
+                        {
+                            *dom_expr = bound_expr.clone();
+                        }
                     }
                 }
             }
@@ -331,14 +340,13 @@ pub(super) fn parse_tvf_call(
 
     Ok(Relation::TVF {
         function: function.into(),
-        arguments,
         domain_spec,
         alias: alias.map(|s| s.into()),
         namespace: namespace_path,
         grounding,
         cpr_schema: PhaseBox::phantom(),
         argument_groups,
-        first_parens_spec,
+        ho_arguments,
     })
 }
 
@@ -488,20 +496,41 @@ fn collect_first_parens_exprs(node: CstNode, out: &mut Vec<DomainExpression>) ->
     Ok(())
 }
 
-/// Recursively collect tvf_argument text from potentially nested node structures.
-/// Handles ho_argument_list → ho_argument_group → ho_argument_row → tvf_argument.
-fn collect_tvf_arguments_recursive(node: CstNode, out: &mut Vec<String>) {
+/// Parse a single tvf_argument CST node into an HoArgument.
+///
+/// - `table_access` → HoArgument::Table (full relational expression with interior)
+/// - everything else → HoArgument::Scalar (via existing domain expression path)
+fn parse_tvf_argument_as_ho_argument(
+    node: CstNode,
+    features: &mut crate::pipeline::query_features::FeatureCollector,
+) -> Result<HoArgument> {
     for child in node.children() {
-        match child.kind() {
-            "tvf_argument" => out.push(extract_tvf_argument_text(child)),
-            "ho_argument_list" | "ho_argument_group" | "ho_argument_row" | "argument_list" => {
-                collect_tvf_arguments_recursive(child, out);
-            }
-            other => {
-                log::warn!("Ignoring unknown node kind in TVF arguments: {:?}", other);
-            }
+        if child.kind() == "table_access" {
+            let rel_expr = parse_table_access(child, features)?;
+            return Ok(HoArgument::Table(rel_expr));
         }
     }
+    // Not a table_access — fall through to scalar path
+    let domain_expr = parse_tvf_argument_as_domain_expression(node)?;
+    Ok(HoArgument::Scalar(domain_expr))
+}
+
+/// Recursively collect HoArguments from first-parens CST nodes.
+pub(in crate::pipeline::builder_v2) fn collect_ho_arguments(
+    node: CstNode,
+    features: &mut crate::pipeline::query_features::FeatureCollector,
+    out: &mut Vec<HoArgument>,
+) -> Result<()> {
+    for child in node.children() {
+        match child.kind() {
+            "tvf_argument" => out.push(parse_tvf_argument_as_ho_argument(child, features)?),
+            "ho_argument_list" | "ho_argument_group" | "ho_argument_row" | "argument_list" => {
+                collect_ho_arguments(child, features, out)?;
+            }
+            _ => {} // skip separators (&, ;, ,)
+        }
+    }
+    Ok(())
 }
 
 fn parse_single_ns(node: CstNode) -> Result<NamespacePath> {

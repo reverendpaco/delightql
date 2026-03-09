@@ -1137,24 +1137,32 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
         }),
         Relation::TVF {
             function,
-            arguments,
             argument_groups,
-            first_parens_spec,
             domain_spec,
             alias,
             namespace,
             grounding,
             cpr_schema,
+            ho_arguments,
         } => Ok(Relation::TVF {
             function,
-            arguments,
             argument_groups,
-            first_parens_spec,
             domain_spec: t.transform_domain_spec(domain_spec)?,
             alias,
             namespace,
             grounding,
             cpr_schema: cpr_schema.rephase(),
+            ho_arguments: ho_arguments
+                .into_iter()
+                .map(|a| match a {
+                    crate::pipeline::asts::core::operators::HoArgument::Table(r) => {
+                        t.transform_relational(r).map(crate::pipeline::asts::core::operators::HoArgument::Table)
+                    }
+                    crate::pipeline::asts::core::operators::HoArgument::Scalar(d) => {
+                        t.transform_domain(d).map(crate::pipeline::asts::core::operators::HoArgument::Scalar)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
         }),
         Relation::InnerRelation {
             pattern,

@@ -57,6 +57,8 @@ pub type Row = crate::pipeline::asts::core::Row<crate::pipeline::asts::core::Unr
 pub type WindowFrame = crate::pipeline::asts::core::WindowFrame;
 pub type FrameMode = crate::pipeline::asts::core::FrameMode;
 pub type FrameBound = crate::pipeline::asts::core::FrameBound;
+pub type HoArgument =
+    crate::pipeline::asts::core::operators::HoArgument<crate::pipeline::asts::core::Unresolved>;
 
 // Re-export non-parameterized types from core
 pub use crate::pipeline::asts::core::expressions::{
