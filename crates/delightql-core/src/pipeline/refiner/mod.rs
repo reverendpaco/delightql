@@ -41,6 +41,7 @@ use crate::pipeline::asts::{refined, resolved};
 
 struct RefinerFold {
     is_top_level: bool,
+    danger_gates: crate::pipeline::danger_gates::DangerGateMap,
 }
 
 impl AstTransform<Resolved, Refined> for RefinerFold {
@@ -143,7 +144,8 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
             )
             | resolved::RelationalExpression::Filter { .. }
             | resolved::RelationalExpression::SetOperation { .. } => {
-                let refined = refine_segment(expr, self.is_top_level)?;
+                let min_mult = self.danger_gates.is_enabled("dql/semantics/min_multiplicity");
+                let refined = refine_segment(expr, self.is_top_level, min_mult)?;
                 Ok(FoldAction::Replaced(refined))
             }
 
@@ -151,6 +153,14 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
             resolved::RelationalExpression::ErJoinChain { .. }
             | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
                 unreachable!("ER chains should be resolved before refinement")
+            }
+
+            // IntersectCorresponding is produced by the refiner, not consumed by it.
+            // It should never appear in the Resolved phase input to the refiner.
+            resolved::RelationalExpression::IntersectCorresponding { .. } => {
+                unreachable!(
+                    "IntersectCorresponding is produced by the refiner, not consumed by it"
+                )
             }
         }
     }
@@ -239,7 +249,7 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
     fn transform_query(&mut self, query: resolved::Query) -> Result<refined::Query> {
         match query {
             resolved::Query::Relational(expr) => {
-                let mut fold = RefinerFold { is_top_level: true };
+                let mut fold = RefinerFold { is_top_level: true, danger_gates: self.danger_gates.clone() };
                 Ok(refined::Query::Relational(
                     fold.transform_relational_action(expr)?.into_inner(),
                 ))
@@ -248,7 +258,7 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
                 let refined_ctes = ctes
                     .into_iter()
                     .map(|cte| {
-                        let mut fold = RefinerFold { is_top_level: true };
+                        let mut fold = RefinerFold { is_top_level: true, danger_gates: self.danger_gates.clone() };
                         Ok(refined::CteBinding {
                             expression: fold
                                 .transform_relational_action(cte.expression)?
@@ -259,7 +269,7 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let mut fold = RefinerFold { is_top_level: true };
+                let mut fold = RefinerFold { is_top_level: true, danger_gates: self.danger_gates.clone() };
                 let refined_main = fold.transform_relational_action(query)?.into_inner();
 
                 Ok(refined::Query::WithCtes {
@@ -304,7 +314,15 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
 
 /// Main entry point for AST refinement (for RelationalExpression)
 pub fn refine(ast: resolved::RelationalExpression) -> Result<refined::RelationalExpression> {
-    refine_internal(ast, true)
+    refine_with_gates(ast, crate::pipeline::danger_gates::DangerGateMap::with_defaults())
+}
+
+/// Refine with danger gate context.
+pub fn refine_with_gates(
+    ast: resolved::RelationalExpression,
+    danger_gates: crate::pipeline::danger_gates::DangerGateMap,
+) -> Result<refined::RelationalExpression> {
+    refine_internal(ast, true, danger_gates)
 }
 
 /// Internal refine with context tracking
@@ -312,8 +330,12 @@ pub fn refine(ast: resolved::RelationalExpression) -> Result<refined::Relational
 pub(crate) fn refine_internal(
     ast: resolved::RelationalExpression,
     is_top_level: bool,
+    danger_gates: crate::pipeline::danger_gates::DangerGateMap,
 ) -> Result<refined::RelationalExpression> {
-    let mut fold = RefinerFold { is_top_level };
+    let mut fold = RefinerFold {
+        is_top_level,
+        danger_gates,
+    };
     fold.transform_relational_action(ast)
         .map(|a| a.into_inner())
 }
@@ -322,6 +344,7 @@ pub(crate) fn refine_internal(
 fn refine_segment(
     ast: resolved::RelationalExpression,
     is_top_level: bool,
+    min_multiplicity: bool,
 ) -> Result<refined::RelationalExpression> {
     log::debug!(
         "refine_segment: Processing AST type: {:?}, is_top_level={}",
@@ -347,13 +370,24 @@ fn refine_segment(
 
     // Phase 3: Rebuild the AST with predicates in proper locations
     log::debug!("refine_segment: Calling rebuilder::rebuild");
-    let refined_ast = rebuilder::rebuild_internal(analyzed_segment, is_top_level)?;
+    let refined_ast = rebuilder::rebuild_internal(analyzed_segment, is_top_level, min_multiplicity)?;
 
     Ok(refined_ast)
 }
 
 /// Refine a full Query (with CTEs)
 pub fn refine_query(query: resolved::Query) -> Result<refined::Query> {
-    let mut fold = RefinerFold { is_top_level: true };
+    refine_query_with_gates(query, crate::pipeline::danger_gates::DangerGateMap::with_defaults())
+}
+
+/// Refine a full Query with danger gate context.
+pub fn refine_query_with_gates(
+    query: resolved::Query,
+    danger_gates: crate::pipeline::danger_gates::DangerGateMap,
+) -> Result<refined::Query> {
+    let mut fold = RefinerFold {
+        is_top_level: true,
+        danger_gates,
+    };
     fold.transform_query(query)
 }

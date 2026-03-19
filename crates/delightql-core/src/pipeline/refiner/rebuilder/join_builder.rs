@@ -208,7 +208,8 @@ pub(super) fn build_join_condition(
                 }
             }
             _ if matches!(p.class, PredicateClass::FJC { .. }) => {
-                join_conditions.push(super::refine_predicate_boolean(p.expr)?);
+                let refined = super::refine_predicate_boolean(p.expr)?;
+                join_conditions.push(downgrade_null_safe_eq(refined));
             }
             // Other predicates (FIC, etc.): not join conditions, skip here
             // They'll be placed as WHERE filters by the predicate placement logic
@@ -469,4 +470,36 @@ fn validate_outer_join_markers(
     }
 
     Ok(())
+}
+
+/// Rewrite `null_safe_eq` → `traditional_eq` in join conditions.
+///
+/// In join position, null-safe equality (`IS NOT DISTINCT FROM`) risks cartesian
+/// explosion when NULL values match. DQL's `=` compiles to traditional SQL `=`
+/// in ON clauses by default. The danger gate `dql/cardinality/nulljoin` can
+/// opt back into INDF (not yet wired — added when danger gates reach the refiner).
+fn downgrade_null_safe_eq(expr: refined::BooleanExpression) -> refined::BooleanExpression {
+    match expr {
+        refined::BooleanExpression::Comparison {
+            operator,
+            left,
+            right,
+        } if operator == "null_safe_eq" => refined::BooleanExpression::Comparison {
+            operator: "traditional_eq".to_string(),
+            left,
+            right,
+        },
+        refined::BooleanExpression::And { left, right } => refined::BooleanExpression::And {
+            left: Box::new(downgrade_null_safe_eq(*left)),
+            right: Box::new(downgrade_null_safe_eq(*right)),
+        },
+        refined::BooleanExpression::Or { left, right } => refined::BooleanExpression::Or {
+            left: Box::new(downgrade_null_safe_eq(*left)),
+            right: Box::new(downgrade_null_safe_eq(*right)),
+        },
+        refined::BooleanExpression::Not { expr: inner } => refined::BooleanExpression::Not {
+            expr: Box::new(downgrade_null_safe_eq(*inner)),
+        },
+        other => other,
+    }
 }

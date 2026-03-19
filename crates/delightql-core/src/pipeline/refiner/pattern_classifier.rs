@@ -154,6 +154,9 @@ fn has_aggregation(expr: &resolved::RelationalExpression) -> bool {
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before pattern classification")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -192,6 +195,9 @@ fn has_limit(expr: &resolved::RelationalExpression) -> bool {
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before pattern classification")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -218,6 +224,9 @@ fn extract_limit_value(expr: &resolved::RelationalExpression) -> Result<Option<i
         resolved::RelationalExpression::ErJoinChain { .. }
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before pattern classification")
+        }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }
@@ -256,6 +265,9 @@ fn extract_order_by(
         resolved::RelationalExpression::ErJoinChain { .. }
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before pattern classification")
+        }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }
@@ -305,6 +317,9 @@ fn inject_hygienic_columns_if_needed(
         resolved::RelationalExpression::ErJoinChain { .. }
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before pattern classification")
+        }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     };
 

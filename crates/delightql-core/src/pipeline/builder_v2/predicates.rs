@@ -210,6 +210,7 @@ pub(super) fn parse_predicate(
                     RelationalExpression::Relation(Relation::Ground {
                         identifier: identifier.clone(),
                         canonical_name: PhaseBox::phantom(),
+                        backend_schema: PhaseBox::phantom(),
                         domain_spec: DomainSpec::Glob,
                         alias: alias.clone().map(|s| s.into()),
                         outer: false,
@@ -223,6 +224,7 @@ pub(super) fn parse_predicate(
                 RelationalExpression::Relation(Relation::Ground {
                     identifier: identifier.clone(),
                     canonical_name: PhaseBox::phantom(),
+                    backend_schema: PhaseBox::phantom(),
                     domain_spec: DomainSpec::Glob,
                     alias: alias.clone().map(|s| s.into()),
                     outer: false,
@@ -236,6 +238,7 @@ pub(super) fn parse_predicate(
             RelationalExpression::Relation(Relation::Ground {
                 identifier: identifier.clone(),
                 canonical_name: PhaseBox::phantom(),
+                backend_schema: PhaseBox::phantom(),
                 domain_spec: DomainSpec::Glob,
                 alias: alias.clone().map(|s| s.into()),
                 outer: false,
@@ -481,6 +484,7 @@ pub(super) fn parse_inner_exists_as_boolean(
                 RelationalExpression::Relation(Relation::Ground {
                     identifier: identifier.clone(),
                     canonical_name: PhaseBox::phantom(),
+                    backend_schema: PhaseBox::phantom(),
                     domain_spec: DomainSpec::Glob,
                     alias: alias.clone().map(|s| s.into()),
                     outer: false,
@@ -494,6 +498,7 @@ pub(super) fn parse_inner_exists_as_boolean(
             RelationalExpression::Relation(Relation::Ground {
                 identifier: identifier.clone(),
                 canonical_name: PhaseBox::phantom(),
+                backend_schema: PhaseBox::phantom(),
                 domain_spec: DomainSpec::Glob,
                 alias: alias.clone().map(|s| s.into()),
                 outer: false,
@@ -507,6 +512,7 @@ pub(super) fn parse_inner_exists_as_boolean(
         RelationalExpression::Relation(Relation::Ground {
             identifier: identifier.clone(),
             canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
             domain_spec: DomainSpec::Glob,
             alias: alias.clone().map(|s| s.into()),
             outer: false,
@@ -736,6 +742,7 @@ pub(super) fn parse_in_relational_as_boolean(
                 RelationalExpression::Relation(Relation::Ground {
                     identifier: identifier.clone(),
                     canonical_name: PhaseBox::phantom(),
+                    backend_schema: PhaseBox::phantom(),
                     domain_spec: DomainSpec::Glob,
                     alias: None,
                     outer: false,
@@ -749,6 +756,7 @@ pub(super) fn parse_in_relational_as_boolean(
             RelationalExpression::Relation(Relation::Ground {
                 identifier: identifier.clone(),
                 canonical_name: PhaseBox::phantom(),
+                backend_schema: PhaseBox::phantom(),
                 domain_spec: DomainSpec::Glob,
                 alias: None,
                 outer: false,
@@ -762,6 +770,7 @@ pub(super) fn parse_in_relational_as_boolean(
         RelationalExpression::Relation(Relation::Ground {
             identifier: identifier.clone(),
             canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
             domain_spec: DomainSpec::Glob,
             alias: None,
             outer: false,

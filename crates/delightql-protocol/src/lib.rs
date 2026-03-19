@@ -15,11 +15,3 @@ pub use layer0::*;
 // Re-export layer1 control types
 pub use layer1::{ClientMessage, ControlOp, ControlResult, ServerMessage};
 
-// Re-export layer1 cell encoding utilities
-pub use layer1::{
-    CELL_TAG_BLOB, CELL_TAG_INTEGER, CELL_TAG_REAL, CELL_TAG_TEXT, decode_cell_for_hash,
-    decode_cell_to_text,
-};
-
-// Re-export bhash cell utility
-pub use layer1::cell_content_bytes;

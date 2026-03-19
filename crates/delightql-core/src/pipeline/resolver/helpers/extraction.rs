@@ -37,6 +37,9 @@ pub(in super::super) fn extract_cpr_schema(
         | ast_resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER-join consumed by resolver")
         }
+        ast_resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -94,15 +97,33 @@ pub(in super::super) fn extract_inline_using_columns(
         | ast_resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before USING column extraction")
         }
+        ast_resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
 /// Transform a schema's table names to use a new table name
 /// This is used for CTEs to ensure their columns reference the CTE name, not the original table
-/// EPOCH 3: Also pushes CteRegistration identity onto each column's identity stack
+/// Also pushes CteRegistration identity onto each column's identity stack.
+/// CTE origin is inferred: `_ho_*` names → CompilerGenerated, others → UserDefined.
 pub(in super::super) fn transform_schema_table_names(
     schema: ast_resolved::CprSchema,
     new_table_name: &str,
+) -> ast_resolved::CprSchema {
+    let origin = if new_table_name.starts_with("_ho_") {
+        ast_resolved::CteOrigin::CompilerGenerated
+    } else {
+        ast_resolved::CteOrigin::UserDefined
+    };
+    transform_schema_table_names_with_origin(schema, new_table_name, origin)
+}
+
+/// Transform schema table names with explicit CTE origin
+pub(in super::super) fn transform_schema_table_names_with_origin(
+    schema: ast_resolved::CprSchema,
+    new_table_name: &str,
+    origin: ast_resolved::CteOrigin,
 ) -> ast_resolved::CprSchema {
     match schema {
         ast_resolved::CprSchema::Resolved(columns) => {
@@ -113,13 +134,10 @@ pub(in super::super) fn transform_schema_table_names(
                     // CTEs are query-local — they don't belong to any database schema.
                     // Clear namespace metadata so column refs produce `table.column`,
                     // never `schema.table.column`.
-                    col.fq_table = ast_resolved::FqTable {
-                        parents_path: ast_resolved::NamespacePath::empty(),
-                        name: ast_resolved::TableName::Named(new_table_name.to_string().into()),
-                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    };
+                    col.table_name =
+                        ast_resolved::TableName::Named(new_table_name.to_string().into());
 
-                    // EPOCH 3: Push CteRegistration identity onto the stack
+                    // Push CteRegistration identity onto the stack
                     col.info = col
                         .info
                         .clone()
@@ -127,6 +145,7 @@ pub(in super::super) fn transform_schema_table_names(
                             name: col.info.name().unwrap_or("<unnamed>").into(),
                             context: ast_resolved::IdentityContext::CteRegistration {
                                 cte_name: new_table_name.to_string(),
+                                origin,
                             },
                             phase: ast_resolved::TransformationPhase::Resolved,
                             table_qualifier: ast_resolved::TableName::Named(
@@ -151,6 +170,7 @@ pub(in super::super) fn transform_schema_table_names(
 pub(crate) fn scope_schema_to_alias(
     schema: ast_resolved::CprSchema,
     alias: &str,
+    resolver_id: Option<ast_resolved::ResolverId>,
 ) -> ast_resolved::CprSchema {
     match schema {
         ast_resolved::CprSchema::Resolved(columns) => {
@@ -166,6 +186,7 @@ pub(crate) fn scope_schema_to_alias(
                             context: ast_resolved::IdentityContext::SubqueryAlias {
                                 alias: alias.to_string(),
                                 previous_context: prev,
+                                resolver_id,
                             },
                             phase: ast_resolved::TransformationPhase::Resolved,
                             table_qualifier: ast_resolved::TableName::Named(

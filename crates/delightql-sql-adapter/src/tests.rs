@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use delightql_protocol::{
     Client, CloseResponse, DirectTransport, FetchResponse, Orientation, Projection,
     QueryResponse, Session, VersionResult,
-    CELL_TAG_INTEGER, CELL_TAG_TEXT, decode_cell_to_text,
 };
 
 use crate::SqlParty;
@@ -33,15 +32,11 @@ fn b(s: &str) -> Vec<u8> {
 }
 
 fn text_cell(s: &str) -> Option<Vec<u8>> {
-    let mut v = vec![CELL_TAG_TEXT];
-    v.extend_from_slice(s.as_bytes());
-    Some(v)
+    Some(s.as_bytes().to_vec())
 }
 
 fn int_cell(n: i64) -> Option<Vec<u8>> {
-    let mut v = vec![CELL_TAG_INTEGER];
-    v.extend_from_slice(&n.to_le_bytes());
-    Some(v)
+    Some(n.to_string().into_bytes())
 }
 
 fn null_cell() -> Option<Vec<u8>> {
@@ -51,7 +46,7 @@ fn null_cell() -> Option<Vec<u8>> {
 /// Decode a cell to its text string for assertion comparisons.
 fn cell_text(cell: &Option<Vec<u8>>) -> String {
     match cell {
-        Some(bytes) => decode_cell_to_text(bytes),
+        Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
         None => "NULL".to_string(),
     }
 }

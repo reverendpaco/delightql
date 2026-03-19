@@ -10,9 +10,8 @@
 use std::collections::HashMap;
 
 use delightql_protocol::{
-    decode_cell_to_text, ByteSeq, Cell, ClientTerm, CloseResponse, Dimension, ErrorKind,
-    FetchResponse, Handle, Handler, MetaItem, Orientation, Projection, QueryHandle, QueryResponse,
-    ServerTerm, Session, Transport, CELL_TAG_TEXT,
+    ByteSeq, Cell, ClientTerm, CloseResponse, Dimension, ErrorKind, FetchResponse, Handle, Handler,
+    MetaItem, Orientation, Projection, QueryHandle, QueryResponse, ServerTerm, Session, Transport,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite;
@@ -89,7 +88,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             danger_overrides: Vec::new(),
             option_overrides: Vec::new(),
             is_repl: false,
-            sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel::None,
+            sql_optimization_level: pipeline::sql_optimizer::level_from_env(),
             inline_ctes: false,
             hooks: RelayHooks::default(),
         }
@@ -1130,7 +1129,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             .map(|(i, name)| Dimension {
                 position: i as u64,
                 name: name.as_bytes().to_vec(),
-                descriptor: Vec::new(),
+                descriptor: b"TEXT".to_vec(),
             })
             .collect();
         let cells: Vec<Vec<Cell>> = rows
@@ -1141,9 +1140,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         if val == "NULL" {
                             None
                         } else {
-                            let mut v = vec![CELL_TAG_TEXT];
-                            v.extend_from_slice(val.as_bytes());
-                            Some(v)
+                            Some(val.as_bytes().to_vec())
                         }
                     })
                     .collect()
@@ -1199,7 +1196,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         all_rows.push(
                             row.iter()
                                 .map(|cell| match cell {
-                                    Some(bytes) => decode_cell_to_text(bytes),
+                                    Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
                                     None => "NULL".to_string(),
                                 })
                                 .collect(),

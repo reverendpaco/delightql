@@ -110,7 +110,9 @@ impl NamespacePath {
         );
 
         NamespacePath {
-            items: smallvec![NamespaceItem { name: SqlIdentifier::new(name) }],
+            items: smallvec![NamespaceItem {
+                name: SqlIdentifier::new(name)
+            }],
         }
     }
 
@@ -155,7 +157,9 @@ impl NamespacePath {
         Ok(NamespacePath {
             items: parts
                 .into_iter()
-                .map(|name| NamespaceItem { name: SqlIdentifier::new(name) })
+                .map(|name| NamespaceItem {
+                    name: SqlIdentifier::new(name),
+                })
                 .collect(),
         })
     }
@@ -225,7 +229,11 @@ impl NamespacePath {
     /// Phase 2: Core's rich NamespacePath needs to convert to the simplified
     /// types version when calling DatabaseSchema methods.
     pub fn to_types_namespace_path(&self) -> delightql_types::namespace::NamespacePath {
-        let parts: Vec<String> = self.items.iter().map(|item| item.name.to_string()).collect();
+        let parts: Vec<String> = self
+            .items
+            .iter()
+            .map(|item| item.name.to_string())
+            .collect();
         delightql_types::namespace::NamespacePath::from_parts(parts)
     }
 
@@ -316,33 +324,14 @@ pub enum TableName {
     Fresh,
 }
 
-/// Fully qualified table reference
-///
-/// For table identity (not aliases): namespace_path identifies location, name is the table
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-#[lispy("fq_table")]
-pub struct FqTable {
-    /// Namespace path (WHERE to find table) - logical namespace
-    /// This is what the user wrote (e.g., "c", "sys", "main")
-    pub parents_path: NamespacePath,
-
-    /// Table name
-    pub name: TableName,
-
-    /// Backend database schema name - physical namespace
-    /// This is what SQL generation needs (e.g., "_c", "sys", "main")
-    /// Only available after resolution phase - populated by querying sys.namespaces
-    pub backend_schema: super::PhaseBox<Option<String>, super::Resolved>,
-}
-
 /// Column metadata with schema information
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
 #[lispy("c")]
 pub struct ColumnMetadata {
     /// Core column identity and reference information
     pub info: ColumnProvenance,
-    /// Source table information
-    pub fq_table: FqTable,
+    /// Source table name (flattened from former FqTable)
+    pub table_name: TableName,
     /// Position in the output
     pub table_position: Option<usize>,
     /// Whether this column has a user-provided name (vs generated)
@@ -370,10 +359,14 @@ fn is_false(b: &bool) -> bool {
 
 impl ColumnMetadata {
     /// Create new metadata from components
-    pub fn new(info: ColumnProvenance, fq_table: FqTable, table_position: Option<usize>) -> Self {
+    pub fn new(
+        info: ColumnProvenance,
+        table_name: TableName,
+        table_position: Option<usize>,
+    ) -> Self {
         Self {
             info,
-            fq_table,
+            table_name,
             table_position,
             has_user_name: true, // Default to true for backward compatibility
             needs_hygienic_alias: false,
@@ -385,13 +378,13 @@ impl ColumnMetadata {
     /// Create new metadata with explicit user name flag
     pub fn new_with_name_flag(
         info: ColumnProvenance,
-        fq_table: FqTable,
+        table_name: TableName,
         table_position: Option<usize>,
         has_user_name: bool,
     ) -> Self {
         Self {
             info,
-            fq_table,
+            table_name,
             table_position,
             has_user_name,
             needs_hygienic_alias: false,
@@ -435,23 +428,40 @@ impl ColumnMetadata {
 pub struct ScopedSchema {
     alias: SqlIdentifier,
     schema: CprSchema,
+    /// Opaque resolver ID for this scope. Carried through to the transformer
+    /// so it can map directly to a ProvenanceId without string remapping.
+    #[serde(default)]
+    resolver_id: Option<super::provenance::ResolverId>,
 }
 
 impl ScopedSchema {
     /// Construct a ScopedSchema, pushing SubqueryAlias onto every column.
     /// This is the primary constructor — enforces the alias-schema invariant.
-    pub fn bind(schema: CprSchema, alias: SqlIdentifier) -> Self {
+    pub fn bind(
+        schema: CprSchema,
+        alias: SqlIdentifier,
+        resolver_id: Option<super::provenance::ResolverId>,
+    ) -> Self {
         let scoped = crate::pipeline::resolver::helpers::extraction::scope_schema_to_alias(
             schema,
             &alias,
+            resolver_id,
         );
-        ScopedSchema { alias, schema: scoped }
+        ScopedSchema {
+            alias,
+            schema: scoped,
+            resolver_id,
+        }
     }
 
     /// Reconstruct from already-scoped parts (for rebuilder after flatten/rebuild).
     /// The caller guarantees that `schema` already has the alias in its provenance.
     pub fn from_parts(alias: SqlIdentifier, schema: CprSchema) -> Self {
-        ScopedSchema { alias, schema }
+        ScopedSchema {
+            alias,
+            schema,
+            resolver_id: None,
+        }
     }
 
     pub fn alias(&self) -> &SqlIdentifier {
@@ -461,11 +471,19 @@ impl ScopedSchema {
     pub fn schema(&self) -> &CprSchema {
         &self.schema
     }
+
+    pub fn resolver_id(&self) -> Option<super::provenance::ResolverId> {
+        self.resolver_id
+    }
 }
 
 impl ToLispy for ScopedSchema {
     fn to_lispy(&self) -> String {
-        format!("(scoped-schema :alias {} {})", self.alias, self.schema.to_lispy())
+        format!(
+            "(scoped-schema :alias {} {})",
+            self.alias,
+            self.schema.to_lispy()
+        )
     }
 }
 

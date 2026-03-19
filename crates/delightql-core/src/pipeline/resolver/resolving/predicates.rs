@@ -92,7 +92,7 @@ pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
         let outer_qualifier: Option<delightql_types::SqlIdentifier> = outer_available
             .iter()
             .find(|cm| cm.info.name().map_or(false, |n| n == col_name))
-            .and_then(|cm| match &cm.fq_table.name {
+            .and_then(|cm| match &cm.table_name {
                 TableName::Named(id) => Some(id.clone()),
                 TableName::Fresh => None,
             });
@@ -159,7 +159,7 @@ pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
             let outer_qualifier: Option<delightql_types::SqlIdentifier> = outer_available
                 .iter()
                 .find(|cm| cm.info.name().map_or(false, |n| n == col_name))
-                .and_then(|cm| match &cm.fq_table.name {
+                .and_then(|cm| match &cm.table_name {
                     TableName::Named(id) => Some(id.clone()),
                     TableName::Fresh => None,
                 });

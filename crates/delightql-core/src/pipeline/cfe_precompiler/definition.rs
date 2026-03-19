@@ -1,10 +1,10 @@
 // CFE definition precompilation - query-level and single CFE processing
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::asts::core::{DomainExpression, FunctionExpression, Unresolved};
-use crate::pipeline::asts::unresolved::{self as ast_unresolved, NamespacePath};
-use crate::pipeline::asts::{resolved, unresolved};
 use crate::pipeline::ast_transform::{self, AstTransform};
+use crate::pipeline::asts::core::{FunctionExpression, Unresolved};
+use crate::pipeline::asts::unresolved::{self as ast_unresolved};
+use crate::pipeline::asts::{resolved, unresolved};
 use crate::pipeline::resolver::{self, DatabaseSchema};
 use crate::resolution::registry::ConsultRegistry;
 
@@ -117,11 +117,7 @@ pub(crate) fn precompile_cfe_definition(
     for (idx, param) in cfe.curried_params.iter().enumerate() {
         fake_columns.push(resolved::ColumnMetadata::new_with_name_flag(
             resolved::ColumnProvenance::from_column(param.clone()),
-            resolved::FqTable {
-                parents_path: NamespacePath::empty(),
-                name: resolved::TableName::Named("__cfe_curried_params__".into()),
-                backend_schema: resolved::PhaseBox::from_optional_schema(None), // Synthetic table
-            },
+            resolved::TableName::Named("__cfe_curried_params__".into()),
             Some(idx),
             true, // has_user_name
         ));
@@ -132,11 +128,7 @@ pub(crate) fn precompile_cfe_definition(
     for (idx, param) in cfe.parameters.iter().enumerate() {
         fake_columns.push(resolved::ColumnMetadata::new_with_name_flag(
             resolved::ColumnProvenance::from_column(param.clone()),
-            resolved::FqTable {
-                parents_path: NamespacePath::empty(),
-                name: resolved::TableName::Named("__cfe_params__".into()),
-                backend_schema: resolved::PhaseBox::from_optional_schema(None), // Synthetic table
-            },
+            resolved::TableName::Named("__cfe_params__".into()),
             Some(curried_count + idx),
             true, // has_user_name
         ));
@@ -148,11 +140,7 @@ pub(crate) fn precompile_cfe_definition(
         for (idx, ctx_param) in ctx_params.iter().enumerate() {
             fake_columns.push(resolved::ColumnMetadata::new_with_name_flag(
                 resolved::ColumnProvenance::from_column(ctx_param.clone()),
-                resolved::FqTable {
-                    parents_path: NamespacePath::empty(),
-                    name: resolved::TableName::Named("__cfe_context__".into()),
-                    backend_schema: resolved::PhaseBox::from_optional_schema(None), // Synthetic table
-                },
+                resolved::TableName::Named("__cfe_context__".into()),
                 Some(param_count + idx),
                 true, // has_user_name
             ));
@@ -186,7 +174,8 @@ pub(crate) fn precompile_cfe_definition(
         &mut registry,
         &fake_columns,
         in_correlation,
-    ).map_err(|e| {
+    )
+    .map_err(|e| {
         log::debug!("CFE '{}' resolution failed: {}", cfe.name, e);
         e
     })?;
@@ -279,8 +268,7 @@ fn discover_nested_consulted_functions(
     cfes: &mut Vec<unresolved::CfeDefinition>,
     consult: &ConsultRegistry,
 ) -> Result<()> {
-    let mut seen: std::collections::HashSet<String> =
-        cfes.iter().map(|c| c.name.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = cfes.iter().map(|c| c.name.clone()).collect();
     let mut i = 0;
     // Process existing + newly added CFEs (list grows as we discover)
     while i < cfes.len() {
@@ -291,15 +279,11 @@ fn discover_nested_consulted_functions(
             }
             let entity = if let Some(ns) = &namespace {
                 let fq = crate::pipeline::resolver::grounding::namespace_path_to_fq(ns);
-                consult
-                    .lookup_entity(&name, &fq)
-                    .filter(|e| {
-                        e.entity_type
-                            == crate::enums::EntityType::DqlFunctionExpression.as_i32()
-                            || e.entity_type
-                                == crate::enums::EntityType::DqlContextAwareFunctionExpression
-                                    .as_i32()
-                    })
+                consult.lookup_entity(&name, &fq).filter(|e| {
+                    e.entity_type == crate::enums::EntityType::DqlFunctionExpression.as_i32()
+                        || e.entity_type
+                            == crate::enums::EntityType::DqlContextAwareFunctionExpression.as_i32()
+                })
             } else {
                 let e = consult.lookup_enlisted_function(&name)?;
                 if e.is_some() {

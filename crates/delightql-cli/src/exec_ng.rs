@@ -5,7 +5,6 @@
 use anyhow::Result;
 use delightql_backends::QueryResults;
 use delightql_core::api::DqlSession;
-use delightql_protocol::decode_cell_to_text;
 
 use crate::args::Stage;
 use crate::output_format::OutputFormat;
@@ -41,7 +40,7 @@ fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<QueryResults> {
             all_rows.push(
                 row.iter()
                     .map(|cell| match cell {
-                        Some(bytes) => decode_cell_to_text(bytes),
+                        Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
                         None => "NULL".to_string(),
                     })
                     .collect(),
@@ -126,7 +125,7 @@ fn display_results(
             .map(|row| {
                 row.iter()
                     .map(|cell| match cell {
-                        Some(bytes) => decode_cell_to_text(bytes),
+                        Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
                         None => "NULL".to_string(),
                     })
                     .collect()
@@ -160,7 +159,6 @@ fn display_results(
 
 /// Stream raw cell bytes to stdout (no text conversion, no formatting).
 fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<ResultMetadata> {
-    use delightql_protocol::cell_content_bytes;
     use std::io::Write;
 
     let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -180,7 +178,7 @@ fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<Result
         for row in &fr.rows {
             for cell in row {
                 if let Some(bytes) = cell {
-                    stdout.write_all(cell_content_bytes(bytes))?;
+                    stdout.write_all(bytes)?;
                 }
                 // NULL → zero bytes (nothing written)
             }

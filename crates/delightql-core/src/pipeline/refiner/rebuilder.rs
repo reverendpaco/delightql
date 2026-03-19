@@ -34,6 +34,7 @@ enum SetOperatorStrategy {
 pub(super) fn rebuild_internal(
     analyzed: AnalyzedSegment,
     is_top_level: bool,
+    min_multiplicity: bool,
 ) -> Result<refined::RelationalExpression> {
     log::debug!(
         "rebuild: segment_type={:?}, {} tables, {} operators, {} predicates, is_top_level={}",
@@ -68,7 +69,7 @@ pub(super) fn rebuild_internal(
         }
         SegmentType::SetOperation => {
             log::debug!("Calling rebuild_setop_segment");
-            rebuild_setop_segment(analyzed, op_predicates)
+            rebuild_setop_segment(analyzed, op_predicates, min_multiplicity)
         }
         SegmentType::Mixed => {
             log::debug!("Calling rebuild_mixed_segment");
@@ -284,7 +285,7 @@ fn table_to_refined(
     if let Some(ref pipe_expr) = table.pipe_expr {
         // Recursively refine the pipe expression
         // Pass is_top_level=false to skip outer join validation (this is an inner context)
-        return crate::pipeline::refiner::refine_internal(pipe_expr.as_ref().clone(), false);
+        return crate::pipeline::refiner::refine_internal(pipe_expr.as_ref().clone(), false, crate::pipeline::danger_gates::DangerGateMap::with_defaults());
     }
 
     let mut result = build_base_relation(table)?;
@@ -446,6 +447,8 @@ fn build_tvf_relation(
         cpr_schema: schema_box,
         argument_groups: None,
         ho_arguments,
+        backend_schema: PhaseBox::from_optional_schema(tvf_data.backend_schema.clone())
+            .into_refined(),
     })
 }
 
@@ -590,7 +593,7 @@ fn build_inner_relation_from_flattened(
 
     // Recursively rebuild the analyzed segment into a Refined AST
     // Pass is_top_level=false to skip outer join validation (this is an inner context)
-    let rebuilt_subquery = rebuild_internal(analyzed_subquery, false)?;
+    let rebuilt_subquery = rebuild_internal(analyzed_subquery, false, false)?;
 
     // Convert pattern from Resolved to Refined, replacing the subquery with the rebuilt one
     let refined_pattern: InnerRelationPattern<Refined> = match pattern {
@@ -837,6 +840,9 @@ pub fn remove_correlation_filters_from_expr(
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before correlation filter removal")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -897,6 +903,9 @@ pub fn remove_limit_from_expr(
         resolved::RelationalExpression::ErJoinChain { .. }
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before CDT-WJ processing")
+        }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }
@@ -960,6 +969,9 @@ pub fn remove_order_by_from_expr(
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before CDT-WJ processing")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -990,6 +1002,7 @@ fn build_ground_relation(
         passthrough: false,
         cpr_schema: schema_box,
         hygienic_injections: Vec::new(),
+        backend_schema: PhaseBox::from_optional_schema(table.backend_schema.clone()).into_refined(),
     })
 }
 
@@ -1040,7 +1053,7 @@ pub(super) fn refine_predicate_boolean(
             using_columns,
         } => {
             // Refine the InnerExists subquery through the full refiner pipeline
-            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false)?;
+            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false, crate::pipeline::danger_gates::DangerGateMap::with_defaults())?;
             Ok(refined::BooleanExpression::InnerExists {
                 exists,
                 identifier,
@@ -1055,7 +1068,7 @@ pub(super) fn refine_predicate_boolean(
             identifier,
             negated,
         } => {
-            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false)?;
+            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false, crate::pipeline::danger_gates::DangerGateMap::with_defaults())?;
             Ok(refined::BooleanExpression::InRelational {
                 value: Box::new((*value).into()),
                 subquery: Box::new(refined_subquery),

@@ -54,6 +54,24 @@ pub enum RelationalExpression<Phase = Unresolved> {
         correlation: PhaseBox<Option<BooleanExpression<Phase>>, Phase>,
         cpr_schema: PhaseBox<CprSchema, Phase>,
     },
+    /// Intersection via bidirectional semijoin.
+    ///
+    /// Produced by the refiner when a SetOperation has correlation predicates.
+    /// Operands are already column-aligned (NULL-padded, reordered) by the refiner.
+    ///
+    /// Gate OFF (default): EXISTS-filtered halves UNIONed ALL (m+n copies).
+    /// Gate ON (min_multiplicity): ROW_NUMBER + equi-join (min(m,n) copies).
+    IntersectCorresponding {
+        /// The operands (already column-aligned by the refiner)
+        operands: Vec<RelationalExpression<Phase>>,
+        /// Per-column matching conditions (e.g., x.id IS NOT DISTINCT FROM y.id)
+        correlation: BooleanExpression<Phase>,
+        /// When true, use ROW_NUMBER + JOIN for min(m,n) multiplicity.
+        /// Set by the refiner when `danger://dql/semantics/min_multiplicity` is ON.
+        min_multiplicity: bool,
+        cpr_schema: PhaseBox<CprSchema, Phase>,
+    },
+
     /// ER-context join chain: A(*) & B(*) & C(*)
     /// Unresolved-only — resolver expands into standard Joins.
     #[lispy("er_join_chain")]
@@ -122,6 +140,17 @@ impl<Phase: Clone> RelationalExpression<Phase> {
                 correlation: correlation.clone(),
                 cpr_schema: cpr_schema.clone(),
             },
+            Self::IntersectCorresponding {
+                operands,
+                correlation,
+                min_multiplicity,
+                cpr_schema,
+            } => Self::IntersectCorresponding {
+                operands: operands.clone(),
+                correlation: correlation.clone(),
+                min_multiplicity: *min_multiplicity,
+                cpr_schema: cpr_schema.clone(),
+            },
             Self::ErJoinChain { relations } => Self::ErJoinChain {
                 relations: relations.clone(),
             },
@@ -187,6 +216,12 @@ impl From<RelationalExpression<Resolved>> for RelationalExpression<Refined> {
                 panic!(
                     "INTERNAL ERROR: ER-join expression found in Resolved phase. \
                      Must be consumed by resolver."
+                )
+            }
+            RelationalExpression::IntersectCorresponding { .. } => {
+                panic!(
+                    "INTERNAL ERROR: IntersectCorresponding found in Resolved phase. \
+                     Only produced by the refiner."
                 )
             }
         }
@@ -272,6 +307,10 @@ pub enum Relation<Phase = Unresolved> {
         /// Only accessible in Resolved/Refined phases via PhaseBox.
         /// Used at SQL generation boundary; identifier.name (user-typed) used for error messages.
         canonical_name: PhaseBox<Option<SqlIdentifier>, Phase>,
+        /// Physical backend schema name for SQL generation (e.g., "_c" for logical namespace "c").
+        /// Resolved by the registry from the logical namespace_path.
+        /// Only accessible in Resolved/Refined phases via PhaseBox.
+        backend_schema: PhaseBox<Option<String>, Phase>,
         domain_spec: DomainSpec<Phase>,
         alias: Option<SqlIdentifier>,
         outer: bool,
@@ -320,6 +359,9 @@ pub enum Relation<Phase = Unresolved> {
         /// Namespace qualification for namespace-qualified TVFs / HO view invocations
         #[serde(skip_serializing_if = "Option::is_none", default)]
         namespace: Option<NamespacePath>,
+        /// Physical backend schema name for SQL generation.
+        /// Resolved by the registry from the logical namespace.
+        backend_schema: PhaseBox<Option<String>, Phase>,
         /// Grounding context for grounded HO view invocations (e.g., data::test^lib::ho.active_only)
         #[serde(skip_serializing_if = "Option::is_none", default)]
         grounding: Option<GroundedPath>,

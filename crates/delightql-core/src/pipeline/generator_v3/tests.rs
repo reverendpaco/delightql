@@ -5,8 +5,8 @@
 
 use crate::pipeline::ast_refined::LiteralValue;
 use crate::pipeline::generator_v3::{SqlDialect, SqlGenerator};
+use crate::pipeline::sql_ast_v3::ColumnQualifier;
 use crate::pipeline::sql_ast_v3::*;
-use crate::pipeline::transformer_v3::QualifierMint;
 
 #[test]
 fn test_simple_select_star() {
@@ -67,11 +67,11 @@ fn test_qualified_columns() {
     // Build: SELECT u.id, u.name FROM users AS u
     let select = SelectStatement::builder()
         .select(SelectItem::expression(DomainExpression::with_qualifier(
-            ColumnQualifier::table("u", &QualifierMint::for_test()),
+            ColumnQualifier::table("u"),
             "id",
         )))
         .select(SelectItem::expression(DomainExpression::with_qualifier(
-            ColumnQualifier::table("u", &QualifierMint::for_test()),
+            ColumnQualifier::table("u"),
             "name",
         )))
         .from_table_with_alias("users", "u")
@@ -182,20 +182,14 @@ fn test_inner_join() {
         TableExpression::table_with_alias("users", "u"),
         TableExpression::table_with_alias("orders", "o"),
         DomainExpression::eq(
-            DomainExpression::with_qualifier(
-                ColumnQualifier::table("u", &QualifierMint::for_test()),
-                "id",
-            ),
-            DomainExpression::with_qualifier(
-                ColumnQualifier::table("o", &QualifierMint::for_test()),
-                "user_id",
-            ),
+            DomainExpression::with_qualifier(ColumnQualifier::table("u"), "id"),
+            DomainExpression::with_qualifier(ColumnQualifier::table("o"), "user_id"),
         ),
     );
 
     let select = SelectStatement::builder()
-        .select(SelectItem::qualified_star("u"))
-        .select(SelectItem::qualified_star("o"))
+        .select(SelectItem::qualified_star(ColumnQualifier::table("u")))
+        .select(SelectItem::qualified_star(ColumnQualifier::table("o")))
         .from_tables(vec![join])
         .build()
         .unwrap();

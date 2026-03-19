@@ -16,6 +16,7 @@ use std::collections::HashMap;
 pub(super) fn rebuild_setop_segment(
     analyzed: AnalyzedSegment,
     mut op_predicates: HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
+    min_multiplicity: bool,
 ) -> Result<refined::RelationalExpression> {
     // Handle simple cases first
     if analyzed.operators.is_empty() {
@@ -94,15 +95,24 @@ pub(super) fn rebuild_setop_segment(
             None
         };
 
-        // Build flat N-way SetOperation
+        // Emit IntersectCorresponding when correlation is present,
+        // otherwise plain SetOperation.
         let cpr_schema = compute_setop_schema(final_operator, &final_operands);
-        result = Some(refined::RelationalExpression::SetOperation {
-            operator: final_operator,
-            operands: final_operands,
-            correlation: <PhaseBox<Option<refined::BooleanExpression>, Refined>>::with_correlation(
-                correlation,
-            ),
-            cpr_schema,
+        result = Some(if let Some(corr) = correlation {
+            refined::RelationalExpression::IntersectCorresponding {
+                operands: final_operands,
+                correlation: corr,
+                min_multiplicity,
+                cpr_schema,
+            }
+        } else {
+            refined::RelationalExpression::SetOperation {
+                operator: final_operator,
+                operands: final_operands,
+                correlation:
+                    <PhaseBox<Option<refined::BooleanExpression>, Refined>>::with_correlation(None),
+                cpr_schema,
+            }
         });
     } else {
         // Single operator - use existing logic
@@ -163,16 +173,25 @@ pub(super) fn rebuild_setop_segment(
             }
         };
 
-        // Build the set operation with proper schema
+        // Emit IntersectCorresponding when correlation is present,
+        // otherwise plain SetOperation.
         let cpr_schema = compute_setop_schema(final_operator, &final_operands);
 
-        result = Some(refined::RelationalExpression::SetOperation {
-            operator: final_operator,
-            operands: final_operands,
-            correlation: <PhaseBox<Option<refined::BooleanExpression>, Refined>>::with_correlation(
-                correlation,
-            ),
-            cpr_schema,
+        result = Some(if let Some(corr) = correlation {
+            refined::RelationalExpression::IntersectCorresponding {
+                operands: final_operands,
+                correlation: corr,
+                min_multiplicity,
+                cpr_schema,
+            }
+        } else {
+            refined::RelationalExpression::SetOperation {
+                operator: final_operator,
+                operands: final_operands,
+                correlation:
+                    <PhaseBox<Option<refined::BooleanExpression>, Refined>>::with_correlation(None),
+                cpr_schema,
+            }
         });
     }
 
@@ -305,12 +324,9 @@ pub(super) fn build_projections_for_operand(
             });
         } else {
             // Project NULL with alias for missing column
-            projections.push(refined::DomainExpression::Lvar {
-                name: "__NULL__".into(),
-                qualifier: None,
-                namespace_path: NamespacePath::empty(),
+            projections.push(refined::DomainExpression::Literal {
+                value: crate::pipeline::asts::core::literals::LiteralValue::Null,
                 alias: Some(col_name.clone().into()),
-                provenance: crate::pipeline::asts::refined::PhaseBox::new(None),
             });
         }
     }

@@ -33,6 +33,7 @@ pub struct FlatSegment {
 pub struct FlatTable {
     pub identifier: QualifiedName,
     pub canonical_name: Option<SqlIdentifier>,
+    pub backend_schema: Option<String>,
     pub alias: Option<String>,
     pub position: usize,
     pub _scope_id: usize,                  // Which operator introduces it
@@ -67,6 +68,7 @@ pub struct TvfData {
     pub arguments: Vec<String>,
     pub domain_spec: resolved::DomainSpec,
     pub namespace: Option<crate::pipeline::asts::core::metadata::NamespacePath>,
+    pub backend_schema: Option<String>,
     pub grounding: Option<crate::pipeline::asts::core::metadata::GroundedPath>,
 }
 

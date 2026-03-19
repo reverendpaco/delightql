@@ -519,6 +519,42 @@ impl PhaseBox<Option<String>, Resolved> {
     pub fn get(&self) -> &Option<String> {
         &self.data
     }
+
+    /// Transitions to Refined phase.
+    pub fn into_refined(self) -> PhaseBox<Option<String>, Refined> {
+        PhaseBox {
+            data: self.data,
+            _phase: PhantomData,
+        }
+    }
+}
+
+// Option<String>: Resolved → Refined
+impl From<PhaseBox<Option<String>, Resolved>> for PhaseBox<Option<String>, Refined> {
+    fn from(resolved: PhaseBox<Option<String>, Resolved>) -> Self {
+        resolved.into_refined()
+    }
+}
+
+// Option<String>: Refined phase access + conversion
+impl PhaseBox<Option<String>, Refined> {
+    pub fn get(&self) -> &Option<String> {
+        &self.data
+    }
+
+    pub fn into_addressed(self) -> PhaseBox<Option<String>, Addressed> {
+        PhaseBox {
+            data: self.data,
+            _phase: PhantomData,
+        }
+    }
+}
+
+// Option<String>: Refined → Addressed
+impl From<PhaseBox<Option<String>, Refined>> for PhaseBox<Option<String>, Addressed> {
+    fn from(refined: PhaseBox<Option<String>, Refined>) -> Self {
+        refined.into_addressed()
+    }
 }
 
 // Implement Default for deserialization support

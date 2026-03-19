@@ -30,7 +30,7 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
 
             let candidates = if let Some(qual) = &ordinal.qualifier {
                 available.iter()
-                    .filter(|col| matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual))
+                    .filter(|col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual))
                     .collect::<Vec<_>>()
             } else {
                 available.iter().collect::<Vec<_>>()
@@ -83,7 +83,7 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
             Ok(ast_resolved::DomainExpression::Lvar {
                 name: name.into(),
                 qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(|| {
-                    match &column.fq_table.name {
+                    match &column.table_name {
                         ast_resolved::TableName::Named(t) => Some(t.clone().into()),
                         _ => None,
                     }
@@ -230,7 +230,7 @@ fn resolve_lvar(
     } else {
         // In correlation, qualified - validate only if qualifier is in available
         let qual_name = qualifier.as_ref().unwrap();
-        let qualifier_known = available.iter().any(|col| match &col.fq_table.name {
+        let qualifier_known = available.iter().any(|col| match &col.table_name {
             ast_resolved::TableName::Named(t) => t == qual_name,
             ast_resolved::TableName::Fresh => false,
         });
@@ -242,7 +242,7 @@ fn resolve_lvar(
             // the resolver doesn't track; let it through for SQL-level resolution.
             let col_under_named = available.iter().any(|col| {
                 col.info.original_name() == Some(&name)
-                    && matches!(col.fq_table.name, ast_resolved::TableName::Named(_))
+                    && matches!(col.table_name, ast_resolved::TableName::Named(_))
             });
             if col_under_named {
                 return Err(DelightQLError::ColumnNotFoundError {
@@ -263,24 +263,44 @@ fn resolve_lvar(
 
         let schema = namespace_path.first().map(|s| s.to_string());
 
-        // Detect post-pipe context: all available columns are Fresh.
-        // After a pipe boundary, qualifiers referring to the original table are stale
-        // and must be rejected. In other contexts (joins, subqueries), qualifiers may
-        // not match the resolver's internal table names but are valid at SQL level,
-        // so we preserve the lenient strip-and-validate behavior.
-        let all_fresh = qualifier.is_some()
+        // Stale post-pipe qualifier detection (two cases):
+        // 1. All columns are Fresh (pure pipe context) — any non-"_" qualifier is stale.
+        // 2. Mixed context (both Fresh and Named columns, e.g. pipe result joined
+        //    with a named table) — a qualifier that doesn't match any Named table
+        //    but resolves to a Fresh column is stale.
+        // Case 2 does NOT apply when all columns are Fresh (pure anonymous table
+        // context), because there qualifiers are aliases that resolve at SQL level.
+        let has_qualifier = qualifier.is_some()
             && qualifier.as_ref().unwrap() != "_"
-            && !available.is_empty()
+            && !available.is_empty();
+
+        let all_fresh = has_qualifier
             && available
                 .iter()
-                .all(|col| matches!(col.fq_table.name, ast_resolved::TableName::Fresh));
+                .all(|col| matches!(col.table_name, ast_resolved::TableName::Fresh));
 
-        if all_fresh {
-            // Post-pipe context: qualifier is definitely stale.
+        let mixed_stale = if has_qualifier && !all_fresh {
+            let has_named = available.iter().any(|col| {
+                matches!(&col.table_name, ast_resolved::TableName::Named(_))
+            });
+            let has_fresh = available.iter().any(|col| {
+                matches!(col.table_name, ast_resolved::TableName::Fresh)
+            });
+            let qualifier_matches_named = available.iter().any(|col| {
+                matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qualifier.as_ref().unwrap().as_str())
+            });
+            has_named && has_fresh && !qualifier_matches_named
+        } else {
+            false
+        };
+
+        if all_fresh || mixed_stale {
+            // Qualifier doesn't match any named table. Check if the column
+            // exists under a Fresh table — if so, it's a stale post-pipe ref.
             let unqual_ref = ColumnReference::Named {
                 name: name.clone(),
                 qualifier: None,
-                schema,
+                schema: schema.clone(),
             };
             let result = unify_columns(vec![unqual_ref], available)
                 .into_iter()
@@ -288,8 +308,24 @@ fn resolve_lvar(
                 .unwrap();
 
             match result {
-                UnificationResult::Resolved(_) | UnificationResult::Ambiguous { .. } => {
-                    // Column exists but qualifier is stale after pipe boundary
+                UnificationResult::Resolved(ref col)
+                    if matches!(col.table_name, ast_resolved::TableName::Fresh) =>
+                {
+                    return Err(DelightQLError::ColumnNotFoundError {
+                        column: format!("{}.{}", qualifier.as_ref().unwrap(), name),
+                        context: format!(
+                            "Qualifier '{}' is not in scope after pipe boundary. Use unqualified '{}'",
+                            qualifier.as_ref().unwrap(),
+                            name
+                        ),
+                    });
+                }
+                UnificationResult::Resolved(_) => {
+                    // Column resolved to a Named table — qualifier is just wrong,
+                    // not a pipe-scope issue. Fall through to normal validation.
+                }
+                UnificationResult::Ambiguous { .. } => {
+                    // Multiple matches including Fresh — stale qualifier
                     return Err(DelightQLError::ColumnNotFoundError {
                         column: format!("{}.{}", qualifier.as_ref().unwrap(), name),
                         context: format!(
@@ -306,9 +342,11 @@ fn resolve_lvar(
                     ));
                 }
             }
-        } else {
-            // Non-pipe context or unqualified: validate column name exists,
-            // stripping qualifier (existing lenient behavior).
+        }
+
+        // Non-pipe context or unqualified: validate column name exists,
+        // stripping qualifier (existing lenient behavior).
+        {
             let col_ref = ColumnReference::Named {
                 name: name.clone(),
                 qualifier: None,

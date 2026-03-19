@@ -123,6 +123,9 @@ fn walk_relational(expr: &RelationalExpression, refs: &mut Vec<ExtractedReferenc
             walk_relational(left, refs);
             walk_relational(right, refs);
         }
+        RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 

@@ -70,6 +70,7 @@ pub fn resolve_entity_with_alias(
             name: actual_name.clone().into(),
             canonical_name: None, // CTEs don't have canonical names from bootstrap
             resolved_namespace: None,
+            backend_schema: None,
             entity_type: EntityType::Relation,
             registry_source: RegistrySource::QueryLocal,
             schema_source: SchemaSource::SelectClause,
@@ -112,13 +113,19 @@ pub fn resolve_entity_with_alias(
                     .database
                     .lookup_table_with_namespace(&core_namespace_path, &actual_name)
                 {
-                    Ok(Some((table_schema, connection_id, _registry_canonical))) => {
+                    Ok(Some((
+                        table_schema,
+                        connection_id,
+                        _registry_canonical,
+                        backend_schema_opt,
+                    ))) => {
                         // Track connection_id for cross-connection join validation
                         registry.track_connection_id(connection_id);
                         return ResolutionResult::DatabaseEntity(EntityInfo {
                             name: actual_name.clone().into(),
                             canonical_name: Some(canonical_name),
                             resolved_namespace: Some(core_namespace_path.clone()),
+                            backend_schema: backend_schema_opt,
                             entity_type: EntityType::Relation,
                             registry_source: RegistrySource::Database,
                             schema_source: SchemaSource::DatabaseCatalog,
@@ -167,6 +174,7 @@ pub fn resolve_entity_with_alias(
                             name: actual_name.clone().into(),
                             canonical_name: None, // No canonical name available in fallback path
                             resolved_namespace: None,
+                            backend_schema: None,
                             entity_type: EntityType::Relation,
                             registry_source: RegistrySource::Database,
                             schema_source: SchemaSource::DatabaseCatalog,
@@ -195,6 +203,7 @@ pub fn resolve_entity_with_alias(
                 name: actual_name.clone().into(),
                 canonical_name: None, // No system, no canonical name
                 resolved_namespace: None,
+                backend_schema: None,
                 entity_type: EntityType::Relation,
                 registry_source: RegistrySource::Database,
                 schema_source: SchemaSource::DatabaseCatalog,

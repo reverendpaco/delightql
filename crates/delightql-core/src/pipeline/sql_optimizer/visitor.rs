@@ -80,6 +80,7 @@ pub fn apply_transformer<T: QueryTransformer>(
 }
 
 /// Recursively transform a query expression
+#[stacksafe::stacksafe]
 fn transform_query<T: QueryTransformer>(
     query: QueryExpression,
     transformer: &mut T,

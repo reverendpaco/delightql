@@ -687,7 +687,6 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
     let cst_tree = CstTree::new(tree, source);
     let root = cst_tree.root();
 
-
     let mut definitions = Vec::new();
     let mut query_statements = Vec::new();
     let mut inline_ddl_blocks = Vec::new();

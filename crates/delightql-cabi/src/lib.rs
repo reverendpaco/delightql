@@ -228,9 +228,11 @@ pub unsafe extern "C" fn dql_query(
     let mut col_infos: Vec<DqlColumnInfo> = Vec::with_capacity(num_columns);
     for col in &result.columns {
         let name = CString::new(col.name.as_str()).unwrap_or_default();
+        let type_name = CString::new(col.descriptor.as_str()).unwrap_or_default();
         col_infos.push(DqlColumnInfo {
             name: name.into_raw(),
             position: col.position,
+            type_name: type_name.into_raw(),
         });
     }
 
@@ -466,6 +468,9 @@ pub unsafe extern "C" fn dql_free_query_result(result: *mut DqlQueryResult) {
         for col in columns {
             if !col.name.is_null() {
                 let _ = CString::from_raw(col.name);
+            }
+            if !col.type_name.is_null() {
+                let _ = CString::from_raw(col.type_name);
             }
         }
     }

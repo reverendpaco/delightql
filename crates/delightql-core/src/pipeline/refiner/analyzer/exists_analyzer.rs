@@ -106,6 +106,10 @@ fn extract_table_references_from_exists(
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before EXISTS analysis")
         }
+        // IntersectCorresponding is produced by the refiner, not present in resolved phase
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 

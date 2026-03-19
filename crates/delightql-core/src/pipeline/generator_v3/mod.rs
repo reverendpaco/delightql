@@ -10,6 +10,9 @@
 // 3. Proper formatting - indentation for readability
 // 4. Safety - quote identifiers when needed
 
+use std::sync::Arc;
+
+use crate::bin_cartridge::registry::BinCartridgeRegistry;
 use crate::pipeline::sql_ast_v3::*;
 use std::fmt::Write;
 
@@ -27,6 +30,9 @@ pub use errors::GeneratorError;
 /// The main SQL generator
 pub struct SqlGenerator {
     config: GeneratorConfig,
+    /// Bin cartridge registry for resolving rewrite-rule predicates.
+    /// None for standalone/utility generation paths.
+    bin_registry: Option<Arc<BinCartridgeRegistry>>,
 }
 
 impl Default for SqlGenerator {
@@ -39,6 +45,7 @@ impl SqlGenerator {
     pub fn new() -> Self {
         SqlGenerator {
             config: GeneratorConfig::default(),
+            bin_registry: None,
         }
     }
 
@@ -48,7 +55,13 @@ impl SqlGenerator {
                 dialect,
                 ..Default::default()
             },
+            bin_registry: None,
         }
+    }
+
+    pub fn with_bin_registry(mut self, registry: Arc<BinCartridgeRegistry>) -> Self {
+        self.bin_registry = Some(registry);
+        self
     }
 
     /// Render a SQL-layer domain expression to a string.
@@ -498,7 +511,7 @@ impl SqlGenerator {
                 sql.push('*');
             }
             SelectItem::QualifiedStar { qualifier } => {
-                identifiers::write_identifier(sql, qualifier, self.config.dialect)?;
+                self.generate_column_qualifier(sql, qualifier)?;
                 sql.push_str(".*");
             }
             SelectItem::Expression { expr, alias } => {
@@ -673,7 +686,19 @@ impl SqlGenerator {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    sql.push_str(&arg.to_sql());
+                    match arg {
+                        TvfArgument::ColumnRef { qualifier, column } => {
+                            self.generate_column_qualifier(sql, qualifier)?;
+                            sql.push('.');
+                            identifiers::write_identifier(sql, column, self.config.dialect)?;
+                        }
+                        TvfArgument::QualifiedRef { qualifier, column } => {
+                            identifiers::write_identifier(sql, qualifier, self.config.dialect)?;
+                            sql.push('.');
+                            identifiers::write_identifier(sql, column, self.config.dialect)?;
+                        }
+                        _ => sql.push_str(&arg.to_sql()),
+                    }
                 }
 
                 sql.push(')');
@@ -905,11 +930,78 @@ impl SqlGenerator {
                 self.generate_query_expression(sql, query, 0)?;
                 sql.push(')');
             }
+            DomainExpression::Tuple(elements) => {
+                sql.push('(');
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    self.generate_domain_expression(sql, elem)?;
+                }
+                sql.push(')');
+            }
             DomainExpression::RawSql(raw) => {
                 // EPOCH 7: Inject raw SQL for melt packets
                 sql.push_str(raw);
             }
+            DomainExpression::PredicateRewrite {
+                name,
+                args,
+                negated,
+            } => {
+                self.generate_predicate_rewrite(sql, name, args, *negated)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Generate SQL for a predicate rewrite call by consulting the bin_registry.
+    fn generate_predicate_rewrite(
+        &self,
+        sql: &mut String,
+        name: &str,
+        args: &[DomainExpression],
+        negated: bool,
+    ) -> Result<(), GeneratorError> {
+        let registry = self.bin_registry.as_ref().ok_or_else(|| {
+            GeneratorError::Error(format!(
+                "PredicateRewrite '{}' but no bin_registry available",
+                name
+            ))
+        })?;
+
+        let entity = registry.lookup_entity(name).ok_or_else(|| {
+            GeneratorError::Error(format!("Unknown predicate rewrite: '{}'", name))
+        })?;
+
+        let sql_gen = entity.as_sql_generatable().ok_or_else(|| {
+            GeneratorError::Error(format!(
+                "Entity '{}' does not implement SqlGeneratable",
+                name
+            ))
+        })?;
+
+        let render_fn = |expr: &DomainExpression| -> String {
+            let mut s = String::new();
+            // Use a fresh generator (same config) to avoid borrow issues
+            let gen = SqlGenerator {
+                config: self.config.clone(),
+                bin_registry: None,
+            };
+            gen.generate_domain_expression(&mut s, expr).unwrap();
+            s
+        };
+
+        let gen_context = crate::bin_cartridge::GeneratorContext {
+            _dialect: self.config.dialect,
+            render_expr: &render_fn,
+        };
+
+        let sql_string = sql_gen
+            .generate_sql(args, &gen_context, negated)
+            .map_err(|e| GeneratorError::Typed(e))?;
+
+        sql.push_str(&sql_string);
         Ok(())
     }
 

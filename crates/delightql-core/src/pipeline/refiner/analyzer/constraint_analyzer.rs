@@ -259,5 +259,9 @@ fn extract_using_columns_from_pipe(expr: &resolved::RelationalExpression) -> Opt
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before constraint analysis")
         }
+        // IntersectCorresponding is produced by the refiner, not present in resolved phase
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }

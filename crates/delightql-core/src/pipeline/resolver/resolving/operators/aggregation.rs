@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::pipeline::asts::unresolved::NamespacePath;
+
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
@@ -521,13 +521,7 @@ pub(super) fn resolve_modulo_via_fold(
                             let col_name = value.to_lowercase();
                             output.push(ast_resolved::ColumnMetadata::new_with_name_flag(
                                 ast_resolved::ColumnProvenance::from_column(col_name),
-                                ast_resolved::FqTable {
-                                    parents_path: NamespacePath::empty(),
-                                    name: ast_resolved::TableName::Fresh,
-                                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(
-                                        None,
-                                    ),
-                                },
+                                ast_resolved::TableName::Fresh,
                                 None,
                                 true,
                             ));

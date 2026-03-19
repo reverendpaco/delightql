@@ -2,14 +2,115 @@
 //!
 //! This module contains pure conversion functions that transform unresolved AST nodes
 //! to their resolved counterparts. These are used during the resolution process.
+//!
+//! The core conversion logic is provided by `PhaseConverter`, a no-op `AstTransform`
+//! implementor that uses the default walk functions for Unresolved → Resolved phase
+//! conversion, overriding only the variants that need special handling.
 
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_resolved::{Resolved, StringTemplatePart};
+use crate::pipeline::ast_transform::{walk_transform_boolean, walk_transform_domain, AstTransform};
 use crate::pipeline::ast_unresolved;
-use crate::pipeline::asts::core::{ProjectionExpr, SubstitutionExpr};
+use crate::pipeline::asts::core::{BooleanExpression, DomainExpression, Unresolved};
 
 use super::string_templates::build_concat_chain_as_function;
+
+/// No-op phase converter: Unresolved → Resolved using AstTransform's default walks.
+/// Overrides only the variants that need special handling (ColumnOrdinal placeholder,
+/// ScalarSubquery panic, InnerExists/InRelational placeholders).
+struct PhaseConverter;
+
+impl AstTransform<Unresolved, Resolved> for PhaseConverter {
+    fn transform_domain(
+        &mut self,
+        expr: DomainExpression<Unresolved>,
+    ) -> Result<DomainExpression<Resolved>> {
+        match expr {
+            DomainExpression::ColumnOrdinal(_) => {
+                // Column ordinals should be resolved to actual column references
+                // For now, return a placeholder
+                Ok(DomainExpression::NonUnifiyingUnderscore)
+            }
+            DomainExpression::ScalarSubquery { .. } => {
+                // This is a bug - ScalarSubquery should only appear in projections (column_spec),
+                // never in positional patterns (domain_spec). The grammar and builder should prevent this.
+                unreachable!("BUG: ScalarSubquery found in positional pattern context. This should be impossible - ScalarSubquery is only valid in projections.")
+            }
+            other => walk_transform_domain(self, other),
+        }
+    }
+
+    fn transform_boolean(
+        &mut self,
+        expr: BooleanExpression<Unresolved>,
+    ) -> Result<BooleanExpression<Resolved>> {
+        match expr {
+            BooleanExpression::InnerExists {
+                exists,
+                identifier,
+                subquery: _,
+                alias,
+                using_columns,
+            } => {
+                // For InnerExists, we'd need to convert the subquery recursively
+                // For now, just preserve the structure with a placeholder
+                Ok(BooleanExpression::InnerExists {
+                    exists,
+                    identifier: identifier.clone(),
+                    subquery: Box::new(ast_resolved::RelationalExpression::Relation(
+                        ast_resolved::Relation::Ground {
+                            identifier: identifier.clone(),
+                            canonical_name: ast_resolved::PhaseBox::new(None),
+                            backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
+                            domain_spec: ast_resolved::DomainSpec::Glob,
+                            alias: alias.clone().map(|s| s.into()),
+                            outer: false,
+                            mutation_target: false,
+                            passthrough: false,
+                            cpr_schema: ast_resolved::PhaseBox::new(
+                                ast_resolved::CprSchema::Unknown,
+                            ),
+                            hygienic_injections: Vec::new(),
+                        },
+                    )),
+                    alias,
+                    using_columns,
+                })
+            }
+            BooleanExpression::InRelational {
+                value,
+                identifier,
+                negated,
+                subquery: _,
+            } => {
+                // Placeholder — same approach as InnerExists above
+                Ok(BooleanExpression::InRelational {
+                    value: Box::new(self.transform_domain(*value)?),
+                    subquery: Box::new(ast_resolved::RelationalExpression::Relation(
+                        ast_resolved::Relation::Ground {
+                            identifier: identifier.clone(),
+                            canonical_name: ast_resolved::PhaseBox::new(None),
+                            backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
+                            domain_spec: ast_resolved::DomainSpec::Glob,
+                            alias: None,
+                            outer: false,
+                            mutation_target: false,
+                            passthrough: false,
+                            cpr_schema: ast_resolved::PhaseBox::new(
+                                ast_resolved::CprSchema::Unknown,
+                            ),
+                            hygienic_injections: Vec::new(),
+                        },
+                    )),
+                    identifier,
+                    negated,
+                })
+            }
+            other => walk_transform_boolean(self, other),
+        }
+    }
+}
 
 /// Helper function to preserve domain_spec from unresolved to resolved
 pub(super) fn preserve_domain_spec(
@@ -27,7 +128,7 @@ pub(super) fn preserve_domain_spec(
         ast_unresolved::DomainSpec::Positional(exprs) => {
             let resolved_exprs = exprs
                 .iter()
-                .map(|e| convert_domain_expression(e))
+                .map(|e| PhaseConverter.transform_domain(e.clone()))
                 .collect::<Result<Vec<_>>>()?;
             Ok(ast_resolved::DomainSpec::Positional(resolved_exprs))
         }
@@ -38,143 +139,25 @@ pub(super) fn preserve_domain_spec(
 pub(super) fn convert_domain_expression(
     expr: &ast_unresolved::DomainExpression,
 ) -> Result<ast_resolved::DomainExpression> {
-    match expr {
-        ast_unresolved::DomainExpression::Lvar {
-            name,
-            qualifier,
-            namespace_path,
-            alias,
-            provenance: _,
-        } => Ok(ast_resolved::DomainExpression::Lvar {
-            name: name.clone(),
-            qualifier: qualifier.clone(),
-            namespace_path: namespace_path.clone(),
-            alias: alias.clone(),
-            provenance: ast_resolved::PhaseBox::phantom(),
-        }),
-        ast_unresolved::DomainExpression::Literal { value, alias } => {
-            Ok(ast_resolved::DomainExpression::Literal {
-                value: value.clone(),
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::Projection(ref proj) => match proj {
-            ProjectionExpr::Glob {
-                qualifier,
-                namespace_path,
-            } => Ok(ast_resolved::DomainExpression::Projection(
-                ProjectionExpr::Glob {
-                    qualifier: qualifier.clone(),
-                    namespace_path: namespace_path.clone(),
-                },
-            )),
-            ProjectionExpr::Pattern { pattern, alias } => Ok(
-                ast_resolved::DomainExpression::Projection(ProjectionExpr::Pattern {
-                    pattern: pattern.clone(),
-                    alias: alias.clone(),
-                }),
-            ),
-            ProjectionExpr::ColumnRange(_) => {
-                // Column ranges should be expanded to multiple columns
-                // For now, return a placeholder
-                Ok(ast_resolved::DomainExpression::NonUnifiyingUnderscore)
-            }
-            ProjectionExpr::JsonPathLiteral {
-                segments,
-                root_is_array,
-                alias,
-            } => Ok(ast_resolved::DomainExpression::Projection(
-                ProjectionExpr::JsonPathLiteral {
-                    segments: segments.clone(),
-                    root_is_array: *root_is_array,
-                    alias: alias.clone(),
-                },
-            )),
-        },
-        ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
-            Ok(ast_resolved::DomainExpression::NonUnifiyingUnderscore)
-        }
-        ast_unresolved::DomainExpression::Function(f) => Ok(
-            ast_resolved::DomainExpression::Function(convert_function_expression(f)?),
-        ),
-        ast_unresolved::DomainExpression::Predicate { expr, alias } => {
-            Ok(ast_resolved::DomainExpression::Predicate {
-                expr: Box::new(convert_boolean_expression(expr)?),
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::ColumnOrdinal(_) => {
-            // Column ordinals should be resolved to actual column references
-            // For now, return a placeholder
-            Ok(ast_resolved::DomainExpression::NonUnifiyingUnderscore)
-        }
-        ast_unresolved::DomainExpression::ValuePlaceholder { alias } => {
-            Ok(ast_resolved::DomainExpression::ValuePlaceholder {
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::Substitution(ref sub) => match sub {
-            SubstitutionExpr::Parameter { .. }
-            | SubstitutionExpr::CurriedParameter { .. }
-            | SubstitutionExpr::ContextMarker => {
-                Ok(ast_resolved::DomainExpression::Substitution(sub.clone()))
-            }
-            SubstitutionExpr::ContextParameter { .. } => {
-                // ContextParameter should never exist in unresolved phase - it's only created during
-                // postprocessing in refined phase for CCAFE feature
-                unreachable!("ContextParameter should not appear in unresolved phase")
-            }
-        },
-        ast_unresolved::DomainExpression::PipedExpression {
-            value,
-            transforms,
-            alias,
-        } => Ok(ast_resolved::DomainExpression::PipedExpression {
-            value: Box::new(convert_domain_expression(value)?),
-            transforms: transforms
-                .iter()
-                .map(|t| convert_function_expression(t))
-                .collect::<Result<Vec<_>>>()?,
-            alias: alias.clone(),
-        }),
-        ast_unresolved::DomainExpression::ScalarSubquery { .. } => {
-            // This is a bug - ScalarSubquery should only appear in projections (column_spec),
-            // never in positional patterns (domain_spec). The grammar and builder should prevent this.
-            unreachable!("BUG: ScalarSubquery found in positional pattern context. This should be impossible - ScalarSubquery is only valid in projections.")
-        }
-        ast_unresolved::DomainExpression::Parenthesized { inner, alias } => {
-            Ok(ast_resolved::DomainExpression::Parenthesized {
-                inner: Box::new(convert_domain_expression(inner)?),
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::Tuple { elements, alias } => {
-            Ok(ast_resolved::DomainExpression::Tuple {
-                elements: elements
-                    .iter()
-                    .map(|e| convert_domain_expression(e))
-                    .collect::<Result<Vec<_>>>()?,
-                alias: alias.clone(),
-            })
-        }
-
-        // Pivot: convert both children
-        ast_unresolved::DomainExpression::PivotOf {
-            value_column,
-            pivot_key,
-            pivot_values,
-        } => Ok(ast_resolved::DomainExpression::PivotOf {
-            value_column: Box::new(convert_domain_expression(value_column)?),
-            pivot_key: Box::new(convert_domain_expression(pivot_key)?),
-            pivot_values: pivot_values.clone(),
-        }),
-    }
+    PhaseConverter.transform_domain(expr.clone())
 }
 
-/// Helper to convert function expressions
-pub(super) fn convert_function_expression(
+/// Generic helper to convert FunctionExpression variants from unresolved to resolved,
+/// parameterized by the domain expression and boolean expression converters.
+///
+/// Both `convert_function_expression` (type_conversion) and `convert_unresolved_function`
+/// (pattern_resolver) share identical match-arm structure — they differ only in which
+/// domain/boolean converter they call for recursion. This generic helper captures that
+/// shared structure once.
+pub(super) fn convert_function_expression_generic<F, B>(
     func: &ast_unresolved::FunctionExpression,
-) -> Result<ast_resolved::FunctionExpression> {
+    convert_domain: &mut F,
+    convert_bool: &mut B,
+) -> Result<ast_resolved::FunctionExpression>
+where
+    F: FnMut(&ast_unresolved::DomainExpression) -> Result<ast_resolved::DomainExpression>,
+    B: FnMut(&ast_unresolved::BooleanExpression) -> Result<ast_resolved::BooleanExpression>,
+{
     match func {
         ast_unresolved::FunctionExpression::Regular {
             name,
@@ -187,12 +170,12 @@ pub(super) fn convert_function_expression(
             namespace: namespace.clone(),
             arguments: arguments
                 .iter()
-                .map(|a| convert_domain_expression(a))
+                .map(|a| convert_domain(a))
                 .collect::<Result<Vec<_>>>()?,
             alias: alias.clone(),
             conditioned_on: conditioned_on
                 .as_ref()
-                .map(|cond| convert_boolean_expression(cond.as_ref()).map(Box::new))
+                .map(|cond| convert_bool(cond.as_ref()).map(Box::new))
                 .transpose()?,
         }),
         ast_unresolved::FunctionExpression::Curried {
@@ -205,18 +188,18 @@ pub(super) fn convert_function_expression(
             namespace: namespace.clone(),
             arguments: arguments
                 .iter()
-                .map(|a| convert_domain_expression(a))
+                .map(|a| convert_domain(a))
                 .collect::<Result<Vec<_>>>()?,
             conditioned_on: conditioned_on
                 .as_ref()
-                .map(|cond| convert_boolean_expression(cond.as_ref()).map(Box::new))
+                .map(|cond| convert_bool(cond.as_ref()).map(Box::new))
                 .transpose()?,
         }),
         ast_unresolved::FunctionExpression::Bracket { arguments, alias } => {
             Ok(ast_resolved::FunctionExpression::Bracket {
                 arguments: arguments
                     .iter()
-                    .map(|a| convert_domain_expression(a))
+                    .map(|a| convert_domain(a))
                     .collect::<Result<Vec<_>>>()?,
                 alias: alias.clone(),
             })
@@ -228,46 +211,38 @@ pub(super) fn convert_function_expression(
             alias,
         } => Ok(ast_resolved::FunctionExpression::Infix {
             operator: operator.clone(),
-            left: Box::new(convert_domain_expression(left)?),
-            right: Box::new(convert_domain_expression(right)?),
+            left: Box::new(convert_domain(left)?),
+            right: Box::new(convert_domain(right)?),
             alias: alias.clone(),
         }),
         ast_unresolved::FunctionExpression::Lambda { body, alias } => {
             Ok(ast_resolved::FunctionExpression::Lambda {
-                body: Box::new(convert_domain_expression(body)?),
+                body: Box::new(convert_domain(body)?),
                 alias: alias.clone(),
             })
         }
         ast_unresolved::FunctionExpression::StringTemplate { parts, alias } => {
-            // Expand StringTemplate to concat expression right here
-            // This is a simplified conversion path for anonymous table headers
-
-            // Convert parts to resolved parts
+            // Convert parts to resolved parts, then build concat chain
             let resolved_parts: Vec<StringTemplatePart<Resolved>> = parts
                 .iter()
                 .map(|part| match part {
                     ast_unresolved::StringTemplatePart::Text(text) => {
                         Ok(StringTemplatePart::Text(text.clone()))
                     }
-                    ast_unresolved::StringTemplatePart::Interpolation(expr) => {
-                        Ok(StringTemplatePart::Interpolation(Box::new(
-                            convert_domain_expression(expr)?,
-                        )))
-                    }
+                    ast_unresolved::StringTemplatePart::Interpolation(expr) => Ok(
+                        StringTemplatePart::Interpolation(Box::new(convert_domain(expr)?)),
+                    ),
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // Build concat chain from parts
             Ok(build_concat_chain_as_function(
                 resolved_parts,
                 alias.clone(),
             ))
         }
-        ast_unresolved::FunctionExpression::CaseExpression { .. } => {
-            Err(DelightQLError::not_implemented(
-                "CASE expression in type conversion context (positional pattern)",
-            ))
-        }
+        ast_unresolved::FunctionExpression::CaseExpression { .. } => Err(
+            DelightQLError::not_implemented("CASE expression in function conversion context"),
+        ),
         ast_unresolved::FunctionExpression::HigherOrder {
             name,
             curried_arguments,
@@ -278,16 +253,16 @@ pub(super) fn convert_function_expression(
             name: name.clone(),
             curried_arguments: curried_arguments
                 .iter()
-                .map(|a| convert_domain_expression(a))
+                .map(|a| convert_domain(a))
                 .collect::<Result<Vec<_>>>()?,
             regular_arguments: regular_arguments
                 .iter()
-                .map(|a| convert_domain_expression(a))
+                .map(|a| convert_domain(a))
                 .collect::<Result<Vec<_>>>()?,
             alias: alias.clone(),
             conditioned_on: conditioned_on
                 .as_ref()
-                .map(|cond| convert_boolean_expression(cond.as_ref()).map(Box::new))
+                .map(|cond| convert_bool(cond.as_ref()).map(Box::new))
                 .transpose()?,
         }),
         ast_unresolved::FunctionExpression::Curly {
@@ -311,7 +286,7 @@ pub(super) fn convert_function_expression(
                     }),
                     unresolved::CurlyMember::Comparison { condition } => {
                         Ok(resolved::CurlyMember::Comparison {
-                            condition: Box::new(convert_boolean_expression(condition)?),
+                            condition: Box::new(convert_bool(condition)?),
                         })
                     }
                     unresolved::CurlyMember::KeyValue {
@@ -321,16 +296,14 @@ pub(super) fn convert_function_expression(
                     } => Ok(resolved::CurlyMember::KeyValue {
                         key: key.clone(),
                         nested_reduction: *nested_reduction,
-                        value: Box::new(convert_domain_expression(value)?),
+                        value: Box::new(convert_domain(value)?),
                     }),
-                    // PATH FIRST-CLASS: Epoch 5 - PathLiteral handling
                     unresolved::CurlyMember::PathLiteral { path, alias } => {
                         Ok(resolved::CurlyMember::PathLiteral {
-                            path: Box::new(convert_domain_expression(path)?),
+                            path: Box::new(convert_domain(path)?),
                             alias: alias.clone(),
                         })
                     }
-                    // TG-ERGONOMIC-INDUCTOR: Pass through - will be expanded in main resolver
                     unresolved::CurlyMember::Glob => Ok(resolved::CurlyMember::Glob),
                     unresolved::CurlyMember::Pattern { pattern } => {
                         Ok(resolved::CurlyMember::Pattern {
@@ -343,14 +316,13 @@ pub(super) fn convert_function_expression(
                             end: *end,
                         })
                     }
-                    // Placeholder passes through to resolved phase
                     unresolved::CurlyMember::Placeholder => Ok(resolved::CurlyMember::Placeholder),
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(ast_resolved::FunctionExpression::Curly {
                 members: resolved_members,
                 inner_grouping_keys: vec![],
-                cte_requirements: None, // Type conversion doesn't populate this
+                cte_requirements: None,
                 alias: alias.clone(),
             })
         }
@@ -366,7 +338,11 @@ pub(super) fn convert_function_expression(
             key_column: key_column.clone(),
             key_qualifier: key_qualifier.clone(),
             key_schema: key_schema.clone(),
-            constructor: Box::new(convert_function_expression(constructor)?),
+            constructor: Box::new(convert_function_expression_generic(
+                constructor,
+                convert_domain,
+                convert_bool,
+            )?),
             keys_only: *keys_only,
             cte_requirements: None,
             alias: alias.clone(),
@@ -382,187 +358,43 @@ pub(super) fn convert_function_expression(
             name: name.clone(),
             arguments: arguments
                 .iter()
-                .map(|a| convert_domain_expression(a))
+                .map(|a| convert_domain(a))
                 .collect::<Result<Vec<_>>>()?,
             partition_by: partition_by
                 .iter()
-                .map(|a| convert_domain_expression(a))
+                .map(|a| convert_domain(a))
                 .collect::<Result<Vec<_>>>()?,
             order_by: order_by
                 .iter()
                 .map(|spec| {
                     Ok(ast_resolved::OrderingSpec {
-                        column: convert_domain_expression(&spec.column)?,
+                        column: convert_domain(&spec.column)?,
                         direction: spec.direction.clone(),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
-            frame: None, // Frame bounds not converted in type conversion
+            frame: None,
             alias: alias.clone(),
         }),
         _ => Err(DelightQLError::not_implemented(
-            "JsonPath in type conversion context",
+            "JsonPath/Array in function conversion context",
         )),
     }
 }
 
-/// Helper to convert boolean expressions (simplified)
+/// Helper to convert function expressions (type_conversion path).
+/// Delegates to PhaseConverter's AstTransform walk.
+pub(super) fn convert_function_expression(
+    func: &ast_unresolved::FunctionExpression,
+) -> Result<ast_resolved::FunctionExpression> {
+    PhaseConverter.transform_function(func.clone())
+}
+
+/// Helper to convert boolean expressions
 pub(super) fn convert_boolean_expression(
     expr: &ast_unresolved::BooleanExpression,
 ) -> Result<ast_resolved::BooleanExpression> {
-    // This is a simplified conversion - for positional patterns we mainly need infix operations
-    match expr {
-        ast_unresolved::BooleanExpression::Comparison {
-            operator,
-            left,
-            right,
-        } => Ok(ast_resolved::BooleanExpression::Comparison {
-            operator: operator.clone(),
-            left: Box::new(convert_domain_expression(left)?),
-            right: Box::new(convert_domain_expression(right)?),
-        }),
-        ast_unresolved::BooleanExpression::Using { columns } => {
-            Ok(ast_resolved::BooleanExpression::Using {
-                columns: columns.clone(),
-            })
-        }
-        ast_unresolved::BooleanExpression::In {
-            value,
-            set,
-            negated,
-        } => Ok(ast_resolved::BooleanExpression::In {
-            value: Box::new(convert_domain_expression(value)?),
-            set: set
-                .iter()
-                .map(|e| convert_domain_expression(e))
-                .collect::<Result<Vec<_>>>()?,
-            negated: *negated,
-        }),
-        ast_unresolved::BooleanExpression::InnerExists {
-            exists,
-            identifier,
-            subquery: _,
-            alias,
-            using_columns,
-        } => {
-            // For InnerExists, we'd need to convert the subquery recursively
-            // For now, just preserve the structure with a placeholder
-            Ok(ast_resolved::BooleanExpression::InnerExists {
-                exists: *exists,
-                identifier: identifier.clone(),
-                subquery: Box::new(ast_resolved::RelationalExpression::Relation(
-                    ast_resolved::Relation::Ground {
-                        identifier: identifier.clone(),
-                        canonical_name: ast_resolved::PhaseBox::new(None),
-                        domain_spec: ast_resolved::DomainSpec::Glob,
-                        alias: alias.clone().map(|s| s.into()),
-                        outer: false,
-                        mutation_target: false,
-                        passthrough: false,
-                        cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Unknown),
-                        hygienic_injections: Vec::new(),
-                    },
-                )),
-                alias: alias.clone(),
-                using_columns: using_columns.clone(),
-            })
-        }
-        ast_unresolved::BooleanExpression::InRelational {
-            value,
-            identifier,
-            negated,
-            subquery: _,
-        } => {
-            // Placeholder — same approach as InnerExists above
-            Ok(ast_resolved::BooleanExpression::InRelational {
-                value: Box::new(convert_domain_expression(value)?),
-                subquery: Box::new(ast_resolved::RelationalExpression::Relation(
-                    ast_resolved::Relation::Ground {
-                        identifier: identifier.clone(),
-                        canonical_name: ast_resolved::PhaseBox::new(None),
-                        domain_spec: ast_resolved::DomainSpec::Glob,
-                        alias: None,
-                        outer: false,
-                        mutation_target: false,
-                        passthrough: false,
-                        cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Unknown),
-                        hygienic_injections: Vec::new(),
-                    },
-                )),
-                identifier: identifier.clone(),
-                negated: *negated,
-            })
-        }
-        ast_unresolved::BooleanExpression::And { left, right } => {
-            Ok(ast_resolved::BooleanExpression::And {
-                left: Box::new(convert_boolean_expression(left)?),
-                right: Box::new(convert_boolean_expression(right)?),
-            })
-        }
-        ast_unresolved::BooleanExpression::Or { left, right } => {
-            Ok(ast_resolved::BooleanExpression::Or {
-                left: Box::new(convert_boolean_expression(left)?),
-                right: Box::new(convert_boolean_expression(right)?),
-            })
-        }
-        ast_unresolved::BooleanExpression::Not { expr } => {
-            Ok(ast_resolved::BooleanExpression::Not {
-                expr: Box::new(convert_boolean_expression(expr)?),
-            })
-        }
-        ast_unresolved::BooleanExpression::BooleanLiteral { value } => {
-            Ok(ast_resolved::BooleanExpression::BooleanLiteral { value: *value })
-        }
-        ast_unresolved::BooleanExpression::Sigma { condition } => {
-            Ok(ast_resolved::BooleanExpression::Sigma {
-                condition: Box::new(convert_sigma_condition(condition)?),
-            })
-        }
-        ast_unresolved::BooleanExpression::GlobCorrelation { left, right } => {
-            Ok(ast_resolved::BooleanExpression::GlobCorrelation {
-                left: left.clone(),
-                right: right.clone(),
-            })
-        }
-        ast_unresolved::BooleanExpression::OrdinalGlobCorrelation { left, right } => {
-            Ok(ast_resolved::BooleanExpression::OrdinalGlobCorrelation {
-                left: left.clone(),
-                right: right.clone(),
-            })
-        }
-    }
-}
-
-/// Convert unresolved SigmaCondition to resolved SigmaCondition
-fn convert_sigma_condition(
-    condition: &ast_unresolved::SigmaCondition,
-) -> Result<ast_resolved::SigmaCondition> {
-    match condition {
-        ast_unresolved::SigmaCondition::Predicate(pred) => Ok(
-            ast_resolved::SigmaCondition::Predicate(convert_boolean_expression(pred)?),
-        ),
-        ast_unresolved::SigmaCondition::TupleOrdinal(clause) => {
-            Ok(ast_resolved::SigmaCondition::TupleOrdinal(clause.clone()))
-        }
-        ast_unresolved::SigmaCondition::Destructure { .. } => Err(DelightQLError::not_implemented(
-            "Destructure in type conversion context (positional pattern)",
-        )),
-        ast_unresolved::SigmaCondition::SigmaCall {
-            functor,
-            arguments,
-            exists,
-        } => {
-            let converted_args = arguments
-                .iter()
-                .map(|arg| convert_domain_expression(arg))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(ast_resolved::SigmaCondition::SigmaCall {
-                functor: functor.clone(),
-                arguments: converted_args,
-                exists: *exists,
-            })
-        }
-    }
+    PhaseConverter.transform_boolean(expr.clone())
 }
 
 /// Convert unresolved QualifiedName to resolved QualifiedName

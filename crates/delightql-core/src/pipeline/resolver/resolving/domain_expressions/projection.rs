@@ -3,6 +3,7 @@ use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::ast_unresolved;
 use crate::pipeline::asts::core::{ProjectionExpr, SubstitutionExpr};
+use crate::pipeline::asts::resolved::NamespacePath;
 
 fn expand_glob(
     qualifier: Option<String>,
@@ -12,12 +13,12 @@ fn expand_glob(
         Ok(available
             .iter()
             .filter(
-                |col| matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == &qual),
+                |col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == &qual),
             )
             .map(|col| ast_resolved::DomainExpression::Lvar {
                 name: col.name().into(),
                 qualifier: Some(qual.clone().into()),
-                namespace_path: col.fq_table.parents_path.clone(),
+                namespace_path: NamespacePath::empty(),
                 alias: None,
                 provenance: ast_resolved::PhaseBox::phantom(),
             })
@@ -26,7 +27,7 @@ fn expand_glob(
         Ok(available
             .iter()
             .map(|col| {
-                let qualifier = match &col.fq_table.name {
+                let qualifier = match &col.table_name {
                     ast_resolved::TableName::Named(name) if !name.is_empty() => {
                         Some(name.to_string())
                     }
@@ -35,7 +36,7 @@ fn expand_glob(
                 ast_resolved::DomainExpression::Lvar {
                     name: col.name().into(),
                     qualifier: qualifier.map(|s| s.into()),
-                    namespace_path: col.fq_table.parents_path.clone(),
+                    namespace_path: NamespacePath::empty(),
                     alias: None,
                     provenance: ast_resolved::PhaseBox::phantom(),
                 }
@@ -60,14 +61,14 @@ fn expand_pattern(
         .iter()
         .filter(|col| re.is_match(col.name()))
         .map(|col| {
-            let qualifier = match &col.fq_table.name {
+            let qualifier = match &col.table_name {
                 ast_resolved::TableName::Named(name) if !name.is_empty() => Some(name.to_string()),
                 ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => None,
             };
             ast_resolved::DomainExpression::Lvar {
                 name: col.name().into(),
                 qualifier: qualifier.map(|s| s.into()),
-                namespace_path: col.fq_table.parents_path.clone(),
+                namespace_path: NamespacePath::empty(),
                 alias: None,
                 provenance: ast_resolved::PhaseBox::phantom(),
             }
@@ -246,7 +247,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
 
                     let candidates = if let Some(qual) = &range.qualifier {
                         available.iter()
-                            .filter(|col| matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual))
+                            .filter(|col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual))
                             .collect::<Vec<_>>()
                     } else {
                         available.iter().collect::<Vec<_>>()
@@ -276,7 +277,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                     for idx in start_idx..=end_idx {
                         let column = candidates[idx];
                         let qualifier =
-                            if let ast_resolved::TableName::Named(name) = &column.fq_table.name {
+                            if let ast_resolved::TableName::Named(name) = &column.table_name {
                                 if !name.is_empty() {
                                     Some(name.to_string())
                                 } else {
@@ -291,7 +292,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                         resolved.push(ast_resolved::DomainExpression::Lvar {
                             name: name.into(),
                             qualifier: qualifier.map(|s| s.into()),
-                            namespace_path: column.fq_table.parents_path.clone(),
+                            namespace_path: NamespacePath::empty(),
                             alias: None,
                             provenance: ast_resolved::PhaseBox::phantom(),
                         });
@@ -318,7 +319,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
 
                 let candidates = if let Some(qual) = &ordinal.qualifier {
                     available.iter()
-                        .filter(|col| matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual))
+                        .filter(|col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual))
                         .collect::<Vec<_>>()
                 } else {
                     available.iter().collect::<Vec<_>>()
@@ -340,12 +341,12 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                 resolved.push(ast_resolved::DomainExpression::Lvar {
                     name: name.into(),
                     qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(
-                        || match &column.fq_table.name {
+                        || match &column.table_name {
                             ast_resolved::TableName::Named(t) => Some(t.clone().into()),
                             _ => None,
                         },
                     ),
-                    namespace_path: column.fq_table.parents_path.clone(),
+                    namespace_path: NamespacePath::empty(),
                     alias: ordinal.alias.clone().map(|s| s.into()),
                     provenance: ast_resolved::PhaseBox::phantom(),
                 });

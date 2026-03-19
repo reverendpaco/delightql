@@ -19,13 +19,9 @@ pub(super) fn create_tvf_column_metadata(
         info: ast_resolved::ColumnProvenance::from_table_column(
             name.to_string(),
             table.clone(),
-            false, // TVF columns are not qualified in source
+            ast_resolved::QualificationSource::None, // TVF columns are not qualified in source
         ),
-        fq_table: ast_resolved::FqTable {
-            parents_path: crate::pipeline::asts::resolved::NamespacePath::empty(),
-            name: table,
-            backend_schema: ast_resolved::PhaseBox::from_optional_schema(None), // TVFs don't have backend schemas
-        },
+        table_name: table,
         table_position: Some(position),
         has_user_name: true, // Table columns have user names
         needs_hygienic_alias: false,

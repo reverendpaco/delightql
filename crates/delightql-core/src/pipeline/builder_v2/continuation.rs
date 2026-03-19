@@ -1139,6 +1139,7 @@ fn apply_using_columns_to_rel_expr(
         RelationalExpression::Relation(Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema: _,
             domain_spec,
             alias,
             cpr_schema,
@@ -1162,6 +1163,7 @@ fn apply_using_columns_to_rel_expr(
             RelationalExpression::Relation(Relation::Ground {
                 identifier,
                 canonical_name,
+                backend_schema: PhaseBox::phantom(),
                 domain_spec: new_domain_spec,
                 alias,
                 cpr_schema,
@@ -1184,6 +1186,7 @@ fn apply_using_all_to_rel_expr(expr: RelationalExpression) -> RelationalExpressi
         RelationalExpression::Relation(Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema: _,
             domain_spec: _,
             alias,
             cpr_schema,
@@ -1194,6 +1197,7 @@ fn apply_using_all_to_rel_expr(expr: RelationalExpression) -> RelationalExpressi
         }) => RelationalExpression::Relation(Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema: PhaseBox::phantom(),
             domain_spec: DomainSpec::GlobWithUsingAll,
             alias,
             cpr_schema,

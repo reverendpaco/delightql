@@ -1,6 +1,6 @@
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::AstTransform;
-use crate::pipeline::asts::resolved::NamespacePath;
+
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
@@ -11,7 +11,7 @@ use super::helpers::{emit_validation_warning, expand_column_template};
 
 /// Check if a column's table provenance matches a qualifier string
 fn matches_table_qualifier(col: &ast_resolved::ColumnMetadata, qualifier: &str) -> bool {
-    match &col.fq_table.name {
+    match &col.table_name {
         ast_resolved::TableName::Named(name) => name.as_ref() == qualifier,
         ast_resolved::TableName::Fresh => false,
     }
@@ -331,13 +331,9 @@ pub(super) fn resolve_embed_map_cover_via_fold(
             ast_resolved::ColumnProvenance::from_table_column(
                 new_column_name.clone(),
                 ast_resolved::TableName::Fresh,
-                false,
+                ast_resolved::QualificationSource::None,
             ),
-            ast_resolved::FqTable {
-                parents_path: NamespacePath::empty(),
-                name: ast_resolved::TableName::Fresh,
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-            },
+            ast_resolved::TableName::Fresh,
             Some(new_column_position),
             true,
         ));

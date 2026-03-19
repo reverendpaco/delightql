@@ -84,10 +84,18 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                                 let guard_text = &source[bs..be];
                                 body_parser::parse_guard_expression(guard_text).ok()
                             });
-                            FunctionParam { name, guard, callable }
+                            FunctionParam {
+                                name,
+                                guard,
+                                callable,
+                            }
                         } else {
                             let name = p.text().to_string();
-                            FunctionParam { name, guard: None, callable: false }
+                            FunctionParam {
+                                name,
+                                guard: None,
+                                callable: false,
+                            }
                         }
                     } else {
                         FunctionParam {

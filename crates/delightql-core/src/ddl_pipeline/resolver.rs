@@ -4,9 +4,9 @@ use delightql_types::SqlIdentifier;
 use crate::pipeline::ast_resolved;
 use crate::pipeline::asts::core::expressions::boolean::BooleanExpression;
 use crate::pipeline::asts::core::expressions::domain::DomainExpression;
-use crate::pipeline::asts::core::metadata::{FqTable, NamespacePath, TableName};
+use crate::pipeline::asts::core::metadata::TableName;
 use crate::pipeline::asts::core::provenance::ColumnProvenance;
-use crate::pipeline::asts::core::{LiteralValue, PhaseBox, Resolved, Unresolved};
+use crate::pipeline::asts::core::{LiteralValue, Resolved, Unresolved};
 use crate::pipeline::resolver::resolving::resolve_domain_expr_via_registry;
 use crate::Result;
 
@@ -58,13 +58,9 @@ fn build_available(columns: &[ColumnDef<Unresolved>]) -> Vec<ast_resolved::Colum
             info: ColumnProvenance::from_table_column(
                 SqlIdentifier::from(col.name.as_str()),
                 TableName::Fresh,
-                false,
+                crate::pipeline::asts::core::QualificationSource::None,
             ),
-            fq_table: FqTable {
-                parents_path: NamespacePath::empty(),
-                name: TableName::Fresh,
-                backend_schema: PhaseBox::from_optional_schema(None),
-            },
+            table_name: TableName::Fresh,
             table_position: Some(i),
             has_user_name: true,
             needs_hygienic_alias: false,

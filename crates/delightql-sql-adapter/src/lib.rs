@@ -17,7 +17,6 @@ use std::thread;
 use delightql_protocol::{
     ByteSeq, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem, Orientation,
     Projection, ServerTerm, resolve_projection,
-    CELL_TAG_BLOB, CELL_TAG_INTEGER, CELL_TAG_REAL, CELL_TAG_TEXT,
 };
 
 pub mod siso;
@@ -106,9 +105,7 @@ impl SqlParty {
                         {
                             return;
                         }
-                        // Encode affected_rows as tagged integer
-                        let mut v = vec![CELL_TAG_INTEGER];
-                        v.extend_from_slice(&(affected as i64).to_le_bytes());
+                        let v = (affected as i64).to_string().into_bytes();
                         let _ = tx.send(StreamBatch::Rows(vec![vec![Some(v)]]));
                         let _ = tx.send(StreamBatch::Done);
                     }
@@ -156,24 +153,16 @@ impl SqlParty {
                                 cells.push(match val {
                                     rusqlite::types::Value::Null => None,
                                     rusqlite::types::Value::Integer(n) => {
-                                        let mut v = vec![CELL_TAG_INTEGER];
-                                        v.extend_from_slice(&n.to_le_bytes());
-                                        Some(v)
+                                        Some(n.to_string().into_bytes())
                                     }
                                     rusqlite::types::Value::Real(f) => {
-                                        let mut v = vec![CELL_TAG_REAL];
-                                        v.extend_from_slice(&f.to_le_bytes());
-                                        Some(v)
+                                        Some(f.to_string().into_bytes())
                                     }
                                     rusqlite::types::Value::Text(s) => {
-                                        let mut v = vec![CELL_TAG_TEXT];
-                                        v.extend_from_slice(s.as_bytes());
-                                        Some(v)
+                                        Some(s.into_bytes())
                                     }
                                     rusqlite::types::Value::Blob(b) => {
-                                        let mut v = vec![CELL_TAG_BLOB];
-                                        v.extend(b);
-                                        Some(v)
+                                        Some(b)
                                     }
                                 });
                             }

@@ -142,6 +142,7 @@ pub(super) fn parse_catalog_functor(
         let base = RelationalExpression::Relation(Relation::Ground {
             identifier: identifier.clone(),
             canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
             domain_spec: DomainSpec::Bare,
             alias: alias.clone().map(|s| s.into()),
             outer: false,
@@ -158,6 +159,7 @@ pub(super) fn parse_catalog_functor(
             return Ok(RelationalExpression::Relation(Relation::Ground {
                 identifier,
                 canonical_name: PhaseBox::phantom(),
+                backend_schema: PhaseBox::phantom(),
                 domain_spec,
                 alias: alias.map(|s| s.into()),
                 outer: false,
@@ -183,6 +185,7 @@ pub(super) fn parse_catalog_functor(
         Ok(RelationalExpression::Relation(Relation::Ground {
             identifier,
             canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
             domain_spec,
             alias: alias.map(|s| s.into()),
             outer: false,
@@ -196,6 +199,7 @@ pub(super) fn parse_catalog_functor(
         Ok(RelationalExpression::Relation(Relation::Ground {
             identifier,
             canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
             domain_spec: DomainSpec::Glob,
             alias: alias.map(|s| s.into()),
             outer: false,
@@ -327,9 +331,7 @@ pub(super) fn parse_tvf_call(
                     if let DomainExpression::Lvar { name, .. } = dom_expr {
                         if let Some(actual_name) = bindings.table_params.get(name.as_str()) {
                             *name = actual_name.clone().into();
-                        } else if let Some(bound_expr) =
-                            bindings.scalar_params.get(name.as_str())
-                        {
+                        } else if let Some(bound_expr) = bindings.scalar_params.get(name.as_str()) {
                             *dom_expr = bound_expr.clone();
                         }
                     }
@@ -343,6 +345,7 @@ pub(super) fn parse_tvf_call(
         domain_spec,
         alias: alias.map(|s| s.into()),
         namespace: namespace_path,
+        backend_schema: PhaseBox::phantom(),
         grounding,
         cpr_schema: PhaseBox::phantom(),
         argument_groups,
@@ -667,6 +670,7 @@ pub(super) fn parse_table_access(
                     RelationalExpression::Relation(Relation::Ground {
                         identifier: identifier.clone(),
                         canonical_name: PhaseBox::phantom(),
+                        backend_schema: PhaseBox::phantom(),
                         domain_spec: DomainSpec::Bare,
                         alias: alias.clone().map(|s| s.into()),
                         outer,
@@ -680,6 +684,7 @@ pub(super) fn parse_table_access(
                 RelationalExpression::Relation(Relation::Ground {
                     identifier: identifier.clone(),
                     canonical_name: PhaseBox::phantom(),
+                    backend_schema: PhaseBox::phantom(),
                     domain_spec: DomainSpec::Bare,
                     alias: alias.clone().map(|s| s.into()),
                     outer,
@@ -693,6 +698,7 @@ pub(super) fn parse_table_access(
             RelationalExpression::Relation(Relation::Ground {
                 identifier: identifier.clone(),
                 canonical_name: PhaseBox::phantom(),
+                backend_schema: PhaseBox::phantom(),
                 domain_spec: DomainSpec::Bare,
                 alias: alias.clone().map(|s| s.into()),
                 outer,
@@ -732,6 +738,7 @@ pub(super) fn parse_table_access(
             return Ok(RelationalExpression::Relation(Relation::Ground {
                 identifier,
                 canonical_name: PhaseBox::phantom(),
+                backend_schema: PhaseBox::phantom(),
                 domain_spec,
                 alias: alias.map(|s| s.into()),
                 outer,
@@ -769,6 +776,7 @@ pub(super) fn parse_table_access(
                 grounding,
             },
             canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
             domain_spec,
             alias: alias.map(|s| s.into()),
             outer,
@@ -1266,6 +1274,9 @@ fn apply_alias_to_relational_expr(expr: &mut RelationalExpression, alias: String
         RelationalExpression::ErJoinChain { .. }
         | RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before apply_alias_to_relational_expr")
+        }
+        RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }

@@ -70,6 +70,9 @@ pub fn detect_correlation_filters(
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before correlation analysis")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 
     Ok(filters)

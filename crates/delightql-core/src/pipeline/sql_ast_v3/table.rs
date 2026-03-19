@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::expressions::DomainExpression;
+use super::expressions::{ColumnQualifier, DomainExpression};
 use super::query::QueryExpression;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -17,7 +17,7 @@ pub enum TableExpression {
     /// through deeply nested subquery chains (e.g. 1000-pipe queries).
     Subquery {
         query: Box<stacksafe::StackSafe<QueryExpression>>,
-        alias: String, // Required in SQL!
+        alias: String,
     },
 
     /// JOIN expression
@@ -29,17 +29,16 @@ pub enum TableExpression {
     },
 
     /// VALUES clause: VALUES (row1), (row2), ... AS alias
-    /// Use this when no column headers are specified
     Values {
         rows: Vec<Vec<DomainExpression>>,
-        alias: String, // Required in FROM clause
+        alias: String,
     },
 
     /// UNION ALL for anonymous tables with headers
     /// First SELECT has column aliases, rest are UNION ALL
     UnionTable {
         selects: Vec<QueryExpression>,
-        alias: String, // Required to reference the result
+        alias: String,
     },
 
     /// Table-Valued Function: json_each(...), pragma_table_info(...)
@@ -62,6 +61,12 @@ pub enum TvfArgument {
     Identifier(String),
     /// Qualified column reference: table.column
     QualifiedRef { qualifier: String, column: String },
+    /// Provenance-aware qualified column reference.
+    /// The generator resolves the ColumnQualifier through NameAllocator.
+    ColumnRef {
+        qualifier: ColumnQualifier,
+        column: String,
+    },
 }
 
 impl TvfArgument {
@@ -109,13 +114,13 @@ impl TvfArgument {
     }
 
     /// Resolve qualifier through scope stack. If the resolver returns a remapping
-    /// for the qualifier, return a new QualifiedRef with the remapped qualifier.
+    /// for the qualifier, return a ColumnRef with the provenance-aware qualifier.
     /// All other variants pass through unchanged.
-    pub fn resolve_qualifier(&self, resolver: impl Fn(&str) -> Option<String>) -> Self {
+    pub fn resolve_qualifier(&self, resolver: impl Fn(&str) -> Option<ColumnQualifier>) -> Self {
         match self {
             TvfArgument::QualifiedRef { qualifier, column } => {
                 if let Some(new_qualifier) = resolver(qualifier) {
-                    TvfArgument::QualifiedRef {
+                    TvfArgument::ColumnRef {
                         qualifier: new_qualifier,
                         column: column.clone(),
                     }
@@ -125,7 +130,8 @@ impl TvfArgument {
             }
             TvfArgument::StringLiteral(_)
             | TvfArgument::NumberLiteral(_)
-            | TvfArgument::Identifier(_) => self.clone(),
+            | TvfArgument::Identifier(_)
+            | TvfArgument::ColumnRef { .. } => self.clone(),
         }
     }
 
@@ -149,7 +155,10 @@ impl TvfArgument {
             TvfArgument::NumberLiteral(n) => n.clone(),
             TvfArgument::Identifier(id) => id.clone(),
             TvfArgument::QualifiedRef { qualifier, column } => {
-                format!("\"{}\".\"{}\"", qualifier, column)
+                format!("{}.{}", qualifier, column)
+            }
+            TvfArgument::ColumnRef { .. } => {
+                panic!("ColumnRef must be emitted through the generator (which resolves ColumnQualifier via NameAllocator)")
             }
         }
     }

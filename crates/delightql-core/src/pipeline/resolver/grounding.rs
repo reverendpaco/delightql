@@ -130,11 +130,22 @@ pub(crate) fn consulted_entity_to_cfe_definition(
     // Split params into curried (callable) and regular based on FunctionParam.callable
     let (curried_params, parameters) = match &ddl_defs[0].head {
         DdlHead::Function { params, .. } => {
-            let curried: Vec<String> = params.iter().filter(|p| p.callable).map(|p| p.name.clone()).collect();
-            let regular: Vec<String> = params.iter().filter(|p| !p.callable).map(|p| p.name.clone()).collect();
+            let curried: Vec<String> = params
+                .iter()
+                .filter(|p| p.callable)
+                .map(|p| p.name.clone())
+                .collect();
+            let regular: Vec<String> = params
+                .iter()
+                .filter(|p| !p.callable)
+                .map(|p| p.name.clone())
+                .collect();
             (curried, regular)
         }
-        _ => (vec![], entity.params.iter().map(|p| p.name.clone()).collect()),
+        _ => (
+            vec![],
+            entity.params.iter().map(|p| p.name.clone()).collect(),
+        ),
     };
 
     if ddl_defs.len() == 1 {
@@ -197,10 +208,8 @@ fn discover_nested_cfes(
     data_ns: Option<&ast_unresolved::NamespacePath>,
     already_collected: &[CfeDefinition],
 ) -> Result<Vec<CfeDefinition>> {
-    let mut seen: std::collections::HashSet<String> = already_collected
-        .iter()
-        .map(|c| c.name.clone())
-        .collect();
+    let mut seen: std::collections::HashSet<String> =
+        already_collected.iter().map(|c| c.name.clone()).collect();
     let mut result = Vec::new();
     discover_nested_cfes_inner(body, source_ns, consult, data_ns, &mut seen, &mut result)?;
     Ok(result)
@@ -218,31 +227,35 @@ fn discover_nested_cfes_inner(
         DomainExpression::Function(func) => {
             match func {
                 FunctionExpression::Regular {
-                    name, namespace, arguments, ..
+                    name,
+                    namespace,
+                    arguments,
+                    ..
                 }
                 | FunctionExpression::Curried {
-                    name, namespace, arguments, ..
+                    name,
+                    namespace,
+                    arguments,
+                    ..
                 } => {
                     let name_str = name.to_string();
                     if !seen.contains(&name_str) {
                         // Activate namespace-local enlistments for the source namespace
                         let activated =
                             consult.activate_namespace_local_enlists_into_main(source_ns);
-                        let entity = lookup_borrowed_function(
-                            &name_str,
-                            namespace.as_ref(),
-                            consult,
-                        );
+                        let entity =
+                            lookup_borrowed_function(&name_str, namespace.as_ref(), consult);
                         // Also try context-aware functions
-                        let ccafe_entity = if entity.as_ref().ok().and_then(|e| e.as_ref()).is_none() {
-                            lookup_borrowed_context_aware_function(
-                                &name_str,
-                                namespace.as_ref(),
-                                consult,
-                            )
-                        } else {
-                            Ok(None)
-                        };
+                        let ccafe_entity =
+                            if entity.as_ref().ok().and_then(|e| e.as_ref()).is_none() {
+                                lookup_borrowed_context_aware_function(
+                                    &name_str,
+                                    namespace.as_ref(),
+                                    consult,
+                                )
+                            } else {
+                                Ok(None)
+                            };
                         consult.deactivate_namespace_local_enlists(&activated);
 
                         let entity = entity?.or(ccafe_entity?);
@@ -250,8 +263,7 @@ fn discover_nested_cfes_inner(
                             seen.insert(name_str);
                             let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
                             if let Some(ns) = data_ns {
-                                cfe_def.body =
-                                    patch_data_ns_in_domain_expr(cfe_def.body, ns);
+                                cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
                             }
                             // Recurse into this entity's body
                             discover_nested_cfes_inner(
@@ -274,14 +286,24 @@ fn discover_nested_cfes_inner(
                     for arm in arms {
                         match arm {
                             ast_unresolved::CaseArm::Searched { result, .. } => {
-                                discover_nested_cfes_inner(result, source_ns, consult, data_ns, seen, out)?;
+                                discover_nested_cfes_inner(
+                                    result, source_ns, consult, data_ns, seen, out,
+                                )?;
                             }
-                            ast_unresolved::CaseArm::Simple { test_expr, result, .. } => {
-                                discover_nested_cfes_inner(test_expr, source_ns, consult, data_ns, seen, out)?;
-                                discover_nested_cfes_inner(result, source_ns, consult, data_ns, seen, out)?;
+                            ast_unresolved::CaseArm::Simple {
+                                test_expr, result, ..
+                            } => {
+                                discover_nested_cfes_inner(
+                                    test_expr, source_ns, consult, data_ns, seen, out,
+                                )?;
+                                discover_nested_cfes_inner(
+                                    result, source_ns, consult, data_ns, seen, out,
+                                )?;
                             }
                             ast_unresolved::CaseArm::Default { result } => {
-                                discover_nested_cfes_inner(result, source_ns, consult, data_ns, seen, out)?;
+                                discover_nested_cfes_inner(
+                                    result, source_ns, consult, data_ns, seen, out,
+                                )?;
                             }
                             _ => {}
                         }
@@ -369,25 +391,13 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
         match expr {
             DomainExpression::Function(func) => {
                 // Extract name/namespace/arguments from Regular/Curried
-                let (name_str, namespace, arguments, alias) = match &func {
+                let (name_str, namespace) = match &func {
                     FunctionExpression::Regular {
-                        name,
-                        namespace,
-                        arguments,
-                        alias,
-                        ..
-                    } => (
-                        name.to_string(),
-                        namespace.clone(),
-                        arguments.clone(),
-                        alias.clone(),
-                    ),
+                        name, namespace, ..
+                    } => (name.to_string(), namespace.clone()),
                     FunctionExpression::Curried {
-                        name,
-                        namespace,
-                        arguments,
-                        ..
-                    } => (name.to_string(), namespace.clone(), arguments.clone(), None),
+                        name, namespace, ..
+                    } => (name.to_string(), namespace.clone()),
                     _ => {
                         // Non-Regular/Curried: recurse into children
                         return Ok(DomainExpression::Function(self.transform_function(func)?));
@@ -728,25 +738,13 @@ impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
     ) -> Result<DomainExpression<Unresolved>> {
         match expr {
             DomainExpression::Function(func) => {
-                let (name, namespace, arguments, alias) = match &func {
+                let (name, namespace) = match &func {
                     FunctionExpression::Regular {
-                        name,
-                        namespace,
-                        arguments,
-                        alias,
-                        ..
-                    } => (
-                        name.clone(),
-                        namespace.clone(),
-                        arguments.clone(),
-                        alias.clone(),
-                    ),
+                        name, namespace, ..
+                    } => (name.clone(), namespace.clone()),
                     FunctionExpression::Curried {
-                        name,
-                        namespace,
-                        arguments,
-                        ..
-                    } => (name.clone(), namespace.clone(), arguments.clone(), None),
+                        name, namespace, ..
+                    } => (name.clone(), namespace.clone()),
                     _ => return walk_transform_domain(self, DomainExpression::Function(func)),
                 };
 
@@ -1109,6 +1107,7 @@ pub(super) fn expand_multi_clause_view(
                 grounding: None,
             },
             canonical_name: ast_unresolved::PhaseBox::phantom(),
+            backend_schema: ast_unresolved::PhaseBox::phantom(),
             domain_spec: ast_unresolved::DomainSpec::Glob,
             alias: None,
             outer: false,
@@ -1701,6 +1700,7 @@ pub(super) fn split_ho_first_parens(
                                     grounding: None,
                                 },
                                 canonical_name: ast_unresolved::PhaseBox::phantom(),
+                                backend_schema: ast_unresolved::PhaseBox::phantom(),
                                 domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
                                 alias: None,
                                 outer: false,
@@ -1771,6 +1771,7 @@ pub(super) fn split_ho_first_parens(
                                 grounding: None,
                             },
                             canonical_name: ast_unresolved::PhaseBox::phantom(),
+                            backend_schema: ast_unresolved::PhaseBox::phantom(),
                             domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
                             alias: None,
                             outer: false,
@@ -1821,6 +1822,7 @@ pub(super) fn split_ho_first_parens(
                                     grounding: None,
                                 },
                                 canonical_name: ast_unresolved::PhaseBox::phantom(),
+                                backend_schema: ast_unresolved::PhaseBox::phantom(),
                                 domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
                                 alias: None,
                                 outer: false,
@@ -2098,20 +2100,19 @@ fn normalize_interior_for_cte(
     expr: ast_unresolved::RelationalExpression,
 ) -> ast_unresolved::RelationalExpression {
     match expr {
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::InnerRelation {
-            pattern:
-                ast_unresolved::InnerRelationPattern::Indeterminate {
-                    subquery,
-                    ..
-                },
-            ..
-        }) => {
+        ast_unresolved::RelationalExpression::Relation(
+            ast_unresolved::Relation::InnerRelation {
+                pattern: ast_unresolved::InnerRelationPattern::Indeterminate { subquery, .. },
+                ..
+            },
+        ) => {
             // Unwrap the InnerRelation and patch the base to Glob
             patch_bare_to_glob(*subquery)
         }
         ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema,
             domain_spec: ast_unresolved::DomainSpec::Positional(ref exprs),
             alias,
             outer,
@@ -2123,10 +2124,11 @@ fn normalize_interior_for_cte(
             // Convert Positional to Glob + Projection pipe:
             // users(first_name, age) → users(*) |> (first_name, age)
             let projection_exprs = exprs.clone();
-            let base = ast_unresolved::RelationalExpression::Relation(
-                ast_unresolved::Relation::Ground {
+            let base =
+                ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
                     identifier,
                     canonical_name,
+                    backend_schema,
                     domain_spec: ast_unresolved::DomainSpec::Glob,
                     alias,
                     outer,
@@ -2134,8 +2136,7 @@ fn normalize_interior_for_cte(
                     passthrough,
                     cpr_schema,
                     hygienic_injections,
-                },
-            );
+                });
             ast_unresolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
                 ast_unresolved::PipeExpression {
                     source: base,
@@ -2159,6 +2160,7 @@ fn patch_bare_to_glob(
         ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema,
             domain_spec: ast_unresolved::DomainSpec::Bare,
             alias,
             outer,
@@ -2169,6 +2171,7 @@ fn patch_bare_to_glob(
         }) => ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema,
             domain_spec: ast_unresolved::DomainSpec::Glob,
             alias,
             outer,
@@ -2262,16 +2265,11 @@ fn extract_clause_ctes(
                 is_recursive: ast_unresolved::PhaseBox::phantom(),
             });
         }
-        ast_unresolved::Query::WithCfes {
-            cfes,
-            query: inner,
-        } => {
+        ast_unresolved::Query::WithCfes { cfes, query: inner } => {
             collected_cfes.extend(cfes);
             extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
         }
-        ast_unresolved::Query::WithPrecompiledCfes {
-            query: inner, ..
-        } => {
+        ast_unresolved::Query::WithPrecompiledCfes { query: inner, .. } => {
             // Already precompiled — just unwrap and recurse
             extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
         }
@@ -2313,6 +2311,7 @@ fn inject_input_table_into_query(
                 grounding: None,
             },
             canonical_name: ast_unresolved::PhaseBox::phantom(),
+            backend_schema: ast_unresolved::PhaseBox::phantom(),
             domain_spec: ast_unresolved::DomainSpec::Glob,
             alias: None,
             outer: false,
@@ -2416,6 +2415,8 @@ pub(super) fn build_squished_relation(
 
     // Detect which scalar params are free (Lvar call-site expressions).
     // These need the _input table injected into correlated clause bodies.
+    // Also collect (param_name, lvar_name) pairs for the correlation JOIN:
+    // param_name = column in the squished CTE, lvar_name = column in _ho_scalar_input.
     let free_scalar_param_names: Vec<String> = if join_input_cte_name.is_some() {
         table_bindings
             .scalar_params
@@ -2488,7 +2489,13 @@ pub(super) fn build_squished_relation(
                 clause_query
             };
 
-            extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context, &mut collected_cfes)?;
+            extract_clause_ctes(
+                clause_query,
+                function,
+                &mut all_ctes,
+                &mut er_context,
+                &mut collected_cfes,
+            )?;
         }
     } else {
         // Single clause
@@ -2534,7 +2541,13 @@ pub(super) fn build_squished_relation(
             clause_query
         };
 
-        extract_clause_ctes(clause_query, function, &mut all_ctes, &mut er_context, &mut collected_cfes)?;
+        extract_clause_ctes(
+            clause_query,
+            function,
+            &mut all_ctes,
+            &mut er_context,
+            &mut collected_cfes,
+        )?;
     }
 
     // Main query: function(*) referencing the CTE
@@ -2546,6 +2559,7 @@ pub(super) fn build_squished_relation(
                 grounding: None,
             },
             canonical_name: ast_unresolved::PhaseBox::phantom(),
+            backend_schema: ast_unresolved::PhaseBox::phantom(),
             domain_spec: ast_unresolved::DomainSpec::Glob,
             alias: None,
             outer: false,
@@ -2794,6 +2808,7 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
             Relation::Ground {
                 mut identifier,
                 canonical_name,
+                backend_schema,
                 domain_spec,
                 alias,
                 outer,
@@ -2803,9 +2818,7 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
                 hygienic_injections,
             } => {
                 // Skip namespace patching for HO-generated CTE names (_ho_pipe_src, _ho_arg_T, etc.)
-                if identifier.namespace_path.is_empty()
-                    && !identifier.name.starts_with("_ho_")
-                {
+                if identifier.namespace_path.is_empty() && !identifier.name.starts_with("_ho_") {
                     identifier.namespace_path = self.data_ns.clone();
                 }
                 // Don't recurse further — Ground's children (domain_spec) don't
@@ -2814,6 +2827,7 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
                 Ok(Relation::Ground {
                     identifier,
                     canonical_name,
+                    backend_schema,
                     domain_spec,
                     alias,
                     outer,
@@ -2826,6 +2840,7 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
             Relation::TVF {
                 function,
                 argument_groups,
+                backend_schema,
                 domain_spec,
                 alias,
                 mut namespace,
@@ -2839,6 +2854,7 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
                 Ok(Relation::TVF {
                     function,
                     argument_groups,
+                    backend_schema,
                     domain_spec,
                     alias,
                     namespace,

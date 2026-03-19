@@ -1,7 +1,9 @@
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
 use delightql_types::error::{DelightQLError, Result};
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Case-insensitive column name comparison, matching SQL semantics
 /// where unquoted identifiers are case-insensitive.
@@ -13,6 +15,44 @@ mod pattern_resolver;
 pub use pattern_resolver::{JoinContext, PatternResolver};
 
 mod string_templates;
+
+/// Per-resolution alias counter. Shared across clones so that all
+/// resolution phases within a single query use the same sequence.
+#[derive(Debug, Clone)]
+pub struct ResolverAliasCounter(Rc<Cell<usize>>);
+
+impl ResolverAliasCounter {
+    pub fn new() -> Self {
+        Self(Rc::new(Cell::new(0)))
+    }
+
+    /// Generate a unique `_rN` alias for this resolution pass.
+    pub fn next_alias(&self) -> String {
+        let n = self.0.get();
+        self.0.set(n + 1);
+        format!("_r{}", n)
+    }
+
+    /// Generate a unique `_rN` alias paired with an opaque ResolverId.
+    /// The string is for backward-compatible scope lookup; the ResolverId
+    /// flows through identity stacks to the transformer.
+    pub fn next_alias_with_id(
+        &self,
+    ) -> (String, crate::pipeline::asts::core::provenance::ResolverId) {
+        let n = self.0.get();
+        self.0.set(n + 1);
+        (
+            format!("_r{}", n),
+            crate::pipeline::asts::core::provenance::ResolverId::new(n as u64),
+        )
+    }
+}
+
+impl Default for ResolverAliasCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Configuration for TVF resolution behavior
 #[derive(Debug, Clone)]
@@ -33,6 +73,8 @@ pub struct ResolutionConfig {
     /// Set when resolving a namespace-qualified view (`ns.view(*)`), so that ER-rules
     /// from the view's namespace are found without requiring engage.
     pub resolution_namespace: Option<String>,
+    /// Per-resolution alias counter (shared across clones).
+    pub alias_counter: ResolverAliasCounter,
 }
 
 impl Default for ResolutionConfig {
@@ -43,6 +85,7 @@ impl Default for ResolutionConfig {
             validate_in_correlation: false,
             er_context: None,
             resolution_namespace: None,
+            alias_counter: ResolverAliasCounter::new(),
         }
     }
 }
@@ -79,6 +122,10 @@ pub struct BubbledState {
 }
 
 impl BubbledState {
+    pub fn empty() -> Self {
+        Self::resolved(Vec::new())
+    }
+
     pub fn resolved(columns: Vec<ast_resolved::ColumnMetadata>) -> Self {
         Self {
             i_provide: columns,
@@ -124,6 +171,204 @@ pub struct ResolvedQueryResult {
     pub connection_id: Option<i64>,
 }
 
+/// Group a flat list of CTE bindings by name, preserving first-appearance order,
+/// then validate inter-CTE dependencies (forward references, cycles).
+fn group_ctes(
+    ctes: Vec<ast_unresolved::CteBinding>,
+) -> Result<(
+    HashMap<String, Vec<ast_unresolved::CteBinding>>,
+    Vec<String>,
+)> {
+    let mut cte_groups: HashMap<String, Vec<ast_unresolved::CteBinding>> = HashMap::new();
+    let mut cte_order: Vec<String> = Vec::new();
+
+    for cte in ctes {
+        let name = cte.name.clone();
+        let is_new = !cte_groups.contains_key(&name);
+        cte_groups.entry(name.clone()).or_default().push(cte);
+        if is_new {
+            cte_order.push(name);
+        }
+    }
+
+    validate_grouped_cte_dependencies(&cte_groups, &cte_order)?;
+
+    Ok((cte_groups, cte_order))
+}
+
+/// Trait abstracting CTE resolution + registration so that `resolve_cte_bindings`
+/// can be shared between `resolve_query` (which uses a `ResolverFold`) and
+/// `resolve_query_inline` (which calls `resolve_relational_expression_with_pipe_cfes`).
+trait CteResolver {
+    /// Resolve an unresolved relational expression, returning the resolved form
+    /// plus any pipe-collected CFE definitions discovered during resolution.
+    fn resolve_cte_expression(
+        &mut self,
+        expr: ast_unresolved::RelationalExpression,
+    ) -> Result<(
+        ast_resolved::RelationalExpression,
+        Vec<ast_unresolved::CfeDefinition>,
+    )>;
+
+    /// Register a resolved CTE's schema so subsequent CTEs can reference it.
+    fn register_cte(&mut self, name: String, schema: ast_resolved::CprSchema);
+}
+
+/// `ResolverFold` as a CTE resolver — used by the top-level `resolve_query`.
+impl CteResolver for ResolverFold<'_, '_> {
+    fn resolve_cte_expression(
+        &mut self,
+        expr: ast_unresolved::RelationalExpression,
+    ) -> Result<(
+        ast_resolved::RelationalExpression,
+        Vec<ast_unresolved::CfeDefinition>,
+    )> {
+        let (resolved, _bubbled) = self.resolve_relational(expr)?;
+        let cfes = std::mem::take(&mut self.collected_pipe_cfes);
+        Ok((resolved, cfes))
+    }
+
+    fn register_cte(&mut self, name: String, schema: ast_resolved::CprSchema) {
+        self.registry.query_local.register_cte(name, schema);
+    }
+}
+
+/// Wrapper for inline resolution — used by `resolve_query_inline`.
+struct InlineCteResolver<'a, 'db> {
+    registry: &'a mut crate::resolution::EntityRegistry<'db>,
+    outer_context: Option<&'a [ast_resolved::ColumnMetadata]>,
+    config: &'a ResolutionConfig,
+    grounding: Option<&'a ast_unresolved::GroundedPath>,
+}
+
+impl CteResolver for InlineCteResolver<'_, '_> {
+    fn resolve_cte_expression(
+        &mut self,
+        expr: ast_unresolved::RelationalExpression,
+    ) -> Result<(
+        ast_resolved::RelationalExpression,
+        Vec<ast_unresolved::CfeDefinition>,
+    )> {
+        let (resolved, _bubbled, pipe_cfes) = resolve_relational_expression_with_pipe_cfes(
+            expr,
+            self.registry,
+            self.outer_context,
+            self.config,
+            self.grounding,
+        )?;
+        Ok((resolved, pipe_cfes))
+    }
+
+    fn register_cte(&mut self, name: String, schema: ast_resolved::CprSchema) {
+        self.registry.query_local.register_cte(name, schema);
+    }
+}
+
+/// Resolve grouped CTE bindings, registering each CTE in the entity registry
+/// so that later CTEs (and the main query) can reference earlier ones.
+///
+/// The `resolver` handles both expression resolution and CTE registration,
+/// avoiding borrow conflicts by bundling both operations behind a single
+/// `&mut self`.
+///
+/// The helper handles schema extraction, table-name transformation, CTE
+/// registration, and multi-head UNION assembly.
+fn resolve_cte_bindings(
+    mut cte_groups: HashMap<String, Vec<ast_unresolved::CteBinding>>,
+    cte_order: &[String],
+    resolver: &mut dyn CteResolver,
+) -> Result<(
+    Vec<ast_resolved::CteBinding>,
+    Vec<ast_unresolved::CfeDefinition>,
+)> {
+    let mut resolved_ctes = Vec::new();
+    let mut all_pipe_cfes = Vec::new();
+
+    for name in cte_order {
+        let group = cte_groups
+            .remove(name)
+            .expect("CTE should exist after ordering - invariant violation");
+
+        if group.len() == 1 {
+            // Single CTE — resolve normally
+            let cte = group
+                .into_iter()
+                .next()
+                .expect("Group has len==1, must have element - invariant");
+            let (resolved_expr, pipe_cfes) = resolver.resolve_cte_expression(cte.expression)?;
+            all_pipe_cfes.extend(pipe_cfes);
+            let mut cte_schema = extract_cpr_schema(&resolved_expr)?;
+            cte_schema = transform_schema_table_names(cte_schema, name);
+            resolver.register_cte(name.clone(), cte_schema);
+
+            resolved_ctes.push(ast_resolved::CteBinding {
+                expression: resolved_expr,
+                name: name.clone(),
+                is_recursive: ast_resolved::PhaseBox::phantom(),
+            });
+        } else {
+            // Multiple CTEs with same name — create UNION
+            let mut operands = Vec::new();
+            let mut schemas = Vec::new();
+            let mut all_schemas_same = true;
+
+            for (idx, cte) in group.iter().enumerate() {
+                let (resolved_expr, pipe_cfes) =
+                    resolver.resolve_cte_expression(cte.expression.clone())?;
+                all_pipe_cfes.extend(pipe_cfes);
+                let expr_schema = extract_cpr_schema(&resolved_expr)?;
+
+                // After first head, register the CTE so recursive heads can reference it
+                if idx == 0 {
+                    let mut base_schema = expr_schema.clone();
+                    base_schema = transform_schema_table_names(base_schema, name);
+                    resolver.register_cte(name.clone(), base_schema);
+                }
+
+                if !schemas.is_empty() {
+                    if validate_union_compatible_schemas(&schemas[0], &expr_schema).is_err() {
+                        all_schemas_same = false;
+                    }
+                }
+
+                schemas.push(expr_schema);
+                operands.push(resolved_expr);
+            }
+
+            let (operator, final_schema) = if all_schemas_same {
+                (
+                    ast_resolved::SetOperator::UnionAllPositional,
+                    schemas[0].clone(),
+                )
+            } else {
+                let unified = build_corresponding_schema(&schemas)?;
+                (ast_resolved::SetOperator::UnionCorresponding, unified)
+            };
+
+            let mut final_schema = final_schema;
+            final_schema = transform_schema_table_names(final_schema, name);
+            resolver.register_cte(name.clone(), final_schema.clone());
+
+            let union_expr = ast_resolved::RelationalExpression::SetOperation {
+                operator,
+                operands,
+                correlation: ast_resolved::PhaseBox::pass_through_correlation(
+                    ast_unresolved::PhaseBox::no_correlation(),
+                ),
+                cpr_schema: ast_resolved::PhaseBox::new(final_schema),
+            };
+
+            resolved_ctes.push(ast_resolved::CteBinding {
+                expression: union_expr,
+                name: name.clone(),
+                is_recursive: ast_resolved::PhaseBox::phantom(),
+            });
+        }
+    }
+
+    Ok((resolved_ctes, all_pipe_cfes))
+}
+
 /// Resolve a full Query (which may contain CTEs)
 ///
 /// Returns the resolved query along with connection routing information.
@@ -147,9 +392,17 @@ pub fn resolve_query(
     // grounding, etc.) — not just inside pipe operators.
     let (query, ccafe_cfes) = grounding::inline_in_query_borrowed(query, &registry.consult, None)?;
 
-    log::debug!("inline_in_query_borrowed collected {} CFE definitions", ccafe_cfes.len());
+    log::debug!(
+        "inline_in_query_borrowed collected {} CFE definitions",
+        ccafe_cfes.len()
+    );
     for cfe in &ccafe_cfes {
-        log::debug!("  CFE: '{}' params={:?} curried={:?}", cfe.name, cfe.parameters, cfe.curried_params);
+        log::debug!(
+            "  CFE: '{}' params={:?} curried={:?}",
+            cfe.name,
+            cfe.parameters,
+            cfe.curried_params
+        );
     }
 
     // If any DDL functions were discovered during inlining,
@@ -208,122 +461,10 @@ pub fn resolve_query(
             ctes,
             query: main_query,
         } => {
-            // Group CTEs by name for merging
-            let mut cte_groups: HashMap<String, Vec<ast_unresolved::CteBinding>> = HashMap::new();
-            let mut cte_order: Vec<String> = Vec::new(); // Track order of first appearance
-
-            for cte in ctes {
-                let name = cte.name.clone();
-                let is_new = !cte_groups.contains_key(&name);
-                cte_groups.entry(name.clone()).or_default().push(cte);
-
-                // Track the order of first appearance for each unique name
-                if is_new {
-                    cte_order.push(name);
-                }
-            }
-
-            // Validate CTE dependencies on the grouped structure
-            validate_grouped_cte_dependencies(&cte_groups, &cte_order)?;
-
-            // Process each group of CTEs in order of first appearance
-            let mut resolved_ctes = Vec::new();
-
-            for name in &cte_order {
-                let group = cte_groups
-                    .remove(name)
-                    .expect("CTE should exist after topological sort - invariant violation");
-                if group.len() == 1 {
-                    // Single CTE - process normally
-                    let cte = group
-                        .into_iter()
-                        .next()
-                        .expect("Group has len==1, must have element - invariant");
-                    let (resolved_expr, _) = fold.resolve_relational(cte.expression)?;
-                    let mut cte_schema = extract_cpr_schema(&resolved_expr)?;
-                    // Transform the schema to use the CTE's name as the table name
-                    cte_schema = transform_schema_table_names(cte_schema, name);
-                    // Register the CTE in the EntityRegistry
-                    fold.registry
-                        .query_local
-                        .register_cte(name.clone(), cte_schema);
-
-                    resolved_ctes.push(ast_resolved::CteBinding {
-                        expression: resolved_expr,
-                        name: name.clone(),
-                        is_recursive: ast_resolved::PhaseBox::phantom(),
-                    });
-                } else {
-                    // Multiple CTEs with same name - create UNION
-                    let mut operands = Vec::new();
-                    let mut schemas = Vec::new();
-                    let mut all_schemas_same = true;
-
-                    for (idx, cte) in group.iter().enumerate() {
-                        let (resolved_expr, _) = fold.resolve_relational(cte.expression.clone())?;
-                        let expr_schema = extract_cpr_schema(&resolved_expr)?;
-
-                        // CRITICAL: After first head, register the CTE so recursive heads can reference it!
-                        // This enables recursive CTEs where later heads reference the CTE being defined
-                        if idx == 0 {
-                            let mut base_schema = expr_schema.clone();
-                            base_schema = transform_schema_table_names(base_schema, name);
-                            fold.registry
-                                .query_local
-                                .register_cte(name.clone(), base_schema);
-                        }
-
-                        // Check if schemas are the same
-                        if !schemas.is_empty() {
-                            // Try strict validation to see if schemas match
-                            if validate_union_compatible_schemas(&schemas[0], &expr_schema).is_err()
-                            {
-                                all_schemas_same = false;
-                            }
-                        }
-
-                        schemas.push(expr_schema);
-                        operands.push(resolved_expr);
-                    }
-
-                    // Choose operator based on whether schemas match
-                    let (operator, final_schema) = if all_schemas_same {
-                        // All schemas are the same - use positional union
-                        (
-                            ast_resolved::SetOperator::UnionAllPositional,
-                            schemas[0].clone(),
-                        )
-                    } else {
-                        // Different schemas - use UNION CORRESPONDING
-                        let unified = build_corresponding_schema(&schemas)?;
-                        (ast_resolved::SetOperator::UnionCorresponding, unified)
-                    };
-
-                    // Transform the schema to use the CTE's name as the table name
-                    let mut final_schema = final_schema;
-                    final_schema = transform_schema_table_names(final_schema, name);
-                    // Register the CTE in the EntityRegistry
-                    fold.registry
-                        .query_local
-                        .register_cte(name.clone(), final_schema.clone());
-
-                    // Create SetOperation node (resolver can't set correlation)
-                    let union_expr = ast_resolved::RelationalExpression::SetOperation {
-                        operator,
-                        operands,
-                        correlation: ast_resolved::PhaseBox::pass_through_correlation(
-                            ast_unresolved::PhaseBox::no_correlation(),
-                        ),
-                        cpr_schema: ast_resolved::PhaseBox::new(final_schema),
-                    };
-
-                    resolved_ctes.push(ast_resolved::CteBinding {
-                        expression: union_expr,
-                        name: name.clone(),
-                        is_recursive: ast_resolved::PhaseBox::phantom(),
-                    });
-                }
-            }
+            let (cte_groups, cte_order) = group_ctes(ctes)?;
+            let (resolved_ctes, cte_pipe_cfes) =
+                resolve_cte_bindings(cte_groups, &cte_order, &mut fold)?;
+            fold.collected_pipe_cfes.extend(cte_pipe_cfes);
 
             // Now resolve the main query with all CTEs in registry
             let (resolved_main_query, _) = fold.resolve_relational(main_query)?;
@@ -359,13 +500,8 @@ pub fn resolve_query(
                     Box::new(ast_resolved::Query::Relational(resolved))
                 }
                 other => {
-                    let (inner, _bubbled) = resolve_query_inline(
-                        other,
-                        fold.registry,
-                        None,
-                        &config,
-                        None,
-                    )?;
+                    let (inner, _bubbled) =
+                        resolve_query_inline(other, fold.registry, None, &config, None)?;
                     Box::new(inner)
                 }
             };
@@ -423,10 +559,7 @@ pub fn resolve_query(
                 query: inner,
             } => {
                 cfes.append(&mut precompiled);
-                ast_resolved::Query::WithPrecompiledCfes {
-                    cfes,
-                    query: inner,
-                }
+                ast_resolved::Query::WithPrecompiledCfes { cfes, query: inner }
             }
             other => ast_resolved::Query::WithPrecompiledCfes {
                 cfes: precompiled,
@@ -483,8 +616,7 @@ pub(crate) fn resolve_query_inline(
             // pipe-level CFEs (from inline_consulted_functions_in_operator)
             pipe_cfes.extend(ccafe_cfes);
             let resolved_query = ast_resolved::Query::Relational(resolved_expr);
-            let resolved_query =
-                wrap_with_pipe_cfes(resolved_query, pipe_cfes, registry)?;
+            let resolved_query = wrap_with_pipe_cfes(resolved_query, pipe_cfes, registry)?;
             Ok((resolved_query, bubbled))
         }
         ast_unresolved::Query::WithCtes {
@@ -503,118 +635,18 @@ pub(crate) fn resolve_query_inline(
                 _ => unreachable!("inline_in_query_borrowed preserves WithCtes variant"),
             };
 
-            // Group CTEs by name for merging (same logic as resolve_query)
-            let mut cte_groups: HashMap<String, Vec<ast_unresolved::CteBinding>> = HashMap::new();
-            let mut cte_order: Vec<String> = Vec::new();
+            let (cte_groups, cte_order) = group_ctes(ctes)?;
 
-            for cte in ctes {
-                let name = cte.name.clone();
-                let is_new = !cte_groups.contains_key(&name);
-                cte_groups.entry(name.clone()).or_default().push(cte);
-                if is_new {
-                    cte_order.push(name);
-                }
-            }
-
-            validate_grouped_cte_dependencies(&cte_groups, &cte_order)?;
-
-            let mut resolved_ctes = Vec::new();
-            let mut all_pipe_cfes = Vec::new();
-
-            for name in &cte_order {
-                let group = cte_groups
-                    .remove(name)
-                    .expect("CTE should exist after ordering - invariant violation");
-                if group.len() == 1 {
-                    let cte = group
-                        .into_iter()
-                        .next()
-                        .expect("Group has len==1, must have element - invariant");
-                    let (resolved_expr, _, pipe_cfes) =
-                        resolve_relational_expression_with_pipe_cfes(
-                            cte.expression,
-                            registry,
-                            outer_context,
-                            config,
-                            grounding,
-                        )?;
-                    all_pipe_cfes.extend(pipe_cfes);
-                    let mut cte_schema = extract_cpr_schema(&resolved_expr)?;
-                    cte_schema = transform_schema_table_names(cte_schema, name);
-                    registry.query_local.register_cte(name.clone(), cte_schema);
-
-                    resolved_ctes.push(ast_resolved::CteBinding {
-                        expression: resolved_expr,
-                        name: name.clone(),
-                        is_recursive: ast_resolved::PhaseBox::phantom(),
-                    });
-                } else {
-                    // Multiple CTEs with same name — create UNION
-                    let mut operands = Vec::new();
-                    let mut schemas = Vec::new();
-                    let mut all_schemas_same = true;
-
-                    for (idx, cte) in group.iter().enumerate() {
-                        let (resolved_expr, _, pipe_cfes) =
-                            resolve_relational_expression_with_pipe_cfes(
-                                cte.expression.clone(),
-                                registry,
-                                outer_context,
-                                config,
-                                grounding,
-                            )?;
-                        all_pipe_cfes.extend(pipe_cfes);
-                        let expr_schema = extract_cpr_schema(&resolved_expr)?;
-
-                        if idx == 0 {
-                            let mut base_schema = expr_schema.clone();
-                            base_schema = transform_schema_table_names(base_schema, name);
-                            registry.query_local.register_cte(name.clone(), base_schema);
-                        }
-
-                        if !schemas.is_empty() {
-                            if validate_union_compatible_schemas(&schemas[0], &expr_schema).is_err()
-                            {
-                                all_schemas_same = false;
-                            }
-                        }
-
-                        schemas.push(expr_schema);
-                        operands.push(resolved_expr);
-                    }
-
-                    let (operator, final_schema) = if all_schemas_same {
-                        (
-                            ast_resolved::SetOperator::UnionAllPositional,
-                            schemas[0].clone(),
-                        )
-                    } else {
-                        let unified = build_corresponding_schema(&schemas)?;
-                        (ast_resolved::SetOperator::UnionCorresponding, unified)
-                    };
-
-                    let mut final_schema = final_schema;
-                    final_schema = transform_schema_table_names(final_schema, name);
-                    registry
-                        .query_local
-                        .register_cte(name.clone(), final_schema.clone());
-
-                    let union_expr = ast_resolved::RelationalExpression::SetOperation {
-                        operator,
-                        operands,
-                        correlation: ast_resolved::PhaseBox::pass_through_correlation(
-                            ast_unresolved::PhaseBox::no_correlation(),
-                        ),
-                        cpr_schema: ast_resolved::PhaseBox::new(final_schema),
-                    };
-
-                    resolved_ctes.push(ast_resolved::CteBinding {
-                        expression: union_expr,
-                        name: name.clone(),
-                        is_recursive: ast_resolved::PhaseBox::phantom(),
-                    });
-                }
-            }
+            // Resolve CTEs using the InlineCteResolver wrapper
+            let (resolved_ctes, mut all_pipe_cfes) = {
+                let mut inline_resolver = InlineCteResolver {
+                    registry: &mut *registry,
+                    outer_context,
+                    config,
+                    grounding,
+                };
+                resolve_cte_bindings(cte_groups, &cte_order, &mut inline_resolver)?
+            };
 
             // Resolve the main query with all CTEs registered
             let (resolved_main, bubbled, main_pipe_cfes) =
@@ -632,8 +664,7 @@ pub(crate) fn resolve_query_inline(
                 ctes: resolved_ctes,
                 query: resolved_main,
             };
-            let resolved_query =
-                wrap_with_pipe_cfes(resolved_query, all_pipe_cfes, registry)?;
+            let resolved_query = wrap_with_pipe_cfes(resolved_query, all_pipe_cfes, registry)?;
             Ok((resolved_query, bubbled))
         }
         ast_unresolved::Query::WithPrecompiledCfes { cfes, query } => {
@@ -719,10 +750,7 @@ fn wrap_with_pipe_cfes(
             query: inner,
         } => {
             cfes.append(&mut precompiled);
-            Ok(ast_resolved::Query::WithPrecompiledCfes {
-                cfes,
-                query: inner,
-            })
+            Ok(ast_resolved::Query::WithPrecompiledCfes { cfes, query: inner })
         }
         other => Ok(ast_resolved::Query::WithPrecompiledCfes {
             cfes: precompiled,
@@ -795,6 +823,9 @@ fn collect_exists_table_columns(
         ast_unresolved::RelationalExpression::ErJoinChain { .. }
         | ast_unresolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before EXISTS collection")
+        }
+        ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }
@@ -889,8 +920,8 @@ fn expand_er_join_chain(
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
-    left_endpoint_alias: Option<delightql_types::SqlIdentifier>,
-    right_endpoint_alias: Option<delightql_types::SqlIdentifier>,
+    _left_endpoint_alias: Option<delightql_types::SqlIdentifier>,
+    _right_endpoint_alias: Option<delightql_types::SqlIdentifier>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     if relations.len() < 2 {
         return Err(DelightQLError::validation_error(
@@ -1384,6 +1415,7 @@ fn add_self_alias_to_relation(rel: ast_unresolved::Relation) -> ast_unresolved::
         ast_unresolved::Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema,
             domain_spec,
             alias: None,
             outer,
@@ -1395,6 +1427,7 @@ fn add_self_alias_to_relation(rel: ast_unresolved::Relation) -> ast_unresolved::
             alias: Some(identifier.name.clone()),
             identifier,
             canonical_name,
+            backend_schema,
             domain_spec,
             outer,
             mutation_target,
@@ -1418,7 +1451,7 @@ fn expand_er_transitive_join(
     grounding: Option<&ast_unresolved::GroundedPath>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     // Extract table names (and alias/domain_spec) from endpoints
-    let (left_name, left_alias, left_domain_spec) = match &left {
+    let (left_name, left_alias, _left_domain_spec) = match &left {
         ast_unresolved::RelationalExpression::Relation(rel) => match rel {
             ast_unresolved::Relation::Ground {
                 identifier,
@@ -1444,7 +1477,7 @@ fn expand_er_transitive_join(
             ))
         }
     };
-    let (right_name, right_alias, right_domain_spec) = match &right {
+    let (right_name, right_alias, _right_domain_spec) = match &right {
         ast_unresolved::RelationalExpression::Relation(rel) => match rel {
             ast_unresolved::Relation::Ground {
                 identifier,
@@ -1556,6 +1589,7 @@ fn expand_er_transitive_join(
                 grounding: None,
             },
             canonical_name: ast_unresolved::PhaseBox::phantom(),
+            backend_schema: ast_unresolved::PhaseBox::phantom(),
             domain_spec: ast_unresolved::DomainSpec::Glob,
             alias: None,
             outer: false,
@@ -1609,6 +1643,7 @@ fn rename_in_resolved_expr(
                 ast_resolved::Relation::Ground {
                     identifier,
                     canonical_name,
+                    backend_schema,
                     domain_spec,
                     alias,
                     outer,
@@ -1623,6 +1658,7 @@ fn rename_in_resolved_expr(
                         ast_resolved::Relation::Ground {
                             identifier,
                             canonical_name,
+                            backend_schema,
                             domain_spec,
                             alias: Some(new_name.clone()),
                             outer,
@@ -1635,6 +1671,7 @@ fn rename_in_resolved_expr(
                         ast_resolved::Relation::Ground {
                             identifier,
                             canonical_name,
+                            backend_schema,
                             domain_spec,
                             alias,
                             outer,
@@ -1754,9 +1791,9 @@ fn rename_schema(
         ast_resolved::CprSchema::Resolved(cols) => ast_resolved::CprSchema::Resolved(
             cols.into_iter()
                 .map(|mut col| {
-                    if let ast_resolved::TableName::Named(ref tn) = col.fq_table.name {
+                    if let ast_resolved::TableName::Named(ref tn) = col.table_name {
                         if tn.as_str() == old_name {
-                            col.fq_table.name = ast_resolved::TableName::Named(new_name.clone());
+                            col.table_name = ast_resolved::TableName::Named(new_name.clone());
                         }
                     }
                     col
@@ -1774,9 +1811,9 @@ fn rename_bubbled_columns(
     new_name: &delightql_types::SqlIdentifier,
 ) {
     for col in &mut bubbled.i_provide {
-        if let ast_resolved::TableName::Named(ref tn) = col.fq_table.name {
+        if let ast_resolved::TableName::Named(ref tn) = col.table_name {
             if tn.as_str() == old_name {
-                col.fq_table.name = ast_resolved::TableName::Named(new_name.clone());
+                col.table_name = ast_resolved::TableName::Named(new_name.clone());
             }
         }
     }
@@ -1937,7 +1974,8 @@ fn extract_grounding_from_source(
         ast_unresolved::RelationalExpression::Join { .. }
         | ast_unresolved::RelationalExpression::SetOperation { .. }
         | ast_unresolved::RelationalExpression::ErJoinChain { .. }
-        | ast_unresolved::RelationalExpression::ErTransitiveJoin { .. } => None,
+        | ast_unresolved::RelationalExpression::ErTransitiveJoin { .. }
+        | ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => None,
     }
 }
 
@@ -1991,6 +2029,9 @@ fn scan_for_in_predicates(
         // but recurse defensively.
         ast_unresolved::RelationalExpression::ErJoinChain { .. }
         | ast_unresolved::RelationalExpression::ErTransitiveJoin { .. } => {}
+        ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -2099,6 +2140,9 @@ fn scan_resolved_for_in_predicates(
         ast_resolved::RelationalExpression::ErJoinChain { .. }
         | ast_resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before IN predicate scanning")
+        }
+        ast_resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }
@@ -2262,6 +2306,9 @@ fn find_mutation_targets(expr: &ast_unresolved::RelationalExpression) -> Vec<Str
         ast_unresolved::RelationalExpression::ErTransitiveJoin { left, right, .. } => {
             targets.extend(find_mutation_targets(left));
             targets.extend(find_mutation_targets(right));
+        }
+        ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
     targets

@@ -83,7 +83,9 @@ cd ..
 tar czf untracked/delightql-cli.tar.gz \
    target/release-tiny/dql \
    target/release-tiny/dql-fmt \
-   ./lua/dql.lua \
+   ./lua/dql.lua  \
+   ./lua/dql/init.lua  \
+   ./lua/dql/protocol.lua  \
   ./grammar_dql/delightql_v2.so \
   ./config/highlights.scm \
   ./config/theme-*.toml

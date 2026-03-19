@@ -1097,6 +1097,7 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
             passthrough,
             cpr_schema,
             hygienic_injections,
+            backend_schema,
         } => Ok(Relation::Ground {
             identifier,
             canonical_name: canonical_name.rephase(),
@@ -1107,6 +1108,7 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
             passthrough,
             cpr_schema: cpr_schema.rephase(),
             hygienic_injections,
+            backend_schema: backend_schema.rephase(),
         }),
         Relation::Anonymous {
             column_headers,
@@ -1144,6 +1146,7 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
             grounding,
             cpr_schema,
             ho_arguments,
+            backend_schema,
         } => Ok(Relation::TVF {
             function,
             argument_groups,
@@ -1152,15 +1155,16 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
             namespace,
             grounding,
             cpr_schema: cpr_schema.rephase(),
+            backend_schema: backend_schema.rephase(),
             ho_arguments: ho_arguments
                 .into_iter()
                 .map(|a| match a {
-                    crate::pipeline::asts::core::operators::HoArgument::Table(r) => {
-                        t.transform_relational(r).map(crate::pipeline::asts::core::operators::HoArgument::Table)
-                    }
-                    crate::pipeline::asts::core::operators::HoArgument::Scalar(d) => {
-                        t.transform_domain(d).map(crate::pipeline::asts::core::operators::HoArgument::Scalar)
-                    }
+                    crate::pipeline::asts::core::operators::HoArgument::Table(r) => t
+                        .transform_relational(r)
+                        .map(crate::pipeline::asts::core::operators::HoArgument::Table),
+                    crate::pipeline::asts::core::operators::HoArgument::Scalar(d) => t
+                        .transform_domain(d)
+                        .map(crate::pipeline::asts::core::operators::HoArgument::Scalar),
                 })
                 .collect::<Result<Vec<_>>>()?,
         }),
@@ -1265,6 +1269,20 @@ pub fn walk_transform_relational<P, Q, F: AstTransform<P, Q> + ?Sized>(
                 right: Box::new(t.transform_relational_action(*right)?.into_inner()),
             })
         }
+        RelationalExpression::IntersectCorresponding {
+            operands,
+            correlation,
+            min_multiplicity,
+            cpr_schema,
+        } => Ok(RelationalExpression::IntersectCorresponding {
+            operands: operands
+                .into_iter()
+                .map(|e| Ok(t.transform_relational_action(e)?.into_inner()))
+                .collect::<Result<Vec<_>>>()?,
+            correlation: t.transform_boolean(correlation)?,
+            min_multiplicity,
+            cpr_schema: cpr_schema.rephase(),
+        }),
     }
 }
 

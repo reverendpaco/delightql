@@ -6516,6 +6516,9 @@ fn walk_relational_for_tree_groups(
             walk_relational_for_tree_groups(conn, entity_id, left)?;
             walk_relational_for_tree_groups(conn, entity_id, right)?;
         }
+        RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 
     Ok(())

@@ -79,6 +79,9 @@ fn expression_references_name(expr: &ast_refined::RelationalExpression, name: &s
             .any(|op| expression_references_name(op, name)),
         ast_refined::RelationalExpression::ErJoinChain { .. }
         | ast_refined::RelationalExpression::ErTransitiveJoin { .. } => false,
+        ast_refined::RelationalExpression::IntersectCorresponding { operands, .. } => operands
+            .iter()
+            .any(|op| expression_references_name(op, name)),
     }
 }
 
@@ -196,6 +199,11 @@ fn walk_relational_for_tree_groups(
         }
         ast_addressed::RelationalExpression::ErJoinChain { .. }
         | ast_addressed::RelationalExpression::ErTransitiveJoin { .. } => {}
+        ast_addressed::RelationalExpression::IntersectCorresponding { operands, .. } => {
+            for operand in operands.iter_mut() {
+                walk_relational_for_tree_groups(operand, counter);
+            }
+        }
     }
 }
 

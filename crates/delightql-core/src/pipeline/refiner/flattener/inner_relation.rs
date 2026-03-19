@@ -190,6 +190,7 @@ pub(super) fn flatten_inner_relation(
             segment.tables.push(FlatTable {
                 identifier: identifier.clone(),
                 canonical_name: None,
+                backend_schema: None,
                 alias: alias.clone(),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
@@ -246,6 +247,7 @@ pub(super) fn flatten_inner_relation(
             segment.tables.push(FlatTable {
                 identifier: identifier.clone(),
                 canonical_name: None,
+                backend_schema: None,
                 alias: alias.clone(),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,

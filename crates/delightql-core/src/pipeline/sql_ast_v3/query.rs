@@ -77,6 +77,10 @@ impl SelectStatement {
         &self.select_list
     }
 
+    pub fn select_list_mut(&mut self) -> &mut Vec<SelectItem> {
+        &mut self.select_list
+    }
+
     pub fn from(&self) -> Option<&[TableExpression]> {
         self.from.as_deref()
     }

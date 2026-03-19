@@ -111,7 +111,7 @@ pub(super) fn resolve_general_via_fold(
             if let Some(qual) = qualifier {
                 let count_before = output_columns.len();
                 for col in available {
-                    if let ast_resolved::TableName::Named(table_name) = &col.fq_table.name {
+                    if let ast_resolved::TableName::Named(table_name) = &col.table_name {
                         if table_name == qual {
                             output_columns.push(col.clone());
                         }

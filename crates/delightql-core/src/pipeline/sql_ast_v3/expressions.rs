@@ -1,5 +1,4 @@
 use crate::pipeline::ast_refined::LiteralValue;
-use crate::pipeline::transformer_v3::QualifierMint;
 use serde::{Deserialize, Serialize};
 
 use super::operators::{BinaryOperator, UnaryOperator};
@@ -48,18 +47,13 @@ pub enum QualifierParts<'a> {
 
 impl ColumnQualifier {
     /// Construct a table-qualified ColumnQualifier.
-    ///
-    /// Transformer code should use `QualifierScope::structural()` or
-    /// `QualifierScope::qualify_column()` instead of calling this directly.
-    /// Direct usage should be limited to `qualifier_scope.rs` and tests.
-    pub(in crate::pipeline) fn table(name: impl Into<String>, _mint: &QualifierMint) -> Self {
+    pub(in crate::pipeline) fn table(name: impl Into<String>) -> Self {
         ColumnQualifier(ColumnQualifierKind::Table(name.into()))
     }
 
     pub(in crate::pipeline) fn schema_table(
         schema: impl Into<String>,
         table: impl Into<String>,
-        _mint: &QualifierMint,
     ) -> Self {
         ColumnQualifier(ColumnQualifierKind::SchemaTable {
             schema: schema.into(),
@@ -175,6 +169,18 @@ pub enum DomainExpression {
     /// Raw SQL expression - for cases where we need to inject literal SQL
     /// EPOCH 7: Used for melt json_array packets with column references
     RawSql(String),
+
+    /// Row value constructor: (expr1, expr2, ...)
+    /// Used for multi-column IN expressions: (a, b) IN (VALUES ...)
+    Tuple(Vec<DomainExpression>),
+
+    /// Predicate-position rewrite call (sigma predicates like +like, +between).
+    /// The generator consults the bin_registry to render this.
+    PredicateRewrite {
+        name: String,
+        args: Vec<DomainExpression>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +226,93 @@ pub enum SqlFrameBound {
     CurrentRow,
     Preceding(Box<DomainExpression>),
     Following(Box<DomainExpression>),
+}
+
+/// A predicate in boolean position (WHERE, ON, HAVING).
+///
+/// Either a plain `DomainExpression` or a rewrite call that the generator
+/// resolves via the bin_registry (sigma predicates like +like, +between).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SqlPredicate {
+    /// A domain expression used as a predicate.
+    Expr(DomainExpression),
+    /// A rewrite-rule predicate (sigma predicates).
+    /// The generator consults the bin_registry to render this.
+    RewriteCall {
+        name: String,
+        args: Vec<DomainExpression>,
+        negated: bool,
+    },
+}
+
+impl SqlPredicate {
+    /// Wrap a `DomainExpression` as a predicate.
+    pub(crate) fn new(expr: DomainExpression) -> Self {
+        Self::Expr(expr)
+    }
+
+    /// Wrap a rewrite-rule predicate.
+    pub(crate) fn rewrite_call(
+        name: impl Into<String>,
+        args: Vec<DomainExpression>,
+        negated: bool,
+    ) -> Self {
+        Self::RewriteCall {
+            name: name.into(),
+            args,
+            negated,
+        }
+    }
+
+    /// Access the inner expression (read-only).
+    /// Panics on RewriteCall — use pattern matching when both variants are possible.
+    pub fn as_expr(&self) -> &DomainExpression {
+        match self {
+            Self::Expr(e) => e,
+            Self::RewriteCall { .. } => panic!("as_expr called on RewriteCall"),
+        }
+    }
+
+    /// Unwrap into a `DomainExpression`.
+    /// RewriteCall converts to `DomainExpression::PredicateRewrite`.
+    pub fn into_expr(self) -> DomainExpression {
+        match self {
+            Self::Expr(e) => e,
+            Self::RewriteCall {
+                name,
+                args,
+                negated,
+            } => DomainExpression::PredicateRewrite {
+                name,
+                args,
+                negated,
+            },
+        }
+    }
+
+    /// Combine two predicates with AND.
+    pub fn and(self, other: SqlPredicate) -> Self {
+        Self::Expr(DomainExpression::and(vec![
+            self.into_expr(),
+            other.into_expr(),
+        ]))
+    }
+
+    /// Combine two predicates with OR.
+    pub fn or(self, other: SqlPredicate) -> Self {
+        Self::Expr(DomainExpression::or(vec![
+            self.into_expr(),
+            other.into_expr(),
+        ]))
+    }
+
+    /// Negate this predicate.
+    pub fn not(self) -> Self {
+        Self::Expr(DomainExpression::Unary {
+            op: super::operators::UnaryOperator::Not,
+            expr: Box::new(self.into_expr()),
+        })
+    }
 }
 
 // Smart constructors for DomainExpression

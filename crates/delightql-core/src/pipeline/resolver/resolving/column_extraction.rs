@@ -1,6 +1,5 @@
 use crate::pipeline::ast_resolved;
 use crate::pipeline::asts::core::{ProjectionExpr, SubstitutionExpr};
-use crate::pipeline::asts::unresolved::NamespacePath;
 use delightql_types::SqlIdentifier;
 
 /// Check if a domain expression contains any qualified references
@@ -168,9 +167,12 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
                 let mut output_col = col.clone();
 
                 // Preserve the qualification status from the resolved expression.
-                // If the expression had a qualifier (e.g., users.id), mark the column as qualified.
+                // Qualifiers here come from projection expansion (glob, pattern, etc.)
+                // which is resolver-generated, not user-written.
                 if qualifier.is_some() {
-                    output_col.info = output_col.info.with_updated_qualification(true);
+                    output_col.info = output_col.info.with_updated_qualification(
+                        crate::pipeline::asts::core::QualificationSource::Resolver,
+                    );
                 }
 
                 if let Some(alias_name) = alias {
@@ -190,16 +192,14 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
                 // Even for computed columns, preserve qualification status
                 if qualifier.is_some() {
-                    info = info.with_updated_qualification(true);
+                    info = info.with_updated_qualification(
+                        crate::pipeline::asts::core::QualificationSource::Resolver,
+                    );
                 }
 
                 Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                     info,
-                    ast_resolved::FqTable {
-                        parents_path: NamespacePath::empty(),
-                        name: ast_resolved::TableName::Fresh,
-                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    },
+                    ast_resolved::TableName::Fresh,
                     None,
                     true, // Lvar in projection = user explicitly named this column
                 ))
@@ -281,18 +281,16 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
                 // Function with alias creates a new column
                 let mut info = ast_resolved::ColumnProvenance::from_column(alias_name.clone());
 
-                // CRITICAL FIX: If function arguments contain qualified references, mark the output as qualified
+                // If function arguments contain qualified references, propagate as resolver-qualified
                 if has_qualified_args {
-                    info = info.with_updated_qualification(true);
+                    info = info.with_updated_qualification(
+                        crate::pipeline::asts::core::QualificationSource::Resolver,
+                    );
                 }
 
                 Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                     info,
-                    ast_resolved::FqTable {
-                        parents_path: NamespacePath::empty(),
-                        name: ast_resolved::TableName::Fresh,
-                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    },
+                    ast_resolved::TableName::Fresh,
                     None,
                     alias.is_some(), // has_user_name true only if alias provided
                 ))
@@ -304,19 +302,17 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
                 let mut info = ast_resolved::ColumnProvenance::from_column(col_name);
 
-                // CRITICAL: Preserve qualification status even without alias
+                // Propagate qualification from arguments as resolver-qualified
                 if has_qualified_args {
-                    info = info.with_updated_qualification(true);
+                    info = info.with_updated_qualification(
+                        crate::pipeline::asts::core::QualificationSource::Resolver,
+                    );
                 }
 
                 // ALWAYS create a column for function expressions, even without alias
                 Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                     info,
-                    ast_resolved::FqTable {
-                        parents_path: NamespacePath::empty(),
-                        name: ast_resolved::TableName::Fresh,
-                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    },
+                    ast_resolved::TableName::Fresh,
                     None,
                     false, // No alias in this branch, so has_user_name is false
                 ))
@@ -333,11 +329,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
             Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                 ast_resolved::ColumnProvenance::from_column(col_name),
-                ast_resolved::FqTable {
-                    parents_path: NamespacePath::empty(),
-                    name: ast_resolved::TableName::Fresh,
-                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                },
+                ast_resolved::TableName::Fresh,
                 None,
                 alias.is_some(), // has_user_name true only if alias provided
             ))
@@ -353,11 +345,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
             Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                 ast_resolved::ColumnProvenance::from_column(col_name),
-                ast_resolved::FqTable {
-                    parents_path: NamespacePath::empty(),
-                    name: ast_resolved::TableName::Fresh,
-                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                },
+                ast_resolved::TableName::Fresh,
                 None,
                 alias.is_some(), // has_user_name true only if alias provided
             ))
@@ -380,11 +368,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
                 Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                     ast_resolved::ColumnProvenance::from_column(col_name),
-                    ast_resolved::FqTable {
-                        parents_path: NamespacePath::empty(),
-                        name: ast_resolved::TableName::Fresh,
-                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    },
+                    ast_resolved::TableName::Fresh,
                     None,
                     alias.is_some(), // has_user_name true only if alias provided
                 ))
@@ -406,11 +390,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
             Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                 ast_resolved::ColumnProvenance::from_column(col_name),
-                ast_resolved::FqTable {
-                    parents_path: NamespacePath::empty(),
-                    name: ast_resolved::TableName::Fresh,
-                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                },
+                ast_resolved::TableName::Fresh,
                 None,
                 alias.is_some(), // has_user_name true only if alias provided
             ))
@@ -422,11 +402,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
                 let col_name = alias.as_ref().unwrap_or(name).clone();
                 Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                     ast_resolved::ColumnProvenance::from_column(col_name),
-                    ast_resolved::FqTable {
-                        parents_path: NamespacePath::empty(),
-                        name: ast_resolved::TableName::Fresh,
-                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    },
+                    ast_resolved::TableName::Fresh,
                     None,
                     alias.is_some(),
                 ))
@@ -453,11 +429,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
             Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                 ast_resolved::ColumnProvenance::from_column(col_name),
-                ast_resolved::FqTable {
-                    parents_path: NamespacePath::empty(),
-                    name: ast_resolved::TableName::Fresh,
-                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                },
+                ast_resolved::TableName::Fresh,
                 None,
                 alias.is_some(), // has_user_name true only if alias provided
             ))
@@ -471,11 +443,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
 
             Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                 ast_resolved::ColumnProvenance::from_column(col_name),
-                ast_resolved::FqTable {
-                    parents_path: NamespacePath::empty(),
-                    name: ast_resolved::TableName::Fresh,
-                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                },
+                ast_resolved::TableName::Fresh,
                 None,
                 alias.is_some(),
             ))
@@ -488,11 +456,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
                     ast_resolved::ColumnProvenance::from_column(
                         alias.as_ref().expect("Checked is_some() above").clone(),
                     ),
-                    ast_resolved::FqTable {
-                        parents_path: NamespacePath::empty(),
-                        name: ast_resolved::TableName::Fresh,
-                        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    },
+                    ast_resolved::TableName::Fresh,
                     None,
                     true,
                 ))

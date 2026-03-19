@@ -3,7 +3,7 @@
 use crate::enums::EntityType;
 use crate::error::DelightQLError;
 use crate::pipeline::ast_resolved::{
-    ColumnMetadata, ColumnProvenance, CprSchema, FqTable, NamespacePath, TableName,
+    ColumnMetadata, ColumnProvenance, CprSchema, NamespacePath, TableName,
 };
 use crate::pipeline::resolver::DatabaseSchema;
 use log::debug;
@@ -120,20 +120,9 @@ impl<'a> DatabaseRegistry<'a> {
                     .into_iter()
                     .enumerate()
                     .map(|(idx, col)| {
-                        use crate::pipeline::asts::resolved::PhaseBox;
-
                         ColumnMetadata::new(
                             ColumnProvenance::from_column(col.name.clone()),
-                            FqTable {
-                                parents_path: schema
-                                    .map(|s| NamespacePath::single(s))
-                                    .unwrap_or_else(|| NamespacePath::empty()),
-                                name: TableName::Named(table_name.to_string().into()),
-                                // For old-style lookup, backend schema is same as the parsed schema
-                                backend_schema: PhaseBox::from_optional_schema(
-                                    schema.map(|s| s.to_string()),
-                                ),
-                            },
+                            TableName::Named(table_name.to_string().into()),
                             Some(idx + 1), // 1-based position
                         )
                     })
@@ -162,7 +151,14 @@ impl<'a> DatabaseRegistry<'a> {
         &self,
         namespace_path: &NamespacePath,
         table_name: &str,
-    ) -> crate::error::Result<Option<(CprSchema, i64, delightql_types::SqlIdentifier)>> {
+    ) -> crate::error::Result<
+        Option<(
+            CprSchema,
+            i64,
+            delightql_types::SqlIdentifier,
+            Option<String>,
+        )>,
+    > {
         debug!(
             "lookup_table_with_namespace called: namespace={:?}, table={}",
             namespace_path, table_name
@@ -321,17 +317,9 @@ impl<'a> DatabaseRegistry<'a> {
                 .into_iter()
                 .enumerate()
                 .map(|(idx, col)| {
-                    use crate::pipeline::asts::resolved::PhaseBox;
-
                     ColumnMetadata::new(
                         ColumnProvenance::from_column(col.name.clone()),
-                        FqTable {
-                            parents_path: namespace_path.clone(),
-                            name: TableName::Named(canonical_name.clone()),
-                            backend_schema: PhaseBox::from_optional_schema(
-                                backend_schema_opt.clone(),
-                            ),
-                        },
+                        TableName::Named(canonical_name.clone()),
                         Some(idx + 1), // 1-based position
                     )
                 })
@@ -341,6 +329,7 @@ impl<'a> DatabaseRegistry<'a> {
                 CprSchema::Resolved(column_metadata),
                 conn_id,
                 canonical_name.clone(),
+                backend_schema_opt.clone(),
             )
         }))
     }

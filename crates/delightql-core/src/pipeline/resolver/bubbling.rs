@@ -1,8 +1,194 @@
 use super::*;
 use crate::pipeline::ast_resolved;
+use crate::pipeline::ast_transform::{
+    walk_transform_boolean, walk_transform_domain, walk_transform_function, AstTransform,
+    FoldAction,
+};
 use crate::pipeline::ast_unresolved;
+use crate::pipeline::asts::core::Unresolved;
 use crate::system::DelightQLSystem;
 use std::collections::HashMap;
+
+// =============================================================================
+// BubbleCollector — AstTransform-based dependency collector
+// =============================================================================
+
+/// Walks the AST collecting column dependencies (`ColumnReference`) into `deps`.
+///
+/// Implements `AstTransform<Unresolved, Unresolved>` — same-phase identity
+/// transform that intercepts leaf nodes (`Lvar`, `ColumnOrdinal`) to record
+/// column references, and intercepts subquery-bearing nodes (`InnerExists`,
+/// `ScalarSubquery`, `InRelational`) to call `resolve_inner_cpr_during_bubbling`.
+struct BubbleCollector<'a> {
+    deps: Vec<ColumnReference>,
+    schema: &'a dyn DatabaseSchema,
+    system: Option<&'a DelightQLSystem>,
+    cte_context: &'a mut HashMap<String, ast_resolved::CprSchema>,
+    outer_context: Option<&'a [ast_resolved::ColumnMetadata]>,
+}
+
+impl BubbleCollector<'_> {
+    /// Shared logic for InnerExists / ScalarSubquery / InRelational: attempt
+    /// `resolve_inner_cpr_during_bubbling` if the entity is known, otherwise
+    /// skip (consulted-view path handles it later).
+    fn try_resolve_inner_cpr(
+        &mut self,
+        table_name: &str,
+        subquery: ast_unresolved::RelationalExpression,
+    ) {
+        let known =
+            self.schema.table_exists(None, table_name) || self.cte_context.contains_key(table_name);
+        if known {
+            if let Ok(bubble_result) = super::helpers::resolve_inner_cpr_during_bubbling(
+                subquery,
+                self.schema,
+                self.system,
+                self.cte_context,
+                self.outer_context,
+            ) {
+                *self.cte_context = bubble_result.updated_cte_context;
+                self.deps.extend(bubble_result.dependencies);
+            }
+            // On error: fall through with no deps (matches original behavior)
+        }
+        // Entity not in DB/CTEs: skip (consulted view resolution handles it)
+    }
+}
+
+impl AstTransform<Unresolved, Unresolved> for BubbleCollector<'_> {
+    fn transform_domain(
+        &mut self,
+        expr: ast_unresolved::DomainExpression,
+    ) -> Result<ast_unresolved::DomainExpression> {
+        match expr {
+            // Lvar: push Named column reference
+            ast_unresolved::DomainExpression::Lvar {
+                ref name,
+                ref qualifier,
+                ref namespace_path,
+                ..
+            } => {
+                self.deps.push(ColumnReference::Named {
+                    name: name.to_string(),
+                    qualifier: qualifier.as_deref().map(String::from),
+                    schema: namespace_path.first().map(|s| s.to_string()),
+                });
+                Ok(expr)
+            }
+
+            // ColumnOrdinal: push Ordinal column reference
+            ast_unresolved::DomainExpression::ColumnOrdinal(ref ordinal_box) => {
+                let ordinal = ordinal_box.get();
+                self.deps.push(ColumnReference::Ordinal {
+                    position: ordinal.position,
+                    reverse: ordinal.reverse,
+                    qualifier: ordinal.qualifier.clone(),
+                    alias: ordinal.alias.clone(),
+                });
+                Ok(expr)
+            }
+
+            // ScalarSubquery: resolve inner CPR, don't walk into subquery
+            ast_unresolved::DomainExpression::ScalarSubquery {
+                ref identifier,
+                ref subquery,
+                ..
+            } => {
+                let table_name = identifier.name.clone();
+                let sq = (**subquery).clone();
+                self.try_resolve_inner_cpr(&table_name, sq);
+                Ok(expr)
+            }
+
+            // Substitution: error on ContextParameter, otherwise pass through
+            ast_unresolved::DomainExpression::Substitution(ref sub) => {
+                use crate::pipeline::asts::core::SubstitutionExpr;
+                if let SubstitutionExpr::ContextParameter { .. } = sub {
+                    return Err(DelightQLError::ParseError {
+                        message: "ContextParameter should not appear in unresolved phase"
+                            .to_string(),
+                        source: None,
+                        subcategory: None,
+                    });
+                }
+                Ok(expr)
+            }
+
+            // Everything else: delegate to the walk (which recurses into children)
+            other => walk_transform_domain(self, other),
+        }
+    }
+
+    fn transform_boolean(
+        &mut self,
+        expr: ast_unresolved::BooleanExpression,
+    ) -> Result<ast_unresolved::BooleanExpression> {
+        match expr {
+            // InnerExists: resolve inner CPR, don't walk into subquery
+            ast_unresolved::BooleanExpression::InnerExists {
+                ref identifier,
+                ref subquery,
+                ..
+            } => {
+                let table_name = identifier.name.clone();
+                let sq = (**subquery).clone();
+                self.try_resolve_inner_cpr(&table_name, sq);
+                Ok(expr)
+            }
+
+            // InRelational: bubble the value expression, then resolve inner CPR
+            ast_unresolved::BooleanExpression::InRelational {
+                ref identifier,
+                ref subquery,
+                ref value,
+                ..
+            } => {
+                // Walk the value expression to collect its deps
+                let v = (**value).clone();
+                let _ = self.transform_domain(v)?;
+
+                let table_name = identifier.name.clone();
+                let sq = (**subquery).clone();
+                self.try_resolve_inner_cpr(&table_name, sq);
+
+                Ok(expr)
+            }
+
+            // Sigma: no deps to collect (matches original behavior)
+            ast_unresolved::BooleanExpression::Sigma { .. } => Ok(expr),
+
+            // Everything else: delegate to the walk
+            other => walk_transform_boolean(self, other),
+        }
+    }
+
+    fn transform_function(
+        &mut self,
+        func: ast_unresolved::FunctionExpression,
+    ) -> Result<ast_unresolved::FunctionExpression> {
+        match func {
+            // CaseExpression: TODO - skip bubbling (matches original behavior)
+            ast_unresolved::FunctionExpression::CaseExpression { .. } => Ok(func),
+
+            // Curly, Array, MetadataTreeGroup: no deps to collect
+            ast_unresolved::FunctionExpression::Curly { .. }
+            | ast_unresolved::FunctionExpression::Array { .. }
+            | ast_unresolved::FunctionExpression::MetadataTreeGroup { .. } => Ok(func),
+
+            // Everything else: delegate to the walk
+            other => walk_transform_function(self, other),
+        }
+    }
+
+    // Relational expressions inside subqueries should not be walked —
+    // bubbling handles them via resolve_inner_cpr_during_bubbling.
+    fn transform_relational_action(
+        &mut self,
+        e: ast_unresolved::RelationalExpression,
+    ) -> Result<FoldAction<ast_unresolved::RelationalExpression>> {
+        Ok(FoldAction::Replaced(e))
+    }
+}
 
 pub(super) fn bubble_unary_operator(
     operator: ast_unresolved::UnaryRelationalOperator,
@@ -101,27 +287,27 @@ pub(super) fn bubble_unary_operator(
         // MetaIze has no expressions to bubble - schema synthesis happens at resolution time
         ast_unresolved::UnaryRelationalOperator::MetaIze { detailed } => Ok((
             ast_unresolved::UnaryRelationalOperator::MetaIze { detailed },
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // Witness has no expressions to bubble - existence check happens at SQL level
         ast_unresolved::UnaryRelationalOperator::Witness { exists } => Ok((
             ast_unresolved::UnaryRelationalOperator::Witness { exists },
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // Qualify has no expressions to bubble - it just marks columns as qualified
         ast_unresolved::UnaryRelationalOperator::Qualify => Ok((
             ast_unresolved::UnaryRelationalOperator::Qualify,
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // Using has no expressions to bubble - columns are simple strings
         ast_unresolved::UnaryRelationalOperator::Using { columns } => Ok((
             ast_unresolved::UnaryRelationalOperator::Using { columns },
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // UsingAll has no expressions to bubble - validated at join time
         ast_unresolved::UnaryRelationalOperator::UsingAll => Ok((
             ast_unresolved::UnaryRelationalOperator::UsingAll,
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // DmlTerminal has no expressions to bubble - target is a string literal
         ast_unresolved::UnaryRelationalOperator::DmlTerminal {
@@ -136,7 +322,7 @@ pub(super) fn bubble_unary_operator(
                 target_namespace,
                 domain_spec,
             },
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // InteriorDrillDown has no expressions to bubble - column/columns are simple strings
         ast_unresolved::UnaryRelationalOperator::InteriorDrillDown {
@@ -153,17 +339,33 @@ pub(super) fn bubble_unary_operator(
                 interior_schema,
                 groundings,
             },
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // NarrowingDestructure has no expressions to bubble - column/fields are simple strings
         ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields } => Ok((
             ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields },
-            BubbledState::resolved(Vec::new()),
+            BubbledState::empty(),
         )),
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. } => unreachable!(),
     }
+}
+
+/// Bubble a list of domain expressions and collect their dependencies.
+fn bubble_expressions_collect_deps(
+    exprs: &[ast_unresolved::DomainExpression],
+    schema: &dyn DatabaseSchema,
+    system: Option<&DelightQLSystem>,
+    cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
+) -> Result<Vec<ColumnReference>> {
+    let mut deps = Vec::new();
+    for expr in exprs {
+        let (_, bubbled) =
+            bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
+        deps.extend(bubbled.i_need);
+    }
+    Ok(deps)
 }
 
 pub(super) fn bubble_general_operator(
@@ -173,22 +375,12 @@ pub(super) fn bubble_general_operator(
     system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-
-    for expr in &expressions {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-    }
-
+    let deps = bubble_expressions_collect_deps(&expressions, schema, system, cte_context)?;
     let operator = ast_unresolved::UnaryRelationalOperator::General {
         containment_semantic,
         expressions,
     };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_modulo_operator(
@@ -198,49 +390,39 @@ pub(super) fn bubble_modulo_operator(
     system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-
-    match &spec {
+    let deps = match &spec {
         ast_unresolved::ModuloSpec::Columns(cols) => {
-            // Simple columns for distinct/group
-            for expr in cols {
-                let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
-                merged_i_need.extend(bubbled.i_need);
-            }
+            bubble_expressions_collect_deps(cols, schema, system, cte_context)?
         }
         ast_unresolved::ModuloSpec::GroupBy {
             reducing_by,
             reducing_on,
             arbitrary,
         } => {
-            for expr in reducing_by {
-                let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
-                merged_i_need.extend(bubbled.i_need);
-            }
-
-            for expr in reducing_on {
-                let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
-                merged_i_need.extend(bubbled.i_need);
-            }
-
-            for expr in arbitrary {
-                let (_unchanged_expr, bubbled) =
-                    bubble_domain_expression(expr.clone(), schema, system, cte_context, None)?;
-                merged_i_need.extend(bubbled.i_need);
-            }
+            let mut deps =
+                bubble_expressions_collect_deps(reducing_by, schema, system, cte_context)?;
+            deps.extend(bubble_expressions_collect_deps(
+                reducing_on,
+                schema,
+                system,
+                cte_context,
+            )?);
+            deps.extend(bubble_expressions_collect_deps(
+                arbitrary,
+                schema,
+                system,
+                cte_context,
+            )?);
+            deps
         }
-    }
+    };
 
     let operator = ast_unresolved::UnaryRelationalOperator::Modulo {
         containment_semantic,
         spec,
     };
 
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_tupleordering_operator(
@@ -250,21 +432,13 @@ pub(super) fn bubble_tupleordering_operator(
     system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-
-    for spec in &specs {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(spec.column.clone(), schema, system, cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-    }
-
+    let columns: Vec<_> = specs.iter().map(|s| s.column.clone()).collect();
+    let deps = bubble_expressions_collect_deps(&columns, schema, system, cte_context)?;
     let operator = ast_unresolved::UnaryRelationalOperator::TupleOrdering {
         containment_semantic,
         specs,
     };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_mapcover_operator(
@@ -276,17 +450,15 @@ pub(super) fn bubble_mapcover_operator(
     system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-
-    let (_unchanged_func, func_bubbled) =
+    let (_, func_bubbled) =
         bubble_function_expression(function.clone(), schema, system, cte_context)?;
-    merged_i_need.extend(func_bubbled.i_need);
-
-    for col in &columns {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(col.clone(), schema, system, cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-    }
+    let mut deps = func_bubbled.i_need;
+    deps.extend(bubble_expressions_collect_deps(
+        &columns,
+        schema,
+        system,
+        cte_context,
+    )?);
 
     let operator = ast_unresolved::UnaryRelationalOperator::MapCover {
         function,
@@ -294,9 +466,7 @@ pub(super) fn bubble_mapcover_operator(
         containment_semantic,
         conditioned_on,
     };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_projectout_operator(
@@ -304,23 +474,14 @@ pub(super) fn bubble_projectout_operator(
     expressions: Vec<ast_unresolved::DomainExpression>,
     schema: &dyn DatabaseSchema,
     system: Option<&DelightQLSystem>,
-    _cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
+    cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-
-    for expr in &expressions {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(expr.clone(), schema, system, _cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-    }
-
+    let deps = bubble_expressions_collect_deps(&expressions, schema, system, cte_context)?;
     let operator = ast_unresolved::UnaryRelationalOperator::ProjectOut {
         containment_semantic,
         expressions,
     };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_renamecover_operator(
@@ -329,18 +490,10 @@ pub(super) fn bubble_renamecover_operator(
     system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-
-    for spec in &specs {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(spec.from.clone(), schema, system, cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-    }
-
+    let from_exprs: Vec<_> = specs.iter().map(|s| s.from.clone()).collect();
+    let deps = bubble_expressions_collect_deps(&from_exprs, schema, system, cte_context)?;
     let operator = ast_unresolved::UnaryRelationalOperator::RenameCover { specs };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_transform_operator(
@@ -348,45 +501,26 @@ pub(super) fn bubble_transform_operator(
     conditioned_on: Option<Box<ast_unresolved::BooleanExpression>>,
     schema: &dyn DatabaseSchema,
     system: Option<&DelightQLSystem>,
-    _cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
+    cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-    let mut bubbled_transformations = Vec::new();
-
-    for (expr, alias, qual) in transformations {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(expr.clone(), schema, system, _cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-        bubbled_transformations.push((expr, alias, qual));
-    }
-
+    let exprs: Vec<_> = transformations.iter().map(|(e, _, _)| e.clone()).collect();
+    let deps = bubble_expressions_collect_deps(&exprs, schema, system, cte_context)?;
     let operator = ast_unresolved::UnaryRelationalOperator::Transform {
-        transformations: bubbled_transformations,
+        transformations,
         conditioned_on,
     };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_aggregatepipe_operator(
     aggregations: Vec<ast_unresolved::DomainExpression>,
     schema: &dyn DatabaseSchema,
     system: Option<&DelightQLSystem>,
-    _cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
+    cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-
-    for agg in &aggregations {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(agg.clone(), schema, system, _cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-    }
-
+    let deps = bubble_expressions_collect_deps(&aggregations, schema, system, cte_context)?;
     let operator = ast_unresolved::UnaryRelationalOperator::AggregatePipe { aggregations };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_reposition_operator(
@@ -395,25 +529,10 @@ pub(super) fn bubble_reposition_operator(
     system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, BubbledState)> {
-    let mut merged_i_need = Vec::new();
-    let mut bubbled_moves = Vec::new();
-
-    for spec in moves {
-        let (_unchanged_expr, bubbled) =
-            bubble_domain_expression(spec.column.clone(), schema, system, cte_context, None)?;
-        merged_i_need.extend(bubbled.i_need);
-        bubbled_moves.push(ast_unresolved::RepositionSpec {
-            column: spec.column,
-            position: spec.position,
-        });
-    }
-
-    let operator = ast_unresolved::UnaryRelationalOperator::Reposition {
-        moves: bubbled_moves,
-    };
-
-    let state = BubbledState::with_unresolved(Vec::new(), merged_i_need);
-    Ok((operator, state))
+    let columns: Vec<_> = moves.iter().map(|s| s.column.clone()).collect();
+    let deps = bubble_expressions_collect_deps(&columns, schema, system, cte_context)?;
+    let operator = ast_unresolved::UnaryRelationalOperator::Reposition { moves };
+    Ok((operator, BubbledState::with_unresolved(Vec::new(), deps)))
 }
 
 pub(super) fn bubble_domain_expression(
@@ -423,257 +542,18 @@ pub(super) fn bubble_domain_expression(
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
 ) -> Result<(ast_unresolved::DomainExpression, BubbledState)> {
-    match expr.clone() {
-        ast_unresolved::DomainExpression::Lvar {
-            name,
-            qualifier,
-            namespace_path,
-            alias: _,
-            provenance: _,
-        } => {
-            let col_ref = ColumnReference::Named {
-                name: name.to_string(),
-                qualifier: qualifier.as_deref().map(String::from),
-                schema: namespace_path.first().map(|s| s.to_string()),
-            };
-
-            let mut state = BubbledState::resolved(Vec::new());
-            state.i_need.push(col_ref);
-
-            Ok((expr, state))
-        }
-        ast_unresolved::DomainExpression::Literal { value: _, alias: _ } => {
-            let state = BubbledState::resolved(Vec::new());
-
-            Ok((expr, state))
-        }
-        ast_unresolved::DomainExpression::Projection(
-            ast_unresolved::ProjectionExpr::Glob { .. }
-            | ast_unresolved::ProjectionExpr::Pattern { .. },
-        ) => {
-            let state = BubbledState::resolved(Vec::new());
-            Ok((expr, state))
-        }
-        ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
-            let state = BubbledState::resolved(Vec::new());
-            Ok((expr, state))
-        }
-        ast_unresolved::DomainExpression::ValuePlaceholder { .. } => {
-            let state = BubbledState::resolved(Vec::new());
-            Ok((expr, state))
-        }
-        ast_unresolved::DomainExpression::Substitution(ref sub) => {
-            use crate::pipeline::asts::core::SubstitutionExpr;
-            match sub {
-                SubstitutionExpr::Parameter { .. }
-                | SubstitutionExpr::CurriedParameter { .. }
-                | SubstitutionExpr::ContextMarker => {
-                    // Parameters, curried parameters, and context markers don't need bubbling
-                    let state = BubbledState::resolved(Vec::new());
-                    Ok((expr, state))
-                }
-                SubstitutionExpr::ContextParameter { .. } => {
-                    // ContextParameter should never exist in unresolved phase - it's only created during
-                    // postprocessing in refined phase for CCAFE feature
-                    Err(DelightQLError::ParseError {
-                        message: "ContextParameter should not appear in unresolved phase"
-                            .to_string(),
-                        source: None,
-                        subcategory: None,
-                    })
-                }
-            }
-        }
-        ast_unresolved::DomainExpression::Function(f) => {
-            let (_func_unchanged, func_bubbled) =
-                bubble_function_expression(f, schema, system, cte_context)?;
-            Ok((expr, func_bubbled))
-        }
-        ast_unresolved::DomainExpression::Predicate { expr: p, alias: _ } => {
-            match *p {
-                ast_unresolved::BooleanExpression::InnerExists {
-                    exists: _,
-                    identifier,
-                    subquery,
-                    alias: _,
-                    using_columns: _,
-                } => {
-                    let table_name = &identifier.name;
-                    let state = if schema.table_exists(None, table_name)
-                        || cte_context.contains_key(table_name.as_ref())
-                    {
-                        // Table is in database or CTE context — do full bubbling.
-                        // Bubbling operates with incomplete context (no outer columns),
-                        // so correlated subqueries may fail here.  Fall back to empty
-                        // deps; the real resolution phase has the full picture.
-                        match super::helpers::resolve_inner_cpr_during_bubbling(
-                            *subquery,
-                            schema,
-                            system,
-                            cte_context,
-                            outer_context,
-                        ) {
-                            Ok(bubble_result) => {
-                                *cte_context = bubble_result.updated_cte_context;
-                                BubbledState::with_unresolved(
-                                    Vec::new(),
-                                    bubble_result.dependencies,
-                                )
-                            }
-                            Err(_) => BubbledState::resolved(Vec::new()),
-                        }
-                    } else {
-                        // Entity not in DB schema or CTEs — may be a consulted view.
-                        // Skip inner-CPR bubbling; registry-based resolution handles it.
-                        BubbledState::resolved(Vec::new())
-                    };
-
-                    Ok((expr, state))
-                }
-                other => {
-                    let (_pred_unchanged, pred_bubbled) = bubble_predicate_expression(
-                        other,
-                        schema,
-                        system,
-                        cte_context,
-                        outer_context,
-                    )?;
-                    Ok((expr, pred_bubbled))
-                }
-            }
-        }
-        ast_unresolved::DomainExpression::ColumnOrdinal(ordinal_box) => {
-            let ordinal = ordinal_box.get();
-            let col_ref = ColumnReference::Ordinal {
-                position: ordinal.position,
-                reverse: ordinal.reverse,
-                qualifier: ordinal.qualifier.clone(),
-                alias: ordinal.alias.clone(),
-            };
-
-            let mut state = BubbledState::resolved(Vec::new());
-            state.i_need.push(col_ref);
-
-            Ok((expr, state))
-        }
-        ast_unresolved::DomainExpression::Projection(
-            ast_unresolved::ProjectionExpr::ColumnRange(_),
-        ) => {
-            let state = BubbledState::with_unresolved(Vec::new(), Vec::new());
-
-            Ok((expr, state))
-        }
-        ast_unresolved::DomainExpression::PipedExpression {
-            value,
-            transforms,
-            alias: _,
-        } => {
-            // Bubble the value expression
-            let (_, value_state) =
-                bubble_domain_expression(*value, schema, system, cte_context, outer_context)?;
-
-            // Bubble each transform and merge states
-            let mut merged_state = value_state;
-            for transform in transforms {
-                let (_, transform_state) =
-                    bubble_function_expression(transform, schema, system, cte_context)?;
-                merged_state.i_need.extend(transform_state.i_need);
-            }
-
-            Ok((expr, merged_state))
-        }
-        ast_unresolved::DomainExpression::Parenthesized { inner, alias } => {
-            let (bubbled_inner, state) =
-                bubble_domain_expression(*inner, schema, system, cte_context, outer_context)?;
-            Ok((
-                ast_unresolved::DomainExpression::Parenthesized {
-                    inner: Box::new(bubbled_inner),
-                    alias: alias.clone(),
-                },
-                state,
-            ))
-        }
-        ast_unresolved::DomainExpression::Tuple { elements, alias } => {
-            let bubbled_elements: Vec<_> = elements
-                .into_iter()
-                .map(|e| {
-                    let (bubbled, _state) =
-                        bubble_domain_expression(e, schema, system, cte_context, outer_context)?;
-                    Ok(bubbled)
-                })
-                .collect::<Result<_>>()?;
-
-            Ok((
-                ast_unresolved::DomainExpression::Tuple {
-                    elements: bubbled_elements,
-                    alias: alias.clone(),
-                },
-                BubbledState::resolved(Vec::new()),
-            ))
-        }
-        ast_unresolved::DomainExpression::ScalarSubquery {
-            identifier,
-            subquery,
-            alias: _,
-        } => {
-            // Scalar subquery - same pattern as InnerExists but returns a value.
-            // See comment above re: incomplete bubbling context.
-            let table_name = &identifier.name;
-            let state = if schema.table_exists(None, table_name)
-                || cte_context.contains_key(table_name.as_ref())
-            {
-                match super::helpers::resolve_inner_cpr_during_bubbling(
-                    *subquery,
-                    schema,
-                    system,
-                    cte_context,
-                    outer_context,
-                ) {
-                    Ok(bubble_result) => {
-                        *cte_context = bubble_result.updated_cte_context;
-                        BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
-                    }
-                    Err(_) => BubbledState::resolved(Vec::new()),
-                }
-            } else {
-                // Entity not in DB schema or CTEs — may be a consulted view.
-                // Skip inner-CPR bubbling; the registry-based resolution
-                // path will handle validation properly.
-                BubbledState::resolved(Vec::new())
-            };
-
-            Ok((expr, state))
-        }
-
-        // PATH FIRST-CLASS: Epoch 5 - JsonPathLiteral handling
-        // JsonPathLiteral is a simple literal-like value - no dependencies to bubble
-        ast_unresolved::DomainExpression::Projection(
-            ast_unresolved::ProjectionExpr::JsonPathLiteral { .. },
-        ) => {
-            let state = BubbledState::resolved(Vec::new());
-            Ok((expr, state))
-        }
-
-        // Pivot: bubble both children and merge their dependency states
-        ast_unresolved::DomainExpression::PivotOf {
-            value_column,
-            pivot_key,
-            ..
-        } => {
-            let (_, value_state) = bubble_domain_expression(
-                *value_column,
-                schema,
-                system,
-                cte_context,
-                outer_context,
-            )?;
-            let (_, key_state) =
-                bubble_domain_expression(*pivot_key, schema, system, cte_context, outer_context)?;
-            let mut merged_state = value_state;
-            merged_state.i_need.extend(key_state.i_need);
-            Ok((expr, merged_state))
-        }
-    }
+    let mut collector = BubbleCollector {
+        deps: vec![],
+        schema,
+        system,
+        cte_context,
+        outer_context,
+    };
+    let result = collector.transform_domain(expr)?;
+    Ok((
+        result,
+        BubbledState::with_unresolved(Vec::new(), collector.deps),
+    ))
 }
 
 pub(super) fn bubble_function_expression(
@@ -682,183 +562,18 @@ pub(super) fn bubble_function_expression(
     system: Option<&DelightQLSystem>,
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
 ) -> Result<(ast_unresolved::FunctionExpression, BubbledState)> {
-    match func.clone() {
-        ast_unresolved::FunctionExpression::Regular {
-            arguments,
-            conditioned_on,
-            ..
-        } => {
-            let mut merged_state = BubbledState::resolved(Vec::new());
-
-            for arg in arguments {
-                let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(arg_state.i_need);
-            }
-
-            // Also bubble filter condition if present
-            if let Some(cond) = conditioned_on {
-                let (_cond_unchanged, cond_state) =
-                    bubble_predicate_expression(*cond, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(cond_state.i_need);
-            }
-
-            // Return the original unresolved function
-            Ok((func, merged_state))
-        }
-        ast_unresolved::FunctionExpression::Curried {
-            arguments,
-            conditioned_on,
-            ..
-        } => {
-            let mut merged_state = BubbledState::resolved(Vec::new());
-
-            for arg in arguments {
-                let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(arg_state.i_need);
-            }
-
-            if let Some(cond) = conditioned_on {
-                let (_cond_unchanged, cond_state) =
-                    bubble_predicate_expression(*cond, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(cond_state.i_need);
-            }
-
-            Ok((func, merged_state))
-        }
-        ast_unresolved::FunctionExpression::Bracket { arguments, .. } => {
-            let mut merged_state = BubbledState::resolved(Vec::new());
-
-            for arg in arguments {
-                let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(arg_state.i_need);
-            }
-
-            Ok((func, merged_state))
-        }
-        ast_unresolved::FunctionExpression::Infix { left, right, .. } => {
-            let (_left_unchanged, left_state) =
-                bubble_domain_expression(*left, schema, system, cte_context, None)?;
-            let (_right_unchanged, right_state) =
-                bubble_domain_expression(*right, schema, system, cte_context, None)?;
-
-            let mut merged_state = BubbledState::resolved(Vec::new());
-            merged_state.i_need.extend(left_state.i_need);
-            merged_state.i_need.extend(right_state.i_need);
-
-            Ok((func, merged_state))
-        }
-        ast_unresolved::FunctionExpression::Lambda { body, .. } => {
-            // Bubble the lambda body expression
-            let (_body_unchanged, body_state) =
-                bubble_domain_expression(*body, schema, system, cte_context, None)?;
-
-            Ok((func, body_state))
-        }
-        ast_unresolved::FunctionExpression::StringTemplate { parts, .. } => {
-            // Bubble interpolated expressions in the string template
-            let mut merged_state = BubbledState::resolved(Vec::new());
-
-            for part in parts {
-                if let ast_unresolved::StringTemplatePart::Interpolation(expr) = part {
-                    let (_expr_unchanged, expr_state) =
-                        bubble_domain_expression(*expr, schema, system, cte_context, None)?;
-                    merged_state.i_need.extend(expr_state.i_need);
-                }
-            }
-
-            Ok((func, merged_state))
-        }
-        ast_unresolved::FunctionExpression::CaseExpression { .. } => {
-            // TODO: Implement CASE expression bubbling
-            Ok((func, BubbledState::resolved(Vec::new())))
-        }
-        ast_unresolved::FunctionExpression::HigherOrder {
-            curried_arguments,
-            regular_arguments,
-            conditioned_on,
-            ..
-        } => {
-            let mut merged_state = BubbledState::resolved(Vec::new());
-
-            // Bubble curried arguments
-            for arg in curried_arguments {
-                let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(arg_state.i_need);
-            }
-
-            // Bubble regular arguments
-            for arg in regular_arguments {
-                let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(arg_state.i_need);
-            }
-
-            // Bubble filter condition if present
-            if let Some(cond) = conditioned_on {
-                let (_cond_unchanged, cond_state) =
-                    bubble_predicate_expression(*cond, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(cond_state.i_need);
-            }
-
-            // Return the original unresolved function
-            Ok((func, merged_state))
-        }
-        ast_unresolved::FunctionExpression::Curly { .. } => {
-            // Tree groups don't need bubbling (Epoch 1)
-            Ok((func, BubbledState::resolved(Vec::new())))
-        }
-        ast_unresolved::FunctionExpression::Array { .. } => {
-            // Array destructuring don't need bubbling
-            Ok((func, BubbledState::resolved(Vec::new())))
-        }
-        ast_unresolved::FunctionExpression::MetadataTreeGroup { .. } => {
-            // Tree groups don't need bubbling (Epoch 1)
-            Ok((func, BubbledState::resolved(Vec::new())))
-        }
-        ast_unresolved::FunctionExpression::Window {
-            arguments,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            // Window functions: bubble arguments, partition_by, and order_by expressions
-            let mut merged_state = BubbledState::resolved(Vec::new());
-
-            for arg in arguments {
-                let (_arg_unchanged, arg_state) =
-                    bubble_domain_expression(arg, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(arg_state.i_need);
-            }
-
-            for expr in partition_by {
-                let (_expr_unchanged, expr_state) =
-                    bubble_domain_expression(expr, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(expr_state.i_need);
-            }
-
-            for spec in order_by {
-                let (_col_unchanged, col_state) =
-                    bubble_domain_expression(spec.column, schema, system, cte_context, None)?;
-                merged_state.i_need.extend(col_state.i_need);
-            }
-
-            Ok((func, merged_state))
-        }
-        ast_unresolved::FunctionExpression::JsonPath { source, .. } => {
-            // JsonPath: bubble the source expression
-            let mut merged_state = BubbledState::resolved(Vec::new());
-
-            let (_source_unchanged, source_state) =
-                bubble_domain_expression(*source, schema, system, cte_context, None)?;
-            merged_state.i_need.extend(source_state.i_need);
-
-            Ok((func, merged_state))
-        }
-    }
+    let mut collector = BubbleCollector {
+        deps: vec![],
+        schema,
+        system,
+        cte_context,
+        outer_context: None,
+    };
+    let result = collector.transform_function(func)?;
+    Ok((
+        result,
+        BubbledState::with_unresolved(Vec::new(), collector.deps),
+    ))
 }
 
 pub(super) fn bubble_predicate_expression(
@@ -868,185 +583,18 @@ pub(super) fn bubble_predicate_expression(
     cte_context: &mut HashMap<String, ast_resolved::CprSchema>,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
 ) -> Result<(ast_unresolved::BooleanExpression, BubbledState)> {
-    match pred.clone() {
-        ast_unresolved::BooleanExpression::Comparison { left, right, .. } => {
-            let (_left_unchanged, left_state) =
-                bubble_domain_expression(*left, schema, system, cte_context, None)?;
-            let (_right_unchanged, right_state) =
-                bubble_domain_expression(*right, schema, system, cte_context, None)?;
-
-            let mut merged_state = BubbledState::resolved(Vec::new());
-            merged_state.i_need.extend(left_state.i_need);
-            merged_state.i_need.extend(right_state.i_need);
-
-            Ok((pred, merged_state))
-        }
-        ast_unresolved::BooleanExpression::Using { .. } => {
-            let state = BubbledState::resolved(Vec::new());
-
-            Ok((pred, state))
-        }
-        ast_unresolved::BooleanExpression::GlobCorrelation { .. } => {
-            let state = BubbledState::resolved(Vec::new());
-            Ok((pred, state))
-        }
-        ast_unresolved::BooleanExpression::OrdinalGlobCorrelation { .. } => {
-            let state = BubbledState::resolved(Vec::new());
-            Ok((pred, state))
-        }
-        ast_unresolved::BooleanExpression::InnerExists {
-            identifier,
-            subquery,
-            ..
-        } => {
-            let table_name = &identifier.name;
-            let state = if schema.table_exists(None, table_name)
-                || cte_context.contains_key(table_name.as_ref())
-            {
-                // See comment in bubble_domain_expression/InnerExists re:
-                // incomplete bubbling context.
-                match super::helpers::resolve_inner_cpr_during_bubbling(
-                    *subquery,
-                    schema,
-                    system,
-                    cte_context,
-                    outer_context,
-                ) {
-                    Ok(bubble_result) => {
-                        *cte_context = bubble_result.updated_cte_context;
-                        BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies)
-                    }
-                    Err(_) => BubbledState::resolved(Vec::new()),
-                }
-            } else {
-                // Entity not in DB schema or CTEs — may be a consulted view.
-                // Skip inner-CPR bubbling; registry-based resolution handles it.
-                BubbledState::resolved(Vec::new())
-            };
-
-            Ok((pred, state))
-        }
-        ast_unresolved::BooleanExpression::And { left, right } => {
-            let (left_pred, left_state) =
-                bubble_predicate_expression(*left, schema, system, cte_context, outer_context)?;
-            let (right_pred, right_state) =
-                bubble_predicate_expression(*right, schema, system, cte_context, outer_context)?;
-
-            let mut merged_state = BubbledState::resolved(Vec::new());
-            merged_state.i_need.extend(left_state.i_need);
-            merged_state.i_need.extend(right_state.i_need);
-
-            Ok((
-                ast_unresolved::BooleanExpression::And {
-                    left: Box::new(left_pred),
-                    right: Box::new(right_pred),
-                },
-                merged_state,
-            ))
-        }
-        ast_unresolved::BooleanExpression::Or { left, right } => {
-            let (left_pred, left_state) =
-                bubble_predicate_expression(*left, schema, system, cte_context, outer_context)?;
-            let (right_pred, right_state) =
-                bubble_predicate_expression(*right, schema, system, cte_context, outer_context)?;
-
-            let mut merged_state = BubbledState::resolved(Vec::new());
-            merged_state.i_need.extend(left_state.i_need);
-            merged_state.i_need.extend(right_state.i_need);
-
-            Ok((
-                ast_unresolved::BooleanExpression::Or {
-                    left: Box::new(left_pred),
-                    right: Box::new(right_pred),
-                },
-                merged_state,
-            ))
-        }
-        ast_unresolved::BooleanExpression::Not { expr } => {
-            let (inner_pred, inner_state) =
-                bubble_predicate_expression(*expr, schema, system, cte_context, outer_context)?;
-
-            Ok((
-                ast_unresolved::BooleanExpression::Not {
-                    expr: Box::new(inner_pred),
-                },
-                inner_state,
-            ))
-        }
-        ast_unresolved::BooleanExpression::In {
-            value,
-            set,
-            negated: _,
-        } => {
-            // Epoch 2 stub: Just bubble through value and set expressions
-            let (_value_unchanged, value_state) =
-                bubble_domain_expression(*value.clone(), schema, system, cte_context, None)?;
-
-            let mut merged_state = BubbledState::resolved(Vec::new());
-            merged_state.i_need.extend(value_state.i_need);
-
-            for set_expr in &set {
-                let (_set_unchanged, set_state) =
-                    bubble_domain_expression(set_expr.clone(), schema, system, cte_context, None)?;
-                merged_state.i_need.extend(set_state.i_need);
-            }
-
-            Ok((pred, merged_state))
-        }
-        ast_unresolved::BooleanExpression::InRelational {
-            identifier,
-            subquery,
-            value,
-            ..
-        } => {
-            let table_name = &identifier.name;
-            let (_value_unchanged, value_state) =
-                bubble_domain_expression(*value, schema, system, cte_context, None)?;
-
-            let state = if schema.table_exists(None, table_name)
-                || cte_context.contains_key(table_name.as_ref())
-            {
-                // See comment in bubble_domain_expression/InnerExists re:
-                // incomplete bubbling context.
-                match super::helpers::resolve_inner_cpr_during_bubbling(
-                    *subquery,
-                    schema,
-                    system,
-                    cte_context,
-                    outer_context,
-                ) {
-                    Ok(bubble_result) => {
-                        *cte_context = bubble_result.updated_cte_context;
-                        let mut state =
-                            BubbledState::with_unresolved(Vec::new(), bubble_result.dependencies);
-                        state.i_need.extend(value_state.i_need);
-                        state
-                    }
-                    Err(_) => {
-                        let mut state = BubbledState::resolved(Vec::new());
-                        state.i_need.extend(value_state.i_need);
-                        state
-                    }
-                }
-            } else {
-                // Entity not in DB schema or CTEs — may be a consulted view.
-                // Skip inner-CPR bubbling; registry-based resolution handles it.
-                let mut state = BubbledState::resolved(Vec::new());
-                state.i_need.extend(value_state.i_need);
-                state
-            };
-
-            Ok((pred, state))
-        }
-        ast_unresolved::BooleanExpression::BooleanLiteral { value } => Ok((
-            ast_unresolved::BooleanExpression::BooleanLiteral { value },
-            BubbledState::resolved(Vec::new()),
-        )),
-        ast_unresolved::BooleanExpression::Sigma { condition } => Ok((
-            ast_unresolved::BooleanExpression::Sigma { condition },
-            BubbledState::resolved(Vec::new()),
-        )),
-    }
+    let mut collector = BubbleCollector {
+        deps: vec![],
+        schema,
+        system,
+        cte_context,
+        outer_context,
+    };
+    let result = collector.transform_boolean(pred)?;
+    Ok((
+        result,
+        BubbledState::with_unresolved(Vec::new(), collector.deps),
+    ))
 }
 
 /// Helper to bubble column selector
@@ -1059,7 +607,7 @@ fn bubble_column_selector(
     match selector {
         ast_unresolved::ColumnSelector::Explicit(exprs) => {
             let mut bubbled_exprs = Vec::new();
-            let mut combined_state = BubbledState::resolved(Vec::new());
+            let mut combined_state = BubbledState::empty();
 
             for expr in exprs {
                 let (bubbled_expr, expr_state) =
@@ -1073,6 +621,6 @@ fn bubble_column_selector(
                 combined_state,
             ))
         }
-        other => Ok((other, BubbledState::resolved(Vec::new()))),
+        other => Ok((other, BubbledState::empty())),
     }
 }

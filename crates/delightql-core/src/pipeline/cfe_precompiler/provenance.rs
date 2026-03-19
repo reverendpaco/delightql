@@ -82,6 +82,10 @@ pub(super) fn populate_provenance_in_relational(
         | RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains consumed before CFE precompilation")
         }
+        // IntersectCorresponding is produced by the refiner, after CFE precompilation
+        RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 

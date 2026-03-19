@@ -351,6 +351,7 @@ pub(in crate::pipeline::builder_v2) fn parse_scalar_subquery(
                 RelationalExpression::Relation(Relation::Ground {
                     identifier: identifier.clone(),
                     canonical_name: PhaseBox::phantom(),
+                    backend_schema: PhaseBox::phantom(),
                     domain_spec: DomainSpec::Glob,
                     alias: alias.clone().map(|s| s.into()),
                     outer: false,
@@ -364,6 +365,7 @@ pub(in crate::pipeline::builder_v2) fn parse_scalar_subquery(
             RelationalExpression::Relation(Relation::Ground {
                 identifier: identifier.clone(),
                 canonical_name: PhaseBox::phantom(),
+                backend_schema: PhaseBox::phantom(),
                 domain_spec: DomainSpec::Glob,
                 alias: alias.clone().map(|s| s.into()),
                 outer: false,
@@ -377,6 +379,7 @@ pub(in crate::pipeline::builder_v2) fn parse_scalar_subquery(
         RelationalExpression::Relation(Relation::Ground {
             identifier: identifier.clone(),
             canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
             domain_spec: DomainSpec::Glob,
             alias: alias.clone().map(|s| s.into()),
             outer: false,
@@ -462,9 +465,7 @@ pub(in crate::pipeline::builder_v2) fn parse_ho_scalar_subquery(
                     if let DomainExpression::Lvar { name, .. } = dom_expr {
                         if let Some(actual_name) = bindings.table_params.get(name.as_str()) {
                             *name = actual_name.clone().into();
-                        } else if let Some(bound_expr) =
-                            bindings.scalar_params.get(name.as_str())
-                        {
+                        } else if let Some(bound_expr) = bindings.scalar_params.get(name.as_str()) {
                             *dom_expr = bound_expr.clone();
                         }
                     }
@@ -479,6 +480,7 @@ pub(in crate::pipeline::builder_v2) fn parse_ho_scalar_subquery(
         domain_spec: DomainSpec::Glob,
         alias: None,
         namespace,
+        backend_schema: PhaseBox::phantom(),
         grounding,
         cpr_schema: PhaseBox::phantom(),
         argument_groups: None,

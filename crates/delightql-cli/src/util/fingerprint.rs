@@ -204,8 +204,6 @@ fn hash_file(path: &Path) -> Result<String> {
 /// No framing bytes, no type tags, no prefixes, no separators.
 /// Pure data at every level.
 pub fn compute_byte_hash(rows: &[Vec<Option<Vec<u8>>>]) -> String {
-    use delightql_protocol::cell_content_bytes;
-
     let mut row_hashes: Vec<String> = Vec::with_capacity(rows.len());
 
     for row in rows {
@@ -214,7 +212,7 @@ pub fn compute_byte_hash(rows: &[Vec<Option<Vec<u8>>>]) -> String {
         for cell in row {
             let mut cell_hasher = Sha256::new();
             if let Some(bytes) = cell {
-                cell_hasher.update(cell_content_bytes(bytes));
+                cell_hasher.update(bytes);
             }
             // NULL and empty content both hash as SHA-256("")
             row_hasher.update(cell_hasher.finalize());
@@ -307,13 +305,8 @@ mod tests {
 
     #[test]
     fn test_byte_hash_deterministic() {
-        use delightql_protocol::{CELL_TAG_INTEGER, CELL_TAG_TEXT};
-
-        let mut int_cell = vec![CELL_TAG_INTEGER];
-        int_cell.extend_from_slice(&42i64.to_le_bytes());
-
-        let mut text_cell = vec![CELL_TAG_TEXT];
-        text_cell.extend_from_slice(b"Alice");
+        let int_cell = b"42".to_vec();
+        let text_cell = b"Alice".to_vec();
 
         let rows = vec![vec![Some(int_cell.clone()), Some(text_cell.clone())]];
 
@@ -325,13 +318,7 @@ mod tests {
 
     #[test]
     fn test_byte_hash_order_independent() {
-        use delightql_protocol::CELL_TAG_TEXT;
-
-        let make_row = |s: &str| {
-            let mut cell = vec![CELL_TAG_TEXT];
-            cell.extend_from_slice(s.as_bytes());
-            vec![Some(cell)]
-        };
+        let make_row = |s: &str| vec![Some(s.as_bytes().to_vec())];
 
         let rows1 = vec![make_row("Alice"), make_row("Bob")];
         let rows2 = vec![make_row("Bob"), make_row("Alice")];
@@ -339,28 +326,18 @@ mod tests {
     }
 
     #[test]
-    fn test_byte_hash_int_vs_text_differ() {
-        use delightql_protocol::{CELL_TAG_INTEGER, CELL_TAG_TEXT};
+    fn test_byte_hash_different_content_differs() {
+        let rows_a = vec![vec![Some(b"1".to_vec())]];
+        let rows_b = vec![vec![Some(b"2".to_vec())]];
 
-        let mut int_cell = vec![CELL_TAG_INTEGER];
-        int_cell.extend_from_slice(&1i64.to_le_bytes());
-        let int_rows = vec![vec![Some(int_cell)]];
-
-        let mut text_cell = vec![CELL_TAG_TEXT];
-        text_cell.extend_from_slice(b"1");
-        let text_rows = vec![vec![Some(text_cell)]];
-
-        assert_ne!(compute_byte_hash(&int_rows), compute_byte_hash(&text_rows));
+        assert_ne!(compute_byte_hash(&rows_a), compute_byte_hash(&rows_b));
     }
 
     #[test]
     fn test_byte_hash_null_equals_empty() {
-        use delightql_protocol::CELL_TAG_TEXT;
-
-        // NULL and empty string both hash as SHA-256("") — this is by design
+        // NULL and empty content both hash as SHA-256("") — this is by design
         let null_rows = vec![vec![None]];
-        let empty_text = vec![CELL_TAG_TEXT]; // tag only, no content
-        let empty_rows = vec![vec![Some(empty_text)]];
+        let empty_rows = vec![vec![Some(vec![])]];
 
         assert_eq!(
             compute_byte_hash(&null_rows),

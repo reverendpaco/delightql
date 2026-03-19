@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use delightql_protocol::{
     ByteSeq, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem, Orientation,
-    Projection, ServerTerm, resolve_projection, CELL_TAG_TEXT,
+    Projection, ServerTerm, resolve_projection,
 };
 
 use delightql_types::DatabaseConnection;
@@ -88,7 +88,7 @@ impl SisoParty {
             .map(|(i, name)| Dimension {
                 position: (i + 1) as u64,
                 name: name.as_bytes().to_vec(),
-                descriptor: Vec::new(),
+                descriptor: b"TEXT".to_vec(),
             })
             .collect();
 
@@ -136,11 +136,7 @@ impl SisoParty {
                     col_indices
                         .iter()
                         .map(|&ci| {
-                            row[ci].as_ref().map(|s| {
-                                let mut v = vec![CELL_TAG_TEXT];
-                                v.extend_from_slice(s.as_bytes());
-                                v
-                            })
+                            row[ci].as_ref().map(|s| s.as_bytes().to_vec())
                         })
                         .collect()
                 })

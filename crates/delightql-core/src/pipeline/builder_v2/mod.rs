@@ -514,12 +514,18 @@ fn parse_cfe_definition(
                         if node.kind() == "identifier" || node.kind() == "callable_param" {
                             param_nodes.push(node);
                         } else {
-                            param_nodes.extend(node.children().filter(|c| c.kind() == "identifier" || c.kind() == "callable_param"));
+                            param_nodes.extend(node.children().filter(|c| {
+                                c.kind() == "identifier" || c.kind() == "callable_param"
+                            }));
                         }
                     }
                 }
             } else {
-                param_nodes.extend(first_params_node.children().filter(|c| c.kind() == "identifier" || c.kind() == "callable_param"));
+                param_nodes.extend(
+                    first_params_node
+                        .children()
+                        .filter(|c| c.kind() == "identifier" || c.kind() == "callable_param"),
+                );
             };
 
             for child in param_nodes {

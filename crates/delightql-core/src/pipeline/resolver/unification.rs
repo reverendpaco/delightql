@@ -87,11 +87,13 @@ fn unify_single_column(
                         ));
                     }
 
-                    // Clone the matched column and update was_qualified based on the reference
+                    // Clone the matched column and update qualification based on the reference
                     let mut resolved = matches[0].clone();
-                    // If the reference had a qualifier, mark it as qualified
+                    // If the reference had a qualifier, mark as USER-qualified
                     if qualifier.is_some() {
-                        resolved.info = resolved.info.with_updated_qualification(true);
+                        resolved.info = resolved.info.with_updated_qualification(
+                            crate::pipeline::asts::core::QualificationSource::User,
+                        );
                     }
                     UnificationResult::Resolved(resolved)
                 }
@@ -105,7 +107,7 @@ fn unify_single_column(
                         // Find Fresh (anonymous) table matches
                         let fresh_matches: Vec<&ColumnMetadata> = matches
                             .iter()
-                            .filter(|col| matches!(col.fq_table.name, TableName::Fresh))
+                            .filter(|col| matches!(col.table_name, TableName::Fresh))
                             .copied()
                             .collect();
 
@@ -124,7 +126,9 @@ fn unify_single_column(
                                 ));
                             }
                             let mut resolved = fresh_matches[0].clone();
-                            resolved.info = resolved.info.with_updated_qualification(false); // Unqualified reference
+                            resolved.info = resolved.info.with_updated_qualification(
+                                crate::pipeline::asts::core::QualificationSource::None,
+                            ); // Unqualified reference
                             return UnificationResult::Resolved(resolved);
                         }
                     }
@@ -132,7 +136,7 @@ fn unify_single_column(
                     // No precedence rule applies - report ambiguity
                     let tables: Vec<String> = matches
                         .iter()
-                        .map(|col| match &col.fq_table.name {
+                        .map(|col| match &col.table_name {
                             TableName::Named(table_name) => table_name.to_string(),
                             TableName::Fresh => "_".to_string(),
                         })
@@ -155,7 +159,7 @@ fn unify_single_column(
             let candidates = if let Some(qual) = &qualifier {
                 available
                     .iter()
-                    .filter(|col| matches!(&col.fq_table.name, TableName::Named(t) if t == qual))
+                    .filter(|col| matches!(&col.table_name, TableName::Named(t) if t == qual))
                     .collect::<Vec<_>>()
             } else {
                 available.iter().collect::<Vec<_>>()
@@ -195,9 +199,11 @@ fn unify_single_column(
                 resolved.info = resolved.info.with_alias(alias_name);
             }
 
-            // Mark as qualified if it had a qualifier
+            // Mark as USER-qualified if it had a qualifier
             if qualifier.is_some() {
-                resolved.info = resolved.info.with_updated_qualification(true);
+                resolved.info = resolved.info.with_updated_qualification(
+                    crate::pipeline::asts::core::QualificationSource::User,
+                );
             }
 
             UnificationResult::Resolved(resolved)
@@ -211,7 +217,7 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
         ColumnReference::Named {
             name,
             qualifier,
-            schema,
+            schema: _,
         } => {
             // Check column name (using effective name for matching)
             if !super::col_name_eq(col.name(), name) {
@@ -222,12 +228,12 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
             if let Some(ref qual) = qualifier {
                 if qual == "_" {
                     // Special CPR reference - only matches Fresh (anonymous) tables
-                    if !matches!(col.fq_table.name, TableName::Fresh) {
+                    if !matches!(col.table_name, TableName::Fresh) {
                         return false;
                     }
                 } else {
                     // Regular qualifier - must match table name
-                    match &col.fq_table.name {
+                    match &col.table_name {
                         TableName::Named(table_name) => {
                             if table_name != qual {
                                 return false;
@@ -238,13 +244,6 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
                             return false;
                         }
                     }
-                }
-            }
-
-            // If reference has a schema, it must match
-            if let Some(ref sch) = schema {
-                if col.fq_table.parents_path.first() != Some(sch) {
-                    return false;
                 }
             }
 

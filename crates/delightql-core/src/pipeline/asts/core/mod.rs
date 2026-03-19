@@ -16,11 +16,14 @@ pub use expressions::{
     UsingColumn,
 };
 pub use literals::{ColumnOrdinal, ColumnRange, LiteralValue};
-pub use metadata::{ColumnMetadata, CprSchema, FqTable, NamespacePath, ScopedSchema, TableName};
+pub use metadata::{ColumnMetadata, CprSchema, NamespacePath, ScopedSchema, TableName};
 pub use operators::{FrameBound, FrameMode, JoinType, UnaryRelationalOperator, WindowFrame};
 pub use phase_box::{PhaseBox, PhaseBoxable};
 pub use phases::{Addressed, Refined, Resolved, Unresolved};
-pub use provenance::{ColumnIdentity, ColumnProvenance, IdentityContext, TransformationPhase};
+pub use provenance::{
+    ColumnIdentity, ColumnProvenance, CteOrigin, IdentityContext, QualificationSource, ResolverId,
+    TransformationPhase,
+};
 pub use queries::{
     AssertionPredicate, AssertionSpec, CfeDefinition, ContextMode, CteBinding, DangerSpec,
     DangerState, EmitSpec, ErContextSpec, InlineDdlSpec, OptionSpec, OptionState,

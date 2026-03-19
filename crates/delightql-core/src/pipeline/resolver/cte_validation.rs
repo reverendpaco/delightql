@@ -248,5 +248,8 @@ fn extract_table_references_recursive(
             extract_table_references_recursive(left, refs);
             extract_table_references_recursive(right, refs);
         }
+        ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }

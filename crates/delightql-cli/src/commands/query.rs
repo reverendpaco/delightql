@@ -92,7 +92,7 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         .map(|p| p.to_string_lossy().to_string());
 
     if *sql_optimize > 0 {
-        eprintln!("warning: --soptimize currently does nothing");
+        std::env::set_var("DQL_SOPTIMIZE", sql_optimize.to_string());
     }
     if *inline_ctes {
         eprintln!("warning: --inline-ctes currently does nothing");

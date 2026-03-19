@@ -212,6 +212,9 @@ fn extract_base_relation_name(expr: &resolved::RelationalExpression) -> Option<S
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before correlation alias fixing")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -323,6 +326,9 @@ fn apply_alias_to_base_relation(
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before correlation alias fixing")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 
@@ -366,6 +372,9 @@ fn extract_qualifiers_from_relational(
         resolved::RelationalExpression::ErJoinChain { .. }
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER-join consumed by resolver")
+        }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }

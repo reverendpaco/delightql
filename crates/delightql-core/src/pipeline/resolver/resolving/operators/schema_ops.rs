@@ -39,18 +39,20 @@ pub(super) fn resolve_project_out(
                 }
                 // Same name — if qualifier specified, only remove from matching table
                 if let Some(qual) = qualifier {
-                    !matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual)
+                    !matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual)
                 } else {
                     false // No qualifier, remove all with this name
                 }
             });
         }
     }
-    // If any spec used a qualifier, mark all output columns as qualified
+    // If any spec used a qualifier, mark all output columns as resolver-qualified
     // so LAW1 keeps joins flat and the transformer can emit qualified refs.
     if any_qualified {
         for col in &mut output_columns {
-            col.info = col.info.clone().with_updated_qualification(true);
+            col.info = col.info.clone().with_updated_qualification(
+                crate::pipeline::asts::core::QualificationSource::Resolver,
+            );
         }
     }
 
@@ -113,7 +115,7 @@ pub(super) fn resolve_rename_cover(
                 let col_idx = if let Some(qual) = qualifier {
                     available.iter().position(|col| {
                         crate::pipeline::resolver::col_name_eq(col.name(), name)
-                            && matches!(&col.fq_table.name, ast_resolved::TableName::Named(t) if t == qual)
+                            && matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual)
                     })
                 } else {
                     available
@@ -163,9 +165,11 @@ pub(super) fn resolve_rename_cover(
             output_col.has_user_name = true;
         }
         // If this column was identified via a qualified reference, propagate
-        // that qualification so LAW1 keeps joins flat in the transformer.
+        // as resolver-qualified so LAW1 keeps joins flat in the transformer.
         if qualified_positions.contains(&idx) {
-            output_col.info = output_col.info.with_updated_qualification(true);
+            output_col.info = output_col.info.with_updated_qualification(
+                crate::pipeline::asts::core::QualificationSource::Resolver,
+            );
         }
         output_columns.push(output_col);
     }
@@ -347,11 +351,7 @@ pub(super) fn resolve_witness(
     fn make_witness_column(name: &str, position: usize) -> ast_resolved::ColumnMetadata {
         ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(name.to_string()),
-            ast_resolved::FqTable {
-                parents_path: crate::pipeline::asts::unresolved::NamespacePath::empty(),
-                name: ast_resolved::TableName::Fresh,
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-            },
+            ast_resolved::TableName::Fresh,
             Some(position),
         )
     }
@@ -387,11 +387,7 @@ pub(super) fn resolve_meta_ize(
     fn make_meta_column(name: &str, position: usize) -> ast_resolved::ColumnMetadata {
         ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(name.to_string()),
-            ast_resolved::FqTable {
-                parents_path: crate::pipeline::asts::unresolved::NamespacePath::empty(),
-                name: ast_resolved::TableName::Fresh,
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-            },
+            ast_resolved::TableName::Fresh,
             Some(position),
         )
     }
@@ -425,19 +421,21 @@ pub(super) fn resolve_meta_ize(
 ///
 /// This operator marks all columns as qualified (table-prefixed).
 /// Qualified columns don't unify implicitly with same-named columns from other tables.
-/// The output columns are identical to input, but with `was_qualified: true`.
+/// The output columns are identical to input, with user-qualified status.
 pub(super) fn resolve_qualify(
     available: &[ast_resolved::ColumnMetadata],
 ) -> Result<(
     ast_resolved::UnaryRelationalOperator,
     Vec<ast_resolved::ColumnMetadata>,
 )> {
-    // Mark all columns as qualified
+    // Mark all columns as user-qualified (explicit operator request)
     let output_columns: Vec<_> = available
         .iter()
         .map(|col| {
             let mut new_col = col.clone();
-            new_col.info = new_col.info.with_updated_qualification(true);
+            new_col.info = new_col
+                .info
+                .with_updated_qualification(crate::pipeline::asts::core::QualificationSource::User);
             new_col
         })
         .collect();
@@ -691,11 +689,7 @@ pub(super) fn resolve_interior_drill_down(
         resolved_col_list.push(def.name.clone());
         let mut col = ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(output_name.clone()),
-            ast_resolved::FqTable {
-                parents_path: crate::pipeline::asts::unresolved::NamespacePath::empty(),
-                name: ast_resolved::TableName::Named(column.clone().into()),
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-            },
+            ast_resolved::TableName::Named(column.clone().into()),
             Some(output_columns.len() + idx + 1),
         );
         // If this interior column has its own nested interior, mark it
@@ -773,11 +767,7 @@ pub(super) fn resolve_narrowing_destructure(
         let output_name = field.rsplit('.').next().unwrap_or(field).to_string();
         let col = ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(output_name),
-            ast_resolved::FqTable {
-                parents_path: crate::pipeline::asts::unresolved::NamespacePath::empty(),
-                name: ast_resolved::TableName::Fresh,
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-            },
+            ast_resolved::TableName::Fresh,
             Some(idx + 1),
         );
         output_columns.push(col);

@@ -314,5 +314,8 @@ pub(super) fn extract_refs_from_relational(
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER chains should be resolved before flattening")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }

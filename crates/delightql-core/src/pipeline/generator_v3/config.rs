@@ -1,4 +1,5 @@
 use super::dialect::SqlDialect;
+#[derive(Clone)]
 pub struct GeneratorConfig {
     pub dialect: SqlDialect,
     pub indent_width: usize,

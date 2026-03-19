@@ -1,26 +1,21 @@
 // sql_optimizer/mod.rs - SQL-level optimization pass
 //
-// This module takes SQL AST v3 and applies various optimizations:
-// - Redundant subquery elimination (PASS 1 - BASIC)
-// - CTE extraction from deeply nested subqueries (PASS 2 - MODERATE)
-// - Predicate pushdown (PASS 2 - MODERATE)
-// - Boolean algebra simplification (PASS 3 - AGGRESSIVE)
+// Post-order (bottom-up) walker over SQL AST v3.
+// Each rewrite rule only inspects its immediate child — deeper
+// nodes are already optimized by the time the parent is visited.
 //
-// See DESIGN.md for full architecture and implementation details
+// Current passes:
+// - Cleanup (Basic): redundant subquery elimination
+//
+// See OPTIMIZER.md for the theory (epistemological barrier / grammar barrier).
 
-mod advanced;
-mod boolean_simplification;
 mod cleanup;
-mod restructure;
 mod visitor;
 
 use crate::error::Result;
 use crate::pipeline::sql_ast_v3::SqlStatement;
 
-// Re-export the pass functions for internal use
-use advanced::pass_advanced;
 use cleanup::pass_cleanup;
-use restructure::pass_restructure;
 
 /// Optimization level controls which passes are applied
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -30,12 +25,16 @@ pub enum OptimizationLevel {
     None,
     /// Basic cleanup - redundant subquery elimination only
     Basic,
-    /// Moderate - Basic + projection flattening (restructuring pass)
-    /// Note: Partially implemented. CTE extraction and predicate pushdown are reserved for future use.
-    Moderate,
-    /// Aggressive - Moderate + boolean simplification and advanced optimizations
-    /// Note: Currently available but not used in production. Reserved for future use.
-    Aggressive,
+}
+
+/// Read the optimization level from the DQL_SOPTIMIZE environment variable.
+/// Falls back to `Basic` if unset or unparseable.
+pub fn level_from_env() -> OptimizationLevel {
+    match std::env::var("DQL_SOPTIMIZE").as_deref() {
+        Ok("0") => OptimizationLevel::None,
+        Ok("1") => OptimizationLevel::Basic,
+        _ => OptimizationLevel::Basic,
+    }
 }
 
 /// Main entry point for SQL optimization
@@ -43,38 +42,17 @@ pub enum OptimizationLevel {
 pub fn optimize(statement: SqlStatement, level: OptimizationLevel) -> Result<SqlStatement> {
     log::debug!("SQL Optimizer: Starting with level {:?}", level);
 
-    // Level 0: No optimization
     if matches!(level, OptimizationLevel::None) {
         log::debug!("SQL Optimizer: No optimization requested, returning unchanged");
         return Ok(statement);
     }
 
-    let stmt = statement;
-
     // PASS 1: Cleanup (Level >= Basic)
     let stmt = if level >= OptimizationLevel::Basic {
-        log::debug!("SQL Optimizer: Running PASS 1 (Cleanup)");
-        let result = pass_cleanup(stmt)?;
-        log::debug!("SQL Optimizer: PASS 1 complete");
-        result
+        log::debug!("SQL Optimizer: Running cleanup pass");
+        pass_cleanup(statement)?
     } else {
-        stmt
-    };
-
-    // PASS 2: Restructuring (Level >= Moderate)
-    let stmt = if level >= OptimizationLevel::Moderate {
-        log::debug!("SQL Optimizer: Running PASS 2 (Restructuring)");
-        pass_restructure(stmt)?
-    } else {
-        stmt
-    };
-
-    // PASS 3: Advanced (Level >= Aggressive)
-    let stmt = if level >= OptimizationLevel::Aggressive {
-        log::debug!("SQL Optimizer: Running PASS 3 (Advanced)");
-        pass_advanced(stmt)?
-    } else {
-        stmt
+        statement
     };
 
     log::debug!("SQL Optimizer: Complete");

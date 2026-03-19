@@ -47,8 +47,8 @@ pub mod table;
 // Re-export all public types for backward compatibility
 pub use builders::SelectBuilder;
 pub use expressions::{
-    ColumnQualifier, DomainExpression, QualifierParts, SqlFrameBound, SqlFrameMode, SqlWindowFrame,
-    WhenClause,
+    ColumnQualifier, DomainExpression, QualifierParts, SqlFrameBound, SqlFrameMode, SqlPredicate,
+    SqlWindowFrame, WhenClause,
 };
 pub use operators::{BinaryOperator, UnaryOperator};
 pub use ordering::{OrderDirection, OrderTerm};

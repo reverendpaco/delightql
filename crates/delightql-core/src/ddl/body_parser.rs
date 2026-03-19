@@ -298,6 +298,9 @@ fn remap_relexpr_qualifiers(
             remap_relexpr_qualifiers(left, remap);
             remap_relexpr_qualifiers(right, remap);
         }
+        RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 }
 

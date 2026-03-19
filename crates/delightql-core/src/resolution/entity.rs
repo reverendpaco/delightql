@@ -18,6 +18,9 @@ pub struct EntityInfo {
     /// For engaged tables resolved as unqualified names, this carries the
     /// discovered namespace so the transformer can emit schema-qualified SQL.
     pub resolved_namespace: Option<NamespacePath>,
+    /// Physical backend schema name for SQL generation (e.g., "_c" for logical namespace "c").
+    /// Populated by the registry from namespace resolution.
+    pub backend_schema: Option<String>,
     pub entity_type: EntityType,
     pub registry_source: RegistrySource,
     pub schema_source: SchemaSource,

@@ -74,7 +74,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                 for col in &available {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let col_qualifier = match &col.fq_table.name {
+                        let col_qualifier = match &col.table_name {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -86,7 +86,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                             name: column_name.into(),
                             qualifier: qualifier.clone().or(col_qualifier.map(|s| s.into())),
                             namespace_path: if namespace_path.is_empty() {
-                                col.fq_table.parents_path.clone()
+                                crate::pipeline::asts::resolved::NamespacePath::empty()
                             } else {
                                 namespace_path.clone()
                             },
@@ -109,7 +109,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                 for col in available.iter().filter(|col| re.is_match(col.name())) {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.fq_table.name {
+                        let qualifier = match &col.table_name {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -120,7 +120,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                         resolved_args.push(resolved::DomainExpression::Lvar {
                             name: column_name.into(),
                             qualifier: qualifier.map(|s| s.into()),
-                            namespace_path: col.fq_table.parents_path.clone(),
+                            namespace_path: crate::pipeline::asts::resolved::NamespacePath::empty(),
                             alias: None,
                             provenance: ast_resolved::PhaseBox::phantom(),
                         });
@@ -173,7 +173,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                     let col = candidates[idx];
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.fq_table.name {
+                        let qualifier = match &col.table_name {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -184,7 +184,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                         resolved_args.push(resolved::DomainExpression::Lvar {
                             name: column_name.into(),
                             qualifier: qualifier.map(|s| s.into()),
-                            namespace_path: col.fq_table.parents_path.clone(),
+                            namespace_path: crate::pipeline::asts::resolved::NamespacePath::empty(),
                             alias: None,
                             provenance: ast_resolved::PhaseBox::phantom(),
                         });
@@ -249,7 +249,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                 for col in &available {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.fq_table.name {
+                        let qualifier = match &col.table_name {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -260,11 +260,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                         resolved_members.push(resolved::CurlyMember::Shorthand {
                             column: column_name.into(),
                             qualifier: qualifier.map(|s| s.into()),
-                            schema: col
-                                .fq_table
-                                .parents_path
-                                .first()
-                                .map(|s| s.to_string().into()),
+                            schema: None,
                         });
                     }
                 }
@@ -279,7 +275,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                 for col in available.iter().filter(|col| re.is_match(col.name())) {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.fq_table.name {
+                        let qualifier = match &col.table_name {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -290,11 +286,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                         resolved_members.push(resolved::CurlyMember::Shorthand {
                             column: column_name.into(),
                             qualifier: qualifier.map(|s| s.into()),
-                            schema: col
-                                .fq_table
-                                .parents_path
-                                .first()
-                                .map(|s| s.to_string().into()),
+                            schema: None,
                         });
                     }
                 }
@@ -341,7 +333,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                     let col = candidates[idx];
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.fq_table.name {
+                        let qualifier = match &col.table_name {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -352,11 +344,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                         resolved_members.push(resolved::CurlyMember::Shorthand {
                             column: column_name.into(),
                             qualifier: qualifier.map(|s| s.into()),
-                            schema: col
-                                .fq_table
-                                .parents_path
-                                .first()
-                                .map(|s| s.to_string().into()),
+                            schema: None,
                         });
                     }
                 }

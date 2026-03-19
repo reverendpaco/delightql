@@ -8,6 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
@@ -18,7 +19,7 @@ use tree_sitter::Language;
 use delightql_protocol::socket::SocketTransport;
 use delightql_protocol::{
     AgreedOrientation, Cell, Client, ControlResult, FetchResponse, Orientation, Projection,
-    QueryResponse, Session, VersionResult, cell_content_bytes, decode_cell_to_text,
+    QueryResponse, Session, VersionResult,
 };
 
 extern "C" {
@@ -41,6 +42,10 @@ struct Args {
     /// Send Shutdown control op to the server after tests complete
     #[arg(long)]
     shutdown: bool,
+
+    /// Write results to a SQLite database (created if missing, appended to if existing)
+    #[arg(long)]
+    results_db: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -49,12 +54,21 @@ enum HashMode {
     Byte,
 }
 
+struct TestResultRow {
+    status: String,
+    ball: String,
+    test_name: String,
+    detail: String,
+    duration_ms: f64,
+}
+
 struct WorkerResult {
     passed: u32,
     failed: u32,
     errors: u32,
     meh: u32,
     output: Vec<String>,
+    rows: Vec<TestResultRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +165,7 @@ fn send_mount(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn reset_and_mount(
     session: &mut Session<SocketTransport>,
     db_filename: &str,
@@ -264,7 +279,7 @@ fn compute_data_hash(rows: &[Vec<Cell>]) -> String {
         for cell in row {
             match cell {
                 Some(bytes) if !bytes.is_empty() => {
-                    let text = decode_cell_to_text(bytes);
+                    let text = String::from_utf8_lossy(bytes).to_string();
                     if text.is_empty() {
                         hasher.update(b"NULL");
                     } else {
@@ -294,7 +309,7 @@ fn compute_byte_hash(rows: &[Vec<Cell>]) -> String {
         for cell in row {
             let mut cell_hasher = Sha256::new();
             if let Some(bytes) = cell {
-                cell_hasher.update(cell_content_bytes(bytes));
+                cell_hasher.update(bytes);
             }
             row_hasher.update(cell_hasher.finalize());
         }
@@ -485,79 +500,87 @@ struct BallTestRun {
     hashtype: Option<String>,
 }
 
+fn format_duration(d: Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms < 1000.0 {
+        format!("{:.1}ms", ms)
+    } else {
+        format!("{:.2}s", d.as_secs_f64())
+    }
+}
+
 fn judge(
     ball_name: &str,
     test_name: &str,
     exec_result: Result<String, String>,
     expected_hash: &Option<String>,
     hashtype: &Option<String>,
+    elapsed: Duration,
     result: &mut WorkerResult,
 ) {
+    let dur = format_duration(elapsed);
+    let duration_ms = elapsed.as_secs_f64() * 1000.0;
     let is_error_test = hashtype.as_deref() == Some("error");
 
-    if is_error_test {
-        match exec_result {
+    let (status, detail) = if is_error_test {
+        match &exec_result {
             Err(e) => {
-                // Expected an error and got one — check optional pattern
                 if let Some(pattern) = expected_hash.as_ref().filter(|p| !p.is_empty()) {
                     if e.contains(pattern.as_str()) {
-                        result.output.push(format!("[PASS]\t{}\t{}\t", ball_name, test_name));
-                        result.passed += 1;
+                        ("PASS", String::new())
                     } else {
-                        result.output.push(format!(
-                            "[FAIL]\t{}\t{}\terror expected to contain '{}' but got: {}",
-                            ball_name, test_name, pattern, e
-                        ));
-                        result.failed += 1;
+                        ("FAIL", format!("error expected to contain '{}' but got: {}", pattern, e))
                     }
                 } else {
-                    result.output.push(format!("[PASS]\t{}\t{}\t", ball_name, test_name));
-                    result.passed += 1;
+                    ("PASS", String::new())
                 }
             }
-            Ok(_) => {
-                result.output.push(format!(
-                    "[FAIL]\t{}\t{}\texpected error but query succeeded",
-                    ball_name, test_name
-                ));
-                result.failed += 1;
-            }
+            Ok(_) => ("FAIL", "expected error but query succeeded".to_string()),
         }
-        return;
+    } else {
+        match &exec_result {
+            Ok(actual_hex) => match expected_hash {
+                None => {
+                    let actual_short = hex2hash(actual_hex);
+                    ("MEH", actual_short)
+                }
+                Some(expected) => {
+                    let actual_short = if hashtype.as_deref() == Some("shash") {
+                        actual_hex.clone()
+                    } else {
+                        hex2hash(actual_hex)
+                    };
+                    if *expected == actual_short {
+                        ("PASS", String::new())
+                    } else {
+                        ("FAIL", format!("expected:{} actual:{}", expected, actual_short))
+                    }
+                }
+            },
+            Err(e) => ("ERROR", e.replace('\n', " ")),
+        }
+    };
+
+    if detail.is_empty() {
+        result.output.push(format!("[{}]\t{}\t{}\t\t{}", status, ball_name, test_name, dur));
+    } else {
+        result.output.push(format!("[{}]\t{}\t{}\t{}\t{}", status, ball_name, test_name, detail, dur));
     }
 
-    match exec_result {
-        Ok(actual_hex) => match expected_hash {
-            None => {
-                let actual_short = hex2hash(&actual_hex);
-                result
-                    .output
-                    .push(format!("[MEH]\t{}\t{}\t{}", ball_name, test_name, actual_short));
-                result.meh += 1;
-            }
-            Some(expected) => {
-                let actual_short = if hashtype.as_deref() == Some("shash") {
-                    actual_hex.clone()
-                } else {
-                    hex2hash(&actual_hex)
-                };
-                if *expected == actual_short {
-                    result.output.push(format!("[PASS]\t{}\t{}\t", ball_name, test_name));
-                    result.passed += 1;
-                } else {
-                    result.output.push(format!(
-                        "[FAIL]\t{}\t{}\texpected:{} actual:{}",
-                        ball_name, test_name, expected, actual_short
-                    ));
-                    result.failed += 1;
-                }
-            }
-        },
-        Err(e) => {
-            let e_oneline = e.replace('\n', " ");
-            result.output.push(format!("[ERROR]\t{}\t{}\t{}", ball_name, test_name, e_oneline));
-            result.errors += 1;
-        }
+    result.rows.push(TestResultRow {
+        status: status.to_string(),
+        ball: ball_name.to_string(),
+        test_name: test_name.to_string(),
+        detail,
+        duration_ms,
+    });
+
+    match status {
+        "PASS" => result.passed += 1,
+        "FAIL" => result.failed += 1,
+        "ERROR" => result.errors += 1,
+        "MEH" => result.meh += 1,
+        _ => {}
     }
 }
 
@@ -578,7 +601,40 @@ fn copy_databases_to_work_dir(
     Ok(())
 }
 
-fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
+fn write_results_db(path: &Path, rows: &[TestResultRow]) -> Result<(), String> {
+    let conn = Connection::open(path)
+        .map_err(|e| format!("open results db {}: {}", path.display(), e))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| format!("set WAL: {}", e))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS test_result (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f','now')),
+            status TEXT NOT NULL,
+            ball TEXT NOT NULL,
+            test_name TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            duration_ms REAL NOT NULL
+        )"
+    ).map_err(|e| format!("create table: {}", e))?;
+
+    let tx = conn.unchecked_transaction()
+        .map_err(|e| format!("begin transaction: {}", e))?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO test_result (status, ball, test_name, detail, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5)"
+        ).map_err(|e| format!("prepare insert: {}", e))?;
+        for row in rows {
+            stmt.execute(rusqlite::params![
+                row.status, row.ball, row.test_name, row.detail, row.duration_ms
+            ]).map_err(|e| format!("insert: {}", e))?;
+        }
+    }
+    tx.commit().map_err(|e| format!("commit: {}", e))?;
+    Ok(())
+}
+
+fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> Result<bool, String> {
     let ball_name = ball_path
         .file_stem()
         .unwrap_or_default()
@@ -757,6 +813,7 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
     let mut errors = 0u32;
     let mut meh = 0u32;
     let mut any_worker_error = false;
+    let mut all_rows: Vec<TestResultRow> = Vec::new();
 
     // Helper to collect results from worker handles
     let mut collect = |handles: Vec<std::thread::JoinHandle<Result<WorkerResult, String>>>| {
@@ -773,6 +830,7 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
                     failed += wr.failed;
                     errors += wr.errors;
                     meh += wr.meh;
+                    all_rows.extend(wr.rows);
                 }
                 Ok(Err(e)) => {
                     eprintln!("dql-test-ball-runner: worker {} error: {}", i, e);
@@ -821,8 +879,10 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
                     let (mut session, rows_orientation) = connect_session(&socket)?;
                     let mut result = WorkerResult {
-                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(),
+                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
                     };
+                    let mut needs_remount = true;
+                    let mut current_mount_path: Option<String> = None;
 
                     for batch in shard {
                         if let Some(&first) = batch.first() {
@@ -830,21 +890,59 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
                             let mount_path = db_paths
                                 .get(&run.db_id)
                                 .ok_or_else(|| format!("no path for db_id {}", run.db_id))?;
-                            send_reset(&mut session)?;
-                            send_mount(&mut session, &mount_path.to_string_lossy(), rows_orientation)?;
+                            current_mount_path = Some(mount_path.to_string_lossy().to_string());
+                            needs_remount = true;
                         }
                         for &idx in &batch {
+                            // (Re)mount if needed (start of batch or after reconnect)
+                            if needs_remount {
+                                if let Some(ref mp) = current_mount_path {
+                                    if send_reset(&mut session).is_err()
+                                        || send_mount(&mut session, mp, rows_orientation).is_err()
+                                    {
+                                        // Connection dead on setup — reconnect
+                                        match connect_session(&socket) {
+                                            Ok((s, _)) => { session = s; }
+                                            Err(_) => continue,
+                                        }
+                                        if send_reset(&mut session).is_err()
+                                            || send_mount(&mut session, mp, rows_orientation).is_err()
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                }
+                                needs_remount = false;
+                            }
+
                             let run = &sef_runs[idx];
                             let hash_mode = match run.hashtype.as_deref() {
                                 Some("bhash") => HashMode::Byte,
                                 _ => HashMode::String,
                             };
+                            let t0 = Instant::now();
                             let exec = if run.sequential {
                                 send_sequential_and_hash(&mut session, &run.dql, rows_orientation, hash_mode)
                             } else {
                                 send_query_and_hash_dispatch(&mut session, &run.dql, rows_orientation, hash_mode)
                             };
-                            judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, &mut result);
+                            let elapsed = t0.elapsed();
+
+                            // If the query failed with a connection-level error,
+                            // reconnect for subsequent queries. Query-level errors
+                            // (prefixed "query error:") don't break the connection.
+                            if let Err(ref e) = exec {
+                                let is_query_error = e.starts_with("query error:");
+                                if !is_query_error {
+                                    eprintln!("runner: connection lost ({}), reconnecting", e);
+                                    if let Ok((s, _)) = connect_session(&socket) {
+                                        session = s;
+                                        needs_remount = true;
+                                    }
+                                }
+                            }
+
+                            judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
                         }
                     }
 
@@ -878,7 +976,7 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
                     let (mut session, rows_orientation) = connect_session(&socket)?;
                     let mut result = WorkerResult {
-                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(),
+                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
                     };
 
                     for &idx in &shard {
@@ -923,8 +1021,10 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
                             Some("bhash") => HashMode::Byte,
                             _ => HashMode::String,
                         };
+                        let t0 = Instant::now();
                         let exec = send_sequential_and_hash(&mut session, &run.dql, rows_orientation, hash_mode);
-                        judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, &mut result);
+                        let elapsed = t0.elapsed();
+                        judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
 
                         if let Some(ref dir) = work_dir {
                             let _ = std::fs::remove_dir_all(dir);
@@ -961,7 +1061,7 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
                     let (mut session, rows_orientation) = connect_session(&socket)?;
                     let mut result = WorkerResult {
-                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(),
+                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
                     };
 
                     for &idx in &shard {
@@ -1017,8 +1117,10 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
                             Some("bhash") => HashMode::Byte,
                             _ => HashMode::String,
                         };
+                        let t0 = Instant::now();
                         let exec = send_sequential_and_hash(&mut session, &run.dql, rows_orientation, hash_mode);
-                        judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, &mut result);
+                        let elapsed = t0.elapsed();
+                        judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
 
                         let _ = std::fs::remove_dir_all(&isolate_dir);
                     }
@@ -1029,6 +1131,11 @@ fn run_ball(ball_path: &Path, socket_path: &Path) -> Result<bool, String> {
             .collect();
 
         collect(handles);
+    }
+
+    if let Some(db_path) = results_db {
+        write_results_db(db_path, &all_rows)
+            .unwrap_or_else(|e| eprintln!("dql-test-ball-runner: results-db: {}", e));
     }
 
     let total = passed + failed + errors + meh;
@@ -1076,7 +1183,7 @@ fn main() {
 
     let mut all_ok = true;
     for ball_path in &args.balls {
-        match run_ball(ball_path, &args.socket) {
+        match run_ball(ball_path, &args.socket, args.results_db.as_deref()) {
             Ok(success) => {
                 if !success {
                     all_ok = false;

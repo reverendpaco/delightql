@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use super::expressions::DomainExpression;
+use super::expressions::{ColumnQualifier, DomainExpression};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SelectItem {
     Star,
 
     QualifiedStar {
-        qualifier: String,
+        qualifier: ColumnQualifier,
     },
 
     Expression {
@@ -22,10 +22,8 @@ impl SelectItem {
         SelectItem::Star
     }
 
-    pub fn qualified_star(qualifier: impl Into<String>) -> Self {
-        SelectItem::QualifiedStar {
-            qualifier: qualifier.into(),
-        }
+    pub fn qualified_star(qualifier: ColumnQualifier) -> Self {
+        SelectItem::QualifiedStar { qualifier }
     }
 
     pub fn expression(expr: DomainExpression) -> Self {

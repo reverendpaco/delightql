@@ -1,6 +1,5 @@
 use crate::pipeline::asts::refined::{self, JoinType, PhaseBox, SetOperator};
-use crate::pipeline::asts::resolved::{self, ColumnMetadata, CprSchema, FqTable, TableName};
-use crate::pipeline::asts::unresolved::NamespacePath;
+use crate::pipeline::asts::resolved::{self, ColumnMetadata, CprSchema, TableName};
 use crate::pipeline::refiner::rebuilder::collect_columns_from_schema;
 use delightql_types::SqlIdentifier;
 
@@ -41,11 +40,7 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
                                 };
                                 ColumnMetadata::new(
                                     resolved::ColumnProvenance::from_column(col_name),
-                                    FqTable {
-                                        parents_path: NamespacePath::empty(),
-                                        name: table_name.clone(),
-                                        backend_schema: PhaseBox::from_optional_schema(None),
-                                    },
+                                    table_name.clone(),
                                     Some(i),
                                 )
                             })
@@ -57,10 +52,7 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
                         cpr_schema.get().clone()
                     }
                 }
-                refined::Relation::TVF { .. } => {
-                    // TVFs have unknown schema until execution
-                    CprSchema::Unknown
-                }
+                refined::Relation::TVF { cpr_schema, .. } => cpr_schema.get().clone(),
                 refined::Relation::InnerRelation { cpr_schema, .. } => {
                     // InnerRelation has schema from resolved subquery
                     cpr_schema.get().clone()
@@ -76,7 +68,7 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
                             .iter()
                             .map(|col| {
                                 let mut c = col.clone();
-                                c.fq_table.name = TableName::Named(alias_name.clone());
+                                c.table_name = TableName::Named(alias_name.clone());
                                 c
                             })
                             .collect();
@@ -122,6 +114,10 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
         refined::RelationalExpression::ErJoinChain { .. }
         | refined::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER-join consumed by resolver")
+        }
+        // IntersectCorresponding carries its own cpr_schema
+        refined::RelationalExpression::IntersectCorresponding { cpr_schema, .. } => {
+            cpr_schema.get().clone()
         }
     }
 }
@@ -256,11 +252,7 @@ pub(super) fn compute_pipe_schema(
                 // If there's an alias, use it
                 ColumnMetadata::new(
                     resolved::ColumnProvenance::from_column(alias.clone()),
-                    FqTable {
-                        parents_path: NamespacePath::empty(),
-                        name: TableName::Fresh,
-                        backend_schema: PhaseBox::from_optional_schema(None),
-                    },
+                    TableName::Fresh,
                     Some(i),
                 )
             } else {
@@ -268,20 +260,12 @@ pub(super) fn compute_pipe_schema(
                 match expr {
                     refined::DomainExpression::Lvar { name, .. } => ColumnMetadata::new(
                         resolved::ColumnProvenance::from_column(name.clone()),
-                        FqTable {
-                            parents_path: NamespacePath::empty(),
-                            name: TableName::Fresh,
-                            backend_schema: PhaseBox::from_optional_schema(None),
-                        },
+                        TableName::Fresh,
                         Some(i),
                     ),
                     refined::DomainExpression::Literal { .. } => ColumnMetadata::new(
                         resolved::ColumnProvenance::from_column(format!("literal_{}", i + 1)),
-                        FqTable {
-                            parents_path: NamespacePath::empty(),
-                            name: TableName::Fresh,
-                            backend_schema: PhaseBox::from_optional_schema(None),
-                        },
+                        TableName::Fresh,
                         Some(i),
                     ),
                     _ => {
@@ -290,11 +274,7 @@ pub(super) fn compute_pipe_schema(
                             resolved::ColumnProvenance::from_column(
                                 crate::pipeline::naming::generate_refined_domain_expression_column_name(expr, i)
                             ),
-                            FqTable {
-                                parents_path: NamespacePath::empty(),
-                                name: TableName::Fresh,
-                                backend_schema: PhaseBox::from_optional_schema(None),
-                            },
+                            TableName::Fresh,
                             Some(i),
                         )
                     }
@@ -347,11 +327,7 @@ pub(super) fn compute_setop_schema(
                 .map(|(i, name)| {
                     ColumnMetadata::new(
                         resolved::ColumnProvenance::from_column(name),
-                        FqTable {
-                            parents_path: NamespacePath::empty(),
-                            name: TableName::Fresh,
-                            backend_schema: PhaseBox::from_optional_schema(None),
-                        },
+                        TableName::Fresh,
                         Some(i),
                     )
                 })

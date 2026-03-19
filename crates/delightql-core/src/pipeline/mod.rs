@@ -54,13 +54,14 @@ pub mod cfe_precompiler; // Phase 1.5: CFE precompilation (runs after builder, b
 pub mod effect_executor; // Phase 1.X: Execute pseudo-predicates and rewrite AST
 pub mod refiner;
 pub mod resolver; // Phase 2: AST(unresolved) → AST(resolved) // Phase 3: AST(resolved) → AST(refined)
-                  // Note: transformer v1 and transformer_v2 referenced in comments below no longer exist in the codebase.
-                  // Only transformer_v3 remains as the production implementation.
-                  // pub mod transformer;   // Phase 4: AST(refined) → SQL AST (OLD - v1 - REMOVED)
-                  // pub mod transformer_v2; // Phase 4: AST(refined) → SQL AST (OLD - v2 INDUCTIVE REWRITE - REMOVED)
+                  // transformer_v3 shelved — code preserved in transformer_v3BAK/ for reference.
+                  // Use `./dqlOLD` binary for TV3 comparison.
 pub mod ast_transform; // Unified AST walk infrastructure (JEDI Epoch 0 — replaced ast_fold)
+pub mod cfe_substitution; // CFE parameter substitution (shared between transformers)
+pub mod precedence; // Operator precedence helpers for infix expressions
 pub mod sql_optimizer;
-pub mod transformer_v3; // Phase 4: AST(refined) → SQL AST v3 (PURE FUNCTIONAL - PRODUCTION) // Phase 4.5: SQL AST v3 → SQL AST v3 (currently identity pass)
+pub mod sql_rewriter;
+pub mod transformer_v4; // Phase 4: AST → SQL AST (PRODUCTION)
                         // Note: generator v1 and generator_v2 referenced below no longer exist in the codebase.
                         // Only generator_v3 remains as the production SQL string generator.
                         // pub mod generator;     // Phase 5: SQL AST → SQL String (OLD - v1 - REMOVED)
@@ -158,7 +159,7 @@ impl<'a> Pipeline<'a> {
             source,
             system,
             resolver::ResolutionConfig::default(),
-            sql_optimizer::OptimizationLevel::Basic,
+            sql_optimizer::level_from_env(),
             false, // inline_ctes
             false, // is_repl
         )
@@ -176,7 +177,7 @@ impl<'a> Pipeline<'a> {
             "<injected>",
             system,
             resolver::ResolutionConfig::default(),
-            sql_optimizer::OptimizationLevel::Basic,
+            sql_optimizer::level_from_env(),
             false,
             false,
         );
@@ -380,13 +381,8 @@ impl<'a> Pipeline<'a> {
                 self.execute_to_sql_ast()?;
                 let sql_ast = self.sql_ast().unwrap();
                 let generator = generator_v3::SqlGenerator::new();
-                generator.generate_statement(sql_ast).map_err(|e| {
-                    crate::error::DelightQLError::ParseError {
-                        message: format!("SQL AST rendering error: {:?}", e),
-                        source: None,
-                        subcategory: None,
-                    }
-                })
+                generator.generate_statement(sql_ast)
+                    .map_err(|e| e.into_delightql_error("SQL AST rendering error"))
             }
             "sql" => {
                 let sql = self.execute_to_sql()?;
@@ -624,8 +620,17 @@ impl<'a> Pipeline<'a> {
         self.execute_to_query_resolved()?;
         let query_resolved = self.query_resolved.as_ref().unwrap();
 
+        // Build danger gate map from per-query overrides (needed by refiner and transformer)
+        let mut query_danger_gates = danger_gates::DangerGateMap::with_defaults();
+        query_danger_gates.apply_overrides(&self.cli_danger_overrides);
+        query_danger_gates.apply_overrides(&self.danger_specs);
+
         // Refine and transform
-        let refined_query = refiner::refine_query(query_resolved.clone()).map_err(|e| {
+        let refined_query = refiner::refine_query_with_gates(
+            query_resolved.clone(),
+            query_danger_gates.clone(),
+        )
+        .map_err(|e| {
             self.record_delightql_error(&e);
             e
         })?;
@@ -637,25 +642,18 @@ impl<'a> Pipeline<'a> {
         let force_ctes = !self.inline_ctes;
         let bin_registry = self.system.bin_registry();
 
-        // Build danger gate map from per-query overrides
-        let mut danger_gates = danger_gates::DangerGateMap::with_defaults();
-        danger_gates.apply_overrides(&self.cli_danger_overrides); // Session baseline (CLI --danger)
-        danger_gates.apply_overrides(&self.danger_specs); // Per-query inline overrides
-
         // Build option map from per-query overrides
         let mut options = option_map::OptionMap::with_defaults();
         options.apply_overrides(&self.cli_option_overrides); // Session baseline (CLI --option)
         options.apply_overrides(&self.option_specs); // Per-query inline overrides
 
-        let sql_ast = transformer_v3::transform_query_with_options(
-            addressed_query,
-            force_ctes,
-            self.dialect,
-            Some(bin_registry),
-            Some(danger_gates),
-            Some(options),
-        )
-        .map_err(|e| {
+        let ctx = transformer_v4::TransformCtx {
+            cfes: vec![],
+            names: transformer_v4::builder::NameGenerator::new(),
+            outer_columns: vec![],
+            danger_gates: query_danger_gates.clone(),
+        };
+        let sql_ast = transformer_v4::transform(addressed_query, &ctx).map_err(|e| {
             self.record_delightql_error(&e);
             e
         })?;
@@ -686,22 +684,20 @@ impl<'a> Pipeline<'a> {
         self.execute_to_sql_ast()?;
         let sql_ast = self.sql_ast.as_ref().unwrap();
 
-        // Optimize
-        let optimized = sql_optimizer::optimize(sql_ast.clone(), self.sql_optimization_level)
+        // Dialect-aware rewriting, then optimize
+        let rewritten = sql_rewriter::rewrite(sql_ast.clone(), self.dialect)?;
+        let optimized = sql_optimizer::optimize(rewritten, self.sql_optimization_level)
             .map_err(|e| {
                 self.record_delightql_error(&e);
                 e
             })?;
 
         // Generate SQL string
-        let generator = generator_v3::SqlGenerator::new();
-        let sql = generator.generate_statement(&optimized).map_err(|e| {
-            crate::error::DelightQLError::ParseError {
-                message: format!("SQL generation error: {:?}", e),
-                source: None,
-                subcategory: None,
-            }
-        })?;
+        let generator =
+            generator_v3::SqlGenerator::new().with_bin_registry(self.system.bin_registry());
+        let sql = generator
+            .generate_statement(&optimized)
+            .map_err(|e| e.into_delightql_error("SQL generation error"))?;
 
         self.sql_string = Some(sql);
 
@@ -730,32 +726,66 @@ impl<'a> Pipeline<'a> {
             assert_options.apply_overrides(&self.cli_option_overrides);
             assert_options.apply_overrides(&self.option_specs);
 
-            // Extract CTEs from the main query so assertions can reference
-            // CTE names defined in the outer scope (e.g., `expected(*) : ...`).
-            let outer_ctes: Vec<ast_unresolved::CteBinding> = match self.query_unresolved.as_ref() {
-                Some(ast_unresolved::Query::WithCtes { ctes, .. }) => ctes.clone(),
-                Some(ast_unresolved::Query::WithCfes { query, .. })
-                | Some(ast_unresolved::Query::WithPrecompiledCfes { query, .. }) => {
-                    match query.as_ref() {
-                        ast_unresolved::Query::WithCtes { ctes, .. } => ctes.clone(),
-                        ast_unresolved::Query::Relational(_) => vec![],
-                        other => panic!("catch-all hit in mod.rs outer_ctes extraction: unexpected inner Query variant: {:?}", other),
-                    }
+            // Extract CTEs and CFEs from the main query so assertions can reference
+            // CTE names and CFE definitions from the outer scope.
+            let (outer_ctes, outer_cfes): (
+                Vec<ast_unresolved::CteBinding>,
+                Vec<ast_unresolved::CfeDefinition>,
+            ) = match self.query_unresolved.as_ref() {
+                Some(ast_unresolved::Query::WithCtes { ctes, .. }) => (ctes.clone(), vec![]),
+                Some(ast_unresolved::Query::WithCfes { cfes, query, .. }) => {
+                    let ctes = match query.as_ref() {
+                            ast_unresolved::Query::WithCtes { ctes, .. } => ctes.clone(),
+                            ast_unresolved::Query::Relational(_) => vec![],
+                            other => panic!("catch-all hit in mod.rs outer_ctes extraction: unexpected inner Query variant: {:?}", other),
+                        };
+                    (ctes, cfes.clone())
                 }
-                _ => vec![],
+                Some(ast_unresolved::Query::WithPrecompiledCfes { query, .. }) => {
+                    let ctes = match query.as_ref() {
+                            ast_unresolved::Query::WithCtes { ctes, .. } => ctes.clone(),
+                            ast_unresolved::Query::Relational(_) => vec![],
+                            other => panic!("catch-all hit in mod.rs outer_ctes extraction: unexpected inner Query variant: {:?}", other),
+                        };
+                    (ctes, vec![])
+                }
+                _ => (vec![], vec![]),
             };
 
             for spec in &specs {
-                // Wrap the assertion body in a Query, including outer CTEs
-                // so CTE references inside assertions resolve correctly.
-                let assertion_query = if outer_ctes.is_empty() {
-                    ast_unresolved::Query::Relational(spec.body.clone())
-                } else {
-                    ast_unresolved::Query::WithCtes {
+                // Wrap the assertion body in a Query, including outer CTEs and CFEs
+                // so CTE references and CFE definitions resolve correctly inside assertions.
+                let mut assertion_query = ast_unresolved::Query::Relational(spec.body.clone());
+
+                // Wrap with CTEs first (innermost layer)
+                if !outer_ctes.is_empty() {
+                    assertion_query = ast_unresolved::Query::WithCtes {
                         ctes: outer_ctes.clone(),
-                        query: spec.body.clone(),
-                    }
-                };
+                        query: match assertion_query {
+                            ast_unresolved::Query::Relational(expr) => expr,
+                            other => panic!("unexpected assertion query variant: {:?}", other),
+                        },
+                    };
+                }
+
+                // Wrap with CFEs (outermost layer) — precompiler will resolve+refine them
+                if !outer_cfes.is_empty() {
+                    assertion_query = ast_unresolved::Query::WithCfes {
+                        cfes: outer_cfes.clone(),
+                        query: Box::new(assertion_query),
+                    };
+                }
+
+                // Precompile CFEs in the assertion query (resolve+refine CFE bodies)
+                let assertion_query = cfe_precompiler::precompile_query_cfes(
+                    assertion_query,
+                    schema,
+                    Some(self.system),
+                )
+                .map_err(|e| {
+                    self.record_delightql_error(&e);
+                    e
+                })?;
 
                 // Resolve
                 let resolved_result = resolver::resolve_query(
@@ -769,8 +799,12 @@ impl<'a> Pipeline<'a> {
                     e
                 })?;
 
-                // Refine (assertion uses same connection as main query)
-                let refined = refiner::refine_query(resolved_result.query).map_err(|e| {
+                // Refine (assertion uses same danger gates as main query)
+                let refined = refiner::refine_query_with_gates(
+                    resolved_result.query,
+                    assert_danger_gates.clone(),
+                )
+                .map_err(|e| {
                     self.record_delightql_error(&e);
                     e
                 })?;
@@ -779,37 +813,32 @@ impl<'a> Pipeline<'a> {
                     e
                 })?;
 
-                // Transform to SQL AST (inherit per-query danger gates + options)
-                let force_ctes = !self.inline_ctes;
-                let sql_ast = transformer_v3::transform_query_with_options(
-                    addressed,
-                    force_ctes,
-                    self.dialect,
-                    Some(bin_registry.clone()),
-                    Some(assert_danger_gates.clone()),
-                    Some(assert_options.clone()),
-                )
-                .map_err(|e| {
+                // Transform to SQL AST
+                let assert_ctx = transformer_v4::TransformCtx {
+                    cfes: vec![],
+                    names: transformer_v4::builder::NameGenerator::new(),
+                    outer_columns: vec![],
+                    danger_gates: assert_danger_gates.clone(),
+                };
+                let sql_ast = transformer_v4::transform(addressed, &assert_ctx).map_err(|e| {
                     self.record_delightql_error(&e);
                     e
                 })?;
 
-                // Optimize
-                let optimized = sql_optimizer::optimize(sql_ast, self.sql_optimization_level)
+                // Dialect-aware rewriting, then optimize
+                let rewritten = sql_rewriter::rewrite(sql_ast, self.dialect)?;
+                let optimized = sql_optimizer::optimize(rewritten, self.sql_optimization_level)
                     .map_err(|e| {
                         self.record_delightql_error(&e);
                         e
                     })?;
 
                 // Generate SQL string
-                let generator = generator_v3::SqlGenerator::new();
-                let assertion_sql = generator.generate_statement(&optimized).map_err(|e| {
-                    crate::error::DelightQLError::ParseError {
-                        message: format!("Assertion SQL generation error: {:?}", e),
-                        source: None,
-                        subcategory: None,
-                    }
-                })?;
+                let generator =
+                    generator_v3::SqlGenerator::new().with_bin_registry(bin_registry.clone());
+                let assertion_sql = generator
+                    .generate_statement(&optimized)
+                    .map_err(|e| e.into_delightql_error("Assertion SQL generation error"))?;
 
                 // Wrap the assertion SQL to produce a single-row,
                 // single-column boolean result.
@@ -851,25 +880,27 @@ impl<'a> Pipeline<'a> {
                             Some(self.system),
                             &self.resolution_config,
                         )?;
-                        let right_refined = refiner::refine_query(right_resolved_result.query)?;
-                        let right_addressed = addresser::address_query(right_refined)?;
-                        let right_sql_ast = transformer_v3::transform_query_with_options(
-                            right_addressed,
-                            force_ctes,
-                            self.dialect,
-                            Some(bin_registry.clone()),
-                            Some(assert_danger_gates.clone()),
-                            Some(assert_options.clone()),
+                        let right_refined = refiner::refine_query_with_gates(
+                            right_resolved_result.query,
+                            assert_danger_gates.clone(),
                         )?;
+                        let right_addressed = addresser::address_query(right_refined)?;
+                        let right_ctx = transformer_v4::TransformCtx {
+                            cfes: vec![],
+                            names: transformer_v4::builder::NameGenerator::new(),
+                            outer_columns: vec![],
+                            danger_gates: danger_gates::DangerGateMap::with_defaults(),
+                        };
+                        let right_sql_ast = transformer_v4::transform(right_addressed, &right_ctx)?;
+                        let right_rewritten = sql_rewriter::rewrite(right_sql_ast, self.dialect)?;
                         let right_optimized =
-                            sql_optimizer::optimize(right_sql_ast, self.sql_optimization_level)?;
-                        let right_generator = generator_v3::SqlGenerator::new();
+                            sql_optimizer::optimize(right_rewritten, self.sql_optimization_level)?;
+                        let right_generator = generator_v3::SqlGenerator::new()
+                            .with_bin_registry(bin_registry.clone());
                         let right_sql = right_generator
                             .generate_statement(&right_optimized)
-                            .map_err(|e| crate::error::DelightQLError::ParseError {
-                                message: format!("Equals right SQL generation error: {:?}", e),
-                                source: None,
-                                subcategory: None,
+                            .map_err(|e| {
+                                e.into_delightql_error("Equals right SQL generation error")
                             })?;
 
                         // Bag equality: same row count AND same set of rows.
@@ -915,8 +946,16 @@ impl<'a> Pipeline<'a> {
                     e
                 })?;
 
-                // Emit streams use the same connection as the main query
-                let refined = refiner::refine_query(resolved_result.query).map_err(|e| {
+                let mut emit_danger_gates = danger_gates::DangerGateMap::with_defaults();
+                emit_danger_gates.apply_overrides(&self.cli_danger_overrides);
+                emit_danger_gates.apply_overrides(&self.danger_specs);
+
+                // Emit streams use the same danger gates as the main query
+                let refined = refiner::refine_query_with_gates(
+                    resolved_result.query,
+                    emit_danger_gates.clone(),
+                )
+                .map_err(|e| {
                     self.record_delightql_error(&e);
                     e
                 })?;
@@ -924,35 +963,29 @@ impl<'a> Pipeline<'a> {
                     self.record_delightql_error(&e);
                     e
                 })?;
-
-                let force_ctes = !self.inline_ctes;
-                let sql_ast = transformer_v3::transform_query_with_options(
-                    addressed,
-                    force_ctes,
-                    self.dialect,
-                    Some(bin_registry.clone()),
-                    None,
-                    None,
-                )
-                .map_err(|e| {
+                let emit_ctx = transformer_v4::TransformCtx {
+                    cfes: vec![],
+                    names: transformer_v4::builder::NameGenerator::new(),
+                    outer_columns: vec![],
+                    danger_gates: emit_danger_gates,
+                };
+                let sql_ast = transformer_v4::transform(addressed, &emit_ctx).map_err(|e| {
                     self.record_delightql_error(&e);
                     e
                 })?;
 
-                let optimized = sql_optimizer::optimize(sql_ast, self.sql_optimization_level)
+                let rewritten = sql_rewriter::rewrite(sql_ast, self.dialect)?;
+                let optimized = sql_optimizer::optimize(rewritten, self.sql_optimization_level)
                     .map_err(|e| {
                         self.record_delightql_error(&e);
                         e
                     })?;
 
-                let generator = generator_v3::SqlGenerator::new();
-                let emit_sql = generator.generate_statement(&optimized).map_err(|e| {
-                    crate::error::DelightQLError::ParseError {
-                        message: format!("Emit SQL generation error: {:?}", e),
-                        source: None,
-                        subcategory: None,
-                    }
-                })?;
+                let generator =
+                    generator_v3::SqlGenerator::new().with_bin_registry(bin_registry.clone());
+                let emit_sql = generator
+                    .generate_statement(&optimized)
+                    .map_err(|e| e.into_delightql_error("Emit SQL generation error"))?;
 
                 compiled_emits.push(compiled_query::EmitStream {
                     name: spec.name.clone(),
@@ -995,6 +1028,9 @@ fn query_has_meta_ize(query: &ast_resolved::Query) -> bool {
             | ast_resolved::RelationalExpression::ErTransitiveJoin { .. } => {
                 unreachable!("ER chains consumed before meta-ize check")
             }
+            ast_resolved::RelationalExpression::IntersectCorresponding { .. } => {
+                unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+            }
         }
     }
 
@@ -1012,21 +1048,23 @@ fn query_has_meta_ize(query: &ast_resolved::Query) -> bool {
     }
 }
 
-/// Generate SQL string using v3 pipeline only
+/// Generate SQL string from a single addressed relational expression
 fn generate_sql_v3_only(ast_addressed: ast_addressed::RelationalExpression) -> Result<String> {
-    // V3 pipeline only: transformer_v3 → sql_ast_v3 → sql_optimizer → generator_v3
-    // Default to SQLite dialect for now
-    let sql_ast_v3 = transformer_v3::transform(ast_addressed, generator_v3::SqlDialect::SQLite)?;
+    let ctx = transformer_v4::TransformCtx {
+        cfes: vec![],
+        names: transformer_v4::builder::NameGenerator::new(),
+        outer_columns: vec![],
+        danger_gates: danger_gates::DangerGateMap::with_defaults(),
+    };
+    let query = ast_addressed::Query::Relational(ast_addressed);
+    let sql_ast_v3 = transformer_v4::transform(query, &ctx)?;
+    let rewritten = sql_rewriter::rewrite(sql_ast_v3, generator_v3::SqlDialect::SQLite)?;
     let optimized_sql_ast_v3 =
-        sql_optimizer::optimize(sql_ast_v3, sql_optimizer::OptimizationLevel::Basic)?;
+        sql_optimizer::optimize(rewritten, sql_optimizer::level_from_env())?;
     let generator = generator_v3::SqlGenerator::new();
     generator
         .generate_statement(&optimized_sql_ast_v3)
-        .map_err(|e| crate::error::DelightQLError::ParseError {
-            message: format!("SQL generation error: {:?}", e),
-            source: None,
-            subcategory: None,
-        })
+        .map_err(|e| e.into_delightql_error("SQL generation error"))
 }
 
 /// Generate SQL string with CTE support using v3 pipeline
@@ -1049,37 +1087,28 @@ fn generate_sql_with_ctes(
     let addressed_main: ast_addressed::RelationalExpression = refined_main.into();
 
     // Step 3: Transform each CTE to SQL AST
+    let ctx = transformer_v4::TransformCtx {
+        cfes: vec![],
+        names: transformer_v4::builder::NameGenerator::new(),
+        outer_columns: vec![],
+        danger_gates: danger_gates::DangerGateMap::with_defaults(),
+    };
     let mut sql_ctes = Vec::new();
     for (name, expr) in addressed_ctes {
-        // Transform the CTE expression to a query
-        // Default to SQLite dialect for now
-        let cte_sql_ast = transformer_v3::transform(expr, generator_v3::SqlDialect::SQLite)?;
-        // Extract the query from the statement (CTEs should not have nested CTEs)
-        let cte_query = match cte_sql_ast {
+        let cte_stmt = transformer_v4::transform(ast_addressed::Query::Relational(expr), &ctx)?;
+        let cte_query_expr = match cte_stmt {
             SqlStatement::Query { query, .. } => query,
-            _ => {
-                return Err(crate::error::DelightQLError::ParseError {
-                    message: "CTE produced non-query statement".to_string(),
-                    source: None,
-                    subcategory: None,
-                })
-            }
+            _ => unreachable!("CTE body cannot be DML"),
         };
-        sql_ctes.push(Cte::new(name, cte_query));
+        sql_ctes.push(Cte::new(name, cte_query_expr));
     }
 
     // Step 4: Transform main query to SQL AST
-    // Default to SQLite dialect for now
-    let main_sql_ast = transformer_v3::transform(addressed_main, generator_v3::SqlDialect::SQLite)?;
-    let main_query = match main_sql_ast {
+    let main_stmt =
+        transformer_v4::transform(ast_addressed::Query::Relational(addressed_main), &ctx)?;
+    let main_query = match main_stmt {
         SqlStatement::Query { query, .. } => query,
-        _ => {
-            return Err(crate::error::DelightQLError::ParseError {
-                message: "Main query produced non-query statement".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
+        _ => unreachable!("main query in generate_sql_with_ctes cannot be DML"),
     };
 
     // Step 5: Create SQL statement with CTEs
@@ -1090,16 +1119,13 @@ fn generate_sql_with_ctes(
     };
     let statement = SqlStatement::with_ctes(with_clause, main_query);
 
-    // Step 6: Optimize and generate
-    let optimized = sql_optimizer::optimize(statement, sql_optimizer::OptimizationLevel::Basic)?;
+    // Step 6: Rewrite, optimize, and generate
+    let rewritten = sql_rewriter::rewrite(statement, generator_v3::SqlDialect::SQLite)?;
+    let optimized = sql_optimizer::optimize(rewritten, sql_optimizer::level_from_env())?;
     let generator = generator_v3::SqlGenerator::new();
     generator
         .generate_statement(&optimized)
-        .map_err(|e| crate::error::DelightQLError::ParseError {
-            message: format!("CTE SQL generation error: {:?}", e),
-            source: None,
-            subcategory: None,
-        })
+        .map_err(|e| e.into_delightql_error("CTE SQL generation error"))
 }
 
 /// Compile DelightQL source text to SQL string (with CTE support)

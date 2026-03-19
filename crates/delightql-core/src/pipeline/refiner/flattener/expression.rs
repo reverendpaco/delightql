@@ -165,6 +165,7 @@ pub(super) fn flatten_expression(
                             grounding: None,
                         },
                         canonical_name: None,
+                        backend_schema: None,
                         alias: None,
                         position: ctx.position,
                         _scope_id: ctx.scope_id,
@@ -257,6 +258,7 @@ pub(super) fn flatten_expression(
                         grounding: None,
                     },
                     canonical_name: None,
+                    backend_schema: None,
                     alias: None,
                     position: ctx.position,
                     _scope_id: ctx.scope_id,
@@ -315,6 +317,7 @@ pub(super) fn flatten_expression(
                     grounding: None,
                 },
                 canonical_name: None,
+                backend_schema: None,
                 alias: None,
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
@@ -337,6 +340,9 @@ pub(super) fn flatten_expression(
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
             unreachable!("ER-join consumed by resolver")
         }
+        resolved::RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
     }
 
     Ok(())
@@ -352,6 +358,7 @@ pub(super) fn flatten_relation(
         resolved::Relation::Ground {
             identifier,
             canonical_name,
+            backend_schema,
             domain_spec,
             alias,
             cpr_schema,
@@ -368,6 +375,7 @@ pub(super) fn flatten_relation(
             segment.tables.push(FlatTable {
                 identifier: identifier.clone(),
                 canonical_name: canonical_name.get().cloned(),
+                backend_schema: backend_schema.get().clone(),
                 alias: alias.map(|s| s.to_string()),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
@@ -411,6 +419,7 @@ pub(super) fn flatten_relation(
                     grounding: None,
                 },
                 canonical_name: None,
+                backend_schema: None,
                 alias: alias.map(|s| s.to_string()),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
@@ -440,7 +449,9 @@ pub(super) fn flatten_relation(
             domain_spec,
             alias,
             namespace,
+            backend_schema,
             grounding,
+            cpr_schema,
             ..
         } => {
             // Derive flat string arguments from ho_arguments for TvfData.
@@ -454,16 +465,16 @@ pub(super) fn flatten_relation(
                     crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => {
                         ho_argument_scalar_to_string(dom)
                     }
-                    crate::pipeline::asts::core::operators::HoArgument::Table(rel) => {
-                        match rel {
-                            resolved::RelationalExpression::Relation(
-                                resolved::Relation::Ground { identifier, .. },
-                            ) => identifier.name.to_string(),
-                            _ => "_unknown_".to_string(),
-                        }
-                    }
+                    crate::pipeline::asts::core::operators::HoArgument::Table(rel) => match rel {
+                        resolved::RelationalExpression::Relation(resolved::Relation::Ground {
+                            identifier,
+                            ..
+                        }) => identifier.name.to_string(),
+                        _ => "_unknown_".to_string(),
+                    },
                 })
                 .collect();
+            let tvf_backend_schema = backend_schema.get().clone();
             segment.tables.push(FlatTable {
                 identifier: QualifiedName {
                     namespace_path: NamespacePath::empty(),
@@ -471,12 +482,13 @@ pub(super) fn flatten_relation(
                     grounding: None,
                 },
                 canonical_name: None,
+                backend_schema: tvf_backend_schema.clone(),
                 alias: alias.map(|s| s.to_string()),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
                 domain_spec: domain_spec.clone(),
                 operation_context: OperationContext::Direct,
-                schema: resolved::CprSchema::Unknown,
+                schema: cpr_schema.get().clone(),
                 outer: false,
                 anonymous_data: None,
                 correlation_refs: Vec::new(),
@@ -489,6 +501,7 @@ pub(super) fn flatten_relation(
                     arguments,
                     domain_spec: domain_spec.clone(),
                     namespace: namespace.clone(),
+                    backend_schema: tvf_backend_schema,
                     grounding: grounding.clone(),
                 }),
                 subquery_segment: None,
@@ -525,6 +538,7 @@ pub(super) fn flatten_relation(
             segment.tables.push(FlatTable {
                 identifier,
                 canonical_name: None,
+                backend_schema: None,
                 alias: Some(scoped_data.alias().to_string()),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,

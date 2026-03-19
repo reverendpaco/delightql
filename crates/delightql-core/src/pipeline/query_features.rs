@@ -158,7 +158,10 @@ pub struct HoParamBindings {
     /// Interior CTEs: table arguments with interior conditions (filters, pipes, etc.)
     /// that need to be materialized as CTEs before the view body is expanded.
     /// (cte_name, relational_expression)
-    pub interior_ctes: Vec<(String, crate::pipeline::asts::unresolved::RelationalExpression)>,
+    pub interior_ctes: Vec<(
+        String,
+        crate::pipeline::asts::unresolved::RelationalExpression,
+    )>,
 }
 
 impl HoParamBindings {

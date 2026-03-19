@@ -17,10 +17,11 @@
 // This architecture is ready for positional patterns - when they're added to the
 // grammar and builder, they'll automatically flow through this single unified path.
 
-use super::string_templates::build_concat_chain_as_function;
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_resolved::StringTemplatePart;
-use crate::pipeline::asts::core::{ProjectionExpr, SubstitutionExpr};
+use crate::pipeline::ast_transform::{walk_transform_boolean, walk_transform_domain, AstTransform};
+use crate::pipeline::asts::core::{
+    BooleanExpression, DomainExpression, ProjectionExpr, Resolved, SubstitutionExpr, Unresolved,
+};
 use crate::pipeline::asts::unresolved::LiteralValue;
 use crate::pipeline::asts::unresolved::NamespacePath;
 use crate::pipeline::asts::{resolved as ast_resolved, unresolved as ast_unresolved};
@@ -411,7 +412,7 @@ impl PatternResolver {
                     provenance: ast_resolved::PhaseBox::phantom(),
                 };
 
-                let left_qualifier = match &left_col.fq_table.name {
+                let left_qualifier = match &left_col.table_name {
                     ast_resolved::TableName::Named(name) => Some(name.to_string()),
                     ast_resolved::TableName::Fresh => None,
                 };
@@ -465,7 +466,7 @@ fn create_unification_condition(
     right_col: &ast_resolved::ColumnMetadata,
     right_table: &str,
 ) -> ast_resolved::BooleanExpression {
-    let left_qualifier = match &left_col.fq_table.name {
+    let left_qualifier = match &left_col.table_name {
         ast_resolved::TableName::Named(name) => Some(name.to_string()),
         ast_resolved::TableName::Fresh => None,
     };
@@ -518,47 +519,40 @@ fn create_expression_constraint(
     })
 }
 
-fn convert_unresolved_to_resolved_expression(
-    expr: &ast_unresolved::DomainExpression,
-) -> Result<ast_resolved::DomainExpression> {
-    match expr {
-        ast_unresolved::DomainExpression::Literal { value, alias } => {
-            Ok(ast_resolved::DomainExpression::Literal {
-                value: value.clone(),
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::Lvar {
-            name,
-            qualifier,
-            namespace_path,
-            alias,
-            provenance: _,
-        } => Ok(ast_resolved::DomainExpression::Lvar {
-            name: name.clone(),
-            qualifier: qualifier.clone(),
-            namespace_path: namespace_path.clone(),
-            alias: alias.clone(),
-            provenance: ast_resolved::PhaseBox::phantom(),
-        }),
-        ast_unresolved::DomainExpression::Function(func) => Ok(
-            ast_resolved::DomainExpression::Function(convert_unresolved_function(func)?),
-        ),
-        ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
-            Ok(ast_resolved::DomainExpression::NonUnifiyingUnderscore)
-        }
-        ast_unresolved::DomainExpression::ValuePlaceholder { alias } => {
-            Ok(ast_resolved::DomainExpression::ValuePlaceholder {
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::Substitution(ref sub) => match sub {
-            SubstitutionExpr::Parameter { .. }
-            | SubstitutionExpr::CurriedParameter { .. }
-            | SubstitutionExpr::ContextMarker => {
-                Ok(ast_resolved::DomainExpression::Substitution(sub.clone()))
+/// Strict phase converter: Unresolved → Resolved using AstTransform's default walks.
+/// Unlike the permissive `PhaseConverter` in type_conversion.rs (which uses placeholders),
+/// this converter returns errors for unsupported variants in the pattern constraint context:
+/// ColumnOrdinal, ColumnRange, ScalarSubquery, InnerExists, InRelational, Sigma.
+struct StrictPhaseConverter;
+
+impl AstTransform<Unresolved, Resolved> for StrictPhaseConverter {
+    fn transform_domain(
+        &mut self,
+        expr: DomainExpression<Unresolved>,
+    ) -> Result<DomainExpression<Resolved>> {
+        match expr {
+            DomainExpression::ColumnOrdinal(_) => {
+                // These should be resolved by now in patterns
+                Err(DelightQLError::ParseError {
+                    message: "Column ordinals not supported in pattern constraints".to_string(),
+                    source: None,
+                    subcategory: None,
+                })
             }
-            SubstitutionExpr::ContextParameter { .. } => {
+            DomainExpression::Projection(ProjectionExpr::ColumnRange(_)) => {
+                // These should be resolved by now in patterns
+                Err(DelightQLError::ParseError {
+                    message: "Column ranges not supported in pattern constraints".to_string(),
+                    source: None,
+                    subcategory: None,
+                })
+            }
+            DomainExpression::ScalarSubquery { .. } => Err(DelightQLError::ParseError {
+                message: "Scalar subqueries not supported in pattern constraints".to_string(),
+                source: None,
+                subcategory: None,
+            }),
+            DomainExpression::Substitution(SubstitutionExpr::ContextParameter { .. }) => {
                 // ContextParameter should never exist in unresolved phase - it's only created during
                 // postprocessing in refined phase for CCAFE feature
                 Err(DelightQLError::ParseError {
@@ -567,469 +561,55 @@ fn convert_unresolved_to_resolved_expression(
                     subcategory: None,
                 })
             }
-        },
-        ast_unresolved::DomainExpression::Projection(ref proj) => match proj {
-            ProjectionExpr::Glob {
-                qualifier,
-                namespace_path,
-            } => Ok(ast_resolved::DomainExpression::Projection(
-                ProjectionExpr::Glob {
-                    qualifier: qualifier.clone(),
-                    namespace_path: namespace_path.clone(),
-                },
-            )),
-            ProjectionExpr::Pattern { pattern, alias } => {
-                // Patterns are preserved for later expansion
-                Ok(ast_resolved::DomainExpression::Projection(
-                    ProjectionExpr::Pattern {
-                        pattern: pattern.clone(),
-                        alias: alias.clone(),
-                    },
-                ))
-            }
-            ProjectionExpr::ColumnRange(_) => {
-                // These should be resolved by now in patterns
+            other => walk_transform_domain(self, other),
+        }
+    }
+
+    fn transform_boolean(
+        &mut self,
+        expr: BooleanExpression<Unresolved>,
+    ) -> Result<BooleanExpression<Resolved>> {
+        match expr {
+            BooleanExpression::InnerExists { .. } => {
+                // Complex subquery conversion not supported in pattern constraints
                 Err(DelightQLError::ParseError {
-                    message: "Column ranges not supported in pattern constraints".to_string(),
+                    message: "EXISTS expressions not supported in pattern constraints".to_string(),
                     source: None,
                     subcategory: None,
                 })
             }
-            ProjectionExpr::JsonPathLiteral {
-                segments,
-                root_is_array,
-                alias,
-            } => Ok(ast_resolved::DomainExpression::Projection(
-                ProjectionExpr::JsonPathLiteral {
-                    segments: segments.clone(),
-                    root_is_array: *root_is_array,
-                    alias: alias.clone(),
-                },
-            )),
-        },
-        ast_unresolved::DomainExpression::Predicate { expr, alias } => {
-            // Convert the predicate expression
-            let resolved_pred = convert_unresolved_boolean_expression(expr)?;
-            Ok(ast_resolved::DomainExpression::Predicate {
-                expr: Box::new(resolved_pred),
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::PipedExpression {
-            value,
-            transforms,
-            alias,
-        } => {
-            // Convert the value and transforms
-            Ok(ast_resolved::DomainExpression::PipedExpression {
-                value: Box::new(convert_unresolved_to_resolved_expression(value)?),
-                transforms: transforms
-                    .iter()
-                    .map(convert_unresolved_function)
-                    .collect::<Result<Vec<_>>>()?,
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::Parenthesized { inner, alias } => {
-            Ok(ast_resolved::DomainExpression::Parenthesized {
-                inner: Box::new(convert_unresolved_to_resolved_expression(inner)?),
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::Tuple { elements, alias } => {
-            Ok(ast_resolved::DomainExpression::Tuple {
-                elements: elements
-                    .iter()
-                    .map(convert_unresolved_to_resolved_expression)
-                    .collect::<Result<_>>()?,
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::DomainExpression::ScalarSubquery { .. } => {
-            Err(DelightQLError::ParseError {
-                message: "Scalar subqueries not supported in pattern constraints".to_string(),
+            BooleanExpression::InRelational { .. } => Err(DelightQLError::ParseError {
+                message: "IN subquery expressions not supported in pattern constraints".to_string(),
                 source: None,
                 subcategory: None,
-            })
+            }),
+            BooleanExpression::Sigma { .. } => {
+                // Sigma predicates not yet fully supported in pattern context
+                Err(DelightQLError::not_implemented(
+                    "Sigma predicates in pattern destructuring not yet supported",
+                ))
+            }
+            other => walk_transform_boolean(self, other),
         }
-        ast_unresolved::DomainExpression::ColumnOrdinal(_) => {
-            // These should be resolved by now in patterns
-            Err(DelightQLError::ParseError {
-                message: "Column ordinals not supported in pattern constraints".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
-
-        // Pivot: convert both children
-        ast_unresolved::DomainExpression::PivotOf {
-            value_column,
-            pivot_key,
-            pivot_values,
-        } => Ok(ast_resolved::DomainExpression::PivotOf {
-            value_column: Box::new(convert_unresolved_to_resolved_expression(value_column)?),
-            pivot_key: Box::new(convert_unresolved_to_resolved_expression(pivot_key)?),
-            pivot_values: pivot_values.clone(),
-        }),
     }
+}
+
+fn convert_unresolved_to_resolved_expression(
+    expr: &ast_unresolved::DomainExpression,
+) -> Result<ast_resolved::DomainExpression> {
+    StrictPhaseConverter.transform_domain(expr.clone())
 }
 
 fn convert_unresolved_function(
     func: &ast_unresolved::FunctionExpression,
 ) -> Result<ast_resolved::FunctionExpression> {
-    match func {
-        ast_unresolved::FunctionExpression::Regular {
-            name,
-            namespace,
-            arguments,
-            alias,
-            conditioned_on,
-        } => {
-            let resolved_args: Result<Vec<_>> = arguments
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect();
-            let resolved_condition = conditioned_on
-                .as_ref()
-                .map(|cond| convert_unresolved_boolean_expression(cond.as_ref()))
-                .transpose()?;
-            Ok(ast_resolved::FunctionExpression::Regular {
-                name: name.clone(),
-                namespace: namespace.clone(),
-                arguments: resolved_args?,
-                alias: alias.clone(),
-                conditioned_on: resolved_condition.map(Box::new),
-            })
-        }
-        ast_unresolved::FunctionExpression::Curried {
-            name,
-            namespace,
-            arguments,
-            conditioned_on,
-        } => {
-            let resolved_args: Result<Vec<_>> = arguments
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect();
-            let resolved_condition = conditioned_on
-                .as_ref()
-                .map(|cond| convert_unresolved_boolean_expression(cond.as_ref()))
-                .transpose()?;
-            Ok(ast_resolved::FunctionExpression::Curried {
-                name: name.clone(),
-                namespace: namespace.clone(),
-                arguments: resolved_args?,
-                conditioned_on: resolved_condition.map(Box::new),
-            })
-        }
-        ast_unresolved::FunctionExpression::Bracket { arguments, alias } => {
-            let resolved_args: Result<Vec<_>> = arguments
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect();
-            Ok(ast_resolved::FunctionExpression::Bracket {
-                arguments: resolved_args?,
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::FunctionExpression::Infix {
-            operator,
-            left,
-            right,
-            alias,
-        } => Ok(ast_resolved::FunctionExpression::Infix {
-            operator: operator.clone(),
-            left: Box::new(convert_unresolved_to_resolved_expression(left)?),
-            right: Box::new(convert_unresolved_to_resolved_expression(right)?),
-            alias: alias.clone(),
-        }),
-        ast_unresolved::FunctionExpression::Lambda { body, alias } => {
-            Ok(ast_resolved::FunctionExpression::Lambda {
-                body: Box::new(convert_unresolved_to_resolved_expression(body)?),
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::FunctionExpression::StringTemplate { parts, alias } => {
-            // Expand StringTemplate to concat expression here for pattern resolution
-            // Convert parts to resolved
-            let mut resolved_parts = Vec::new();
-            for part in parts {
-                match part {
-                    ast_unresolved::StringTemplatePart::Text(text) => {
-                        resolved_parts.push(StringTemplatePart::Text(text.clone()));
-                    }
-                    ast_unresolved::StringTemplatePart::Interpolation(expr) => {
-                        let resolved_expr = convert_unresolved_to_resolved_expression(expr)?;
-                        resolved_parts
-                            .push(StringTemplatePart::Interpolation(Box::new(resolved_expr)));
-                    }
-                }
-            }
-
-            // Build concat chain from parts
-            Ok(build_concat_chain_as_function(
-                resolved_parts,
-                alias.clone(),
-            ))
-        }
-        ast_unresolved::FunctionExpression::CaseExpression { .. } => {
-            Err(crate::error::DelightQLError::not_implemented(
-                "CASE expression in positional pattern context",
-            ))
-        }
-        ast_unresolved::FunctionExpression::HigherOrder {
-            name,
-            curried_arguments,
-            regular_arguments,
-            alias,
-            conditioned_on,
-        } => {
-            // Process curried arguments
-            let resolved_curried: Result<Vec<_>> = curried_arguments
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect();
-
-            // Process regular arguments
-            let resolved_regular: Result<Vec<_>> = regular_arguments
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect();
-
-            // Process filter condition if present
-            let resolved_condition = conditioned_on
-                .as_ref()
-                .map(|cond| convert_unresolved_boolean_expression(cond.as_ref()))
-                .transpose()?;
-
-            Ok(ast_resolved::FunctionExpression::HigherOrder {
-                name: name.clone(),
-                curried_arguments: resolved_curried?,
-                regular_arguments: resolved_regular?,
-                alias: alias.clone(),
-                conditioned_on: resolved_condition.map(Box::new),
-            })
-        }
-        ast_unresolved::FunctionExpression::Curly {
-            members,
-            inner_grouping_keys: _,
-            cte_requirements: _,
-            alias,
-        } => {
-            // Tree groups pass through unchanged (Epoch 1)
-            use crate::pipeline::asts::{resolved, unresolved};
-            let resolved_members: Vec<resolved::CurlyMember> = members
-                .iter()
-                .map(|m| -> Result<resolved::CurlyMember> {
-                    Ok(match m {
-                        unresolved::CurlyMember::Shorthand {
-                            column,
-                            qualifier,
-                            schema,
-                        } => resolved::CurlyMember::Shorthand {
-                            column: column.clone(),
-                            qualifier: qualifier.clone(),
-                            schema: schema.clone(),
-                        },
-                        unresolved::CurlyMember::Comparison { condition } => {
-                            resolved::CurlyMember::Comparison {
-                                condition: Box::new(convert_unresolved_boolean_expression(
-                                    condition,
-                                )?),
-                            }
-                        }
-                        unresolved::CurlyMember::KeyValue {
-                            key,
-                            nested_reduction,
-                            value,
-                        } => resolved::CurlyMember::KeyValue {
-                            key: key.clone(),
-                            nested_reduction: *nested_reduction,
-                            value: Box::new(convert_unresolved_to_resolved_expression(value)?),
-                        },
-                        // TG-ERGONOMIC-INDUCTOR: Pass through - will be expanded in main resolver
-                        unresolved::CurlyMember::Glob => resolved::CurlyMember::Glob,
-                        unresolved::CurlyMember::Pattern { pattern } => {
-                            resolved::CurlyMember::Pattern {
-                                pattern: pattern.clone(),
-                            }
-                        }
-                        unresolved::CurlyMember::OrdinalRange { start, end } => {
-                            resolved::CurlyMember::OrdinalRange {
-                                start: *start,
-                                end: *end,
-                            }
-                        }
-                        // Placeholder passes through to resolved phase
-                        unresolved::CurlyMember::Placeholder => resolved::CurlyMember::Placeholder,
-                        // PATH FIRST-CLASS: Epoch 4 - PathLiteral passes through with path conversion
-                        unresolved::CurlyMember::PathLiteral { path, alias } => {
-                            resolved::CurlyMember::PathLiteral {
-                                path: Box::new(convert_unresolved_to_resolved_expression(path)?),
-                                alias: alias.clone(),
-                            }
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(ast_resolved::FunctionExpression::Curly {
-                members: resolved_members,
-                inner_grouping_keys: vec![], // Pattern resolver doesn't populate this
-                cte_requirements: None,      // Phase R2+ will populate this
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::FunctionExpression::MetadataTreeGroup {
-            key_column,
-            key_qualifier,
-            key_schema,
-            constructor,
-            alias,
-            keys_only,
-            cte_requirements: _,
-        } => {
-            // Tree groups pass through unchanged (Epoch 1)
-            Ok(ast_resolved::FunctionExpression::MetadataTreeGroup {
-                key_column: key_column.clone(),
-                key_qualifier: key_qualifier.clone(),
-                key_schema: key_schema.clone(),
-                constructor: Box::new(convert_unresolved_function(constructor)?),
-                keys_only: *keys_only,
-                cte_requirements: None,
-                alias: alias.clone(),
-            })
-        }
-        ast_unresolved::FunctionExpression::Window {
-            name,
-            arguments,
-            partition_by,
-            order_by,
-            frame: _frame,
-            alias,
-        } => {
-            // Window functions: convert arguments, partition_by, and order_by
-            let resolved_arguments = arguments
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect::<Result<Vec<_>>>()?;
-
-            let resolved_partition = partition_by
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect::<Result<Vec<_>>>()?;
-
-            let resolved_order = order_by
-                .iter()
-                .map(|spec| {
-                    Ok(ast_resolved::OrderingSpec {
-                        column: convert_unresolved_to_resolved_expression(&spec.column)?,
-                        direction: spec.direction.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            Ok(ast_resolved::FunctionExpression::Window {
-                name: name.clone(),
-                arguments: resolved_arguments,
-                partition_by: resolved_partition,
-                order_by: resolved_order,
-                frame: None, // Frame bounds not resolved in pattern resolution
-                alias: alias.clone(),
-            })
-        }
-        _ => unimplemented!("JsonPath not yet implemented in this phase"),
-    }
+    StrictPhaseConverter.transform_function(func.clone())
 }
 
 fn convert_unresolved_boolean_expression(
     expr: &ast_unresolved::BooleanExpression,
 ) -> Result<ast_resolved::BooleanExpression> {
-    match expr {
-        ast_unresolved::BooleanExpression::Comparison {
-            operator,
-            left,
-            right,
-        } => Ok(ast_resolved::BooleanExpression::Comparison {
-            operator: operator.clone(),
-            left: Box::new(convert_unresolved_to_resolved_expression(left)?),
-            right: Box::new(convert_unresolved_to_resolved_expression(right)?),
-        }),
-        ast_unresolved::BooleanExpression::And { left, right } => {
-            Ok(ast_resolved::BooleanExpression::And {
-                left: Box::new(convert_unresolved_boolean_expression(left)?),
-                right: Box::new(convert_unresolved_boolean_expression(right)?),
-            })
-        }
-        ast_unresolved::BooleanExpression::Or { left, right } => {
-            Ok(ast_resolved::BooleanExpression::Or {
-                left: Box::new(convert_unresolved_boolean_expression(left)?),
-                right: Box::new(convert_unresolved_boolean_expression(right)?),
-            })
-        }
-        ast_unresolved::BooleanExpression::Not { expr } => {
-            Ok(ast_resolved::BooleanExpression::Not {
-                expr: Box::new(convert_unresolved_boolean_expression(expr)?),
-            })
-        }
-        ast_unresolved::BooleanExpression::Using { columns } => {
-            Ok(ast_resolved::BooleanExpression::Using {
-                columns: columns.clone(),
-            })
-        }
-        ast_unresolved::BooleanExpression::InnerExists {
-            exists: _,
-            identifier: _,
-            subquery: _,
-            alias: _,
-            using_columns: _,
-        } => {
-            // For now, we'll skip complex subquery conversion
-            // This would need proper relational expression conversion
-            Err(DelightQLError::ParseError {
-                message: "EXISTS expressions not supported in pattern constraints".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
-        ast_unresolved::BooleanExpression::In {
-            value,
-            set,
-            negated,
-        } => Ok(ast_resolved::BooleanExpression::In {
-            value: Box::new(convert_unresolved_to_resolved_expression(value)?),
-            set: set
-                .iter()
-                .map(convert_unresolved_to_resolved_expression)
-                .collect::<Result<Vec<_>>>()?,
-            negated: *negated,
-        }),
-        ast_unresolved::BooleanExpression::InRelational { .. } => Err(DelightQLError::ParseError {
-            message: "IN subquery expressions not supported in pattern constraints".to_string(),
-            source: None,
-            subcategory: None,
-        }),
-        ast_unresolved::BooleanExpression::BooleanLiteral { value } => {
-            Ok(ast_resolved::BooleanExpression::BooleanLiteral { value: *value })
-        }
-        ast_unresolved::BooleanExpression::Sigma { .. } => {
-            // Sigma predicates not yet fully supported in pattern context
-            Err(crate::error::DelightQLError::not_implemented(
-                "Sigma predicates in pattern destructuring not yet supported",
-            ))
-        }
-        ast_unresolved::BooleanExpression::GlobCorrelation { left, right } => {
-            Ok(ast_resolved::BooleanExpression::GlobCorrelation {
-                left: left.clone(),
-                right: right.clone(),
-            })
-        }
-        ast_unresolved::BooleanExpression::OrdinalGlobCorrelation { left, right } => {
-            Ok(ast_resolved::BooleanExpression::OrdinalGlobCorrelation {
-                left: left.clone(),
-                right: right.clone(),
-            })
-        }
-    }
+    StrictPhaseConverter.transform_boolean(expr.clone())
 }
 
 // Extension trait for ColumnMetadata

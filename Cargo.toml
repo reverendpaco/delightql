@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["grammar_dql"]
+exclude = ["grammar_dql", "tools/fn-lengths"]
 members = [
     "crates/delightql-core",
     "crates/delightql-cli",
