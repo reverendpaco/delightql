@@ -755,7 +755,7 @@ fn parse_path_segment(node: CstNode) -> Result<PathSegment> {
             }
         }
         "integer_literal" => {
-            let text = node.text();
+            let text = node.text().replace('_', "");
             let idx = text.parse::<i64>().map_err(|_| {
                 DelightQLError::parse_error(format!("Invalid array index: {}", text))
             })?;

@@ -493,9 +493,10 @@ fn apply_comma_to_node(
                 .with_condition(SigmaCondition::Predicate(combined))
                 .build())
         }
-        other => {
-            panic!("catch-all hit in builder_v2/continuation.rs apply_comma_to_node: unexpected node kind {:?}", other)
-        }
+        other => Err(DelightQLError::parse_error(format!(
+            "Unexpected expression after comma: '{}' is not a valid filter or join condition",
+            other
+        ))),
     }
 }
 

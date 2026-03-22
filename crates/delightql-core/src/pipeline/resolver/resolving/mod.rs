@@ -5,7 +5,7 @@ pub(super) mod column_extraction;
 pub(super) mod domain_expressions;
 pub(super) mod functions;
 pub(super) mod helpers;
-mod operators;
+pub(in crate::pipeline::resolver) mod operators;
 pub(super) mod predicates;
 pub(super) mod tree_group_analysis;
 

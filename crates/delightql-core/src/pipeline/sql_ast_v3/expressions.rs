@@ -51,16 +51,6 @@ impl ColumnQualifier {
         ColumnQualifier(ColumnQualifierKind::Table(name.into()))
     }
 
-    pub(in crate::pipeline) fn schema_table(
-        schema: impl Into<String>,
-        table: impl Into<String>,
-    ) -> Self {
-        ColumnQualifier(ColumnQualifierKind::SchemaTable {
-            schema: schema.into(),
-            table: table.into(),
-        })
-    }
-
     /// Destructure for pattern matching (read-only).
     pub fn parts(&self) -> QualifierParts<'_> {
         match &self.0 {
@@ -261,15 +251,6 @@ impl SqlPredicate {
             name: name.into(),
             args,
             negated,
-        }
-    }
-
-    /// Access the inner expression (read-only).
-    /// Panics on RewriteCall — use pattern matching when both variants are possible.
-    pub fn as_expr(&self) -> &DomainExpression {
-        match self {
-            Self::Expr(e) => e,
-            Self::RewriteCall { .. } => panic!("as_expr called on RewriteCall"),
         }
     }
 

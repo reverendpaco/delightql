@@ -705,7 +705,7 @@ fn parse_limit_offset(node: CstNode, features: &FeatureCollector) -> Result<Tupl
 
     // Value is usually an integer literal, but HO view bodies may use parameter
     // names (e.g., `# < n`). Check HO scalar bindings first, then fall back.
-    let value = if let Ok(v) = value_text.parse::<i64>() {
+    let value = if let Ok(v) = value_text.replace('_', "").parse::<i64>() {
         v
     } else if let Some(ref bindings) = features.ho_bindings {
         // Try to resolve the identifier from scalar bindings

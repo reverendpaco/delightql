@@ -34,36 +34,8 @@ impl SelectBuilder {
         self
     }
 
-    pub fn has_select_items(&self) -> bool {
-        !self.select_list.is_empty()
-    }
-
-    /// Returns true if the SELECT list contains non-trivial items (not just `SELECT *`).
-    /// Used to detect builders from value-covers that need materialization before
-    /// another operator can apply its own SELECT.
-    pub fn has_cover_select_items(&self) -> bool {
-        if self.select_list.is_empty() {
-            return false;
-        }
-        // A trivial SELECT is a single `*` — produced by filter/join builders.
-        // Anything else (cover transforms, projections) is non-trivial.
-        !(self.select_list.len() == 1 && matches!(self.select_list[0], SelectItem::Star))
-    }
-
     pub fn has_limit(&self) -> bool {
         self.limit.is_some()
-    }
-
-    pub fn get_from(&self) -> Option<&Vec<TableExpression>> {
-        self.from.as_ref()
-    }
-
-    pub fn get_where_clause(&self) -> Option<&DomainExpression> {
-        self.where_clause.as_ref()
-    }
-
-    pub fn get_select_list(&self) -> &[SelectItem] {
-        &self.select_list
     }
 
     pub fn select(mut self, item: SelectItem) -> Self {

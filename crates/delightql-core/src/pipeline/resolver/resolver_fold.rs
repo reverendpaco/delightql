@@ -331,6 +331,10 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         // Pass through correlation (resolver doesn't set it, refiner will)
         let resolved_correlation = unresolved_corr.into();
 
+        let bubbled = match &final_schema {
+            ast_resolved::CprSchema::Resolved(cols) => BubbledState::resolved(cols.clone()),
+            _ => BubbledState::empty(),
+        };
         Ok((
             ast_resolved::RelationalExpression::SetOperation {
                 operator,
@@ -338,7 +342,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 correlation: resolved_correlation,
                 cpr_schema: ast_resolved::PhaseBox::new(final_schema),
             },
-            BubbledState::empty(), // SetOperations don't bubble anything
+            bubbled,
         ))
     }
 
@@ -1619,10 +1623,6 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             ast_resolved::TableName::Fresh
                         },
                     });
-
-                // Seal column identity: after a pipe barrier, the column's
-                // public name is its effective name. original_name() == name().
-                col.info = col.info.clone().promote_at_barrier();
             }
 
             // Construct resolved pipe, accumulate as new source
@@ -2159,6 +2159,18 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                         &functor,
                         arguments,
                         exists,
+                    )?;
+                    let resolved = self.transform_boolean(expanded)?;
+                    return Ok(ast_resolved::SigmaCondition::Predicate(resolved));
+                }
+
+                // Check if functor matches a known table or fact (used as sigma).
+                // Expand +table(args) → EXISTS (SELECT 1 FROM table WHERE table.col = arg)
+                if self.registry.database.lookup_table(&functor).is_some()
+                    || self.registry.consult.lookup_enlisted_table(&functor)?
+                {
+                    let expanded = super::resolving::predicates::expand_table_as_sigma(
+                        &functor, arguments, exists,
                     )?;
                     let resolved = self.transform_boolean(expanded)?;
                     return Ok(ast_resolved::SigmaCondition::Predicate(resolved));

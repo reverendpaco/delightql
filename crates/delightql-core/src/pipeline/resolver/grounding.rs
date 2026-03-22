@@ -336,32 +336,6 @@ fn discover_nested_cfes_inner(
     Ok(())
 }
 
-fn discover_nested_cfes_inner_func(
-    func: &FunctionExpression<Unresolved>,
-    source_ns: &str,
-    consult: &ConsultRegistry,
-    data_ns: Option<&ast_unresolved::NamespacePath>,
-    seen: &mut std::collections::HashSet<String>,
-    out: &mut Vec<CfeDefinition>,
-) -> Result<()> {
-    // Wrap as DomainExpression::Function for uniform handling
-    let as_domain = DomainExpression::Function(func.clone());
-    discover_nested_cfes_inner(&as_domain, source_ns, consult, data_ns, seen, out)
-}
-
-fn discover_nested_cfes_in_boolean(
-    _cond: &ast_unresolved::BooleanExpression,
-    _source_ns: &str,
-    _consult: &ConsultRegistry,
-    _data_ns: Option<&ast_unresolved::NamespacePath>,
-    _seen: &mut std::collections::HashSet<String>,
-    _out: &mut Vec<CfeDefinition>,
-) -> Result<()> {
-    // Boolean conditions in CASE arms rarely contain function calls to consulted entities.
-    // Skip for now — can be extended if needed.
-    Ok(())
-}
-
 // ============================================================================
 // Borrowed inlining — BorrowedInliner fold
 // ============================================================================

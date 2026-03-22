@@ -600,18 +600,6 @@ fn convert_unresolved_to_resolved_expression(
     StrictPhaseConverter.transform_domain(expr.clone())
 }
 
-fn convert_unresolved_function(
-    func: &ast_unresolved::FunctionExpression,
-) -> Result<ast_resolved::FunctionExpression> {
-    StrictPhaseConverter.transform_function(func.clone())
-}
-
-fn convert_unresolved_boolean_expression(
-    expr: &ast_unresolved::BooleanExpression,
-) -> Result<ast_resolved::BooleanExpression> {
-    StrictPhaseConverter.transform_boolean(expr.clone())
-}
-
 // Extension trait for ColumnMetadata
 trait ColumnMetadataExt {
     fn with_name(&self, name: String) -> ast_resolved::ColumnMetadata;

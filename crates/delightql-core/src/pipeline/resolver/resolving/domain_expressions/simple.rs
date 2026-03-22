@@ -270,9 +270,8 @@ fn resolve_lvar(
         //    but resolves to a Fresh column is stale.
         // Case 2 does NOT apply when all columns are Fresh (pure anonymous table
         // context), because there qualifiers are aliases that resolve at SQL level.
-        let has_qualifier = qualifier.is_some()
-            && qualifier.as_ref().unwrap() != "_"
-            && !available.is_empty();
+        let has_qualifier =
+            qualifier.is_some() && qualifier.as_ref().unwrap() != "_" && !available.is_empty();
 
         let all_fresh = has_qualifier
             && available
@@ -280,12 +279,12 @@ fn resolve_lvar(
                 .all(|col| matches!(col.table_name, ast_resolved::TableName::Fresh));
 
         let mixed_stale = if has_qualifier && !all_fresh {
-            let has_named = available.iter().any(|col| {
-                matches!(&col.table_name, ast_resolved::TableName::Named(_))
-            });
-            let has_fresh = available.iter().any(|col| {
-                matches!(col.table_name, ast_resolved::TableName::Fresh)
-            });
+            let has_named = available
+                .iter()
+                .any(|col| matches!(&col.table_name, ast_resolved::TableName::Named(_)));
+            let has_fresh = available
+                .iter()
+                .any(|col| matches!(col.table_name, ast_resolved::TableName::Fresh));
             let qualifier_matches_named = available.iter().any(|col| {
                 matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qualifier.as_ref().unwrap().as_str())
             });

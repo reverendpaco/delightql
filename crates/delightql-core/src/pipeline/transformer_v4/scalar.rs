@@ -776,83 +776,34 @@ fn s_lower_piped(
             // If no @: prepend current value as first argument
             ast_addressed::FunctionExpression::Window {
                 name,
-                mut arguments,
+                arguments,
                 partition_by,
                 order_by,
                 frame,
                 ..
             } => {
-                if transform_has_placeholder {
-                    // @ present: substitute @ → current in args, then lower
-                    let current = state.to_sql(qualify, ctx)?;
-                    let args: Vec<SqlDomainExpr> = arguments
+                let current = state.to_sql(qualify, ctx)?;
+                let args = if transform_has_placeholder {
+                    arguments
                         .into_iter()
                         .map(|a| s_lower_with_placeholder(a, qualify, ctx, &current))
-                        .collect::<Result<_>>()?;
-                    let partition: Vec<SqlDomainExpr> = partition_by
-                        .into_iter()
-                        .map(|p| s_lower_expression(p, qualify, ctx))
-                        .collect::<Result<_>>()?;
-                    let order: Vec<(SqlDomainExpr, crate::pipeline::sql_ast_v3::ordering::OrderDirection)> = order_by
-                        .into_iter()
-                        .map(|spec| {
-                            let expr = s_lower_expression(spec.column, qualify, ctx)?;
-                            let dir = match spec.direction {
-                                Some(ast_addressed::OrderDirection::Descending) => {
-                                    crate::pipeline::sql_ast_v3::ordering::OrderDirection::Desc
-                                }
-                                _ => crate::pipeline::sql_ast_v3::ordering::OrderDirection::Asc,
-                            };
-                            Ok((expr, dir))
-                        })
-                        .collect::<Result<_>>()?;
-                    let sql_frame = match frame {
-                        Some(f) => Some(s_lower_window_frame(f, qualify, ctx)?),
-                        None => None,
-                    };
-                    PipeVal::Sql(SqlDomainExpr::WindowFunction {
-                        name: name.as_str().to_string(),
-                        args,
-                        partition_by: partition,
-                        order_by: order,
-                        frame: sql_frame,
-                    })
+                        .collect::<Result<_>>()?
                 } else {
-                    // No @: prepend current value as first argument
-                    let current = state.to_sql(qualify, ctx)?;
-                    let mut sql_args = vec![current];
+                    let mut sql_args = vec![current.clone()];
                     for a in arguments {
                         sql_args.push(s_lower_expression(a, qualify, ctx)?);
                     }
-                    let partition: Vec<SqlDomainExpr> = partition_by
-                        .into_iter()
-                        .map(|p| s_lower_expression(p, qualify, ctx))
-                        .collect::<Result<_>>()?;
-                    let order: Vec<(SqlDomainExpr, crate::pipeline::sql_ast_v3::ordering::OrderDirection)> = order_by
-                        .into_iter()
-                        .map(|spec| {
-                            let expr = s_lower_expression(spec.column, qualify, ctx)?;
-                            let dir = match spec.direction {
-                                Some(ast_addressed::OrderDirection::Descending) => {
-                                    crate::pipeline::sql_ast_v3::ordering::OrderDirection::Desc
-                                }
-                                _ => crate::pipeline::sql_ast_v3::ordering::OrderDirection::Asc,
-                            };
-                            Ok((expr, dir))
-                        })
-                        .collect::<Result<_>>()?;
-                    let sql_frame = match frame {
-                        Some(f) => Some(s_lower_window_frame(f, qualify, ctx)?),
-                        None => None,
-                    };
-                    PipeVal::Sql(SqlDomainExpr::WindowFunction {
-                        name: name.as_str().to_string(),
-                        args: sql_args,
-                        partition_by: partition,
-                        order_by: order,
-                        frame: sql_frame,
-                    })
-                }
+                    sql_args
+                };
+                PipeVal::Sql(s_lower_window_parts(
+                    name.as_str(),
+                    args,
+                    partition_by,
+                    order_by,
+                    frame,
+                    qualify,
+                    ctx,
+                )?)
             }
 
             other => {
@@ -1294,6 +1245,49 @@ fn s_lower_window(
 
     Ok(SqlDomainExpr::WindowFunction {
         name,
+        args,
+        partition_by: partition,
+        order_by: order,
+        frame: sql_frame,
+    })
+}
+
+/// Lower window partition_by, order_by, and frame into a WindowFunction SQL node.
+fn s_lower_window_parts(
+    name: &str,
+    args: Vec<SqlDomainExpr>,
+    partition_by: Vec<ast_addressed::DomainExpression>,
+    order_by: Vec<ast_addressed::OrderingSpec>,
+    frame: Option<ast_addressed::WindowFrame>,
+    qualify: &dyn Qualify,
+    ctx: &TransformCtx,
+) -> Result<SqlDomainExpr> {
+    let partition: Vec<SqlDomainExpr> = partition_by
+        .into_iter()
+        .map(|p| s_lower_expression(p, qualify, ctx))
+        .collect::<Result<_>>()?;
+    let order: Vec<(
+        SqlDomainExpr,
+        crate::pipeline::sql_ast_v3::ordering::OrderDirection,
+    )> = order_by
+        .into_iter()
+        .map(|spec| {
+            let expr = s_lower_expression(spec.column, qualify, ctx)?;
+            let dir = match spec.direction {
+                Some(ast_addressed::OrderDirection::Descending) => {
+                    crate::pipeline::sql_ast_v3::ordering::OrderDirection::Desc
+                }
+                _ => crate::pipeline::sql_ast_v3::ordering::OrderDirection::Asc,
+            };
+            Ok((expr, dir))
+        })
+        .collect::<Result<_>>()?;
+    let sql_frame = match frame {
+        Some(f) => Some(s_lower_window_frame(f, qualify, ctx)?),
+        None => None,
+    };
+    Ok(SqlDomainExpr::WindowFunction {
+        name: name.to_string(),
         args,
         partition_by: partition,
         order_by: order,

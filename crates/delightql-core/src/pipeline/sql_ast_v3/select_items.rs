@@ -22,10 +22,6 @@ impl SelectItem {
         SelectItem::Star
     }
 
-    pub fn qualified_star(qualifier: ColumnQualifier) -> Self {
-        SelectItem::QualifiedStar { qualifier }
-    }
-
     pub fn expression(expr: DomainExpression) -> Self {
         SelectItem::Expression { expr, alias: None }
     }

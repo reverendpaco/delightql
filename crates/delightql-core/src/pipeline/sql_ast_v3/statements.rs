@@ -73,37 +73,6 @@ impl SqlStatement {
     pub fn with_ctes(with_clause: Option<Vec<Cte>>, query: QueryExpression) -> Self {
         Self::Query { with_clause, query }
     }
-
-    pub fn create_temp_table(
-        table_name: String,
-        with_clause: Option<Vec<Cte>>,
-        query: QueryExpression,
-    ) -> Self {
-        Self::CreateTempTable {
-            table_name,
-            with_clause,
-            query,
-        }
-    }
-
-    pub fn create_temp_view(
-        view_name: String,
-        with_clause: Option<Vec<Cte>>,
-        query: QueryExpression,
-    ) -> Self {
-        Self::CreateTempView {
-            view_name,
-            with_clause,
-            query,
-        }
-    }
-
-    pub fn simple(query: QueryExpression) -> Self {
-        SqlStatement::Query {
-            with_clause: None,
-            query,
-        }
-    }
 }
 
 /// Common Table Expression (CTE) - lives at statement level

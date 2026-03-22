@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::pipeline::ast_resolved;
 
+#[stacksafe::stacksafe]
 pub(in super::super) fn extract_cpr_schema(
     expr: &ast_resolved::RelationalExpression,
 ) -> Result<ast_resolved::CprSchema> {

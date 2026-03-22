@@ -16,13 +16,6 @@ use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::ast_unresolved;
 use delightql_types::SqlIdentifier;
 
-/// Generate a unique resolver-phase alias using the per-resolution counter.
-/// These are semantic names for the resolved AST, not SQL aliases —
-/// the transformer creates its own provenance independently.
-fn resolver_alias(counter: &super::ResolverAliasCounter) -> String {
-    counter.next_alias()
-}
-
 /// Generate a unique resolver-phase alias paired with an opaque ResolverId.
 fn resolver_alias_with_id(
     counter: &super::ResolverAliasCounter,
@@ -86,39 +79,6 @@ fn ho_arguments_to_domain_spec(
         ast_unresolved::DomainSpec::Glob
     } else {
         ast_unresolved::DomainSpec::Positional(exprs)
-    }
-}
-
-/// Convert a scalar HoArgument's domain expression to a string for SQL generation.
-fn ho_argument_scalar_to_string(dom: &ast_unresolved::DomainExpression) -> String {
-    match dom {
-        ast_unresolved::DomainExpression::Literal {
-            value: ast_unresolved::LiteralValue::String(s),
-            ..
-        } => format!("\"{}\"", s),
-        ast_unresolved::DomainExpression::Literal {
-            value: ast_unresolved::LiteralValue::Number(n),
-            ..
-        } => n.clone(),
-        ast_unresolved::DomainExpression::Lvar {
-            name,
-            qualifier: Some(ref qual),
-            ..
-        } => format!("{}.{}", qual, name),
-        ast_unresolved::DomainExpression::Lvar { name, .. } => name.to_string(),
-        ast_unresolved::DomainExpression::Projection(ast_unresolved::ProjectionExpr::Glob {
-            ..
-        }) => "*".to_string(),
-        ast_unresolved::DomainExpression::ValuePlaceholder { .. } => "@".to_string(),
-        ast_unresolved::DomainExpression::ColumnOrdinal(ord) => {
-            let o = ord.get();
-            if o.reverse {
-                format!("|-{}|", o.position)
-            } else {
-                format!("|{}|", o.position)
-            }
-        }
-        _ => format!("{:?}", dom),
     }
 }
 
@@ -1633,14 +1593,22 @@ pub(super) fn resolve_anonymous(
                             (name, true)
                         }
                         ast_resolved::DomainExpression::Literal { value, .. } => {
-                            // For literals, use a generic column name
+                            // Sanitization protocol: headerless anonymous columns
+                            // get |N| (unaliased) or <alias>|N| (aliased)
+                            let ordinal = idx + 1;
                             let name = match value {
                                 ast_resolved::LiteralValue::String(s)
                                     if s.starts_with("column") =>
                                 {
                                     s.clone()
                                 }
-                                _ => crate::pipeline::naming::anonymous_column_name(idx),
+                                _ => {
+                                    if let Some(alias_name) = &relation_alias {
+                                        format!("{}|{}|", alias_name, ordinal)
+                                    } else {
+                                        format!("|{}|", ordinal)
+                                    }
+                                }
                             };
                             (name, false)
                         }
@@ -1681,19 +1649,27 @@ pub(super) fn resolve_anonymous(
         };
         let columns = (0..num_cols)
             .map(|idx| {
+                let ordinal = idx + 1;
                 let table_name = if let Some(alias_name) = &relation_alias {
                     ast_resolved::TableName::Named(alias_name.clone().into())
                 } else {
                     ast_resolved::TableName::Fresh
                 };
+                // Sanitization protocol: headerless anonymous columns get
+                // |N| (unaliased) or <alias>|N| (aliased)
+                let col_name = if let Some(alias_name) = &relation_alias {
+                    format!("{}|{}|", alias_name, ordinal)
+                } else {
+                    format!("|{}|", ordinal)
+                };
                 ast_resolved::ColumnMetadata::new_with_name_flag(
                     ast_resolved::ColumnProvenance::from_table_column(
-                        crate::pipeline::naming::anonymous_column_name(idx),
+                        col_name,
                         table_name.clone(),
                         ast_resolved::QualificationSource::None,
                     ),
                     table_name,
-                    Some(idx + 1),
+                    Some(ordinal),
                     false, // Anonymous table columns don't have user names
                 )
             })
@@ -2521,6 +2497,15 @@ pub(super) fn expand_ho_view(
         Vec::new()
     };
 
+    // Capture which scalar params are literal-bound BEFORE table_bindings is moved.
+    // Used later to mark ground scalar columns as hygienic in glob call-sites.
+    let ground_literal_scalar_names: Vec<String> = table_bindings
+        .scalar_params
+        .iter()
+        .filter(|(_, expr)| matches!(expr, ast_unresolved::DomainExpression::Literal { .. }))
+        .map(|(name, _)| name.clone())
+        .collect();
+
     // Build the squished relation (ALL clauses, no pre-filtering)
     let squished_query = super::grounding::build_squished_relation(
         function,
@@ -2579,6 +2564,42 @@ pub(super) fn expand_ho_view(
     //   - Output positions: pass-through Lvars (keep original name)
     // One PatternResolver call handles everything.
     if matches!(scalar_spec, ast_unresolved::DomainSpec::Glob) {
+        // For glob call-sites, mark ground-bound scalar columns as hygienic
+        // so they don't leak into the output (e.g., `label` from `tagged("young", T(*))(*)`).
+        // Only hide columns where the call-site bound a LITERAL, not a free variable.
+        let ground_scalar_col_names: Vec<&str> = positions
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.column_kind,
+                    crate::pipeline::asts::ddl::HoColumnKind::Scalar
+                )
+            })
+            .filter(|p| {
+                // Only hide if the call-site explicitly bound a literal for this position.
+                // Check scalar_params (captured before move) for a literal expression.
+                p.column_name.as_ref().map_or(false, |name| {
+                    ground_literal_scalar_names.iter().any(|n| n == name)
+                })
+            })
+            .filter_map(|p| p.column_name.as_deref())
+            .collect();
+
+        if !ground_scalar_col_names.is_empty() {
+            let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr)?;
+            if let ast_resolved::CprSchema::Resolved(cols) = &body_schema {
+                let mut updated_cols = cols.clone();
+                for col in &mut updated_cols {
+                    if ground_scalar_col_names.contains(&col.name()) {
+                        col.needs_hygienic_alias = true;
+                    }
+                }
+                let mut expr = resolved_expr;
+                update_relation_cpr_schema(&mut expr, &updated_cols);
+                return Ok((expr, bubbled, absorbed_join_input));
+            }
+        }
+
         return Ok((resolved_expr, bubbled, absorbed_join_input));
     }
 

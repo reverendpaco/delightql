@@ -7,4 +7,5 @@
 pub mod analyzer;
 pub mod body_parser;
 pub mod ddl_builder;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod manifest;

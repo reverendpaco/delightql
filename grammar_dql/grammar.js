@@ -1517,8 +1517,8 @@ module.exports = grammar({
     // Octal literal: 0o12 or 0O12 (case insensitive)
     octal_literal: $ => /0[oO][0-7]+/,
 
-    number_literal: $ => /-?[0-9]+(\.[0-9]+)?/,
-    integer_literal: $ => /-?[0-9]+/,  // Integers only (no decimals)
+    number_literal: $ => /-?[0-9][0-9_]*(\.[0-9][0-9_]*)?/,
+    integer_literal: $ => /-?[0-9][0-9_]*/,  // Integers only (underscores allowed)
     string_literal: $ => choice(
       /"""([^"]|"[^"]|""[^"])*"""/,  // Triple double-quotes (longest match wins)
       seq('"', /[^"]*/, '"'),  // Double quotes

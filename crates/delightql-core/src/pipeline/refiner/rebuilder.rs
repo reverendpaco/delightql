@@ -285,7 +285,11 @@ fn table_to_refined(
     if let Some(ref pipe_expr) = table.pipe_expr {
         // Recursively refine the pipe expression
         // Pass is_top_level=false to skip outer join validation (this is an inner context)
-        return crate::pipeline::refiner::refine_internal(pipe_expr.as_ref().clone(), false, crate::pipeline::danger_gates::DangerGateMap::with_defaults());
+        return crate::pipeline::refiner::refine_internal(
+            pipe_expr.as_ref().clone(),
+            false,
+            crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+        );
     }
 
     let mut result = build_base_relation(table)?;
@@ -1053,7 +1057,11 @@ pub(super) fn refine_predicate_boolean(
             using_columns,
         } => {
             // Refine the InnerExists subquery through the full refiner pipeline
-            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false, crate::pipeline::danger_gates::DangerGateMap::with_defaults())?;
+            let refined_subquery = crate::pipeline::refiner::refine_internal(
+                *subquery,
+                false,
+                crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+            )?;
             Ok(refined::BooleanExpression::InnerExists {
                 exists,
                 identifier,
@@ -1068,7 +1076,11 @@ pub(super) fn refine_predicate_boolean(
             identifier,
             negated,
         } => {
-            let refined_subquery = crate::pipeline::refiner::refine_internal(*subquery, false, crate::pipeline::danger_gates::DangerGateMap::with_defaults())?;
+            let refined_subquery = crate::pipeline::refiner::refine_internal(
+                *subquery,
+                false,
+                crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+            )?;
             Ok(refined::BooleanExpression::InRelational {
                 value: Box::new((*value).into()),
                 subquery: Box::new(refined_subquery),

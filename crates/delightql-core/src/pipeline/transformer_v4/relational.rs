@@ -64,6 +64,7 @@ fn lvar_names(exprs: &[ast_addressed::DomainExpression]) -> Vec<String> {
 }
 
 /// Extract CprSchema from the outermost node of a RelationalExpression.
+#[stacksafe::stacksafe]
 fn extract_cpr_schema(expr: &ast_addressed::RelationalExpression) -> &CprSchema {
     use crate::pipeline::asts::core::expressions::relational::{Relation, RelationalExpression};
     match expr {
@@ -105,6 +106,95 @@ fn passthrough_item(col: &ColumnMetadata) -> crate::pipeline::sql_ast_v3::Select
         expr: qualified_col_expr(col),
         alias: Some(col_name(col).to_string()),
     }
+}
+
+/// Project builder columns according to a CprSchema.
+///
+/// The CprSchema is the resolver's authoritative answer about which columns
+/// survive and in what order. This function matches each CprSchema column to
+/// the corresponding builder column using original/provenance names (which are
+/// stable across the transformer's `_2` disambiguation).
+///
+/// Used by pipe operators that filter or reorder columns (project-out,
+/// reposition, rename-cover, etc.) to ensure the transformer respects
+/// the resolver's decisions.
+fn select_items_from_cpr_schema(
+    builder_columns: &[ColumnMetadata],
+    cpr_schema: &CprSchema,
+) -> Vec<crate::pipeline::sql_ast_v3::SelectItem> {
+    let schema_cols = match cpr_schema {
+        CprSchema::Resolved(cols) => cols,
+        CprSchema::Failed {
+            resolved_columns, ..
+        } => resolved_columns,
+        CprSchema::Unresolved(cols) => cols,
+        CprSchema::Unknown => {
+            // Fallback: pass everything through
+            return builder_columns
+                .iter()
+                .map(|c| passthrough_item(c))
+                .collect();
+        }
+    };
+
+    let mut items = Vec::with_capacity(schema_cols.len());
+    let mut used = vec![false; builder_columns.len()];
+
+    for schema_col in schema_cols {
+        let target_name = schema_col.name();
+        let target_original = schema_col.info.original_name();
+
+        // Find the matching builder column that hasn't been used yet.
+        // Match by original name (bottom of provenance stack) on BOTH sides,
+        // so renames (where name() differs from original_name()) still match.
+        let found_idx = builder_columns.iter().enumerate().position(|(idx, bc)| {
+            if used[idx] { return false; }
+
+            if let Some(bc_orig) = bc.info.original_name() {
+                // Primary: match original names (both sides look through renames/disambiguation)
+                let schema_orig = target_original.unwrap_or(target_name);
+                if bc_orig.eq_ignore_ascii_case(schema_orig) {
+                    // Verify table scope matches to handle same-named columns
+                    // from different tables (e.g., two `name` columns)
+                    if let (TableName::Named(a), TableName::Named(b)) =
+                        (&schema_col.table_name, &bc.table_name)
+                    {
+                        return a.as_str().eq_ignore_ascii_case(b.as_str());
+                    }
+                    // Check identity stack for matching table qualifier
+                    if let TableName::Named(schema_table) = &schema_col.table_name {
+                        if bc.info.identity_stack().iter().any(|id| {
+                            matches!(&id.table_qualifier, TableName::Named(t) if t.as_str().eq_ignore_ascii_case(schema_table.as_str()))
+                        }) {
+                            return true;
+                        }
+                    }
+                    // Fresh scope or no table info — match by original name alone
+                    return true;
+                }
+                // Secondary: match current name (for non-renamed columns)
+                if bc_orig.eq_ignore_ascii_case(target_name) {
+                    return true;
+                }
+            }
+            // Fall back to current name
+            col_name(bc).eq_ignore_ascii_case(target_name)
+        });
+
+        if let Some(idx) = found_idx {
+            used[idx] = true;
+            // Use the CprSchema's name as the alias — this is the resolver's
+            // authoritative output name (handles renames, project-out, etc.)
+            let bc = &builder_columns[idx];
+            let expr = qualified_col_expr(bc);
+            items.push(crate::pipeline::sql_ast_v3::SelectItem::Expression {
+                expr,
+                alias: Some(target_name.to_string()),
+            });
+        }
+    }
+
+    items
 }
 
 /// Build a `json_each(source.column) AS alias` table-valued function expression.
@@ -935,8 +1025,6 @@ fn columns_from_cpr_schema(schema: &CprSchema, scope_name: &TableName) -> Vec<Co
         .collect();
 
     // Second pass: disambiguate duplicate names (e.g., join produces id, id → id, id_2).
-    // This ensures the scope matches the SQL that project_all / disambiguated_select_items
-    // will produce for the CTE body.
     let has_duplicates = {
         let mut seen = HashSet::new();
         result.iter().any(|c| !seen.insert(col_name(c).to_string()))
@@ -978,7 +1066,7 @@ fn cpr_column_names(schema: &CprSchema) -> Vec<String> {
     cols.iter()
         .map(|c| {
             c.info
-                .alias_name()
+                .name()
                 .or_else(|| c.info.original_name())
                 .unwrap_or("?")
                 .to_string()
@@ -1395,7 +1483,7 @@ pub(super) fn r_lower_pipe(
             }
 
             UnaryRelationalOperator::ProjectOut { expressions, .. } => {
-                r_lower_project_out(current, expressions, ctx)?
+                r_lower_project_out(current, expressions, &cpr_schema, ctx)?
             }
 
             UnaryRelationalOperator::RenameCover { specs } => {
@@ -1678,6 +1766,29 @@ pub(super) fn r_lower_projection(
         }
     }
 
+    // Check for projections that reference hygienic columns (e.g., HO ground params).
+    // Hygienic columns are available for filtering (WHERE) but not for user-facing projection.
+    for item in &items {
+        if let crate::pipeline::sql_ast_v3::SelectItem::Expression { expr, alias } = item {
+            if let crate::pipeline::sql_ast_v3::DomainExpression::Column { name, .. } = expr {
+                if builder
+                    .columns()
+                    .iter()
+                    .any(|c| col_name(c) == name.as_str() && c.needs_hygienic_alias)
+                {
+                    return Err(DelightQLError::ParseError {
+                        message: format!(
+                            "Column '{}' is not available for projection (internal/hygienic column)",
+                            name
+                        ),
+                        source: None,
+                        subcategory: None,
+                    });
+                }
+            }
+        }
+    }
+
     builder.add_projection(items)
 }
 
@@ -1787,6 +1898,7 @@ fn r_lower_group_by_spec(
             builder,
             reducing_by,
             reducing_on,
+            cpr_schema,
             ctx,
         );
     }
@@ -1811,7 +1923,13 @@ fn r_lower_group_by_spec(
     });
 
     if needs_cte {
-        return tree_group::r_lower_tree_group_cte(builder, reducing_by, reducing_on, ctx);
+        return tree_group::r_lower_tree_group_cte(
+            builder,
+            reducing_by,
+            reducing_on,
+            cpr_schema,
+            ctx,
+        );
     }
 
     // Lower GROUP BY keys → SelectItems
@@ -2397,137 +2515,27 @@ pub(super) fn r_lower_map_cover(
 
 /// Lower project-out: `|> -(cols)`.
 ///
-/// Collects names to exclude, then projects all remaining scope columns.
+/// Trusts the CprSchema — the resolver already determined which columns survive.
 pub(super) fn r_lower_project_out(
     builder: Builder<Unprojected>,
-    expressions: Vec<ast_addressed::DomainExpression>,
-    ctx: &TransformCtx,
+    _expressions: Vec<ast_addressed::DomainExpression>,
+    cpr_schema: &PhaseBox<CprSchema, Addressed>,
+    _ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    // Extract (name, optional_qualifier) pairs so qualified project-out
-    // like -(ns.name) only removes the column from that specific table.
-    let exclude: Vec<(String, Option<String>)> = expressions
-        .iter()
-        .filter_map(|e| match e {
-            ast_addressed::DomainExpression::Lvar {
-                name, qualifier, ..
-            } => Some((
-                name.as_str().to_string(),
-                qualifier.as_ref().map(|q| q.as_str().to_string()),
-            )),
-            _ => None,
-        })
-        .collect();
-
-    let items: Vec<_> = builder
-        .columns()
-        .iter()
-        .filter(|c| {
-            let cname = col_name(c).to_string();
-            !exclude.iter().any(|(ename, equal)| {
-                if !ename.eq_ignore_ascii_case(&cname) {
-                    return false;
-                }
-                match equal {
-                    // Qualified: match against the column's current table name,
-                    // or any prior table name in the identity stack (for columns
-                    // that have been requalified through joins/wrapping).
-                    Some(q) => {
-                        let direct_match = match &c.table_name {
-                            TableName::Named(tn) => {
-                                tn.as_str().eq_ignore_ascii_case(q.as_str())
-                            }
-                            TableName::Fresh => false,
-                        };
-                        if direct_match {
-                            return true;
-                        }
-                        // Check identity stack for prior qualifiers
-                        c.info.identity_stack().iter().any(|id| {
-                            match &id.table_qualifier {
-                                TableName::Named(tn) => {
-                                    tn.as_str().eq_ignore_ascii_case(q.as_str())
-                                }
-                                TableName::Fresh => false,
-                            }
-                        })
-                    }
-                    // Unqualified: matches any column with that name
-                    None => true,
-                }
-            })
-        })
-        .map(|c| passthrough_item(c))
-        .collect();
-
+    let items = select_items_from_cpr_schema(builder.columns(), cpr_schema.get());
     builder.add_projection(items)
 }
 
 /// Lower rename-cover: `|> *(old as new)`.
 ///
-/// Projects all columns, renaming those that match a spec.
-/// Uses the cpr_schema (which the refiner already resolved with qualifier
-/// information) to determine output names positionally.
+/// Trusts the CprSchema — the resolver already determined the output names.
 pub(super) fn r_lower_rename_cover(
     builder: Builder<Unprojected>,
-    specs: Vec<ast_addressed::RenameSpec>,
+    _specs: Vec<ast_addressed::RenameSpec>,
     cpr_schema: &PhaseBox<CprSchema, Addressed>,
-    ctx: &TransformCtx,
+    _ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    use crate::pipeline::asts::core::specs::RenameTarget;
-    use crate::pipeline::sql_ast_v3::SelectItem;
-
-    // The refiner's cpr_schema carries the correctly-resolved output names.
-    // It already applied qualifier-aware matching (e.g., *(ns.name as nsname)
-    // only renames ns.name, not e.name). Use it positionally to determine
-    // which columns to rename.
-    let output_names: Vec<String> = match cpr_schema.get() {
-        CprSchema::Resolved(cpr_cols) if cpr_cols.len() == builder.columns().len() => {
-            cpr_cols.iter().map(|c| col_name(c).to_string()).collect()
-        }
-        _ => {
-            // Fallback: use rename specs with name-only matching (no qualifier
-            // info available in the AST at this phase).
-            let renames: Vec<(String, String)> = specs
-                .into_iter()
-                .filter_map(|spec| {
-                    let old_name = match &spec.from {
-                        ast_addressed::DomainExpression::Lvar { name, .. } => {
-                            name.as_str().to_string()
-                        }
-                        _ => return None,
-                    };
-                    let new_name = match spec.to {
-                        RenameTarget::Literal(s) => s,
-                        _ => return None,
-                    };
-                    Some((old_name, new_name))
-                })
-                .collect();
-
-            builder
-                .columns()
-                .iter()
-                .map(|c| {
-                    renames
-                        .iter()
-                        .find(|(old, _)| *old == col_name(c))
-                        .map(|(_, new)| new.clone())
-                        .unwrap_or_else(|| col_name(c).to_string())
-                })
-                .collect()
-        }
-    };
-
-    let items: Vec<SelectItem> = builder
-        .columns()
-        .iter()
-        .zip(output_names.iter())
-        .map(|(c, alias)| SelectItem::Expression {
-            expr: qualified_col_expr(c),
-            alias: Some(alias.clone()),
-        })
-        .collect();
-
+    let items = select_items_from_cpr_schema(builder.columns(), cpr_schema.get());
     builder.add_projection(items)
 }
 
@@ -2715,7 +2723,7 @@ pub(super) fn r_lower_meta_ize(
     let make_row = |idx: usize, col: &ColumnMetadata| {
         let col_name = col
             .info
-            .alias_name()
+            .name()
             .or_else(|| col.info.original_name())
             .unwrap_or("?")
             .to_string();
@@ -2836,42 +2844,13 @@ pub(super) fn r_lower_witness(
 
 /// Lower reposition: `|> *[col as pos]`.
 ///
-/// The resolver has already computed the reordered column list and stored it
-/// in the pipe segment's `CprSchema`. We simply project the builder's scope
-/// columns in the order given by the CprSchema.
+/// Trusts the CprSchema — the resolver already computed the reordered column list.
 pub(super) fn r_lower_reposition(
     builder: Builder<Unprojected>,
     cpr_schema: &CprSchema,
-    ctx: &TransformCtx,
+    _ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    let column_names: Vec<String> = match cpr_schema {
-        CprSchema::Resolved(cols)
-        | CprSchema::Failed {
-            resolved_columns: cols,
-            ..
-        } => cols.iter().map(|c| c.name().to_string()).collect(),
-        CprSchema::Unresolved(cols) => cols.iter().map(|c| c.name().to_string()).collect(),
-        CprSchema::Unknown => {
-            return Err(DelightQLError::ParseError {
-                message: "r_lower_reposition: cannot reposition with unknown schema".to_string(),
-                source: None,
-                subcategory: None,
-            });
-        }
-    };
-
-    // Lookup each column by name in the builder's scope to get proper qualification
-    let items: Vec<_> = column_names
-        .iter()
-        .filter_map(|name| {
-            builder
-                .columns()
-                .iter()
-                .find(|c| col_name(c) == name.as_str())
-                .map(|c| passthrough_item(c))
-        })
-        .collect();
-
+    let items = select_items_from_cpr_schema(builder.columns(), cpr_schema);
     builder.add_projection(items)
 }
 
@@ -3234,134 +3213,13 @@ pub(super) fn r_lower_intersect_corresponding(
 
     // Dispatch: min_multiplicity → bag intersection (ROW_NUMBER JOIN)
     if min_multiplicity && op_queries.len() == 2 {
-        let rn_col = "__dql_rn";
-
-        // Extract column pairs from correlation: (left_col, right_col)
-        let col_pairs = extract_isect_column_pairs(
+        return r_lower_intersect_min_multiplicity(
             &correlation,
-            alias_map.first().and_then(|(u, _)| u.as_deref()),
-            alias_map.get(1).and_then(|(u, _)| u.as_deref()),
+            &alias_map,
+            op_queries,
+            &op_columns,
+            &names,
         );
-
-        let left_cols: Vec<String> = col_pairs.iter().map(|(l, _)| l.clone()).collect();
-        let right_cols: Vec<String> = col_pairs.iter().map(|(_, r)| r.clone()).collect();
-
-        // Rebuild operand Builders from frozen queries, then add ROW_NUMBER
-        let left_scope = names.next_table_name("isect");
-        let left_builder = Builder::from_frozen(
-            op_queries.remove(0),
-            left_scope,
-            op_columns[0].clone(),
-            names.clone(),
-        )
-        .project_all()?;
-
-        let right_scope = names.next_table_name("isect");
-        let right_builder = Builder::from_frozen(
-            op_queries.remove(0),
-            right_scope,
-            op_columns[1].clone(),
-            names.clone(),
-        )
-        .project_all()?;
-
-        // Add ROW_NUMBER window column to each side
-        let left_partition: Vec<SqlDomainExpr> =
-            left_cols.iter().map(|c| SqlDomainExpr::column(c)).collect();
-        let left_order: Vec<(SqlDomainExpr, OrderDirection)> = left_cols
-            .iter()
-            .map(|c| (SqlDomainExpr::column(c), OrderDirection::Asc))
-            .collect();
-        let left_rn = left_builder.add_window_column(
-            "ROW_NUMBER",
-            vec![],
-            left_partition,
-            left_order,
-            rn_col,
-        )?;
-
-        let right_partition: Vec<SqlDomainExpr> = right_cols
-            .iter()
-            .map(|c| SqlDomainExpr::column(c))
-            .collect();
-        let right_order: Vec<(SqlDomainExpr, OrderDirection)> = right_cols
-            .iter()
-            .map(|c| (SqlDomainExpr::column(c), OrderDirection::Asc))
-            .collect();
-        let right_rn = right_builder.add_window_column(
-            "ROW_NUMBER",
-            vec![],
-            right_partition,
-            right_order,
-            rn_col,
-        )?;
-
-        // Convert to join operands
-        let left_op = left_rn.demote()?.into_join_operand()?;
-        let right_op = right_rn.demote()?.into_join_operand()?;
-
-        // Build JOIN ON condition using the post-wrap qualifiers from
-        // the join operands' columns.
-        let left_qual = left_op
-            .columns
-            .first()
-            .and_then(|c| col_qualifier(c))
-            .unwrap_or("_left")
-            .to_string();
-        let right_qual = right_op
-            .columns
-            .first()
-            .and_then(|c| col_qualifier(c))
-            .unwrap_or("_right")
-            .to_string();
-
-        let mut join_conds: Vec<SqlDomainExpr> = Vec::new();
-        for (l, r) in &col_pairs {
-            join_conds.push(SqlDomainExpr::Binary {
-                left: Box::new(SqlDomainExpr::with_qualifier(
-                    crate::pipeline::sql_ast_v3::ColumnQualifier::table(&left_qual),
-                    l,
-                )),
-                op: crate::pipeline::sql_ast_v3::BinaryOperator::IsNotDistinctFrom,
-                right: Box::new(SqlDomainExpr::with_qualifier(
-                    crate::pipeline::sql_ast_v3::ColumnQualifier::table(&right_qual),
-                    r,
-                )),
-            });
-        }
-        join_conds.push(SqlDomainExpr::Binary {
-            left: Box::new(SqlDomainExpr::with_qualifier(
-                crate::pipeline::sql_ast_v3::ColumnQualifier::table(&left_qual),
-                rn_col,
-            )),
-            op: crate::pipeline::sql_ast_v3::BinaryOperator::Equal,
-            right: Box::new(SqlDomainExpr::with_qualifier(
-                crate::pipeline::sql_ast_v3::ColumnQualifier::table(&right_qual),
-                rn_col,
-            )),
-        });
-        let join_on = SqlDomainExpr::and(join_conds);
-
-        // Build the join
-        let joined = Builder::from_join(left_op, right_op, JoinType::Inner, JoinCondition::On(join_on));
-
-        // Project out __dql_rn — keep only the left side's original columns
-        let output_cols = &op_columns[0];
-        let output_items: Vec<SelectItem> = output_cols
-            .iter()
-            .map(|col| {
-                let cname = col_name(col).to_string();
-                SelectItem::Expression {
-                    expr: SqlDomainExpr::with_qualifier(
-                        crate::pipeline::sql_ast_v3::ColumnQualifier::table(&left_qual),
-                        &cname,
-                    ),
-                    alias: Some(cname),
-                }
-            })
-            .collect();
-
-        return joined.add_projection(output_items);
     }
 
     // EXISTS path: For each operand i, build:
@@ -3379,10 +3237,7 @@ pub(super) fn r_lower_intersect_corresponding(
             let rewritten_corr = rewrite_correlation_qualifiers(
                 &correlation,
                 &alias_map,
-                &[
-                    (i, op_aliases[i].as_str()),
-                    (j, op_aliases[j].as_str()),
-                ],
+                &[(i, op_aliases[i].as_str()), (j, op_aliases[j].as_str())],
             )?;
 
             // Build inner EXISTS subquery using Builder.
@@ -3426,6 +3281,151 @@ pub(super) fn r_lower_intersect_corresponding(
         .unwrap();
 
     Ok(combined)
+}
+
+/// Bag intersection via ROW_NUMBER + JOIN for exactly 2 operands.
+/// Preserves duplicate multiplicity: min(count_left, count_right) copies
+/// of each matching group are kept.
+fn r_lower_intersect_min_multiplicity(
+    correlation: &ast_addressed::BooleanExpression,
+    alias_map: &[(Option<String>, String)],
+    mut op_queries: Vec<crate::pipeline::sql_ast_v3::QueryExpression>,
+    op_columns: &[Vec<crate::pipeline::asts::resolved::ColumnMetadata>],
+    names: &super::builder::names::NameGenerator,
+) -> Result<Builder<Projected>> {
+    use crate::pipeline::sql_ast_v3::{
+        ordering::OrderDirection, DomainExpression as SqlDomainExpr, JoinCondition, JoinType,
+        SelectItem,
+    };
+
+    let rn_col = "__dql_rn";
+
+    // Extract column pairs from correlation: (left_col, right_col)
+    let col_pairs = extract_isect_column_pairs(
+        correlation,
+        alias_map.first().and_then(|(u, _)| u.as_deref()),
+        alias_map.get(1).and_then(|(u, _)| u.as_deref()),
+    );
+
+    let left_cols: Vec<String> = col_pairs.iter().map(|(l, _)| l.clone()).collect();
+    let right_cols: Vec<String> = col_pairs.iter().map(|(_, r)| r.clone()).collect();
+
+    // Rebuild operand Builders from frozen queries, then add ROW_NUMBER
+    let left_scope = names.next_table_name("isect");
+    let left_builder = Builder::from_frozen(
+        op_queries.remove(0),
+        left_scope,
+        op_columns[0].clone(),
+        names.clone(),
+    )
+    .project_all()?;
+
+    let right_scope = names.next_table_name("isect");
+    let right_builder = Builder::from_frozen(
+        op_queries.remove(0),
+        right_scope,
+        op_columns[1].clone(),
+        names.clone(),
+    )
+    .project_all()?;
+
+    // Add ROW_NUMBER window column to each side
+    let left_partition: Vec<SqlDomainExpr> =
+        left_cols.iter().map(|c| SqlDomainExpr::column(c)).collect();
+    let left_order: Vec<(SqlDomainExpr, OrderDirection)> = left_cols
+        .iter()
+        .map(|c| (SqlDomainExpr::column(c), OrderDirection::Asc))
+        .collect();
+    let left_rn =
+        left_builder.add_window_column("ROW_NUMBER", vec![], left_partition, left_order, rn_col)?;
+
+    let right_partition: Vec<SqlDomainExpr> = right_cols
+        .iter()
+        .map(|c| SqlDomainExpr::column(c))
+        .collect();
+    let right_order: Vec<(SqlDomainExpr, OrderDirection)> = right_cols
+        .iter()
+        .map(|c| (SqlDomainExpr::column(c), OrderDirection::Asc))
+        .collect();
+    let right_rn = right_builder.add_window_column(
+        "ROW_NUMBER",
+        vec![],
+        right_partition,
+        right_order,
+        rn_col,
+    )?;
+
+    // Convert to join operands
+    let left_op = left_rn.demote()?.into_join_operand()?;
+    let right_op = right_rn.demote()?.into_join_operand()?;
+
+    // Build JOIN ON condition using the post-wrap qualifiers from
+    // the join operands' columns.
+    let left_qual = left_op
+        .columns
+        .first()
+        .and_then(|c| col_qualifier(c))
+        .unwrap_or("_left")
+        .to_string();
+    let right_qual = right_op
+        .columns
+        .first()
+        .and_then(|c| col_qualifier(c))
+        .unwrap_or("_right")
+        .to_string();
+
+    let mut join_conds: Vec<SqlDomainExpr> = Vec::new();
+    for (l, r) in &col_pairs {
+        join_conds.push(SqlDomainExpr::Binary {
+            left: Box::new(SqlDomainExpr::with_qualifier(
+                crate::pipeline::sql_ast_v3::ColumnQualifier::table(&left_qual),
+                l,
+            )),
+            op: crate::pipeline::sql_ast_v3::BinaryOperator::IsNotDistinctFrom,
+            right: Box::new(SqlDomainExpr::with_qualifier(
+                crate::pipeline::sql_ast_v3::ColumnQualifier::table(&right_qual),
+                r,
+            )),
+        });
+    }
+    join_conds.push(SqlDomainExpr::Binary {
+        left: Box::new(SqlDomainExpr::with_qualifier(
+            crate::pipeline::sql_ast_v3::ColumnQualifier::table(&left_qual),
+            rn_col,
+        )),
+        op: crate::pipeline::sql_ast_v3::BinaryOperator::Equal,
+        right: Box::new(SqlDomainExpr::with_qualifier(
+            crate::pipeline::sql_ast_v3::ColumnQualifier::table(&right_qual),
+            rn_col,
+        )),
+    });
+    let join_on = SqlDomainExpr::and(join_conds);
+
+    // Build the join
+    let joined = Builder::from_join(
+        left_op,
+        right_op,
+        JoinType::Inner,
+        JoinCondition::On(join_on),
+    );
+
+    // Project out __dql_rn — keep only the left side's original columns
+    let output_cols = &op_columns[0];
+    let output_items: Vec<SelectItem> = output_cols
+        .iter()
+        .map(|col| {
+            let cname = col_name(col).to_string();
+            SelectItem::Expression {
+                expr: SqlDomainExpr::with_qualifier(
+                    crate::pipeline::sql_ast_v3::ColumnQualifier::table(&left_qual),
+                    &cname,
+                ),
+                alias: Some(cname),
+            }
+        })
+        .collect();
+
+    joined.add_projection(output_items)
 }
 
 /// Extract (left_col_name, right_col_name) pairs from a correlation.
@@ -3540,9 +3540,7 @@ fn rewrite_correlation_qualifiers(
     alias_map: &[(Option<String>, String)],
     active_aliases: &[(usize, &str)],
 ) -> Result<crate::pipeline::sql_ast_v3::DomainExpression> {
-    use crate::pipeline::sql_ast_v3::{
-        BinaryOperator, DomainExpression as SqlDomainExpr,
-    };
+    use crate::pipeline::sql_ast_v3::{BinaryOperator, DomainExpression as SqlDomainExpr};
 
     match correlation {
         ast_addressed::BooleanExpression::Comparison {

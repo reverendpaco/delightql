@@ -4,7 +4,7 @@ use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
 use super::super::column_extraction::extract_provided_column_from_domain_expr;
-use super::helpers::restructure_tree_groups_for_grouping;
+use super::helpers::{check_duplicate_user_names, restructure_tree_groups_for_grouping};
 
 /// Extract all Lvar names from a resolved expression (recursing into concat chains).
 fn extract_lvar_names_from_expr(expr: &ast_resolved::DomainExpression) -> Vec<String> {
@@ -399,6 +399,8 @@ pub(super) fn resolve_modulo_via_fold(
                 }
             }
 
+            check_duplicate_user_names(&output)?;
+
             (ast_resolved::ModuloSpec::Columns(resolved_cols), output)
         }
         ast_unresolved::ModuloSpec::GroupBy {
@@ -578,6 +580,8 @@ pub(super) fn resolve_modulo_via_fold(
                     output.push(col);
                 }
             }
+
+            check_duplicate_user_names(&output)?;
 
             // Capture interior schemas for tree group columns
             // When reducing_on contains a Curly function with an alias (e.g., ~> {name, type} as entities),

@@ -159,10 +159,28 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
             qualifier,
             ..
         } => {
-            // An Lvar provides a column - either with its original name or with an alias
+            // An Lvar provides a column - either with its original name or with an alias.
+            // When a qualifier is present, prefer matching by both name AND table scope
+            // to avoid picking the wrong column in multi-table contexts (e.g., u.id vs o.id).
             if let Some(col) = input_columns
                 .iter()
-                .find(|c| crate::pipeline::resolver::col_name_eq(c.name(), name))
+                .find(|c| {
+                    if !crate::pipeline::resolver::col_name_eq(c.name(), name) {
+                        return false;
+                    }
+                    if let Some(qual) = qualifier {
+                        // If qualifier is specified, prefer matching scope
+                        matches!(&c.table_name, ast_resolved::TableName::Named(t) if t == qual)
+                    } else {
+                        true
+                    }
+                })
+                .or_else(|| {
+                    // Fallback: match by name only (for cases where qualifier doesn't match a scope)
+                    input_columns
+                        .iter()
+                        .find(|c| crate::pipeline::resolver::col_name_eq(c.name(), name))
+                })
             {
                 let mut output_col = col.clone();
 

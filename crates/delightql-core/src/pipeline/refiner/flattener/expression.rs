@@ -129,9 +129,36 @@ pub(super) fn flatten_expression(
             // Complex operands (Filters, Pipes, etc.) are treated as opaque
             // to prevent their predicates from being extracted and pooled
             // at the segment level — each UNION branch keeps its own filters.
+            //
+            // Nested same-type SetOps are un-nested: (A ; B) ; C → A ; B ; C.
+            // This ensures correlation predicates between any pair of operands
+            // are visible to the analyzer for FIC classification.
+            let mut flat_operands: Vec<resolved::RelationalExpression> = Vec::new();
+            fn unnest_setop(
+                op: resolved::SetOperator,
+                operands: Vec<resolved::RelationalExpression>,
+                out: &mut Vec<resolved::RelationalExpression>,
+            ) {
+                for operand in operands {
+                    if let resolved::RelationalExpression::SetOperation {
+                        operator: inner_op,
+                        operands: inner_operands,
+                        ..
+                    } = &operand
+                    {
+                        if *inner_op == op {
+                            unnest_setop(op, inner_operands.clone(), out);
+                            continue;
+                        }
+                    }
+                    out.push(operand);
+                }
+            }
+            unnest_setop(operator, operands, &mut flat_operands);
+
             let mut operand_tables = Vec::new();
 
-            for (i, operand) in operands.into_iter().enumerate() {
+            for (i, operand) in flat_operands.into_iter().enumerate() {
                 let start = segment.tables.len();
 
                 let saved_context = ctx.scope_id;

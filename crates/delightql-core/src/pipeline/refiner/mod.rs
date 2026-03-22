@@ -144,7 +144,9 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
             )
             | resolved::RelationalExpression::Filter { .. }
             | resolved::RelationalExpression::SetOperation { .. } => {
-                let min_mult = self.danger_gates.is_enabled("dql/semantics/min_multiplicity");
+                let min_mult = self
+                    .danger_gates
+                    .is_enabled("dql/semantics/min_multiplicity");
                 let refined = refine_segment(expr, self.is_top_level, min_mult)?;
                 Ok(FoldAction::Replaced(refined))
             }
@@ -249,7 +251,10 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
     fn transform_query(&mut self, query: resolved::Query) -> Result<refined::Query> {
         match query {
             resolved::Query::Relational(expr) => {
-                let mut fold = RefinerFold { is_top_level: true, danger_gates: self.danger_gates.clone() };
+                let mut fold = RefinerFold {
+                    is_top_level: true,
+                    danger_gates: self.danger_gates.clone(),
+                };
                 Ok(refined::Query::Relational(
                     fold.transform_relational_action(expr)?.into_inner(),
                 ))
@@ -258,7 +263,10 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
                 let refined_ctes = ctes
                     .into_iter()
                     .map(|cte| {
-                        let mut fold = RefinerFold { is_top_level: true, danger_gates: self.danger_gates.clone() };
+                        let mut fold = RefinerFold {
+                            is_top_level: true,
+                            danger_gates: self.danger_gates.clone(),
+                        };
                         Ok(refined::CteBinding {
                             expression: fold
                                 .transform_relational_action(cte.expression)?
@@ -269,7 +277,10 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let mut fold = RefinerFold { is_top_level: true, danger_gates: self.danger_gates.clone() };
+                let mut fold = RefinerFold {
+                    is_top_level: true,
+                    danger_gates: self.danger_gates.clone(),
+                };
                 let refined_main = fold.transform_relational_action(query)?.into_inner();
 
                 Ok(refined::Query::WithCtes {
@@ -314,7 +325,10 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
 
 /// Main entry point for AST refinement (for RelationalExpression)
 pub fn refine(ast: resolved::RelationalExpression) -> Result<refined::RelationalExpression> {
-    refine_with_gates(ast, crate::pipeline::danger_gates::DangerGateMap::with_defaults())
+    refine_with_gates(
+        ast,
+        crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+    )
 }
 
 /// Refine with danger gate context.
@@ -370,14 +384,18 @@ fn refine_segment(
 
     // Phase 3: Rebuild the AST with predicates in proper locations
     log::debug!("refine_segment: Calling rebuilder::rebuild");
-    let refined_ast = rebuilder::rebuild_internal(analyzed_segment, is_top_level, min_multiplicity)?;
+    let refined_ast =
+        rebuilder::rebuild_internal(analyzed_segment, is_top_level, min_multiplicity)?;
 
     Ok(refined_ast)
 }
 
 /// Refine a full Query (with CTEs)
 pub fn refine_query(query: resolved::Query) -> Result<refined::Query> {
-    refine_query_with_gates(query, crate::pipeline::danger_gates::DangerGateMap::with_defaults())
+    refine_query_with_gates(
+        query,
+        crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+    )
 }
 
 /// Refine a full Query with danger gate context.

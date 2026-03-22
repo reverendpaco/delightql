@@ -12,19 +12,6 @@ mod domain;
 // Re-export public functions
 pub use domain::substitute_in_domain_expression_with_curried;
 
-/// Check if a function name corresponds to a CFE invocation
-pub fn is_cfe_invocation(func_name: &str, cfes: &[ast::PrecompiledCfeDefinition]) -> bool {
-    cfes.iter().any(|cfe| cfe.name == func_name)
-}
-
-/// Lookup a CFE by name
-pub fn lookup_cfe<'a>(
-    func_name: &str,
-    cfes: &'a [ast::PrecompiledCfeDefinition],
-) -> Option<&'a ast::PrecompiledCfeDefinition> {
-    cfes.iter().find(|cfe| cfe.name == func_name)
-}
-
 /// Check if arguments represent a context-aware call (first arg is ContextMarker)
 pub fn is_context_aware_call(arguments: &[ast::DomainExpression]) -> bool {
     matches!(

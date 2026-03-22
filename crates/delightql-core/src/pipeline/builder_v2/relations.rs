@@ -411,7 +411,7 @@ fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<DomainExpres
             }
             "number_literal" => {
                 return Ok(DomainExpression::literal_builder(LiteralValue::Number(
-                    child.text().to_string(),
+                    child.text().replace('_', ""),
                 ))
                 .build());
             }

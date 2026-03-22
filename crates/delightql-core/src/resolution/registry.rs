@@ -1185,6 +1185,57 @@ impl ConsultRegistry {
         Ok(None)
     }
 
+    /// Check if an enlisted table expression (entity_type = 6) exists by name.
+    /// Used to detect DDL-defined facts that can be used as sigma predicates.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn lookup_enlisted_table(&self, name: &str) -> std::result::Result<bool, DelightQLError> {
+        use crate::bootstrap::enums::EntityType;
+
+        let Some(system) = self.system else {
+            return Ok(false);
+        };
+        let system_ref = unsafe { &*system };
+        let bootstrap = system_ref.get_bootstrap_connection();
+        let conn = bootstrap.lock().map_err(|e| {
+            DelightQLError::database_error(
+                "Failed to acquire bootstrap lock for enlisted table lookup",
+                format!("{}", e),
+            )
+        })?;
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity e
+                 JOIN activated_entity ae ON ae.entity_id = e.id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 WHERE e.name = ?1 COLLATE NOCASE AND e.type = ?2
+                 AND n.id IN (
+                     WITH RECURSIVE reachable(ns_id) AS (
+                         SELECT en.from_namespace_id
+                         FROM enlisted_namespace en
+                         JOIN namespace main_ns ON main_ns.id = en.to_namespace_id
+                            AND main_ns.fq_name = 'main'
+                         UNION
+                         SELECT exp.exposed_namespace_id
+                         FROM exposed_namespace exp
+                         JOIN reachable r ON r.ns_id = exp.exposing_namespace_id
+                     )
+                     SELECT ns_id FROM reachable
+                 )",
+                rusqlite::params![name, EntityType::DqlFactExpression.as_i32()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        Ok(count > 0)
+    }
+
+    /// WASM stub
+    #[cfg(target_arch = "wasm32")]
+    pub fn lookup_enlisted_table(&self, _name: &str) -> std::result::Result<bool, DelightQLError> {
+        Ok(false)
+    }
+
     /// Look up an enlisted HO view (entity_type = 8) by unqualified name
     #[cfg(not(target_arch = "wasm32"))]
     pub fn lookup_enlisted_ho_view(

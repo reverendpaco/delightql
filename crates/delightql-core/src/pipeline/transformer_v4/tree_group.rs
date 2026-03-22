@@ -17,7 +17,8 @@ use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::addressed as ast_addressed;
 use crate::pipeline::asts::core::expressions::CurlyMember;
 use crate::pipeline::asts::core::literals::LiteralValue;
-use crate::pipeline::asts::core::Addressed;
+use crate::pipeline::asts::core::metadata::CprSchema;
+use crate::pipeline::asts::core::{Addressed, PhaseBox};
 use crate::pipeline::sql_ast_v3::{
     BinaryOperator, ColumnQualifier, DomainExpression as SqlExpr, SelectBuilder, SelectItem,
     TableExpression, WhenClause,
@@ -83,6 +84,7 @@ pub(super) fn r_lower_tree_group_cte(
     builder: Builder<Unprojected>,
     reducing_by: Vec<ast_addressed::DomainExpression>,
     reducing_on: Vec<ast_addressed::DomainExpression>,
+    cpr_schema: &PhaseBox<CprSchema, Addressed>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     let item = reducing_on
@@ -111,10 +113,22 @@ pub(super) fn r_lower_tree_group_cte(
     let metadata_keys: Vec<GroupKey> = metadata_keys;
 
     let has_metadata = !metadata_keys.is_empty();
+
+    // Get the CprSchema's name for the tree group column — this is the
+    // resolver's authoritative name. Use it instead of hardcoded "result".
+    let cpr_tg_name: Option<String> = match cpr_schema.get() {
+        CprSchema::Resolved(cols) => {
+            // The tree group column is after the reducing_by keys
+            cols.get(reducing_by_names.len())
+                .map(|c| c.name().to_string())
+        }
+        _ => None,
+    };
+
     let top_alias = if has_metadata {
-        "constructor"
+        "constructor".to_string()
     } else {
-        "result"
+        cpr_tg_name.clone().unwrap_or_else(|| "result".to_string())
     };
 
     let mut initial_group_keys: Vec<GroupKey> = reducing_by_names
@@ -130,7 +144,12 @@ pub(super) fn r_lower_tree_group_cte(
         top_alias.to_string(),
         &mut levels,
     );
-    append_metadata_levels(&metadata_keys, &reducing_by_names, &mut levels);
+    append_metadata_levels(
+        &metadata_keys,
+        &reducing_by_names,
+        &mut levels,
+        cpr_tg_name.as_deref(),
+    );
 
     // Build the CTE chain bottom-up via push_cte.
     let mut projected = builder.project_all()?;
@@ -140,7 +159,7 @@ pub(super) fn r_lower_tree_group_cte(
     }
 
     // Final projection from the last CTE.
-    build_final_projection(projected, &levels, &reducing_by, alias)
+    build_final_projection(projected, &levels, &reducing_by, alias, cpr_schema)
 }
 
 /// Lower a tree group that appears in reducing_by (key) position.
@@ -154,6 +173,7 @@ pub(super) fn r_lower_tree_group_in_reducing_by(
     builder: Builder<Unprojected>,
     reducing_by: Vec<ast_addressed::DomainExpression>,
     reducing_on: Vec<ast_addressed::DomainExpression>,
+    cpr_schema: &PhaseBox<CprSchema, Addressed>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     // Partition reducing_by into the tree group item and plain keys
@@ -229,6 +249,7 @@ pub(super) fn r_lower_tree_group_in_reducing_by(
         &nested_items,
         tg_alias,
         extra_start,
+        cpr_schema,
     )
 }
 
@@ -437,6 +458,7 @@ fn build_reducing_by_final_projection(
     nested_items: &[(String, Vec<CurlyMember<Addressed>>, bool)],
     tg_alias: Option<delightql_types::SqlIdentifier>,
     extra_start: usize,
+    cpr_schema: &PhaseBox<CprSchema, Addressed>,
 ) -> Result<Builder<Projected>> {
     let mut final_items = Vec::new();
     let mut json_args = Vec::new();
@@ -468,10 +490,20 @@ fn build_reducing_by_final_projection(
         }
     }
 
+    // Use CprSchema name for the tree group column (resolver's authoritative name)
+    let cpr_names: Vec<String> = match cpr_schema.get() {
+        CprSchema::Resolved(cols) => cols.iter().map(|c| c.name().to_string()).collect(),
+        _ => Vec::new(),
+    };
+    let tg_final_alias = tg_alias
+        .as_ref()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| cpr_names.first().cloned());
+
     let json_object = SqlExpr::function("JSON_OBJECT", json_args);
     final_items.push(SelectItem::Expression {
         expr: json_object,
-        alias: tg_alias.as_ref().map(|a| a.as_str().to_string()),
+        alias: tg_final_alias,
     });
 
     for col in columns.iter().skip(extra_start) {
@@ -798,11 +830,12 @@ fn append_metadata_levels(
     metadata_keys: &[GroupKey],
     reducing_by_names: &[String],
     levels: &mut Vec<NestingLevel>,
+    cpr_tg_name: Option<&str>,
 ) {
     for (i, key) in metadata_keys.iter().rev().enumerate() {
         let is_outermost = i == metadata_keys.len() - 1;
         let agg_alias = if is_outermost {
-            "result".to_string()
+            cpr_tg_name.unwrap_or("result").to_string()
         } else {
             "constructor".to_string()
         };
@@ -1113,11 +1146,20 @@ fn build_final_projection(
     levels: &[NestingLevel],
     reducing_by: &[ast_addressed::DomainExpression],
     alias: Option<delightql_types::SqlIdentifier>,
+    cpr_schema: &PhaseBox<CprSchema, Addressed>,
 ) -> Result<Builder<Projected>> {
     let last_level = levels.last().unwrap();
     let mut final_items = Vec::new();
 
-    for key_expr in reducing_by {
+    // Get the CprSchema column names for aliasing — the resolver's authoritative names.
+    let cpr_names: Vec<String> = match cpr_schema.get() {
+        CprSchema::Resolved(cols) => cols.iter().map(|c| c.name().to_string()).collect(),
+        _ => Vec::new(),
+    };
+
+    let num_keys = reducing_by.len();
+
+    for (i, key_expr) in reducing_by.iter().enumerate() {
         if let ast_addressed::DomainExpression::Lvar { name, .. } = key_expr {
             let key_name = name.as_str();
             let qc = projected.columns().iter().find(|c| col_name(c) == key_name);
@@ -1129,9 +1171,14 @@ fn build_final_projection(
             } else {
                 SqlExpr::column(key_name)
             };
+            // Use CprSchema name if available, otherwise key_name
+            let out_alias = cpr_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| key_name.to_string());
             final_items.push(SelectItem::Expression {
                 expr: sql_expr,
-                alias: Some(key_name.to_string()),
+                alias: Some(out_alias),
             });
         }
     }
@@ -1149,10 +1196,16 @@ fn build_final_projection(
     } else {
         SqlExpr::column(agg_name)
     };
-    let final_alias = alias.as_ref().map(|a| a.as_str().to_string());
+    // Use CprSchema name for the aggregate column — this is the resolver's name
+    // (e.g., "tree_group_") rather than the transformer's internal name ("result").
+    let final_alias = alias
+        .as_ref()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| cpr_names.get(num_keys).cloned())
+        .unwrap_or_else(|| agg_name.clone());
     final_items.push(SelectItem::Expression {
         expr: agg_expr,
-        alias: final_alias,
+        alias: Some(final_alias),
     });
 
     projected.add_projection(final_items)

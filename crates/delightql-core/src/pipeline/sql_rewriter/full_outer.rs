@@ -13,8 +13,8 @@
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::generator_v3::SqlDialect;
 use crate::pipeline::sql_ast_v3::{
-    BinaryOperator, DomainExpression, JoinCondition, JoinType, QueryExpression, SelectItem,
-    SelectStatement, SetOperator, SqlStatement, TableExpression,
+    BinaryOperator, DomainExpression, JoinCondition, JoinType, QueryExpression, SelectStatement,
+    SetOperator, SqlStatement, TableExpression,
 };
 
 /// Should we expand FULL OUTER JOIN for this dialect?
@@ -81,12 +81,7 @@ fn rewrite_select_query(stmt: SelectStatement) -> Result<QueryExpression> {
         } = from[0]
         {
             // Top-level FULL OUTER — expand this SELECT
-            return expand_full_outer_select(
-                &stmt,
-                left,
-                right,
-                join_condition,
-            );
+            return expand_full_outer_select(&stmt, left, right, join_condition);
         }
     }
 
@@ -96,8 +91,7 @@ fn rewrite_select_query(stmt: SelectStatement) -> Result<QueryExpression> {
         .map(|t| rewrite_table_subqueries(t.clone()))
         .collect::<Result<Vec<_>>>()?;
 
-    rebuild_select_with_from(stmt, new_from)
-        .map(|s| QueryExpression::Select(Box::new(s)))
+    rebuild_select_with_from(stmt, new_from).map(|s| QueryExpression::Select(Box::new(s)))
 }
 
 /// Expand a SELECT with a top-level FULL OUTER JOIN.
@@ -126,11 +120,7 @@ fn expand_full_outer_select(
         right: Box::new(right.clone()),
         join_condition: condition.clone(),
     };
-    let branch1 = rebuild_select_with_from_and_extra_where(
-        stmt,
-        vec![branch1_from],
-        None,
-    )?;
+    let branch1 = rebuild_select_with_from_and_extra_where(stmt, vec![branch1_from], None)?;
 
     // Branch 2: B LEFT JOIN A ON cond, with extra WHERE A.key IS NULL
     let branch2_from = TableExpression::Join {
@@ -146,11 +136,8 @@ fn expand_full_outer_select(
             crate::pipeline::ast_refined::LiteralValue::Null,
         )),
     };
-    let branch2 = rebuild_select_with_from_and_extra_where(
-        stmt,
-        vec![branch2_from],
-        Some(null_check),
-    )?;
+    let branch2 =
+        rebuild_select_with_from_and_extra_where(stmt, vec![branch2_from], Some(null_check))?;
 
     // UNION ALL
     Ok(QueryExpression::SetOperation {
@@ -256,15 +243,14 @@ fn rebuild_select_with_from_and_extra_where(
 /// Extract a qualified column from the join condition for NULL checking.
 fn extract_null_check_column(condition: &JoinCondition) -> Result<DomainExpression> {
     match condition {
-        JoinCondition::On(expr) => find_first_qualified_column(expr).ok_or_else(|| {
-            DelightQLError::ParseError {
-                message:
-                    "FULL OUTER JOIN: could not find qualified column in ON for NULL check"
-                        .to_string(),
+        JoinCondition::On(expr) => {
+            find_first_qualified_column(expr).ok_or_else(|| DelightQLError::ParseError {
+                message: "FULL OUTER JOIN: could not find qualified column in ON for NULL check"
+                    .to_string(),
                 source: None,
                 subcategory: None,
-            }
-        }),
+            })
+        }
         JoinCondition::Using(cols) => {
             if cols.is_empty() {
                 Err(DelightQLError::ParseError {

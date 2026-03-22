@@ -58,31 +58,11 @@ pub fn build_concat_chain(
     apply_alias_to_expression(result, alias)
 }
 
-/// Build a concat chain and extract just the FunctionExpression
-///
-/// This is a convenience wrapper for callers that need a FunctionExpression
-/// rather than a DomainExpression. Used by pattern_resolver and mod.rs.
-pub fn build_concat_chain_as_function(
-    parts: Vec<StringTemplatePart<Resolved>>,
-    alias: Option<SqlIdentifier>,
-) -> FunctionExpression {
-    let expr = build_concat_chain(parts, alias.clone());
-
-    match expr {
-        DomainExpression::Function(func) => func,
-        // For single literals or empty templates, wrap in a Regular function
-        _ => FunctionExpression::Regular {
-            name: "concat".into(),
-            namespace: None,
-            arguments: vec![expr],
-            alias,
-            conditioned_on: None,
-        },
-    }
-}
-
 /// Apply an alias to the outermost level of an expression
-fn apply_alias_to_expression(expr: DomainExpression, alias: Option<SqlIdentifier>) -> DomainExpression {
+fn apply_alias_to_expression(
+    expr: DomainExpression,
+    alias: Option<SqlIdentifier>,
+) -> DomainExpression {
     match expr {
         DomainExpression::Function(FunctionExpression::Infix {
             operator,

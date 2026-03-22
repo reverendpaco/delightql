@@ -626,14 +626,12 @@ impl<'a> Pipeline<'a> {
         query_danger_gates.apply_overrides(&self.danger_specs);
 
         // Refine and transform
-        let refined_query = refiner::refine_query_with_gates(
-            query_resolved.clone(),
-            query_danger_gates.clone(),
-        )
-        .map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+        let refined_query =
+            refiner::refine_query_with_gates(query_resolved.clone(), query_danger_gates.clone())
+                .map_err(|e| {
+                    self.record_delightql_error(&e);
+                    e
+                })?;
         let addressed_query = addresser::address_query(refined_query).map_err(|e| {
             self.record_delightql_error(&e);
             e
@@ -686,8 +684,8 @@ impl<'a> Pipeline<'a> {
 
         // Dialect-aware rewriting, then optimize
         let rewritten = sql_rewriter::rewrite(sql_ast.clone(), self.dialect)?;
-        let optimized = sql_optimizer::optimize(rewritten, self.sql_optimization_level)
-            .map_err(|e| {
+        let optimized =
+            sql_optimizer::optimize(rewritten, self.sql_optimization_level).map_err(|e| {
                 self.record_delightql_error(&e);
                 e
             })?;
@@ -1059,8 +1057,7 @@ fn generate_sql_v3_only(ast_addressed: ast_addressed::RelationalExpression) -> R
     let query = ast_addressed::Query::Relational(ast_addressed);
     let sql_ast_v3 = transformer_v4::transform(query, &ctx)?;
     let rewritten = sql_rewriter::rewrite(sql_ast_v3, generator_v3::SqlDialect::SQLite)?;
-    let optimized_sql_ast_v3 =
-        sql_optimizer::optimize(rewritten, sql_optimizer::level_from_env())?;
+    let optimized_sql_ast_v3 = sql_optimizer::optimize(rewritten, sql_optimizer::level_from_env())?;
     let generator = generator_v3::SqlGenerator::new();
     generator
         .generate_statement(&optimized_sql_ast_v3)

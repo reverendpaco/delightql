@@ -204,26 +204,4 @@ impl TableExpression {
             alias: alias.into(),
         }
     }
-
-    pub fn inner_join(
-        left: TableExpression,
-        right: TableExpression,
-        on: Option<DomainExpression>,
-    ) -> Self {
-        TableExpression::Join {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinType::Inner,
-            join_condition: on.map(JoinCondition::On).unwrap_or(JoinCondition::Natural),
-        }
-    }
-
-    pub fn left_join(left: TableExpression, right: TableExpression, on: DomainExpression) -> Self {
-        TableExpression::Join {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinType::Left,
-            join_condition: JoinCondition::On(on),
-        }
-    }
 }

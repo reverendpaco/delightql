@@ -132,8 +132,6 @@ impl ScopeEntry {
         let mut names = Vec::with_capacity(self.columns.len());
 
         for col in &self.columns {
-            // Hygienic columns (e.g. _label_0 for clause selection) exist in
-            // the SQL subquery but should not appear in the output projection.
             if col.needs_hygienic_alias {
                 continue;
             }

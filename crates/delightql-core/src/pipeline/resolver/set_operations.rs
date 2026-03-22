@@ -49,8 +49,8 @@ pub(super) fn validate_union_compatible_schemas(
     // Check column names match (not just count).
     // If names differ, schemas are NOT the same -> caller uses CORRESPONDING.
     for (c1, c2) in cols1.iter().zip(cols2.iter()) {
-        let n1 = c1.info.original_name().or_else(|| c1.info.alias_name());
-        let n2 = c2.info.original_name().or_else(|| c2.info.alias_name());
+        let n1 = c1.info.name().or_else(|| c1.info.original_name());
+        let n2 = c2.info.name().or_else(|| c2.info.original_name());
         if n1 != n2 {
             return Err(DelightQLError::ParseError {
                 message: format!(
@@ -92,13 +92,13 @@ pub(super) fn build_corresponding_schema(
         }
     };
 
-    // Track which column names we've already seen
+    // Track which column names we've already seen (use effective name, not original)
     let mut seen_names: HashSet<String> = unified_columns
         .iter()
         .filter_map(|col| {
             col.info
-                .original_name()
-                .or_else(|| col.info.alias_name())
+                .name()
+                .or_else(|| col.info.original_name())
                 .map(|s| s.to_string())
         })
         .collect();
@@ -120,8 +120,8 @@ pub(super) fn build_corresponding_schema(
         for col in cols {
             let col_name = col
                 .info
-                .original_name()
-                .or_else(|| col.info.alias_name())
+                .name()
+                .or_else(|| col.info.original_name())
                 .unwrap_or("unknown")
                 .to_string();
 

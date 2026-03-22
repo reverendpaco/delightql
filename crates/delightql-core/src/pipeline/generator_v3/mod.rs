@@ -49,16 +49,6 @@ impl SqlGenerator {
         }
     }
 
-    pub fn with_dialect(dialect: SqlDialect) -> Self {
-        SqlGenerator {
-            config: GeneratorConfig {
-                dialect,
-                ..Default::default()
-            },
-            bin_registry: None,
-        }
-    }
-
     pub fn with_bin_registry(mut self, registry: Arc<BinCartridgeRegistry>) -> Self {
         self.bin_registry = Some(registry);
         self

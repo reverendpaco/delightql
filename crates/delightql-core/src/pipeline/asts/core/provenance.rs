@@ -317,24 +317,6 @@ impl ColumnProvenance {
         self
     }
 
-    /// Promote the effective (top-of-stack) name to the bottom of the stack.
-    ///
-    /// Called at pipe boundaries after pushing PipeBarrier. After promotion,
-    /// `original_name()` returns the same as `name()` — the column's identity
-    /// is sealed. The alias (if any) has been consumed; downstream code sees
-    /// a single unambiguous name regardless of which accessor it uses.
-    pub fn promote_at_barrier(mut self) -> Self {
-        let stack = Arc::make_mut(&mut self.identity_stack);
-        if stack.len() > 1 {
-            if let Some(effective) = stack.first().map(|e| e.name.clone()) {
-                if let Some(bottom) = stack.last_mut() {
-                    bottom.name = effective;
-                }
-            }
-        }
-        self
-    }
-
     /// Update qualification source in the identity stack
     ///
     /// Used by resolver during unification when the actual reference style is determined.

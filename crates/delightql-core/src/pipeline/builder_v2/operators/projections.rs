@@ -132,7 +132,7 @@ pub(in crate::pipeline::builder_v2) fn parse_reposition(
 
             let column = if column_node.kind() == "integer_literal" {
                 // Bare integer in *[...] — build ColumnOrdinal directly
-                let text = column_node.text();
+                let text = column_node.text().replace('_', "");
                 let (position, reverse) = if text.starts_with('-') {
                     (
                         text[1..]

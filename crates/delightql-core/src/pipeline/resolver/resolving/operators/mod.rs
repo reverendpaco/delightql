@@ -2,7 +2,7 @@
 // Each module handles a specific category of unary relational operators
 
 mod aggregation;
-mod helpers;
+pub(in crate::pipeline::resolver) mod helpers;
 mod ordering;
 mod projection;
 mod schema_ops;

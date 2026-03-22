@@ -6,6 +6,75 @@ pub(super) fn emit_validation_warning(warning: &str) {
     log::warn!("Column validation: {}", warning);
 }
 
+/// Check that programmer-authored column names are unique in an output schema.
+/// Engine-managed names (has_user_name == false) are allowed to collide.
+pub(super) fn check_duplicate_user_names(output: &[ast_resolved::ColumnMetadata]) -> Result<()> {
+    let mut seen = std::collections::HashMap::new();
+    for col in output {
+        if !col.has_user_name {
+            continue;
+        }
+        let name = col.name();
+        if seen.contains_key(name) {
+            return Err(DelightQLError::validation_error_categorized(
+                "constraint",
+                format!(
+                    "Duplicate column '{}': programmer-authored names must be unique. \
+                     Rename one with 'as' to disambiguate",
+                    name,
+                ),
+                "in output schema",
+            ));
+        }
+        seen.insert(name, ());
+    }
+    Ok(())
+}
+
+/// Apply the sanitization protocol to engine-managed columns in an output schema.
+///
+/// When engine-managed columns (from glob, pattern, range expansion) share a name,
+/// every instance of the colliding name gets the disambiguated form:
+///   `<scope>.<column>|<N>|`
+/// where `<scope>` is the table name or alias, and `<N>` is the 1-based global ordinal.
+///
+/// Non-colliding engine-managed columns keep their bare names.
+/// Programmer-authored columns (has_user_name == true) are never touched.
+pub(in crate::pipeline::resolver) fn sanitize_engine_managed_columns(
+    output: &mut Vec<ast_resolved::ColumnMetadata>,
+    is_engine_col: &[bool],
+) {
+    // Find which bare names collide among engine-managed columns
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (idx, col) in output.iter().enumerate() {
+        if is_engine_col[idx] {
+            *name_counts.entry(col.name().to_string()).or_insert(0) += 1;
+        }
+    }
+
+    // Apply sanitized names to every instance of a colliding name
+    for (idx, col) in output.iter_mut().enumerate() {
+        if !is_engine_col[idx] {
+            continue;
+        }
+        let bare_name = col.name().to_string();
+        if name_counts.get(&bare_name).copied().unwrap_or(0) <= 1 {
+            continue; // No collision, keep bare name
+        }
+
+        // Build sanitized name: <scope>.<column>|<N>|
+        let ordinal = idx + 1; // 1-based
+        let scope = match &col.table_name {
+            ast_resolved::TableName::Named(t) if !t.is_empty() => t.to_string(),
+            _ => "_".to_string(),
+        };
+        let sanitized = format!("{}.{}|{}|", scope, bare_name, ordinal);
+
+        col.info = ast_resolved::ColumnProvenance::from_column(sanitized);
+    }
+}
+
 /// Restructure tree groups for proper grouping when nested reductions are present
 ///
 /// When a tree group in `reducing_on` contains both non-nested and nested members:

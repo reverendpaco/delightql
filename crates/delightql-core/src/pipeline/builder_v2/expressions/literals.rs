@@ -131,7 +131,7 @@ pub(in crate::pipeline::builder_v2) fn parse_literal(node: CstNode) -> Result<Do
             Ok(DomainExpression::literal_builder(LiteralValue::Number(value.to_string())).build())
         }
         "number_literal" | "integer_literal" => Ok(DomainExpression::literal_builder(
-            LiteralValue::Number(child.text().to_string()),
+            LiteralValue::Number(child.text().replace('_', "")),
         )
         .build()),
         "boolean_literal" => {
@@ -165,7 +165,7 @@ pub(in crate::pipeline::builder_v2) fn parse_column_ordinal(
         ));
     }
 
-    let text = position_node.text();
+    let text = position_node.text().replace('_', "");
 
     // Glob ordinal: x|*| — represents all columns by position
     if text == "*" {

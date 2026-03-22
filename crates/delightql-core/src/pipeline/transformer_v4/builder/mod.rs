@@ -898,7 +898,10 @@ impl Builder<Projected> {
         func_name: &str,
         args: Vec<DomainExpression>,
         partition_by: Vec<DomainExpression>,
-        order_by: Vec<(DomainExpression, crate::pipeline::sql_ast_v3::ordering::OrderDirection)>,
+        order_by: Vec<(
+            DomainExpression,
+            crate::pipeline::sql_ast_v3::ordering::OrderDirection,
+        )>,
         alias: &str,
     ) -> Result<Self> {
         // Wrap current state as subquery so window function sees finalized rows
@@ -1763,8 +1766,6 @@ pub(in crate::pipeline::transformer_v4) fn disambiguate_aliases(
                     return SelectItem::Expression { expr, alias };
                 }
                 let unique = state::unique_name(&effective, &mut used);
-                // Only add/change the alias if disambiguation changed the name
-                // or an alias was already present.
                 let new_alias = if unique != effective || alias.is_some() {
                     Some(unique)
                 } else {

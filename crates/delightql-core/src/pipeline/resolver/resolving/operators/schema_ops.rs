@@ -155,6 +155,27 @@ pub(super) fn resolve_rename_cover(
         }
     }
 
+    // Check rename targets don't collide with passthrough columns
+    for (idx, (_, new_name)) in &rename_map {
+        // A passthrough column is one that isn't being renamed
+        let collides_with_passthrough = available.iter().enumerate().any(|(i, col)| {
+            i != *idx
+                && !rename_map.contains_key(&i)
+                && crate::pipeline::resolver::col_name_eq(col.name(), new_name)
+        });
+        if collides_with_passthrough {
+            return Err(DelightQLError::validation_error_categorized(
+                "constraint",
+                format!(
+                    "Rename target '{}' collides with an existing column that passes through unchanged. \
+                     Use a different target name to avoid ambiguity",
+                    new_name,
+                ),
+                "in rename-cover operator",
+            ));
+        }
+    }
+
     // Apply renames to output columns (using position-based map)
     let mut output_columns = Vec::new();
     for (idx, col) in available.iter().enumerate() {

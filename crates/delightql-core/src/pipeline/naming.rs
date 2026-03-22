@@ -4,18 +4,6 @@
 /// used throughout the pipeline, ensuring consistency between resolver
 /// and transformer stages.
 
-/// Generate a column name for anonymous tables without headers
-///
-/// # Arguments
-/// * `index` - 0-based column index
-///
-/// # Returns
-/// Column name in the format "column1", "column2", etc. (1-based naming)
-#[inline]
-pub fn anonymous_column_name(index: usize) -> String {
-    format!("column{}", index + 1)
-}
-
 /// Generate a unique column name for a resolved function expression without an alias
 ///
 /// This is used when ordinal selectors (|1|, |2|) need to reference columns.

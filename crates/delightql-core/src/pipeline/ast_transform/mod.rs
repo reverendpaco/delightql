@@ -39,10 +39,6 @@ impl<T> FoldAction<T> {
             FoldAction::Continue(t) | FoldAction::Replaced(t) => t,
         }
     }
-
-    pub fn is_replaced(&self) -> bool {
-        matches!(self, FoldAction::Replaced(_))
-    }
 }
 
 // =============================================================================

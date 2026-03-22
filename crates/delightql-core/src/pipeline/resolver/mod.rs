@@ -26,13 +26,6 @@ impl ResolverAliasCounter {
         Self(Rc::new(Cell::new(0)))
     }
 
-    /// Generate a unique `_rN` alias for this resolution pass.
-    pub fn next_alias(&self) -> String {
-        let n = self.0.get();
-        self.0.set(n + 1);
-        format!("_r{}", n)
-    }
-
     /// Generate a unique `_rN` alias paired with an opaque ResolverId.
     /// The string is for backward-compatible scope lookup; the ResolverId
     /// flows through identity stacks to the transformer.

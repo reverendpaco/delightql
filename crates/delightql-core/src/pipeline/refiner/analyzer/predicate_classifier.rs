@@ -117,18 +117,38 @@ fn are_tables_in_operator_relationship(
     flat: &FlatSegment,
     operator_type: OperatorType,
 ) -> bool {
-    for op in &flat.operators {
-        let matches_type = match operator_type {
-            OperatorType::Join => {
-                matches!(op.kind, FlatOperatorKind::Join { .. })
+    // For SetOps, collect ALL tables across all operators at the same position
+    // into one pool. A three-way UNION has all operands in the same set-op group,
+    // so correlation between any pair (e.g., operands 1 and 3) is valid.
+    if matches!(operator_type, OperatorType::SetOp) {
+        let mut setop_groups: std::collections::HashMap<usize, Vec<String>> =
+            std::collections::HashMap::new();
+        for op in &flat.operators {
+            if matches!(op.kind, FlatOperatorKind::SetOp { .. }) {
+                let group = setop_groups.entry(op.position).or_default();
+                for t in &op.left_tables {
+                    if !group.contains(t) {
+                        group.push(t.clone());
+                    }
+                }
+                for t in &op.right_tables {
+                    if !group.contains(t) {
+                        group.push(t.clone());
+                    }
+                }
             }
-            OperatorType::SetOp => {
-                matches!(op.kind, FlatOperatorKind::SetOp { .. })
+        }
+        for group in setop_groups.values() {
+            if group.contains(&left.to_string()) && group.contains(&right.to_string()) {
+                return true;
             }
-        };
+        }
+        return false;
+    }
 
-        if matches_type {
-            // Check if one table is on the left and the other is on the right
+    // For joins, check pairwise as before
+    for op in &flat.operators {
+        if matches!(op.kind, FlatOperatorKind::Join { .. }) {
             if (op.left_tables.contains(&left.to_string())
                 && op.right_tables.contains(&right.to_string()))
                 || (op.left_tables.contains(&right.to_string())

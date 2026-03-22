@@ -34,18 +34,6 @@ impl OptionMap {
             self.options.insert(spec.uri.clone(), spec.state);
         }
     }
-
-    pub fn is_enabled(&self, uri: &str) -> bool {
-        match self.get(uri) {
-            Some(OptionState::On) => true,
-            Some(OptionState::Severity(n)) if *n > 0 => true,
-            _ => false,
-        }
-    }
-
-    pub fn get(&self, uri: &str) -> Option<&OptionState> {
-        self.options.get(uri)
-    }
 }
 
 impl Default for OptionMap {

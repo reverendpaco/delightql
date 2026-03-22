@@ -10,7 +10,7 @@
 //! - `descend_as_query()` — for set-op operands, returns `Builder<Projected>`
 //! - `descend_as_final()` — root expression, returns `Builder<Projected>` for `to_sql()`
 
-use crate::error::{DelightQLError, Result};
+use crate::error::Result;
 use crate::pipeline::asts::addressed as ast_addressed;
 use crate::pipeline::pipe_chain::collect_pipe_chain;
 

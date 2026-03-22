@@ -7,60 +7,6 @@ use crate::pipeline::asts::ddl::DdlHead;
 use crate::pipeline::resolver::grounding::substitute_in_domain_expr;
 use std::collections::HashMap;
 
-/// Desugar IN operator to InnerExists with anonymous table
-/// EPOCH 5: Supports both single-column and tuple IN
-/// Transforms: value in (val1; val2) → +_(value @ val1; val2) as InnerExists
-/// Transforms: (c1, c2) in (v1, v2; v3, v4) → +_(c1, c2 @ v1, v2; v3, v4) as InnerExists
-pub(in crate::pipeline::resolver) fn desugar_in_to_anonymous(
-    resolved_value: ast_resolved::DomainExpression,
-    resolved_set: Vec<ast_resolved::DomainExpression>,
-    negated: bool,
-) -> ast_resolved::BooleanExpression {
-    // Unwrap tuple if needed - extract header columns
-    let header_columns: Vec<ast_resolved::DomainExpression> = match resolved_value {
-        ast_resolved::DomainExpression::Tuple { elements, .. } => elements,
-        single_expr => vec![single_expr],
-    };
-
-    // Create rows from the set values
-    // Each set element can be either a single value or a tuple
-    let rows: Vec<ast_resolved::Row> = resolved_set
-        .into_iter()
-        .map(|expr| {
-            // Unwrap tuple if needed - extract row values
-            let row_values = match expr {
-                ast_resolved::DomainExpression::Tuple { elements, .. } => elements,
-                single_expr => vec![single_expr],
-            };
-            ast_resolved::Row { values: row_values }
-        })
-        .collect();
-
-    // Create the anonymous table relation
-    let anon_table =
-        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::Anonymous {
-            column_headers: Some(header_columns),
-            rows,
-            alias: None,
-            outer: false,
-            exists_mode: true,
-            qua_target: None,
-            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Unknown),
-        });
-
-    ast_resolved::BooleanExpression::InnerExists {
-        exists: !negated,
-        identifier: ast_resolved::QualifiedName {
-            namespace_path: crate::pipeline::asts::resolved::NamespacePath::empty(),
-            name: "_".into(),
-            grounding: None,
-        },
-        subquery: Box::new(anon_table),
-        alias: None,
-        using_columns: vec![],
-    }
-}
-
 // =============================================================================
 // USING correlation synthesis for semi-joins
 // =============================================================================
@@ -789,4 +735,93 @@ pub(in crate::pipeline::resolver) fn expand_consulted_sigma(
             expr: Box::new(combined),
         })
     }
+}
+
+/// Expand a table (fact) used as a sigma predicate.
+///
+/// `+no_data(x)` expands to:
+///   EXISTS (SELECT * FROM no_data AS _fact WHERE x IS NOT DISTINCT FROM _fact.|1|)
+///
+/// Constructs the AST directly without re-parsing.
+pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
+    table_name: &str,
+    arguments: Vec<ast_unresolved::DomainExpression>,
+    exists: bool,
+) -> Result<ast_unresolved::BooleanExpression> {
+    use crate::pipeline::asts::core::{FilterOrigin, NamespacePath, PhaseBox};
+
+    if arguments.is_empty() {
+        return Err(DelightQLError::parse_error(format!(
+            "Sigma predicate '+{}()' requires at least one argument",
+            table_name
+        )));
+    }
+
+    let table_ident = ast_unresolved::QualifiedName {
+        namespace_path: NamespacePath::empty(),
+        name: table_name.into(),
+        grounding: None,
+    };
+
+    let fact_alias = "_fact";
+
+    // Build subquery: table_name(*) as _fact
+    let subquery =
+        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier: table_ident.clone(),
+            canonical_name: PhaseBox::phantom(),
+            backend_schema: PhaseBox::phantom(),
+            domain_spec: ast_unresolved::DomainSpec::Glob,
+            alias: Some(fact_alias.into()),
+            outer: false,
+            mutation_target: false,
+            passthrough: false,
+            cpr_schema: PhaseBox::phantom(),
+            hygienic_injections: vec![],
+        });
+
+    // Build correlation: arg IS NOT DISTINCT FROM _fact.|N| for each argument
+    let mut conditions: Vec<ast_unresolved::BooleanExpression> = Vec::new();
+    for (i, arg) in arguments.iter().enumerate() {
+        let ordinal = (i + 1) as u16;
+        let fact_col = ast_unresolved::DomainExpression::ColumnOrdinal(PhaseBox::new(
+            crate::pipeline::asts::core::ColumnOrdinal {
+                position: ordinal,
+                reverse: false,
+                qualifier: Some(fact_alias.into()),
+                alias: None,
+                glob: false,
+                namespace_path: NamespacePath::empty(),
+            },
+        ));
+
+        conditions.push(ast_unresolved::BooleanExpression::Comparison {
+            operator: "null_safe_eq".to_string(),
+            left: Box::new(arg.clone()),
+            right: Box::new(fact_col),
+        });
+    }
+
+    let combined = conditions
+        .into_iter()
+        .reduce(|acc, next| ast_unresolved::BooleanExpression::And {
+            left: Box::new(acc),
+            right: Box::new(next),
+        })
+        .unwrap();
+
+    let filtered = ast_unresolved::RelationalExpression::Filter {
+        source: Box::new(subquery),
+        condition: ast_unresolved::SigmaCondition::Predicate(combined),
+        origin: FilterOrigin::Generated,
+        cpr_schema: PhaseBox::phantom(),
+    };
+
+    Ok(ast_unresolved::BooleanExpression::InnerExists {
+        exists,
+        identifier: table_ident,
+        subquery: Box::new(filtered),
+        alias: Some(fact_alias.into()),
+        using_columns: vec![],
+    })
 }

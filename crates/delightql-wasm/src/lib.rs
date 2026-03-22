@@ -510,7 +510,6 @@ pub fn execute_dql(query: &str) -> std::result::Result<String, JsValue> {
 
         let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
 
-        // Fetch all rows
         let mut all_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
         loop {
             let fetch = session
@@ -524,7 +523,6 @@ pub fn execute_dql(query: &str) -> std::result::Result<String, JsValue> {
 
         let _ = session.close(result.handle);
 
-        // Build JSON response
         let json_rows: Vec<Vec<serde_json::Value>> = all_rows
             .iter()
             .map(|row| {
@@ -532,13 +530,8 @@ pub fn execute_dql(query: &str) -> std::result::Result<String, JsValue> {
                     .map(|cell| match cell {
                         None => serde_json::Value::Null,
                         Some(bytes) => {
-                            // Protocol cells are tagged: first byte is type tag
-                            if bytes.is_empty() {
-                                serde_json::Value::Null
-                            } else {
-                                let text = String::from_utf8_lossy(&bytes[1..]);
-                                serde_json::Value::String(text.to_string())
-                            }
+                            let text = String::from_utf8_lossy(bytes);
+                            serde_json::Value::String(text.to_string())
                         }
                     })
                     .collect()

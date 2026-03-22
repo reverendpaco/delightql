@@ -42,43 +42,55 @@ fn find_operator_for_tables(
     flat: &FlatSegment,
     operator_type: OperatorType,
 ) -> Option<OperatorRef> {
-    for (i, op) in flat.operators.iter().enumerate() {
-        let (matches_type, operator_ref) = match (&op.kind, operator_type) {
-            (FlatOperatorKind::Join { .. }, OperatorType::Join) => {
-                (true, OperatorRef::Join { position: i })
+    // For SetOps: group all operators at the same position, then check if
+    // both tables appear anywhere in that group. This handles three-way+
+    // unions where correlation spans non-adjacent operands.
+    if matches!(operator_type, OperatorType::SetOp) {
+        let mut position_groups: std::collections::HashMap<
+            usize,
+            (Vec<String>, Option<OperatorRef>),
+        > = std::collections::HashMap::new();
+        for (i, op) in flat.operators.iter().enumerate() {
+            if let FlatOperatorKind::SetOp { operator } = &op.kind {
+                let (tables, op_ref) = position_groups.entry(op.position).or_insert_with(|| {
+                    (
+                        Vec::new(),
+                        Some(OperatorRef::SetOp {
+                            position: i,
+                            operator: *operator,
+                        }),
+                    )
+                });
+                for t in &op.left_tables {
+                    if !tables.contains(t) {
+                        tables.push(t.clone());
+                    }
+                }
+                for t in &op.right_tables {
+                    if !tables.contains(t) {
+                        tables.push(t.clone());
+                    }
+                }
             }
-            (FlatOperatorKind::SetOp { operator }, OperatorType::SetOp) => (
-                true,
-                OperatorRef::SetOp {
-                    position: i,
-                    operator: *operator,
-                },
-            ),
-            // Mismatched operator type: looking for Join but found SetOp, or vice versa.
-            (FlatOperatorKind::Join { .. }, OperatorType::SetOp)
-            | (FlatOperatorKind::SetOp { .. }, OperatorType::Join) => {
-                (false, OperatorRef::TopLevel)
+        }
+        for (tables, op_ref) in position_groups.values() {
+            if tables.contains(&left.to_string()) && tables.contains(&right.to_string()) {
+                return op_ref.clone();
             }
-        };
+        }
+        return None;
+    }
 
-        if matches_type {
-            // Check if this operator involves both tables
+    // For joins: check pairwise as before
+    for (i, op) in flat.operators.iter().enumerate() {
+        if matches!(op.kind, FlatOperatorKind::Join { .. }) {
             let left_in_left = op.left_tables.contains(&left.to_string());
             let left_in_right = op.right_tables.contains(&left.to_string());
             let right_in_left = op.left_tables.contains(&right.to_string());
             let right_in_right = op.right_tables.contains(&right.to_string());
 
-            // The predicate belongs to this operator if one table is on the left
-            // and the other is on the right (in either order)
             if (left_in_left && right_in_right) || (left_in_right && right_in_left) {
-                log::debug!(
-                    "{:?} predicate for {} and {} belongs to operator {}",
-                    operator_type,
-                    left,
-                    right,
-                    i
-                );
-                return Some(operator_ref);
+                return Some(OperatorRef::Join { position: i });
             }
         }
     }
