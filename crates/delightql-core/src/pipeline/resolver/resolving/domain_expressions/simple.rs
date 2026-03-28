@@ -30,7 +30,7 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
 
             let candidates = if let Some(qual) = &ordinal.qualifier {
                 available.iter()
-                    .filter(|col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual))
+                    .filter(|col| matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual))
                     .collect::<Vec<_>>()
             } else {
                 available.iter().collect::<Vec<_>>()
@@ -83,7 +83,7 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
             Ok(ast_resolved::DomainExpression::Lvar {
                 name: name.into(),
                 qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(|| {
-                    match &column.table_name {
+                    match column.qualifier() {
                         ast_resolved::TableName::Named(t) => Some(t.clone().into()),
                         _ => None,
                     }
@@ -230,7 +230,7 @@ fn resolve_lvar(
     } else {
         // In correlation, qualified - validate only if qualifier is in available
         let qual_name = qualifier.as_ref().unwrap();
-        let qualifier_known = available.iter().any(|col| match &col.table_name {
+        let qualifier_known = available.iter().any(|col| match col.qualifier() {
             ast_resolved::TableName::Named(t) => t == qual_name,
             ast_resolved::TableName::Fresh => false,
         });
@@ -242,7 +242,7 @@ fn resolve_lvar(
             // the resolver doesn't track; let it through for SQL-level resolution.
             let col_under_named = available.iter().any(|col| {
                 col.info.original_name() == Some(&name)
-                    && matches!(col.table_name, ast_resolved::TableName::Named(_))
+                    && matches!(col.qualifier(), ast_resolved::TableName::Named(_))
             });
             if col_under_named {
                 return Err(DelightQLError::ColumnNotFoundError {
@@ -276,17 +276,17 @@ fn resolve_lvar(
         let all_fresh = has_qualifier
             && available
                 .iter()
-                .all(|col| matches!(col.table_name, ast_resolved::TableName::Fresh));
+                .all(|col| matches!(col.qualifier(), ast_resolved::TableName::Fresh));
 
         let mixed_stale = if has_qualifier && !all_fresh {
             let has_named = available
                 .iter()
-                .any(|col| matches!(&col.table_name, ast_resolved::TableName::Named(_)));
+                .any(|col| matches!(col.qualifier(), ast_resolved::TableName::Named(_)));
             let has_fresh = available
                 .iter()
-                .any(|col| matches!(col.table_name, ast_resolved::TableName::Fresh));
+                .any(|col| matches!(col.qualifier(), ast_resolved::TableName::Fresh));
             let qualifier_matches_named = available.iter().any(|col| {
-                matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qualifier.as_ref().unwrap().as_str())
+                matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qualifier.as_ref().unwrap().as_str())
             });
             has_named && has_fresh && !qualifier_matches_named
         } else {
@@ -308,7 +308,7 @@ fn resolve_lvar(
 
             match result {
                 UnificationResult::Resolved(ref col)
-                    if matches!(col.table_name, ast_resolved::TableName::Fresh) =>
+                    if matches!(col.qualifier(), ast_resolved::TableName::Fresh) =>
                 {
                     return Err(DelightQLError::ColumnNotFoundError {
                         column: format!("{}.{}", qualifier.as_ref().unwrap(), name),

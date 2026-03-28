@@ -878,27 +878,20 @@ pub(super) fn r_resolve_cte(
                 cols.iter()
                     .map(|col| {
                         let mut new_col = col.clone();
-                        new_col.table_name =
-                            ast_resolved::TableName::Named(alias_name.clone().into());
                         // Push SubqueryAlias so the provenance stack
                         // carries the alias for qualifier resolution
-                        let prev = col.info.name().unwrap_or("<unnamed>").to_string();
-                        new_col.info =
-                            new_col
-                                .info
-                                .clone()
-                                .with_identity(ast_resolved::ColumnIdentity {
-                                    name: prev.clone().into(),
-                                    context: ast_resolved::IdentityContext::SubqueryAlias {
-                                        alias: alias_name.to_string(),
-                                        previous_context: prev,
-                                        resolver_id: None,
-                                    },
-                                    phase: ast_resolved::TransformationPhase::Resolved,
-                                    table_qualifier: ast_resolved::TableName::Named(
-                                        alias_name.clone().into(),
-                                    ),
-                                });
+                        let prev = match col.qualifier() {
+                            ast_resolved::TableName::Named(t) => t.to_string(),
+                            ast_resolved::TableName::Fresh => "_".to_string(),
+                        };
+                        new_col.push_scope(
+                            ast_resolved::TableName::Named(alias_name.clone().into()),
+                            ast_resolved::IdentityContext::SubqueryAlias {
+                                alias: alias_name.to_string(),
+                                previous_context: prev,
+                                resolver_id: None,
+                            },
+                        );
                         new_col
                     })
                     .collect()
@@ -1466,6 +1459,16 @@ pub(super) fn resolve_anonymous(
         unreachable!("resolve_anonymous called with non-Anonymous variant");
     };
 
+    // Assign a synthetic table name for unaliased anonymous tables so their
+    // columns get a qualifier (e.g., _1, _2) for disambiguation.
+    static ANON_TABLE_COUNTER: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(1);
+    let anon_table_id = if relation_alias.is_none() {
+        ANON_TABLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    } else {
+        0 // unused when alias is present
+    };
+
     // P10 FIX: Anonymous relations now support DomainExpression headers for unification
 
     // Convert rows from unresolved to resolved format
@@ -1618,7 +1621,9 @@ pub(super) fn resolve_anonymous(
                     let table_name = if let Some(alias_name) = &relation_alias {
                         ast_resolved::TableName::Named(alias_name.clone().into())
                     } else {
-                        ast_resolved::TableName::Fresh
+                        // Use the same synthetic name as the headerless path
+                        // so all columns from this anonymous table share a qualifier.
+                        ast_resolved::TableName::Named(format!("_{}", anon_table_id).into())
                     };
                     let mut col_meta = ast_resolved::ColumnMetadata::new_with_name_flag(
                         ast_resolved::ColumnProvenance::from_table_column(
@@ -1653,7 +1658,7 @@ pub(super) fn resolve_anonymous(
                 let table_name = if let Some(alias_name) = &relation_alias {
                     ast_resolved::TableName::Named(alias_name.clone().into())
                 } else {
-                    ast_resolved::TableName::Fresh
+                    ast_resolved::TableName::Named(format!("_{}", anon_table_id).into())
                 };
                 // Sanitization protocol: headerless anonymous columns get
                 // |N| (unaliased) or <alias>|N| (aliased)
@@ -2002,7 +2007,7 @@ pub(super) fn resolve_tvf(
                     context
                         .iter()
                         .filter(|col| {
-                            matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual)
+                            matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
                         })
                         .collect()
                 } else {
@@ -2054,7 +2059,7 @@ pub(super) fn resolve_tvf(
                 let col_name = column.name().to_string();
                 let qualifier = if let Some(ref qual) = ordinal.qualifier {
                     Some(qual.clone())
-                } else if let ast_resolved::TableName::Named(ref t) = column.table_name {
+                } else if let ast_resolved::TableName::Named(t) = column.qualifier() {
                     Some(t.to_string())
                 } else {
                     None
@@ -2223,7 +2228,18 @@ pub(super) fn resolve_inner_relation(
         .i_provide
         .into_iter()
         .map(|mut col| {
-            col.table_name = ast_resolved::TableName::Named(effective_name.to_string().into());
+            let prev = match col.qualifier() {
+                ast_resolved::TableName::Named(t) => t.to_string(),
+                ast_resolved::TableName::Fresh => "_".to_string(),
+            };
+            col.push_scope(
+                ast_resolved::TableName::Named(effective_name.to_string().into()),
+                ast_resolved::IdentityContext::SubqueryAlias {
+                    alias: effective_name.to_string(),
+                    previous_context: prev,
+                    resolver_id: None,
+                },
+            );
             col
         })
         .collect();
@@ -2309,7 +2325,18 @@ pub(super) fn relabel_bubbled_with_alias(
         .i_provide
         .into_iter()
         .map(|mut col| {
-            col.table_name = ast_resolved::TableName::Named(effective_name.to_string().into());
+            let prev = match col.qualifier() {
+                ast_resolved::TableName::Named(t) => t.to_string(),
+                ast_resolved::TableName::Fresh => "_".to_string(),
+            };
+            col.push_scope(
+                ast_resolved::TableName::Named(effective_name.to_string().into()),
+                ast_resolved::IdentityContext::SubqueryAlias {
+                    alias: effective_name.to_string(),
+                    previous_context: prev,
+                    resolver_id: None,
+                },
+            );
             col
         })
         .collect();
@@ -2326,7 +2353,18 @@ fn relabel_columns_with_alias(
         cols.iter()
             .map(|col| {
                 let mut new_col = col.clone();
-                new_col.table_name = ast_resolved::TableName::Named(alias_name.clone().into());
+                let prev = match col.qualifier() {
+                    ast_resolved::TableName::Named(t) => t.to_string(),
+                    ast_resolved::TableName::Fresh => "_".to_string(),
+                };
+                new_col.push_scope(
+                    ast_resolved::TableName::Named(alias_name.clone().into()),
+                    ast_resolved::IdentityContext::SubqueryAlias {
+                        alias: alias_name.to_string(),
+                        previous_context: prev,
+                        resolver_id: None,
+                    },
+                );
                 new_col
             })
             .collect()
@@ -2833,8 +2871,18 @@ fn apply_call_site_pattern(
             .iter()
             .map(|col| {
                 let mut relabeled = col.clone();
-                relabeled.table_name =
-                    ast_resolved::TableName::Named(entity_name.to_string().into());
+                let prev = match col.qualifier() {
+                    ast_resolved::TableName::Named(t) => t.to_string(),
+                    ast_resolved::TableName::Fresh => "_".to_string(),
+                };
+                relabeled.push_scope(
+                    ast_resolved::TableName::Named(entity_name.to_string().into()),
+                    ast_resolved::IdentityContext::SubqueryAlias {
+                        alias: entity_name.to_string(),
+                        previous_context: prev,
+                        resolver_id: None,
+                    },
+                );
                 relabeled
             })
             .collect::<Vec<_>>(),

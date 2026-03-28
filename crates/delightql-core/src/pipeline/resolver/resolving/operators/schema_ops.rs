@@ -39,7 +39,7 @@ pub(super) fn resolve_project_out(
                 }
                 // Same name — if qualifier specified, only remove from matching table
                 if let Some(qual) = qualifier {
-                    !matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual)
+                    !matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
                 } else {
                     false // No qualifier, remove all with this name
                 }
@@ -115,7 +115,7 @@ pub(super) fn resolve_rename_cover(
                 let col_idx = if let Some(qual) = qualifier {
                     available.iter().position(|col| {
                         crate::pipeline::resolver::col_name_eq(col.name(), name)
-                            && matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual)
+                            && matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
                     })
                 } else {
                     available

@@ -13,7 +13,7 @@ fn expand_glob(
         Ok(available
             .iter()
             .filter(
-                |col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == &qual),
+                |col| matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == &qual),
             )
             .map(|col| ast_resolved::DomainExpression::Lvar {
                 name: col.name().into(),
@@ -27,7 +27,7 @@ fn expand_glob(
         Ok(available
             .iter()
             .map(|col| {
-                let qualifier = match &col.table_name {
+                let qualifier = match col.qualifier() {
                     ast_resolved::TableName::Named(name) if !name.is_empty() => {
                         Some(name.to_string())
                     }
@@ -61,7 +61,7 @@ fn expand_pattern(
         .iter()
         .filter(|col| re.is_match(col.name()))
         .map(|col| {
-            let qualifier = match &col.table_name {
+            let qualifier = match col.qualifier() {
                 ast_resolved::TableName::Named(name) if !name.is_empty() => Some(name.to_string()),
                 ast_resolved::TableName::Named(_) | ast_resolved::TableName::Fresh => None,
             };
@@ -247,7 +247,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
 
                     let candidates = if let Some(qual) = &range.qualifier {
                         available.iter()
-                            .filter(|col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual))
+                            .filter(|col| matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual))
                             .collect::<Vec<_>>()
                     } else {
                         available.iter().collect::<Vec<_>>()
@@ -277,7 +277,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                     for idx in start_idx..=end_idx {
                         let column = candidates[idx];
                         let qualifier =
-                            if let ast_resolved::TableName::Named(name) = &column.table_name {
+                            if let ast_resolved::TableName::Named(name) = column.qualifier() {
                                 if !name.is_empty() {
                                     Some(name.to_string())
                                 } else {
@@ -319,7 +319,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
 
                 let candidates = if let Some(qual) = &ordinal.qualifier {
                     available.iter()
-                        .filter(|col| matches!(&col.table_name, ast_resolved::TableName::Named(t) if t == qual))
+                        .filter(|col| matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual))
                         .collect::<Vec<_>>()
                 } else {
                     available.iter().collect::<Vec<_>>()
@@ -334,18 +334,18 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
 
                 let idx = calculate_ordinal_index(&ordinal, candidates.len())?;
                 let column = candidates[idx];
-
-                // Use the actual column name (alias if present, otherwise original)
-                // The ordinal's own alias takes precedence if specified
                 let name = column.name().to_string();
+
                 resolved.push(ast_resolved::DomainExpression::Lvar {
                     name: name.into(),
-                    qualifier: ordinal.qualifier.clone().map(|s| s.into()).or_else(
-                        || match &column.table_name {
+                    qualifier: ordinal
+                        .qualifier
+                        .clone()
+                        .map(|s| s.into())
+                        .or_else(|| match column.qualifier() {
                             ast_resolved::TableName::Named(t) => Some(t.clone().into()),
                             _ => None,
-                        },
-                    ),
+                        }),
                     namespace_path: NamespacePath::empty(),
                     alias: ordinal.alias.clone().map(|s| s.into()),
                     provenance: ast_resolved::PhaseBox::phantom(),

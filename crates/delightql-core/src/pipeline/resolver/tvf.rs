@@ -15,19 +15,15 @@ pub(super) fn create_tvf_column_metadata(
     position: usize,
 ) -> ast_resolved::ColumnMetadata {
     let table = ast_resolved::TableName::Named(table_name.into());
-    ast_resolved::ColumnMetadata {
-        info: ast_resolved::ColumnProvenance::from_table_column(
+    ast_resolved::ColumnMetadata::new(
+        ast_resolved::ColumnProvenance::from_table_column(
             name.to_string(),
             table.clone(),
             ast_resolved::QualificationSource::None, // TVF columns are not qualified in source
         ),
-        table_name: table,
-        table_position: Some(position),
-        has_user_name: true, // Table columns have user names
-        needs_hygienic_alias: false,
-        needs_sql_rename: false,
-        interior_schema: None,
-    }
+        table,
+        Some(position),
+    )
 }
 
 /// Hardcoded TVF schemas for known functions.

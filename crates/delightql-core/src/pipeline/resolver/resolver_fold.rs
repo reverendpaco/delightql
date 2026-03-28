@@ -541,17 +541,11 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     if std::env::var("DQL_DEBUG").is_ok() {
                         eprintln!("Adding destructured column: {}", mapping.column_name);
                     }
-                    updated_columns.push(ast_resolved::ColumnMetadata {
-                        info: ast_resolved::ColumnProvenance::from_column(
-                            mapping.column_name.clone(),
-                        ),
-                        table_name: ast_resolved::TableName::Fresh,
-                        table_position: None,
-                        has_user_name: true,
-                        needs_hygienic_alias: false,
-                        needs_sql_rename: false,
-                        interior_schema: None,
-                    });
+                    updated_columns.push(ast_resolved::ColumnMetadata::new(
+                        ast_resolved::ColumnProvenance::from_column(mapping.column_name.clone()),
+                        ast_resolved::TableName::Fresh,
+                        None,
+                    ));
                 }
                 if std::env::var("DQL_DEBUG").is_ok() {
                     eprintln!("Final schema has {} columns", updated_columns.len());
@@ -573,17 +567,13 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     // Create ColumnMetadata for the destructured column
                     updated_bubbled
                         .i_provide
-                        .push(ast_resolved::ColumnMetadata {
-                            info: ast_resolved::ColumnProvenance::from_column(
+                        .push(ast_resolved::ColumnMetadata::new(
+                            ast_resolved::ColumnProvenance::from_column(
                                 mapping.column_name.clone(),
                             ),
-                            table_name: ast_resolved::TableName::Fresh,
-                            table_position: None,
-                            has_user_name: true,
-                            needs_hygienic_alias: false,
-                            needs_sql_rename: false,
-                            interior_schema: None,
-                        });
+                            ast_resolved::TableName::Fresh,
+                            None,
+                        ));
                 }
                 updated_bubbled
             }
@@ -1600,29 +1590,21 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             );
 
             for (idx, col) in output_columns.iter_mut().enumerate() {
-                let previous_table = col.table_name.clone();
-
-                if !preserves_scope {
-                    col.table_name = ast_resolved::TableName::Fresh;
-                }
+                let previous_table = col.qualifier().clone();
                 col.table_position = Some(idx + 1);
 
-                col.info = col
-                    .info
-                    .clone()
-                    .with_identity(ast_resolved::ColumnIdentity {
-                        name: col.info.name().unwrap_or("<unnamed>").into(),
-                        context: ast_resolved::IdentityContext::PipeBarrier {
-                            previous_table,
-                            fresh_scope: idx + 1,
-                        },
-                        phase: ast_resolved::TransformationPhase::Resolved,
-                        table_qualifier: if preserves_scope {
-                            col.table_name.clone()
-                        } else {
-                            ast_resolved::TableName::Fresh
-                        },
-                    });
+                let new_qualifier = if preserves_scope {
+                    col.qualifier().clone()
+                } else {
+                    ast_resolved::TableName::Fresh
+                };
+                col.push_scope(
+                    new_qualifier,
+                    ast_resolved::IdentityContext::PipeBarrier {
+                        previous_table,
+                        fresh_scope: idx + 1,
+                    },
+                );
             }
 
             // Construct resolved pipe, accumulate as new source

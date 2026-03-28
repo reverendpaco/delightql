@@ -65,7 +65,7 @@ pub(in crate::pipeline::resolver) fn sanitize_engine_managed_columns(
 
         // Build sanitized name: <scope>.<column>|<N>|
         let ordinal = idx + 1; // 1-based
-        let scope = match &col.table_name {
+        let scope = match col.qualifier() {
             ast_resolved::TableName::Named(t) if !t.is_empty() => t.to_string(),
             _ => "_".to_string(),
         };

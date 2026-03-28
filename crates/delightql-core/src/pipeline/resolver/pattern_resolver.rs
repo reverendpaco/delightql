@@ -412,7 +412,7 @@ impl PatternResolver {
                     provenance: ast_resolved::PhaseBox::phantom(),
                 };
 
-                let left_qualifier = match &left_col.table_name {
+                let left_qualifier = match left_col.qualifier() {
                     ast_resolved::TableName::Named(name) => Some(name.to_string()),
                     ast_resolved::TableName::Fresh => None,
                 };
@@ -466,7 +466,7 @@ fn create_unification_condition(
     right_col: &ast_resolved::ColumnMetadata,
     right_table: &str,
 ) -> ast_resolved::BooleanExpression {
-    let left_qualifier = match &left_col.table_name {
+    let left_qualifier = match left_col.qualifier() {
         ast_resolved::TableName::Named(name) => Some(name.to_string()),
         ast_resolved::TableName::Fresh => None,
     };

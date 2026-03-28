@@ -170,7 +170,7 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
                     }
                     if let Some(qual) = qualifier {
                         // If qualifier is specified, prefer matching scope
-                        matches!(&c.table_name, ast_resolved::TableName::Named(t) if t == qual)
+                        matches!(c.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
                     } else {
                         true
                     }

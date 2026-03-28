@@ -324,14 +324,19 @@ pub enum TableName {
     Fresh,
 }
 
-/// Column metadata with schema information
+/// Column metadata with schema information.
+///
+/// The `table_name` field is private — access it via `qualifier()` and
+/// modify it via `set_qualifier()`. This ensures consistency with the
+/// identity stack in `info`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
 #[lispy("c")]
 pub struct ColumnMetadata {
     /// Core column identity and reference information
     pub info: ColumnProvenance,
-    /// Source table name (flattened from former FqTable)
-    pub table_name: TableName,
+    /// Current table qualifier — kept in sync with identity stack.
+    /// Use `qualifier()` to read and `set_qualifier()` to write.
+    table_name: TableName,
     /// Position in the output
     pub table_position: Option<usize>,
     /// Whether this column has a user-provided name (vs generated)
@@ -415,6 +420,32 @@ impl ColumnMetadata {
 
     pub fn set_alias(&mut self, alias: String) {
         self.info = self.info.clone().with_alias(alias);
+    }
+
+    /// Get the current table qualifier
+    pub fn qualifier(&self) -> &TableName {
+        &self.table_name
+    }
+
+    /// Push a scope transition: updates both the table qualifier field
+    /// and the identity stack atomically. This is the only way to change
+    /// the qualifier after construction.
+    pub fn push_scope(
+        &mut self,
+        qualifier: TableName,
+        context: super::provenance::IdentityContext,
+    ) {
+        let name = self.info.name().unwrap_or("<unnamed>").to_string();
+        self.table_name = qualifier.clone();
+        self.info = self
+            .info
+            .clone()
+            .with_identity(super::provenance::ColumnIdentity {
+                name: name.into(),
+                context,
+                phase: super::provenance::TransformationPhase::Resolved,
+                table_qualifier: qualifier,
+            });
     }
 }
 

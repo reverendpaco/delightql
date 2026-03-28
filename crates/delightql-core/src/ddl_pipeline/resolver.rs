@@ -54,18 +54,16 @@ fn build_available(columns: &[ColumnDef<Unresolved>]) -> Vec<ast_resolved::Colum
     columns
         .iter()
         .enumerate()
-        .map(|(i, col)| ast_resolved::ColumnMetadata {
-            info: ColumnProvenance::from_table_column(
-                SqlIdentifier::from(col.name.as_str()),
+        .map(|(i, col)| {
+            ast_resolved::ColumnMetadata::new(
+                ColumnProvenance::from_table_column(
+                    SqlIdentifier::from(col.name.as_str()),
+                    TableName::Fresh,
+                    crate::pipeline::asts::core::QualificationSource::None,
+                ),
                 TableName::Fresh,
-                crate::pipeline::asts::core::QualificationSource::None,
-            ),
-            table_name: TableName::Fresh,
-            table_position: Some(i),
-            has_user_name: true,
-            needs_hygienic_alias: false,
-            needs_sql_rename: false,
-            interior_schema: None,
+                Some(i),
+            )
         })
         .collect()
 }

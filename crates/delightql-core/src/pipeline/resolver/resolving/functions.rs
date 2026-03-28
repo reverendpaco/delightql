@@ -74,7 +74,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                 for col in &available {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let col_qualifier = match &col.table_name {
+                        let col_qualifier = match col.qualifier() {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -109,7 +109,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                 for col in available.iter().filter(|col| re.is_match(col.name())) {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.table_name {
+                        let qualifier = match col.qualifier() {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -173,7 +173,7 @@ pub(in crate::pipeline::resolver) fn resolve_bracket_via_fold(
                     let col = candidates[idx];
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.table_name {
+                        let qualifier = match col.qualifier() {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -249,7 +249,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                 for col in &available {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.table_name {
+                        let qualifier = match col.qualifier() {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -275,7 +275,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                 for col in available.iter().filter(|col| re.is_match(col.name())) {
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.table_name {
+                        let qualifier = match col.qualifier() {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }
@@ -333,7 +333,7 @@ pub(in crate::pipeline::resolver) fn resolve_curly_via_fold(
                     let col = candidates[idx];
                     let column_name = col.name().to_string();
                     if seen_columns.insert(column_name.clone()) {
-                        let qualifier = match &col.table_name {
+                        let qualifier = match col.qualifier() {
                             ast_resolved::TableName::Named(name) if !name.is_empty() => {
                                 Some(name.to_string())
                             }

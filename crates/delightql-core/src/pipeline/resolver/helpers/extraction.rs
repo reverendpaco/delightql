@@ -131,28 +131,17 @@ pub(in super::super) fn transform_schema_table_names_with_origin(
             let transformed_columns = columns
                 .into_iter()
                 .map(|mut col| {
-                    // Update the table name to the CTE's name.
+                    // Update the table name to the CTE's name and push CteRegistration identity.
                     // CTEs are query-local — they don't belong to any database schema.
                     // Clear namespace metadata so column refs produce `table.column`,
                     // never `schema.table.column`.
-                    col.table_name =
-                        ast_resolved::TableName::Named(new_table_name.to_string().into());
-
-                    // Push CteRegistration identity onto the stack
-                    col.info = col
-                        .info
-                        .clone()
-                        .with_identity(ast_resolved::ColumnIdentity {
-                            name: col.info.name().unwrap_or("<unnamed>").into(),
-                            context: ast_resolved::IdentityContext::CteRegistration {
-                                cte_name: new_table_name.to_string(),
-                                origin,
-                            },
-                            phase: ast_resolved::TransformationPhase::Resolved,
-                            table_qualifier: ast_resolved::TableName::Named(
-                                new_table_name.to_string().into(),
-                            ),
-                        });
+                    col.push_scope(
+                        ast_resolved::TableName::Named(new_table_name.to_string().into()),
+                        ast_resolved::IdentityContext::CteRegistration {
+                            cte_name: new_table_name.to_string(),
+                            origin,
+                        },
+                    );
 
                     col
                 })

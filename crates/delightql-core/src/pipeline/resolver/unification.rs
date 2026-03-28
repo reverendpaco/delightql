@@ -107,7 +107,7 @@ fn unify_single_column(
                         // Find Fresh (anonymous) table matches
                         let fresh_matches: Vec<&ColumnMetadata> = matches
                             .iter()
-                            .filter(|col| matches!(col.table_name, TableName::Fresh))
+                            .filter(|col| matches!(col.qualifier(), TableName::Fresh))
                             .copied()
                             .collect();
 
@@ -136,7 +136,7 @@ fn unify_single_column(
                     // No precedence rule applies - report ambiguity
                     let tables: Vec<String> = matches
                         .iter()
-                        .map(|col| match &col.table_name {
+                        .map(|col| match col.qualifier() {
                             TableName::Named(table_name) => table_name.to_string(),
                             TableName::Fresh => "_".to_string(),
                         })
@@ -159,7 +159,7 @@ fn unify_single_column(
             let candidates = if let Some(qual) = &qualifier {
                 available
                     .iter()
-                    .filter(|col| matches!(&col.table_name, TableName::Named(t) if t == qual))
+                    .filter(|col| matches!(col.qualifier(), TableName::Named(t) if t == qual))
                     .collect::<Vec<_>>()
             } else {
                 available.iter().collect::<Vec<_>>()
@@ -228,12 +228,12 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
             if let Some(ref qual) = qualifier {
                 if qual == "_" {
                     // Special CPR reference - only matches Fresh (anonymous) tables
-                    if !matches!(col.table_name, TableName::Fresh) {
+                    if !matches!(col.qualifier(), TableName::Fresh) {
                         return false;
                     }
                 } else {
                     // Regular qualifier - must match table name
-                    match &col.table_name {
+                    match col.qualifier() {
                         TableName::Named(table_name) => {
                             if table_name != qual {
                                 return false;

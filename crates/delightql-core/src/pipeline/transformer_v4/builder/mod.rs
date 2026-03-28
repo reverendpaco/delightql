@@ -760,10 +760,18 @@ impl Builder<Unprojected> {
             .collect();
         let all_items = disambiguate_aliases(all_items);
 
-        // Build SELECT with optional grounding WHERE conditions.
+        // Build SELECT with LEFT JOIN json_each (preserves rows with empty arrays).
+        let joined_from = TableExpression::Join {
+            left: Box::new(source_table),
+            right: Box::new(je_tvf),
+            join_type: JoinType::Left,
+            join_condition: JoinCondition::On(DomainExpression::literal(
+                crate::pipeline::asts::core::LiteralValue::Boolean(true),
+            )),
+        };
         let mut sb = SelectBuilder::new()
             .set_select(all_items.clone())
-            .from_tables(vec![source_table, je_tvf]);
+            .from_tables(vec![joined_from]);
         for (schema_name, value) in groundings {
             sb = sb.and_where(DomainExpression::RawSql(format!(
                 "json_extract({}.value, '$.{}') = '{}'",

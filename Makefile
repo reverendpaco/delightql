@@ -15,9 +15,6 @@ setup: ensure-rust ensure-llvm ensure-duckdb ensure-wasm-pack ensure-node ensure
 	@echo "  cargo build --bin dql"
 	@echo "  cd crates/delightql-wasm && make build"
 
-all: ensure-tree-sitter
-	PATH=~/.cargo/bin/:$$PATH cargo build --bin dql
-
 .PHONY: ensure-rust
 ensure-rust:
 	@if ! command -v rustc >/dev/null 2>&1; then \
@@ -75,7 +72,14 @@ ensure-node:
 
 .PHONY: ensure-tree-sitter
 ensure-tree-sitter:
-	cargo install tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION);
+	@if ! command -v tree-sitter >/dev/null 2>&1; then \
+		echo "Installing tree-sitter CLI v$(TREE_SITTER_EXPECTED_VERSION)..."; \
+		cargo install tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION); \
+	else \
+		INSTALLED_VERSION=$$(tree-sitter --version 2>&1 | grep -o 'tree-sitter [0-9.]*' || echo "unknown"); \
+		echo "✓ tree-sitter CLI installed ($$INSTALLED_VERSION)"; \
+		echo "  Note: Must be v$(TREE_SITTER_EXPECTED_VERSION) to match tree-sitter-c2rust in Cargo.toml"; \
+	fi
 
 .PHONY: generate-parser
 generate-parser: ensure-tree-sitter

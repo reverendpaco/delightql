@@ -157,19 +157,52 @@ fn select_items_from_cpr_schema(
                     // Verify table scope matches to handle same-named columns
                     // from different tables (e.g., two `name` columns)
                     if let (TableName::Named(a), TableName::Named(b)) =
-                        (&schema_col.table_name, &bc.table_name)
+                        (schema_col.qualifier(), bc.qualifier())
                     {
                         return a.as_str().eq_ignore_ascii_case(b.as_str());
                     }
                     // Check identity stack for matching table qualifier
-                    if let TableName::Named(schema_table) = &schema_col.table_name {
+                    if let TableName::Named(schema_table) = schema_col.qualifier() {
                         if bc.info.identity_stack().iter().any(|id| {
                             matches!(&id.table_qualifier, TableName::Named(t) if t.as_str().eq_ignore_ascii_case(schema_table.as_str()))
                         }) {
                             return true;
                         }
                     }
-                    // Fresh scope or no table info — match by original name alone
+                    // When qualifier is Fresh (after pipe boundary), check the
+                    // most recent PipeBarrier's previous_table to distinguish
+                    // same-named columns from different sources.
+                    if matches!(schema_col.qualifier(), TableName::Fresh) {
+                        // Find the FIRST (most recent) PipeBarrier — respect
+                        // whatever it says, including Fresh.
+                        let top_barrier = schema_col.info.identity_stack().iter().find_map(|id| {
+                            if let crate::pipeline::asts::core::provenance::IdentityContext::PipeBarrier {
+                                previous_table, ..
+                            } = &id.context {
+                                Some(previous_table)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(TableName::Named(prev_table)) = top_barrier {
+                            // The column came from a named table before the pipe.
+                            // Check bc's qualifier or identity stack for that name.
+                            if let TableName::Named(bt) = bc.qualifier() {
+                                if bt.as_str().eq_ignore_ascii_case(prev_table) {
+                                    return true;
+                                }
+                            }
+                            // Builder may use an alias — check if the table
+                            // name appears anywhere in bc's provenance history.
+                            let bc_knows_table = bc.info.identity_stack().iter().any(|id| {
+                                matches!(&id.table_qualifier, TableName::Named(t) if t.as_str().eq_ignore_ascii_case(prev_table))
+                            });
+                            return bc_knows_table;
+                        }
+                        // top_barrier is Fresh or absent — no table info to
+                        // disambiguate. Fall through to name-only matching.
+                    }
+                    // No table info anywhere — match by original name alone
                     return true;
                 }
                 // Secondary: match current name (for non-renamed columns)
@@ -1121,9 +1154,9 @@ pub(super) fn r_lower_filter(
         ast_addressed::SigmaCondition::Destructure {
             json_column,
             mode,
-            destructured_schema,
+            pattern,
             ..
-        } => r_lower_destructure(child, *json_column, mode, destructured_schema.data(), ctx),
+        } => r_lower_destructure(child, *json_column, mode, &pattern, ctx),
 
         sigma @ ast_addressed::SigmaCondition::SigmaCall { .. } => {
             let predicate = scalar::s_lower_sigma(sigma, &child, ctx)?;
@@ -1737,39 +1770,43 @@ pub(super) fn r_lower_projection(
     cpr_schema: Option<&PhaseBox<CprSchema, Addressed>>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    let mut items: Vec<_> = expressions
+    // Lower expressions first — this processes computed expressions,
+    // function calls, etc. into SQL items via qualify().
+    let items: Vec<_> = expressions
         .into_iter()
         .map(|e| scalar::s_lower_select_item(e, &builder, ctx))
         .collect::<Result<_>>()?;
 
-    // Fill in missing aliases from cpr_schema (positional match).
-    if let Some(cpr) = cpr_schema {
-        use crate::pipeline::sql_ast_v3::SelectItem as SqlSelectItem;
-        let names = cpr_column_names(cpr.get());
+    // Now use CprSchema to fix up aliases. The CprSchema has the resolver's
+    // authoritative output names. Apply them positionally to the lowered items.
+    let mut items = if let Some(cpr) = cpr_schema {
+        let cpr_names = cpr_column_names(cpr.get());
         let mut name_idx = 0;
-        for item in &mut items {
-            match item {
-                SqlSelectItem::Star | SqlSelectItem::QualifiedStar { .. } => {
-                    // Stars expand to multiple columns — skip past them in the name list.
-                    let star_count = builder.columns().len();
-                    name_idx += star_count;
+        items
+            .into_iter()
+            .map(|item| match item {
+                crate::pipeline::sql_ast_v3::SelectItem::Star
+                | crate::pipeline::sql_ast_v3::SelectItem::QualifiedStar { .. } => {
+                    name_idx += builder.columns().len();
+                    item
                 }
-                SqlSelectItem::Expression { alias, .. } => {
-                    if alias.is_none() {
-                        if let Some(cpr_name) = names.get(name_idx) {
-                            *alias = Some(cpr_name.clone());
-                        }
-                    }
+                crate::pipeline::sql_ast_v3::SelectItem::Expression { expr, alias } => {
+                    let cpr_alias = cpr_names.get(name_idx).cloned().or(alias);
                     name_idx += 1;
+                    crate::pipeline::sql_ast_v3::SelectItem::Expression {
+                        expr,
+                        alias: cpr_alias,
+                    }
                 }
-            }
-        }
-    }
+            })
+            .collect()
+    } else {
+        items
+    };
 
-    // Check for projections that reference hygienic columns (e.g., HO ground params).
-    // Hygienic columns are available for filtering (WHERE) but not for user-facing projection.
+    // Check for hygienic column references
     for item in &items {
-        if let crate::pipeline::sql_ast_v3::SelectItem::Expression { expr, alias } = item {
+        if let crate::pipeline::sql_ast_v3::SelectItem::Expression { expr, .. } = item {
             if let crate::pipeline::sql_ast_v3::DomainExpression::Column { name, .. } = expr {
                 if builder
                     .columns()
@@ -2574,7 +2611,7 @@ pub(super) fn r_lower_transform(
                 match qual {
                     // Qualified: match against the column's original table name
                     // (not the current scope qualifier, which changes through joins)
-                    Some(q) => match &c.table_name {
+                    Some(q) => match c.qualifier() {
                         TableName::Named(tn) => tn.as_str() == q.as_str(),
                         TableName::Fresh => false,
                     },
@@ -2727,7 +2764,7 @@ pub(super) fn r_lower_meta_ize(
             .or_else(|| col.info.original_name())
             .unwrap_or("?")
             .to_string();
-        let scope = match &col.table_name {
+        let scope = match col.qualifier() {
             TableName::Named(name) => name.to_string(),
             TableName::Fresh => "_".to_string(),
         };
@@ -3021,103 +3058,322 @@ fn r_lower_interior_drill_down(
 
 /// Lower scalar destructure: `data ~= {first_name, last_name}`.
 ///
-/// Adds `json_extract(col, '$.key') AS name` columns to the source.
-/// No row explosion — the source row count is unchanged.
+/// Lower a destructure pattern by walking the pattern tree inductively.
 ///
-/// ```sql
-/// SELECT *, json_extract(data, '$.first_name') AS first_name,
-///           json_extract(data, '$.last_name') AS last_name
-/// FROM (<source>) AS t_N
-/// ```
+/// Scalar mode: extracts fields from a JSON value without row explosion.
+/// Aggregate mode: first explodes the top-level array via `json_each`,
+/// then walks the pattern against each element.
 ///
-/// Aggregate mode (`~= ~>`) uses LEFT JOIN json_each for row explosion —
-/// not yet implemented.
+/// Nested `~>` patterns produce additional `json_each` joins at each level.
+/// One recursive function handles everything: base extractions, nested `~>`
+/// (KeyValue with nested_reduction), and MetadataTreeGroup (`key:~>`).
 fn r_lower_destructure(
     builder: Builder<Unprojected>,
     json_column: ast_addressed::DomainExpression,
     mode: ast_addressed::DestructureMode,
-    mappings: &[ast_addressed::DestructureMapping],
+    pattern: &ast_addressed::FunctionExpression,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
-    use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
+    let source_expr = scalar::s_lower_expression(json_column.clone(), &builder, ctx)?;
 
     if matches!(mode, ast_addressed::DestructureMode::Aggregate) {
-        return r_lower_aggregate_destructure(builder, json_column, mappings, ctx);
+        // Aggregate: explode the top-level array first, then walk pattern.
+        let json_col_name = match &json_column {
+            ast_addressed::DomainExpression::Lvar { name, .. } => name.as_str().to_string(),
+            _ => {
+                return Err(DelightQLError::ParseError {
+                    message: "aggregate destructure: expected Lvar for json column".into(),
+                    source: None,
+                    subcategory: None,
+                });
+            }
+        };
+        // json_each on source column, then walk pattern against .value
+        lower_with_json_each(builder, &json_col_name, pattern)
+    } else {
+        // Scalar: walk pattern directly. If there are nested ~> inside,
+        // they'll each get their own json_each.
+        lower_destructure_pattern(builder, &source_expr, pattern)
     }
-
-    // Lower the json column expression
-    let source_expr = scalar::s_lower_expression(json_column, &builder, ctx)?;
-
-    // Build json_extract items for each mapping
-    let mut extra_items: Vec<SelectItem> = Vec::new();
-    for mapping in mappings {
-        let extract = SqlDomainExpr::function(
-            "json_extract",
-            vec![
-                source_expr.clone(),
-                SqlDomainExpr::literal(ast_addressed::LiteralValue::String(format!(
-                    "$.{}",
-                    mapping.json_key
-                ))),
-            ],
-        );
-        extra_items.push(SelectItem::expression_with_alias(
-            extract,
-            &mapping.column_name,
-        ));
-    }
-
-    // project_all (SELECT *) + append destructured columns → Projected → demote
-    let mut all_items: Vec<SelectItem> = vec![SelectItem::Star];
-    all_items.extend(extra_items);
-    builder.add_projection(all_items)?.demote()
 }
 
-/// Lower aggregate destructure: `data ~= ~> {first_name, country}`.
+/// The inductive core. Handles one pattern level, eats any `~>`, recurses.
 ///
-/// Explodes JSON array rows via `json_each`, extracting specified fields.
-/// Context columns (everything except the JSON source) are preserved.
+/// At each level:
+/// 1. Collect base extractions (json_extract items)
+/// 2. For each `~>` member: project base items + temp col, json_each, recurse
+/// 3. For MetadataTreeGroup: json_each(source), .key → column, recurse on .value
 ///
-/// ```sql
-/// SELECT t_N.col1, ..., json_extract(_destr_M.value, '$.first_name') AS first_name, ...
-/// FROM (<source>) AS t_N, json_each(t_N."json_col") AS _destr_M
-/// ```
-fn r_lower_aggregate_destructure(
+/// One function. Each call handles exactly one level. Depth is emergent.
+fn lower_destructure_pattern(
     builder: Builder<Unprojected>,
-    json_column: ast_addressed::DomainExpression,
-    mappings: &[ast_addressed::DestructureMapping],
-    _ctx: &TransformCtx,
+    source: &crate::pipeline::sql_ast_v3::DomainExpression,
+    pattern: &ast_addressed::FunctionExpression,
 ) -> Result<Builder<Unprojected>> {
     use crate::pipeline::sql_ast_v3::{
         ColumnQualifier, DomainExpression as SqlDomainExpr, SelectItem,
     };
 
-    let json_col_name = match &json_column {
-        ast_addressed::DomainExpression::Lvar { name, .. } => name.as_str().to_string(),
-        _ => {
-            return Err(DelightQLError::ParseError {
-                message: "aggregate destructure: expected Lvar for json column".into(),
-                source: None,
-                subcategory: None,
-            });
+    // Step 1: Classify each member as base or explosive.
+    // Step 2: Project base extractions + temp cols for explosions.
+    // Step 3: For each explosion, eat it (json_each) and recurse.
+
+    match pattern {
+        // --- MetadataTreeGroup: json_each(source) iterating object keys ---
+        ast_addressed::FunctionExpression::MetadataTreeGroup {
+            key_column,
+            constructor,
+            ..
+        } => {
+            let temp_col = format!("_mtg_src_{}", key_column);
+            let context_cols: Vec<String> = builder
+                .columns()
+                .iter()
+                .map(|c| col_name(c).to_string())
+                .collect();
+
+            // Project source as named column so expand_with_json_each can reference it
+            let mut proj: Vec<SelectItem> = builder
+                .columns()
+                .iter()
+                .map(|c| passthrough_item(c))
+                .collect();
+            proj.push(SelectItem::expression_with_alias(source.clone(), &temp_col));
+            let builder = builder.add_projection(proj)?.demote()?;
+
+            let key_col_name = key_column.as_str().to_string();
+            let constructor_clone = constructor.clone();
+            let val_col_name = format!("_mtg_val_{}", key_column);
+
+            // json_each on the object — produces .key and .value per entry
+            let builder = builder
+                .expand_with_json_each(
+                    &temp_col,
+                    "_je",
+                    |source_alias| {
+                        let sq = ColumnQualifier::table(source_alias);
+                        context_cols
+                            .iter()
+                            .map(|c| {
+                                SelectItem::expression_with_alias(
+                                    SqlDomainExpr::with_qualifier(sq.clone(), c.as_str()),
+                                    c.as_str(),
+                                )
+                            })
+                            .collect()
+                    },
+                    |tvf_alias| {
+                        let sq = ColumnQualifier::table(tvf_alias);
+                        // .key → key column
+                        vec![
+                            SelectItem::expression_with_alias(
+                                SqlDomainExpr::with_qualifier(sq.clone(), "key"),
+                                &key_col_name,
+                            ),
+                            // .value → pass through for recursion
+                            SelectItem::expression_with_alias(
+                                SqlDomainExpr::with_qualifier(sq, "value"),
+                                &val_col_name,
+                            ),
+                        ]
+                    },
+                    &[],
+                )?
+                .demote()?;
+
+            // Remove temp source column
+            let builder = remove_column(builder, &temp_col)?;
+
+            // ~> means iterate values as arrays, then apply constructor
+            let builder = lower_with_json_each(builder, &val_col_name, &constructor_clone)?;
+
+            // Remove the temp .value column
+            remove_column(builder, &val_col_name)
         }
+
+        // --- Curly: process members, each ~> is one explosion ---
+        ast_addressed::FunctionExpression::Curly { members, .. } => {
+            // Partition: base extractions, explosive (~>), and nested navigations
+            let mut base_items = Vec::new();
+            let mut explosions: Vec<(String, ast_addressed::FunctionExpression)> = Vec::new();
+            let mut nested_navigations: Vec<(String, ast_addressed::FunctionExpression)> = Vec::new();
+
+            for member in members {
+                match member {
+                    ast_addressed::CurlyMember::Shorthand { column, .. } => {
+                        base_items.push(make_json_extract_item(
+                            source, &format!(".{}", column), column.as_str(),
+                        ));
+                    }
+                    ast_addressed::CurlyMember::KeyValue { key, nested_reduction, value } => {
+                        if *nested_reduction {
+                            // Explosive: this ~> needs a json_each
+                            if let ast_addressed::DomainExpression::Function(p) = value.as_ref() {
+                                explosions.push((key.clone(), p.clone()));
+                            }
+                        } else if let ast_addressed::DomainExpression::Lvar { name, .. } = value.as_ref() {
+                            base_items.push(make_json_extract_item(
+                                source, &format!(".{}", key), name.as_str(),
+                            ));
+                        } else if let ast_addressed::DomainExpression::Function(nested_pat) = value.as_ref() {
+                            // Nested object without ~>: navigate into sub-object
+                            // and recurse (handles any ~> inside)
+                            nested_navigations.push((key.clone(), nested_pat.clone()));
+                        }
+                    }
+                    ast_addressed::CurlyMember::PathLiteral { path, alias } => {
+                        if let Some((json_path, col)) = extract_path_literal_info(path, alias) {
+                            base_items.push(make_json_extract_item(source, &json_path, &col));
+                        }
+                    }
+                    ast_addressed::CurlyMember::Placeholder => {}
+                    _ => {}
+                }
+            }
+
+            // Project: existing columns + base items + temp cols
+            // Enumerate explicitly (not SELECT *) so the builder can
+            // disambiguate collisions between source and extracted columns.
+            let mut proj: Vec<SelectItem> = builder
+                .columns()
+                .iter()
+                .map(|c| passthrough_item(c))
+                .collect();
+            proj.extend(base_items);
+            for (key, _) in &explosions {
+                proj.push(make_json_extract_item(
+                    source,
+                    &format!(".{}", key),
+                    &format!("_nested_{}", key),
+                ));
+            }
+            for (key, _) in &nested_navigations {
+                proj.push(make_json_extract_item(
+                    source,
+                    &format!(".{}", key),
+                    &format!("_nav_{}", key),
+                ));
+            }
+            let mut builder = builder.add_projection(proj)?.demote()?;
+
+            // Eat each explosion: json_each on temp col, recurse
+            for (key, nested_pattern) in explosions {
+                let temp = format!("_nested_{}", key);
+                builder = lower_with_json_each(builder, &temp, &nested_pattern)?;
+                builder = remove_column(builder, &temp)?;
+            }
+
+            // Navigate into nested objects (no json_each, just recurse)
+            for (key, nested_pattern) in nested_navigations {
+                let temp = format!("_nav_{}", key);
+                let nav_source = SqlDomainExpr::column(&temp);
+                builder = lower_destructure_pattern(builder, &nav_source, &nested_pattern)?;
+                builder = remove_column(builder, &temp)?;
+            }
+
+            Ok(builder)
+        }
+
+        // --- Array: base extractions only (no ~> in array patterns) ---
+        ast_addressed::FunctionExpression::Array { members, .. } => {
+            let mut items: Vec<SelectItem> = builder
+                .columns()
+                .iter()
+                .map(|c| passthrough_item(c))
+                .collect();
+            for member in members {
+                let ast_addressed::ArrayMember::Index { path, alias } = member;
+                if let Some((json_path, col)) = extract_path_literal_info(path, alias) {
+                    items.push(make_json_extract_item(source, &json_path, &col));
+                }
+            }
+            builder.add_projection(items)?.demote()
+        }
+
+        _ => Ok(builder),
+    }
+}
+
+/// Eat a `~>`: wrap a column in json_each, then recurse into the nested pattern.
+///
+/// This is the bridge between levels. Each call produces exactly one json_each.
+///
+/// For MetadataTreeGroup patterns, the json_each's `.key` is captured as
+/// the key column, and the constructor is walked against `.value`. This is
+/// because `"key": ~> name:~> constructor` means ONE json_each on the object,
+/// with `.key` → name column and `.value` → constructor source.
+fn lower_with_json_each(
+    builder: Builder<Unprojected>,
+    col_name_str: &str,
+    pattern: &ast_addressed::FunctionExpression,
+) -> Result<Builder<Unprojected>> {
+    use crate::pipeline::sql_ast_v3::{
+        ColumnQualifier, DomainExpression as SqlDomainExpr, SelectItem,
     };
 
     let context_cols: Vec<String> = builder
         .columns()
         .iter()
         .map(|c| col_name(c).to_string())
-        .filter(|n| *n != json_col_name)
         .collect();
 
-    let mappings_owned: Vec<(String, String)> = mappings
-        .iter()
-        .map(|m| (m.json_key.clone(), m.column_name.clone()))
-        .collect();
+    // If pattern is MTG, capture .key as the key column and recurse on .value
+    // with the constructor — no separate json_each for the MTG.
+    if let ast_addressed::FunctionExpression::MetadataTreeGroup {
+        key_column,
+        constructor,
+        ..
+    } = pattern
+    {
+        let key_col_name = key_column.as_str().to_string();
+        let constructor_clone = constructor.clone();
+        let val_temp = format!("_mtg_val_{}", key_column);
 
-    builder
+        let builder = builder
+            .expand_with_json_each(
+                col_name_str,
+                "_je",
+                |source_alias| {
+                    let sq = ColumnQualifier::table(source_alias);
+                    context_cols
+                        .iter()
+                        .map(|c| {
+                            SelectItem::expression_with_alias(
+                                SqlDomainExpr::with_qualifier(sq.clone(), c.as_str()),
+                                c.as_str(),
+                            )
+                        })
+                        .collect()
+                },
+                |tvf_alias| {
+                    let sq = ColumnQualifier::table(tvf_alias);
+                    vec![
+                        SelectItem::expression_with_alias(
+                            SqlDomainExpr::with_qualifier(sq.clone(), "key"),
+                            &key_col_name,
+                        ),
+                        SelectItem::expression_with_alias(
+                            SqlDomainExpr::with_qualifier(sq, "value"),
+                            &val_temp,
+                        ),
+                    ]
+                },
+                &[],
+            )?
+            .demote()?;
+
+        // ~> on MTG means iterate values as arrays, then apply constructor
+        let builder = lower_with_json_each(builder, &val_temp, &constructor_clone)?;
+        return remove_column(builder, &val_temp);
+    }
+
+    // Non-MTG: just pass .value through and recurse
+    let pattern_clone = pattern.clone();
+    let val_temp = format!("_val_{}", col_name_str);
+
+    let builder = builder
         .expand_with_json_each(
-            &json_col_name,
+            col_name_str,
             "_destr",
             |source_alias| {
                 let sq = ColumnQualifier::table(source_alias);
@@ -3132,30 +3388,123 @@ fn r_lower_aggregate_destructure(
                     .collect()
             },
             |tvf_alias| {
-                mappings_owned
-                    .iter()
-                    .map(|(json_key, col_name)| {
-                        SelectItem::expression_with_alias(
-                            SqlDomainExpr::function(
-                                "json_extract",
-                                vec![
-                                    SqlDomainExpr::with_qualifier(
-                                        ColumnQualifier::table(tvf_alias),
-                                        "value",
-                                    ),
-                                    SqlDomainExpr::literal(ast_addressed::LiteralValue::String(
-                                        format!("$.{}", json_key),
-                                    )),
-                                ],
-                            ),
-                            col_name,
-                        )
-                    })
-                    .collect()
+                vec![SelectItem::expression_with_alias(
+                    SqlDomainExpr::with_qualifier(
+                        ColumnQualifier::table(tvf_alias),
+                        "value",
+                    ),
+                    &val_temp,
+                )]
             },
             &[],
         )?
-        .demote()
+        .demote()?;
+
+    let val_source = SqlDomainExpr::column(&val_temp);
+    let builder = lower_destructure_pattern(builder, &val_source, &pattern_clone)?;
+    remove_column(builder, &val_temp)
+}
+
+
+/// Extract JSON path and column name from a PathLiteral or Array Index member.
+fn extract_path_literal_info(
+    path: &ast_addressed::DomainExpression,
+    alias: &Option<delightql_types::SqlIdentifier>,
+) -> Option<(String, String)> {
+    use crate::pipeline::asts::core::expressions::functions::PathSegment;
+
+    if let ast_addressed::DomainExpression::Projection(
+        crate::pipeline::asts::core::expressions::domain::ProjectionExpr::JsonPathLiteral {
+            segments, ..
+        },
+    ) = path
+    {
+        let json_path = segments_to_json_path_sql(segments);
+        let col = alias
+            .as_ref()
+            .map(|a| a.as_str().to_string())
+            .unwrap_or_else(|| infer_col_name(segments));
+        Some((json_path, col))
+    } else {
+        None
+    }
+}
+
+/// Remove a column from the builder's output.
+fn remove_column(
+    builder: Builder<Unprojected>,
+    col_to_remove: &str,
+) -> Result<Builder<Unprojected>> {
+    use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
+
+    let keep: Vec<String> = builder
+        .columns()
+        .iter()
+        .map(|c| col_name(c).to_string())
+        .filter(|n| n != col_to_remove)
+        .collect();
+
+    if keep.is_empty() {
+        return Ok(builder);
+    }
+
+    let items: Vec<SelectItem> = keep
+        .iter()
+        .map(|c| SelectItem::expression_with_alias(SqlDomainExpr::column(c), c))
+        .collect();
+    builder.add_projection(items)?.demote()
+}
+
+/// Build a `json_extract(source, path) AS alias` SelectItem.
+fn make_json_extract_item(
+    source: &crate::pipeline::sql_ast_v3::DomainExpression,
+    json_path: &str,
+    alias: &str,
+) -> crate::pipeline::sql_ast_v3::SelectItem {
+    use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
+
+    let full_path = if json_path.starts_with('[') || json_path.starts_with('.') {
+        format!("${}", json_path)
+    } else {
+        format!("$.{}", json_path)
+    };
+
+    SelectItem::expression_with_alias(
+        SqlDomainExpr::function(
+            "json_extract",
+            vec![
+                source.clone(),
+                SqlDomainExpr::literal(ast_addressed::LiteralValue::String(full_path)),
+            ],
+        ),
+        alias,
+    )
+}
+
+/// Convert path segments to JSON path suffix: `.key` or `[N]`.
+fn segments_to_json_path_sql(
+    segments: &[crate::pipeline::asts::core::expressions::functions::PathSegment],
+) -> String {
+    use crate::pipeline::asts::core::expressions::functions::PathSegment;
+    let mut path = String::new();
+    for seg in segments {
+        match seg {
+            PathSegment::ObjectKey(key) => { path.push('.'); path.push_str(key); }
+            PathSegment::ArrayIndex(idx) => { path.push_str(&format!("[{}]", idx)); }
+        }
+    }
+    path
+}
+
+/// Infer column name from path segments (joined with `_`).
+fn infer_col_name(
+    segments: &[crate::pipeline::asts::core::expressions::functions::PathSegment],
+) -> String {
+    use crate::pipeline::asts::core::expressions::functions::PathSegment;
+    segments.iter().map(|s| match s {
+        PathSegment::ObjectKey(k) => k.clone(),
+        PathSegment::ArrayIndex(i) => i.to_string(),
+    }).collect::<Vec<_>>().join("_")
 }
 
 /// Lower an `IntersectCorresponding` node into SQL.

@@ -38,7 +38,7 @@ pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
         let outer_qualifier: Option<delightql_types::SqlIdentifier> = outer_available
             .iter()
             .find(|cm| cm.info.name().map_or(false, |n| n == col_name))
-            .and_then(|cm| match &cm.table_name {
+            .and_then(|cm| match cm.qualifier() {
                 TableName::Named(id) => Some(id.clone()),
                 TableName::Fresh => None,
             });
@@ -105,7 +105,7 @@ pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
             let outer_qualifier: Option<delightql_types::SqlIdentifier> = outer_available
                 .iter()
                 .find(|cm| cm.info.name().map_or(false, |n| n == col_name))
-                .and_then(|cm| match &cm.table_name {
+                .and_then(|cm| match cm.qualifier() {
                     TableName::Named(id) => Some(id.clone()),
                     TableName::Fresh => None,
                 });
@@ -248,7 +248,9 @@ pub(in crate::pipeline::resolver) fn extract_key_mappings_from_unresolved_patter
                     }
                     // PATH FIRST-CLASS: Epoch 5 - PathLiteral handling
                     ast_unresolved::CurlyMember::PathLiteral { path, alias } => {
-                        // Path literals in destructuring extract to the alias or inferred name
+                        // json_key is the dotted JSON path (e.g. "name_info.last_name")
+                        let json_key = extract_json_path_from_path_literal(path.as_ref())?;
+                        // column_name is the alias or inferred name
                         let column_name: String = if let Some(alias_name) = alias {
                             alias_name.to_string()
                         } else {
@@ -256,7 +258,7 @@ pub(in crate::pipeline::resolver) fn extract_key_mappings_from_unresolved_patter
                         };
 
                         mappings.push(ast_resolved::DestructureMapping {
-                            json_key: column_name.clone(),
+                            json_key,
                             column_name,
                         });
                     }
@@ -303,13 +305,7 @@ pub(in crate::pipeline::resolver) fn extract_key_mappings_from_unresolved_patter
                                     ));
                                 }
 
-                                let json_key = segments.iter()
-                                    .map(|seg| match seg {
-                                        crate::pipeline::asts::core::expressions::functions::PathSegment::ObjectKey(key) => key.clone(),
-                                        crate::pipeline::asts::core::expressions::functions::PathSegment::ArrayIndex(idx) => idx.to_string(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(".");
+                                let json_key = segments_to_json_path(segments);
 
                                 let column_name: String = alias.as_ref().map(|s| s.to_string()).unwrap_or_else(|| {
                                     segments.iter()
@@ -612,6 +608,52 @@ fn convert_unresolved_domain_to_resolved(
 }
 
 /// Extract column name from a path literal for destructuring
+/// Convert path segments to a JSON path string with proper syntax:
+/// ObjectKey → `.key`, ArrayIndex → `[N]`
+fn segments_to_json_path(
+    segments: &[crate::pipeline::asts::core::expressions::functions::PathSegment],
+) -> String {
+    use crate::pipeline::asts::core::expressions::functions::PathSegment;
+
+    let mut path = String::new();
+    for seg in segments {
+        match seg {
+            PathSegment::ObjectKey(key) => {
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(key);
+            }
+            PathSegment::ArrayIndex(idx) => {
+                path.push_str(&format!("[{}]", idx));
+            }
+        }
+    }
+    path
+}
+
+fn extract_json_path_from_path_literal(
+    path_expr: &ast_unresolved::DomainExpression,
+) -> Result<String> {
+    match path_expr {
+        ast_unresolved::DomainExpression::Projection(ProjectionExpr::JsonPathLiteral {
+            segments,
+            ..
+        }) => {
+            let path = segments_to_json_path(segments);
+            if path.is_empty() {
+                return Err(DelightQLError::parse_error(
+                    "Path literal must have at least one segment",
+                ));
+            }
+            Ok(path)
+        }
+        _ => Err(DelightQLError::parse_error(
+            "PathLiteral in destructuring must contain a JsonPathLiteral expression",
+        )),
+    }
+}
+
 fn extract_column_name_from_path_literal(
     path_expr: &ast_unresolved::DomainExpression,
 ) -> Result<String> {

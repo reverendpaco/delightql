@@ -68,7 +68,18 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
                             .iter()
                             .map(|col| {
                                 let mut c = col.clone();
-                                c.table_name = TableName::Named(alias_name.clone());
+                                let prev = match c.qualifier() {
+                                    TableName::Named(t) => t.to_string(),
+                                    TableName::Fresh => "_".to_string(),
+                                };
+                                c.push_scope(
+                                    TableName::Named(alias_name.clone()),
+                                    crate::pipeline::asts::core::provenance::IdentityContext::SubqueryAlias {
+                                        alias: alias_name.to_string(),
+                                        previous_context: prev,
+                                        resolver_id: None,
+                                    },
+                                );
                                 c
                             })
                             .collect();

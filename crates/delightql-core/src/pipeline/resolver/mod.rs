@@ -1784,9 +1784,17 @@ fn rename_schema(
         ast_resolved::CprSchema::Resolved(cols) => ast_resolved::CprSchema::Resolved(
             cols.into_iter()
                 .map(|mut col| {
-                    if let ast_resolved::TableName::Named(ref tn) = col.table_name {
+                    if let ast_resolved::TableName::Named(tn) = col.qualifier() {
                         if tn.as_str() == old_name {
-                            col.table_name = ast_resolved::TableName::Named(new_name.clone());
+                            let prev = tn.to_string();
+                            col.push_scope(
+                                ast_resolved::TableName::Named(new_name.clone()),
+                                ast_resolved::IdentityContext::SubqueryAlias {
+                                    alias: new_name.to_string(),
+                                    previous_context: prev,
+                                    resolver_id: None,
+                                },
+                            );
                         }
                     }
                     col
@@ -1804,9 +1812,17 @@ fn rename_bubbled_columns(
     new_name: &delightql_types::SqlIdentifier,
 ) {
     for col in &mut bubbled.i_provide {
-        if let ast_resolved::TableName::Named(ref tn) = col.table_name {
+        if let ast_resolved::TableName::Named(tn) = col.qualifier() {
             if tn.as_str() == old_name {
-                col.table_name = ast_resolved::TableName::Named(new_name.clone());
+                let prev = tn.to_string();
+                col.push_scope(
+                    ast_resolved::TableName::Named(new_name.clone()),
+                    ast_resolved::IdentityContext::SubqueryAlias {
+                        alias: new_name.to_string(),
+                        previous_context: prev,
+                        resolver_id: None,
+                    },
+                );
             }
         }
     }

@@ -134,7 +134,7 @@ pub(super) fn resolve_general_via_fold(
             if let Some(qual) = qualifier {
                 let count_before = output_columns.len();
                 for col in available {
-                    if let ast_resolved::TableName::Named(table_name) = &col.table_name {
+                    if let ast_resolved::TableName::Named(table_name) = col.qualifier() {
                         if table_name == qual {
                             is_engine_col.push(true);
                             output_columns.push(col.clone());
@@ -177,7 +177,7 @@ pub(super) fn resolve_general_via_fold(
     // Engine-managed names are allowed to collide with each other:
     //    (u.*, o.*) → permitted, engine disambiguates
     {
-        let mut seen_user: std::collections::HashMap<&str, usize> =
+        let mut seen_user: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut seen_engine: std::collections::HashSet<&str> = std::collections::HashSet::new();
         // First pass: collect engine-managed names
@@ -192,8 +192,22 @@ pub(super) fn resolve_general_via_fold(
                 continue;
             }
             let name = col.name();
+            // For columns with synthetic ordinal names (|N|) from
+            // anonymous tables, use qualifier.name as key so _1.|1| and
+            // _2.|1| don't collide. For real identifiers (u.id, o.id),
+            // use bare name — both produce "id" after scope closure.
+            let is_ordinal_name = name.starts_with('|') && name.ends_with('|');
+            let key = if is_ordinal_name {
+                let qual_str = match col.qualifier() {
+                    ast_resolved::TableName::Named(t) => t.as_str(),
+                    ast_resolved::TableName::Fresh => "_",
+                };
+                format!("{}.{}", qual_str, name)
+            } else {
+                name.to_string()
+            };
             // Rule 1: programmer-authored vs programmer-authored
-            if let Some(_first_idx) = seen_user.get(name) {
+            if let Some(_first_idx) = seen_user.get(&key) {
                 return Err(DelightQLError::validation_error_categorized(
                     "constraint",
                     format!(
@@ -216,7 +230,7 @@ pub(super) fn resolve_general_via_fold(
                     "in projection",
                 ));
             }
-            seen_user.insert(name, idx);
+            seen_user.insert(key, idx);
         }
     }
 
