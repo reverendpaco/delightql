@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Sequential compilation of multi-query source strings.
 //!
 //! `compile_sequential` takes a source string containing multiple queries,

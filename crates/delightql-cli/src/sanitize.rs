@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Terminal output sanitization for CLI cell values.
 ///
 /// Database cell values can contain bytes that are dangerous when rendered

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Sync bin cartridges to bootstrap database
 //!
 //! This module provides functionality to register bin cartridges (built-in entities)

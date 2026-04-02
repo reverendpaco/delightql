@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Database backend implementations for DelightQL
 //!
 //! This crate provides concrete implementations of database backends including:

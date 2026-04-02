@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // rebuilder.rs - Phase 3 of FAR cycle: Rebuild AST with predicates in proper homes
 //
 // The rebuilder takes the analyzed segment and rebuilds it into a refined AST

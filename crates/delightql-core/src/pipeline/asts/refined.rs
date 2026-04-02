@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // ast_refined.rs - Refined AST for DelightQL
 //
 // This module defines the refined AST that comes from

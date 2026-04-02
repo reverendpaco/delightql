@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Shared REPL command handler
 use anyhow::{Context, Result};
 use std::time::Instant;

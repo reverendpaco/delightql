@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // inner_cpr.rs - Shared helpers for Inner-CPR (Inner Column Preservation Rules) features
 //
 // Inner-CPR includes:

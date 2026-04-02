@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Hints (suggestions at the right of the prompt as you type).
 
 use crate::history::SearchDirection;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Prelude Cartridge - Built-in pseudo-predicates
 //!
 //! This cartridge provides the core pseudo-predicates that are available

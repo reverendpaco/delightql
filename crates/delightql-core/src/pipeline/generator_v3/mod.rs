@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // SQL Generator V3 - From SQL AST V3 to SQL String
 //
 // This generator converts our SQL AST V3 structures into actual SQL strings.

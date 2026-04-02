@@ -2,7 +2,9 @@
 !.gitignore
 !*/
 !Cargo.lock
+!LICENSE
 !Cargo.toml
+!README.md
 !Makefile
 !crates/
 !crates/**/*.rs

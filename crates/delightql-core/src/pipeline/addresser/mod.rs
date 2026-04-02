@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::error::Result;
 use crate::pipeline::asts::core::phase_box::{PhaseBox, PhaseBoxable};
 use crate::pipeline::{ast_addressed, ast_refined};

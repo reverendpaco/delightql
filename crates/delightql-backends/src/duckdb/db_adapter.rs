@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // DuckDB adapter implementing DelightQL database traits
 //
 // This module adapts duckdb to work with DelightQL's DatabaseConnection trait.

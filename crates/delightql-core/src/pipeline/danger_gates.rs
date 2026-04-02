@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Danger Gate System
 //
 // Named safety boundaries that are OFF by default. Each gate is identified

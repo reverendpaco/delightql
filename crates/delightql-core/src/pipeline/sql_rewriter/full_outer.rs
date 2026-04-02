@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // full_outer.rs — Expand FULL OUTER JOIN for dialects without native support.
 //
 // SELECT <proj> FROM A FULL OUTER JOIN B ON cond WHERE <filters>

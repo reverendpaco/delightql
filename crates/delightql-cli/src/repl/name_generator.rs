@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Deterministic name generator for REPL auto-captured queries.
 ///
 /// Produces names in `adjective_color_animal` format (e.g. "fuzzy_red_wombat").

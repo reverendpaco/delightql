@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// DelightQL CLI library
 ///
 /// Exposes shared modules for use by binary targets

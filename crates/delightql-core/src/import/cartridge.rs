@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Cartridge Installation and Management
 //
 // This module handles installing cartridges from various sources:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};

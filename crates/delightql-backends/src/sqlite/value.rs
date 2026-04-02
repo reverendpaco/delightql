@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Type-safe SQL value representation
 ///
 /// Preserves type information for NULL values and provides proper display formatting

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// DuckDB Schema Provider
 ///
 /// Implements schema introspection for DuckDB databases using information_schema.

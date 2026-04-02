@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // types.rs - Core types for the principled refiner
 //
 // Based on PRINCIPLED-RELOOK-AT-REFINER.md

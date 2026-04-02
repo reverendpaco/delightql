@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Specification types for various operations
 
 use super::{Addressed, DomainExpression, Refined, Resolved, Unresolved};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // context_builder.rs - Build context structures for law checking and scope analysis
 //
 // This module handles construction of law checking contexts and scope sequences

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Domain expressions, functions, literals parsing
 //!
 //! This module contains the main expression parsing logic, organized into:

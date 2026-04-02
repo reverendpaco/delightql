@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! DDL AST — typed in-memory representation of definitions.
 //!
 //! The DDL AST is ephemeral: produced by parsing definition text, used for

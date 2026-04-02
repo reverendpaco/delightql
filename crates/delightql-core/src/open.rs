@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Entry points for creating DQL sessions.
 //!
 //! `open()` is the sole public entry point for external crates.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // SqlParty Integration Tests
 //
 // Each test creates a raw rusqlite connection to the test database,

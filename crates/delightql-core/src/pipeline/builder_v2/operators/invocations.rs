@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Piped invocations: HO view application, DML terminals, directive terminals
 
 use super::super::expressions::*;

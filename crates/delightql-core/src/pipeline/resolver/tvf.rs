@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! TVF (Table-Valued Function) schema resolution
 //!
 //! TECHNICAL DEBT: This module hardcodes column schemas for known TVFs.

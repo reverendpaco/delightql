@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `ground!()` pseudo-predicate implementation
 //!
 //! Syntax: `ground!(data_ns, lib_ns, new_ns_name)`

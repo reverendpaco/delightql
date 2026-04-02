@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use super::super::column_extraction::extract_provided_column_from_domain_expr;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::AstTransform;

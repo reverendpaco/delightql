@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! SQL Identifier newtype with case-insensitive semantics.
 //!
 //! SQL identifiers (column names, table names, schema names) are case-insensitive

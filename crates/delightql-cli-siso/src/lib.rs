@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! DelightQL CLI SISO (Standard In / Standard Out) Backend
 //!
 //! Provides pipe-based database connections that communicate with

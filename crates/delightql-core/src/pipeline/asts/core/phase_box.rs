@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use super::{Addressed, CprSchema, Refined, Resolved, Unresolved};
 use crate::lispy::ToLispy;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

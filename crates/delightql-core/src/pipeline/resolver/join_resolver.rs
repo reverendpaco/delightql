@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Join-specific resolution logic
 //!
 //! This module handles JOIN condition creation and anonymous table unification.

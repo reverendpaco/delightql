@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Unix specific definitions
 use std::cmp;
 use std::collections::HashMap;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Pattern matching utilities for column selection
 //!
 //! Provides POSIX BRE-compatible pattern matching for column selection,

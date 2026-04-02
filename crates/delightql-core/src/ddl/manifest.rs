@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Manifest reader — reads `_internal` HO entity data from bootstrap DB.
 //!
 //! `_internal` HO views (schema, constraints, defaults, imprinting) are consulted

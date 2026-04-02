@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Domain expression resolution helpers
 // simple: column validation, ordinal resolution, literal conversion
 // subqueries: scalar subquery resolution with fresh registry context

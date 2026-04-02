@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // DQL Server — Socket listener and thread pool
 //
 // Binds a Unix socket, accepts connections, and dispatches them to

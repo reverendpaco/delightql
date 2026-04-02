@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Bin Cartridge SPI (Service Provider Interface)
 //!
 //! This module defines the trait system for built-in (bin) cartridges - entities

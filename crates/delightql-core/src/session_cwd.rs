@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Per-session working directory for relative path resolution.
 //
 // Thread-local storage set by the server handler on ControlOp::Cwd,

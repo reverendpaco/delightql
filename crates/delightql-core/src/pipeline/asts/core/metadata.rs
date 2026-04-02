@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Metadata structures for resolved and refined phases
 
 use super::ColumnProvenance;

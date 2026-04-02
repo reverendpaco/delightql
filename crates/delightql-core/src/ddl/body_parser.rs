@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Parse definition source text into unresolved AST nodes.
 //!
 //! Entity definitions are stored as full source text in the bootstrap

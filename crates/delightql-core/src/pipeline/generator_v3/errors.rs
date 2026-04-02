@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum GeneratorError {

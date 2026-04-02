@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // sql_optimizer/mod.rs - SQL-level optimization pass
 //
 // Post-order (bottom-up) walker over SQL AST v3.

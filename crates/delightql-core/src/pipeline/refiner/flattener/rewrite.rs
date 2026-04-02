@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // rewrite.rs - Qualifier and hygienic name rewriting
 //
 // Uses AstTransform<Resolved, Resolved> folds for structural descent.

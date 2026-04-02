@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use super::dialect::SqlDialect;
 use crate::pipeline::sql_ast_v3::{BinaryOperator, UnaryOperator};
 

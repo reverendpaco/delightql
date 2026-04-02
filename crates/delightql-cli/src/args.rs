@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::output_format::OutputFormat;
 /// Command-line argument parsing for DelightQL CLI
 use clap::{Parser, Subcommand, ValueEnum};

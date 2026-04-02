@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Abstract Syntax Tree representations for the DelightQL pipeline.
 //
 // Three phases with shared core structures:

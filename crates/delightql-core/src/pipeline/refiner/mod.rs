@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // REFINER V2 - PRINCIPLED FAR (Flatten-Analyze-Rebuild) ARCHITECTURE
 //
 // Following PRINCIPLED-RELOOK-AT-REFINER.md with:

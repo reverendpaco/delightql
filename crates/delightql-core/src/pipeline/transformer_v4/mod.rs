@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Transformer V4: Unified Builder Architecture
 //!
 //! Clean-slate transformer built around a unified `Builder<P>` that carries

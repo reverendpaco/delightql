@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // analyzer.rs - Phase 2 of FAR cycle: Classify predicates according to Laws 1-6
 //
 // The analyzer takes flattened segments and classifies each predicate as:

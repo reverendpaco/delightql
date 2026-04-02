@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Relay Protocol
 //
 // Layer 0: 14 data terms (ClientTerm, ServerTerm) + typestate client
@@ -14,4 +16,3 @@ pub use layer0::*;
 
 // Re-export layer1 control types
 pub use layer1::{ClientMessage, ControlOp, ControlResult, ServerMessage};
-

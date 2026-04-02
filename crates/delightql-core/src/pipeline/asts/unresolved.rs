@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // ast_unresolved.rs - Pure syntactic AST for DelightQL (NEW PROPOSAL)
 //
 // This module defines the unresolved (syntactic) AST that comes directly from

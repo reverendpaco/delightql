@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // SQLite adapter implementing DelightQL database traits
 //
 // This module adapts rusqlite to work with DelightQL's DatabaseConnection trait.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Table access, joins, anonymous tables parsing
 
 use super::expressions::*;

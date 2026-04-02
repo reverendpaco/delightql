@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Unified SQL builder with two-phase typestate.
 //!
 //! The single type that flows through the transformer. Replaces the v3 trio of

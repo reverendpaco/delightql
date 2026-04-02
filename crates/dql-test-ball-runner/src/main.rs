@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // dql-test-ball-runner — Run test balls (new schema: test_code/test_run)
 //
 // Reads a ball SQLite file, connects to a running `dql server`, executes

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Provenance population - Post-refiner fixup for CFE parameter tracking
 // This walks an already-refined tree and populates provenance fields based on qualifier matching
 //

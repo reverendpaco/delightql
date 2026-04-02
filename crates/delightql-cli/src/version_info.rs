@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 pub struct BuildInfo {
     pub version: &'static str,
     pub change_id_short: &'static str,

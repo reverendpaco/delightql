@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Database Introspection Types
 //!
 //! This module provides the core introspection trait and types used by both:

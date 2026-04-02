@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Core entity model for DelightQL resolution
 //!
 //! These types represent what things exist in DelightQL's world.

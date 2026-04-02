@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // sql_rewriter/mod.rs — Dialect-aware SQL AST rewriting
 //
 // Runs AFTER the transformer and BEFORE the optimizer.

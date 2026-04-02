@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // DQL Server — Per-connection handler
 //
 // Uses the trait API: DqlHandle.create_relay() returns Box<dyn ServerRelay>.

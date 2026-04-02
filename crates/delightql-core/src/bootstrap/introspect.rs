@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // DelightQL Database Introspection Module (Runtime)
 //
 // This module implements database introspection logic for the RUNTIME/BOOTSTRAP database.

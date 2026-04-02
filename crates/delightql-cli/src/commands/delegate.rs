@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Generic subcommand delegation: try linked library, fall back to external binary.
 
 use anyhow::Result;

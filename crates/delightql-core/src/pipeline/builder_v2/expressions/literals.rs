@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Literal values, column references, ordinals, and ranges parsing
 
 use crate::error::{DelightQLError, Result};

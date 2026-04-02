@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // visitor.rs - Generic AST visitor pattern for SQL optimizer passes
 //
 // This module provides a reusable visitor pattern that eliminates ~450 lines

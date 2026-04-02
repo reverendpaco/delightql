@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // laws.rs - Implementation of Laws 1-6 from PRINCIPLED-RELOOK-AT-REFINER.md
 //
 // These laws govern predicate classification and association

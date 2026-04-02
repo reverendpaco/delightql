@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::pipeline::sql_ast_v3::DomainExpression as SqlExpression;
 
 use super::asts::GeneratedKind;

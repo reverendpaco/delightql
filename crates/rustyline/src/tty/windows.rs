@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Windows specific definitions
 #![allow(clippy::try_err)] // suggested fix does not work (cannot infer...)
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // predicate_classifier.rs - Classify predicates into FIC, FJC, F, Fx categories
 //
 // This module handles predicate classification logic and law application

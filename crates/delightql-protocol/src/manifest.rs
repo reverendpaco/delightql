@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Relay Protocol — MessagePack Manifestation
 //
 // Serialization: Term <-> msgpack bytes (via rmp-serde)

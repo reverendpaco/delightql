@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// SQLite Connection Management
 ///
 /// Provides thread-safe connection management for SQLite databases,

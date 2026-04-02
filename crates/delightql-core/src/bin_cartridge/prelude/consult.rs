@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `consult!()` pseudo-predicate implementation
 //!
 //! Syntax: `consult!(file_path, namespace_name)`

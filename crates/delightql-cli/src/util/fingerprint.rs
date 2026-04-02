@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use anyhow::Result;
 use delightql_backends::QueryResults;
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // CFE Precompilation - Convert unresolved CFE definitions to refined, ready-to-substitute form
 //
 // This module implements the "precompilation" step where CFE bodies are:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // flattener.rs - Phase 1 of FAR cycle: Flatten AST segments
 //
 // The flattener transforms tree-form resolved AST into flat structures

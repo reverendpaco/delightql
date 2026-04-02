@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Relay Protocol — Layer 0 Vocabulary
 //
 // Transcription of the logical model from protocol/SQL9-PROTOCOL-2.md.

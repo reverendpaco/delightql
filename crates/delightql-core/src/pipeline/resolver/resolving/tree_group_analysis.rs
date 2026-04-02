@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Tree group CTE requirements analysis (Phase R2+)
 //!
 //! This module analyzes tree groups in modulo reductions to determine which ones

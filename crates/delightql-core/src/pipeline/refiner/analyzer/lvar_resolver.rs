@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // lvar_resolver.rs - Handle Lvar bindings and USING column interpretation
 //
 // This module handles Lvar extraction and binding creation

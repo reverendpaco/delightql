@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// DuckDB Schema Provider Implementation
 ///
 /// This module implements the SchemaProvider trait for DuckDB databases,

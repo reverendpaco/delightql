@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Type conversion utilities for resolver
 //!
 //! This module contains pure conversion functions that transform unresolved AST nodes

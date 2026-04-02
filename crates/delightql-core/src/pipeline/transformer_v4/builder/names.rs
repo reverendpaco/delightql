@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Counter-based name generator for SQL aliases and CTE names.
 ///
 /// Produces deterministic, sequential names: `t_1`, `t_2`, `cte_1`, etc.

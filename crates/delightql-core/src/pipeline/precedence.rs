@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Operator precedence helpers for infix expressions
 
 /// Determine if parentheses are needed based on operator precedence

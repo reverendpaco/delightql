@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! History related commands tests
 use super::assert_history;
 use crate::config::EditMode;

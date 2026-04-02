@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Public API facade for delightql-core.
 //!
 //! The CLI calls session.query() and session.fetch(). Nothing else

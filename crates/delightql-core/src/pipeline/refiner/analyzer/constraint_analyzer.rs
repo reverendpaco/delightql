@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // constraint_analyzer.rs - Extract constraints from table patterns and anonymous tables
 //
 // This module handles constraint extraction from positional patterns and anonymous table processing

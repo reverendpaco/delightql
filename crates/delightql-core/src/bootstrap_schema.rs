@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// DatabaseSchema implementation backed by bootstrap metadata.
 ///
 /// Instead of querying the live database connection (via PRAGMA table_xinfo),

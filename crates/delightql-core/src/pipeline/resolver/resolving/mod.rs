@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Modularized resolver components
 // These handle the actual resolution of AST nodes from unresolved to resolved state
 

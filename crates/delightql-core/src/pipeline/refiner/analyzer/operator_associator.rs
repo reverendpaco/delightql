@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // operator_associator.rs - Associate predicates with their appropriate operators
 //
 // This module handles the logic of determining which operator owns each predicate

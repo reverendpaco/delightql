@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Post-processing: Replace parameter Lvars with Parameter/CurriedParameter/ContextParameter nodes.
 //!
 //! Three modes, each a small `AstTransform<Refined, Refined>` implementation:

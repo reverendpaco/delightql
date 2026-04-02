@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Contains error type for handling I/O and Errno errors
 #[cfg(windows)]
 use std::char;

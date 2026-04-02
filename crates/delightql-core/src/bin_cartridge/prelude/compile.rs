@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `sys::execution.compile()` bin relation implementation
 //!
 //! Syntax: `sys::execution.compile("stage", """source""")`

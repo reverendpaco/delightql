@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! PostgreSQL driver implementation for DelightQL
 //!
 //! This crate provides an implementation of the `DatabaseConnection` trait

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! File input tracking with auto-numbering for process substitutions
 //!
 //! Handles tracking file inputs for `dql tools munge` command, automatically

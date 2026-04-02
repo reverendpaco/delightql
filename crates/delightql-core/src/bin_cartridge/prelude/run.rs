@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `run!()` pseudo-predicate implementation
 //!
 //! Syntax: `run!(file_path)`

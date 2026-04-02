@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Theme configuration for syntax highlighting
 //!
 //! Supports both named colors (red, blue, etc.) and hex colors (#rrggbb)

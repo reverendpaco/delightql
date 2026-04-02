@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Filemunge command handler
 //!
 //! Handles: dql tools filemunge --table name:format[:noheader] path ... '<query>'

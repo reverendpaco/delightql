@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Relational expressions and base relations
 //! RelationalExpression, Relation, InnerRelationPattern
 

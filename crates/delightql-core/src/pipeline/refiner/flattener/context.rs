@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // context.rs - Context for flattening operations
 
 use std::collections::{HashMap, HashSet};

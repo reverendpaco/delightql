@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::pipeline::builder_v2::build_domain_expression_from_node;
 use crate::pipeline::cst::CstTree;
 use crate::pipeline::parser::parse_sigil_expression;

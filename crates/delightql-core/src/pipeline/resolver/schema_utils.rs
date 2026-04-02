@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Schema utility functions
 //!
 //! This module contains utilities for validating and working with column schemas

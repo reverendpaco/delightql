@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Recursive descent dispatcher.
 //!
 //! `descend()` takes an addressed `RelationalExpression`, pattern-matches on

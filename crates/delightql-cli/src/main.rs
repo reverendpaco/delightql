@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// DelightQL CLI
 ///
 /// Command-line interface for the DelightQL query language

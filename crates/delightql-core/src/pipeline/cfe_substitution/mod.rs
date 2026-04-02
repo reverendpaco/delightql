@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// CFE (Common Function Expression) parameter substitution
 ///
 /// This module handles substituting CFE parameters with argument expressions during transformation.

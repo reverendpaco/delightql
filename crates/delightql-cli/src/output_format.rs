@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Output format handling for DelightQL CLI
 ///
 /// This module provides functionality for formatting query results in different

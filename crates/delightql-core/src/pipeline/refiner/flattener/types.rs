@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // types.rs - Core data structures for flattening
 
 use crate::pipeline::asts::refined::QualifiedName;

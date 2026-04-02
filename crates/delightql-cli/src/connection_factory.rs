@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! CLI implementation of ConnectionFactory
 //!
 //! Bridges the ConnectionFactory trait with the CLI's ConnectionManager,

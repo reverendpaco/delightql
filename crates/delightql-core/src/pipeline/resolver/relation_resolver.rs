@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Relation resolution logic
 //!
 //! This module handles the resolution of Relation nodes (Ground, Anonymous, TVF)

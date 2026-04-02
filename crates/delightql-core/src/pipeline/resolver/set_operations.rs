@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Set operation validation and schema building
 //!
 //! This module handles validation and schema construction for set operations

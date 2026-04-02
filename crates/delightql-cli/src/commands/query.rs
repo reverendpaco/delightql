@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Query command handler — plumbing layer.
 //!
 //! Creates connections, handles, and sessions. Passes the session to exec_ng.

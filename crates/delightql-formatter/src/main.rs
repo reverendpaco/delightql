@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use clap::Parser;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;

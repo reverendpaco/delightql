@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // SisoParty — Back-End Seam (Generic DatabaseConnection)
 //
 // Backed by Arc<Mutex<dyn DatabaseConnection>>. Eager execution,

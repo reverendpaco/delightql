@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! DDL definition parsing, building, and analysis.
 //!
 //! - `body_parser`: Re-parses definition body text into unresolved DQL AST nodes

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Helper functions for the resolver
 // These are extracted to reduce the size of the main resolver module
 

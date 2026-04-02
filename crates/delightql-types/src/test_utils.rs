@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Mock implementations for testing
 //!
 //! Provides mock database connections and schema providers that can be used

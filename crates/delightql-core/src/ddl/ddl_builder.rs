@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! DDL builder — produces `DdlDefinition` from the DDL CST.
 //!
 //! Parallels `extract_definition` in `parser/mod.rs` but produces typed

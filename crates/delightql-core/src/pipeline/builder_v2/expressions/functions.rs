@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Function call parsing (regular, bracket, curly, higher-order)
 
 use super::literals::{parse_column_range, parse_lvar};

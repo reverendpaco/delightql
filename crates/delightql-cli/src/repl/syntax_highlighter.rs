@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Syntax highlighting for DelightQL REPL
 //!
 //! This module provides real-time syntax highlighting by parsing

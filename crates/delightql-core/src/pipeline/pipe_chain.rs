@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Pipe chain linearization utilities.
 //!
 //! Converts nested `Pipe(C, Pipe(B, A))` linked lists into flat `(A, [B, C])`

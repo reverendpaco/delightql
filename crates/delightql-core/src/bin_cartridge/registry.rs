@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Bin Cartridge Registry
 //!
 //! The registry maintains an index of all registered bin cartridges and their entities,

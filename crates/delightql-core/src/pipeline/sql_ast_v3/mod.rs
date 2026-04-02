@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // SQL AST V3 - A Proper SQL Syntax Tree
 //
 // This AST models SQL as SQL actually is - following its syntactic structure

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use super::schema_computation::compute_join_schema;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::refined::{self, JoinType, QualifiedName};

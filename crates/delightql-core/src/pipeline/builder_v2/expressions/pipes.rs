@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Piped expression parsing (/-> operator)
 
 use super::functions::parse_function_call;

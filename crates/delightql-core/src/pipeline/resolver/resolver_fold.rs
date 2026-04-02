@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! ResolverFold — the resolver as an AstTransform<Unresolved, Resolved>.
 //!
 //! All recursive calls within resolve_relational_impl now go through

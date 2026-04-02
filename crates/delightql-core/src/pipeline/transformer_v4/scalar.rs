@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Scalar lowering: `s_lower_*` handlers.
 //!
 //! Each function lowers a DQL AST scalar expression into a SQL AST

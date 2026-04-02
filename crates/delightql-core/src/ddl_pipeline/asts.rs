@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::pipeline::asts::core::expressions::domain::DomainExpression;
 use crate::pipeline::asts::core::Unresolved;
 

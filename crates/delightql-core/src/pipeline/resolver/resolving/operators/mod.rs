@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Modularized operator resolution components
 // Each module handles a specific category of unary relational operators
 

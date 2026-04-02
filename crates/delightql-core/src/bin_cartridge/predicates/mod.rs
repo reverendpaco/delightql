@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Predicates Cartridge - Built-in sigma predicates
 //!
 //! This cartridge provides constraint-oriented sigma predicates that represent

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Full-screen window manager for DelightQL
 ///
 /// This module provides a windowed interface with full-screen windows:

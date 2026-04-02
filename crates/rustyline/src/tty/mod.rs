@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! This module implements and describes common TTY methods & traits
 
 use unicode_width::UnicodeWidthStr;

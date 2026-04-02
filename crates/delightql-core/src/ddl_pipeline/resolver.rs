@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
 use delightql_types::SqlIdentifier;
 

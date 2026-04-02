@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! DelightQL WASM Bridge
 //!
 //! Provides WebAssembly bindings for DelightQL using the protocol/session API.

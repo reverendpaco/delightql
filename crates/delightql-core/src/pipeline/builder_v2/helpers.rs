@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Common parsing utilities and helpers
 
 use super::*; // Import everything from parent module

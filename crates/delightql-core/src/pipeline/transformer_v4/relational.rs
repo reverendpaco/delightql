@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Relational lowering: `r_lower_*` handlers.
 //!
 //! Each function lowers one AST node kind into builder operations.
@@ -3196,26 +3198,39 @@ fn lower_destructure_pattern(
             // Partition: base extractions, explosive (~>), and nested navigations
             let mut base_items = Vec::new();
             let mut explosions: Vec<(String, ast_addressed::FunctionExpression)> = Vec::new();
-            let mut nested_navigations: Vec<(String, ast_addressed::FunctionExpression)> = Vec::new();
+            let mut nested_navigations: Vec<(String, ast_addressed::FunctionExpression)> =
+                Vec::new();
 
             for member in members {
                 match member {
                     ast_addressed::CurlyMember::Shorthand { column, .. } => {
                         base_items.push(make_json_extract_item(
-                            source, &format!(".{}", column), column.as_str(),
+                            source,
+                            &format!(".{}", column),
+                            column.as_str(),
                         ));
                     }
-                    ast_addressed::CurlyMember::KeyValue { key, nested_reduction, value } => {
+                    ast_addressed::CurlyMember::KeyValue {
+                        key,
+                        nested_reduction,
+                        value,
+                    } => {
                         if *nested_reduction {
                             // Explosive: this ~> needs a json_each
                             if let ast_addressed::DomainExpression::Function(p) = value.as_ref() {
                                 explosions.push((key.clone(), p.clone()));
                             }
-                        } else if let ast_addressed::DomainExpression::Lvar { name, .. } = value.as_ref() {
+                        } else if let ast_addressed::DomainExpression::Lvar { name, .. } =
+                            value.as_ref()
+                        {
                             base_items.push(make_json_extract_item(
-                                source, &format!(".{}", key), name.as_str(),
+                                source,
+                                &format!(".{}", key),
+                                name.as_str(),
                             ));
-                        } else if let ast_addressed::DomainExpression::Function(nested_pat) = value.as_ref() {
+                        } else if let ast_addressed::DomainExpression::Function(nested_pat) =
+                            value.as_ref()
+                        {
                             // Nested object without ~>: navigate into sub-object
                             // and recurse (handles any ~> inside)
                             nested_navigations.push((key.clone(), nested_pat.clone()));
@@ -3389,10 +3404,7 @@ fn lower_with_json_each(
             },
             |tvf_alias| {
                 vec![SelectItem::expression_with_alias(
-                    SqlDomainExpr::with_qualifier(
-                        ColumnQualifier::table(tvf_alias),
-                        "value",
-                    ),
+                    SqlDomainExpr::with_qualifier(ColumnQualifier::table(tvf_alias), "value"),
                     &val_temp,
                 )]
             },
@@ -3405,7 +3417,6 @@ fn lower_with_json_each(
     remove_column(builder, &val_temp)
 }
 
-
 /// Extract JSON path and column name from a PathLiteral or Array Index member.
 fn extract_path_literal_info(
     path: &ast_addressed::DomainExpression,
@@ -3415,7 +3426,8 @@ fn extract_path_literal_info(
 
     if let ast_addressed::DomainExpression::Projection(
         crate::pipeline::asts::core::expressions::domain::ProjectionExpr::JsonPathLiteral {
-            segments, ..
+            segments,
+            ..
         },
     ) = path
     {
@@ -3489,8 +3501,13 @@ fn segments_to_json_path_sql(
     let mut path = String::new();
     for seg in segments {
         match seg {
-            PathSegment::ObjectKey(key) => { path.push('.'); path.push_str(key); }
-            PathSegment::ArrayIndex(idx) => { path.push_str(&format!("[{}]", idx)); }
+            PathSegment::ObjectKey(key) => {
+                path.push('.');
+                path.push_str(key);
+            }
+            PathSegment::ArrayIndex(idx) => {
+                path.push_str(&format!("[{}]", idx));
+            }
         }
     }
     path
@@ -3501,10 +3518,14 @@ fn infer_col_name(
     segments: &[crate::pipeline::asts::core::expressions::functions::PathSegment],
 ) -> String {
     use crate::pipeline::asts::core::expressions::functions::PathSegment;
-    segments.iter().map(|s| match s {
-        PathSegment::ObjectKey(k) => k.clone(),
-        PathSegment::ArrayIndex(i) => i.to_string(),
-    }).collect::<Vec<_>>().join("_")
+    segments
+        .iter()
+        .map(|s| match s {
+            PathSegment::ObjectKey(k) => k.clone(),
+            PathSegment::ArrayIndex(i) => i.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// Lower an `IntersectCorresponding` node into SQL.

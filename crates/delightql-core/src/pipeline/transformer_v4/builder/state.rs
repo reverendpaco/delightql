@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Internal state machine for the SQL builder.
 //!
 //! Four states with well-defined transitions. The builder's public methods

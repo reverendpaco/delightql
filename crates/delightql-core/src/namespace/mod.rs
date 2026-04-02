@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Namespace management (REMOVED)
 //!
 //! This module has been replaced by the meta-circular bootstrap system.

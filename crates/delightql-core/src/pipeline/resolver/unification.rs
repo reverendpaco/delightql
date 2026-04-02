@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Unification Engine for Column Resolution
 //!
 //! This module handles matching unresolved column references against available columns,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Domain expression refining - Convert resolved → refined AST nodes
 // This phase handles embedded subqueries by calling a CFE-aware refiner
 // that populates LvarProvenance based on parameter lists

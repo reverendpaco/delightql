@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Connection Factory
 //!
 //! Defines the trait for creating database connections from URIs.

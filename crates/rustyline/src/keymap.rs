@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Bindings from keys to command for Emacs and Vi modes
 use log::debug;
 

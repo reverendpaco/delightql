@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Function expressions and related types
 //! FunctionExpression, CurlyMember, CaseArm, StringTemplatePart
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Minimal namespace path type for delightql-types
 ///
 /// This is a simplified version without dependencies on core's lispy traits.

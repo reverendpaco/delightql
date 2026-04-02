@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Namespace Creation and Management
 //
 // This module handles creating and managing the namespace hierarchy.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Tree-group lowering: `%(keys ~> {curly})` with nested reductions.
 //!
 //! Handles data-oriented tree groups (`~> {cols}`), metadata tree groups

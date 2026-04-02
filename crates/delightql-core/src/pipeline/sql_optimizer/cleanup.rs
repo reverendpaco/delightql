@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // cleanup.rs - Subquery boundary collapse
 //
 // One rule: if the child SELECT has no epistemological barrier

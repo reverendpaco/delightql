@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // pattern_resolver.rs - Unified pattern resolution to prevent duplicate code paths
 // This is the single entry point for ALL pattern types (Glob, GlobWithUsing, Positional, etc.)
 //

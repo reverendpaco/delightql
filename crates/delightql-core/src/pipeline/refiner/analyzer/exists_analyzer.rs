@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // exists_analyzer.rs - EXISTS dependency detection and analysis
 //
 // This module handles detection of interdependent EXISTS clauses and their relationships

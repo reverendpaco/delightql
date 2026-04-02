@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // inner_relation.rs - INNER-RELATION pattern handling and correlation filter hoisting
 
 use super::context::FlattenContext;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Line buffer with current cursor position
 use crate::keymap::{At, CharSearch, Movement, RepeatCount, Word};
 use std::cell::RefCell;

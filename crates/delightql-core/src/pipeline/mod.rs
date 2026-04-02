@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Next Generation Pipeline - Full Intercalation Architecture
 //!
 //! This is a parallel implementation of the DelightQL pipeline with

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Tree visitor for formatting DelightQL queries
 use anyhow::Result;
 use tree_sitter::Node;

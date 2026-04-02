@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Grammar-based fuzzer for DelightQL
 //!
 //! Generates random syntactically valid DelightQL queries by walking the grammar.json

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// CFE substitution via AstTransform<Addressed, Addressed>
 ///
 /// Replaces ~1,760 lines of hand-written walkers (old domain.rs + relational.rs)

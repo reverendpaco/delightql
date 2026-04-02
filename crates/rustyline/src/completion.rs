@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Completion API
 use std::borrow::Cow::{self, Borrowed, Owned};
 use std::fs;

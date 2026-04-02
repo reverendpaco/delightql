@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `imprint!()` pseudo-predicate implementation
 //!
 //! Syntax: `imprint!(source_ns, target_ns)`

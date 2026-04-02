@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! WASM-compatible DelightQL System
 //!
 //! This module provides a minimal system implementation for WASM builds.

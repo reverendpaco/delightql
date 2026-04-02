@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! CASE expression and scalar subquery parsing
 
 use super::literals::parse_literal;

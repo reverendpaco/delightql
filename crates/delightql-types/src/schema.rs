@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Database Schema Abstraction
 ///
 /// This module provides the core database schema trait and types needed by

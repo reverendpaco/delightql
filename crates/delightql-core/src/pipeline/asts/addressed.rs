@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // ast_addressed.rs - Addressed AST for DelightQL
 //
 // This module defines the addressed AST that comes from

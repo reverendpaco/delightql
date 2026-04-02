@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::error::Result;
 
 /// Parse CSV text into column headers and rows of string values.

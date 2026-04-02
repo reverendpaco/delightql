@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `between()` sigma predicate implementation
 //!
 //! Syntax: `+between(value, low, high)` or `\+between(value, low, high)`

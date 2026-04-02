@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use std::{
     collections::HashMap, ffi::CStr, fmt, os::raw::c_char, process::abort, slice, str,
     sync::atomic::AtomicUsize,

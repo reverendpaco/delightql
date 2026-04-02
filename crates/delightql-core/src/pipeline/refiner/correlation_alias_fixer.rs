@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // correlation_alias_fixer.rs - Fix missing table aliases in correlated subqueries
 //
 // This module handles the pattern where inner-CPR constructs (ScalarSubquery, InnerExists)

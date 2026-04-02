@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Reference extractor — walks unresolved ASTs to find entity references
 //!
 //! At consult time, we parse each definition body and extract the entities

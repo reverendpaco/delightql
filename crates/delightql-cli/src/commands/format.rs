@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Format command handler
 //!
 //! When built with feature = "formatter", uses the linked delightql-formatter library.

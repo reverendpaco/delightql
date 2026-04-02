@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// File and stdin execution module
 use anyhow::{Context, Result};
 use std::fs;

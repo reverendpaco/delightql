@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Option Map System
 //
 // Strategy/preference selection. Each option is identified by a hierarchical

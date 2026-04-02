@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `like()` sigma predicate implementation
 //!
 //! Syntax: `+like(value, pattern)` or `\+like(value, pattern)`

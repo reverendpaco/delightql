@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use std::cmp::{Ord, Ordering, PartialOrd};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

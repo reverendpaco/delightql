@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Correlation Filter Detection
 //
 // Shared module for detecting correlation filters in subqueries.

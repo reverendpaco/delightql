@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // segment_classifier.rs - Determine segment types (Join, SetOperation, Mixed)
 //
 // This module will classify segments based on their operators

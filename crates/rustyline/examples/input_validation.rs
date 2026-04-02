@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Result};
 use rustyline_derive::{Completer, Helper, Highlighter, Hinter};

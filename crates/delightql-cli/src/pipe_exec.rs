@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Pipe execution helpers for SISO (Standard In / Standard Out) connections.
 //!
 //! Provides a bridge between the CLI execution engine and pipe-based backends.

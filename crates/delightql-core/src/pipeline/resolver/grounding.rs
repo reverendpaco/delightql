@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Grounding support: function inlining and view expansion
 //!
 //! When a query uses the grounding operator (^), consulted definitions from

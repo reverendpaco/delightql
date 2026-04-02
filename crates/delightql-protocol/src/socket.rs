@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Relay Protocol — Unix Socket Transport
 //
 // Implements the Transport trait over a UnixStream, plus server-side

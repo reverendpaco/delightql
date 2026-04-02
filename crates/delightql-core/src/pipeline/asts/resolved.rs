@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // ast_resolved.rs - Semantically resolved AST for DelightQL
 //
 // This module defines the resolved (semantic) AST that comes from

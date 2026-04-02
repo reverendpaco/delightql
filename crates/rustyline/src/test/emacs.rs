@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Emacs specific key bindings
 use super::{assert_cursor, assert_history};
 use crate::config::EditMode;

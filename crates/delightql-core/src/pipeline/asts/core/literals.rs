@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use super::metadata::NamespacePath;
 use crate::{lispy::ToLispy, ToLispy};
 use serde::{Deserialize, Serialize};

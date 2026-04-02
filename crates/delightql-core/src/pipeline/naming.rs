@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Common naming utilities for the pipeline
 ///
 /// This module provides a single source of truth for naming conventions

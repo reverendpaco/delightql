@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::pipeline::asts::refined::{self, JoinType, PhaseBox, SetOperator};
 use crate::pipeline::asts::resolved::{self, ColumnMetadata, CprSchema, TableName};
 use crate::pipeline::refiner::rebuilder::collect_columns_from_schema;

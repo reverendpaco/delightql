@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Tests specific definitions
 use std::iter::IntoIterator;
 use std::slice::Iter;

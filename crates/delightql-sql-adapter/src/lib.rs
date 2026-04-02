@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // SqlParty — Back-End Seam (Epoch 6)
 //
 // Receives raw SQL, executes it against rusqlite with a live cursor,

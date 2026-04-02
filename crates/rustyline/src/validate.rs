@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Input validation API (Multi-line editing)
 
 use crate::keymap::Invoke;

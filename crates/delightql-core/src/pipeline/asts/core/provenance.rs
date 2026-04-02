@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Column provenance / identity stack infrastructure (Epoch 1)
 //!
 //! Tracks how a column's identity evolves through the pipeline:

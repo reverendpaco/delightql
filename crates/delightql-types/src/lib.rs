@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! DelightQL Shared Types
 //!
 //! This crate contains shared types used by both delightql-core and delightql-backends,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // RelayParty — Front-End Seam (Epoch 6)
 //
 // RelayParty is the front-end seam: DQL in, protocol terms out.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// S-expression formatter for pretty-printing
 ///
 /// This module provides utilities to format our lispy notation.

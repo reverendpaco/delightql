@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // DML support for Transformer V4.
 //
 // Detects DML terminal operators at the end of a pipe chain and produces

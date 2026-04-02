@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 #![doc = include_str!("../README.md")]
 
 pub mod c_lib;

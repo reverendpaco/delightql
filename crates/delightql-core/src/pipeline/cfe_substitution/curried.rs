@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Curried parameter handling for HOCFEs
 ///
 /// This module handles extraction and merging of function expressions from curried code arguments.

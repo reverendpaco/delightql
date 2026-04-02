@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Core types for the Query Execution Engine
 /// 
 /// This module defines the fundamental types that control how queries are executed

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // CFE definition precompilation - query-level and single CFE processing
 
 use crate::error::{DelightQLError, Result};

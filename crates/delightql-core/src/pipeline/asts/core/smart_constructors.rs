@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Smart constructors for AST expression types
 // Provides fluent builder APIs to reduce boilerplate in AST construction
 

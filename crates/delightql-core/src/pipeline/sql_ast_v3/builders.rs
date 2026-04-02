@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use super::expressions::DomainExpression;
 use super::ordering::{Limit, OrderTerm};
 use super::query::{QueryExpression, SelectStatement};

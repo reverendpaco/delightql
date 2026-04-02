@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Vi insert mode specific key bindings
 use super::assert_cursor;
 use crate::config::EditMode;

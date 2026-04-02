@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Execution Error Types with Enhanced Context
 ///
 /// This module provides rich error types for the Query Execution Engine

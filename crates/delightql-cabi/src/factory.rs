@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! SQLite-only ConnectionFactory for the C-ABI crate.
 //!
 //! Mirrors the CLI's CliConnectionFactory but depends only on

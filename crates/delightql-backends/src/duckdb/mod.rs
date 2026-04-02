@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// DuckDB Integration Module for DelightQL
 ///
 /// This module provides complete DuckDB integration for DelightQL, including:

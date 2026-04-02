@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // predicates.rs - Predicate extraction and reference tracking
 
 use crate::pipeline::asts::resolved;

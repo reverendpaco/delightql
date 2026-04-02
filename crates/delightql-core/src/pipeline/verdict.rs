@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! Verdict types for assertion and error hook outcomes.
 //!
 //! The pipeline produces verdicts; the runner (CLI, test harness, CI)

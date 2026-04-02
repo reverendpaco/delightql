@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 pub mod assemble_manifest;
 pub mod asts;
 pub mod builder;

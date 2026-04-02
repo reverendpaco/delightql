@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // DuckDB Database Introspection Implementation
 //
 // Implements DatabaseIntrospector trait for user-facing DuckDB databases.

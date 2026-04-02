@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // Database abstraction traits for DelightQL core
 //
 // These traits decouple delightql-core from specific database implementations (rusqlite, DuckDB, WASM bridge, mocks).

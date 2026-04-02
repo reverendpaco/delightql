@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! DelightQL System Management
 //!
 //! This module provides the `DelightQLSystem` struct which encapsulates

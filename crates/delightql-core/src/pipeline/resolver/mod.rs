@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
 use delightql_types::error::{DelightQLError, Result};

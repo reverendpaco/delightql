@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! `reconsult!()` pseudo-predicate implementation
 //!
 //! Syntax: `reconsult!(namespace_path)` or `reconsult!(namespace_path, new_file_path)`

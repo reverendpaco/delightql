@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 /// Result data from an emit stream (name + column names + rows)
 #[derive(Clone, Debug, Default)]
 pub struct EmitResult {

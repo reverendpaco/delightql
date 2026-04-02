@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 //! CST (Concrete Syntax Tree) CONTRACT
 //!
 //! This module provides an ergonomic wrapper around tree-sitter's CST representation.

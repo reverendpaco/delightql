@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Daniel Eklund
 // reference_extraction.rs - Extract table references from expressions
 //
 // This module handles extraction of table references from various AST node types
