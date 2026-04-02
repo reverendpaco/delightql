@@ -7,8 +7,8 @@
 //! (SQLite, DuckDB, pipe://).
 
 use delightql_core::api::{CreatedConnection, Handler};
-use delightql_sql_adapter::siso::SisoParty;
-use delightql_sql_adapter::SqlParty;
+use delightql_sqlite_relay::siso::SisoParty;
+use delightql_sqlite_relay::SqlParty;
 
 use crate::connection::ConnectionManager;
 

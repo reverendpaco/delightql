@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0", "cffi"]
+build-backend = "maturin"
+
+
+[project]
+name = "delightql"
+version = "0.1.0"
+requires-python = ">=3.8"
+
+[tool.maturin]
+manifest-path = "../../crates/delightql-cabi/Cargo.toml"
+bindings = "cffi"
+python-source = "."
+module-name = "delightql._lib"

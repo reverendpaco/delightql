@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use delightql_backends::sqlite::connection::SqliteConnectionManager;
 use delightql_backends::sqlite::{DynamicSqliteSchema, SqliteConnection, SqliteIntrospector};
 use delightql_core::api::{CreatedConnection, Handler};
-use delightql_sql_adapter::SqlParty;
+use delightql_sqlite_relay::SqlParty;
 
 pub struct CabiConnectionFactory;
 

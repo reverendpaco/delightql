@@ -1,0 +1,11 @@
+{
+  "name": "delightql",
+  "version": "0.1.0",
+  "description": "DelightQL Node.js binding via C-ABI",
+  "main": "index.js",
+  "dependencies": {
+    "koffi": "^2.9",
+    "better-sqlite3": "^11.0",
+    "fzstd": "^0.1"
+  }
+}

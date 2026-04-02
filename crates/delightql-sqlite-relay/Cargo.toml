@@ -1,5 +1,5 @@
 [package]
-name = "delightql-sql-adapter"
+name = "delightql-sqlite-relay"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

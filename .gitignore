@@ -7,6 +7,7 @@
 !README.md
 !Makefile
 !crates/
+!hosts/**
 !crates/**/*.rs
 !crates/**/*.dql
 !crates/**/*.sql

@@ -10,7 +10,7 @@ members = [
     "crates/delightql-wasm",
     "crates/delightql-cli-siso",
     "crates/delightql-protocol",
-    "crates/delightql-sql-adapter",
+    "crates/delightql-sqlite-relay",
     "crates/dql-test-ball-runner",
     "crates/tree-sitter-highlight",
     "crates/delightql-cabi",

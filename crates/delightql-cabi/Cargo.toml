@@ -13,7 +13,7 @@ crate-type = ["cdylib", "staticlib"]
 delightql-core = { path = "../delightql-core" }
 delightql-types = { path = "../delightql-types" }
 delightql-backends = { path = "../delightql-backends", default-features = false, features = ["sqlite"] }
-delightql-sql-adapter = { path = "../delightql-sql-adapter" }
+delightql-sqlite-relay = { path = "../delightql-sqlite-relay" }
 rusqlite.workspace = true
 stacksafe = "1"
 tree-sitter.workspace = true

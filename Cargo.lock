@@ -970,7 +970,7 @@ dependencies = [
  "cc",
  "delightql-backends",
  "delightql-core",
- "delightql-sql-adapter",
+ "delightql-sqlite-relay",
  "delightql-types",
  "rusqlite",
  "stacksafe",
@@ -994,7 +994,7 @@ dependencies = [
  "delightql-core",
  "delightql-formatter",
  "delightql-protocol",
- "delightql-sql-adapter",
+ "delightql-sqlite-relay",
  "delightql-types",
  "directories 5.0.1",
  "env_logger 0.11.8",
@@ -1099,7 +1099,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "delightql-sql-adapter"
+name = "delightql-sqlite-relay"
 version = "0.1.0"
 dependencies = [
  "delightql-protocol",
