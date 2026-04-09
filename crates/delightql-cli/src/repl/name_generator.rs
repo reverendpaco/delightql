@@ -7,31 +7,21 @@
 /// 50 adjectives * 4 colors * 50 animals = 10,000 unique names.
 
 const ADJECTIVES: &[&str] = &[
-    "fuzzy", "calm", "bright", "swift", "bold",
-    "keen", "warm", "cool", "soft", "sharp",
-    "quick", "slow", "tall", "wide", "deep",
-    "light", "dark", "thin", "flat", "round",
-    "firm", "mild", "pure", "raw", "shy",
-    "odd", "dry", "wet", "old", "new",
-    "kind", "wild", "tame", "fair", "grim",
-    "loud", "hush", "vast", "snug", "trim",
-    "glad", "free", "rare", "rich", "lean",
-    "pale", "dull", "neat", "long", "tiny",
+    "fuzzy", "calm", "bright", "swift", "bold", "keen", "warm", "cool", "soft", "sharp", "quick",
+    "slow", "tall", "wide", "deep", "light", "dark", "thin", "flat", "round", "firm", "mild",
+    "pure", "raw", "shy", "odd", "dry", "wet", "old", "new", "kind", "wild", "tame", "fair",
+    "grim", "loud", "hush", "vast", "snug", "trim", "glad", "free", "rare", "rich", "lean", "pale",
+    "dull", "neat", "long", "tiny",
 ];
 
 const COLORS: &[&str] = &["red", "blue", "green", "amber"];
 
 const ANIMALS: &[&str] = &[
-    "wombat", "parrot", "otter", "falcon", "bison",
-    "crane", "finch", "gecko", "heron", "koala",
-    "lemur", "moose", "newt", "osprey", "panda",
-    "quail", "raven", "sloth", "trout", "viper",
-    "whale", "yak", "zebra", "badger", "cobra",
-    "dingo", "egret", "fox", "grouse", "hippo",
-    "ibis", "jackal", "kiwi", "llama", "marten",
-    "narwhal", "ocelot", "puffin", "robin", "seal",
-    "tern", "urchin", "vole", "wren", "condor",
-    "dove", "elk", "frog", "gull", "hawk",
+    "wombat", "parrot", "otter", "falcon", "bison", "crane", "finch", "gecko", "heron", "koala",
+    "lemur", "moose", "newt", "osprey", "panda", "quail", "raven", "sloth", "trout", "viper",
+    "whale", "yak", "zebra", "badger", "cobra", "dingo", "egret", "fox", "grouse", "hippo", "ibis",
+    "jackal", "kiwi", "llama", "marten", "narwhal", "ocelot", "puffin", "robin", "seal", "tern",
+    "urchin", "vole", "wren", "condor", "dove", "elk", "frog", "gull", "hawk",
 ];
 
 pub struct ReplNameGenerator {

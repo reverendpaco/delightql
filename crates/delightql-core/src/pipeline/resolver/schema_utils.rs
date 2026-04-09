@@ -28,10 +28,7 @@ pub(super) fn validate_and_get_resolved(
                 resolved_columns.push(col);
             }
             super::unification::UnificationResult::Unresolved(name) => {
-                return Err(DelightQLError::column_not_found_error(
-                    name,
-                    error_context,
-                ));
+                return Err(DelightQLError::column_not_found_error(name, error_context));
             }
             super::unification::UnificationResult::Ambiguous { column, tables } => {
                 return Err(DelightQLError::ValidationError {

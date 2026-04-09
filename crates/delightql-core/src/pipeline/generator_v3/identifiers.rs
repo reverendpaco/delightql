@@ -68,13 +68,17 @@ pub fn needs_quoting(ident: &str) -> bool {
 /// column or table names.
 fn is_reserved_word(word: &str) -> bool {
     // Binary search on a sorted array for O(log n) lookup.
-    RESERVED_WORDS.binary_search_by(|probe| {
-        probe.as_bytes().iter()
-            .zip(word.as_bytes().iter())
-            .map(|(&a, &b)| a.cmp(&b.to_ascii_uppercase()))
-            .find(|&ord| ord != std::cmp::Ordering::Equal)
-            .unwrap_or_else(|| probe.len().cmp(&word.len()))
-    }).is_ok()
+    RESERVED_WORDS
+        .binary_search_by(|probe| {
+            probe
+                .as_bytes()
+                .iter()
+                .zip(word.as_bytes().iter())
+                .map(|(&a, &b)| a.cmp(&b.to_ascii_uppercase()))
+                .find(|&ord| ord != std::cmp::Ordering::Equal)
+                .unwrap_or_else(|| probe.len().cmp(&word.len()))
+        })
+        .is_ok()
 }
 
 /// Sorted uppercase. Covers SQL:2016 core + common dialect extensions.

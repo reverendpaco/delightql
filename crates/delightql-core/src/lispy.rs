@@ -26,7 +26,11 @@ impl ToLispy for delightql_types::SqlIdentifier {
 
 impl ToLispy for bool {
     fn to_lispy(&self) -> String {
-        if *self { "true".to_string() } else { "false".to_string() }
+        if *self {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }
     }
 }
 
@@ -53,7 +57,8 @@ impl<T: ToLispy> ToLispy for Option<T> {
 
 impl<T: ToLispy> ToLispy for Vec<T> {
     fn to_lispy(&self) -> String {
-        let items = self.iter()
+        let items = self
+            .iter()
             .map(|item| item.to_lispy())
             .collect::<Vec<_>>()
             .join(" ");
@@ -75,6 +80,11 @@ impl<T1: ToLispy, T2: ToLispy> ToLispy for (T1, T2) {
 
 impl<T1: ToLispy, T2: ToLispy, T3: ToLispy> ToLispy for (T1, T2, T3) {
     fn to_lispy(&self) -> String {
-        format!("({} {} {})", self.0.to_lispy(), self.1.to_lispy(), self.2.to_lispy())
+        format!(
+            "({} {} {})",
+            self.0.to_lispy(),
+            self.1.to_lispy(),
+            self.2.to_lispy()
+        )
     }
 }

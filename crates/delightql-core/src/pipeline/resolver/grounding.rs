@@ -511,145 +511,21 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
         &mut self,
         op: UnaryRelationalOperator<Unresolved>,
     ) -> Result<UnaryRelationalOperator<Unresolved>> {
-        match op {
-            UnaryRelationalOperator::MapCover {
-                function,
-                columns,
-                containment_semantic,
-                conditioned_on,
-            } => {
-                let inlined_cols = columns
-                    .into_iter()
-                    .map(|e| self.transform_domain(e))
-                    .collect::<Result<Vec<_>>>()?;
-
-                // Check if the function is a consulted entity with empty curried args.
+        // For MapCover/EmbedMapCover: if the function is a consulted entity,
+        // collect its CfeDefinition for precompilation but leave the operator
+        // intact. The resolver's resolve_map_cover_via_fold will handle
+        // function substitution and column expansion (regex, ordinals, etc.)
+        // uniformly — no manual lowering needed here.
+        match &op {
+            UnaryRelationalOperator::MapCover { function, .. }
+            | UnaryRelationalOperator::EmbedMapCover { function, .. } => {
                 if !self.discovery_only {
-                    if let Some((name, namespace)) = extract_empty_curried_name(&function) {
-                        let entity =
-                            lookup_borrowed_function(&name, namespace.as_ref(), self.consult)?;
-
-                        if entity.is_some() {
-                            let transformations: Result<Vec<_>> = inlined_cols
-                                .into_iter()
-                                .map(|col| {
-                                    let col_name = match &col {
-                                        DomainExpression::Lvar { name, .. } => name.to_string(),
-                                        _ => "__expr__".to_string(),
-                                    };
-                                    let synthetic =
-                                        DomainExpression::Function(FunctionExpression::Regular {
-                                            name: SqlIdentifier::from(name.as_str()),
-                                            namespace: namespace.clone(),
-                                            arguments: vec![col],
-                                            alias: None,
-                                            conditioned_on: None,
-                                        });
-                                    let inlined = self.transform_domain(synthetic)?;
-                                    Ok((inlined, col_name, None))
-                                })
-                                .collect();
-
-                            return Ok(UnaryRelationalOperator::Transform {
-                                transformations: transformations?,
-                                conditioned_on,
-                            });
-                        }
-                    }
+                    self.collect_curried_consulted_function(function)?;
                 }
-
-                let inlined_func = self.transform_function(function)?;
-                Ok(UnaryRelationalOperator::MapCover {
-                    function: inlined_func,
-                    columns: inlined_cols,
-                    containment_semantic,
-                    conditioned_on,
-                })
             }
-            UnaryRelationalOperator::EmbedMapCover {
-                function,
-                selector,
-                alias_template,
-                containment_semantic,
-            } => {
-                if !self.discovery_only {
-                    if let Some((name, namespace)) = extract_empty_curried_name(&function) {
-                        let entity =
-                            lookup_borrowed_function(&name, namespace.as_ref(), self.consult)?;
-
-                        if entity.is_some() {
-                            let target_exprs = match selector {
-                                ast_unresolved::ColumnSelector::Explicit(exprs) => exprs,
-                                other_sel => {
-                                    return Ok(UnaryRelationalOperator::EmbedMapCover {
-                                        function,
-                                        selector: other_sel,
-                                        alias_template,
-                                        containment_semantic,
-                                    });
-                                }
-                            };
-
-                            let expressions: Result<Vec<_>> = target_exprs
-                                .into_iter()
-                                .map(|col| {
-                                    let col_name = match &col {
-                                        DomainExpression::Lvar { name, .. } => name.to_string(),
-                                        _ => "__expr__".to_string(),
-                                    };
-                                    let alias_str = match &alias_template {
-                                        Some(ast_unresolved::ColumnAlias::Template(t)) => {
-                                            t.template.replace("{@}", &col_name)
-                                        }
-                                        Some(ast_unresolved::ColumnAlias::Literal(lit)) => {
-                                            lit.clone()
-                                        }
-                                        None => format!("{}_transformed", col_name),
-                                    };
-                                    let synthetic =
-                                        DomainExpression::Function(FunctionExpression::Regular {
-                                            name: SqlIdentifier::from(name.as_str()),
-                                            namespace: namespace.clone(),
-                                            arguments: vec![col],
-                                            alias: Some(SqlIdentifier::from(alias_str.as_str())),
-                                            conditioned_on: None,
-                                        });
-                                    self.transform_domain(synthetic)
-                                })
-                                .collect();
-
-                            let mut all_exprs =
-                                vec![ast_unresolved::DomainExpression::glob_builder().build()];
-                            all_exprs.extend(expressions?);
-
-                            return Ok(UnaryRelationalOperator::General {
-                                containment_semantic,
-                                expressions: all_exprs,
-                            });
-                        }
-                    }
-                }
-
-                // Not a consulted function — fold children
-                let inlined_selector = match selector {
-                    ast_unresolved::ColumnSelector::Explicit(exprs) => {
-                        let folded = exprs
-                            .into_iter()
-                            .map(|e| self.transform_domain(e))
-                            .collect::<Result<Vec<_>>>()?;
-                        ast_unresolved::ColumnSelector::Explicit(folded)
-                    }
-                    other_sel => other_sel,
-                };
-                Ok(UnaryRelationalOperator::EmbedMapCover {
-                    function: self.transform_function(function)?,
-                    selector: inlined_selector,
-                    alias_template,
-                    containment_semantic,
-                })
-            }
-            other => walk_transform_operator(self, other),
+            _ => {}
         }
+        walk_transform_operator(self, op)
     }
 
     fn transform_pipe(
@@ -675,6 +551,64 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
             operator,
             cpr_schema: p.cpr_schema,
         })
+    }
+}
+
+impl BorrowedInliner<'_> {
+    /// Collect a CfeDefinition for a consulted function referenced in curried
+    /// form (e.g., `double:()` in a MapCover/EmbedMapCover function field).
+    /// Does NOT modify the operator — just registers the definition so the CFE
+    /// precompiler can process it before resolution.
+    fn collect_curried_consulted_function(&mut self, function: &FunctionExpression) -> Result<()> {
+        if let Some((name, namespace)) = extract_empty_curried_name(function) {
+            // Type=1: regular consulted function
+            let entity = lookup_borrowed_function(&name, namespace.as_ref(), self.consult)?;
+            if let Some(entity) = entity {
+                debug!(
+                    "Collecting DDL function '{}' from namespace '{}' for precompilation (cover operator)",
+                    name, entity.namespace
+                );
+                let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
+                if let Some(ns) = self.data_ns {
+                    cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
+                }
+                if !self
+                    .collected_ccafe_cfes
+                    .iter()
+                    .any(|c| c.name == cfe_def.name)
+                {
+                    let nested = discover_nested_cfes(
+                        &cfe_def.body,
+                        &entity.namespace,
+                        self.consult,
+                        self.data_ns,
+                        &self.collected_ccafe_cfes,
+                    )?;
+                    self.collected_ccafe_cfes.extend(nested);
+                    self.collected_ccafe_cfes.push(cfe_def);
+                }
+                return Ok(());
+            }
+
+            // Type=3: context-aware consulted function
+            let ccafe_entity =
+                lookup_borrowed_context_aware_function(&name, namespace.as_ref(), self.consult)?;
+            if let Some(entity) = ccafe_entity {
+                debug!(
+                    "Collecting DDL context-aware function '{}' from namespace '{}' for precompilation (cover operator)",
+                    name, entity.namespace
+                );
+                let cfe_def = consulted_entity_to_cfe_definition(&entity)?;
+                if !self
+                    .collected_ccafe_cfes
+                    .iter()
+                    .any(|c| c.name == cfe_def.name)
+                {
+                    self.collected_ccafe_cfes.push(cfe_def);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -766,6 +700,66 @@ impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
             }
             other => walk_transform_domain(self, other),
         }
+    }
+
+    fn transform_operator(
+        &mut self,
+        op: UnaryRelationalOperator<Unresolved>,
+    ) -> Result<UnaryRelationalOperator<Unresolved>> {
+        // For MapCover/EmbedMapCover: if the function is a consulted entity,
+        // collect its CfeDefinition for precompilation but leave the operator
+        // intact. Same treatment as BorrowedInliner.
+        match &op {
+            UnaryRelationalOperator::MapCover { function, .. }
+            | UnaryRelationalOperator::EmbedMapCover { function, .. } => {
+                self.collect_curried_consulted_function(function)?;
+            }
+            _ => {}
+        }
+        walk_transform_operator(self, op)
+    }
+}
+
+impl GroundedInliner<'_> {
+    /// Collect a CfeDefinition for a consulted function referenced in curried
+    /// form (e.g., `double:()` in a MapCover/EmbedMapCover function field).
+    fn collect_curried_consulted_function(&mut self, function: &FunctionExpression) -> Result<()> {
+        if let Some((name, namespace)) = extract_empty_curried_name(function) {
+            let entity = if let Some(ns) = &namespace {
+                let fq = namespace_path_to_fq(ns);
+                self.consult
+                    .lookup_entity(&name, &fq)
+                    .filter(|e| e.entity_type == EntityType::DqlFunctionExpression.as_i32())
+            } else {
+                self.grounding.grounded_ns.iter().find_map(|ns| {
+                    let fq = namespace_path_to_fq(ns);
+                    self.consult
+                        .lookup_entity(&name, &fq)
+                        .filter(|e| e.entity_type == EntityType::DqlFunctionExpression.as_i32())
+                })
+            };
+            if let Some(entity) = entity {
+                debug!(
+                    "Collecting DDL function '{}' from grounded path for precompilation (cover operator)",
+                    name
+                );
+                let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
+                let data_ns = &self.grounding.data_ns;
+                cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, data_ns);
+                if !self.collected_cfes.iter().any(|c| c.name == cfe_def.name) {
+                    let nested = discover_nested_cfes(
+                        &cfe_def.body,
+                        &entity.namespace,
+                        self.consult,
+                        Some(data_ns),
+                        &self.collected_cfes,
+                    )?;
+                    self.collected_cfes.extend(nested);
+                    self.collected_cfes.push(cfe_def);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
