@@ -10,6 +10,7 @@ use super::super::{
 use super::boolean::BooleanExpression;
 use super::functions::FunctionExpression;
 use super::helpers::QualifiedName;
+use super::pipes::PipeDirection;
 use super::relational::RelationalExpression;
 use crate::{lispy::ToLispy, PhaseConvert, ToLispy};
 use delightql_types::SqlIdentifier;
@@ -160,11 +161,12 @@ pub enum DomainExpression<Phase = Unresolved> {
         expr: Box<BooleanExpression<Phase>>,
         alias: Option<SqlIdentifier>,
     },
-    /// Value piped through transformations: (expr /-> func1 /-> func2)
+    /// Value piped through transformations: (expr /-> func1 /->> func2)
+    /// Each transform is paired with a direction (`/->` first-arg, `/->>` last-arg).
     #[lispy("domain_expression:piped")]
     PipedExpression {
         value: Box<DomainExpression<Phase>>,
-        transforms: Vec<FunctionExpression<Phase>>,
+        transforms: Vec<(PipeDirection, FunctionExpression<Phase>)>,
         alias: Option<SqlIdentifier>,
     },
     /// Parenthesized expression - preserves user's explicit parentheses

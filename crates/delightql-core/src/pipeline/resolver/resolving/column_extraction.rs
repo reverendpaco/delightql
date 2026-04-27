@@ -65,7 +65,7 @@ pub(in crate::pipeline::resolver) fn expr_has_qualified_ref(
             value, transforms, ..
         } => {
             expr_has_qualified_ref(value)
-                || transforms.iter().any(|t| match t {
+                || transforms.iter().any(|(_, t)| match t {
                     ast_resolved::FunctionExpression::Regular { arguments, .. }
                     | ast_resolved::FunctionExpression::Curried { arguments, .. }
                     | ast_resolved::FunctionExpression::Bracket { arguments, .. } => {

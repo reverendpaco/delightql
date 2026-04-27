@@ -116,7 +116,7 @@ pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec
             value, transforms, ..
         } => {
             tables.extend(extract_table_references(value));
-            for transform in transforms {
+            for (_, transform) in transforms {
                 if let resolved::FunctionExpression::Regular { arguments, .. } = transform {
                     for arg in arguments {
                         tables.extend(extract_table_references(arg));

@@ -169,7 +169,7 @@ fn populate_provenance_in_domain(
             value, transforms, ..
         } => {
             populate_provenance_in_domain(value, curried_params, regular_params, context_params);
-            for t in transforms {
+            for (_, t) in transforms {
                 populate_provenance_in_function(t, curried_params, regular_params, context_params);
             }
         }

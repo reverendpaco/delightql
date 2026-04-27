@@ -239,7 +239,7 @@ fn extract_table_refs_from_domain(
             value, transforms, ..
         } => {
             extract_table_refs_from_domain(value, references);
-            for func in transforms {
+            for (_, func) in transforms {
                 match func {
                     resolved::FunctionExpression::Regular { arguments, .. }
                     | resolved::FunctionExpression::Curried { arguments, .. }

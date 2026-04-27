@@ -426,7 +426,7 @@ fn remap_domexpr_qualifiers(expr: &mut DomainExpression, remap: &HashMap<String,
             value, transforms, ..
         } => {
             remap_domexpr_qualifiers(value, remap);
-            for t in transforms {
+            for (_, t) in transforms {
                 remap_funcexpr_qualifiers(t, remap);
             }
         }

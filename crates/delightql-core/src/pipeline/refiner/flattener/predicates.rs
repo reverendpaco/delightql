@@ -249,7 +249,7 @@ pub(super) fn extract_from_domain(
             value, transforms, ..
         } => {
             extract_from_domain(value, qualified, unqualified);
-            for func in transforms {
+            for (_, func) in transforms {
                 match func {
                     resolved::FunctionExpression::Regular { arguments, .. }
                     | resolved::FunctionExpression::Curried { arguments, .. }

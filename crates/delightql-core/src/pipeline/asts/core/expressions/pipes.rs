@@ -52,6 +52,36 @@ impl ToLispy for DestructureMode {
     }
 }
 
+/// Direction of a value-pipe step: `/->` threads the current value as the
+/// first argument; `/->>` threads it as the last argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToLispy)]
+pub enum PipeDirection {
+    /// `/->` — current value becomes argument 0 (Elixir-style)
+    First,
+    /// `/->>` — current value becomes the final argument (F#-style)
+    Last,
+}
+
+impl PipeDirection {
+    /// Build the argument list for a piped call by inserting `threaded`
+    /// (the current pipe value) at the position dictated by this direction.
+    pub fn thread<T>(self, threaded: T, rest: impl IntoIterator<Item = T>) -> Vec<T> {
+        match self {
+            PipeDirection::First => {
+                let mut out = Vec::with_capacity(1);
+                out.push(threaded);
+                out.extend(rest);
+                out
+            }
+            PipeDirection::Last => {
+                let mut out: Vec<T> = rest.into_iter().collect();
+                out.push(threaded);
+                out
+            }
+        }
+    }
+}
+
 /// Pipe transformation: relation |> operator
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
 #[lispy("pipe")]

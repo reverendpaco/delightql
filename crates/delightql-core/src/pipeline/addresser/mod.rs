@@ -277,7 +277,7 @@ fn walk_domain_for_tree_groups(expr: &mut ast_addressed::DomainExpression, count
             walk_function_for_tree_groups(func, counter);
         }
         ast_addressed::DomainExpression::PipedExpression { transforms, .. } => {
-            for transform in transforms.iter_mut() {
+            for (_, transform) in transforms.iter_mut() {
                 walk_function_for_tree_groups(transform, counter);
             }
         }

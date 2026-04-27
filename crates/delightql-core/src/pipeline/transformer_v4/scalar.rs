@@ -29,6 +29,7 @@ use super::TransformCtx;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::addressed as ast_addressed;
 use crate::pipeline::asts::core::expressions::functions::PathSegment;
+use crate::pipeline::asts::core::expressions::pipes::PipeDirection;
 use crate::pipeline::asts::core::expressions::CurlyMember;
 use crate::pipeline::asts::core::literals::LiteralValue;
 use crate::pipeline::sql_ast_v3::{
@@ -669,15 +670,18 @@ fn s_lower_named_function(
     Ok(SqlDomainExpr::function(name.as_str(), args))
 }
 
-/// Lower a piped expression: `x /-> f:() /-> g:()` → `g(f(x))`.
+/// Lower a piped expression: `x /-> f:() /->> g:(a)` → `g(a, f(x))`.
 ///
 /// Each transform is applied left-to-right. For regular/curried functions,
-/// the current value is prepended as the first argument. For lambdas,
-/// `ValuePlaceholder` (@) in the body is replaced with the current value.
+/// the current value is threaded as the first argument when the step uses
+/// `/->` (`PipeDirection::First`) and as the last argument when it uses
+/// `/->>` (`PipeDirection::Last`). For lambdas the direction is irrelevant —
+/// `ValuePlaceholder` (@) in the body is always replaced with the current
+/// value.
 #[stacksafe::stacksafe]
 fn s_lower_piped(
     value: ast_addressed::DomainExpression,
-    transforms: Vec<ast_addressed::FunctionExpression>,
+    transforms: Vec<(PipeDirection, ast_addressed::FunctionExpression)>,
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
 ) -> Result<SqlDomainExpr> {
@@ -700,7 +704,7 @@ fn s_lower_piped(
 
     let mut state = PipeVal::Ast(value);
 
-    for transform in transforms {
+    for (dir, transform) in transforms {
         let transform_has_placeholder = super::relational::has_placeholder_anywhere(&transform);
         state = match transform {
             ast_addressed::FunctionExpression::Regular {
@@ -712,16 +716,16 @@ fn s_lower_piped(
                 // CFE expansion at AST level (if we still have AST and no @).
                 if !transform_has_placeholder {
                     if let PipeVal::Ast(ref ast_val) = state {
-                        let mut cfe_args = vec![ast_val.clone()];
-                        cfe_args.extend(arguments.iter().cloned());
+                        let cfe_args = dir.thread(ast_val.clone(), arguments.iter().cloned());
                         if let Some(expanded) = try_expand_cfe(name.as_str(), &cfe_args, ctx)? {
                             PipeVal::Ast(expanded)
                         } else {
                             let current = state.to_sql(qualify, ctx)?;
-                            let mut args = vec![current];
-                            for a in arguments {
-                                args.push(s_lower_expression(a, qualify, ctx)?);
-                            }
+                            let lowered: Vec<SqlDomainExpr> = arguments
+                                .into_iter()
+                                .map(|a| s_lower_expression(a, qualify, ctx))
+                                .collect::<Result<_>>()?;
+                            let args = dir.thread(current, lowered);
                             PipeVal::Sql(SqlDomainExpr::function(name.as_str(), args))
                         }
                     } else {
@@ -729,22 +733,22 @@ fn s_lower_piped(
                         let current = state.to_sql(qualify, ctx)?;
                         let placeholder =
                             ast_addressed::DomainExpression::ValuePlaceholder { alias: None };
-                        let mut cfe_args = vec![placeholder];
-                        cfe_args.extend(arguments.iter().cloned());
+                        let cfe_args = dir.thread(placeholder, arguments.iter().cloned());
                         if let Some(expanded) = try_expand_cfe(name.as_str(), &cfe_args, ctx)? {
                             PipeVal::Sql(s_lower_with_placeholder(
                                 expanded, qualify, ctx, &current,
                             )?)
                         } else {
-                            let mut args = vec![current];
-                            for a in arguments {
-                                args.push(s_lower_expression(a, qualify, ctx)?);
-                            }
+                            let lowered: Vec<SqlDomainExpr> = arguments
+                                .into_iter()
+                                .map(|a| s_lower_expression(a, qualify, ctx))
+                                .collect::<Result<_>>()?;
+                            let args = dir.thread(current, lowered);
                             PipeVal::Sql(SqlDomainExpr::function(name.as_str(), args))
                         }
                     }
                 } else {
-                    // @ present: substitute @ → current in args
+                    // @ present: substitute @ → current in args (direction irrelevant)
                     let current = state.to_sql(qualify, ctx)?;
                     let args: Vec<SqlDomainExpr> = arguments
                         .into_iter()
@@ -754,14 +758,16 @@ fn s_lower_piped(
                 }
             }
 
-            // Lambda: substitute @ → current in body, then lower body
+            // Lambda: substitute @ → current in body, then lower body.
+            // Direction-agnostic: @ is positional.
             ast_addressed::FunctionExpression::Lambda { body, .. } => {
                 let current = state.to_sql(qualify, ctx)?;
                 let substituted = substitute_placeholder(*body, &current);
                 PipeVal::Sql(s_lower_expression_sql(substituted, qualify, ctx)?)
             }
 
-            // Infix in pipe position: current becomes left operand
+            // Infix in pipe position: /-> makes current the left operand;
+            // /->> makes current the right operand.
             ast_addressed::FunctionExpression::Infix {
                 operator,
                 left,
@@ -769,13 +775,17 @@ fn s_lower_piped(
                 ..
             } => {
                 let current = state.to_sql(qualify, ctx)?;
-                let right_sql = s_lower_expression(*right, qualify, ctx)?;
-                PipeVal::Sql(s_lower_binary_sql(&operator, current, right_sql)?)
+                let other = s_lower_expression(*right, qualify, ctx)?;
+                let (l, r) = match dir {
+                    PipeDirection::First => (current, other),
+                    PipeDirection::Last => (other, current),
+                };
+                PipeVal::Sql(s_lower_binary_sql(&operator, l, r)?)
             }
 
             // Window function in pipe position:
-            // If @ is present: substitute @ → current in arguments
-            // If no @: prepend current value as first argument
+            // If @ is present: substitute @ → current in arguments (direction irrelevant)
+            // Otherwise: thread current at first or last argument per direction.
             ast_addressed::FunctionExpression::Window {
                 name,
                 arguments,
@@ -791,11 +801,11 @@ fn s_lower_piped(
                         .map(|a| s_lower_with_placeholder(a, qualify, ctx, &current))
                         .collect::<Result<_>>()?
                 } else {
-                    let mut sql_args = vec![current.clone()];
-                    for a in arguments {
-                        sql_args.push(s_lower_expression(a, qualify, ctx)?);
-                    }
-                    sql_args
+                    let lowered: Vec<SqlDomainExpr> = arguments
+                        .into_iter()
+                        .map(|a| s_lower_expression(a, qualify, ctx))
+                        .collect::<Result<_>>()?;
+                    dir.thread(current, lowered)
                 };
                 PipeVal::Sql(s_lower_window_parts(
                     name.as_str(),

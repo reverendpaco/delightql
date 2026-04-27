@@ -286,7 +286,7 @@ fn walk_domain(expr: &DomainExpression, refs: &mut Vec<ExtractedReference>) {
             value, transforms, ..
         } => {
             walk_domain(value, refs);
-            for t in transforms {
+            for (_, t) in transforms {
                 walk_function(t, refs);
             }
         }

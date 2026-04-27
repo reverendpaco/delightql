@@ -1875,10 +1875,13 @@ module.exports = grammar({
     ),
 
     // Functional pipe operator for value-level transformations
+    // /->  threads current value as the first argument (Elixir-style)
+    // /->> threads current value as the last argument (F#-style)
     functional_pipe_operator: $ => token('/->'),
+    reverse_pipe_operator: $ => token('/->>'),
 
     // Piped expression: value flowing through transformations
-    // E.g., col /-> upper:() /-> trim:()
+    // E.g., col /-> upper:() /->> trim:()
     // The value can be any domain expression except binary_expression or piped_expression
     // (both must be parenthesized to enforce PONY rule - no implicit precedence)
     // Lower precedence to bind after arithmetic
@@ -1902,7 +1905,7 @@ module.exports = grammar({
         // Use parentheses for nested pipes: ((a /-> b) /-> c)
       )),
       repeat1(seq(
-        $.functional_pipe_operator,
+        choice($.functional_pipe_operator, $.reverse_pipe_operator),
         field('transform', choice(
           $.function_call,
           $.string_template,

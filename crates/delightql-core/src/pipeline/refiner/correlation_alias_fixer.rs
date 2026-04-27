@@ -466,7 +466,7 @@ fn extract_qualifiers_from_domain(expr: &resolved::DomainExpression, qualifiers:
             value, transforms, ..
         } => {
             extract_qualifiers_from_domain(value, qualifiers);
-            for transform in transforms {
+            for (_, transform) in transforms {
                 extract_qualifiers_from_function(transform, qualifiers);
             }
         }

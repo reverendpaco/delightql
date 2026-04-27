@@ -146,7 +146,10 @@ impl<'a> CfeRefiner<'a> {
                 alias,
             } => refined::DomainExpression::PipedExpression {
                 value: self.rd_box(value)?,
-                transforms: self.rf_vec(transforms)?,
+                transforms: transforms
+                    .into_iter()
+                    .map(|(dir, f)| Ok::<_, crate::error::DelightQLError>((dir, self.rf(f)?)))
+                    .collect::<Result<Vec<_>>>()?,
                 alias,
             },
             resolved::DomainExpression::Parenthesized { inner, alias } => {

@@ -22,6 +22,7 @@ use crate::pipeline::ast_transform::{
     walk_transform_relation, AstTransform,
 };
 use crate::pipeline::ast_unresolved;
+use crate::pipeline::asts::core::expressions::pipes::PipeDirection;
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
 use crate::pipeline::asts::core::metadata::GroundedPath;
 use crate::pipeline::asts::core::{
@@ -447,9 +448,9 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
                 alias,
             } => {
                 let mut current_value = self.transform_domain(*value)?;
-                let mut remaining_transforms = Vec::new();
+                let mut remaining_transforms: Vec<(PipeDirection, FunctionExpression)> = Vec::new();
 
-                for transform in transforms {
+                for (dir, transform) in transforms {
                     let transform = self.transform_function(transform)?;
                     let (name, namespace, args) = match &transform {
                         FunctionExpression::Curried {
@@ -465,13 +466,12 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
                             ..
                         } => (name.clone(), namespace.clone(), arguments.clone()),
                         _ => {
-                            remaining_transforms.push(transform);
+                            remaining_transforms.push((dir, transform));
                             continue;
                         }
                     };
 
-                    let mut full_args = vec![current_value.clone()];
-                    full_args.extend(args);
+                    let full_args: Vec<DomainExpression> = dir.thread(current_value.clone(), args);
                     let synthetic = DomainExpression::Function(FunctionExpression::Regular {
                         name,
                         namespace,
@@ -489,7 +489,7 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
                     if was_inlined {
                         current_value = inlined;
                     } else {
-                        remaining_transforms.push(transform);
+                        remaining_transforms.push((dir, transform));
                     }
                 }
 

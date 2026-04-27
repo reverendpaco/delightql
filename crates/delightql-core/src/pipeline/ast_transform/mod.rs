@@ -484,7 +484,7 @@ pub fn walk_transform_domain<P, Q, F: AstTransform<P, Q> + ?Sized>(
             value: Box::new(t.transform_domain(*value)?),
             transforms: transforms
                 .into_iter()
-                .map(|f| t.transform_function(f))
+                .map(|(dir, f)| t.transform_function(f).map(|f| (dir, f)))
                 .collect::<Result<Vec<_>>>()?,
             alias,
         }),
