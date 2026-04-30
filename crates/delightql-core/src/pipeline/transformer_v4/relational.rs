@@ -283,7 +283,9 @@ fn apply_fn_to_column(
                     scalar::make_column_lvar_qualified(column_name, qc.qualifier.as_deref());
                 let mut cfe_args = vec![col_lvar];
                 cfe_args.extend(arguments.iter().cloned());
-                if let Some(expanded) = scalar::try_expand_cfe(name.as_str(), &cfe_args, ctx)? {
+                if let Some(expanded) =
+                    scalar::try_expand_cfe(name.as_str(), &cfe_args, qualify, ctx)?
+                {
                     return scalar::s_lower_expression(expanded, qualify, ctx);
                 }
             }
@@ -602,16 +604,6 @@ fn r_lower_inner_relation(
             hygienic_injections,
             ..
         } => (identifier, subquery, hygienic_injections),
-        ast_addressed::InnerRelationPattern::CorrelatedWindowJoin {
-            identifier,
-            subquery,
-            ..
-        } => {
-            // TODO: CDT-WJ needs ROW_NUMBER() OVER (PARTITION BY ...) wrapping.
-            // For now, fall through to the common path — produces correct results
-            // for the non-windowed portion but won't apply the LIMIT correctly.
-            (identifier, subquery, vec![])
-        }
     };
 
     // Recursive descent into the subquery — same path as any exterior query.

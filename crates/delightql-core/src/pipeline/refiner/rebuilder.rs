@@ -535,33 +535,6 @@ fn build_inner_relation(
                 hygienic_injections: hygienic_injections.clone(),
             }
         }
-        InnerRelationPattern::CorrelatedWindowJoin {
-            identifier,
-            correlation_filters,
-            order_by,
-            limit,
-            subquery,
-        } => {
-            // For CDT-WJ: Remove correlation filters, LIMIT, and ORDER BY from subquery
-            //
-            // - Correlation filters get hoisted to JOIN ON
-            // - LIMIT is converted to WHERE rn <= N (via ROW_NUMBER window function)
-            // - ORDER BY is converted to ORDER BY inside ROW_NUMBER() OVER (... ORDER BY ...)
-            //
-            // All three must be stripped from the subquery to avoid double-application!
-            let cleaned_subquery =
-                remove_correlation_filters_from_expr(subquery, correlation_filters);
-            let cleaned_subquery = remove_limit_from_expr(&cleaned_subquery);
-            let cleaned_subquery = remove_order_by_from_expr(&cleaned_subquery);
-
-            InnerRelationPattern::CorrelatedWindowJoin {
-                identifier: identifier.clone(),
-                correlation_filters: correlation_filters.clone(),
-                order_by: order_by.clone(),
-                limit: *limit,
-                subquery: Box::new(cleaned_subquery),
-            }
-        }
         other => panic!(
             "catch-all hit in rebuilder.rs build_inner_relation (pattern clean): {:?}",
             other
@@ -632,22 +605,6 @@ fn build_inner_relation_from_flattened(
             aggregations: aggregations.iter().map(|a| a.clone().into()).collect(),
             subquery: Box::new(rebuilt_subquery),
             hygienic_injections: hygienic_injections.clone(),
-        },
-        InnerRelationPattern::CorrelatedWindowJoin {
-            identifier,
-            correlation_filters,
-            order_by,
-            limit,
-            ..
-        } => InnerRelationPattern::CorrelatedWindowJoin {
-            identifier: identifier.clone(),
-            correlation_filters: correlation_filters
-                .iter()
-                .map(|f| f.clone().into())
-                .collect(),
-            order_by: order_by.iter().map(|o| o.clone().into()).collect(),
-            limit: *limit,
-            subquery: Box::new(rebuilt_subquery),
         },
         InnerRelationPattern::UncorrelatedDerivedTable {
             identifier,
@@ -784,22 +741,6 @@ pub fn remove_correlation_filters_from_expr(
                             )),
                             hygienic_injections: hygienic_injections.clone(),
                         },
-                        resolved::InnerRelationPattern::CorrelatedWindowJoin {
-                            identifier,
-                            correlation_filters,
-                            order_by,
-                            limit,
-                            subquery,
-                        } => resolved::InnerRelationPattern::CorrelatedWindowJoin {
-                            identifier: identifier.clone(),
-                            correlation_filters: correlation_filters.clone(),
-                            order_by: order_by.clone(),
-                            limit: *limit,
-                            subquery: Box::new(remove_correlation_filters_from_expr(
-                                subquery,
-                                filters_to_remove,
-                            )),
-                        },
                         resolved::InnerRelationPattern::UncorrelatedDerivedTable {
                             identifier,
                             subquery,
@@ -852,134 +793,6 @@ pub fn remove_correlation_filters_from_expr(
     }
 }
 
-/// Remove LIMIT (TupleOrdinal) filters from a relational expression
-/// Used by CDT-WJ to strip the LIMIT clause since it's converted to ROW_NUMBER() + WHERE rn <= N
-pub fn remove_limit_from_expr(
-    expr: &resolved::RelationalExpression,
-) -> resolved::RelationalExpression {
-    match expr {
-        resolved::RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema,
-        } => {
-            // Check if this is a TupleOrdinal (LIMIT) filter
-            if matches!(condition, resolved::SigmaCondition::TupleOrdinal(_)) {
-                // Skip this filter - it's been converted to ROW_NUMBER() window function
-                return remove_limit_from_expr(source);
-            }
-
-            // Keep this filter, but recursively clean the source
-            resolved::RelationalExpression::Filter {
-                source: Box::new(remove_limit_from_expr(source)),
-                condition: condition.clone(),
-                origin: origin.clone(),
-                cpr_schema: cpr_schema.clone(),
-            }
-        }
-        resolved::RelationalExpression::Pipe(pipe_expr) => {
-            // Recursively clean the source
-            resolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                resolved::PipeExpression {
-                    source: remove_limit_from_expr(&pipe_expr.source),
-                    operator: pipe_expr.operator.clone(),
-                    cpr_schema: pipe_expr.cpr_schema.clone(),
-                },
-            )))
-        }
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            join_type,
-            cpr_schema,
-        } => resolved::RelationalExpression::Join {
-            left: Box::new(remove_limit_from_expr(left)),
-            right: Box::new(remove_limit_from_expr(right)),
-            join_condition: join_condition.clone(),
-            join_type: join_type.clone(),
-            cpr_schema: cpr_schema.clone(),
-        },
-        // Leaf nodes: no LIMIT to strip. Return unchanged.
-        // Relation variants (Ground, Anonymous, TVF, InnerRelation, ConsultedView, PseudoPredicate)
-        // and SetOperation are terminal — they don't contain inner ORDER BY to strip.
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::SetOperation { .. } => expr.clone(),
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains should be resolved before CDT-WJ processing")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    }
-}
-
-/// Remove ORDER BY (TupleOrdering) pipes from a relational expression
-/// Used by CDT-WJ to strip the ORDER BY clause since it's converted to ROW_NUMBER() OVER (... ORDER BY ...)
-pub fn remove_order_by_from_expr(
-    expr: &resolved::RelationalExpression,
-) -> resolved::RelationalExpression {
-    match expr {
-        resolved::RelationalExpression::Pipe(pipe_expr) => {
-            // Check if this is a TupleOrdering (ORDER BY) pipe
-            if matches!(
-                pipe_expr.operator,
-                resolved::UnaryRelationalOperator::TupleOrdering { .. }
-            ) {
-                // Skip this pipe - it's been converted to ORDER BY inside ROW_NUMBER() window function
-                return remove_order_by_from_expr(&pipe_expr.source);
-            }
-
-            // Keep this pipe, but recursively clean the source
-            resolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                resolved::PipeExpression {
-                    source: remove_order_by_from_expr(&pipe_expr.source),
-                    operator: pipe_expr.operator.clone(),
-                    cpr_schema: pipe_expr.cpr_schema.clone(),
-                },
-            )))
-        }
-        resolved::RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema,
-        } => {
-            // Recursively clean the source
-            resolved::RelationalExpression::Filter {
-                source: Box::new(remove_order_by_from_expr(source)),
-                condition: condition.clone(),
-                origin: origin.clone(),
-                cpr_schema: cpr_schema.clone(),
-            }
-        }
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            join_type,
-            cpr_schema,
-        } => resolved::RelationalExpression::Join {
-            left: Box::new(remove_order_by_from_expr(left)),
-            right: Box::new(remove_order_by_from_expr(right)),
-            join_condition: join_condition.clone(),
-            join_type: join_type.clone(),
-            cpr_schema: cpr_schema.clone(),
-        },
-        // Leaf nodes: no ORDER BY to strip. Return unchanged.
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::SetOperation { .. } => expr.clone(),
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains should be resolved before CDT-WJ processing")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    }
-}
 
 fn build_ground_relation(
     table: &FlatTable,

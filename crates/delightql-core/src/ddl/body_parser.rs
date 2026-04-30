@@ -379,20 +379,6 @@ fn remap_inner_pattern_qualifiers(
             }
             remap_relexpr_qualifiers(subquery, remap);
         }
-        InnerRelationPattern::CorrelatedWindowJoin {
-            correlation_filters,
-            order_by,
-            subquery,
-            ..
-        } => {
-            for f in correlation_filters {
-                remap_boolexpr_qualifiers(f, remap);
-            }
-            for o in order_by {
-                remap_domexpr_qualifiers(o, remap);
-            }
-            remap_relexpr_qualifiers(subquery, remap);
-        }
     }
 }
 

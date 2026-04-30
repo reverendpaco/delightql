@@ -253,26 +253,6 @@ fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<Ex
             }
             walk_relational(subquery, refs);
         }
-        InnerRelationPattern::CorrelatedWindowJoin {
-            identifier,
-            correlation_filters,
-            order_by,
-            subquery,
-            ..
-        } => {
-            refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
-            for filter in correlation_filters {
-                walk_boolean(filter, refs);
-            }
-            for ob in order_by {
-                walk_domain(ob, refs);
-            }
-            walk_relational(subquery, refs);
-        }
     }
 }
 

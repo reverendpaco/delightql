@@ -72,10 +72,8 @@ pub(super) fn flatten_inner_relation(
             hygienic_injections,
             ..
         } => hygienic_injections.clone(),
-        // UDT, Indeterminate, CorrelatedWindowJoin: no hygienic injections
         resolved::InnerRelationPattern::UncorrelatedDerivedTable { .. }
-        | resolved::InnerRelationPattern::Indeterminate { .. }
-        | resolved::InnerRelationPattern::CorrelatedWindowJoin { .. } => vec![],
+        | resolved::InnerRelationPattern::Indeterminate { .. } => vec![],
     };
 
     match &pattern {
@@ -91,13 +89,6 @@ pub(super) fn flatten_inner_relation(
             aggregations: _,
             subquery,
             ..
-        }
-        | resolved::InnerRelationPattern::CorrelatedWindowJoin {
-            identifier,
-            correlation_filters,
-            order_by: _,
-            limit: _,
-            subquery,
         } => {
             // Determine the derived table's actual alias
             // If no explicit alias, use table name (schema shadowing)
@@ -111,19 +102,6 @@ pub(super) fn flatten_inner_relation(
                 subquery,
                 correlation_filters,
             );
-
-            // CDT-WJ SPECIFIC: Also remove LIMIT and ORDER BY from the subquery
-            // These are converted to ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) + WHERE rn <= N
-            // If we don't remove them, they'll be double-applied (once in subquery, once in window function)
-            let cleaned_subquery = if matches!(
-                pattern,
-                resolved::InnerRelationPattern::CorrelatedWindowJoin { .. }
-            ) {
-                let cleaned = super::super::rebuilder::remove_limit_from_expr(&cleaned_subquery);
-                super::super::rebuilder::remove_order_by_from_expr(&cleaned)
-            } else {
-                cleaned_subquery
-            };
 
             // Rewrite self-reference qualifiers in non-correlation filters
             // e.g., `o.status = "completed"` → `orders.status = "completed"`
@@ -230,8 +208,7 @@ pub(super) fn flatten_inner_relation(
                 } => (identifier.clone(), Some(subquery)),
                 // These shouldn't reach here (handled above), but for completeness
                 resolved::InnerRelationPattern::CorrelatedScalarJoin { identifier, .. }
-                | resolved::InnerRelationPattern::CorrelatedGroupJoin { identifier, .. }
-                | resolved::InnerRelationPattern::CorrelatedWindowJoin { identifier, .. } => {
+                | resolved::InnerRelationPattern::CorrelatedGroupJoin { identifier, .. } => {
                     (identifier.clone(), None)
                 }
             };

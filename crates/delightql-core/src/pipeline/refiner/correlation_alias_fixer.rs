@@ -199,8 +199,7 @@ fn extract_base_relation_name(expr: &resolved::RelationalExpression) -> Option<S
                 resolved::InnerRelationPattern::Indeterminate { identifier, .. }
                 | resolved::InnerRelationPattern::UncorrelatedDerivedTable { identifier, .. }
                 | resolved::InnerRelationPattern::CorrelatedScalarJoin { identifier, .. }
-                | resolved::InnerRelationPattern::CorrelatedGroupJoin { identifier, .. }
-                | resolved::InnerRelationPattern::CorrelatedWindowJoin { identifier, .. } => {
+                | resolved::InnerRelationPattern::CorrelatedGroupJoin { identifier, .. } => {
                     Some(identifier.name.to_string())
                 }
             },

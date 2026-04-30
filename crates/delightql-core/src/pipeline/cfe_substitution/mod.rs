@@ -25,11 +25,16 @@ pub fn is_context_aware_call(arguments: &[ast::DomainExpression]) -> bool {
 }
 
 /// Substitute CFE with context-aware call: f:(.., args)
-/// Grabs context parameters from scope by creating unqualified Lvar references
-/// The existing resolution/transformation will handle finding these in the current scope
+///
+/// `context_bindings` maps each context-param name to the expression it
+/// should be replaced with at this call site. The caller (transformer)
+/// builds these by qualifying each name against the call-site scope, so
+/// the resulting Lvars carry an explicit outer qualifier — preventing
+/// inner-scope shadowing inside subqueries spawned by the CFE body.
 pub fn substitute_cfe_with_context(
     cfe: &ast::PrecompiledCfeDefinition,
     arguments: &[ast::DomainExpression], // Includes ContextMarker as first element
+    context_bindings: std::collections::HashMap<String, ast::DomainExpression>,
 ) -> Result<ast::DomainExpression> {
     // Skip the ContextMarker (first element)
     let regular_args = if arguments.is_empty() {
@@ -52,22 +57,21 @@ pub fn substitute_cfe_with_context(
         });
     }
 
-    let mut regular_substitutions = std::collections::HashMap::new();
-
-    // Substitute context params with unqualified Lvar references
-    // These will resolve to columns in the current scope during SQL generation
+    // Validate that the caller provided a binding for every context param.
     for ctx_param in &cfe.context_params {
-        regular_substitutions.insert(
-            ctx_param.clone(),
-            ast::DomainExpression::Lvar {
-                name: ctx_param.clone().into(),
-                qualifier: None, // Unqualified - will resolve to current scope
-                namespace_path: ast::NamespacePath::empty(),
-                alias: None,
-                provenance: ast::PhaseBox::phantom(),
-            },
-        );
+        if !context_bindings.contains_key(ctx_param) {
+            return Err(DelightQLError::ParseError {
+                message: format!(
+                    "CFE '{}' context parameter '{}' has no binding at call site",
+                    cfe.name, ctx_param
+                ),
+                source: None,
+                subcategory: None,
+            });
+        }
     }
+
+    let mut regular_substitutions = context_bindings;
 
     // Substitute regular params from arguments
     for (param, arg) in cfe.parameters.iter().zip(regular_args) {

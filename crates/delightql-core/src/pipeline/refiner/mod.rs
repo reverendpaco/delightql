@@ -23,10 +23,12 @@
 // construction, fixing the classify_operator() no-op bug.
 
 mod analyzer;
+mod cdt_wj_rewriter;
 mod correlation_alias_fixer;
 mod correlation_analyzer;
 mod flattener;
 mod laws;
+mod limit_placement;
 mod pattern_classifier;
 mod rebuilder;
 mod types;
@@ -348,6 +350,11 @@ pub(crate) fn refine_internal(
     is_top_level: bool,
     danger_gates: crate::pipeline::danger_gates::DangerGateMap,
 ) -> Result<refined::RelationalExpression> {
+    // Phase 2 of LIMIT-PLACEMENT-PLAN: insert UDT subquery boundaries where
+    // a limit is followed by a row-collapsing operator (aggregation, group,
+    // distinct), and fold consecutive limits into a single min-limit.
+    let ast = limit_placement::apply(ast)?;
+
     let mut fold = RefinerFold {
         is_top_level,
         danger_gates,
@@ -405,9 +412,57 @@ pub fn refine_query_with_gates(
     query: resolved::Query,
     danger_gates: crate::pipeline::danger_gates::DangerGateMap,
 ) -> Result<refined::Query> {
+    // Phase 2 of LIMIT-PLACEMENT-PLAN: pre-process the query AST to insert
+    // UDT subquery boundaries where a limit is followed by a row-collapsing
+    // operator. Runs once at the top level; the pass recurses into all
+    // relational subqueries it encounters.
+    let query = apply_limit_placement_to_query(query)?;
+
     let mut fold = RefinerFold {
         is_top_level: true,
         danger_gates,
     };
     fold.transform_query(query)
+}
+
+#[stacksafe::stacksafe]
+fn apply_limit_placement_to_query(query: resolved::Query) -> Result<resolved::Query> {
+    match query {
+        resolved::Query::Relational(expr) => {
+            Ok(resolved::Query::Relational(limit_placement::apply(expr)?))
+        }
+        resolved::Query::WithCtes { ctes, query } => {
+            let new_ctes = ctes
+                .into_iter()
+                .map(|cte| {
+                    Ok(resolved::CteBinding {
+                        expression: limit_placement::apply(cte.expression)?,
+                        name: cte.name,
+                        is_recursive: cte.is_recursive,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(resolved::Query::WithCtes {
+                ctes: new_ctes,
+                query: limit_placement::apply(query)?,
+            })
+        }
+        resolved::Query::ReplTempTable { query, table_name } => Ok(resolved::Query::ReplTempTable {
+            query: Box::new(apply_limit_placement_to_query(*query)?),
+            table_name,
+        }),
+        resolved::Query::ReplTempView { query, view_name } => Ok(resolved::Query::ReplTempView {
+            query: Box::new(apply_limit_placement_to_query(*query)?),
+            view_name,
+        }),
+        resolved::Query::WithPrecompiledCfes { cfes, query } => {
+            Ok(resolved::Query::WithPrecompiledCfes {
+                cfes,
+                query: Box::new(apply_limit_placement_to_query(*query)?),
+            })
+        }
+        // CFE precompilation and ER-context handled by the caller; the
+        // refiner errors on these in its main path. Pass through.
+        other => Ok(other),
+    }
 }

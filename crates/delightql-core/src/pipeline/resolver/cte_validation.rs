@@ -201,11 +201,6 @@ fn extract_table_references_recursive(
                     identifier,
                     subquery,
                     ..
-                }
-                | ast_unresolved::InnerRelationPattern::CorrelatedWindowJoin {
-                    identifier,
-                    subquery,
-                    ..
                 } => {
                     refs.push(identifier.name.to_string());
                     extract_table_references_recursive(subquery, refs);

@@ -1054,25 +1054,6 @@ pub fn walk_transform_inner_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
             subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
             hygienic_injections,
         }),
-        InnerRelationPattern::CorrelatedWindowJoin {
-            identifier,
-            correlation_filters,
-            order_by,
-            limit,
-            subquery,
-        } => Ok(InnerRelationPattern::CorrelatedWindowJoin {
-            identifier,
-            correlation_filters: correlation_filters
-                .into_iter()
-                .map(|f| t.transform_boolean(f))
-                .collect::<Result<Vec<_>>>()?,
-            order_by: order_by
-                .into_iter()
-                .map(|e| t.transform_domain(e))
-                .collect::<Result<Vec<_>>>()?,
-            limit,
-            subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
-        }),
     }
 }
 

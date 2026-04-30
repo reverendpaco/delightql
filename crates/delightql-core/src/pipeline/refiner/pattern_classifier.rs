@@ -94,16 +94,26 @@ pub fn classify_inner_relation_pattern(
         });
     }
 
-    // Step 3: Has correlation - check for LIMIT (CDT-WJ pattern)
+    // Step 3: Has correlation + LIMIT — structurally rewrite into a
+    // CDT-SJ-shaped subquery whose body explicitly contains a ROW_NUMBER()
+    // window expression and a `WHERE rn <= N` filter (Fork-1, P0').
+    // The rewriter also runs hygienic-column injection when the user's
+    // projection strips correlation columns; we plumb the resulting
+    // injections directly into the CorrelatedScalarJoin pattern instead
+    // of recursing through classify (which would re-run injection on a
+    // shape that no longer matches its trigger).
     if has_limit(&subquery) {
-        let order_by = extract_order_by(&subquery)?;
-        let limit = extract_limit_value(&subquery)?;
-        return Ok(InnerRelationPattern::CorrelatedWindowJoin {
+        let (rewritten, hygienic_injections) =
+            super::cdt_wj_rewriter::rewrite_window_join_subquery(
+                subquery,
+                &correlation_filters,
+                &identifier,
+            )?;
+        return Ok(InnerRelationPattern::CorrelatedScalarJoin {
             identifier,
-            correlation_filters, // Metadata only - filters stay in subquery
-            order_by,
-            limit,
-            subquery: Box::new(subquery),
+            correlation_filters,
+            subquery: Box::new(rewritten),
+            hygienic_injections,
         });
     }
 
@@ -203,77 +213,6 @@ fn has_limit(expr: &resolved::RelationalExpression) -> bool {
     }
 }
 
-fn extract_limit_value(expr: &resolved::RelationalExpression) -> Result<Option<i64>> {
-    match expr {
-        resolved::RelationalExpression::Filter {
-            source, condition, ..
-        } => {
-            if let resolved::SigmaCondition::TupleOrdinal(resolved::TupleOrdinalClause {
-                operator: resolved::TupleOrdinalOperator::LessThan,
-                value,
-                offset: _,
-            }) = condition
-            {
-                return Ok(Some(*value));
-            }
-            extract_limit_value(source)
-        }
-        resolved::RelationalExpression::Pipe(pipe_expr) => extract_limit_value(&pipe_expr.source),
-        // Relation, Join, SetOperation: no limit
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::Join { .. }
-        | resolved::RelationalExpression::SetOperation { .. } => Ok(None),
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before pattern classification")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    }
-}
-
-fn extract_order_by(
-    expr: &resolved::RelationalExpression,
-) -> Result<Vec<resolved::DomainExpression>> {
-    // Recursively search for TupleOrdering operators and extract their column expressions
-    match expr {
-        resolved::RelationalExpression::Pipe(pipe_expr) => {
-            // Check if this pipe is a TupleOrdering operator
-            if let resolved::UnaryRelationalOperator::TupleOrdering { specs, .. } =
-                &pipe_expr.operator
-            {
-                // Extract column expressions from the ordering specs
-                return Ok(specs.iter().map(|spec| spec.column.clone()).collect());
-            }
-            // Otherwise, recurse into the source
-            extract_order_by(&pipe_expr.source)
-        }
-        resolved::RelationalExpression::Filter { source, .. } => {
-            // Recurse into the source
-            extract_order_by(source)
-        }
-        resolved::RelationalExpression::Join { left, right, .. } => {
-            // Check left first, then right
-            let left_order = extract_order_by(left)?;
-            if !left_order.is_empty() {
-                return Ok(left_order);
-            }
-            extract_order_by(right)
-        }
-        // Relation, SetOperation: no order by
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::SetOperation { .. } => Ok(vec![]),
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before pattern classification")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    }
-}
-
 // ============================================================================
 // Hygienic Column Injection
 // ============================================================================
@@ -282,7 +221,7 @@ fn extract_order_by(
 ///
 /// Returns: (modified_subquery, list_of_injections)
 /// where injections = Vec<(original_column_name, hygienic_alias)>
-fn inject_hygienic_columns_if_needed(
+pub(super) fn inject_hygienic_columns_if_needed(
     subquery: resolved::RelationalExpression,
     correlation_filters: &[resolved::BooleanExpression],
     table_identifier: &QualifiedName,

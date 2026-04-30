@@ -123,8 +123,7 @@ fn inner_pattern_references_name(pattern: &ast_refined::InnerRelationPattern, na
         ast_refined::InnerRelationPattern::Indeterminate { subquery, .. }
         | ast_refined::InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. }
         | ast_refined::InnerRelationPattern::CorrelatedScalarJoin { subquery, .. }
-        | ast_refined::InnerRelationPattern::CorrelatedGroupJoin { subquery, .. }
-        | ast_refined::InnerRelationPattern::CorrelatedWindowJoin { subquery, .. } => {
+        | ast_refined::InnerRelationPattern::CorrelatedGroupJoin { subquery, .. } => {
             expression_references_name(subquery, name)
         }
     }

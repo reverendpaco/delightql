@@ -403,6 +403,7 @@ pub(super) fn s_lower_comparison_op(op: &str) -> Result<BinaryOperator> {
 pub(super) fn try_expand_cfe(
     name: &str,
     arguments: &[ast_addressed::DomainExpression],
+    qualify: &dyn super::builder::Qualify,
     ctx: &TransformCtx,
 ) -> Result<Option<ast_addressed::DomainExpression>> {
     use crate::pipeline::cfe_substitution;
@@ -426,7 +427,14 @@ pub(super) fn try_expand_cfe(
     } else if !cfe_def.context_params.is_empty() {
         // Context CFE — check if context-aware call (..) or positional
         if cfe_substitution::is_context_aware_call(arguments) {
-            cfe_substitution::substitute_cfe_with_context(cfe_def, arguments)?
+            // Resolve each context parameter against the call-site scope
+            // *now*, while we still have it. The CFE body will be lowered
+            // inside subqueries that introduce their own columns; an
+            // unqualified reference would shadow against those, which is
+            // exactly the bug captured by `cfe_outer_scope_binding`.
+            let context_bindings =
+                build_context_bindings(&cfe_def.context_params, qualify, ctx)?;
+            cfe_substitution::substitute_cfe_with_context(cfe_def, arguments, context_bindings)?
         } else if cfe_def.allows_positional_context_call {
             let ctx_count = cfe_def.context_params.len();
             let (ctx_args, regular_args) = arguments.split_at(ctx_count);
@@ -457,6 +465,42 @@ pub(super) fn try_expand_cfe(
     };
 
     Ok(Some(substituted))
+}
+
+/// Build the context-parameter binding map for a `..`-form CFE call by
+/// qualifying each parameter name against the call-site scope. The
+/// resulting Lvars carry an explicit qualifier so subsequent lowering
+/// inside subqueries doesn't shadow them.
+fn build_context_bindings(
+    context_params: &[String],
+    qualify: &dyn super::builder::Qualify,
+    ctx: &TransformCtx,
+) -> Result<std::collections::HashMap<String, ast_addressed::DomainExpression>> {
+    let mut bindings = std::collections::HashMap::new();
+    for param in context_params {
+        // Try the call-site (inner) scope first, then any outer scope the
+        // transform context carries. Same precedence as `s_lower_lvar`.
+        let qualified = match qualify.qualify(param) {
+            Ok(qc) => qc,
+            Err(_) if !ctx.outer_columns.is_empty() => super::builder::qualify_in_columns(
+                param,
+                &ctx.outer_columns,
+                "<outer>",
+            )?,
+            Err(e) => return Err(e),
+        };
+        bindings.insert(
+            param.clone(),
+            ast_addressed::DomainExpression::Lvar {
+                name: qualified.name.into(),
+                qualifier: qualified.qualifier.map(|q| q.into()),
+                namespace_path: ast_addressed::NamespacePath::empty(),
+                alias: None,
+                provenance: ast_addressed::PhaseBox::phantom(),
+            },
+        );
+    }
+    Ok(bindings)
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +704,7 @@ fn s_lower_named_function(
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
 ) -> Result<SqlDomainExpr> {
-    if let Some(substituted) = try_expand_cfe(name.as_str(), &arguments, ctx)? {
+    if let Some(substituted) = try_expand_cfe(name.as_str(), &arguments, qualify, ctx)? {
         return s_lower_expression(substituted, qualify, ctx);
     }
     let args: Vec<SqlDomainExpr> = arguments
@@ -717,7 +761,7 @@ fn s_lower_piped(
                 if !transform_has_placeholder {
                     if let PipeVal::Ast(ref ast_val) = state {
                         let cfe_args = dir.thread(ast_val.clone(), arguments.iter().cloned());
-                        if let Some(expanded) = try_expand_cfe(name.as_str(), &cfe_args, ctx)? {
+                        if let Some(expanded) = try_expand_cfe(name.as_str(), &cfe_args, qualify, ctx)? {
                             PipeVal::Ast(expanded)
                         } else {
                             let current = state.to_sql(qualify, ctx)?;
@@ -734,7 +778,7 @@ fn s_lower_piped(
                         let placeholder =
                             ast_addressed::DomainExpression::ValuePlaceholder { alias: None };
                         let cfe_args = dir.thread(placeholder, arguments.iter().cloned());
-                        if let Some(expanded) = try_expand_cfe(name.as_str(), &cfe_args, ctx)? {
+                        if let Some(expanded) = try_expand_cfe(name.as_str(), &cfe_args, qualify, ctx)? {
                             PipeVal::Sql(s_lower_with_placeholder(
                                 expanded, qualify, ctx, &current,
                             )?)
@@ -892,7 +936,7 @@ fn s_lower_with_placeholder(
                     name, arguments, ..
                 } => {
                     // CFE expansion: try before falling through to SQL function
-                    if let Some(expanded) = try_expand_cfe(name.as_str(), &arguments, ctx)? {
+                    if let Some(expanded) = try_expand_cfe(name.as_str(), &arguments, qualify, ctx)? {
                         return s_lower_with_placeholder(expanded, qualify, ctx, replacement);
                     }
                     let args: Vec<SqlDomainExpr> = arguments

@@ -285,17 +285,6 @@ pub enum InnerRelationPattern<Phase = Unresolved> {
         hygienic_injections: Vec<(String, String)>,
     },
 
-    /// CDT-WJ: Correlated Derived Table - Window Join
-    /// Has correlation + LIMIT (with optional ORDER BY)
-    /// Compiles to: CTE with ROW_NUMBER() OVER (PARTITION BY correlation_key ...)
-    #[lispy("pattern:cdt-wj")]
-    CorrelatedWindowJoin {
-        identifier: QualifiedName,
-        correlation_filters: Vec<BooleanExpression<Phase>>,
-        order_by: Vec<DomainExpression<Phase>>,
-        limit: Option<i64>,
-        subquery: Box<RelationalExpression<Phase>>,
-    },
 }
 
 /// Base relations - sources of data
