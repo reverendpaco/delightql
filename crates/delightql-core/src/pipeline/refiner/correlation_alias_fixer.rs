@@ -400,10 +400,15 @@ fn extract_qualifiers_from_operator(
             resolved::ModuloSpec::GroupBy {
                 reducing_by,
                 reducing_on,
-                arbitrary,
+                delegates,
             } => {
-                for expr in reducing_by.iter().chain(reducing_on).chain(arbitrary) {
+                for expr in reducing_by.iter().chain(reducing_on) {
                     extract_qualifiers_from_domain(expr, qualifiers);
+                }
+                for w in delegates {
+                    for expr in w.payload.iter().chain(w.order.iter().map(|o| &o.column)) {
+                        extract_qualifiers_from_domain(expr, qualifiers);
+                    }
                 }
             }
         },

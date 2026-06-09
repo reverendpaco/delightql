@@ -399,7 +399,7 @@ pub(super) fn bubble_modulo_operator(
         ast_unresolved::ModuloSpec::GroupBy {
             reducing_by,
             reducing_on,
-            arbitrary,
+            delegates,
         } => {
             let mut deps =
                 bubble_expressions_collect_deps(reducing_by, schema, system, cte_context)?;
@@ -409,12 +409,21 @@ pub(super) fn bubble_modulo_operator(
                 system,
                 cte_context,
             )?);
-            deps.extend(bubble_expressions_collect_deps(
-                arbitrary,
-                schema,
-                system,
-                cte_context,
-            )?);
+            for w in delegates {
+                deps.extend(bubble_expressions_collect_deps(
+                    &w.payload,
+                    schema,
+                    system,
+                    cte_context,
+                )?);
+                let order_cols: Vec<_> = w.order.iter().map(|o| o.column.clone()).collect();
+                deps.extend(bubble_expressions_collect_deps(
+                    &order_cols,
+                    schema,
+                    system,
+                    cte_context,
+                )?);
+            }
             deps
         }
     };

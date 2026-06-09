@@ -141,7 +141,7 @@ fn parse_unary_operator_core(
                 spec: ModuloSpec::GroupBy {
                     reducing_by: vec![],
                     reducing_on: vec![aggregation],
-                    arbitrary: vec![],
+                    delegates: vec![],
                 },
             },
             cpr_schema: PhaseBox::phantom(),

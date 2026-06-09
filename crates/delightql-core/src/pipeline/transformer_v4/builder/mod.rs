@@ -411,6 +411,72 @@ impl Builder<Unprojected> {
         }
     }
 
+    /// Assemble a left-deep join from N prepared operands (from
+    /// `into_join_operand`) WITHOUT wrapping intermediate joins as subqueries.
+    ///
+    /// `operands` must be non-empty; `conditions` holds one entry per join
+    /// (`operands.len() - 1` entries), applied left-to-right:
+    /// `op[0] JOIN op[1] ON conditions[0]`, then that result `JOIN op[2] ON
+    /// conditions[1]`, and so on.
+    ///
+    /// Unlike chaining `from_join` two-at-a-time, the intermediate joins are
+    /// kept as a single nested `TableExpression::Join` tree (left-associative,
+    /// exactly like SQL's `a JOIN b JOIN c`). No intermediate `SELECT *`
+    /// subquery wrap is introduced, so each operand keeps its own alias and the
+    /// per-operand column provenance survives — the caller projects the final
+    /// output explicitly, qualifying each column to the operand that owns it.
+    ///
+    /// Assumes operands have distinct table identities (each
+    /// `into_join_operand` mints a fresh subquery alias), so no same-name
+    /// collision aliasing is performed.
+    pub(in crate::pipeline::transformer_v4) fn from_joins(
+        operands: Vec<JoinOperand>,
+        conditions: Vec<(JoinType, JoinCondition)>,
+    ) -> Self {
+        assert!(
+            !operands.is_empty(),
+            "from_joins requires at least one operand"
+        );
+        assert_eq!(
+            conditions.len(),
+            operands.len() - 1,
+            "from_joins requires exactly one condition per join"
+        );
+
+        let mut iter = operands.into_iter();
+        let first = iter.next().expect("non-empty checked above");
+        let mut acc_table = first.table;
+        let mut acc_columns = first.columns;
+        let mut acc_ctes = first.ctes;
+        let names = first.names;
+
+        for (operand, (kind, condition)) in iter.zip(conditions.into_iter()) {
+            acc_table = TableExpression::Join {
+                left: Box::new(acc_table),
+                right: Box::new(operand.table),
+                join_type: kind,
+                join_condition: condition,
+            };
+            acc_columns.extend(operand.columns);
+            acc_ctes.extend(operand.ctes);
+        }
+
+        let join_scope_name = names.next_table_name("join");
+        let scope = ScopeEntry::new(join_scope_name, acc_columns);
+        Self {
+            state: BuilderState::Segment {
+                from: vec![acc_table],
+                filters: Vec::new(),
+                order_by: Vec::new(),
+                limit_offset: None,
+                scope,
+            },
+            names,
+            accumulated_ctes: acc_ctes,
+            _phase: PhantomData,
+        }
+    }
+
     /// Set the SELECT list. Transitions Unprojected → Projected.
     ///
     /// Disambiguates duplicate aliases: if two items share an alias

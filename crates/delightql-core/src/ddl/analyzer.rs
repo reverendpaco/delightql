@@ -543,7 +543,7 @@ fn walk_modulo_spec(spec: &ModuloSpec, refs: &mut Vec<ExtractedReference>) {
         ModuloSpec::GroupBy {
             reducing_by,
             reducing_on,
-            arbitrary,
+            delegates,
         } => {
             for expr in reducing_by {
                 walk_domain(expr, refs);
@@ -551,8 +551,13 @@ fn walk_modulo_spec(spec: &ModuloSpec, refs: &mut Vec<ExtractedReference>) {
             for expr in reducing_on {
                 walk_domain(expr, refs);
             }
-            for expr in arbitrary {
-                walk_domain(expr, refs);
+            for w in delegates {
+                for expr in &w.payload {
+                    walk_domain(expr, refs);
+                }
+                for o in &w.order {
+                    walk_domain(&o.column, refs);
+                }
             }
         }
     }

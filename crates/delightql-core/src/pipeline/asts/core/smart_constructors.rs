@@ -458,7 +458,7 @@ impl<Phase> PipeBuilder<Phase> {
             spec: ModuloSpec::GroupBy {
                 reducing_by,
                 reducing_on,
-                arbitrary: vec![], // Default to empty
+                delegates: vec![], // Default to empty
             },
         });
         self

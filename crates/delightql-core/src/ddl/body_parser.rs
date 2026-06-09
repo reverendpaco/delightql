@@ -684,7 +684,7 @@ fn remap_operator_qualifiers(
             ModuloSpec::GroupBy {
                 reducing_by,
                 reducing_on,
-                arbitrary,
+                delegates,
             } => {
                 for e in reducing_by {
                     remap_domexpr_qualifiers(e, remap);
@@ -692,8 +692,13 @@ fn remap_operator_qualifiers(
                 for e in reducing_on {
                     remap_domexpr_qualifiers(e, remap);
                 }
-                for e in arbitrary {
-                    remap_domexpr_qualifiers(e, remap);
+                for w in delegates {
+                    for e in &mut w.payload {
+                        remap_domexpr_qualifiers(e, remap);
+                    }
+                    for o in &mut w.order {
+                        remap_domexpr_qualifiers(&mut o.column, remap);
+                    }
                 }
             }
         },

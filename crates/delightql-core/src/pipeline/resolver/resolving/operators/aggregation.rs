@@ -408,7 +408,7 @@ pub(super) fn resolve_modulo_via_fold(
         ast_unresolved::ModuloSpec::GroupBy {
             reducing_by,
             reducing_on,
-            arbitrary,
+            delegates,
         } => {
             // Complex GROUP BY with aggregations
             let mut resolved_reducing_by =
@@ -567,19 +567,61 @@ pub(super) fn resolve_modulo_via_fold(
                 }
             }
 
-            // Resolve arbitrary columns
-            let resolved_arbitrary =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(
-                    fold, arbitrary, available, false,
-                )?;
+            // Resolve delegate selections: each carries a payload (surfaced
+            // columns) and an ordering (empty == arbitrary delegate). Only the
+            // payload contributes output columns; the order columns are sort
+            // keys consumed later by the lowering.
+            let mut resolved_delegates = Vec::with_capacity(delegates.len());
+            for w in delegates {
+                let payload =
+                    super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                        fold, w.payload, available, false,
+                    )?;
+                let order = w
+                    .order
+                    .into_iter()
+                    .map(|spec| {
+                        super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                            fold,
+                            vec![spec.column],
+                            available,
+                            false,
+                        )
+                        .map(|mut exprs| ast_resolved::OrderingSpec {
+                            column: exprs
+                                .pop()
+                                .expect("resolve_expressions_via_fold returns same count as input"),
+                            direction:
+                                super::super::super::helpers::converters::convert_order_direction(
+                                    spec.direction,
+                                ),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                resolved_delegates.push(ast_resolved::DelegateSpec { payload, order });
+            }
 
-            // Add arbitrary columns to output
+            // Add delegate payload columns to output (order columns are not output).
+            // Dedup by name: a `(*)` payload expands to include the group key(s),
+            // which are already emitted in group position. The design rule is
+            // "grouping columns emit in their group position; `(*)` contributes
+            // everything else, deduped by name."
+            let mut seen_names: std::collections::HashSet<String> =
+                output.iter().map(|c| c.name().to_string()).collect();
             let base_idx = resolved_reducing_by.len() + resolved_reducing_on.len();
-            for (idx, expr) in resolved_arbitrary.iter().enumerate() {
-                if let Some(col) =
-                    extract_provided_column_from_domain_expr(expr, available, base_idx + idx)
-                {
-                    output.push(col);
+            let mut delegate_col_idx = 0;
+            for w in &resolved_delegates {
+                for expr in &w.payload {
+                    if let Some(col) = extract_provided_column_from_domain_expr(
+                        expr,
+                        available,
+                        base_idx + delegate_col_idx,
+                    ) {
+                        if seen_names.insert(col.name().to_string()) {
+                            output.push(col);
+                        }
+                    }
+                    delegate_col_idx += 1;
                 }
             }
 
@@ -593,7 +635,7 @@ pub(super) fn resolve_modulo_via_fold(
             let spec = ast_resolved::ModuloSpec::GroupBy {
                 reducing_by: resolved_reducing_by,
                 reducing_on: resolved_reducing_on,
-                arbitrary: resolved_arbitrary,
+                delegates: resolved_delegates,
             };
 
             (spec, output)

@@ -34,6 +34,9 @@ module.exports = grammar({
     [$.lvar, $.column_header_item],
     // Conflict between parenthesized predicates and tuple expressions
     [$.paren_predicate, $.domain_expression],
+    // Delegate payload (cols)/(*)/<~ vs parenthesized domain_expression: GLR forks,
+    // the trailing <~ window_operator disambiguates delegate from aggregate.
+    [$.domain_expression, $.delegate_payload],
     // EPOCH 7.1: Full domain expressions in data rows can conflict with headers
     [$.domain_expression, $.column_header_item],
     // Window functions: + in frame_bound conflicts with + in exists_marker
@@ -2111,37 +2114,48 @@ module.exports = grammar({
     ),
     
     _grouping_content: $ => choice(
-      // GROUP BY with aggregates: %(country ~> sum:(total))
+      // GROUP BY with reduction items (aggregates and/or delegates):
+      //   %(country ~> sum:(total))           aggregate
+      //   %(country ~> (name) <~)             delegate selection (arbitrary)
+      //   %(country ~> sum:(total), (name) <~ #(created descending))
       seq(
         field('reducing_by', $.domain_expression_list),
         $.aggregation_arrow,
-        field('reducing_on', $.domain_expression_list),
-        // Optional arbitrary expressions: %(country ~> sum:(total) ~? name, email)
-        optional(seq(
-          $.arbitrary_separator,
-          field('arbitrary', $.domain_expression_list)
-        ))
-      ),
-      // GROUP BY without aggregates but with arbitrary: %(country ~? last_name)
-      seq(
-        field('reducing_by', $.domain_expression_list),
-        $.arbitrary_separator,
-        field('arbitrary', $.domain_expression_list)
+        field('reducing_on', $.reduction_item_list)
       ),
       // Simple distinct/GROUP BY: %(country)
       field('reducing_by', $.domain_expression_list),
-      // Whole-table aggregation: %(~> count:(*))
+      // Whole-table aggregation: %(~> count:(*))  or  %(~> (name) <~ #(id))
       seq(
         $.aggregation_arrow,
-        field('reducing_on', $.domain_expression_list),
-        // Optional arbitrary expressions: %(~> count:(*) ~? name)
-        optional(seq(
-          $.arbitrary_separator,
-          field('arbitrary', $.domain_expression_list)
-        ))
+        field('reducing_on', $.reduction_item_list)
       )
     ),
-    
+
+    // A reduction item is an ordinary aggregate/expression OR a delegate selection.
+    reduction_item_list: $ => seq(
+      $.reduction_item,
+      repeat(seq($._comma, $.reduction_item))
+    ),
+    reduction_item: $ => choice(
+      $.delegate_item,
+      $.domain_expression
+    ),
+    // Delegate selection in reduction place: pull the reduction back to a row.
+    //   (*) <~ #(order)     whole-row delegate (DISTINCT ON)
+    //   (a, b) <~ #(order)  coherent multi-column delegate
+    //   col <~ #(order)     single-column ordered delegate
+    //   col <~              arbitrary (empty ordering)
+    delegate_item: $ => seq(
+      field('payload', $.delegate_payload),
+      $.window_operator,
+      optional(field('order', $.window_ordering))
+    ),
+    delegate_payload: $ => choice(
+      seq($._lparen, choice($.glob, $.domain_expression_list), $._rparen),
+      $.domain_expression
+    ),
+
     domain_expression_list: $ => seq(
       $.domain_expression,
       repeat(seq($._comma, $.domain_expression))
@@ -2428,8 +2442,5 @@ module.exports = grammar({
 
     // Aggregation arrow for grouping
     aggregation_arrow: $ => '~>',
-
-    // Arbitrary column separator (for GROUP BY)
-    arbitrary_separator: $ => '~?'
   }
 });

@@ -42,6 +42,8 @@ pub type ModuloSpec =
     crate::pipeline::asts::core::ModuloSpec<crate::pipeline::asts::core::Resolved>;
 pub type OrderingSpec =
     crate::pipeline::asts::core::OrderingSpec<crate::pipeline::asts::core::Resolved>;
+pub type DelegateSpec =
+    crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Resolved>;
 pub type RenameSpec =
     crate::pipeline::asts::core::RenameSpec<crate::pipeline::asts::core::Resolved>;
 pub type RenameTarget = crate::pipeline::asts::core::RenameTarget;

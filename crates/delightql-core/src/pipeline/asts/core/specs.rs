@@ -26,8 +26,22 @@ pub enum ModuloSpec<Phase = Unresolved> {
     GroupBy {
         reducing_by: Vec<DomainExpression<Phase>>,
         reducing_on: Vec<DomainExpression<Phase>>,
-        arbitrary: Vec<DomainExpression<Phase>>,
+        /// Delegate selections: pull the reduction back to a representative row.
+        /// Each spec carries a payload (the columns surfaced) and an ordering
+        /// (empty == arbitrary delegate; non-empty == ordered delegate / DISTINCT ON).
+        delegates: Vec<DelegateSpec<Phase>>,
     },
+}
+
+/// A delegate selection in reduction place: `(payload) <~ [#(order)]`.
+/// Surfaces values *selected* from a single row of the group (not synthesized).
+/// An empty `order` is the degenerate "choose by no order" case = arbitrary.
+/// Parenthesized multi-column payloads share one delegate row (coherent).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
+#[lispy("delegate_spec")]
+pub struct DelegateSpec<Phase = Unresolved> {
+    pub payload: Vec<DomainExpression<Phase>>,
+    pub order: Vec<OrderingSpec<Phase>>,
 }
 
 /// Ordering direction for ORDER BY

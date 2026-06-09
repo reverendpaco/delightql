@@ -33,5 +33,5 @@ pub use queries::{
 };
 pub use specs::{
     ContainmentSemantic, ModuloSpec, OrderDirection, OrderingSpec, RenameSpec, RenameTarget,
-    RepositionSpec, Row, TupleOrdinalClause, TupleOrdinalOperator,
+    RepositionSpec, Row, TupleOrdinalClause, TupleOrdinalOperator, DelegateSpec,
 };

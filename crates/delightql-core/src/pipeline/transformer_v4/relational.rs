@@ -1874,16 +1874,359 @@ fn r_lower_modulo(
         ast_addressed::ModuloSpec::GroupBy {
             reducing_by,
             reducing_on,
-            arbitrary,
-        } => r_lower_group_by_spec(
-            builder,
-            reducing_by,
+            delegates,
+        } => {
+            let any_ordered = delegates.iter().any(|d| !d.order.is_empty());
+
+            // All-arbitrary (empty-order) delegates lower as bare columns,
+            // exactly as the old `~?` arbitrary did (Phase 0/1a behavior).
+            if !any_ordered {
+                let arbitrary = delegates.into_iter().flat_map(|d| d.payload).collect();
+                return r_lower_group_by_spec(
+                    builder,
+                    reducing_by,
+                    reducing_on,
+                    arbitrary,
+                    cpr_schema,
+                    ctx,
+                );
+            }
+
+            // A single ordered delegate with no aggregates is the 1-arity
+            // degenerate of the N-way join: one `row_number()=1` relation, no
+            // join to make.
+            if reducing_on.is_empty() && delegates.len() == 1 {
+                let delegate = delegates.into_iter().next().unwrap();
+                return r_lower_single_ordered_delegate(
+                    builder,
+                    reducing_by,
+                    delegate,
+                    cpr_schema,
+                    ctx,
+                );
+            }
+
+            // General case: an aggregate relation (when there are aggregates)
+            // plus one `row_number()=1` relation per delegate, joined on the
+            // group key.
+            r_lower_n_way_delegate_join(
+                builder,
+                reducing_by,
+                reducing_on,
+                delegates,
+                cpr_schema,
+                ctx,
+            )
+        }
+    }
+}
+
+/// Build one delegate relation — the `row_number()=1` filtered rows for a single
+/// delegate — and return it (pre-projection) as a `Builder<Unprojected>`:
+///
+/// ```sql
+/// SELECT * FROM ( SELECT *, ROW_NUMBER() OVER (PARTITION BY <keys> ORDER BY <order>)
+///                           AS __dql_delegate_rn
+///                 FROM <source> )
+/// WHERE __dql_delegate_rn = 1
+/// ```
+///
+/// This is the shared primitive: the single-delegate lowering projects one of
+/// these; the N-way join builds one per delegate and joins them on the group
+/// key. Partition/order use bare column names (they resolve against the wrapped
+/// subquery). An empty `order` (arbitrary delegate) yields a window with no
+/// ORDER BY — one arbitrary row per group.
+fn build_delegate_relation(
+    builder: Builder<Unprojected>,
+    reducing_by: &[ast_addressed::DomainExpression],
+    order: &[ast_addressed::OrderingSpec],
+    ctx: &TransformCtx,
+) -> Result<Builder<Unprojected>> {
+    use crate::pipeline::asts::core::literals::LiteralValue;
+    use crate::pipeline::sql_ast_v3::{
+        ordering::OrderDirection, BinaryOperator, DomainExpression as SqlDomainExpr, SqlPredicate,
+    };
+
+    const RN: &str = "__dql_delegate_rn";
+
+    // Bare-column form of a lowered expression (strip qualifier) so the window
+    // spec resolves against the wrapped subquery, mirroring the intersect path.
+    let bare = |expr: ast_addressed::DomainExpression,
+                q: &dyn Qualify|
+     -> Result<SqlDomainExpr> {
+        Ok(match scalar::s_lower_expression(expr, q, ctx)? {
+            SqlDomainExpr::Column { name, .. } => SqlDomainExpr::column(name),
+            other => other,
+        })
+    };
+
+    let partition: Vec<SqlDomainExpr> = reducing_by
+        .iter()
+        .map(|e| bare(e.clone(), &builder))
+        .collect::<Result<_>>()?;
+    let sql_order: Vec<(SqlDomainExpr, OrderDirection)> = order
+        .iter()
+        .map(|spec| {
+            let col = bare(spec.column.clone(), &builder)?;
+            let dir = match spec.direction {
+                Some(ast_addressed::OrderDirection::Descending) => OrderDirection::Desc,
+                _ => OrderDirection::Asc,
+            };
+            Ok((col, dir))
+        })
+        .collect::<Result<_>>()?;
+
+    // Tag each row with row_number, wrap as a subquery, filter to the first.
+    builder
+        .project_all()?
+        .add_window_column("ROW_NUMBER", vec![], partition, sql_order, RN)?
+        .demote()?
+        .add_where(SqlPredicate::new(SqlDomainExpr::Binary {
+            left: Box::new(SqlDomainExpr::column(RN)),
+            op: BinaryOperator::Equal,
+            right: Box::new(SqlDomainExpr::literal(LiteralValue::Number("1".to_string()))),
+        }))
+}
+
+/// Lower a single ordered delegate selection (no aggregates): the 1-arity
+/// degenerate of the N-way join — build one delegate relation, project it
+/// directly (no join). Output items are projected against the post-wrap builder,
+/// whose scope carries `prior_identities` so qualification resolves
+/// automatically.
+fn r_lower_single_ordered_delegate(
+    builder: Builder<Unprojected>,
+    reducing_by: Vec<ast_addressed::DomainExpression>,
+    delegate: ast_addressed::DelegateSpec,
+    cpr_schema: &PhaseBox<CprSchema, Addressed>,
+    ctx: &TransformCtx,
+) -> Result<Builder<Projected>> {
+    let filtered = build_delegate_relation(builder, &reducing_by, &delegate.order, ctx)?;
+
+    // Output = group keys + delegate payload, lowered against the POST-WRAP
+    // builder so identities resolve through the wrap chain (trust the builder).
+    // Dedup payload columns that duplicate a group key — a `(*)` payload
+    // expands to include the key, which is already emitted in group position
+    // (matches the resolver's output-schema dedup).
+    let key_names: std::collections::HashSet<String> = reducing_by
+        .iter()
+        .filter_map(|e| match e {
+            ast_addressed::DomainExpression::Lvar { name, .. } => Some(name.to_string()),
+            _ => None,
+        })
+        .collect();
+    let mut output_items: Vec<_> = reducing_by
+        .into_iter()
+        .map(|e| scalar::s_lower_select_item(e, &filtered, ctx))
+        .collect::<Result<Vec<_>>>()?;
+    for e in delegate.payload {
+        let dups_key = matches!(
+            &e,
+            ast_addressed::DomainExpression::Lvar { name, .. } if key_names.contains(name.as_str())
+        );
+        if !dups_key {
+            output_items.push(scalar::s_lower_select_item(e, &filtered, ctx)?);
+        }
+    }
+
+    let output_names = cpr_column_names(cpr_schema.get());
+    thread_resolver_aliases(&mut output_items, &output_names, 0);
+
+    filtered.add_projection(output_items)
+}
+
+/// Lower the general N-way delegate join: a GROUP BY relation (when there are
+/// aggregates) plus one `row_number()=1` relation per ordered delegate, all
+/// joined on the group key. This is the canonical decomposition; the single
+/// ordered delegate with no aggregates is its 1-arity degenerate (handled by
+/// `r_lower_single_ordered_delegate` — no join to make with one relation).
+///
+/// ```sql
+/// SELECT agg.k, agg.<aggs>, d0.<payload0>, d1.<payload1>
+/// FROM   (SELECT k, <aggs> FROM src GROUP BY k)                         AS agg
+/// JOIN   (SELECT * FROM (.. ROW_NUMBER() OVER (PARTITION BY k ORDER BY o0)) WHERE rn=1) AS d0
+///          ON agg.k IS NOT DISTINCT FROM d0.k
+/// JOIN   (.. ORDER BY o1 .. WHERE rn=1)                                 AS d1
+///          ON agg.k IS NOT DISTINCT FROM d1.k
+/// ```
+///
+/// Each relation is built from a frozen copy of the source. The relations share
+/// the source column names, so the join tree is kept flat (no intermediate
+/// subquery wrap, via `Builder::from_joins`) and every output column is
+/// explicitly qualified to the operand that owns it.
+fn r_lower_n_way_delegate_join(
+    builder: Builder<Unprojected>,
+    reducing_by: Vec<ast_addressed::DomainExpression>,
+    reducing_on: Vec<ast_addressed::DomainExpression>,
+    delegates: Vec<ast_addressed::DelegateSpec>,
+    cpr_schema: &PhaseBox<CprSchema, Addressed>,
+    ctx: &TransformCtx,
+) -> Result<Builder<Projected>> {
+    use crate::pipeline::sql_ast_v3::{
+        BinaryOperator, ColumnQualifier, DomainExpression as SqlDomainExpr, JoinCondition,
+        JoinType, SelectItem,
+    };
+
+    // Group-key column names. Each operand wraps the source as a subquery, so a
+    // key must survive as a named column to be joined on. Expression keys
+    // (e.g. `lower(name)`) combined with ordered delegates are a later slice.
+    let key_names: Vec<String> = reducing_by
+        .iter()
+        .map(
+            |e| match scalar::s_lower_expression(e.clone(), &builder, ctx)? {
+                SqlDomainExpr::Column { name, .. } => Ok(name),
+                _ => Err(DelightQLError::ParseError {
+                    message: "N-way delegate join requires plain column group keys \
+                              (expression keys with ordered delegates are not yet supported)"
+                        .to_string(),
+                    source: None,
+                    subcategory: None,
+                }),
+            },
+        )
+        .collect::<Result<_>>()?;
+    let key_set: std::collections::HashSet<&str> = key_names.iter().map(|s| s.as_str()).collect();
+
+    // Freeze the source once and rebuild a fresh frozen Builder per relation.
+    // (Duplicating the source subquery is correct; CTE-hoisting it is a future
+    // perf peephole, not a correctness concern.)
+    let cols = builder.columns().to_vec();
+    let names = builder.names().clone();
+    let src = builder.project_all()?.to_sql()?;
+    let fresh_source = |suffix: &str| {
+        Builder::from_frozen(
+            src.clone(),
+            names.next_table_name(suffix),
+            cols.clone(),
+            names.clone(),
+        )
+    };
+
+    let has_agg = !reducing_on.is_empty();
+
+    // Operands in output order: [aggregate relation?] then one per delegate.
+    let mut operands: Vec<super::builder::JoinOperand> = Vec::new();
+
+    if has_agg {
+        let agg = r_lower_group_by_spec(
+            fresh_source("agg"),
+            reducing_by.clone(),
             reducing_on,
-            arbitrary,
+            vec![],
             cpr_schema,
             ctx,
-        ),
+        )?;
+        operands.push(agg.demote()?.into_join_operand()?);
     }
+
+    // Each delegate → one `row_number()=1` relation. Remember its operand index
+    // and payload so output columns can be mapped back to it.
+    let mut delegate_slots: Vec<(usize, Vec<ast_addressed::DomainExpression>)> = Vec::new();
+    for d in delegates {
+        let rel = build_delegate_relation(fresh_source("dlg"), &reducing_by, &d.order, ctx)?;
+        delegate_slots.push((operands.len(), d.payload));
+        operands.push(rel.into_join_operand()?);
+    }
+
+    // Each operand's post-wrap qualifier (à la intersect's left/right_qual).
+    let quals: Vec<String> = operands
+        .iter()
+        .map(|op| {
+            op.columns
+                .first()
+                .and_then(col_qualifier)
+                .unwrap_or("_op")
+                .to_string()
+        })
+        .collect();
+    let anchor_qual = quals[0].clone();
+
+    // Join conditions: anchor.key IS NOT DISTINCT FROM op_i.key (NULL-safe), one
+    // per non-anchor operand.
+    let conditions: Vec<(JoinType, JoinCondition)> = quals
+        .iter()
+        .skip(1)
+        .map(|op_qual| {
+            let conds: Vec<SqlDomainExpr> = key_names
+                .iter()
+                .map(|k| SqlDomainExpr::Binary {
+                    left: Box::new(SqlDomainExpr::with_qualifier(
+                        ColumnQualifier::table(&anchor_qual),
+                        k,
+                    )),
+                    op: BinaryOperator::IsNotDistinctFrom,
+                    right: Box::new(SqlDomainExpr::with_qualifier(
+                        ColumnQualifier::table(op_qual),
+                        k,
+                    )),
+                })
+                .collect();
+            (JoinType::Inner, JoinCondition::On(SqlDomainExpr::and(conds)))
+        })
+        .collect();
+
+    // Output projection in cpr order: keys, aggregates, then per-delegate
+    // payloads — each explicitly qualified to the operand that owns it, so the
+    // qualifier-aware `find_input_column` attaches correct provenance even
+    // though all operands share the source column names.
+    let mut output_items: Vec<SelectItem> = Vec::new();
+
+    // (a) group keys — from the anchor operand.
+    for k in &key_names {
+        output_items.push(SelectItem::Expression {
+            expr: SqlDomainExpr::with_qualifier(ColumnQualifier::table(&anchor_qual), k),
+            alias: None,
+        });
+    }
+
+    // (b) aggregates — from the aggregate operand (operands[0] when present).
+    // Its columns are keys + aggregate outputs; the aggregates are the columns
+    // whose names are not group keys, in order.
+    if has_agg {
+        for col in &operands[0].columns {
+            let name = col_name(col);
+            if !key_set.contains(name) {
+                output_items.push(SelectItem::Expression {
+                    expr: SqlDomainExpr::with_qualifier(ColumnQualifier::table(&anchor_qual), name),
+                    alias: None,
+                });
+            }
+        }
+    }
+
+    // (c) delegate payloads — each from its own operand, deduping any payload
+    // column that duplicates a group key (matches the resolver dedup and the
+    // single-delegate path).
+    for (op_idx, payload) in &delegate_slots {
+        let op_qual = &quals[*op_idx];
+        for e in payload {
+            let name = match scalar::s_lower_expression(e.clone(), &operands[*op_idx], ctx)? {
+                SqlDomainExpr::Column { name, .. } => name,
+                other => {
+                    // Non-column payload: emit the lowered expression as-is.
+                    output_items.push(SelectItem::Expression {
+                        expr: other,
+                        alias: None,
+                    });
+                    continue;
+                }
+            };
+            if key_set.contains(name.as_str()) {
+                continue;
+            }
+            output_items.push(SelectItem::Expression {
+                expr: SqlDomainExpr::with_qualifier(ColumnQualifier::table(op_qual), &name),
+                alias: None,
+            });
+        }
+    }
+
+    // Thread the resolver/cpr output names positionally over the whole list.
+    let output_names = cpr_column_names(cpr_schema.get());
+    thread_resolver_aliases(&mut output_items, &output_names, 0);
+
+    // Assemble the flat join and project.
+    let joined = Builder::from_joins(operands, conditions);
+    joined.add_projection(output_items)
 }
 
 /// Lower GROUP BY with keys and aggregate reductions.
@@ -1976,9 +2319,10 @@ fn r_lower_group_by_spec(
         .map(|e| tree_group::s_lower_reducing_on_item(e, &builder, ctx))
         .collect::<Result<_>>()?;
 
-    // Lower arbitrary columns (~?) as bare column references.
-    // These rely on SQLite's relaxed GROUP BY semantics (any column can appear
-    // in SELECT even if not in GROUP BY or an aggregate).
+    // Lower arbitrary delegate columns (bare `<~`, formerly `~?`) as bare column
+    // references. These rely on SQLite's relaxed GROUP BY semantics (any column
+    // can appear in SELECT even if not in GROUP BY or an aggregate). Ordered
+    // delegates (`<~ #(order)`) are a Phase 1 feature and not lowered here yet.
     let arb_items: Vec<_> = arbitrary
         .into_iter()
         .map(|e| scalar::s_lower_select_item(e, &builder, ctx))

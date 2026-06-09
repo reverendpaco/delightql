@@ -19,6 +19,7 @@ use crate::pipeline::asts::core::{
     ArrayMember, BooleanExpression, CteBinding, CurlyMember, DomainExpression, DomainSpec,
     FunctionExpression, ModuloSpec, OrderingSpec, PhaseBox, PipeExpression, Query, Relation,
     RelationalExpression, RenameSpec, RepositionSpec, Row, SigmaCondition, UnaryRelationalOperator,
+    DelegateSpec,
 };
 
 // =============================================================================
@@ -235,7 +236,7 @@ pub fn walk_transform_modulo_spec<P, Q, F: AstTransform<P, Q> + ?Sized>(
         ModuloSpec::GroupBy {
             reducing_by,
             reducing_on,
-            arbitrary,
+            delegates,
         } => Ok(ModuloSpec::GroupBy {
             reducing_by: reducing_by
                 .into_iter()
@@ -245,9 +246,22 @@ pub fn walk_transform_modulo_spec<P, Q, F: AstTransform<P, Q> + ?Sized>(
                 .into_iter()
                 .map(|e| t.transform_domain(e))
                 .collect::<Result<Vec<_>>>()?,
-            arbitrary: arbitrary
+            delegates: delegates
                 .into_iter()
-                .map(|e| t.transform_domain(e))
+                .map(|w| {
+                    Ok(DelegateSpec {
+                        payload: w
+                            .payload
+                            .into_iter()
+                            .map(|e| t.transform_domain(e))
+                            .collect::<Result<Vec<_>>>()?,
+                        order: w
+                            .order
+                            .into_iter()
+                            .map(|o| t.transform_ordering_spec(o))
+                            .collect::<Result<Vec<_>>>()?,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?,
         }),
     }

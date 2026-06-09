@@ -82,6 +82,94 @@ pub(in crate::pipeline::builder_v2) fn parse_transform(
     )))
 }
 
+/// Parse a `reduction_item_list` (the body after `~>`): separates ordinary
+/// aggregate/expression items (→ `reducing_on`) from delegate selections
+/// (`(cols) <~ [#(order)]` → `delegates`). Each delegate carries its payload
+/// plus an optional ordering: a bare `<~` (empty ordering) is an arbitrary
+/// delegate, while `<~ #(order)` is an ordered delegate (DISTINCT-ON-style).
+/// Both are represented as `DelegateSpec { payload, order }` and lowered
+/// downstream (empty order → bare columns; non-empty → `row_number()=1`).
+fn parse_reduction_items(
+    list_node: CstNode,
+    features: &mut FeatureCollector,
+) -> Result<(Vec<DomainExpression>, Vec<DelegateSpec>)> {
+    let mut aggregates = Vec::new();
+    let mut delegates = Vec::new();
+    for item in list_node
+        .children()
+        .filter(|c| c.kind() == "reduction_item")
+    {
+        if let Some(delegate) = item.find_child("delegate_item") {
+            let payload_node = delegate
+                .field("payload")
+                .ok_or_else(|| DelightQLError::parse_error("No payload in delegate_item"))?;
+            let payload = parse_delegate_payload_columns(payload_node, features)?;
+            // Empty ordering (bare `<~`) == arbitrary delegate.
+            let order = if let Some(order_node) = delegate.field("order") {
+                parse_delegate_order(order_node, features)?
+            } else {
+                Vec::new()
+            };
+            delegates.push(DelegateSpec { payload, order });
+        } else if let Some(de) = item.find_child("domain_expression") {
+            aggregates.push(parse_domain_expression_wrapper(de, features)?);
+        } else {
+            return Err(DelightQLError::parse_error("Empty reduction_item"));
+        }
+    }
+    Ok((aggregates, delegates))
+}
+
+/// Parse a delegate `#(order)` slot (a `window_ordering` node) into ordering
+/// specs, mirroring the window-function order parser.
+fn parse_delegate_order(
+    ordering_node: CstNode,
+    features: &mut FeatureCollector,
+) -> Result<Vec<OrderingSpec>> {
+    let mut specs = Vec::new();
+    for child in ordering_node.children() {
+        if child.kind() == "window_order_item" {
+            let column_node = child
+                .field("column")
+                .ok_or_else(|| DelightQLError::parse_error("No column in delegate order item"))?;
+            let column = parse_domain_expression_wrapper(column_node, features)?;
+            let direction = child.field_text("direction").and_then(|dir| match dir.as_str() {
+                "asc" | "ascending" => Some(OrderDirection::Ascending),
+                "desc" | "descending" => Some(OrderDirection::Descending),
+                _ => None,
+            });
+            specs.push(OrderingSpec { column, direction });
+        }
+    }
+    Ok(specs)
+}
+
+/// Extract the payload columns from a `delegate_payload` node. Parenthesized
+/// multi-column payloads parse as `domain_expression → tuple_expression`; a
+/// bare single column is a plain `domain_expression`. Whole-row `(*)` parses (in
+/// practice) as a `tuple_expression` whose sole element is a `glob`, handled by
+/// the tuple branch below and expanded to all columns by the resolver.
+fn parse_delegate_payload_columns(
+    payload: CstNode,
+    features: &mut FeatureCollector,
+) -> Result<Vec<DomainExpression>> {
+    if let Some(de) = payload.find_child("domain_expression") {
+        if let Some(tuple) = de.find_child("tuple_expression") {
+            parse_domain_expression_list(tuple, features)
+        } else {
+            Ok(vec![parse_domain_expression_wrapper(de, features)?])
+        }
+    } else if payload.find_child("glob").is_some() {
+        // `(*)` as a bare `glob` child (grammar alternative 1). The GLR parser
+        // routes `(*)` through the `domain_expression → tuple_expression`
+        // branch above, so this is defensive; handling it identically keeps the
+        // two grammar alternatives equivalent regardless of GLR resolution.
+        Ok(vec![DomainExpression::glob_builder().build()])
+    } else {
+        Err(DelightQLError::parse_error("Empty delegate_payload"))
+    }
+}
+
 /// Parse grouping operation: %(city) or %[city]
 pub(in crate::pipeline::builder_v2) fn parse_grouping(
     node: CstNode,
@@ -103,28 +191,18 @@ pub(in crate::pipeline::builder_v2) fn parse_grouping(
 
             if let (Some(by_node), Some(on_node)) = (reducing_by_node, reducing_on_node) {
                 let reducing_by = parse_domain_expression_list(by_node, features)?;
-                let reducing_on = parse_domain_expression_list(on_node, features)?;
-                let arbitrary = if let Some(arb_node) = grouping_node.field("arbitrary") {
-                    parse_domain_expression_list(arb_node, features)?
-                } else {
-                    Vec::new()
-                };
+                let (reducing_on, delegates) = parse_reduction_items(on_node, features)?;
                 ModuloSpec::GroupBy {
                     reducing_by,
                     reducing_on,
-                    arbitrary,
+                    delegates,
                 }
             } else if let Some(on_node) = reducing_on_node {
-                let reducing_on = parse_domain_expression_list(on_node, features)?;
-                let arbitrary = if let Some(arb_node) = grouping_node.field("arbitrary") {
-                    parse_domain_expression_list(arb_node, features)?
-                } else {
-                    Vec::new()
-                };
+                let (reducing_on, delegates) = parse_reduction_items(on_node, features)?;
                 ModuloSpec::GroupBy {
                     reducing_by: Vec::new(),
                     reducing_on,
-                    arbitrary,
+                    delegates,
                 }
             } else {
                 return Err(DelightQLError::parse_error("Invalid grouping structure"));
@@ -137,17 +215,9 @@ pub(in crate::pipeline::builder_v2) fn parse_grouping(
 
             let columns = parse_domain_expression_list(reducing_by_node, features)?;
 
-            // Check for arbitrary columns without aggregates: %(country ~? last_name)
-            if let Some(arb_node) = grouping_node.field("arbitrary") {
-                let arbitrary = parse_domain_expression_list(arb_node, features)?;
-                ModuloSpec::GroupBy {
-                    reducing_by: columns,
-                    reducing_on: Vec::new(),
-                    arbitrary,
-                }
-            } else {
-                ModuloSpec::Columns(columns)
-            }
+            // Delegate selections live in reduction place (after ~>), so a bare
+            // %(cols) with no ~> is always a simple distinct/group.
+            ModuloSpec::Columns(columns)
         }
     };
 
