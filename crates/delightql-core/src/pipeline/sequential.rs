@@ -284,7 +284,7 @@ pub fn process_inline_ddl_block(
     if ddl.definitions.is_empty() && ddl.inline_ddl_blocks.is_empty() {
         return Err(anyhow::anyhow!(
             "Inline DDL block contains no definitions. \
-             (~~ddl:\"name\" ~~) expects rules (:-), tables (:=), or function definitions."
+             (~~ddl:\"name\" ~~) expects definitions (:-)."
         ));
     }
     if !ddl.query_statements.is_empty() {

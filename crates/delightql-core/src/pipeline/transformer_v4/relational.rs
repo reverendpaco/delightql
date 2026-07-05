@@ -1741,7 +1741,8 @@ fn r_lower_union_corresponding(
         });
     }
 
-    // Get output column names from the cpr_schema.
+    // Get output column names (and declared types, for typing the NULL
+    // pads) from the cpr_schema.
     let output_col_names: Vec<String> = match cpr_schema.get() {
         CprSchema::Resolved(cols) => cols.iter().map(|c| col_name(c).to_string()).collect(),
         _ => {
@@ -1750,6 +1751,18 @@ fn r_lower_union_corresponding(
             let first = iter.next().unwrap();
             return iter.try_fold(first, |acc, next| acc.union_all(next));
         }
+    };
+    // A pad is typed by the column it stands in for: the unified schema's
+    // ColumnMetadata is cloned from a branch that HAS the column, carrying
+    // its catalog declared_type. Untyped NULL pads break strict targets —
+    // postgres resolves UNION types pairwise, and two pad-only branches
+    // collapse the column to text before a typed branch arrives.
+    let pad_types: std::collections::HashMap<String, String> = match cpr_schema.get() {
+        CprSchema::Resolved(cols) => cols
+            .iter()
+            .filter_map(|c| c.pad_type().map(|t| (col_name(c).to_string(), t.to_string())))
+            .collect(),
+        _ => Default::default(),
     };
 
     let names = ctx.names.clone();
@@ -1783,9 +1796,18 @@ fn r_lower_union_corresponding(
                         alias: Some(out_name.clone()),
                     }
                 } else {
-                    // Operand doesn't have this column — pad with NULL.
+                    // Operand doesn't have this column — pad with NULL,
+                    // typed by the column it stands in for when the
+                    // catalog knows (CAST(NULL AS t) is still NULL).
+                    let pad = match pad_types.get(out_name) {
+                        Some(t) => SqlDomainExpr::cast(
+                            SqlDomainExpr::literal(LiteralValue::Null),
+                            t.clone(),
+                        ),
+                        None => SqlDomainExpr::literal(LiteralValue::Null),
+                    };
                     SelectItem::Expression {
-                        expr: SqlDomainExpr::literal(LiteralValue::Null),
+                        expr: pad,
                         alias: Some(out_name.clone()),
                     }
                 }
@@ -2394,13 +2416,29 @@ fn r_lower_group_by_spec(
         .map(|e| tree_group::s_lower_reducing_on_item(e, &builder, ctx))
         .collect::<Result<_>>()?;
 
-    // Lower arbitrary delegate columns (bare `<~`, formerly `~?`) as bare column
-    // references. These rely on SQLite's relaxed GROUP BY semantics (any column
-    // can appear in SELECT even if not in GROUP BY or an aggregate). Ordered
-    // delegates (`<~ #(order)`) are a Phase 1 feature and not lowered here yet.
+    // Lower arbitrary delegate columns (bare `<~`, formerly `~?`) and stamp
+    // each with the arbitrary-witness form (`__dql_arbitrary`). This is the
+    // only site that knows the user wrote bare `<~`, so the FORM is chosen
+    // here; the SPELLING is per-dialect — canonical/sqlite unwraps to the
+    // bare column (relaxed GROUP BY), strict targets render `any_value(...)`.
+    // Ordered delegates (`<~ #(order)`) lower via the N-way join, not here.
     let arb_items: Vec<_> = arbitrary
         .into_iter()
-        .map(|e| scalar::s_lower_select_item(e, &builder, ctx))
+        .map(|e| {
+            use crate::pipeline::sql_ast_v3::{
+                DomainExpression as SqlDomainExpr, SelectItem,
+            };
+            scalar::s_lower_select_item(e, &builder, ctx).map(|item| match item {
+                SelectItem::Expression { expr, alias } => SelectItem::Expression {
+                    expr: SqlDomainExpr::function(
+                        crate::pipeline::naming::INTERNAL_ARBITRARY,
+                        vec![expr],
+                    ),
+                    alias,
+                },
+                other => other,
+            })
+        })
         .collect::<Result<_>>()?;
 
     // Thread resolver names onto un-aliased items. The resolver assigns

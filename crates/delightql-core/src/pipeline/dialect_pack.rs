@@ -156,8 +156,51 @@ pub fn rust_render_handler(key: &str) -> Option<RustRenderHandler> {
         "pg_json_path_text" => Some(pg_json_path_text),
         "pg_json_path_jsonb" => Some(pg_json_path_jsonb),
         "pg_group_concat" => Some(pg_group_concat),
+        "pg_scalar_max" => Some(pg_scalar_max),
+        "pg_scalar_min" => Some(pg_scalar_min),
         _ => None,
     }
+}
+
+/// SQLite's scalar `max(a, b, ...)` → NULL-propagating `GREATEST`.
+///
+/// The bare rename is semantically wrong: sqlite's scalar max/min return
+/// NULL when ANY argument is NULL, while pg's GREATEST/LEAST IGNORE
+/// NULLs (measured: `max(age * 2, 18)` with a NULL age — sqlite NULL,
+/// bare GREATEST 18). The fidelity rule (the +like → ILIKE lesson) says
+/// preserve canonical semantics, and the NULL guard is variadic — a
+/// per-argument CASE a positional template cannot express.
+fn pg_scalar_max(args: &[&str], distinct: bool) -> Result<String, String> {
+    pg_scalar_extreme(args, distinct, "GREATEST")
+}
+
+/// SQLite's scalar `min(a, b, ...)` → NULL-propagating `LEAST`.
+fn pg_scalar_min(args: &[&str], distinct: bool) -> Result<String, String> {
+    pg_scalar_extreme(args, distinct, "LEAST")
+}
+
+fn pg_scalar_extreme(args: &[&str], distinct: bool, fn_name: &str) -> Result<String, String> {
+    if distinct {
+        return Err("DISTINCT is not valid on a scalar max/min".into());
+    }
+    if args.len() < 2 {
+        return Err(format!(
+            "scalar {} takes 2+ args, got {} (1-arg is the aggregate form)",
+            fn_name.to_lowercase(),
+            args.len()
+        ));
+    }
+    let null_guard = args
+        .iter()
+        .map(|a| format!("{} IS NULL", a))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Ok(format!(
+        "CASE WHEN {} THEN NULL ELSE {}({}) END",
+        null_guard,
+        fn_name,
+        args.join(", ")
+    ))
 }
 
 /// `json_extract(x, '$.a.b')` → `(CAST(x AS jsonb) #>> '{a,b}')` — the
@@ -337,9 +380,14 @@ mod tests {
         assert_eq!(body("postgres", "lit.bool_true"), "TRUE");
         assert_eq!(body("postgres", "lit.bool_false"), "FALSE");
         assert!(pack.render("postgres", "op.not_equal").is_none()); // != like sqlite
-        // mysql deltas
+        // mysql deltas — concatenate deliberately does NOT reproduce the old
+        // arm: `CONCAT` as an infix token was an M1-era bug faithfully
+        // migrated (DIALECT-CONTRACT.md B3); mysql CONCAT is a function, so
+        // the row is now an op template over both operands.
         assert_eq!(body("mysql", "op.not_equal"), "<>");
-        assert_eq!(body("mysql", "op.concatenate"), "CONCAT");
+        assert_eq!(body("mysql", "op.concatenate"), "CONCAT({0}, {1})");
+        assert_eq!(body("mysql", "op.is_not_distinct_from"), "<=>");
+        assert_eq!(body("mysql", "op.is_distinct_from"), "NOT ({0} <=> {1})");
         assert_eq!(body("mysql", "ident.quoted"), "`{0}`");
         assert!(pack.render("mysql", "lit.bool_true").is_none()); // 1/0 like sqlite
         // sqlserver deltas

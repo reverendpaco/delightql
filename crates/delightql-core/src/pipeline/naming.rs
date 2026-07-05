@@ -47,6 +47,35 @@ pub const INTERNAL_JSON_EACH_ARRAY: &str = "__dql_json_each_array";
 /// `tvf.__dql_json_each_object` render row.
 pub const INTERNAL_JSON_EACH_OBJECT: &str = "__dql_json_each_object";
 
+/// Internal names for sqlite's SCALAR max/min — the 2+-arg overloads of
+/// the aggregate names (`max(a, b)` = row-wise greatest). The overload is
+/// a FORM distinction visible at the node itself (arity), so the
+/// `SqlExpression::function` constructor stamps it: a name-keyed render
+/// row cannot split arities, and postgres has no scalar max at all
+/// (spelled `GREATEST`/`LEAST` via `fn.__dql_scalar_{max,min}` rows).
+/// Also fixes a latent misclassification: the recursive-CTE rewriter's
+/// aggregate refusal no longer catches scalar max/min in members.
+pub const INTERNAL_SCALAR_MAX: &str = "__dql_scalar_max";
+pub const INTERNAL_SCALAR_MIN: &str = "__dql_scalar_min";
+
+/// Internal name for 2-arg `round(x, digits)`. Postgres lacks
+/// `round(double precision, int)` — only `round(numeric, int)` — so the
+/// pg render row wraps the value in a numeric cast. 1-arg round is fine
+/// everywhere and keeps its plain name.
+pub const INTERNAL_ROUND_2: &str = "__dql_round_2";
+
+/// Internal name for the arbitrary-witness form: a bare `<~` delegate column
+/// in a reduction (`%(k ~> ..., (col) <~)`). DQL promises an ARBITRARY row's
+/// value; sqlite spells that as a bare column under its relaxed GROUP BY
+/// (canonical rendering unwraps to just the argument — identity isn't
+/// expressible as a rename row). Strict targets insist you say it:
+/// `any_value({0})` render rows for postgres (16+) and duckdb — the SQL:2023
+/// name for exactly this semantic. Counted witness divergences: sqlite's
+/// lone-min/max rule picks the winning row's companions, and its bare column
+/// can surface NULL where any_value prefers non-null — all legal under
+/// "arbitrary"; wanting a SPECIFIC row is the ordered delegate's job.
+pub const INTERNAL_ARBITRARY: &str = "__dql_arbitrary";
+
 /// Canonical SQL spelling for internal (`__dql_*`) function names.
 /// Returns None for ordinary names. Consulted by the generator before
 /// dialect-pack lookup so internal names never leak into emitted SQL.
@@ -54,6 +83,9 @@ pub fn internal_fn_canonical(name: &str) -> Option<&'static str> {
     match name {
         INTERNAL_JSON_EXTRACT_RAW => Some("json_extract"),
         INTERNAL_JSON_EACH_ARRAY | INTERNAL_JSON_EACH_OBJECT => Some("json_each"),
+        INTERNAL_SCALAR_MAX => Some("max"),
+        INTERNAL_SCALAR_MIN => Some("min"),
+        INTERNAL_ROUND_2 => Some("round"),
         _ => None,
     }
 }

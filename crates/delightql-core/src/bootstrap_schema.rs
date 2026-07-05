@@ -46,7 +46,7 @@ impl DatabaseSchema for BootstrapBackedSchema {
 
         // Primary path: look up by namespace fq_name
         let sql_by_namespace = r#"
-            SELECT ea.attribute_name, ea.position, ea.is_nullable
+            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
             FROM entity_attribute ea
             JOIN entity e ON e.id = ea.entity_id
             JOIN activated_entity ae ON ae.entity_id = e.id
@@ -66,7 +66,7 @@ impl DatabaseSchema for BootstrapBackedSchema {
 
         // Fallback: look up by cartridge source_ns (ATTACH alias)
         let sql_by_source_ns = r#"
-            SELECT ea.attribute_name, ea.position, ea.is_nullable
+            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
             FROM entity_attribute ea
             JOIN entity e ON e.id = ea.entity_id
             JOIN activated_entity ae ON ae.entity_id = e.id
@@ -105,11 +105,13 @@ impl BootstrapBackedSchema {
                 let name: String = row.get(0)?;
                 let position: i32 = row.get(1)?;
                 let is_nullable: Option<i32> = row.get(2)?;
+                let data_type: Option<String> = row.get(3)?;
 
                 Ok(ColumnInfo {
                     name: name.into(),
                     nullable: is_nullable.unwrap_or(1) != 0,
                     position: (position + 1) as usize, // 0-based to 1-based
+                    declared_type: data_type.filter(|t| !t.is_empty()),
                 })
             })
             .ok()?

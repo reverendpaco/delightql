@@ -1875,8 +1875,13 @@ impl DelightQLSystem {
         );
 
         // Install as a cartridge
-        // When mounting into "main", set source_ns = NULL so unqualified table references
-        // resolve via SQLite's cross-schema search (matches the --db path behavior).
+        // When mounting into "main", set source_ns = NULL so unqualified table
+        // references resolve via SQLite's cross-schema search (matches the --db
+        // path behavior, and keeps generated SQL spelling target-portable).
+        // CAUTION: reads may be unqualified, but WRITES may not — CREATE does
+        // not search schemas. imprint_namespace recovers the attach alias via
+        // PRAGMA database_list when it targets a mounted namespace whose
+        // cartridge carries no alias.
         let effective_source_ns: Option<&str> = if namespace == "main" {
             None
         } else {
@@ -1921,12 +1926,26 @@ impl DelightQLSystem {
             )
         })?;
 
-        // Create or reuse the namespace
+        // Create or reuse the namespace. The reuse branch records the new
+        // source just like creation does — an empty pre-created "main" that
+        // gets mounted over must carry the mount's locator.
         let namespace_id = if let Some(ns_id) = existing_namespace_id {
             debug!(
                 "mount_database: Reusing existing namespace_id={} for '{}'",
                 ns_id, namespace
             );
+            bootstrap_conn
+                .execute(
+                    "UPDATE namespace SET provenance = 'file', source_path = ?2 WHERE id = ?1",
+                    rusqlite::params![ns_id, db_path],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error_with_source(
+                        "Failed to record mount source on reused namespace",
+                        e.to_string(),
+                        Box::new(e),
+                    )
+                })?;
             ns_id
         } else {
             let sql = r#"
@@ -5208,7 +5227,13 @@ impl DelightQLSystem {
             ));
         }
 
-        // 4. Get target connection info: schema alias + connection_id
+        // 4. Get target connection info: schema alias + connection_id.
+        // First try the entity path (populated namespaces), then the mount
+        // linkage (namespace.source_path = cartridge.source_uri) — an EMPTY
+        // mounted namespace has no activated entities, and falling through
+        // to the primary connection would silently write the imprinted
+        // tables into the wrong physical database (the session's primary
+        // schema instead of the mounted file).
         let (target_schema_alias, connection_id): (Option<String>, i64) = bootstrap_conn
             .query_row(
                 "SELECT c.source_ns, c.connection_id
@@ -5221,13 +5246,62 @@ impl DelightQLSystem {
                 [target_ns],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap_or_else(|_| (None, 2)); // default: user connection, no schema
+            .or_else(|_| {
+                // namespace.source_path stores the bare locator; cartridge
+                // .source_uri may carry the file:// spelling of the same path.
+                bootstrap_conn.query_row(
+                    "SELECT c.source_ns, c.connection_id
+                     FROM namespace n
+                     JOIN cartridge c ON c.source_uri = n.source_path
+                                      OR c.source_uri = 'file://' || n.source_path
+                     WHERE n.fq_name = ?1 AND n.source_path IS NOT NULL
+                     ORDER BY c.id DESC
+                     LIMIT 1",
+                    [target_ns],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap_or_else(|_| (None, 2)); // primary connection (CLI --db as primary), no schema
 
         let target_conn = self
             .connection_map
             .get(&connection_id)
             .cloned()
             .unwrap_or_else(|| Arc::clone(&self.connection));
+
+        // 4b. A mounted "main" carries no alias in its cartridge (reads
+        // resolve unqualified by design), but WRITES cannot: unqualified
+        // CREATE always lands in the connection's primary schema, not the
+        // mounted file. Recover the attach alias from the connection itself.
+        let target_schema_alias: Option<String> = match target_schema_alias {
+            Some(a) => Some(a),
+            None => {
+                let mounted_path: Option<String> = bootstrap_conn
+                    .query_row(
+                        "SELECT source_path FROM namespace
+                         WHERE fq_name = ?1 AND source_path IS NOT NULL",
+                        [target_ns],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                mounted_path.and_then(|path| {
+                    let want = std::fs::canonicalize(&path).ok()?;
+                    let conn = target_conn.lock().ok()?;
+                    let (_cols, rows) = conn
+                        .query_all_string_rows("PRAGMA database_list", &[])
+                        .ok()?;
+                    rows.iter().find_map(|row| {
+                        let alias = row.get(1)?;
+                        let file = row.get(2)?;
+                        if alias == "main" || file.is_empty() {
+                            return None;
+                        }
+                        (std::fs::canonicalize(file).ok()? == want)
+                            .then(|| alias.clone())
+                    })
+                })
+            }
+        };
 
         // 5. Find _internal child namespace for manifest data
         use crate::ddl::manifest;
@@ -5334,13 +5408,6 @@ impl DelightQLSystem {
                 })
                 .and_then(|def| {
                     if let Some(pos) = def.find(":-") {
-                        let body = def[pos + 2..].trim();
-                        if !body.is_empty() {
-                            Some(body.to_string())
-                        } else {
-                            None
-                        }
-                    } else if let Some(pos) = def.find(":=") {
                         let body = def[pos + 2..].trim();
                         if !body.is_empty() {
                             Some(body.to_string())

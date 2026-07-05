@@ -298,7 +298,7 @@ pub(super) fn resolve_ground(
     // CTEs can't have namespace paths (they're query-local), so this is safe
     let resolution = if let Some(ref grounding) = identifier.grounding {
         // F^S.e(*) — only entities in S are visible. Never look in F.
-        let mut found_entity: Option<(String, i32)> = None;
+        let mut found_entity: Option<(String, i32, String)> = None;
         for ns in &grounding.grounded_ns {
             let fq = super::grounding::namespace_path_to_fq(ns);
             if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &fq) {
@@ -310,13 +310,22 @@ pub(super) fn resolve_ground(
                         identifier.name,
                         fq
                     );
-                    found_entity = Some((entity.definition.clone(), entity.entity_type));
+                    found_entity = Some((entity.definition.clone(), entity.entity_type, fq));
                     break;
                 }
             }
         }
 
-        if let Some((body_source, entity_type)) = found_entity {
+        if let Some((body_source, entity_type, matched_fq)) = found_entity {
+            // Cycle guard (RECURSION-CONTRACT.md B5): re-expanding a name
+            // already in flight means its self-reference did NOT resolve as
+            // the in-progress CTE (recursive clause before base, or an
+            // indirect cycle) — refuse with the teaching error instead of
+            // spinning. The frame pops on every return path.
+            let _expansion_frame = config.expansion_guard.enter(
+                format!("{}::{}", matched_fq, identifier.name),
+                "resolver::consulted_expansion",
+            )?;
             // Capture view name and namespace for error context
             let view_name = identifier.name.clone();
             let view_ns = grounding
@@ -1034,6 +1043,16 @@ pub(super) fn r_resolve_consulted_view(
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+    // Cycle guard (RECURSION-CONTRACT.md B5): re-expanding a view already
+    // in flight means its self-reference did NOT resolve as the in-progress
+    // CTE (recursive clause before base, or an indirect cycle through
+    // another view) — refuse with the teaching error instead of spinning.
+    // The frame pops on every return path.
+    let _expansion_frame = config.expansion_guard.enter(
+        format!("{}::{}", view_ns, view_name),
+        "resolver::consulted_view_expansion",
+    )?;
+
     // Consulted view — expand the body and resolve recursively.
     //
     // Check if this view comes from a pre-grounded namespace
@@ -1228,6 +1247,12 @@ pub(super) fn r_resolve_consulted_view(
         .deactivate_namespace_local_enlists(&activated_enlists);
 
     let (resolved_query, body_bubbled) = resolve_result.map_err(|e| {
+        // Preserve validation errors (e.g., the B5 expansion-cycle refusal)
+        // so their subcategory URI survives to the user and to error
+        // assertions.
+        if matches!(e, DelightQLError::ValidationError { .. }) {
+            return e;
+        }
         DelightQLError::database_error(
             format!("Error while resolving borrowed view '{}': {}", view_name, e),
             e.to_string(),
@@ -1440,6 +1465,50 @@ pub(super) fn r_resolve_unknown(
     }
 }
 
+/// Infer a `declared_type` for each anonymous-table column from its literal
+/// grid — the `@`-rows ARE the column's declaration. Conservative: a column
+/// types only if every cell is a literal of one uniform type (NULLs ignored;
+/// INTEGER unifies with REAL as REAL). Any non-literal cell (melt patterns
+/// reference outer columns), boolean, or text/numeric mix yields None —
+/// that's sqlite-dynamic data with no honest single type. First consumer:
+/// corresponding-union NULL pads (`ColumnMetadata::pad_type`), where an
+/// untyped pad inside a subquery collapses to text at the pg subquery
+/// boundary before the union can resolve it against the typed branch.
+fn infer_anon_column_types(rows: &[ast_resolved::Row]) -> Vec<Option<String>> {
+    let num_cols = rows.first().map(|r| r.values.len()).unwrap_or(0);
+    (0..num_cols)
+        .map(|idx| {
+            let mut unified: Option<&str> = None;
+            for row in rows {
+                let Some(ast_resolved::DomainExpression::Literal { value, .. }) =
+                    row.values.get(idx)
+                else {
+                    return None;
+                };
+                let cell = match value {
+                    ast_resolved::LiteralValue::Null => continue,
+                    ast_resolved::LiteralValue::String(_) => "TEXT",
+                    ast_resolved::LiteralValue::Number(n) => {
+                        if n.contains(['.', 'e', 'E']) {
+                            "REAL"
+                        } else {
+                            "INTEGER"
+                        }
+                    }
+                    ast_resolved::LiteralValue::Boolean(_) => return None,
+                };
+                unified = match (unified, cell) {
+                    (None, c) => Some(c),
+                    (Some(t), c) if t == c => Some(t),
+                    (Some("INTEGER"), "REAL") | (Some("REAL"), "INTEGER") => Some("REAL"),
+                    _ => return None,
+                };
+            }
+            unified.map(str::to_string)
+        })
+        .collect()
+}
+
 /// Resolve an Anonymous relation variant (inline table with rows/headers).
 ///
 /// Handles header resolution, row value resolution, and QUA schema conformance.
@@ -1516,6 +1585,9 @@ pub(super) fn resolve_anonymous(
 
     let resolved_rows = resolved_rows?;
 
+    // Literal-grid type inference: the rows are the columns' declaration.
+    let inferred_types = infer_anon_column_types(&resolved_rows);
+
     // P10 FIX: Process DomainExpression headers and resolve them
     // Headers can now contain references that need resolution for unification
     let (resolved_headers, resolved_schema) = if let Some(headers) = &column_headers {
@@ -1568,12 +1640,15 @@ pub(super) fn resolve_anonymous(
                     if let Some(alias_str) = &alias {
                         prov = prov.with_alias(alias_str.clone());
                     }
-                    columns.push(ast_resolved::ColumnMetadata::new_with_name_flag(
-                        prov,
-                        table_name,
-                        Some(idx + 1),
-                        true, // Explicit headers are user-provided names
-                    ));
+                    columns.push(
+                        ast_resolved::ColumnMetadata::new_with_name_flag(
+                            prov,
+                            table_name,
+                            Some(idx + 1),
+                            true, // Explicit headers are user-provided names
+                        )
+                        .with_declared_type(inferred_types.get(idx).cloned().flatten()),
+                    );
                 }
                 _ => {
                     // Preserve all other expression types (functions, literals, etc.)
@@ -1636,7 +1711,8 @@ pub(super) fn resolve_anonymous(
                         table_name,
                         Some(idx + 1),
                         false, // Anonymous table columns don't have user names
-                    );
+                    )
+                    .with_declared_type(inferred_types.get(idx).cloned().flatten());
                     col_meta.needs_hygienic_alias = needs_hygienic;
                     columns.push(col_meta);
                 }
@@ -1679,6 +1755,7 @@ pub(super) fn resolve_anonymous(
                     Some(ordinal),
                     false, // Anonymous table columns don't have user names
                 )
+                .with_declared_type(inferred_types.get(idx).cloned().flatten())
             })
             .collect();
         (None, ast_resolved::CprSchema::Resolved(columns))

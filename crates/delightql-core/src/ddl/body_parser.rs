@@ -40,15 +40,11 @@ use std::collections::HashMap;
 /// Handles both full definitions (`double:(x) :- x * 2` → `x * 2`)
 /// and body-only text (`x * 2` → `x * 2`, for backwards compatibility).
 ///
-/// Finds the first neck separator (`:-` or `:=`) and returns everything
-/// after it, stripping any leading `(~~docs ... ~~)` block.
+/// Finds the neck separator (`:-`) and returns everything after it,
+/// stripping any leading `(~~docs ... ~~)` block.
 /// If no separator is found, returns the input trimmed (still stripping docs).
 fn extract_body(source: &str) -> &str {
-    let neck_pos = [source.find(":-"), source.find(":=")]
-        .iter()
-        .filter_map(|p| *p)
-        .min();
-    let after_neck = match neck_pos {
+    let after_neck = match source.find(":-") {
         Some(pos) => source[pos + 2..].trim(),
         None => source.trim(),
     };
@@ -1116,17 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_function_body_persistent_neck() {
-        let expr = parse_function_body("cached_double:(x) := x * 2").unwrap();
-        match &expr {
-            DomainExpression::Function(FunctionExpression::Infix { operator, .. }) => {
-                assert_eq!(operator, "multiply");
-            }
-            other => panic!("Expected infix multiply, got: {:?}", other),
-        }
-    }
-
-    #[test]
     fn test_parse_view_body_from_full_source() {
         let query = parse_view_body("active_users :- users(*), balance > 1000").unwrap();
         match &query {
@@ -1147,7 +1132,6 @@ mod tests {
     #[test]
     fn test_extract_body_helper() {
         assert_eq!(extract_body("double:(x) :- x * 2"), "x * 2");
-        assert_eq!(extract_body("cached:(x) := x + 1"), "x + 1");
         assert_eq!(extract_body("x * 2"), "x * 2");
         assert_eq!(extract_body("active :- users(*)"), "users(*)");
     }

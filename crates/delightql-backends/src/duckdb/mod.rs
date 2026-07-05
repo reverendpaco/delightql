@@ -50,7 +50,7 @@ impl DatabaseSchema for DynamicDuckDBSchema {
         // Build the query based on whether schema is specified
         let query = if let Some(schema_name) = schema {
             format!(
-                "SELECT column_name, is_nullable, ordinal_position
+                "SELECT column_name, is_nullable, ordinal_position, data_type
                  FROM information_schema.columns
                  WHERE table_schema = '{}' AND table_name = '{}'
                  ORDER BY ordinal_position",
@@ -58,7 +58,7 @@ impl DatabaseSchema for DynamicDuckDBSchema {
             )
         } else {
             format!(
-                "SELECT column_name, is_nullable, ordinal_position
+                "SELECT column_name, is_nullable, ordinal_position, data_type
                  FROM information_schema.columns
                  WHERE table_name = '{}'
                  ORDER BY ordinal_position",
@@ -72,11 +72,13 @@ impl DatabaseSchema for DynamicDuckDBSchema {
                 let name: String = row.get(0)?;
                 let is_nullable: String = row.get(1)?;
                 let position: i32 = row.get(2)?;
+                let data_type: Option<String> = row.get(3)?;
 
                 Ok(ResolverColumnInfo {
                     name: name.into(),
                     nullable: is_nullable == "YES",
                     position: position as usize,
+                    declared_type: data_type.filter(|t| !t.is_empty()),
                 })
             })
             .ok()?

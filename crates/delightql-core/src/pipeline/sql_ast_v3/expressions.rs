@@ -344,8 +344,22 @@ impl DomainExpression {
     }
 
     pub fn function(name: impl Into<String>, args: Vec<DomainExpression>) -> Self {
+        // Code chooses the form: sqlite's scalar max/min and 2-arg round
+        // are arity-distinguished overloads of the aggregate/1-arg forms,
+        // and a name-keyed render row cannot split arities — so the node
+        // carries the form via an internal name (spelled canonically by
+        // naming::internal_fn_canonical, per-target by fn.__dql_* rows).
+        // The distinction is structural (name + arity), which is why it
+        // lives in the constructor rather than at provenance sites.
+        let name = name.into();
+        let name = match (name.to_ascii_lowercase().as_str(), args.len()) {
+            ("max", n) if n >= 2 => crate::pipeline::naming::INTERNAL_SCALAR_MAX.into(),
+            ("min", n) if n >= 2 => crate::pipeline::naming::INTERNAL_SCALAR_MIN.into(),
+            ("round", 2) => crate::pipeline::naming::INTERNAL_ROUND_2.into(),
+            _ => name,
+        };
         DomainExpression::Function {
-            name: name.into(),
+            name,
             args,
             distinct: false,
         }

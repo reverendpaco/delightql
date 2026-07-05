@@ -449,8 +449,16 @@ CREATE TABLE dialect_capability (
 INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
     ('postgres',  'lit.bool_true',   'template', 'TRUE'),
     ('postgres',  'lit.bool_false',  'template', 'FALSE'),
+    -- op.* bodies: a bare token swaps the infix token; a '{'-body is a full
+    -- template over both rendered operands, for spellings that change SHAPE
+    -- (DIALECT-CONTRACT.md B3/B4): mysql CONCAT is a function, and mysql has
+    -- no IS [NOT] DISTINCT FROM — its null-safe equality is the <=> operator
+    -- (token) and the negation needs a NOT wrap (template). Templates own
+    -- their own parentheses.
     ('mysql',     'op.not_equal',    'template', '<>'),
-    ('mysql',     'op.concatenate',  'template', 'CONCAT'),
+    ('mysql',     'op.concatenate',  'template', 'CONCAT({0}, {1})'),
+    ('mysql',     'op.is_not_distinct_from', 'template', '<=>'),
+    ('mysql',     'op.is_distinct_from',     'template', 'NOT ({0} <=> {1})'),
     ('mysql',     'ident.quoted',    'template', '`{0}`'),
     ('sqlserver', 'op.not_equal',    'template', '<>'),
     ('sqlserver', 'op.concatenate',  'template', '+'),
@@ -474,6 +482,42 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
     ('postgres', 'fn.json_array',        'template', 'json_build_array'),
     ('postgres', 'fn.json_group_object', 'template', 'json_object_agg'),
     ('duckdb',   'fn.json_extract',      'template', 'json_extract_string');
+
+-- ----------------------------------------------------------------------------
+-- Seed rows: scalar-form overloads (`fn.__dql_scalar_*`, `fn.__dql_round_2`).
+-- The transformer's SQL-AST constructor stamps these when arity reveals the
+-- form (2+-arg max/min = sqlite scalar max, not the aggregate; 2-arg round).
+-- Canonical spelling on a lookup miss is max/min/round (naming.rs), so
+-- sqlite/duckdb rows are unnecessary (both have the scalar overloads).
+--   pg scalar max/min are rust_handlers, NOT bare GREATEST/LEAST renames:
+--   sqlite's scalar max/min return NULL when ANY argument is NULL, pg's
+--   GREATEST/LEAST ignore NULLs (measured divergence) — the handler wraps
+--   a variadic NULL guard the fidelity rule demands and a template cannot.
+--   pg round accepts only (numeric, int); the template casts both — the
+--   value (harmless when already numeric) and the digits (sqlite accepts a
+--   double digits arg and TRUNCATES it; pg's int cast ROUNDS — a counted
+--   fractional-digits corner, same hazard family as cast: target semantics).
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'fn.__dql_scalar_max', 'rust_handler', 'pg_scalar_max'),
+    ('postgres', 'fn.__dql_scalar_min', 'rust_handler', 'pg_scalar_min'),
+    ('postgres', 'fn.__dql_round_2',    'template',
+     'round(CAST({0} AS numeric), CAST({1} AS integer))');
+
+-- ----------------------------------------------------------------------------
+-- Seed rows: the arbitrary-witness form (`fn.__dql_arbitrary`). The
+-- transformer stamps bare `<~` delegate columns (arbitrary row's value);
+-- canonical/sqlite spelling is the bare column under relaxed GROUP BY
+-- (unwrapped in code — identity isn't a rename), strict targets must say it:
+-- any_value() (SQL:2023; postgres 16+, duckdb native) is exactly DQL's
+-- promised semantic. Counted witness divergences (all legal under
+-- "arbitrary"): sqlite's lone-min/max rule picks the winning row's
+-- companions; sqlite's bare column can surface NULL where any_value prefers
+-- non-null. Wanting a SPECIFIC row is the ordered delegate's (`<~ #()`) job.
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'fn.__dql_arbitrary', 'template', 'any_value({0})'),
+    ('duckdb',   'fn.__dql_arbitrary', 'template', 'any_value({0})');
 
 -- ----------------------------------------------------------------------------
 -- Seed rows: rust_handler rules — renders a positional template cannot

@@ -765,7 +765,7 @@ pub(super) fn resolve_narrowing_destructure(
     Vec<ast_resolved::ColumnMetadata>,
 )> {
     // 1. Verify column exists in input schema
-    let _col = available
+    let col = available
         .iter()
         .find(|col| crate::pipeline::resolver::col_name_eq(col.name(), &column))
         .ok_or_else(|| {
@@ -782,6 +782,24 @@ pub(super) fn resolve_narrowing_destructure(
                 "Check that the column name matches a column in the input.".to_string(),
             )
         })?;
+
+    // Wrong-aim check (interior-values matrix, task #22): narrowing iterates
+    // a TABLE-shaped value; a plainly-scalar column has nothing to iterate.
+    // Without this the machinery marches json_each over a number/date and
+    // returns silent NULL rows. TEXT stays permissive (documents live there).
+    if let Some(decl) = col.scalar_only_declaration() {
+        return Err(crate::error::DelightQLError::ValidationError {
+            message: format!(
+                "cannot narrow into column '{}': it is declared {} — a plain \
+                 scalar has no rows to iterate. Narrowing ('|> .col{{.field}}') \
+                 expects a table-shaped value: a tree-group you built, or a \
+                 document column (TEXT) holding an array of objects.",
+                column, decl
+            ),
+            context: "resolver::narrowing_destructure".to_string(),
+            subcategory: Some("compound/scalar_column"),
+        });
+    }
 
     // 2. Build output columns — just the named fields (no context carry-forward)
     //    Output name is the last path segment: "name" → "name", "config.host" → "host"

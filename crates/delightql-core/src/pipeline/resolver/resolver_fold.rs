@@ -665,6 +665,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                             name: col.name().into(),
                                             nullable: true,
                                             position: idx + 1,
+                                            declared_type: col.declared_type.clone(),
                                         })
                                         .collect(),
                                 ),
@@ -2189,8 +2190,48 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 super::resolving::functions::resolve_curly_via_fold(self, func)
             }
 
+            // JsonPath: structural descent, then the wrong-aim check — pathing
+            // reaches INTO a value, so a column whose declared type is plainly
+            // scalar (INTEGER, REAL, BOOLEAN, dates) has no insides to reach
+            // into. Without this check the failure is target-dependent and
+            // silent-or-leaky (sqlite: 'malformed JSON' at runtime for text
+            // that doesn't parse, silent NULLs for numbers that do). TEXT
+            // stays permissive — documents live in TEXT columns — as do JSON,
+            // NONE, and undeclared columns. DIALECT/interior-values wrong-aim
+            // matrix (task #22); promise-ladder rung 1 preconditions.
+            ast_unresolved::FunctionExpression::JsonPath { .. } => {
+                let resolved = walk_transform_function(self, func)?;
+                if let ast_resolved::FunctionExpression::JsonPath { source, .. } = &resolved {
+                    if let ast_resolved::DomainExpression::Lvar {
+                        name, qualifier, ..
+                    } = source.as_ref()
+                    {
+                        if let Some(decl) = scalar_only_declaration(
+                            &self.available,
+                            name.as_str(),
+                            qualifier.as_ref().map(|q| q.as_str()),
+                        ) {
+                            return Err(DelightQLError::ValidationError {
+                                message: format!(
+                                    "cannot path into column '{}': it is declared {} — a \
+                                     plain scalar has no insides to reach into. Pathing \
+                                     ('col:{{.field}}' / 'col:[0]') expects a compound \
+                                     value: something you built with {{...}}/[...], a \
+                                     tree-group, or a document column (TEXT).",
+                                    name.as_str(),
+                                    decl
+                                ),
+                                context: "resolver::json_path".to_string(),
+                                subcategory: Some("compound/scalar_column"),
+                            });
+                        }
+                    }
+                }
+                Ok(resolved)
+            }
+
             // Everything else: walk handles structural descent
-            // Infix, Lambda, CaseExpression, Array, MetadataTreeGroup, JsonPath
+            // Infix, Lambda, CaseExpression, Array, MetadataTreeGroup
             other => walk_transform_function(self, other),
         }
     }
@@ -2287,4 +2328,24 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
         self.last_operator_output = Some(output_columns);
         Ok(resolved)
     }
+}
+
+/// Find `name` (optionally qualified) among the available columns and return
+/// its plainly-scalar declaration, if any — the wrong-aim check for tools
+/// that reach into compound values (`ColumnMetadata::scalar_only_declaration`).
+fn scalar_only_declaration<'a>(
+    available: &'a [ast_resolved::ColumnMetadata],
+    name: &str,
+    qualifier: Option<&str>,
+) -> Option<&'a str> {
+    available
+        .iter()
+        .find(|c| {
+            c.name() == name
+                && qualifier.map_or(true, |q| match c.qualifier() {
+                    ast_resolved::TableName::Named(t) => t.as_str() == q,
+                    _ => false,
+                })
+        })
+        .and_then(|c| c.scalar_only_declaration())
 }

@@ -357,6 +357,14 @@ pub struct ColumnMetadata {
     /// describes the columns of the interior relation for drill-down support.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub interior_schema: Option<Vec<crate::pipeline::asts::core::operators::InteriorColumnDef>>,
+    /// The column's DECLARED type from the catalog, when the column comes
+    /// from a physical table (registry lookup carries it forward from
+    /// ColumnInfo). None for derived/expression columns. Declarations lie
+    /// about sqlite storage — this is intent metadata; first consumer is
+    /// corresponding-union NULL-pad typing (a pad is typed by the column
+    /// it stands in for). The germ of resolved-AST type knowledge.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub declared_type: Option<String>,
 }
 
 // Helper for serde skip_serializing_if
@@ -379,7 +387,53 @@ impl ColumnMetadata {
             needs_hygienic_alias: false,
             needs_sql_rename: false,
             interior_schema: None,
+            declared_type: None,
         }
+    }
+
+    /// Attach the catalog's declared type (registry table lookups).
+    pub fn with_declared_type(mut self, declared_type: Option<String>) -> Self {
+        self.declared_type = declared_type;
+        self
+    }
+
+    /// The declared type as usable for typing a corresponding-union NULL
+    /// pad ("a pad is typed by the column it stands in for"). Filters the
+    /// declarations that lie too much to pad with: sqlite's NONE affinity
+    /// keyword (a non-type), and BOOLEAN — sqlite has no boolean storage,
+    /// so BOOLEAN declarations sit over text/int cells and a data-typed
+    /// target column contradicts a boolean-typed pad. Revisit BOOLEAN
+    /// with the boolean dirt migration.
+    pub fn pad_type(&self) -> Option<&str> {
+        self.declared_type.as_deref().filter(|t| {
+            !t.eq_ignore_ascii_case("none")
+                && !t.eq_ignore_ascii_case("boolean")
+                && !t.eq_ignore_ascii_case("bool")
+        })
+    }
+
+    /// The wrong-aim rule (interior-values matrix, task #22): a column whose
+    /// declared type is PLAINLY SCALAR cannot hold an interior value — aiming
+    /// a compound-value tool (pathing, narrow, drill) at it is a compile-time
+    /// error, not a target-dependent runtime surprise (sqlite: 'malformed
+    /// JSON' at runtime or silent NULLs, depending on whether the scalar
+    /// happens to parse as JSON). Returns the offending declaration when the
+    /// column is plainly scalar.
+    ///
+    /// TEXT (and CHAR/VARCHAR/CLOB) stay PERMISSIVE — documents live in TEXT
+    /// columns, and sqlite declarations lie anyway. JSON/JSONB, NONE, and
+    /// undeclared columns are also permissive. Only declarations that cannot
+    /// honestly hold a document reject: the integer/real/boolean/date
+    /// families.
+    pub fn scalar_only_declaration(&self) -> Option<&str> {
+        const SCALAR_PREFIXES: &[&str] = &[
+            "int", "bigint", "smallint", "tinyint", "real", "double", "float", "numeric",
+            "decimal", "bool", "date", "time", "timestamp", "datetime",
+        ];
+        self.declared_type.as_deref().filter(|t| {
+            let lower = t.to_ascii_lowercase();
+            SCALAR_PREFIXES.iter().any(|p| lower.starts_with(p))
+        })
     }
 
     /// Create new metadata with explicit user name flag
@@ -397,6 +451,7 @@ impl ColumnMetadata {
             needs_hygienic_alias: false,
             needs_sql_rename: false,
             interior_schema: None,
+            declared_type: None,
         }
     }
 

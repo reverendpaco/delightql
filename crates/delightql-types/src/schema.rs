@@ -13,6 +13,13 @@ pub struct ColumnInfo {
     pub name: SqlIdentifier,
     pub nullable: bool,
     pub position: usize,
+    /// The column's DECLARED type, verbatim from the catalog (sqlite
+    /// decltype / entity_attribute.data_type). None when the source has no
+    /// declaration (expression columns, typeless historical tables).
+    /// Declarations lie about sqlite STORAGE (dynamic typing) — this is
+    /// intent metadata, used where any consistent type beats none (e.g.
+    /// typing corresponding-union NULL pads for strict targets).
+    pub declared_type: Option<String>,
 }
 
 /// Core database schema trait used by the resolver

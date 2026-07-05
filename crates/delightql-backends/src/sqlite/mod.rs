@@ -49,6 +49,7 @@ impl DatabaseSchema for DynamicSqliteSchema {
         let columns = stmt
             .query_map([], |row| {
                 let name: String = row.get(1)?;  // Column name is at index 1
+                let decltype: String = row.get(2)?;  // Declared type at index 2 ('' if none)
                 let notnull: i32 = row.get(3)?;  // NOT NULL flag is at index 3
                 let cid: i32 = row.get(0)?;      // Column ID is at index 0
 
@@ -56,6 +57,7 @@ impl DatabaseSchema for DynamicSqliteSchema {
                     name: name.into(),
                     nullable: notnull == 0,  // notnull=0 means nullable
                     position: (cid + 1) as usize,  // Convert 0-based to 1-based
+                    declared_type: (!decltype.is_empty()).then_some(decltype),
                 })
             })
             .ok()?

@@ -49,6 +49,58 @@ impl Default for ResolverAliasCounter {
     }
 }
 
+/// In-flight consulted-definition expansions, shared across config clones
+/// (same idiom as [`ResolverAliasCounter`]). Guards the view/rule inliner
+/// against non-terminating expansion: re-encountering a name that is
+/// already being expanded means the self-reference did NOT resolve as the
+/// in-progress CTE (recursive clause before base, or an indirect cycle
+/// through another view) — refuse with a teaching error, never spin.
+/// RECURSION-CONTRACT.md B5.
+#[derive(Debug, Clone, Default)]
+pub struct ExpansionGuard(Rc<std::cell::RefCell<Vec<String>>>);
+
+impl ExpansionGuard {
+    /// Push `key` and return an RAII frame that pops on drop. Errors with
+    /// the current expansion chain if `key` is already in flight.
+    pub fn enter(&self, key: String, context: &str) -> Result<ExpansionFrame> {
+        {
+            let stack = self.0.borrow();
+            if stack.contains(&key) {
+                let chain = stack
+                    .iter()
+                    .chain(std::iter::once(&key))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                return Err(DelightQLError::ValidationError {
+                    message: format!(
+                        "circular consulted-definition expansion: '{key}' is already \
+                         being expanded ({chain}). If this is a recursive rule, the \
+                         base (non-recursive) clause must come FIRST in the consulted \
+                         file — a self-reference is only recursive once a prior clause \
+                         has established the name. If the cycle runs through another \
+                         view, break the cycle. RECURSION-CONTRACT.md B5."
+                    ),
+                    context: context.to_string(),
+                    subcategory: Some("recursion/consulted_clause_order"),
+                });
+            }
+        }
+        self.0.borrow_mut().push(key);
+        Ok(ExpansionFrame(Rc::clone(&self.0)))
+    }
+}
+
+/// RAII frame for [`ExpansionGuard`]: pops the most recent entry on drop,
+/// so every return path (including `?` error propagation) unwinds the stack.
+pub struct ExpansionFrame(Rc<std::cell::RefCell<Vec<String>>>);
+
+impl Drop for ExpansionFrame {
+    fn drop(&mut self) {
+        self.0.borrow_mut().pop();
+    }
+}
+
 /// Configuration for TVF resolution behavior
 #[derive(Debug, Clone)]
 pub struct ResolutionConfig {
@@ -70,6 +122,8 @@ pub struct ResolutionConfig {
     pub resolution_namespace: Option<String>,
     /// Per-resolution alias counter (shared across clones).
     pub alias_counter: ResolverAliasCounter,
+    /// In-flight consulted-definition expansions (shared across clones).
+    pub expansion_guard: ExpansionGuard,
 }
 
 impl Default for ResolutionConfig {
@@ -81,6 +135,7 @@ impl Default for ResolutionConfig {
             er_context: None,
             resolution_namespace: None,
             alias_counter: ResolverAliasCounter::new(),
+            expansion_guard: ExpansionGuard::default(),
         }
     }
 }

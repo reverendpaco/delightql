@@ -61,11 +61,38 @@ fn not_equal_spellings() {
 
 #[test]
 fn concatenate_spellings() {
+    // mysql is a SHAPE change (CONCAT is a function, not an infix token) —
+    // an op.* '{'-template, not a token swap. The old `a CONCAT b` pin
+    // faithfully preserved an M1-era bug (DIALECT-CONTRACT.md B3, fixed).
     let render = |d| seeded_generator(d).render_expression(&concat_expr()).unwrap();
     assert_eq!(render(SqlDialect::SQLite), "a || b");
     assert_eq!(render(SqlDialect::PostgreSQL), "a || b");
-    assert_eq!(render(SqlDialect::MySQL), "a CONCAT b");
+    assert_eq!(render(SqlDialect::MySQL), "CONCAT(a, b)");
     assert_eq!(render(SqlDialect::SqlServer), "a + b");
+}
+
+#[test]
+fn null_safe_spellings_mysql() {
+    // DelightQL = / != are null-safe: canonical IS [NOT] DISTINCT FROM.
+    // mysql has neither — <=> is its null-safe equality (token swap), and
+    // the negation needs a NOT wrap (op template). DIALECT-CONTRACT.md B4.
+    let eq = DomainExpression::Binary {
+        left: Box::new(DomainExpression::column("a")),
+        op: BinaryOperator::IsNotDistinctFrom,
+        right: Box::new(DomainExpression::column("b")),
+    };
+    let neq = DomainExpression::Binary {
+        left: Box::new(DomainExpression::column("a")),
+        op: BinaryOperator::IsDistinctFrom,
+        right: Box::new(DomainExpression::column("b")),
+    };
+    let render =
+        |d: SqlDialect, e: &DomainExpression| seeded_generator(d).render_expression(e).unwrap();
+    assert_eq!(render(SqlDialect::MySQL, &eq), "a <=> b");
+    assert_eq!(render(SqlDialect::MySQL, &neq), "NOT (a <=> b)");
+    // canonical untouched
+    assert_eq!(render(SqlDialect::SQLite, &eq), "a IS NOT DISTINCT FROM b");
+    assert_eq!(render(SqlDialect::SQLite, &neq), "a IS DISTINCT FROM b");
 }
 
 #[test]
@@ -473,4 +500,253 @@ fn internal_json_each_object_spellings() {
         "got: {sql}"
     );
     assert!(!sql.contains("__dql"), "internal name leaked: {sql}");
+}
+
+#[test]
+fn scalar_form_overloads_max_min_round() {
+    use crate::pipeline::naming;
+    // The SQL-AST constructor stamps arity-revealed forms: 2+-arg max/min
+    // is sqlite's SCALAR overload (pg: GREATEST/LEAST), 2-arg round needs
+    // pg's numeric coercion. Aggregate (1-arg) forms keep their names.
+    let scalar_max = DomainExpression::function(
+        "max",
+        vec![
+            DomainExpression::column("a"),
+            DomainExpression::literal(LiteralValue::Number("18".to_string())),
+        ],
+    );
+    assert!(
+        matches!(&scalar_max, DomainExpression::Function { name, .. }
+            if name == naming::INTERNAL_SCALAR_MAX),
+        "constructor did not stamp the scalar-max form"
+    );
+    let render = |d, e: &DomainExpression| seeded_generator(d).render_expression(e).unwrap();
+    // canonical spelling on a row miss — internal name never leaks
+    assert_eq!(render(SqlDialect::SQLite, &scalar_max), "max(a, 18)");
+    assert_eq!(render(SqlDialect::DuckDB, &scalar_max), "max(a, 18)");
+    // pg: NULL-propagating GREATEST (sqlite scalar max is NULL if ANY arg
+    // is NULL; bare GREATEST ignores NULLs — the measured divergence)
+    assert_eq!(
+        render(SqlDialect::PostgreSQL, &scalar_max),
+        "CASE WHEN a IS NULL OR 18 IS NULL THEN NULL ELSE GREATEST(a, 18) END"
+    );
+
+    let scalar_min = DomainExpression::function(
+        "min",
+        vec![DomainExpression::column("a"), DomainExpression::column("b")],
+    );
+    assert_eq!(
+        render(SqlDialect::PostgreSQL, &scalar_min),
+        "CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE LEAST(a, b) END"
+    );
+    assert_eq!(render(SqlDialect::SQLite, &scalar_min), "min(a, b)");
+
+    // aggregate max (1-arg) is untouched everywhere, including pg
+    let agg_max = DomainExpression::function("max", vec![DomainExpression::column("a")]);
+    assert_eq!(render(SqlDialect::PostgreSQL, &agg_max), "max(a)");
+    assert_eq!(render(SqlDialect::SQLite, &agg_max), "max(a)");
+
+    // 2-arg round: pg coerces the value to numeric; canonical elsewhere
+    let round2 = DomainExpression::function(
+        "round",
+        vec![
+            DomainExpression::column("x"),
+            DomainExpression::literal(LiteralValue::Number("1".to_string())),
+        ],
+    );
+    assert_eq!(render(SqlDialect::SQLite, &round2), "round(x, 1)");
+    assert_eq!(render(SqlDialect::DuckDB, &round2), "round(x, 1)");
+    assert_eq!(
+        render(SqlDialect::PostgreSQL, &round2),
+        "round(CAST(x AS numeric), CAST(1 AS integer))"
+    );
+    // 1-arg round is not the stamped form
+    let round1 = DomainExpression::function("round", vec![DomainExpression::column("x")]);
+    assert_eq!(render(SqlDialect::PostgreSQL, &round1), "round(x)");
+}
+
+#[test]
+fn arbitrary_witness_form() {
+    use crate::pipeline::naming;
+    // The transformer stamps bare `<~` delegate columns with the
+    // arbitrary-witness form. Canonical/sqlite spelling UNWRAPS to the bare
+    // column (relaxed GROUP BY); strict targets spell it any_value().
+    let arb = DomainExpression::function(
+        naming::INTERNAL_ARBITRARY,
+        vec![DomainExpression::column("name")],
+    );
+    let render = |d, e: &DomainExpression| seeded_generator(d).render_expression(e).unwrap();
+    assert_eq!(render(SqlDialect::SQLite, &arb), "name");
+    assert_eq!(render(SqlDialect::PostgreSQL, &arb), "any_value(name)");
+    assert_eq!(render(SqlDialect::DuckDB, &arb), "any_value(name)");
+
+    // wrong arity is an error, not a silent leak of the internal name
+    let bad = DomainExpression::function(
+        naming::INTERNAL_ARBITRARY,
+        vec![DomainExpression::column("a"), DomainExpression::column("b")],
+    );
+    assert!(seeded_generator(SqlDialect::SQLite)
+        .render_expression(&bad)
+        .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// DIALECT-CONTRACT.md probes — mechanism claims proven against SYNTHETIC
+// packs (custom rows in an in-memory bootstrap, so the probes are
+// independent of what happens to be seeded). P-numbers refer to the
+// contract's catalog.
+// ---------------------------------------------------------------------------
+
+/// A generator whose pack contains the given extra `dialect_render` rows on
+/// top of the real bootstrap seeds.
+fn generator_with_rows(dialect: SqlDialect, rows: &[(&str, &str, &str, &str)]) -> SqlGenerator {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::bootstrap::initialize_bootstrap_db(&conn).unwrap();
+    for (d, key, kind, body) in rows {
+        conn.execute(
+            "INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![d, key, kind, body],
+        )
+        .unwrap();
+    }
+    let pack = DialectPack::load(&conn).unwrap();
+    SqlGenerator::new()
+        .with_dialect(dialect)
+        .with_dialect_pack(std::sync::Arc::new(pack))
+}
+
+#[test]
+fn contract_p3_template_arg_reorder_and_duplication() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[("postgres", "fn.probe_dup", "template", "({1} + {0} - {0})")],
+    );
+    let expr = fn_call(
+        "probe_dup",
+        vec![DomainExpression::column("a"), DomainExpression::column("b")],
+    );
+    assert_eq!(g.render_expression(&expr).unwrap(), "(b + a - a)");
+}
+
+#[test]
+fn contract_p4_custom_infix_via_template() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[("postgres", "fn.probe_bitor", "template", "({0} | {1})")],
+    );
+    let expr = fn_call(
+        "probe_bitor",
+        vec![DomainExpression::column("a"), DomainExpression::column("b")],
+    );
+    assert_eq!(g.render_expression(&expr).unwrap(), "(a | b)");
+}
+
+#[test]
+fn contract_p5_keyword_interleaved_args() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[
+            ("postgres", "fn.probe_extract_day", "template", "EXTRACT(DAY FROM {0})"),
+            ("postgres", "fn.probe_attz", "template", "{0} AT TIME ZONE {1}"),
+        ],
+    );
+    let extract = fn_call("probe_extract_day", vec![DomainExpression::column("ts")]);
+    assert_eq!(
+        g.render_expression(&extract).unwrap(),
+        "EXTRACT(DAY FROM ts)"
+    );
+    let attz = fn_call(
+        "probe_attz",
+        vec![
+            DomainExpression::column("ts"),
+            DomainExpression::literal(LiteralValue::String("UTC".into())),
+        ],
+    );
+    assert_eq!(g.render_expression(&attz).unwrap(), "ts AT TIME ZONE 'UTC'");
+}
+
+#[test]
+fn contract_p6_clause_carrying_template() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[(
+            "postgres",
+            "fn.probe_pctl",
+            "template",
+            "percentile_cont({0}) WITHIN GROUP (ORDER BY {1})",
+        )],
+    );
+    let expr = fn_call(
+        "probe_pctl",
+        vec![
+            DomainExpression::literal(LiteralValue::Number("0.5".into())),
+            DomainExpression::column("salary"),
+        ],
+    );
+    assert_eq!(
+        g.render_expression(&expr).unwrap(),
+        "percentile_cont(0.5) WITHIN GROUP (ORDER BY salary)"
+    );
+}
+
+#[test]
+fn contract_n1_reserved_rule_kind_is_loud() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[("postgres", "fn.probe_lua", "lua", "return 'nope'")],
+    );
+    let expr = fn_call("probe_lua", vec![DomainExpression::column("a")]);
+    let err = g.render_expression(&expr).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("rule_kind"),
+        "reserved rule_kind must fail loudly, got: {err:?}"
+    );
+}
+
+#[test]
+fn contract_n2_unconsumed_template_arg_is_loud() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[("postgres", "fn.probe_uncons", "template", "f({0})")],
+    );
+    let expr = fn_call(
+        "probe_uncons",
+        vec![DomainExpression::column("a"), DomainExpression::column("b")],
+    );
+    assert!(
+        g.render_expression(&expr).is_err(),
+        "a template that ignores an argument must refuse, not swallow"
+    );
+}
+
+#[test]
+fn contract_n3_full_template_refuses_distinct() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[("postgres", "fn.probe_distinct", "template", "g({0})")],
+    );
+    let expr = DomainExpression::Function {
+        name: "probe_distinct".to_string(),
+        args: vec![DomainExpression::column("a")],
+        distinct: true,
+    };
+    let err = g.render_expression(&expr).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("DISTINCT"),
+        "full template + DISTINCT must refuse loudly, got: {err:?}"
+    );
+}
+
+#[test]
+fn contract_n5_unknown_rust_handler_is_loud() {
+    let g = generator_with_rows(
+        SqlDialect::PostgreSQL,
+        &[("postgres", "fn.probe_handler", "rust_handler", "no_such_handler")],
+    );
+    let expr = fn_call("probe_handler", vec![DomainExpression::column("a")]);
+    let err = g.render_expression(&expr).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("no_such_handler"),
+        "unknown rust_handler must name the missing handler, got: {err:?}"
+    );
 }

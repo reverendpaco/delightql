@@ -56,6 +56,7 @@ impl DatabaseSchema for PipeSchema {
                     name: name.into(),
                     nullable,
                     position,
+                    declared_type: None,
                 }
             })
             .collect();

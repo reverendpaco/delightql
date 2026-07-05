@@ -850,21 +850,42 @@ impl SqlGenerator {
                 literals::generate_literal(sql, value, self.config.dialect, &self.config.dialect_pack)?;
             }
             DomainExpression::Binary { left, op, right } => {
-                // Handle special cases that might need parentheses
-                let needs_parens = matches!(op, BinaryOperator::And | BinaryOperator::Or);
+                // An op.* row whose body contains '{' is a FULL TEMPLATE over
+                // the two rendered operands — for target spellings that change
+                // SHAPE, not just token (mysql CONCAT({0}, {1}) is a function;
+                // NOT ({0} <=> {1}) wraps). Same body-shape dispatch as the
+                // fn.* arm (DIALECT-CONTRACT.md B3). Templates own their
+                // parentheses.
+                let spelling =
+                    operators::binary_operator_to_sql(op, self.config.dialect, &self.config.dialect_pack)?;
+                if spelling.contains('{') {
+                    let mut left_sql = String::new();
+                    self.generate_domain_expression(&mut left_sql, left)?;
+                    let mut right_sql = String::new();
+                    self.generate_domain_expression(&mut right_sql, right)?;
+                    let applied = crate::pipeline::dialect_pack::apply_template(
+                        spelling,
+                        &[left_sql.as_str(), right_sql.as_str()],
+                    )
+                    .map_err(|e| GeneratorError::Error(format!("op template: {}", e)))?;
+                    sql.push_str(&applied);
+                } else {
+                    // Handle special cases that might need parentheses
+                    let needs_parens = matches!(op, BinaryOperator::And | BinaryOperator::Or);
 
-                if needs_parens {
-                    sql.push('(');
-                }
+                    if needs_parens {
+                        sql.push('(');
+                    }
 
-                self.generate_domain_expression(sql, left)?;
-                sql.push(' ');
-                sql.push_str(operators::binary_operator_to_sql(op, self.config.dialect, &self.config.dialect_pack)?);
-                sql.push(' ');
-                self.generate_domain_expression(sql, right)?;
+                    self.generate_domain_expression(sql, left)?;
+                    sql.push(' ');
+                    sql.push_str(spelling);
+                    sql.push(' ');
+                    self.generate_domain_expression(sql, right)?;
 
-                if needs_parens {
-                    sql.push(')');
+                    if needs_parens {
+                        sql.push(')');
+                    }
                 }
             }
             DomainExpression::Unary { op, expr } => {
@@ -980,7 +1001,23 @@ impl SqlGenerator {
                         self.write_fn_call(sql, new_name, args, *distinct)?;
                     }
                     FnRender::Canonical => {
-                        self.write_fn_call(sql, canonical_name, args, *distinct)?;
+                        // The arbitrary-witness form's canonical spelling is
+                        // the bare argument (sqlite's relaxed GROUP BY) —
+                        // identity isn't expressible as a rename row, so this
+                        // one canonical rule lives in code like the rest of
+                        // the canonical spellings.
+                        if name == crate::pipeline::naming::INTERNAL_ARBITRARY {
+                            let [arg] = args.as_slice() else {
+                                return Err(GeneratorError::Error(format!(
+                                    "{}: expects exactly 1 argument, got {}",
+                                    fn_key,
+                                    args.len()
+                                )));
+                            };
+                            self.generate_domain_expression(sql, arg)?;
+                        } else {
+                            self.write_fn_call(sql, canonical_name, args, *distinct)?;
+                        }
                     }
                 }
             }

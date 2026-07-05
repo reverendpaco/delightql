@@ -446,8 +446,6 @@ fn read_ho_clauses_by_ground_value_exact(
 fn extract_body(full_source: &str) -> String {
     if let Some(pos) = full_source.find(":-") {
         full_source[pos + 2..].trim().to_string()
-    } else if let Some(pos) = full_source.find(":=") {
-        full_source[pos + 2..].trim().to_string()
     } else {
         full_source.trim().to_string()
     }

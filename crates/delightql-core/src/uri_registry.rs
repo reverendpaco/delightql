@@ -308,6 +308,37 @@ predicate.",
     },
     RegistryEntry {
         kind: UriKind::Error,
+        hierarchy: "semantic/recursion/consulted_clause_order",
+        summary: "Circular consulted-definition expansion (recursive clause \
+before base, or an indirect view cycle).",
+        explanation: "While inlining a consulted definition, the resolver \
+re-encountered a name it was already expanding — the self-reference did \
+not resolve as the in-progress recursive CTE, so expansion would never \
+terminate (this used to hang the compiler). The common cause: in a \
+consulted rules file, the recursive clause appears BEFORE the base clause \
+— clause order matters; a self-reference is only recursive once a prior \
+clause has established the name. Put the base (non-recursive) clause \
+first. If the cycle runs through another view (a uses v, v uses a), break \
+the cycle. The error message shows the expansion chain. \
+RECURSION-CONTRACT.md B5.",
+    },
+    RegistryEntry {
+        kind: UriKind::Error,
+        hierarchy: "semantic/compound/scalar_column",
+        summary: "A compound-value tool aimed at a plainly-scalar column.",
+        explanation: "Pathing ('col:{.field}', 'col:[0]') reaches into a \
+value; narrowing ('|> .col{.field}') iterates one. A column declared as a \
+plain scalar (INTEGER, REAL, BOOLEAN, dates) has no insides to reach into \
+and no rows to iterate — aiming these tools at it used to fail \
+target-dependently at runtime (sqlite: 'malformed JSON', or silent NULLs \
+when the scalar happened to parse as JSON). Refused at compile time \
+instead. TEXT columns stay permissive: documents live in TEXT, and \
+declarations cannot be trusted to deny it. Aim the tool at a compound \
+value: something built with {...}/[...], a tree-group, or a document \
+column.",
+    },
+    RegistryEntry {
+        kind: UriKind::Error,
         hierarchy: "runtime/assertion",
         summary: "An --assert query did not hold.",
         explanation: "The main query executed, but an assertion attached to \

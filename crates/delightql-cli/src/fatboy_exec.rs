@@ -458,7 +458,8 @@ impl DatabaseSchema for FatboySchema {
         let sql = format!(
             "SELECT c.column_name AS name, \
              CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS notnull, \
-             c.ordinal_position - 1 AS cid \
+             c.ordinal_position - 1 AS cid, \
+             c.data_type AS data_type \
              FROM information_schema.columns c \
              WHERE c.table_schema = '{}' AND c.table_name = '{}' \
              ORDER BY c.ordinal_position",
@@ -478,6 +479,7 @@ impl DatabaseSchema for FatboySchema {
                         name: get(0).into(),
                         nullable: get(1) == "0",
                         position: get(2).parse().unwrap_or(i),
+                        declared_type: Some(get(3)).filter(|t| !t.is_empty()),
                     }
                 })
                 .collect(),

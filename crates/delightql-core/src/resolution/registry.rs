@@ -127,6 +127,7 @@ impl<'a> DatabaseRegistry<'a> {
                             TableName::Named(table_name.to_string().into()),
                             Some(idx + 1), // 1-based position
                         )
+                        .with_declared_type(col.declared_type.clone())
                     })
                     .collect();
 
@@ -246,6 +247,7 @@ impl<'a> DatabaseRegistry<'a> {
                     let cols: Result<Vec<_>, _> = stmt
                         .query_map([], |row| {
                             let name: String = row.get(1)?;
+                            let decltype: String = row.get(2)?;
                             let notnull: i32 = row.get(3)?;
                             let cid: i32 = row.get(0)?;
 
@@ -253,6 +255,7 @@ impl<'a> DatabaseRegistry<'a> {
                                 name: name.into(),
                                 nullable: notnull == 0,
                                 position: (cid + 1) as usize,
+                                declared_type: (!decltype.is_empty()).then_some(decltype),
                             })
                         })
                         .map_err(|e| {
@@ -324,6 +327,7 @@ impl<'a> DatabaseRegistry<'a> {
                         TableName::Named(canonical_name.clone()),
                         Some(idx + 1), // 1-based position
                     )
+                    .with_declared_type(col.declared_type.clone())
                 })
                 .collect();
 

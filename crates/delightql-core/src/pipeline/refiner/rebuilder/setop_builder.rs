@@ -214,9 +214,14 @@ pub(super) fn handle_setop_with_column_alignment(
     let transformed_operands = match strategy {
         SetOperatorStrategy::Correspondence => {
             // Build column mapping for all columns
-            let (column_order, column_presence) =
+            let (column_order, column_presence, column_types) =
                 build_column_correspondence(operand_table_groups)?;
-            transform_operands_with_correspondence(operands, &column_order, &column_presence)?
+            transform_operands_with_correspondence(
+                operands,
+                &column_order,
+                &column_presence,
+                &column_types,
+            )?
         }
         SetOperatorStrategy::SameColumnsReorder => {
             // Verify same columns and reorder to match first
@@ -245,9 +250,19 @@ pub(super) fn handle_union_corresponding(
 /// Build column correspondence mapping for union operations
 pub(super) fn build_column_correspondence(
     operand_table_groups: &[Vec<FlatTable>],
-) -> Result<(Vec<String>, std::collections::HashMap<String, Vec<bool>>)> {
+) -> Result<(
+    Vec<String>,
+    std::collections::HashMap<String, Vec<bool>>,
+    std::collections::HashMap<String, String>,
+)> {
     let mut column_order: Vec<String> = Vec::new();
     let mut column_presence: std::collections::HashMap<String, Vec<bool>> =
+        std::collections::HashMap::new();
+    // Declared type per column (first branch that knows wins) — used to
+    // type the NULL pads: a pad is typed by the column it stands in for.
+    // The lying-declaration filter (NONE, BOOLEAN) is
+    // ColumnMetadata::pad_type's ruling, shared with the TV4 pad site.
+    let mut column_types: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
     // First pass: collect all unique columns in order of first appearance
@@ -266,12 +281,15 @@ pub(super) fn build_column_correspondence(
                     if let Some(presence) = column_presence.get_mut(&col_name) {
                         presence[op_idx] = true;
                     }
+                    if let Some(t) = col.pad_type() {
+                        column_types.entry(col_name.clone()).or_insert(t.to_string());
+                    }
                 }
             }
         }
     }
 
-    Ok((column_order, column_presence))
+    Ok((column_order, column_presence, column_types))
 }
 
 /// Transform operands with column correspondence
@@ -279,12 +297,14 @@ pub(super) fn transform_operands_with_correspondence(
     operands: Vec<refined::RelationalExpression>,
     column_order: &[String],
     column_presence: &std::collections::HashMap<String, Vec<bool>>,
+    column_types: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<refined::RelationalExpression>> {
     operands
         .into_iter()
         .enumerate()
         .map(|(op_idx, operand)| {
-            let projections = build_projections_for_operand(op_idx, column_order, column_presence);
+            let projections =
+                build_projections_for_operand(op_idx, column_order, column_presence, column_types);
 
             // Wrap operand with projection pipe
             Ok(refined::RelationalExpression::Pipe(Box::new(
@@ -306,6 +326,7 @@ pub(super) fn build_projections_for_operand(
     op_idx: usize,
     column_order: &[String],
     column_presence: &std::collections::HashMap<String, Vec<bool>>,
+    column_types: &std::collections::HashMap<String, String>,
 ) -> Vec<refined::DomainExpression> {
     let mut projections = Vec::new();
 
@@ -324,8 +345,35 @@ pub(super) fn build_projections_for_operand(
                 alias: None,
                 provenance: crate::pipeline::asts::refined::PhaseBox::new(None),
             });
+        } else if let Some(t) = column_types.get(col_name) {
+            // Project a TYPED NULL pad — cast:(NULL, t), the same refined
+            // form the resolver emits for user casts, so the type spells
+            // per-target through the type.* render layer. An untyped pad
+            // breaks strict targets: postgres resolves UNION types
+            // pairwise, and two pad-only branches collapse the column to
+            // text before a typed branch arrives.
+            projections.push(refined::DomainExpression::Function(
+                refined::FunctionExpression::Regular {
+                    name: "cast".into(),
+                    namespace: None,
+                    arguments: vec![
+                        refined::DomainExpression::Literal {
+                            value: crate::pipeline::asts::core::literals::LiteralValue::Null,
+                            alias: None,
+                        },
+                        refined::DomainExpression::Literal {
+                            value: crate::pipeline::asts::core::literals::LiteralValue::String(
+                                t.to_ascii_lowercase(),
+                            ),
+                            alias: None,
+                        },
+                    ],
+                    alias: Some(col_name.clone().into()),
+                    conditioned_on: None,
+                },
+            ));
         } else {
-            // Project NULL with alias for missing column
+            // No declared type known — bare NULL pad (canonical behavior).
             projections.push(refined::DomainExpression::Literal {
                 value: crate::pipeline::asts::core::literals::LiteralValue::Null,
                 alias: Some(col_name.clone().into()),
