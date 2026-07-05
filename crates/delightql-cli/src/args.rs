@@ -209,6 +209,16 @@ pub enum Command {
         identifier: String,
     },
 
+    /// Manage target adapters (fatboys — the per-engine co-processes)
+    ///
+    /// The slim dql speaks SQLite natively; other engines are reached
+    /// through separate adapter binaries found via: DQL_FATBOY_DIR
+    /// (hard pin) → next to dql → the adapter store → PATH.
+    Target {
+        #[command(subcommand)]
+        action: TargetCommand,
+    },
+
     /// Start relay protocol server on a Unix socket
     Server {
         /// Unix socket path (default: /tmp/dql-{pid}.sock)
@@ -227,6 +237,42 @@ pub enum Command {
         #[arg(long, default_value = "0")]
         socket_idle_timeout: u64,
     },
+}
+
+/// Subcommands under `dql target`
+///
+/// `install` and `verify` (JOE-EVERYBODY-DISTRIBUTION.md §3.1) wait on
+/// the release pipeline: nothing published to fetch, no digests to
+/// check against yet.
+#[derive(Subcommand)]
+pub enum TargetCommand {
+    /// Show each known adapter and where it resolves from
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Install an adapter into the adapter store
+    ///
+    /// Copies the adapter binary from a local artifact directory
+    /// (--from), verifying it against the digests burned into this
+    /// dql at release time — a mismatch refuses, nothing is installed.
+    /// Downloading from a published artifact host is a future source
+    /// behind the same verification; no host exists yet.
+    Install {
+        /// Adapter profile (e.g. postgres, duckdb)
+        profile: String,
+
+        /// Directory holding the adapter: a bare dql-fatboy-<profile>
+        /// or a release artifact named
+        /// dql-fatboy-<profile>-<version>+<commit>-<os>-<arch>
+        /// (what scripts/release-build.py writes to dist/)
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+
+    /// Re-hash installed adapters against the digests burned into this
+    /// dql at release time. Refuses on dev builds (no digests burned);
+    /// exits nonzero on any mismatch.
+    Verify,
 }
 
 /// Subcommands under `dql tools`

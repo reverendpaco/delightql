@@ -14,3 +14,4 @@ pub mod filemunge;
 pub mod format;
 pub mod jstruct;
 pub mod query;
+pub mod target;

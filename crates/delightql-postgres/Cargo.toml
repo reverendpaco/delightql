@@ -5,12 +5,15 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Postgres fatboy: relay-protocol Handler (PgParty) over libpq. Contains NO compiler."
+description = "Postgres fatboy: relay-protocol Handler (PgParty) over pure-Rust rust-postgres. Contains NO compiler."
 
 # Deliberately NOT depending on delightql-core: the fatboy is an execution
 # adapter (relay-role validation, ALL-SQL-TARGETING-FATBOY.md). It speaks
 # protocol terms on one side and Postgres on the other. Keeping the compiler
-# out of the adapter mirrors keeping libpq out of the slim CLI.
+# out of the adapter mirrors keeping the pg client out of the slim CLI.
+# (The client is rust-postgres, not libpq — ldd shows only libc: the
+# fatboy is a fully static single file, which the distribution design
+# depends on. See JOE-EVERYBODY-DISTRIBUTION.md.)
 [[bin]]
 name = "dql-fatboy-postgres"
 path = "src/bin/dql_fatboy_postgres.rs"

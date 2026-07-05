@@ -209,6 +209,20 @@ fn run() -> Result<()> {
             Command::Explain { identifier } => {
                 delightql_cli::commands::explain::handle_explain(identifier)
             }
+            Command::Target { action } => match action {
+                delightql_cli::args::TargetCommand::List => {
+                    delightql_cli::commands::target::handle_target_list()
+                }
+                delightql_cli::args::TargetCommand::Install { profile, from } => {
+                    delightql_cli::commands::target::handle_target_install(
+                        profile,
+                        from.as_deref(),
+                    )
+                }
+                delightql_cli::args::TargetCommand::Verify => {
+                    delightql_cli::commands::target::handle_target_verify()
+                }
+            },
             Command::Format { .. } => {
                 delightql_cli::commands::format::handle_format_subcommand(command, &args)
             }

@@ -57,21 +57,83 @@ fn introspect_sql(profile: &str) -> String {
     )
 }
 
-/// Locate the fatboy binary, git-exec-path style: env override →
-/// sibling of the running dql → bare name (PATH).
-fn fatboy_binary(profile: &str) -> PathBuf {
-    let env_key = format!("DQL_FATBOY_{}_BIN", profile.to_uppercase());
-    if let Ok(p) = std::env::var(&env_key) {
-        return PathBuf::from(p);
+pub(crate) fn fatboy_name(profile: &str) -> String {
+    format!("dql-fatboy-{}{}", profile, std::env::consts::EXE_SUFFIX)
+}
+
+/// The managed store — delightql's libexec (JOE-EVERYBODY-DISTRIBUTION.md
+/// §3.2): per-version, private, never on PATH. Same ProjectDirs identity
+/// as the REPL's history file. `dql target install` will create it; this
+/// side only probes.
+pub(crate) fn fatboy_store_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "delightql").map(|dirs| {
+        dirs.data_dir()
+            .join("fatboys")
+            .join(delightql_buildinfo::VERSION)
+    })
+}
+
+/// The one env override: a DIRECTORY (git's GIT_EXEC_PATH precedent,
+/// not a per-profile file variable), and a HARD pin — when set, dql
+/// looks only here and a miss is a loud refusal. Fall-through would
+/// let a typoed pin silently resolve to an older store binary: the
+/// silent-wrong of configuration.
+pub(crate) const FATBOY_DIR_ENV: &str = "DQL_FATBOY_DIR";
+
+/// Where an adapter resolved from. One enum serves query-time
+/// resolution, the refusal message, and `dql target list`, so their
+/// vocabularies cannot drift.
+pub(crate) enum FatboyLocation {
+    /// DQL_FATBOY_DIR is set. The pin is hard: this is the answer
+    /// whether or not the file exists — a missing pin refuses loudly
+    /// at spawn instead of falling through.
+    Pinned(PathBuf),
+    Sibling(PathBuf),
+    Store(PathBuf),
+    OnPath(PathBuf),
+    NotFound,
+}
+
+/// Walk the lookup chain: DQL_FATBOY_DIR (hard pin) → sibling of the
+/// running dql → managed store → PATH.
+pub(crate) fn locate_fatboy(profile: &str) -> FatboyLocation {
+    let name = fatboy_name(profile);
+    if let Ok(dir) = std::env::var(FATBOY_DIR_ENV) {
+        return FatboyLocation::Pinned(PathBuf::from(dir).join(name));
     }
-    let name = format!("dql-fatboy-{}", profile);
     if let Ok(me) = std::env::current_exe() {
         let sibling = me.with_file_name(&name);
         if sibling.is_file() {
-            return sibling;
+            return FatboyLocation::Sibling(sibling);
         }
     }
-    PathBuf::from(name) // PATH lookup at spawn time
+    if let Some(store) = fatboy_store_dir() {
+        let stored = store.join(&name);
+        if stored.is_file() {
+            return FatboyLocation::Store(stored);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        if let Some(found) = std::env::split_paths(&paths)
+            .map(|d| d.join(&name))
+            .find(|c| c.is_file())
+        {
+            return FatboyLocation::OnPath(found);
+        }
+    }
+    FatboyLocation::NotFound
+}
+
+fn fatboy_binary(profile: &str) -> PathBuf {
+    match locate_fatboy(profile) {
+        FatboyLocation::Pinned(p)
+        | FatboyLocation::Sibling(p)
+        | FatboyLocation::Store(p)
+        | FatboyLocation::OnPath(p) => p,
+        // Hand the bare name to spawn so its NotFound carries the
+        // OS-level cause; the refusal message does the explaining.
+        FatboyLocation::NotFound => PathBuf::from(fatboy_name(profile)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,18 +345,52 @@ fn spawn_fatboy_stdio(profile: &str, spawn: &SpawnSpec) -> Result<Child, String>
         .stdout(Stdio::piped())
         // stderr inherits — fatboy errors surface on dql's stderr.
         .spawn()
-        .map_err(|e| {
-            // The anti-"is the docker daemon running?" clause: name the
-            // binary, the cause, and the fix.
-            format!(
-                "cannot spawn fatboy binary '{}': {e}\n\
-                 (build it with `cargo build --bin dql-fatboy-{}`, put it \
-                 on PATH, or set DQL_FATBOY_{}_BIN)",
-                bin.display(),
-                profile,
-                profile.to_uppercase()
-            )
-        })
+        .map_err(|e| fatboy_spawn_message(profile, &bin, &e))
+}
+
+/// The refusal a user reads when the adapter isn't there. Speaks the
+/// user's register, not the workshop's (JOE-EVERYBODY-DISTRIBUTION.md
+/// deviation 1): name the adapter, list every place dql looked, end
+/// with the way forward. The from-source line is the install story
+/// until `dql target install` exists to replace it.
+fn fatboy_spawn_message(profile: &str, bin: &std::path::Path, e: &std::io::Error) -> String {
+    if e.kind() != std::io::ErrorKind::NotFound {
+        // Present but unstartable (permissions, wrong arch, …): saying
+        // "not installed" would be a lie. Name the file and the cause.
+        return format!(
+            "cannot start the {} adapter '{}': {}",
+            profile,
+            bin.display(),
+            e
+        );
+    }
+    let name = fatboy_name(profile);
+    if let Ok(dir) = std::env::var(FATBOY_DIR_ENV) {
+        // The pin is hard: we looked only where it pointed, so listing
+        // the other locations would misdescribe the search.
+        return format!(
+            "the {profile} adapter ({name}) is not in {FATBOY_DIR_ENV}.\n\
+             {FATBOY_DIR_ENV} pins the adapter directory to: {dir}\n\
+             dql looked only there; unset it to search normally."
+        );
+    }
+    let sibling_dir = std::env::current_exe()
+        .ok()
+        .and_then(|me| me.parent().map(|d| d.display().to_string()))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let store_dir = fatboy_store_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "<no home directory>".to_string());
+    format!(
+        "the {profile} adapter ({name}) is not installed.\n\
+         dql looked for it in:\n\
+         - next to dql: {sibling_dir}\n\
+         - the adapter store: {store_dir}\n\
+         - PATH\n\
+         To install it: dql target install {profile} --from <dir>\n\
+         (from source: cargo build -p delightql-{profile}; \
+         {FATBOY_DIR_ENV} overrides the search)"
+    )
 }
 
 /// Handler returned when the fatboy disappeared between sessions:
