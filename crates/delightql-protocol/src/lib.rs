@@ -10,6 +10,7 @@ pub mod layer1;
 pub mod manifest;
 #[cfg(unix)]
 pub mod socket;
+pub mod stdio;
 
 // Re-export layer0 for backward compat (existing code uses `delightql_protocol::ClientTerm`)
 pub use layer0::*;

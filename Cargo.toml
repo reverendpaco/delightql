@@ -1,12 +1,33 @@
 [workspace]
 resolver = "2"
 exclude = ["grammar_dql", "tools/fn-lengths"]
-members = [
+# delightql-duckdb is NOT a default member: cargo's per-invocation
+# feature unification would otherwise link libduckdb (backends/duckdb)
+# into every binary built alongside it — including dql itself, which
+# must stay duckdb-free unless its own feature asks. Build the duckdb
+# fatboy explicitly: `cargo build -p delightql-duckdb`.
+default-members = [
+    "crates/delightql-buildinfo",
     "crates/delightql-core",
     "crates/delightql-cli",
     "crates/delightql-formatter",
     "crates/delightql-macros",
     "crates/delightql-postgres", "crates/delightql-backends", "crates/delightql-types",
+    "crates/delightql-wasm",
+    "crates/delightql-cli-siso",
+    "crates/delightql-protocol",
+    "crates/delightql-sqlite-relay",
+    "crates/dql-test-ball-runner",
+    "crates/tree-sitter-highlight",
+    "crates/delightql-cabi",
+]
+members = [
+    "crates/delightql-buildinfo",
+    "crates/delightql-core",
+    "crates/delightql-cli",
+    "crates/delightql-formatter",
+    "crates/delightql-macros",
+    "crates/delightql-postgres", "crates/delightql-duckdb", "crates/delightql-backends", "crates/delightql-types",
     "crates/delightql-wasm",
     "crates/delightql-cli-siso",
     "crates/delightql-protocol",

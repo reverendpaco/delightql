@@ -11,6 +11,7 @@ name = "dql-test-ball-runner"
 path = "src/main.rs"
 
 [dependencies]
+delightql-buildinfo = { path = "../delightql-buildinfo" }
 delightql-protocol = { path = "../delightql-protocol" }
 clap.workspace = true
 rusqlite.workspace = true

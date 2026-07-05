@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "delightql-duckdb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DuckDB fatboy: relay-protocol Handler (DuckParty) over the duckdb crate. Contains NO compiler."
+
+[[bin]]
+name = "dql-fatboy-duckdb"
+path = "src/bin/dql_fatboy_duckdb.rs"
+
+# Values render through the SAME delightql-backends executor the
+# in-process duckdb path uses, so fatboy hashes match native
+# `--db file.duckdb` hashes by construction.
+[dependencies]
+delightql-buildinfo = { path = "../delightql-buildinfo" }
+delightql-protocol = { path = "../delightql-protocol" }
+delightql-backends = { path = "../delightql-backends", default-features = false, features = ["duckdb"] }
+clap.workspace = true
+libc = "0.2"

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "delightql-buildinfo"
+version.workspace = true
+edition.workspace = true
+description = "Build identity for DelightQL binaries (leaf crate, dependency-free)"
+
+# Deliberately NO dependencies: this crate exists to sit at the top of the
+# dependency graph and rebuild in microseconds when DQL_BUILD_IDENT changes.
+[dependencies]

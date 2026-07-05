@@ -215,13 +215,25 @@ impl DqlHandleImpl {
 /// 3. Register bootstrap (id=1) and user (id=2) connections
 /// 4. Create empty "main" namespace — no user introspection
 /// 5. The CLI sends `mount!("path", "main")` as its first query to populate "main"
-pub fn open(factory: Box<dyn ConnectionFactory>) -> Result<Box<dyn api::DqlHandle>, String> {
+///
+/// `mount_factory` is the types-level factory used by `mount!`/`import!`
+/// when the path is a URI scheme (`pipe://`, etc.). Embeddings that can
+/// mount URI-scheme databases pass `Some` (CLI, C-ABI); those that can't
+/// pass `None` (WASM) and URI mounts error with an actionable message.
+pub fn open(
+    factory: Box<dyn ConnectionFactory>,
+    mount_factory: Option<Box<dyn delightql_types::ConnectionFactory>>,
+) -> Result<Box<dyn api::DqlHandle>, String> {
     let created = factory
         .create(":memory:")
         .map_err(|e| format!("Failed to create initial connection: {}", e))?;
 
-    let system = DelightQLSystem::new(created.connection, created.introspector, &created.db_type)
-        .map_err(|e| format!("{}", e))?;
+    let mut system =
+        DelightQLSystem::new(created.connection, created.introspector, &created.db_type)
+            .map_err(|e| format!("{}", e))?;
+    if let Some(mf) = mount_factory {
+        system.set_connection_factory(mf);
+    }
 
     Ok(Box::new(DqlHandleImpl {
         system: Box::new(system),

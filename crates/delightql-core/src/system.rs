@@ -767,6 +767,10 @@ impl DelightQLSystem {
 
         // Idempotent mount: if namespace already exists with the SAME URI, return
         // existing connection info. If a different URI, that's an error.
+        // A namespace that exists but has NO activated entities (e.g. the
+        // empty "main" pre-created by open()) is NOT "already mounted" — it
+        // is reused and populated below.
+        let mut empty_namespace_id: Option<i32> = None;
         {
             let existing: Option<String> = match bootstrap_conn.query_row(
                 "SELECT c.source_uri FROM namespace n
@@ -780,14 +784,14 @@ impl DelightQLSystem {
             ) {
                 Ok(uri) => Some(uri),
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    match bootstrap_conn.query_row(
-                        "SELECT 1 FROM namespace WHERE fq_name = ?1",
-                        [namespace],
-                        |_| Ok(()),
-                    ) {
-                        Ok(()) => Some(String::new()),
-                        Err(_) => None,
-                    }
+                    empty_namespace_id = bootstrap_conn
+                        .query_row(
+                            "SELECT id FROM namespace WHERE fq_name = ?1",
+                            [namespace],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    None
                 }
                 Err(e) => {
                     return Err(DelightQLError::database_error(
@@ -797,7 +801,7 @@ impl DelightQLSystem {
                 }
             };
             if let Some(existing_uri) = existing {
-                if existing_uri == connection_uri || existing_uri.is_empty() {
+                if existing_uri == connection_uri {
                     // Same database — return existing connection info
                     let conn_id: i64 = bootstrap_conn
                         .query_row(
@@ -898,8 +902,23 @@ impl DelightQLSystem {
             )
         })?;
 
-        // Create the namespace
-        let namespace_id = {
+        // Create the namespace — or reuse a pre-existing EMPTY one (the
+        // "main" namespace open() pre-creates), recording its new source.
+        let namespace_id = if let Some(id) = empty_namespace_id {
+            bootstrap_conn
+                .execute(
+                    "UPDATE namespace SET provenance = 'uri', source_path = ?2 WHERE id = ?1",
+                    rusqlite::params![id, connection_uri],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error_with_source(
+                        "Failed to update empty namespace",
+                        e.to_string(),
+                        Box::new(e),
+                    )
+                })?;
+            id
+        } else {
             bootstrap_conn
                 .execute(
                     "INSERT INTO namespace (name, pid, fq_name, kind, provenance, source_path)
@@ -1467,6 +1486,14 @@ impl DelightQLSystem {
 
     /// Mount a database and register it with a namespace
     ///
+    /// Install the connection factory used to mount URI-scheme databases
+    /// (`pipe://`, etc.). Without it, `mount_database` on a URI errors with
+    /// "connection factory not available in this context". Installed by
+    /// `open()` when the embedding provides a types-level factory.
+    pub fn set_connection_factory(&mut self, factory: Box<dyn ConnectionFactory>) {
+        self.connection_factory = Some(factory);
+    }
+
     /// This is called by the `mount!()` pseudo-predicate to:
     /// 1. Open a database connection at the specified path or URI
     /// 2. Register it in the bootstrap connection table
@@ -1489,7 +1516,7 @@ impl DelightQLSystem {
     /// ```
     pub fn mount_database(&mut self, db_path: &str, namespace: &str) -> Result<()> {
         // If a ConnectionFactory is available and the path looks like a URI scheme,
-        // use the factory path (supports pipe://, duckdb://, etc.)
+        // use the factory path (supports pipe://, fatboy://, etc.)
         let has_uri_scheme = db_path.contains("://");
         if has_uri_scheme {
             if let Some(factory) = self.connection_factory.as_ref() {
@@ -5940,7 +5967,7 @@ impl DelightQLSystem {
                 3
             } else {
                 // Determine from source_uri
-                if source_uri.starts_with("duckdb://") {
+                if source_uri.starts_with("fatboy://duckdb/") {
                     4
                 } else if source_uri.starts_with("postgres://")
                     || source_uri.starts_with("postgresql://")

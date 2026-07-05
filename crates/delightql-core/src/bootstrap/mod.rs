@@ -36,8 +36,11 @@ pub const BOOTSTRAP_SCHEMA: &str = include_str!("../../bootstrap/schema.sql");
 /// Seed enum tables from Rust enum definitions
 ///
 /// This is the SINGLE SOURCE OF TRUTH for enum values.
-/// All enum IDs and variants are defined in src/bootstrap/enums.rs
-/// and inserted programmatically here.
+/// All enum IDs and variants are defined in src/enums.rs (re-exported
+/// here as `bootstrap::enums`) and inserted programmatically here.
+/// (A shadowed duplicate at src/bootstrap/enums.rs — never declared as
+/// a module, never compiled — was deleted 2026-06-12 after it absorbed
+/// an edit meant for the live enum.)
 ///
 /// Benefits:
 /// - Type-safe: Impossible to use wrong enum value

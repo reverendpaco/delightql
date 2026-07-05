@@ -100,11 +100,15 @@ pub enum Language {
 
     /// SQL with SQLite dialect (version 3.45.0)
     SqlSqlite = 3,
+
+    /// SQL with DuckDB dialect (version 1.1)
+    SqlDuckdb = 4,
 }
 
 impl Language {
     /// All language variants (for iteration during seeding)
-    pub const ALL: &'static [Self] = &[Self::DqlStandard, Self::SqlPostgres, Self::SqlSqlite];
+    pub const ALL: &'static [Self] =
+        &[Self::DqlStandard, Self::SqlPostgres, Self::SqlSqlite, Self::SqlDuckdb];
 
     /// Convert to integer for database storage
     pub fn as_i32(self) -> i32 {
@@ -117,6 +121,7 @@ impl Language {
             Self::DqlStandard => "DQL",
             Self::SqlPostgres => "SQL",
             Self::SqlSqlite => "SQL",
+            Self::SqlDuckdb => "SQL",
         }
     }
 
@@ -126,6 +131,7 @@ impl Language {
             Self::DqlStandard => "standard",
             Self::SqlPostgres => "postgres",
             Self::SqlSqlite => "sqlite",
+            Self::SqlDuckdb => "duckdb",
         }
     }
 
@@ -135,6 +141,7 @@ impl Language {
             Self::DqlStandard => "1.0",
             Self::SqlPostgres => "16.3",
             Self::SqlSqlite => "3.45.0",
+            Self::SqlDuckdb => "1.1",
         }
     }
 }

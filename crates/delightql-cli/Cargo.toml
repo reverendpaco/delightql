@@ -15,10 +15,10 @@ default = ["repl", "prettify", "formatter"]
 repl = ["dep:rustyline", "dep:ratatui", "dep:crossterm", "dep:ctrlc", "dep:directories"]
 prettify = ["dep:tree-sitter-highlight"]
 formatter = ["dep:delightql-formatter"]
-duckdb = ["delightql-backends/duckdb"]
 recursion_stats = ["delightql-core/recursion_stats"]
 
 [dependencies]
+delightql-buildinfo = { path = "../delightql-buildinfo" }
 delightql-core = { path = "../delightql-core" }
 delightql-formatter = { path = "../delightql-formatter", optional = true }
 delightql-backends = { path = "../delightql-backends", default-features = false, features = ["sqlite"] }

@@ -10,8 +10,6 @@ use crate::bug_report::SessionLog;
 use crate::connection::ConnectionManager;
 use crate::output_format::OutputFormat;
 use crate::version_info;
-#[cfg(feature = "duckdb")]
-use delightql_backends::DuckDBExecutor;
 use delightql_backends::SqliteExecutor;
 use std::sync::Arc;
 
@@ -32,7 +30,7 @@ pub struct ReplState {
     pub target_stage: Option<Stage>, // Which stage to output (None = Results)
     pub shared_info: SharedReplState, // Shared with multi-pane TUI
     pub sql_mode: bool,              // Whether to bypass DelightQL parsing and execute SQL directly
-    pub db_connection: ConnectionManager, // Persistent database connection (SQLite or DuckDB)
+    pub db_connection: ConnectionManager, // Persistent database connection
     pub dql_handle: Arc<std::sync::Mutex<Box<dyn delightql_core::api::DqlHandle>>>, // Persistent DqlHandle (wrapped in Arc<Mutex> for thread-safe mutation)
     pub show_meta_output: bool, // Whether to show meta-command output (verbose/quiet control)
     pub zebra_mode: Option<usize>, // Number of colors for zebra striping columns (None = off)
@@ -734,13 +732,12 @@ pub fn process_query(
                 None
             }
         }
-        #[cfg(feature = "duckdb")]
-        ConnectionManager::DuckDB(_) => {
-            // DuckDB doesn't support interrupt handles yet
-            None
-        }
         ConnectionManager::Pipe(_) => {
             // Pipe connections don't support interrupt handles
+            None
+        }
+        ConnectionManager::Fatboy(_) => {
+            // Fatboy connections don't support interrupt handles
             None
         }
     };
@@ -1023,21 +1020,10 @@ fn execute_sql_directly(
                 .execute_query(sql)
                 .map_err(|e| anyhow::anyhow!("SQL execution error: {}", e))?
         }
-        #[cfg(feature = "duckdb")]
-        ConnectionManager::DuckDB(conn) => {
-            use delightql_backends::DuckDBExecutorImpl;
-            let duckdb_result = {
-                let mut executor = DuckDBExecutorImpl::new(conn);
-                executor
-                    .execute_query(sql)
-                    .map_err(|e| anyhow::anyhow!("SQL execution error: {}", e))?
-            };
-            // Convert DuckDB QueryResult to common format
-            delightql_backends::sqlite::executor::QueryResult {
-                columns: duckdb_result.columns,
-                rows: duckdb_result.rows,
-                affected_rows: None, // Query results don't track affected rows
-            }
+        ConnectionManager::Fatboy(_) => {
+            return Err(anyhow::anyhow!(
+                "Direct SQL execution not supported for fatboy connections"
+            ));
         }
         ConnectionManager::Pipe(_mgr) => {
             return Err(anyhow::anyhow!(

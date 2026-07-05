@@ -1,15 +1,23 @@
 [package]
 name = "delightql-postgres"
-version = "0.1.0"
-edition = "2021"
-authors = ["Daniel Eklund"]
-license = "MIT"
-description = "PostgreSQL driver implementation for DelightQL"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Postgres fatboy: relay-protocol Handler (PgParty) over libpq. Contains NO compiler."
+
+# Deliberately NOT depending on delightql-core: the fatboy is an execution
+# adapter (relay-role validation, ALL-SQL-TARGETING-FATBOY.md). It speaks
+# protocol terms on one side and Postgres on the other. Keeping the compiler
+# out of the adapter mirrors keeping libpq out of the slim CLI.
+[[bin]]
+name = "dql-fatboy-postgres"
+path = "src/bin/dql_fatboy_postgres.rs"
 
 [dependencies]
-delightql-core = { path = "../delightql-core" }
+delightql-buildinfo = { path = "../delightql-buildinfo" }
+delightql-protocol = { path = "../delightql-protocol" }
 postgres = "0.19"
-
-[dev-dependencies]
-# For integration tests (future)
-# testcontainers = "0.15"
+clap.workspace = true
+libc = "0.2"

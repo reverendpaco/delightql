@@ -2,10 +2,8 @@
 // Copyright 2026 Daniel Eklund
 /// Multi-database connection wrapper
 ///
-/// Provides a unified interface for SQLite, DuckDB, and pipe-based connections
+/// Provides a unified interface for SQLite, pipe-based, and fatboy connections
 use anyhow::Result;
-#[cfg(feature = "duckdb")]
-use delightql_backends::DuckDBConnectionManager;
 use delightql_backends::SqliteConnectionManager;
 use delightql_types::DatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -14,18 +12,17 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DatabaseType {
     SQLite,
-    #[cfg(feature = "duckdb")]
-    DuckDB,
 }
 
 impl DatabaseType {
     /// Detect database type from file path by checking magic numbers
     ///
     /// SQLite files start with: "SQLite format 3\0" (16 bytes)
-    /// DuckDB files have "DUCK" at offset 8 (4 bytes)
     ///
-    /// Falls back to extension-based detection if file doesn't exist or can't be read.
-    pub fn from_path(path: &str) -> Self {
+    /// DuckDB files (magic "DUCK" at offset 8, or .duckdb/.ddb extension)
+    /// are recognized only to redirect the user to `fatboy://duckdb/<path>`
+    /// — native in-process DuckDB was removed in favor of the fatboy.
+    pub fn from_path(path: &str) -> Result<Self> {
         use std::io::Read;
 
         // Try to detect by reading file magic numbers
@@ -34,25 +31,28 @@ impl DatabaseType {
             if file.read_exact(&mut header).is_ok() {
                 // Check for SQLite magic: "SQLite format 3\0"
                 if &header[0..16] == b"SQLite format 3\0" {
-                    return DatabaseType::SQLite;
+                    return Ok(DatabaseType::SQLite);
                 }
 
                 // Check for DuckDB magic: "DUCK" at offset 8
-                #[cfg(feature = "duckdb")]
                 if &header[8..12] == b"DUCK" {
-                    return DatabaseType::DuckDB;
+                    anyhow::bail!(
+                        "'{path}' is a DuckDB database. DuckDB is served by a fatboy \
+                         co-process, not linked in: use --db fatboy://duckdb/{path}"
+                    );
                 }
             }
         }
 
-        // Fall back to extension-based detection
-        #[cfg(feature = "duckdb")]
         if path.ends_with(".duckdb") || path.ends_with(".ddb") {
-            return DatabaseType::DuckDB;
+            anyhow::bail!(
+                "'{path}' looks like a DuckDB database. DuckDB is served by a fatboy \
+                 co-process, not linked in: use --db fatboy://duckdb/{path}"
+            );
         }
 
         // Default to SQLite for .db, .sqlite, .sqlite3, or no extension
-        DatabaseType::SQLite
+        Ok(DatabaseType::SQLite)
     }
 }
 
@@ -69,9 +69,10 @@ pub struct ConnectionInfo {
 #[derive(Clone)]
 pub enum ConnectionManager {
     SQLite(SqliteConnectionManager),
-    #[cfg(feature = "duckdb")]
-    DuckDB(DuckDBConnectionManager),
     Pipe(Arc<delightql_cli_siso::PipeConnectionManager>),
+    /// A fatboy process: relay protocol over a Unix socket, foreign
+    /// engine behind it (`fatboy://postgres/<db>`).
+    Fatboy(Arc<crate::fatboy_exec::FatboyManager>),
 }
 
 impl ConnectionManager {
@@ -83,6 +84,22 @@ impl ConnectionManager {
             let mgr = delightql_cli_siso::PipeConnectionManager::from_uri(uri)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             Ok(ConnectionManager::Pipe(Arc::new(mgr)))
+        } else if let Some(rest) = uri.strip_prefix("fatboy://") {
+            // fatboy://<profile>/<db> — socket resolved by convention
+            // (see fatboy_exec::socket_path).
+            let (profile, db) = rest.split_once('/').ok_or_else(|| {
+                anyhow::anyhow!("fatboy URI needs a database: fatboy://postgres/<db>")
+            })?;
+            if !crate::fatboy_exec::PROFILES.contains(&profile) {
+                anyhow::bail!(
+                    "unknown fatboy profile '{}' (known: {})",
+                    profile,
+                    crate::fatboy_exec::PROFILES.join(", ")
+                );
+            }
+            let mgr = crate::fatboy_exec::FatboyManager::connect(profile, db)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(ConnectionManager::Fatboy(Arc::new(mgr)))
         } else {
             anyhow::bail!("Unsupported URI scheme: {}", uri)
         }
@@ -93,19 +110,15 @@ impl ConnectionManager {
     /// Also accepts `pipe://` URIs for pipe-based connections.
     pub fn new_file(path: &str) -> Result<Self> {
         // Check for URI schemes before treating as a file path
-        if path.starts_with("pipe://") {
+        if path.starts_with("pipe://") || path.starts_with("fatboy://") {
             return Self::from_uri(path);
         }
 
-        let db_type = DatabaseType::from_path(path);
+        let db_type = DatabaseType::from_path(path)?;
 
         match db_type {
             DatabaseType::SQLite => Ok(ConnectionManager::SQLite(
                 SqliteConnectionManager::new_file(path)?,
-            )),
-            #[cfg(feature = "duckdb")]
-            DatabaseType::DuckDB => Ok(ConnectionManager::DuckDB(
-                DuckDBConnectionManager::new_file(path)?,
             )),
         }
     }
@@ -117,26 +130,17 @@ impl ConnectionManager {
         ))
     }
 
-    /// Create a new in-memory DuckDB connection
-    #[cfg(feature = "duckdb")]
-    #[allow(dead_code)]
-    pub fn new_memory_duckdb() -> Result<Self> {
-        Ok(ConnectionManager::DuckDB(
-            DuckDBConnectionManager::new_memory()?,
-        ))
-    }
-
     /// Test the connection
     #[allow(dead_code)]
     pub fn test_connection(&self) -> Result<()> {
         match self {
             ConnectionManager::SQLite(conn) => Ok(conn.test_connection()?),
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(conn) => Ok(conn.test_connection()?),
             ConnectionManager::Pipe(mgr) => {
                 let _conn = mgr.connect().map_err(|e| anyhow::anyhow!("{}", e))?;
                 Ok(())
             }
+            // Connected eagerly at construction (fail-closed).
+            ConnectionManager::Fatboy(_) => Ok(()),
         }
     }
 
@@ -144,9 +148,8 @@ impl ConnectionManager {
     pub fn database_type(&self) -> &str {
         match self {
             ConnectionManager::SQLite(_) => "SQLite",
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(_) => "DuckDB",
             ConnectionManager::Pipe(mgr) => mgr.profile_name(),
+            ConnectionManager::Fatboy(mgr) => &mgr.profile,
         }
     }
 
@@ -158,27 +161,16 @@ impl ConnectionManager {
         }
     }
 
-    /// Get the underlying DuckDB connection
-    #[cfg(feature = "duckdb")]
-    #[allow(dead_code)]
-    pub fn as_duckdb(&self) -> Option<&DuckDBConnectionManager> {
-        match self {
-            ConnectionManager::DuckDB(conn) => Some(conn),
-            _ => None,
-        }
-    }
-
     /// Get connection Arc (for SQLite - backward compatibility)
     /// TODO: Remove this once all code uses database-agnostic APIs
     pub fn get_connection_arc(&self) -> std::sync::Arc<std::sync::Mutex<rusqlite::Connection>> {
         match self {
             ConnectionManager::SQLite(conn) => conn.get_connection_arc(),
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(_) => {
-                panic!("Cannot get SQLite connection from DuckDB - use database-agnostic APIs")
-            }
             ConnectionManager::Pipe(_) => {
                 panic!("Cannot get SQLite connection from Pipe - use database-agnostic APIs")
+            }
+            ConnectionManager::Fatboy(_) => {
+                panic!("Cannot get SQLite connection from Fatboy - use database-agnostic APIs")
             }
         }
     }
@@ -191,16 +183,13 @@ impl ConnectionManager {
                     delightql_backends::sqlite::SqliteConnection::new(conn.get_connection_arc());
                 Arc::new(Mutex::new(adapter))
             }
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(conn) => {
-                let adapter =
-                    delightql_backends::duckdb::DuckDBConnection::new(conn.get_connection_arc());
-                Arc::new(Mutex::new(adapter))
-            }
             ConnectionManager::Pipe(mgr) => {
                 let conn = mgr.connect().expect("Failed to spawn pipe connection");
                 Arc::new(Mutex::new(conn))
             }
+            ConnectionManager::Fatboy(mgr) => Arc::new(Mutex::new(
+                crate::fatboy_exec::FatboyConnection::new(mgr.clone()),
+            )),
         }
     }
 
@@ -216,19 +205,15 @@ impl ConnectionManager {
                     is_connected: info.is_connected,
                 })
             }
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(conn) => {
-                let info = conn.connection_info()?;
-                Ok(ConnectionInfo {
-                    database_type: info.database_type,
-                    path: info.path,
-                    is_memory: info.is_memory,
-                    is_connected: info.is_connected,
-                })
-            }
             ConnectionManager::Pipe(mgr) => Ok(ConnectionInfo {
                 database_type: format!("Pipe({})", mgr.profile_name()),
                 path: mgr.target().map(|s| s.to_string()),
+                is_memory: false,
+                is_connected: true,
+            }),
+            ConnectionManager::Fatboy(mgr) => Ok(ConnectionInfo {
+                database_type: format!("Fatboy({})", mgr.profile),
+                path: Some(format!("{} [stdio]", mgr.db)),
                 is_memory: false,
                 is_connected: true,
             }),
@@ -241,12 +226,11 @@ impl ConnectionManager {
             ConnectionManager::SQLite(conn) => conn
                 .attach_database_file(db_path, schema_name)
                 .map_err(|e| anyhow::anyhow!("Failed to attach database: {}", e)),
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(_) => {
-                anyhow::bail!("Database attachment not yet supported for DuckDB")
-            }
             ConnectionManager::Pipe(_) => {
                 anyhow::bail!("Database attachment not supported for pipe connections")
+            }
+            ConnectionManager::Fatboy(_) => {
+                anyhow::bail!("Database attachment not supported for fatboy connections")
             }
         }
     }
@@ -259,20 +243,19 @@ impl ConnectionManager {
     pub fn get_raw_sqlite_connection(&self) -> Result<Arc<Mutex<rusqlite::Connection>>> {
         match self {
             ConnectionManager::SQLite(conn) => Ok(conn.get_connection_arc()),
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(_) => {
-                anyhow::bail!("Import operations not yet supported for DuckDB")
-            }
             ConnectionManager::Pipe(_) => {
                 anyhow::bail!("Import operations not supported for pipe connections")
+            }
+            ConnectionManager::Fatboy(_) => {
+                anyhow::bail!("Import operations not supported for fatboy connections")
             }
         }
     }
 
     /// Execute a SQL query against the underlying database connection.
     ///
-    /// Dispatches to the appropriate backend (SQLite, DuckDB, or Pipe).
-    /// The `db_label` is used for error messages in SQLite/DuckDB; Pipe ignores it.
+    /// Dispatches to the appropriate backend (SQLite, Pipe, or Fatboy).
+    /// The `db_label` is used for error messages in SQLite; Pipe ignores it.
     pub fn execute_query(
         &self,
         sql: &str,
@@ -285,17 +268,12 @@ impl ConnectionManager {
                 std::path::Path::new(db_label),
             )
             .map_err(|e| anyhow::anyhow!("{}", e)),
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(conn) => {
-                delightql_backends::execute_sql_with_duckdb_connection(
-                    sql.to_string(),
-                    conn,
-                    std::path::Path::new(db_label),
-                )
-                .map_err(|e| anyhow::anyhow!("{}", e))
-            }
             ConnectionManager::Pipe(mgr) => crate::pipe_exec::execute_sql_with_pipe(sql, mgr)
                 .map_err(|e| anyhow::anyhow!("{}", e)),
+            ConnectionManager::Fatboy(mgr) => {
+                crate::fatboy_exec::execute_sql_with_fatboy(sql, mgr)
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            }
         }
     }
 
@@ -328,17 +306,6 @@ impl ConnectionManager {
                     .collect();
                 Ok((typed.columns, rows))
             }
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(_) => {
-                // Fall back to string-based execution for now
-                let results = self.execute_query(sql, db_label)?;
-                let rows = results
-                    .rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(Some).collect())
-                    .collect();
-                Ok((results.columns, rows))
-            }
             ConnectionManager::Pipe(_) => {
                 let results = self.execute_query(sql, db_label)?;
                 let rows = results
@@ -348,6 +315,11 @@ impl ConnectionManager {
                     .collect();
                 Ok((results.columns, rows))
             }
+            // NULL fidelity is native here: relay Cells are Option already.
+            ConnectionManager::Fatboy(mgr) => mgr
+                .relay()
+                .query_nullable(sql)
+                .map_err(|e| anyhow::anyhow!("{}", e)),
         }
     }
 
@@ -371,12 +343,11 @@ impl ConnectionManager {
                     vec![vec![Some(affected.to_string())]],
                 ))
             }
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(_) => {
-                anyhow::bail!("DML not yet supported on DuckDB connections")
-            }
             ConnectionManager::Pipe(_) => {
                 anyhow::bail!("DML not supported on pipe connections")
+            }
+            ConnectionManager::Fatboy(_) => {
+                anyhow::bail!("DML not yet supported on fatboy connections")
             }
         }
     }
@@ -400,12 +371,11 @@ impl ConnectionManager {
                     row_count: 1,
                 })
             }
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(_conn) => {
-                anyhow::bail!("DML not yet supported on DuckDB connections")
-            }
             ConnectionManager::Pipe(_) => {
                 anyhow::bail!("DML not supported on pipe connections")
+            }
+            ConnectionManager::Fatboy(_) => {
+                anyhow::bail!("DML not yet supported on fatboy connections")
             }
         }
     }
@@ -434,25 +404,10 @@ impl ConnectionManager {
                     db_type: "sqlite".to_string(),
                 })
             }
-            #[cfg(feature = "duckdb")]
-            ConnectionManager::DuckDB(duckdb_conn) => {
-                let duckdb_arc = duckdb_conn.get_connection_arc();
-                let schema = Box::new(delightql_backends::DynamicDuckDBSchema::new(
-                    duckdb_arc.clone(),
-                ));
-                let introspector = Box::new(delightql_backends::duckdb::DuckDBIntrospector::new(
-                    duckdb_arc.clone(),
-                ));
-                let adapter = delightql_backends::duckdb::DuckDBConnection::new(duckdb_arc.clone());
-                let conn_arc: Arc<Mutex<dyn DatabaseConnection>> = Arc::new(Mutex::new(adapter));
-                Ok(delightql_types::ConnectionComponents {
-                    schema,
-                    connection: conn_arc,
-                    introspector,
-                    db_type: "duckdb".to_string(),
-                })
-            }
             ConnectionManager::Pipe(mgr) => crate::pipe_exec::create_pipe_system_components(mgr),
+            ConnectionManager::Fatboy(mgr) => {
+                crate::fatboy_exec::create_fatboy_system_components(mgr)
+            }
         }
     }
 
@@ -463,6 +418,10 @@ impl ConnectionManager {
     /// `mount!("path", "main")` to populate it.
     pub fn open_handle(&self) -> Result<Box<dyn delightql_core::api::DqlHandle>> {
         let factory = Box::new(crate::connection_factory::CliConnectionFactory);
-        delightql_core::api::open(factory).map_err(|e| anyhow::anyhow!("{}", e))
+        // Second factory (types-level) powers mount!/import! of URI-scheme
+        // databases (pipe://, etc.). Same unit struct, both trait impls.
+        let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
+        delightql_core::api::open(factory, Some(mount_factory))
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 }

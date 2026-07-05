@@ -116,9 +116,11 @@ impl Transport for SocketTransport {
 
 // --- Server-side helpers ---
 
-/// Read one ClientMessage from a UnixStream. Blocks until a complete frame arrives.
-pub fn read_client_message(
-    stream: &mut UnixStream,
+/// Read one ClientMessage from any reader. Blocks until a complete frame
+/// arrives. Generic over the byte channel (UnixStream, stdin, …) — the
+/// framing is identical regardless of transport.
+pub fn read_client_message<R: Read>(
+    stream: &mut R,
     buf: &mut Vec<u8>,
 ) -> Result<ClientMessage, TransportError> {
     loop {
@@ -131,7 +133,7 @@ pub fn read_client_message(
             None => {
                 let mut tmp = [0u8; 8192];
                 let n = stream.read(&mut tmp).map_err(|e| TransportError {
-                    message: format!("socket read error: {}", e),
+                    message: format!("transport read error: {}", e),
                 })?;
                 if n == 0 {
                     return Err(TransportError {
@@ -144,14 +146,20 @@ pub fn read_client_message(
     }
 }
 
-/// Write one ServerMessage to a UnixStream as a framed message.
-pub fn write_server_message(
-    stream: &mut UnixStream,
+/// Write one ServerMessage to any writer as a framed message, then flush.
+/// The flush is essential for buffered writers (a server replying over a
+/// line-buffered stdout would otherwise wedge — the binary frame carries
+/// no newline); it is a harmless no-op on a raw socket fd.
+pub fn write_server_message<W: Write>(
+    stream: &mut W,
     msg: &ServerMessage,
 ) -> Result<(), TransportError> {
     let frame = manifest::frame_server_message(msg)?;
     stream.write_all(&frame).map_err(|e| TransportError {
-        message: format!("socket write error: {}", e),
+        message: format!("transport write error: {}", e),
+    })?;
+    stream.flush().map_err(|e| TransportError {
+        message: format!("transport flush error: {}", e),
     })
 }
 

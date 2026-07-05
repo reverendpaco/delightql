@@ -964,6 +964,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "delightql-buildinfo"
+version = "0.1.0"
+
+[[package]]
 name = "delightql-cabi"
 version = "0.1.0"
 dependencies = [
@@ -990,6 +994,7 @@ dependencies = [
  "csv",
  "ctrlc",
  "delightql-backends",
+ "delightql-buildinfo",
  "delightql-cli-siso",
  "delightql-core",
  "delightql-formatter",
@@ -1064,6 +1069,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "delightql-duckdb"
+version = "0.1.0"
+dependencies = [
+ "clap 4.5.49",
+ "delightql-backends",
+ "delightql-buildinfo",
+ "delightql-protocol",
+ "libc",
+]
+
+[[package]]
 name = "delightql-formatter"
 version = "0.1.0"
 dependencies = [
@@ -1086,7 +1102,10 @@ dependencies = [
 name = "delightql-postgres"
 version = "0.1.0"
 dependencies = [
- "delightql-core",
+ "clap 4.5.49",
+ "delightql-buildinfo",
+ "delightql-protocol",
+ "libc",
  "postgres",
 ]
 
@@ -1269,6 +1288,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "clap 4.5.49",
+ "delightql-buildinfo",
  "delightql-protocol",
  "rusqlite",
  "sha2",

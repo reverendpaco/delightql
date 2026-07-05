@@ -153,6 +153,54 @@ pub fn duckdb_profile() -> PipeProfile {
     }
 }
 
+/// Built-in postgres profile (stock `psql` as the coprocess).
+///
+/// The UUID framing is pure SQL (`SELECT '<uuid>' AS __dql_marker;`), so
+/// psql works unmodified, exactly like sqlite3/duckdb. Defaults target the
+/// test-suite's sweep container (`new_test_suite/sweep.py postgres`
+/// publishes 127.0.0.1:5433 with trust auth); for any other server, use a
+/// TOML profile override (`config_profile_path`) or pass a full conninfo
+/// URI as the target. Target is the database name:
+/// `pipe://postgres/dql_core`.
+pub fn postgres_profile() -> PipeProfile {
+    PipeProfile {
+        name: "postgres".into(),
+        binary: "psql".into(),
+        target_mode: TargetMode::Positional,
+        setup_commands: vec!["\\pset null NULL".into()],
+        output_format: OutputFormat::Csv,
+        headers: true,
+        null_value: "NULL".into(),
+        cli_flags: vec!["-X".into(), "-q".into(), "--csv".into()],
+        introspection: IntrospectionMode::SingleQuery(
+            "SELECT t.table_name, t.table_type, \
+             c.ordinal_position - 1 AS cid, \
+             c.column_name, c.data_type, \
+             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS notnull \
+             FROM information_schema.tables t \
+             JOIN information_schema.columns c \
+               ON t.table_catalog = c.table_catalog \
+              AND t.table_schema = c.table_schema \
+              AND t.table_name = c.table_name \
+             WHERE t.table_schema = 'public' \
+             ORDER BY t.table_name, c.ordinal_position".into()
+        ),
+        schema_mode: SchemaMode::Query(
+            "SELECT c.column_name AS name, \
+             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS notnull, \
+             c.ordinal_position - 1 AS cid \
+             FROM information_schema.columns c \
+             WHERE c.table_schema = 'public' AND c.table_name = '{table}' \
+             ORDER BY c.ordinal_position".into()
+        ),
+        env_vars: HashMap::from([
+            ("PGHOST".to_string(), "127.0.0.1".to_string()),
+            ("PGPORT".to_string(), "5433".to_string()),
+            ("PGUSER".to_string(), "postgres".to_string()),
+        ]),
+    }
+}
+
 /// Built-in snowflake profile (via dql-snowflake-bridge Python coprocess).
 pub fn snowflake_profile() -> PipeProfile {
     PipeProfile {
@@ -196,6 +244,7 @@ pub fn builtin_profile(name: &str) -> Option<PipeProfile> {
         "osqueryi" => Some(osqueryi_profile()),
         "sqlite3" => Some(sqlite3_profile()),
         "duckdb" => Some(duckdb_profile()),
+        "postgres" => Some(postgres_profile()),
         "snowflake" => Some(snowflake_profile()),
         _ => None,
     }

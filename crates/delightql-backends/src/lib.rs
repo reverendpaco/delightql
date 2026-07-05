@@ -24,6 +24,10 @@
 
 // Shared types and errors
 pub mod error;
+// The shared executor is sqlite-flavored dispatch (its entry points
+// construct Sqlite types unconditionally) — gated so duckdb-only
+// consumers (the duckdb fatboy) can build without rusqlite.
+#[cfg(feature = "sqlite")]
 pub mod executor;
 pub mod schema_base;
 pub mod types;
@@ -38,8 +42,9 @@ pub mod duckdb;
 
 // Re-export commonly used types
 pub use error::{ErrorType, ExecutionError};
+#[cfg(feature = "sqlite")]
 pub use executor::{execute_sql, execute_sql_with_connection, QueryResults};
-#[cfg(feature = "duckdb")]
+#[cfg(all(feature = "sqlite", feature = "duckdb"))]
 pub use executor::execute_sql_with_duckdb_connection;
 pub use schema_base::{ColumnInfo, DatabaseSchema, SchemaProvider, TableInfo};
 pub use types::{ExecutionConfig, ExecutionMode, ExecutionStatus, QueryResult};

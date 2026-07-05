@@ -4,7 +4,7 @@
 //!
 //! Bridges the ConnectionFactory trait with the CLI's ConnectionManager,
 //! which knows how to create connections for all supported backends
-//! (SQLite, DuckDB, pipe://).
+//! (SQLite, pipe://, fatboy://).
 
 use delightql_core::api::{CreatedConnection, Handler};
 use delightql_sqlite_relay::siso::SisoParty;
@@ -37,18 +37,17 @@ impl delightql_core::api::ConnectionFactory for CliConnectionFactory {
                         Box::new(SqlParty::new(arc.clone())) as Box<dyn Handler + Send>
                     })
                 }
-                #[cfg(feature = "duckdb")]
-                ConnectionManager::DuckDB(_) => {
-                    let db_conn = conn_mgr.get_database_connection();
-                    Box::new(move || {
-                        Box::new(SisoParty::new(db_conn.clone())) as Box<dyn Handler + Send>
-                    })
-                }
                 ConnectionManager::Pipe(_) => {
                     let db_conn = conn_mgr.get_database_connection();
                     Box::new(move || {
                         Box::new(SisoParty::new(db_conn.clone())) as Box<dyn Handler + Send>
                     })
+                }
+                ConnectionManager::Fatboy(mgr) => {
+                    // Fresh handler = fresh socket = fresh foreign-engine
+                    // session (mirrors the protocol's connection scoping).
+                    let mgr = mgr.clone();
+                    Box::new(move || mgr.new_remote_handler())
                 }
             };
 
@@ -85,7 +84,6 @@ impl delightql_types::ConnectionFactory for CliConnectionFactory {
 ///
 /// For SQLite: uses SqlParty (streaming cursors).
 /// For Pipe: uses SisoParty (eager, buffered).
-/// For DuckDB: uses SisoParty.
 pub fn make_handler(
     conn_mgr: &ConnectionManager,
 ) -> Result<Box<dyn Handler + Send>, Box<dyn std::error::Error + Send + Sync>> {
@@ -94,11 +92,9 @@ pub fn make_handler(
             let db_conn = conn_mgr.get_database_connection();
             Ok(Box::new(SisoParty::new(db_conn)))
         }
-        #[cfg(feature = "duckdb")]
-        ConnectionManager::DuckDB(_) => {
-            let db_conn = conn_mgr.get_database_connection();
-            Ok(Box::new(SisoParty::new(db_conn)))
-        }
+        // The engine's own protocol terms forward verbatim to the fatboy —
+        // the relay's backend-facing side (FATBOY plan, step 4).
+        ConnectionManager::Fatboy(mgr) => Ok(mgr.new_remote_handler()),
         ConnectionManager::SQLite(sqlite_conn) => {
             let arc = sqlite_conn.get_connection_arc();
             Ok(Box::new(SqlParty::new(arc)))
@@ -124,17 +120,14 @@ fn make_introspector_and_type(
             ));
             Ok((introspector, "sqlite".to_string()))
         }
-        #[cfg(feature = "duckdb")]
-        ConnectionManager::DuckDB(duckdb_conn) => {
-            let duckdb_arc = duckdb_conn.get_connection_arc();
-            let introspector = Box::new(delightql_backends::duckdb::DuckDBIntrospector::new(
-                duckdb_arc,
-            ));
-            Ok((introspector, "duckdb".to_string()))
-        }
         ConnectionManager::Pipe(mgr) => {
             let introspector = crate::pipe_exec::create_pipe_introspector(mgr)?;
             Ok((introspector, mgr.profile_name().to_string()))
+        }
+        ConnectionManager::Fatboy(mgr) => {
+            let introspector =
+                Box::new(crate::fatboy_exec::FatboyIntrospector::new(mgr.clone()));
+            Ok((introspector, mgr.profile.clone()))
         }
     }
 }

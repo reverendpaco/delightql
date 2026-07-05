@@ -13,7 +13,9 @@ use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 
 fn check_database_exists(db_path: &str, make_new_db_if_missing: bool) -> Result<()> {
-    if db_path.starts_with("pipe://") {
+    // URI schemes are not files; their reachability is checked by their
+    // own connection paths (fail-closed at connect).
+    if db_path.starts_with("pipe://") || db_path.starts_with("fatboy://") {
         return Ok(());
     }
     if !make_new_db_if_missing && !Path::new(db_path).exists() {

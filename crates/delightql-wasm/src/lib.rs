@@ -484,7 +484,9 @@ pub fn init_delightql() -> std::result::Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
     let factory = Box::new(WasmConnectionFactory);
-    let handle = api::open(factory).map_err(|e| JsValue::from_str(&e))?;
+    // No types-level mount factory: URI-scheme mounts (pipe://, etc.)
+    // are not available in the browser sandbox.
+    let handle = api::open(factory, None).map_err(|e| JsValue::from_str(&e))?;
 
     DQL_HANDLE.with(|h| {
         *h.borrow_mut() = Some(handle);

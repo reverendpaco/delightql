@@ -115,19 +115,4 @@ fn main() {
     // Commented out to avoid watching large .jj directory
     // println!("cargo:rerun-if-changed=../../.jj");
     println!("cargo:rerun-if-changed=build.rs");
-
-    // Set rpath so the binary can find libduckdb.dylib at runtime (only when duckdb feature is enabled)
-    #[cfg(feature = "duckdb")]
-    {
-        #[cfg(target_os = "macos")]
-        {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../../.mise/libs");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../../.mise/libs");
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,/home/doeklund/ducklibs");
-        }
-    }
 }

@@ -31,6 +31,7 @@ extern "C" {
 #[derive(Parser)]
 #[command(
     name = "dql-test-ball-runner",
+    version = delightql_buildinfo::human_static(),
     about = "Run test balls against a dql server"
 )]
 struct Args {

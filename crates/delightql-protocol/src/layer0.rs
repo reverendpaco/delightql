@@ -202,6 +202,14 @@ pub trait Transport {
     fn exchange(&mut self, term: ClientTerm) -> Result<ServerTerm, TransportError>;
 }
 
+/// Lets a `Client`/`Session` hold a transport chosen at runtime
+/// (socket vs. stdio) behind a `Box<dyn Transport + Send>`.
+impl Transport for Box<dyn Transport + Send> {
+    fn exchange(&mut self, term: ClientTerm) -> Result<ServerTerm, TransportError> {
+        (**self).exchange(term)
+    }
+}
+
 /// Transport-level failure (connection lost, IO error). Distinct from protocol Error terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportError {
@@ -473,6 +481,39 @@ impl<H: Handler> DirectTransport<H> {
 impl<H: Handler> Transport for DirectTransport<H> {
     fn exchange(&mut self, term: ClientTerm) -> Result<ServerTerm, TransportError> {
         Ok(self.handler.handle(term))
+    }
+}
+
+// --- RemoteHandler ---
+
+/// The dual of `DirectTransport`: a `Handler` that forwards every term
+/// over a `Transport` to a remote server (e.g. a fatboy process).
+///
+/// `DirectTransport` makes a local Handler look like a wire;
+/// `RemoteHandler` makes a wire look like a local Handler. Together
+/// they are why the engine cannot tell an in-process backend from a
+/// foreign engine across a socket — the "spoken identically on both
+/// sides" claim, composed from two adapters.
+pub struct RemoteHandler<T: Transport> {
+    transport: T,
+}
+
+impl<T: Transport> RemoteHandler<T> {
+    pub fn new(transport: T) -> Self {
+        RemoteHandler { transport }
+    }
+}
+
+impl<T: Transport> Handler for RemoteHandler<T> {
+    fn handle(&mut self, term: ClientTerm) -> ServerTerm {
+        match self.transport.exchange(term) {
+            Ok(response) => response,
+            Err(e) => ServerTerm::Error {
+                kind: ErrorKind::Connection,
+                identity: b"dql/relay/transport".to_vec(),
+                message: e.message.into_bytes(),
+            },
+        }
     }
 }
 

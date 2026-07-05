@@ -190,6 +190,14 @@ fn run() -> Result<()> {
         use delightql_cli::args::{Command, ToolCommand};
 
         return match command {
+            Command::Version { json } => {
+                if *json {
+                    println!("{}", delightql_buildinfo::json());
+                } else {
+                    println!("{}", delightql_buildinfo::human());
+                }
+                Ok(())
+            }
             Command::Query { .. } => {
                 delightql_cli::commands::query::handle_query_subcommand(command, &args)
             }

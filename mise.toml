@@ -1,5 +1,12 @@
 # DelightQL mise configuration
-# Tasks for building and running DelightQL components
+# Tasks for building and running DelightQL components.
+#
+# BOUNDARY NOTE: this file ships with the public impl repo (see
+# export.toml / export-mission.md). Tasks here may only reference paths
+# that exist in the public tree. Tasks touching private paths
+# (new_test_suite/, scripts/, lightweight_webserver/, lua/, config/, …)
+# or personal machine paths live in mise.local.toml (committed, never
+# exported, read automatically by mise).
 
 # Tool requirements
 # Note: tree-sitter CLI is managed via Makefile (cargo install from git)
@@ -8,8 +15,6 @@
 rust = "1.90"
 node = "latest"
 bats = "latest"
-neovim = "latest"
-
 
 [tasks.build-node]
 description = "Build Node.js binding (koffi + C-ABI)"
@@ -28,20 +33,6 @@ uv pip install --quiet --python /tmp/dql-repl hosts/python/dist/*.whl
 rm -rf /tmp/dql-repl
 """
 
-[tasks.test-wasm]
-run="""
-cd ./lightweight_webserver/
- node test_wasm.mjs
-"""
-
-[tasks.test]
-description = "Run the test suite"
-run = "./new_test_suite/test.sh"
-
-[tasks.cross-test]
-description = "Three-way comparison: ball-mode vs Python C-ABI vs Node.js C-ABI"
-run = "./new_test_suite/cross_test.sh"
-
 [tasks.build-rust-bins-debug]
 description = "Build the binaries: dql, dql-test-ball-runner and dql-fmt"
 run = """
@@ -54,64 +45,11 @@ run = """
 cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="bundled-parser" --profile release-tiny
 """
 
-
-[tasks.build-demo]
-run = """
-./scripts/generate_tutorial_db.py lightweight_webserver/demo.db
-"""
-
-[tasks.build-wasm]
-description = "Build DelightQL WASM bundle"
-run = """
-cd ./lightweight_webserver/
-make build-release
-"""
-
-[tasks.web]
-description = "Start DelightQL WASM demo server"
-run = """
-cd ./lightweight_webserver/
-node server.js
-"""
-
-[tasks.build-release-bundle]
-description = "Build and bundle DelightQL CLI + formatter + parser + highlights.scm into a tarball"
-depends = ["build-rust-bins-release-tiny"]
-run = """
-cd grammar_dql
-cc -o delightql_v2.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
-cd ..
-tar czf untracked/delightql-cli.tar.gz \
-   target/release-tiny/dql \
-   target/release-tiny/dql-fmt \
-   ./lua/dql.lua  \
-   ./lua/dql/init.lua  \
-   ./lua/dql/protocol.lua  \
-  ./grammar_dql/delightql_v2.so \
-  ./config/highlights.scm \
-  ./config/theme-*.toml
-"""
-
 [tasks.build-nvim-ts]
-description = "Build treesitter dynlib for IDEs"
+description = "Build treesitter dynlib for IDEs (run grammar generation first)"
 run = """
 cd grammar_dql
 cc -o delightql_v2.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
-"""
-
-[tasks.build-nvim-ts-fedora]
-depends=["nvim-ts"]
-run = """
-cp ./config/highlights.scm ~/.config/eklund_vim0.11.5/queries/delightql_v2/
-cd grammar_dql
-cc -o delightql_v2.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
-cd ..
-cp ./grammar_dql/delightql_v2.so  ~/.local/share/eklund_vim0.11.5/lazy/nvim-treesitter/parser/
-cd grammar_rules
-cc -o delightqlrules.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
-cd ..
-cp ./grammar_rules/delightqlrules.so  ~/.local/share/eklund_vim0.11.5/lazy/nvim-treesitter/parser/
-cp ./config/highlights.scm ~/.config/eklund_vim0.11.5/queries/delightqlrules/
 """
 
 # Env variables

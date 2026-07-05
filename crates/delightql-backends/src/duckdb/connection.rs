@@ -91,6 +91,46 @@ impl DuckDBConnectionManager {
         Ok(DuckDBConnectionManager { connection, info })
     }
 
+    /// Open an EXISTING DuckDB file READ-ONLY.
+    ///
+    /// DuckDB's write lock is exclusive per process, but it permits
+    /// concurrent read-only opens across processes. The stdio fatboy
+    /// spawns one process per relay session (introspection and execution
+    /// are separate children), so read-write would self-conflict on the
+    /// same file. The fatboy is query-only (no load path, DML rejected),
+    /// so read-only loses nothing.
+    pub fn new_file_readonly(path: &str) -> Result<Self> {
+        if !Path::new(path).exists() {
+            return Err(DelightQLError::ParseError {
+                message: format!("Database file '{}' does not exist.", path),
+                source: None,
+                subcategory: None,
+            });
+        }
+
+        let config = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("DuckDB config error: {}", e),
+                    String::new(),
+                )
+            })?;
+        let connection = Connection::open_with_flags(path, config).map_err(|e| {
+            DelightQLError::database_error(format!("DuckDB error: {}", e), String::new())
+        })?;
+
+        let connection = Arc::new(Mutex::new(connection));
+        let info = ConnectionInfo {
+            database_type: "DuckDB".to_string(),
+            path: Some(path.to_string()),
+            is_memory: false,
+            is_connected: true,
+        };
+
+        Ok(DuckDBConnectionManager { connection, info })
+    }
+
     /// Test if the connection is still alive and responsive
     pub fn is_connected(&self) -> bool {
         if let Ok(conn) = self.connection.lock() {

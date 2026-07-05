@@ -112,9 +112,11 @@ pub unsafe extern "C" fn dql_open(
         return std::ptr::null_mut();
     }
 
-    // Create factory and open handle.
+    // Create factory and open handle. The second (types-level) factory
+    // powers mount!/import! of URI-scheme databases.
     let factory = Box::new(factory::CabiConnectionFactory);
-    let mut handle: Box<dyn api::DqlHandle> = match api::open(factory) {
+    let mount_factory = Box::new(factory::CabiConnectionFactory);
+    let mut handle: Box<dyn api::DqlHandle> = match api::open(factory, Some(mount_factory)) {
         Ok(h) => h,
         Err(e) => {
             set_error(error_out, &e);

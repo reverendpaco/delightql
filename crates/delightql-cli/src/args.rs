@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "delightql",
-    version,
+    version = delightql_buildinfo::human_static(),
     about = "DelightQL - Query language transpiler",
     long_about = None
 )]
@@ -31,6 +31,16 @@ pub struct CliArgs {
 /// Subcommands for DelightQL CLI
 #[derive(Subcommand)]
 pub enum Command {
+    /// Print build identity (version, burned identity or "dev", profile,
+    /// os/arch). Machine-readable with --json — the supply-contract
+    /// interface (TEST-ARCHITECTURE.md §11): supplied/CI mode must refuse
+    /// binaries whose identity is "dev".
+    Version {
+        /// Emit as a single-line JSON object
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Execute a query (from string, file, or stdin)
     #[command(visible_alias = "q")]
     Query {

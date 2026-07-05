@@ -79,7 +79,8 @@ fn validate_test_database_path(database_path: &Path) -> Result<()> {
 
     if let Some(file_name) = database_path.file_name() {
         let name = file_name.to_string_lossy();
-        let is_valid = name.ends_with(".db")
+        #[allow(unused_mut)] // mutated only under the duckdb feature
+        let mut is_valid = name.ends_with(".db")
             || name.ends_with(".sqlite")
             || name.ends_with(".sqlite3");
         #[cfg(feature = "duckdb")]
@@ -102,7 +103,8 @@ fn validate_test_database_path(database_path: &Path) -> Result<()> {
 }
 
 /// Detect database type from file extension
-fn detect_database_type(_database_path: &Path) -> DatabaseType {
+fn detect_database_type(database_path: &Path) -> DatabaseType {
+    let _ = database_path; // used only under the duckdb feature
     #[cfg(feature = "duckdb")]
     if let Some(file_name) = database_path.file_name() {
         let name = file_name.to_string_lossy();
