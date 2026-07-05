@@ -114,7 +114,7 @@ impl fmt::Display for DangerState {
 /// The URI identifies the danger; the state controls it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DangerSpec {
-    /// The hierarchical danger URI path (e.g. "dql/cardinality/nulljoin")
+    /// The canonical danger URI (e.g. "delightql-danger://cardinality/nulljoin")
     pub uri: String,
     /// The toggle state for this query
     pub state: DangerState,
@@ -157,7 +157,7 @@ impl fmt::Display for OptionState {
 /// The URI identifies the option; the state controls it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptionSpec {
-    /// The hierarchical option URI path (e.g. "generation/rule/inlining/view")
+    /// The canonical config URI (e.g. "delightql-config://generation/rule/inlining/view")
     pub uri: String,
     /// The toggle state for this query
     pub state: OptionState,

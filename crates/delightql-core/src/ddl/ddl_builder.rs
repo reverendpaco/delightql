@@ -662,7 +662,7 @@ mod tests {
         assert!(matches!(def.head, DdlHead::View));
 
         // Body should be relational
-        assert!(def.as_relational_expr().is_some());
+        assert!(matches!(def.body, DdlBody::Relational(_)));
     }
 
     #[test]
@@ -722,7 +722,7 @@ mod tests {
     fn test_build_single_definition_view() {
         let def = build_single_definition("active_users(*) :- users(*)").unwrap();
         assert_eq!(def.name, "active_users");
-        assert!(def.as_relational_expr().is_some());
+        assert!(matches!(def.body, DdlBody::Relational(_)));
     }
 
     #[test]
@@ -907,7 +907,7 @@ mod tests {
         assert_eq!(def.head.entity_type_id(), 16);
         assert_eq!(def._neck, DdlNeck::Session);
         // Body should be relational (anonymous table)
-        assert!(def.as_relational_expr().is_some());
+        assert!(matches!(def.body, DdlBody::Relational(_)));
     }
 
     #[test]
@@ -919,7 +919,7 @@ mod tests {
         let def = &defs[0];
         assert_eq!(def.name, "employee");
         assert!(matches!(def.head, DdlHead::Fact));
-        assert!(def.as_relational_expr().is_some());
+        assert!(matches!(def.body, DdlBody::Relational(_)));
     }
 
     #[test]

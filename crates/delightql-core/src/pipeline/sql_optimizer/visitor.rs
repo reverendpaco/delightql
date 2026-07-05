@@ -310,6 +310,13 @@ fn transform_domain_expr<T: QueryTransformer>(
                 expr: transformed,
             }
         }
+        DomainExpression::Cast { expr, type_name } => {
+            let transformed = Box::new(transform_domain_expr(*expr, transformer)?);
+            DomainExpression::Cast {
+                expr: transformed,
+                type_name,
+            }
+        }
         DomainExpression::InList { expr, not, values } => {
             let transformed_expr = Box::new(transform_domain_expr(*expr, transformer)?);
             let transformed_values = values

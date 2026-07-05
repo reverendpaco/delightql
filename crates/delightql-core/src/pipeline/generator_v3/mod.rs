@@ -20,6 +20,8 @@ use std::fmt::Write;
 
 mod config;
 mod dialect;
+#[cfg(test)]
+mod dialect_tests;
 mod errors;
 mod identifiers;
 mod literals;
@@ -56,6 +58,23 @@ impl SqlGenerator {
         self
     }
 
+    /// Target a specific SQL dialect (canonical default is SQLite).
+    pub fn with_dialect(mut self, dialect: SqlDialect) -> Self {
+        self.config.dialect = dialect;
+        self
+    }
+
+    /// Attach the per-compile dialect pack (the in-memory image of the
+    /// dialect_* targeting tables). Without one, every render falls back
+    /// to the canonical code default.
+    pub fn with_dialect_pack(
+        mut self,
+        pack: Arc<crate::pipeline::dialect_pack::DialectPack>,
+    ) -> Self {
+        self.config.dialect_pack = pack;
+        self
+    }
+
     /// Render a SQL-layer domain expression to a string.
     ///
     /// Used by the DDL pipeline generator for CHECK/DEFAULT expressions.
@@ -66,6 +85,42 @@ impl SqlGenerator {
         let mut sql = String::new();
         self.generate_domain_expression(&mut sql, expr)?;
         Ok(sql)
+    }
+
+    /// Emit a `name(args)` call with the canonical shape (parens, DISTINCT,
+    /// comma-joined args).
+    fn write_fn_call(
+        &self,
+        sql: &mut String,
+        name: &str,
+        args: &[DomainExpression],
+        distinct: bool,
+    ) -> Result<(), GeneratorError> {
+        sql.push_str(name);
+        sql.push('(');
+        if distinct {
+            sql.push_str("DISTINCT ");
+        }
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            self.generate_domain_expression(sql, arg)?;
+        }
+        sql.push(')');
+        Ok(())
+    }
+
+    /// Render each function argument to its own string (for template and
+    /// rust_handler render rules, which compose from rendered args).
+    fn render_fn_args(&self, args: &[DomainExpression]) -> Result<Vec<String>, GeneratorError> {
+        args.iter()
+            .map(|arg| {
+                let mut s = String::new();
+                self.generate_domain_expression(&mut s, arg)?;
+                Ok(s)
+            })
+            .collect()
     }
 
     /// Generate SQL from a complete statement
@@ -94,7 +149,7 @@ impl SqlGenerator {
             } => {
                 // Generate CREATE TEMPORARY TABLE statement
                 sql.push_str("CREATE TEMPORARY TABLE ");
-                identifiers::write_identifier(&mut sql, table_name, self.config.dialect)?;
+                identifiers::write_identifier(&mut sql, table_name, self.config.dialect, &self.config.dialect_pack)?;
                 sql.push_str(" AS ");
 
                 if self.config.pretty_print {
@@ -121,7 +176,7 @@ impl SqlGenerator {
             } => {
                 // Generate CREATE TEMPORARY VIEW statement
                 sql.push_str("CREATE TEMPORARY VIEW ");
-                identifiers::write_identifier(&mut sql, view_name, self.config.dialect)?;
+                identifiers::write_identifier(&mut sql, view_name, self.config.dialect, &self.config.dialect_pack)?;
                 sql.push_str(" AS ");
 
                 if self.config.pretty_print {
@@ -176,7 +231,7 @@ impl SqlGenerator {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    identifiers::write_identifier(&mut sql, col, self.config.dialect)?;
+                    identifiers::write_identifier(&mut sql, col, self.config.dialect, &self.config.dialect_pack)?;
                     sql.push_str(" = ");
                     self.generate_domain_expression(&mut sql, expr)?;
                 }
@@ -204,7 +259,7 @@ impl SqlGenerator {
                         if i > 0 {
                             sql.push_str(", ");
                         }
-                        identifiers::write_identifier(&mut sql, col, self.config.dialect)?;
+                        identifiers::write_identifier(&mut sql, col, self.config.dialect, &self.config.dialect_pack)?;
                     }
                     sql.push(')');
                 }
@@ -244,7 +299,7 @@ impl SqlGenerator {
             }
 
             // CTE name
-            identifiers::write_identifier(sql, cte.name(), self.config.dialect)?;
+            identifiers::write_identifier(sql, cte.name(), self.config.dialect, &self.config.dialect_pack)?;
             sql.push_str(" AS (");
 
             // CTE query (indented if pretty printing)
@@ -345,7 +400,7 @@ impl SqlGenerator {
                     }
 
                     // CTE name
-                    identifiers::write_identifier(sql, cte.name(), self.config.dialect)?;
+                    identifiers::write_identifier(sql, cte.name(), self.config.dialect, &self.config.dialect_pack)?;
                     sql.push_str(" AS (");
 
                     // CTE query (indented if pretty printing)
@@ -510,7 +565,7 @@ impl SqlGenerator {
                 self.generate_domain_expression(sql, expr)?;
                 if let Some(alias) = alias {
                     sql.push_str(" AS ");
-                    identifiers::write_identifier(sql, alias, self.config.dialect)?;
+                    identifiers::write_identifier(sql, alias, self.config.dialect, &self.config.dialect_pack)?;
                 }
             }
         }
@@ -531,13 +586,13 @@ impl SqlGenerator {
                 alias,
             } => {
                 if let Some(schema) = schema {
-                    identifiers::write_identifier(sql, schema, self.config.dialect)?;
+                    identifiers::write_identifier(sql, schema, self.config.dialect, &self.config.dialect_pack)?;
                     sql.push('.');
                 }
-                identifiers::write_identifier(sql, name, self.config.dialect)?;
+                identifiers::write_identifier(sql, name, self.config.dialect, &self.config.dialect_pack)?;
                 if let Some(alias) = alias {
                     sql.push_str(" AS ");
-                    identifiers::write_identifier(sql, alias, self.config.dialect)?;
+                    identifiers::write_identifier(sql, alias, self.config.dialect, &self.config.dialect_pack)?;
                 }
             }
             TableExpression::Subquery { query, alias } => {
@@ -551,7 +606,7 @@ impl SqlGenerator {
                     self.generate_query_expression(sql, query, indent)?;
                 }
                 sql.push_str(") AS ");
-                identifiers::write_identifier(sql, alias, self.config.dialect)?;
+                identifiers::write_identifier(sql, alias, self.config.dialect, &self.config.dialect_pack)?;
             }
             TableExpression::Join {
                 left,
@@ -595,7 +650,7 @@ impl SqlGenerator {
                             if i > 0 {
                                 sql.push_str(", ");
                             }
-                            identifiers::write_identifier(sql, col, self.config.dialect)?;
+                            identifiers::write_identifier(sql, col, self.config.dialect, &self.config.dialect_pack)?;
                         }
                         sql.push(')');
                     }
@@ -621,7 +676,7 @@ impl SqlGenerator {
                     sql.push(')');
                 }
                 sql.push_str(" AS ");
-                identifiers::write_identifier(sql, alias, self.config.dialect)?;
+                identifiers::write_identifier(sql, alias, self.config.dialect, &self.config.dialect_pack)?;
             }
             TableExpression::UnionTable { selects, alias } => {
                 // Generate UNION ALL with column aliases in first SELECT
@@ -657,7 +712,7 @@ impl SqlGenerator {
                     self.indent(sql, indent);
                 }
                 sql.push_str(") AS ");
-                identifiers::write_identifier(sql, alias, self.config.dialect)?;
+                identifiers::write_identifier(sql, alias, self.config.dialect, &self.config.dialect_pack)?;
             }
 
             TableExpression::TVF {
@@ -666,42 +721,93 @@ impl SqlGenerator {
                 arguments,
                 alias,
             } => {
-                // Generate: [schema.]function(arg1, arg2, ...)
-                if let Some(schema) = schema {
-                    sql.push_str(schema);
-                    sql.push('.');
-                }
-                sql.push_str(function);
-                sql.push('(');
-
-                for (i, arg) in arguments.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
+                // Render arguments first — both the canonical call shape and
+                // a dialect template consume them as text.
+                let mut rendered_args: Vec<String> = Vec::with_capacity(arguments.len());
+                for arg in arguments {
+                    let mut text = String::new();
                     match arg {
                         TvfArgument::ColumnRef { qualifier, column } => {
-                            self.generate_column_qualifier(sql, qualifier)?;
-                            sql.push('.');
-                            identifiers::write_identifier(sql, column, self.config.dialect)?;
+                            self.generate_column_qualifier(&mut text, qualifier)?;
+                            text.push('.');
+                            identifiers::write_identifier(&mut text, column, self.config.dialect, &self.config.dialect_pack)?;
                         }
                         TvfArgument::QualifiedRef { qualifier, column } => {
-                            identifiers::write_identifier(sql, qualifier, self.config.dialect)?;
-                            sql.push('.');
-                            identifiers::write_identifier(sql, column, self.config.dialect)?;
+                            identifiers::write_identifier(&mut text, qualifier, self.config.dialect, &self.config.dialect_pack)?;
+                            text.push('.');
+                            identifiers::write_identifier(&mut text, column, self.config.dialect, &self.config.dialect_pack)?;
                         }
-                        _ => sql.push_str(&arg.to_sql()),
+                        _ => text.push_str(&arg.to_sql()),
                     }
+                    rendered_args.push(text);
                 }
 
-                sql.push(')');
+                // Consult the dialect pack under `tvf.<name>` — same contract
+                // as `fn.<name>`: internal `__dql_*` names key the pack under
+                // their own render key but spell canonically via naming's map,
+                // so they never leak into emitted SQL. A template body renders
+                // the whole FROM item (minus alias); a bare-NAME body renames
+                // the call. The alias is appended by code either way.
+                let tvf_key = format!("tvf.{}", function.to_ascii_lowercase());
+                let rule = self
+                    .config
+                    .dialect_pack
+                    .render(self.config.dialect.family_name(), &tvf_key);
+                match rule {
+                    Some(rule) if rule.rule_kind == "template" => {
+                        let body = rule.template().map_err(GeneratorError::Error)?;
+                        if body.contains('{') {
+                            let refs: Vec<&str> =
+                                rendered_args.iter().map(String::as_str).collect();
+                            let applied =
+                                crate::pipeline::dialect_pack::apply_template(body, &refs)
+                                    .map_err(|e| {
+                                        GeneratorError::Error(format!("{}: {}", tvf_key, e))
+                                    })?;
+                            sql.push_str(&applied);
+                        } else {
+                            self.write_tvf_call(sql, schema.as_deref(), body, &rendered_args);
+                        }
+                    }
+                    Some(rule) => {
+                        return Err(GeneratorError::Error(format!(
+                            "{}: unsupported rule_kind '{}' (no interpreter built for it)",
+                            tvf_key, rule.rule_kind
+                        )));
+                    }
+                    None => {
+                        let canonical_name =
+                            crate::pipeline::naming::internal_fn_canonical(function)
+                                .unwrap_or(function);
+                        self.write_tvf_call(sql, schema.as_deref(), canonical_name, &rendered_args);
+                    }
+                }
 
                 if let Some(alias) = alias {
                     sql.push_str(" AS ");
-                    identifiers::write_identifier(sql, alias, self.config.dialect)?;
+                    identifiers::write_identifier(sql, alias, self.config.dialect, &self.config.dialect_pack)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Write a TVF call shape: `[schema.]name(arg1, arg2, ...)` from
+    /// already-rendered argument texts.
+    fn write_tvf_call(&self, sql: &mut String, schema: Option<&str>, name: &str, args: &[String]) {
+        if let Some(schema) = schema {
+            sql.push_str(schema);
+            sql.push('.');
+        }
+        sql.push_str(name);
+        sql.push('(');
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(arg);
+        }
+        sql.push(')');
     }
 
     /// Write a potentially namespace-qualified table reference
@@ -712,10 +818,10 @@ impl SqlGenerator {
         table: &str,
     ) -> Result<(), GeneratorError> {
         if let Some(ns) = namespace {
-            identifiers::write_identifier(sql, ns, self.config.dialect)?;
+            identifiers::write_identifier(sql, ns, self.config.dialect, &self.config.dialect_pack)?;
             sql.push('.');
         }
-        identifiers::write_identifier(sql, table, self.config.dialect)?;
+        identifiers::write_identifier(sql, table, self.config.dialect, &self.config.dialect_pack)?;
         Ok(())
     }
 
@@ -737,11 +843,11 @@ impl SqlGenerator {
                         self.generate_column_qualifier(sql, qual)?;
                         sql.push('.');
                     }
-                    identifiers::write_identifier(sql, name, self.config.dialect)?;
+                    identifiers::write_identifier(sql, name, self.config.dialect, &self.config.dialect_pack)?;
                 }
             }
             DomainExpression::Literal(value) => {
-                literals::generate_literal(sql, value, self.config.dialect)?;
+                literals::generate_literal(sql, value, self.config.dialect, &self.config.dialect_pack)?;
             }
             DomainExpression::Binary { left, op, right } => {
                 // Handle special cases that might need parentheses
@@ -753,7 +859,7 @@ impl SqlGenerator {
 
                 self.generate_domain_expression(sql, left)?;
                 sql.push(' ');
-                sql.push_str(operators::binary_operator_to_sql(op, self.config.dialect));
+                sql.push_str(operators::binary_operator_to_sql(op, self.config.dialect, &self.config.dialect_pack)?);
                 sql.push(' ');
                 self.generate_domain_expression(sql, right)?;
 
@@ -766,23 +872,117 @@ impl SqlGenerator {
                 sql.push(' ');
                 self.generate_domain_expression(sql, expr)?;
             }
+            DomainExpression::Cast { expr, type_name } => {
+                // CAST(x AS T) is universal skeleton; only T's spelling is
+                // per-target: `type.<name>` render rows, canonical =
+                // uppercased DQL type word. Semantics are the target's cast.
+                sql.push_str("CAST(");
+                self.generate_domain_expression(sql, expr)?;
+                sql.push_str(" AS ");
+                let type_key = format!("type.{}", type_name.to_ascii_lowercase());
+                match self
+                    .config
+                    .dialect_pack
+                    .render(self.config.dialect.family_name(), &type_key)
+                {
+                    Some(rule) => {
+                        sql.push_str(rule.template().map_err(GeneratorError::Error)?)
+                    }
+                    None => sql.push_str(&type_name.to_ascii_uppercase()),
+                }
+                sql.push(')');
+            }
             DomainExpression::Function {
                 name,
                 args,
                 distinct,
             } => {
-                sql.push_str(name);
-                sql.push('(');
-                if *distinct {
-                    sql.push_str("DISTINCT ");
+                // Consult the dialect pack for a per-function render rule
+                // (`fn.<name>`, lowercased — the AST carries mixed case),
+                // dispatching on rule_kind (DESIGN §4.4):
+                //   template, bare-NAME body — rename, call shape and
+                //     DISTINCT kept;
+                //   template with '{'        — re-render from rendered args;
+                //   rust_handler             — body names a compiled fn
+                //     (argument transformation/synthesis templates can't do).
+                // Internal `__dql_*` names key the pack under their own
+                // render key but spell canonically via naming's map — they
+                // must never leak into emitted SQL.
+                let canonical_name =
+                    crate::pipeline::naming::internal_fn_canonical(name).unwrap_or(name);
+                let fn_key = format!("fn.{}", name.to_ascii_lowercase());
+                let rule = self
+                    .config
+                    .dialect_pack
+                    .render(self.config.dialect.family_name(), &fn_key);
+
+                enum FnRender<'a> {
+                    Canonical,
+                    Rename(&'a str),
+                    Template(&'a str),
+                    Handler(crate::pipeline::dialect_pack::RustRenderHandler),
                 }
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
+                let plan = match rule {
+                    None => FnRender::Canonical,
+                    Some(rule) if rule.rule_kind == "template" => {
+                        let body = rule.template().map_err(GeneratorError::Error)?;
+                        if body.contains('{') {
+                            FnRender::Template(body)
+                        } else {
+                            FnRender::Rename(body)
+                        }
                     }
-                    self.generate_domain_expression(sql, arg)?;
+                    Some(rule) if rule.rule_kind == "rust_handler" => {
+                        let handler =
+                            crate::pipeline::dialect_pack::rust_render_handler(&rule.body)
+                                .ok_or_else(|| {
+                                    GeneratorError::Error(format!(
+                                        "{}: unknown rust_handler '{}'",
+                                        fn_key, rule.body
+                                    ))
+                                })?;
+                        FnRender::Handler(handler)
+                    }
+                    Some(rule) => {
+                        return Err(GeneratorError::Error(format!(
+                            "{}: unsupported rule_kind '{}' (no interpreter built for it)",
+                            fn_key, rule.rule_kind
+                        )));
+                    }
+                };
+
+                match plan {
+                    FnRender::Template(template) => {
+                        if *distinct {
+                            return Err(GeneratorError::Error(format!(
+                                "render rule '{}' is a full template and cannot carry DISTINCT",
+                                fn_key
+                            )));
+                        }
+                        let rendered = self.render_fn_args(args)?;
+                        let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
+                        let applied =
+                            crate::pipeline::dialect_pack::apply_template(template, &refs)
+                                .map_err(|e| {
+                                    GeneratorError::Error(format!("{}: {}", fn_key, e))
+                                })?;
+                        sql.push_str(&applied);
+                    }
+                    FnRender::Handler(handler) => {
+                        let rendered = self.render_fn_args(args)?;
+                        let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
+                        let applied = handler(&refs, *distinct).map_err(|e| {
+                            GeneratorError::Error(format!("{}: {}", fn_key, e))
+                        })?;
+                        sql.push_str(&applied);
+                    }
+                    FnRender::Rename(new_name) => {
+                        self.write_fn_call(sql, new_name, args, *distinct)?;
+                    }
+                    FnRender::Canonical => {
+                        self.write_fn_call(sql, canonical_name, args, *distinct)?;
+                    }
                 }
-                sql.push(')');
             }
             DomainExpression::WindowFunction {
                 name,
@@ -947,7 +1147,10 @@ impl SqlGenerator {
         Ok(())
     }
 
-    /// Generate SQL for a predicate rewrite call by consulting the bin_registry.
+    /// Generate SQL for a predicate rewrite call: first consult the
+    /// `dialect_form_rule` table (this call site IS the sigma-predicate
+    /// form — code chooses the form), then fall back to the bin entity's
+    /// canonical lowering via the bin_registry.
     fn generate_predicate_rewrite(
         &self,
         sql: &mut String,
@@ -955,6 +1158,58 @@ impl SqlGenerator {
         args: &[DomainExpression],
         negated: bool,
     ) -> Result<(), GeneratorError> {
+        // DESIGN §4.1 precedence: (entity+form+dialect) → (form+dialect) →
+        // canonical code (the bin entity below).
+        let form_type = crate::enums::EntityType::BinSigmaPredicate.as_i32();
+        if let Some(rule) = self.config.dialect_pack.form_rule(
+            self.config.dialect.family_name(),
+            form_type,
+            name,
+        ) {
+            let rule_id = format!("form.sigma.{}", name);
+            let rendered = self.render_fn_args(args)?;
+            let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
+            let applied = match rule.rule_kind.as_str() {
+                // A template expresses the un-negated predicate; negation
+                // wraps it (`NOT (x ILIKE y)` ≡ `x NOT ILIKE y`).
+                "template" => {
+                    let body = rule.template().map_err(GeneratorError::Error)?;
+                    crate::pipeline::dialect_pack::apply_template(body, &refs)
+                        .map_err(|e| GeneratorError::Error(format!("{}: {}", rule_id, e)))?
+                }
+                "rust_handler" => {
+                    let handler =
+                        crate::pipeline::dialect_pack::rust_render_handler(&rule.body)
+                            .ok_or_else(|| {
+                                GeneratorError::Error(format!(
+                                    "{}: unknown rust_handler '{}'",
+                                    rule_id, rule.body
+                                ))
+                            })?;
+                    // For predicate handlers the flag is NEGATED (they own
+                    // their negation spelling; no outer NOT is added).
+                    sql.push_str(&handler(&refs, negated).map_err(|e| {
+                        GeneratorError::Error(format!("{}: {}", rule_id, e))
+                    })?);
+                    return Ok(());
+                }
+                other => {
+                    return Err(GeneratorError::Error(format!(
+                        "{}: unsupported rule_kind '{}' (no interpreter built for it)",
+                        rule_id, other
+                    )));
+                }
+            };
+            if negated {
+                sql.push_str("NOT (");
+                sql.push_str(&applied);
+                sql.push(')');
+            } else {
+                sql.push_str(&applied);
+            }
+            return Ok(());
+        }
+
         let registry = self.bin_registry.as_ref().ok_or_else(|| {
             GeneratorError::Error(format!(
                 "PredicateRewrite '{}' but no bin_registry available",
@@ -1005,23 +1260,23 @@ impl SqlGenerator {
     ) -> Result<(), GeneratorError> {
         match qual.parts() {
             QualifierParts::Table(table) => {
-                identifiers::write_identifier(sql, table, self.config.dialect)?;
+                identifiers::write_identifier(sql, table, self.config.dialect, &self.config.dialect_pack)?;
             }
             QualifierParts::SchemaTable { schema, table } => {
-                identifiers::write_identifier(sql, schema, self.config.dialect)?;
+                identifiers::write_identifier(sql, schema, self.config.dialect, &self.config.dialect_pack)?;
                 sql.push('.');
-                identifiers::write_identifier(sql, table, self.config.dialect)?;
+                identifiers::write_identifier(sql, table, self.config.dialect, &self.config.dialect_pack)?;
             }
             QualifierParts::DatabaseSchemaTable {
                 database,
                 schema,
                 table,
             } => {
-                identifiers::write_identifier(sql, database, self.config.dialect)?;
+                identifiers::write_identifier(sql, database, self.config.dialect, &self.config.dialect_pack)?;
                 sql.push('.');
-                identifiers::write_identifier(sql, schema, self.config.dialect)?;
+                identifiers::write_identifier(sql, schema, self.config.dialect, &self.config.dialect_pack)?;
                 sql.push('.');
-                identifiers::write_identifier(sql, table, self.config.dialect)?;
+                identifiers::write_identifier(sql, table, self.config.dialect, &self.config.dialect_pack)?;
             }
         }
         Ok(())

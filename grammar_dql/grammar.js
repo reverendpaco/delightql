@@ -370,12 +370,13 @@ module.exports = grammar({
       '~~)'
     )),
 
-    // Option annotation: (~~option://uri/path STATE~~)
+    // Config annotation: (~~config://hierarchy STATE~~) — the sigil declares
+    // the kind (delightql-config://), so the path is the bare hierarchy.
     // Strategy/preference selection for the current query.
     // Same toggle syntax as danger gates: ON, OFF, ALLOW, or 1-9.
     // prec(1) ensures this wins over the generic annotation.
     option_annotation: $ => prec(1, seq(
-      '(~~option',
+      '(~~config',
       token.immediate('://'),
       field('option_uri', $.error_uri_path),
       field('option_state', $.danger_toggle),

@@ -32,8 +32,8 @@ use delightql_protocol::{
     Orientation, Projection, ServerTerm,
 };
 
-const IDENT_DUCK_ERROR: &str = "dql/target/duckdb/error";
-const IDENT_UNIMPLEMENTED: &str = "dql/target/duckdb/unimplemented";
+const IDENT_DUCK_ERROR: &str = "delightql-error://target/duckdb/error";
+const IDENT_UNIMPLEMENTED: &str = "delightql-error://target/duckdb/unimplemented";
 
 struct ResultState {
     columns: Vec<String>,
@@ -126,7 +126,7 @@ impl DuckParty {
         if orientation != Orientation::Rows {
             return error(
                 ErrorKind::Connection,
-                "dql/target/duckdb/orientation",
+                "delightql-error://target/duckdb/orientation",
                 b"orientation Columns not supported".to_vec(),
             );
         }
@@ -198,7 +198,7 @@ impl Handler for DuckParty {
                 if agreed.is_empty() {
                     error(
                         ErrorKind::Connection,
-                        "dql/target/duckdb/orientation",
+                        "delightql-error://target/duckdb/orientation",
                         b"no common orientation".to_vec(),
                     )
                 } else {
@@ -317,7 +317,7 @@ mod tests {
         };
         match session.query(b("SELECT * FROM no_such_table")).unwrap() {
             QueryResponse::Error { identity, .. } => {
-                assert_eq!(identity, b("dql/target/duckdb/error"));
+                assert_eq!(identity, b("delightql-error://target/duckdb/error"));
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
         }

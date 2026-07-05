@@ -63,6 +63,35 @@ fn main() {
 /// is the protocol channel (binary frames) — nothing else may write to
 /// it; diagnostics go to stderr. When the spawner dies the pipe closes,
 /// read returns EOF, and we exit.
+/// Env-complete a conninfo the way libpq would: rust-postgres reads no
+/// environment, so missing pieces (host/port/user/dbname/password) fill
+/// from PG* variables, falling back to the test-suite sweep container.
+/// This is what makes the worldly `postgres:///dbname` form work.
+fn complete_config(conninfo: &str) -> Result<postgres::Config, String> {
+    let mut cfg: postgres::Config = conninfo
+        .parse()
+        .map_err(|e| format!("invalid conninfo '{conninfo}': {e}"))?;
+    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    if cfg.get_hosts().is_empty() {
+        cfg.host(&var("PGHOST", "127.0.0.1"));
+    }
+    if cfg.get_ports().is_empty() {
+        cfg.port(var("PGPORT", "5433").parse().unwrap_or(5433));
+    }
+    if cfg.get_user().is_none() {
+        cfg.user(&var("PGUSER", "postgres"));
+    }
+    if cfg.get_dbname().is_none() {
+        cfg.dbname(&var("PGDATABASE", "dql_core"));
+    }
+    if cfg.get_password().is_none() {
+        if let Ok(pw) = std::env::var("PGPASSWORD") {
+            cfg.password(&pw);
+        }
+    }
+    Ok(cfg)
+}
+
 fn serve_stdio(conninfo: &str) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -71,7 +100,10 @@ fn serve_stdio(conninfo: &str) {
 
     // One Postgres session, fail-closed: if the database is unreachable,
     // answer the first term with a Connection error (not a silent EOF).
-    let mut party = match PgParty::connect(conninfo) {
+    let mut party = match complete_config(conninfo)
+        .map_err(|e| e.to_string())
+        .and_then(|cfg| PgParty::connect_config(&cfg).map_err(|e| e.to_string()))
+    {
         Ok(p) => p,
         Err(e) => {
             let mut buf = Vec::new();
@@ -80,7 +112,7 @@ fn serve_stdio(conninfo: &str) {
                     &mut writer,
                     &ServerMessage::Data(ServerTerm::Error {
                         kind: ErrorKind::Connection,
-                        identity: b"dql/target/postgres/connect".to_vec(),
+                        identity: b"delightql-error://target/postgres/connect".to_vec(),
                         message: format!("cannot reach postgres: {e}").into_bytes(),
                     }),
                 );

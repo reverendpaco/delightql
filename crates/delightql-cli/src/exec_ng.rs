@@ -262,14 +262,36 @@ fn execute_single_query(
 ) -> Result<Option<ResultMetadata>> {
     let zebra_mode = ZEBRA_MODE.with(|z| *z.borrow());
 
+    let compile_stage = match target_stage {
+        Some(Stage::Sql) => Some("sql"),
+        Some(Stage::AstUnresolved) => Some("ast-unresolved"),
+        Some(Stage::AstResolved) => Some("ast-resolved"),
+        Some(Stage::AstRefined) => Some("ast-refined"),
+        Some(Stage::AstSql) => Some("ast-sql"),
+        Some(Stage::Cst) => Some("cst"),
+        Some(Stage::RecursionDepth) => Some("recursion-depth"),
+        _ => None,
+    };
+    if let Some(stage) = compile_stage {
+        return display_compile_stage(
+            session,
+            stage,
+            source_code,
+            output_format,
+            zebra_mode,
+            no_headers,
+            no_sanitize,
+        );
+    }
+
     let dql = match target_stage {
-        Some(Stage::Sql) => compile_stage_dql("sql", source_code),
-        Some(Stage::AstUnresolved) => compile_stage_dql("ast-unresolved", source_code),
-        Some(Stage::AstResolved) => compile_stage_dql("ast-resolved", source_code),
-        Some(Stage::AstRefined) => compile_stage_dql("ast-refined", source_code),
-        Some(Stage::AstSql) => compile_stage_dql("ast-sql", source_code),
-        Some(Stage::Cst) => compile_stage_dql("cst", source_code),
-        Some(Stage::RecursionDepth) => compile_stage_dql("recursion-depth", source_code),
+        Some(Stage::Sql)
+        | Some(Stage::AstUnresolved)
+        | Some(Stage::AstResolved)
+        | Some(Stage::AstRefined)
+        | Some(Stage::AstSql)
+        | Some(Stage::Cst)
+        | Some(Stage::RecursionDepth) => unreachable!("handled by display_compile_stage"),
         Some(Stage::ByteHash) => {
             let (columns, raw_rows) = fetch_all_raw(session, source_code)?;
             let bhash = crate::util::fingerprint::compute_byte_hash(&raw_rows);
@@ -310,11 +332,64 @@ fn execute_single_query(
 }
 
 /// Build a `sys::execution.compile(stage, b64:source)` DQL string.
+/// Projects BOTH representation and error — the caller must consult the
+/// error column, never print a NULL representation as if it were output.
 fn compile_stage_dql(stage: &str, source: &str) -> String {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(source.as_bytes());
     format!(
-        "sys::execution.compile(\"{}\", b64:\"{}\") |> (representation)",
+        "sys::execution.compile(\"{}\", b64:\"{}\") |> (representation, error)",
         stage, encoded
     )
+}
+
+/// Display a compile stage (`--to sql`, `--to ast-*`, …). A failed compile
+/// surfaces its error and exits non-zero — the inspection surface must
+/// never print a literal NULL where the user asked to see the compilation
+/// (RECURSION-CONTRACT.md B4).
+fn display_compile_stage(
+    session: &mut dyn DqlSession,
+    stage: &str,
+    source_code: &str,
+    output_format: OutputFormat,
+    zebra_mode: Option<usize>,
+    no_headers: bool,
+    no_sanitize: bool,
+) -> Result<Option<ResultMetadata>> {
+    use crate::output_format::format_output_with_zebra;
+
+    let dql = compile_stage_dql(stage, source_code);
+    let (_, rows) = fetch_all_raw(session, &dql)?;
+    let row = rows
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("sys::execution.compile returned no rows"))?;
+
+    if let Some(uri) = &row[1] {
+        let uri = String::from_utf8_lossy(uri);
+        anyhow::bail!(
+            "compilation failed: {uri}\n\
+             (run `dql explain {uri}` for the identifier's prose, or run \
+             the query without --to for the full message)"
+        );
+    }
+
+    let representation = match &row[0] {
+        Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
+        None => anyhow::bail!("sys::execution.compile returned neither output nor error"),
+    };
+    let columns = vec!["representation".to_string()];
+    let display_rows = vec![vec![representation]];
+    let output = format_output_with_zebra(
+        &columns,
+        &display_rows,
+        output_format,
+        zebra_mode,
+        no_headers,
+        no_sanitize,
+    );
+    print!("{}", output);
+    Ok(Some(ResultMetadata {
+        columns,
+        row_count: 1,
+    }))
 }

@@ -15,6 +15,11 @@ pub enum KnownLimitationType {
     // Other future limitations can be added here
 }
 
+/// The identifier badge scheme for compiler-minted error identities
+/// (URI-DESIGN.md §2): `delightql-error://<hierarchy>` ⇌
+/// `https://delightql.org/uri/error/<hierarchy>`.
+pub const ERROR_URI_SCHEME: &str = "delightql-error://";
+
 #[derive(Error, Debug)]
 pub enum DelightQLError {
     #[error("Parse error: {message}")]
@@ -72,7 +77,7 @@ pub enum DelightQLError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
         /// Runtime subcategory for URI classification: "bug", "collision",
-        /// "useafterfree", "assertion". When `None`, URI is `"dql/runtime"`.
+        /// "useafterfree", "assertion". When `None`, URI is `delightql-error://runtime`.
         subcategory: Option<&'static str>,
     },
 
@@ -277,29 +282,31 @@ impl DelightQLError {
     /// Return a canonical error URI path for this error.
     ///
     /// The URI is hierarchical and domain-first:
-    ///   `"dql/parse/..."` — structural failures
-    ///   `"dql/semantic/..."` — name resolution, arity, constraint violations
-    ///   `"database/..."`, `"io"` — runtime errors
+    ///   `delightql-error://parse/...` — structural failures
+    ///   `delightql-error://semantic/...` — name resolution, arity, constraints
+    ///   `delightql-error://runtime/...` — execution-time failures
     ///
     /// Used by error hooks (`(~error://path ~)`) for prefix matching:
-    /// an expected URI of `"dql/semantic"` matches actual `"dql/semantic/arity"`.
+    /// hooks carry the bare hierarchy: expected `"semantic"` matches actual
+    /// `delightql-error://semantic/arity` (the matcher strips the scheme).
     pub fn error_uri(&self) -> String {
+        const S: &str = ERROR_URI_SCHEME;
         match self {
             Self::ParseError {
                 subcategory,
                 message,
                 ..
             } => match subcategory {
-                Some(sub) if sub.starts_with("dml/") => format!("dql/{}", sub),
-                Some(sub) => format!("dql/parse/{}", sub),
-                None => format!("dql/parse/{}", Self::parse_subcategory(message)),
+                Some(sub) if sub.starts_with("dml/") => format!("{S}{}", sub),
+                Some(sub) => format!("{S}parse/{}", sub),
+                None => format!("{S}parse/{}", Self::parse_subcategory(message)),
             },
             Self::KnownLimitation { limitation_type, .. } => match limitation_type {
                 KnownLimitationType::QualifiedNameAmbiguity => {
-                    "dql/semantic/limitation/qualified_name_ambiguity".to_string()
+                    format!("{S}semantic/limitation/qualified_name_ambiguity")
                 }
                 KnownLimitationType::FeatureNotImplemented => {
-                    "dql/semantic/limitation/not_implemented".to_string()
+                    format!("{S}semantic/limitation/not_implemented")
                 }
             },
             Self::TransformationError {
@@ -307,10 +314,10 @@ impl DelightQLError {
                 message,
                 ..
             } => match subcategory {
-                Some(sub) if sub.starts_with("dml/") => format!("dql/{}", sub),
-                Some(sub) => format!("dql/semantic/{}", sub),
+                Some(sub) if sub.starts_with("dml/") => format!("{S}{}", sub),
+                Some(sub) => format!("{S}semantic/{}", sub),
                 None => format!(
-                    "dql/semantic/constraint/{}",
+                    "{S}semantic/constraint/{}",
                     Self::semantic_subcategory(message)
                 ),
             },
@@ -319,33 +326,36 @@ impl DelightQLError {
                 message,
                 ..
             } => match subcategory {
-                Some(sub) if sub.starts_with("dml/") => format!("dql/{}", sub),
-                Some(sub) => format!("dql/semantic/{}", sub),
+                Some(sub) if sub.starts_with("dml/") => format!("{S}{}", sub),
+                Some(sub) => format!("{S}semantic/{}", sub),
                 None => format!(
-                    "dql/semantic/constraint/{}",
+                    "{S}semantic/constraint/{}",
                     Self::semantic_subcategory(message)
                 ),
             },
-            Self::TableNotFoundError { .. } => "dql/semantic/resolution/table".to_string(),
-            Self::ColumnNotFoundError { .. } => "dql/semantic/resolution/column".to_string(),
+            Self::TableNotFoundError { .. } => format!("{S}semantic/resolution/table"),
+            Self::ColumnNotFoundError { .. } => format!("{S}semantic/resolution/column"),
             Self::ValidationError {
                 subcategory,
                 message,
                 ..
             } => match subcategory {
-                Some(sub) if sub.starts_with("dml/") => format!("dql/{}", sub),
-                Some(sub) if sub.starts_with("operational/") => format!("dql/{}", sub),
-                Some(sub) => format!("dql/semantic/{}", sub),
-                None => format!("dql/semantic/{}", Self::semantic_subcategory(message)),
+                Some(sub) if sub.starts_with("dml/") => format!("{S}{}", sub),
+                Some(sub) if sub.starts_with("operational/") => format!("{S}{}", sub),
+                Some(sub) => format!("{S}semantic/{}", sub),
+                None => format!("{S}semantic/{}", Self::semantic_subcategory(message)),
             },
-            Self::TreeSitterError(_) => "dql/parse/tree_sitter".to_string(),
+            Self::TreeSitterError(_) => format!("{S}parse/tree_sitter"),
             Self::DatabaseOperationError { subcategory, .. } => match subcategory {
-                Some(sub) => format!("dql/runtime/{}", sub),
-                None => "dql/runtime".to_string(),
+                // target-side failures are their own top segment (the
+                // runtime/target double-spelling collapsed here)
+                Some(sub) if sub.starts_with("target/") => format!("{S}{}", sub),
+                Some(sub) => format!("{S}runtime/{}", sub),
+                None => format!("{S}runtime"),
             },
-            Self::ConnectionPoisonError { .. } => "database/connection".to_string(),
-            Self::NotImplemented(_) => "dql/semantic/limitation/not_implemented".to_string(),
-            Self::IoError(_) => "io".to_string(),
+            Self::ConnectionPoisonError { .. } => format!("{S}runtime/connection"),
+            Self::NotImplemented(_) => format!("{S}semantic/limitation/not_implemented"),
+            Self::IoError(_) => format!("{S}runtime/io"),
         }
     }
 

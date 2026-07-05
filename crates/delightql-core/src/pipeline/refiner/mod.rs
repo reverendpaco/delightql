@@ -150,7 +150,7 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
             | resolved::RelationalExpression::SetOperation { .. } => {
                 let min_mult = self
                     .danger_gates
-                    .is_enabled("dql/semantics/min_multiplicity");
+                    .is_enabled("delightql-danger://semantics/min_multiplicity");
                 let refined = refine_segment(expr, self.is_top_level, min_mult)?;
                 Ok(FoldAction::Replaced(refined))
             }

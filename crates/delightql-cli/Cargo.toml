@@ -36,6 +36,7 @@ rusqlite.workspace = true
 tree-sitter.workspace = true
 # CLI-specific dependencies
 toml = "0.8"
+url = "2"
 log = "0.4"
 env_logger = "0.11"
 tree-sitter-highlight = { path = "../tree-sitter-highlight", optional = true }

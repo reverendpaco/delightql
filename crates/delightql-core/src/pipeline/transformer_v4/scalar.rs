@@ -707,6 +707,35 @@ fn s_lower_named_function(
     if let Some(substituted) = try_expand_cfe(name.as_str(), &arguments, qualify, ctx)? {
         return s_lower_expression(substituted, qualify, ctx);
     }
+    // cast:(x, integer) — the resolver validated the type atom and carried
+    // it forward as a string Literal; lower to the structured Cast node
+    // (the type's per-target spelling happens at generation, so it cannot
+    // be baked into a plain function call here).
+    if name.as_str() == "cast" {
+        let mut args = arguments.into_iter();
+        let (Some(value), Some(type_arg), None) = (args.next(), args.next(), args.next())
+        else {
+            return Err(DelightQLError::ParseError {
+                message: "cast: expects exactly 2 arguments: cast:(expr, type)".into(),
+                source: None,
+                subcategory: None,
+            });
+        };
+        let ast_addressed::DomainExpression::Literal {
+            value: LiteralValue::String(type_name),
+            ..
+        } = type_arg
+        else {
+            return Err(DelightQLError::ParseError {
+                message: "cast: type argument did not survive resolution as a type atom"
+                    .into(),
+                source: None,
+                subcategory: None,
+            });
+        };
+        let lowered = s_lower_expression(value, qualify, ctx)?;
+        return Ok(SqlDomainExpr::cast(lowered, type_name));
+    }
     let args: Vec<SqlDomainExpr> = arguments
         .into_iter()
         .map(|a| s_lower_expression(a, qualify, ctx))
@@ -1488,8 +1517,11 @@ fn s_lower_json_path(
     if json_path == "$" {
         Ok(SqlDomainExpr::function("json", vec![source_sql]))
     } else {
+        // Provenance: first-class json read (`json:{...}`) — the path may
+        // yield an object/array subtree embedded into a JSON_OBJECT, so it
+        // must stay NATIVE json (never a per-dialect *_string respell).
         Ok(SqlDomainExpr::function(
-            "json_extract",
+            crate::pipeline::naming::INTERNAL_JSON_EXTRACT_RAW,
             vec![
                 source_sql,
                 SqlDomainExpr::literal(LiteralValue::String(json_path)),

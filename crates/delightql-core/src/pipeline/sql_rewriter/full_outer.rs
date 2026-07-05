@@ -23,7 +23,7 @@ use crate::pipeline::sql_ast_v3::{
 pub fn needs_expansion(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::SQLite | SqlDialect::MySQL => true,
-        SqlDialect::PostgreSQL | SqlDialect::SqlServer => false,
+        SqlDialect::PostgreSQL | SqlDialect::SqlServer | SqlDialect::DuckDB => false,
     }
 }
 
@@ -285,6 +285,7 @@ fn find_first_qualified_column(expr: &DomainExpression) -> Option<DomainExpressi
             find_first_qualified_column(left).or_else(|| find_first_qualified_column(right))
         }
         DomainExpression::Parens(inner) => find_first_qualified_column(inner),
+        DomainExpression::Cast { expr, .. } => find_first_qualified_column(expr),
         _ => None,
     }
 }

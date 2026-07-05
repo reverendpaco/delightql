@@ -346,7 +346,9 @@ impl DelightQLSystem {
         // (cartridge has FK to connection)
         let bootstrap_conn_id = crate::import::register_connection(
             &bootstrap_conn,
-            "bootstrap://internal",
+            "session:bootstrap",
+            "in-process",
+            None,
             5, // bootstrap connection type
             "Internal engine metadata store",
         )
@@ -440,9 +442,11 @@ impl DelightQLSystem {
 
         let user_conn_id = crate::import::register_connection(
             &bootstrap_conn,
-            "user://main",
+            "session:primary",
+            if db_type_lower == "sqlite" { "in-process" } else { "fatboy" },
+            None,
             connection_type,
-            "User target database",
+            "User target database (pre-mount placeholder)",
         )
         .map_err(|e| {
             DelightQLError::database_error(
@@ -743,6 +747,48 @@ impl DelightQLSystem {
         &self.bootstrap_connection
     }
 
+    /// The SQL dialect of the connection a query routes to — the
+    /// dialect-from-connection inference (ALL-SQL-TARGETING). `None` or the
+    /// user connection (id 2) resolve to the PRIMARY's db_type (so a
+    /// `--db fatboy://postgres/...` primary compiles postgres-spelled SQL);
+    /// mounted connections resolve via their `connection` row:
+    /// connection_type 3 = postgres, 4 = duckdb, pipe (6) parses the
+    /// `pipe://<profile>/...` profile. Anything unknown is canonical SQLite.
+    pub fn dialect_for_connection(
+        &self,
+        connection_id: Option<i64>,
+    ) -> crate::pipeline::generator_v3::SqlDialect {
+        use crate::pipeline::generator_v3::SqlDialect;
+        let primary = || {
+            SqlDialect::from_family_name(&self.db_type.to_lowercase())
+                .unwrap_or(SqlDialect::SQLite)
+        };
+        let id = match connection_id {
+            Some(id) if id != 2 => id,
+            _ => return primary(),
+        };
+        let Ok(conn) = self.bootstrap_connection.lock() else {
+            return primary();
+        };
+        let row: Option<(i32, String)> = conn
+            .query_row(
+                "SELECT connection_type, resource_uri FROM connection WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        match row {
+            Some((3, _)) => SqlDialect::PostgreSQL,
+            Some((4, _)) => SqlDialect::DuckDB,
+            Some((6, uri)) => uri
+                .strip_prefix("delightql-siso://")
+                .and_then(|rest| rest.split('/').next())
+                .and_then(SqlDialect::from_family_name)
+                .unwrap_or(SqlDialect::SQLite),
+            _ => SqlDialect::SQLite,
+        }
+    }
+
     /// Get the schema map for imported connections
     pub fn get_schema_map(&self) -> &HashMap<i64, Box<dyn DatabaseSchema>> {
         &self.schema_map
@@ -805,7 +851,7 @@ impl DelightQLSystem {
                     // Same database — return existing connection info
                     let conn_id: i64 = bootstrap_conn
                         .query_row(
-                            "SELECT id FROM connection WHERE connection_uri = ?1",
+                            "SELECT id FROM connection WHERE resource_uri = ?1",
                             [connection_uri],
                             |row| row.get(0),
                         )
@@ -820,6 +866,49 @@ impl DelightQLSystem {
                     drop(bootstrap_conn);
                     return Ok((conn_id, entity_count));
                 } else {
+                    // Different SPELLING may still be the same RESOURCE
+                    // (postgres:///db vs postgres://localhost:5433/db):
+                    // compare resource-asserted identity before declaring
+                    // a conflict (URI-DESIGN.md §4, connect-before-dedupe —
+                    // the new connection is already live, so its identity
+                    // is in hand).
+                    let existing_identity: Option<String> = bootstrap_conn
+                        .query_row(
+                            "SELECT co.identity FROM namespace n
+                             JOIN activated_entity ae ON ae.namespace_id = n.id
+                             JOIN entity e ON e.id = ae.entity_id
+                             JOIN cartridge c ON c.id = e.cartridge_id
+                             JOIN connection co ON co.id = c.connection_id
+                             WHERE n.fq_name = ?1
+                             LIMIT 1",
+                            [namespace],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten();
+                    if let (Some(new_id), Some(old_id)) =
+                        (components.identity.as_deref(), existing_identity.as_deref())
+                    {
+                        if new_id == old_id {
+                            // Same resource, different spelling — idempotent.
+                            let conn_id: i64 = bootstrap_conn
+                                .query_row(
+                                    "SELECT co.id FROM connection co WHERE co.identity = ?1",
+                                    [new_id],
+                                    |row| row.get(0),
+                                )
+                                .unwrap_or(0);
+                            let entity_count: usize = bootstrap_conn
+                                .query_row(
+                                    "SELECT COUNT(*) FROM namespace n JOIN activated_entity ae ON ae.namespace_id = n.id WHERE n.fq_name = ?1",
+                                    [namespace],
+                                    |row| row.get(0),
+                                )
+                                .unwrap_or(0);
+                            drop(bootstrap_conn);
+                            return Ok((conn_id, entity_count));
+                        }
+                    }
                     return Err(DelightQLError::database_error(
                         format!(
                             "Namespace '{}' already exists (mounted from '{}'), cannot re-mount from '{}'",
@@ -847,6 +936,8 @@ impl DelightQLSystem {
         let connection_id = crate::import::register_connection(
             &bootstrap_conn,
             connection_uri,
+            &components.mechanism,
+            components.identity.as_deref(),
             connection_type,
             &format!("Mounted database: {}", namespace),
         )
@@ -1065,7 +1156,9 @@ impl DelightQLSystem {
         // 4. Register connections (bootstrap=1, user=2)
         let bootstrap_conn_id = crate::import::register_connection(
             &bootstrap_conn,
-            "bootstrap://internal",
+            "session:bootstrap",
+            "in-process",
+            None,
             5,
             "Internal engine metadata store",
         )
@@ -1104,9 +1197,11 @@ impl DelightQLSystem {
 
         let user_conn_id = crate::import::register_connection(
             &bootstrap_conn,
-            "user://main",
+            "session:primary",
+            if db_type_lower == "sqlite" { "in-process" } else { "fatboy" },
+            None,
             connection_type,
-            "User target database",
+            "User target database (pre-mount placeholder)",
         )
         .map_err(|e| {
             DelightQLError::database_error(
@@ -1573,6 +1668,30 @@ impl DelightQLSystem {
                     "File read failed",
                 )
             })?;
+            // DuckDB file (magic "DUCK" at offset 8): route through the
+            // connection factory like any external resource — the factory
+            // classifies the path and picks the duckdb adapter
+            // (resource-first surface, URI-DESIGN.md §4).
+            if bytes_read >= 12 && &header[8..12] == b"DUCK" {
+                if let Some(factory) = self.connection_factory.as_ref() {
+                    let components = factory.create(db_path).map_err(|e| {
+                        DelightQLError::database_error(
+                            format!("mount!() failed for '{}': {}", db_path, e),
+                            e.to_string(),
+                        )
+                    })?;
+                    self.register_external_connection(components, namespace, db_path)?;
+                    return Ok(());
+                }
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "mount!() failed: '{}' is a DuckDB database but no \
+                         connection factory is available",
+                        db_path
+                    ),
+                    "No connection factory",
+                ));
+            }
             // Allow empty files (0 bytes) — SQLite creates the database on ATTACH.
             // Only reject non-empty files that don't have a valid SQLite header.
             if bytes_read > 0 && (bytes_read < 16 || &header != b"SQLite format 3\0") {
@@ -1652,6 +1771,22 @@ impl DelightQLSystem {
                         })?;
                     existing_namespace_id = Some(ns_id);
                 } else {
+                    // Different SPELLING may still be the same FILE (the
+                    // symlink trap, URI-DESIGN.md §4): compare filesystem
+                    // identity before declaring a conflict.
+                    let existing_path = existing_uri.trim_start_matches("file://");
+                    let same_file = match (
+                        std::fs::canonicalize(existing_path),
+                        std::fs::canonicalize(db_path),
+                    ) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => false,
+                    };
+                    if same_file {
+                        // Same resource, different spelling — idempotent.
+                        drop(bootstrap_conn);
+                        return Ok(());
+                    }
                     return Err(DelightQLError::database_error(
                         format!(
                             "Namespace '{}' already exists (mounted from '{}'), cannot re-mount from '{}'",
@@ -1699,11 +1834,17 @@ impl DelightQLSystem {
             )
         })?;
 
-        // Register the connection in bootstrap
-        let connection_uri = format!("file://{}", db_path);
+        // Register the connection in bootstrap. Resource = the path as
+        // given; identity = filesystem identity (canonical path), which
+        // folds symlinked/re-spelled mounts of one file into one row.
+        let attach_identity = std::fs::canonicalize(db_path)
+            .ok()
+            .map(|abs| format!("realpath:{}", abs.display()));
         let _connection_id = crate::import::register_connection(
             &bootstrap_conn,
-            &connection_uri,
+            db_path,
+            "attach",
+            attach_identity.as_deref(),
             1, // sqlite-file
             &format!("Mounted database: {}", namespace),
         )

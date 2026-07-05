@@ -19,6 +19,10 @@ impl OrderTerm {
         &self.expr
     }
 
+    pub fn expr_mut(&mut self) -> &mut DomainExpression {
+        &mut self.expr
+    }
+
     pub fn direction(&self) -> Option<&OrderDirection> {
         self.direction.as_ref()
     }

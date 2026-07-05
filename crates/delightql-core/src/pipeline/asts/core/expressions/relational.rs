@@ -69,7 +69,7 @@ pub enum RelationalExpression<Phase = Unresolved> {
         /// Per-column matching conditions (e.g., x.id IS NOT DISTINCT FROM y.id)
         correlation: BooleanExpression<Phase>,
         /// When true, use ROW_NUMBER + JOIN for min(m,n) multiplicity.
-        /// Set by the refiner when `danger://dql/semantics/min_multiplicity` is ON.
+        /// Set by the refiner when `danger://semantics/min_multiplicity` is ON.
         min_multiplicity: bool,
         cpr_schema: PhaseBox<CprSchema, Phase>,
     },

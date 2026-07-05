@@ -8,4 +8,51 @@ pub enum SqlDialect {
     PostgreSQL,
     MySQL,
     SqlServer,
+    DuckDB,
+}
+
+impl SqlDialect {
+    /// Dialect family key as spelled in the targeting tables and
+    /// `language.dialect` (`dialect_render.dialect` etc.).
+    pub fn family_name(self) -> &'static str {
+        match self {
+            SqlDialect::SQLite => "sqlite",
+            SqlDialect::PostgreSQL => "postgres",
+            SqlDialect::MySQL => "mysql",
+            SqlDialect::SqlServer => "sqlserver",
+            SqlDialect::DuckDB => "duckdb",
+        }
+    }
+
+    /// Parse a dialect family key (the `family_name` spelling).
+    pub fn from_family_name(name: &str) -> Option<Self> {
+        match name {
+            "sqlite" => Some(SqlDialect::SQLite),
+            "postgres" | "postgresql" => Some(SqlDialect::PostgreSQL),
+            "mysql" => Some(SqlDialect::MySQL),
+            "sqlserver" => Some(SqlDialect::SqlServer),
+            "duckdb" => Some(SqlDialect::DuckDB),
+            _ => None,
+        }
+    }
+
+    /// Explicit dialect OVERRIDE from the `DQL_DIALECT` env var (the CLI's
+    /// global `--dialect` flag sets it). `None` = no override: the pipeline
+    /// derives the dialect from the connection the query routes to
+    /// (`DelightQLSystem::dialect_for_connection`), defaulting to SQLite.
+    pub fn override_from_env() -> Option<Self> {
+        match std::env::var("DQL_DIALECT") {
+            Ok(v) => match Self::from_family_name(v.trim()) {
+                Some(d) => Some(d),
+                None => {
+                    eprintln!(
+                        "warning: unknown DQL_DIALECT '{}' (expected sqlite|postgres|mysql|sqlserver|duckdb); ignoring",
+                        v
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
 }

@@ -1938,10 +1938,82 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 alias,
                 conditioned_on,
             } => {
-                let resolved_args =
+                // cast:(x, integer) — arg[1] is a TYPE ATOM, not a column:
+                // validate it against the type vocabulary and carry it as a
+                // string Literal (never column-resolve it). The transformer
+                // lowers the pair to the structured Cast node.
+                let resolved_args = if namespace.is_none() && name.as_ref() == "cast" {
+                    const CAST_TYPES: &[&str] = &["integer", "real", "text", "numeric", "boolean"];
+                    if arguments.len() != 2 {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "cast",
+                            format!(
+                                "cast: expects exactly 2 arguments: cast:(expr, type), got {}",
+                                arguments.len()
+                            ),
+                            "cast resolution",
+                        ));
+                    }
+                    let mut args = arguments.into_iter();
+                    let value_arg = args.next().expect("len checked");
+                    let type_arg = args.next().expect("len checked");
+                    let type_name = match &type_arg {
+                        ast_unresolved::DomainExpression::Lvar {
+                            name: atom,
+                            qualifier: None,
+                            namespace_path,
+                            ..
+                        } if namespace_path.is_empty() => atom.as_ref().to_string(),
+                        ast_unresolved::DomainExpression::Literal { .. } => {
+                            return Err(DelightQLError::validation_error_categorized(
+                                "cast",
+                                format!(
+                                    "cast: takes a bare type name, not a string — write \
+                                     cast:(x, integer). Types: {}",
+                                    CAST_TYPES.join("|")
+                                ),
+                                "cast resolution",
+                            ));
+                        }
+                        _ => {
+                            return Err(DelightQLError::validation_error_categorized(
+                                "cast",
+                                format!(
+                                    "cast: second argument must be a bare type name. \
+                                     Types: {}",
+                                    CAST_TYPES.join("|")
+                                ),
+                                "cast resolution",
+                            ));
+                        }
+                    };
+                    if !CAST_TYPES.contains(&type_name.as_str()) {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "cast",
+                            format!(
+                                "cast: unknown type '{}'. Types: {} \
+                                 (date/timestamp and parameterized types are not yet \
+                                 supported)",
+                                type_name,
+                                CAST_TYPES.join("|")
+                            ),
+                            "cast resolution",
+                        ));
+                    }
+                    vec![
+                        self.transform_domain(value_arg)?,
+                        ast_resolved::DomainExpression::Literal {
+                            value: crate::pipeline::asts::core::literals::LiteralValue::String(
+                                type_name,
+                            ),
+                            alias: None,
+                        },
+                    ]
+                } else {
                     super::resolving::functions::resolve_function_arguments_via_fold(
                         self, arguments,
-                    )?;
+                    )?
+                };
 
                 // CCAFE validation
                 {

@@ -250,6 +250,26 @@ impl<P> Builder<P> {
     }
 }
 
+/// What a json_each expansion iterates — the caller's structural knowledge,
+/// carried into the SQL AST as an internal TVF name so dialects with
+/// separate array/object TVFs can spell each form correctly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JsonEachKind {
+    /// A JSON array the transformer built (melt packets, tree_group columns).
+    Array,
+    /// A `JSON_GROUP_OBJECT` map (metadata tree groups, `key:~>`).
+    Object,
+}
+
+impl JsonEachKind {
+    fn internal_fn_name(self) -> &'static str {
+        match self {
+            JsonEachKind::Array => crate::pipeline::naming::INTERNAL_JSON_EACH_ARRAY,
+            JsonEachKind::Object => crate::pipeline::naming::INTERNAL_JSON_EACH_OBJECT,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Builder<Unprojected> — accumulation phase
 // ---------------------------------------------------------------------------
@@ -771,7 +791,7 @@ impl Builder<Unprojected> {
         }
     }
 
-    /// Expand a JSON array column into rows via `json_each`.
+    /// Expand a JSON column into rows via `json_each`.
     ///
     /// Wraps the current builder as a subquery, adds a `json_each(source.column)`
     /// TVF, and builds a new SELECT from caller-provided context and interior items.
@@ -780,6 +800,11 @@ impl Builder<Unprojected> {
     /// (for inductive chaining like `A.B(*).C(*)`), interior items get fresh
     /// provenance with `column` as table qualifier.
     ///
+    /// `kind` declares what the caller KNOWS it is iterating — an array it
+    /// built (narrow/drill/destructure) or a `JSON_GROUP_OBJECT` map
+    /// (metadata tree groups). SQLite's `json_each` doesn't care; dialects
+    /// with separate array/object TVFs render each internal name differently.
+    ///
     /// Callers provide two closures that receive the SQL alias strings:
     /// - `context_items_fn(source_alias)` — passthrough items from the source
     /// - `interior_items_fn(tvf_alias)` — new items extracted from the TVF
@@ -787,6 +812,7 @@ impl Builder<Unprojected> {
         self,
         column: &str,
         tvf_prefix: &str,
+        kind: JsonEachKind,
         context_items_fn: impl FnOnce(&str) -> Vec<SelectItem>,
         interior_items_fn: impl FnOnce(&str) -> Vec<SelectItem>,
         groundings: &[(String, String)],
@@ -805,7 +831,7 @@ impl Builder<Unprojected> {
         let source_table = TableExpression::subquery(source_query, &source_alias_str);
         let je_tvf = TableExpression::TVF {
             schema: None,
-            function: "json_each".to_string(),
+            function: kind.internal_fn_name().to_string(),
             arguments: vec![TvfArgument::QualifiedRef {
                 qualifier: source_alias_str.clone(),
                 column: column.to_string(),

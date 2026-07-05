@@ -20,6 +20,14 @@ pub struct ConnectionComponents {
     pub introspector: Box<dyn DatabaseIntrospector>,
     /// Database type string (for bootstrap metadata)
     pub db_type: String,
+    /// How DelightQL reaches the resource: "in-process" | "fatboy" | "siso"
+    /// (URI-DESIGN.md §4 — resource and mechanism are orthogonal facts).
+    pub mechanism: String,
+    /// What the resource asserts about itself, obtained at connect —
+    /// method-prefixed so comparisons never cross tiers:
+    /// `pg-system-id:<cluster id>`, `realpath:<canonical path>`. None when
+    /// the resource asserts nothing reachable (`:memory:`, siso pipes).
+    pub identity: Option<String>,
 }
 
 /// Factory that creates database connections from URIs.

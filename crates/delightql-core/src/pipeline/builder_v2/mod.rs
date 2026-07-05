@@ -766,8 +766,14 @@ impl ExpectedError {
         if self.uri_segments.is_empty() {
             return true;
         }
+        // Annotations carry the bare hierarchy (the sigil declares the
+        // kind); minted identities carry the badge scheme. Strip it so
+        // `(~error://semantic ~)` matches `delightql-error://semantic/…`.
+        let actual = actual_uri
+            .strip_prefix(delightql_types::error::ERROR_URI_SCHEME)
+            .unwrap_or(actual_uri);
         let expected = self.uri_segments.join("/");
-        actual_uri == expected || actual_uri.starts_with(&format!("{}/", expected))
+        actual == expected || actual.starts_with(&format!("{}/", expected))
     }
 
     /// Format the expected URI for display.

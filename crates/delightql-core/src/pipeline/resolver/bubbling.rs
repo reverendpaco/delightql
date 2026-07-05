@@ -177,6 +177,33 @@ impl AstTransform<Unresolved, Unresolved> for BubbleCollector<'_> {
             | ast_unresolved::FunctionExpression::Array { .. }
             | ast_unresolved::FunctionExpression::MetadataTreeGroup { .. } => Ok(func),
 
+            // cast:(x, integer): arg[1] is a TYPE ATOM, not a column — walk
+            // only arg[0] so `integer` is never recorded as a dependency.
+            // (The resolver's transform_function validates the atom.)
+            ast_unresolved::FunctionExpression::Regular {
+                name,
+                namespace,
+                arguments,
+                alias,
+                conditioned_on,
+            } if namespace.is_none() && name.as_ref() == "cast" => {
+                // Walk only arg[0]; later args are never columns. Wrong
+                // arity still reaches the resolver's teaching error.
+                let mut args = arguments.into_iter();
+                let mut walked = Vec::new();
+                if let Some(value) = args.next() {
+                    walked.push(self.transform_domain(value)?);
+                }
+                walked.extend(args);
+                Ok(ast_unresolved::FunctionExpression::Regular {
+                    name,
+                    namespace,
+                    arguments: walked,
+                    alias,
+                    conditioned_on,
+                })
+            }
+
             // Everything else: delegate to the walk
             other => walk_transform_function(self, other),
         }

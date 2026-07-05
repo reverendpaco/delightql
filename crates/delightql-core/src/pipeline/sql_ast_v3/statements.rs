@@ -113,7 +113,18 @@ impl Cte {
         &self.query
     }
 
+    pub fn query_mut(&mut self) -> &mut QueryExpression {
+        &mut self.query
+    }
+
     pub fn is_recursive(&self) -> bool {
         self.is_recursive
+    }
+
+    /// Mark this CTE recursive. Used by the lowering pass, which detects
+    /// self-reference structurally (a CTE body referencing its own name)
+    /// regardless of which upstream path built the Cte.
+    pub fn set_recursive(&mut self, recursive: bool) {
+        self.is_recursive = recursive;
     }
 }

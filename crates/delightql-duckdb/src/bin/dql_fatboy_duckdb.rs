@@ -52,7 +52,7 @@ fn serve_stdio(database: &str) {
                     &mut writer,
                     &ServerMessage::Data(ServerTerm::Error {
                         kind: ErrorKind::Connection,
-                        identity: b"dql/target/duckdb/connect".to_vec(),
+                        identity: b"delightql-error://target/duckdb/connect".to_vec(),
                         message: format!("cannot open duckdb database: {e}").into_bytes(),
                     }),
                 );

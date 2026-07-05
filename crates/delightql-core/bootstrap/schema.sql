@@ -45,13 +45,26 @@ CREATE TABLE connection_type_enum (
 
 -- Connection: Represents a physical database connection
 -- Multiple cartridges can share the same connection_id, enabling cross-schema queries
+--
+-- Three orthogonal facts (URI-DESIGN.md §4), not one overloaded string:
+--   resource_uri — WHAT the user named (worldly spelling; the literal
+--                  label 'session:primary' for the pre-mount placeholder)
+--   mechanism    — HOW DelightQL reaches it (in-process | fatboy | siso | attach)
+--   identity     — what the resource ASSERTS about itself, obtained at
+--                  connect, method-prefixed (pg-system-id:…, realpath:…).
+-- Identity is the unique key when present; resource/mechanism need not be
+-- unique (two spellings may reach one server — identity catches that).
 CREATE TABLE connection (
     id INTEGER PRIMARY KEY,
-    connection_uri TEXT NOT NULL UNIQUE,
+    resource_uri TEXT NOT NULL,
+    mechanism TEXT NOT NULL DEFAULT 'in-process',
+    identity TEXT,
     connection_type INTEGER NOT NULL,
     description TEXT,
     FOREIGN KEY (connection_type) REFERENCES connection_type_enum(id)
 );
+CREATE UNIQUE INDEX connection_identity_uq ON connection(identity)
+    WHERE identity IS NOT NULL;
 
 -- ============================================================================
 -- CARTRIDGE TABLES (Cartridge metadata and source management)
@@ -370,3 +383,142 @@ BEGIN
     DELETE FROM compilation
     WHERE id <= (SELECT MAX(id) - 1000 FROM compilation);
 END;
+
+-- ============================================================================
+-- TARGETING RULE TABLES (sys::targeting)
+-- ============================================================================
+-- Data-driven multi-target transpilation rules (ALL-SQL-TARGETING-DESIGN.md §4).
+-- SQLite is the canonical baseline and needs NO rows here; these tables carry
+-- only per-dialect DELTAS from canonical (DESIGN §7.10 — defaults stay in
+-- code, tables are the patch layer). Rules key on dialect FAMILY (the
+-- language.dialect spelling: 'postgres', 'mysql', 'sqlserver', 'duckdb') plus
+-- an optional version range — versions are additive rows, never a
+-- dialect×version cross product (DESIGN §5).
+-- Consumed per-compile via pipeline::dialect_pack (DESIGN §7.11); loaded as a
+-- universal dialect-pack cartridge. DQL-queryable registration under a
+-- sys::targeting namespace lands with the system-table plumbing item
+-- (ALL-SQL-TARGETING-PLAN.md §1 Track B).
+
+-- Per-form lowering rules (Axis A). form_type = entity_type_enum (the form
+-- taxonomy); entity_id NULL = form-wide dialect default, set = per-functor
+-- override. Precedence: entity+form+dialect → form+dialect → canonical code.
+CREATE TABLE dialect_form_rule (
+    form_type    INTEGER NOT NULL,
+    dialect      TEXT NOT NULL,
+    entity_id    INTEGER,
+    rule_kind    TEXT NOT NULL,      -- 'template' | 'rust_handler' (v1); 'lua'/'mustache' reserved
+    body         TEXT NOT NULL,
+    min_version  TEXT,
+    max_version  TEXT,
+    FOREIGN KEY (form_type) REFERENCES entity_type_enum(id),
+    FOREIGN KEY (entity_id) REFERENCES entity(id)
+);
+
+-- Per-dialect spelling of leaves (Axis B): operators, literals, keywords, SQL
+-- builtin functions. Form-independent, node-local. render_key is NAME-BASED —
+-- no arity (DESIGN §7.8): variadic fns take one '{*}' template; arity
+-- overloads (max/min) are form distinctions, not render splits.
+CREATE TABLE dialect_render (
+    dialect      TEXT NOT NULL,
+    render_key   TEXT NOT NULL,      -- 'op.not_equal', 'lit.bool_true', 'ident.quoted', 'fn.json_extract'
+    rule_kind    TEXT NOT NULL,      -- 'template' | 'rust_handler' (v1); 'lua'/'mustache' reserved
+    body         TEXT NOT NULL,      -- '<>' | 'TRUE' | '[{0}]' | '{0} ->> {1}'
+    min_version  TEXT,
+    max_version  TEXT,
+    PRIMARY KEY (dialect, render_key, min_version)
+);
+
+-- Capability gates AND clause strategies (the §2.C stratum). value is TEXT,
+-- not boolean: pure gates use 'true'/'false'; clause strategies use an enum
+-- value the skeleton-assembly code branches on ('limit_style' = 'suffix' |
+-- 'top_prefix' | 'fetch_first' | 'rownum_subquery').
+CREATE TABLE dialect_capability (
+    dialect      TEXT NOT NULL,
+    capability   TEXT NOT NULL,
+    value        TEXT NOT NULL,
+    min_version  TEXT,
+    max_version  TEXT,
+    PRIMARY KEY (dialect, capability, min_version)
+);
+
+-- ----------------------------------------------------------------------------
+-- Seed rows: the M1 generator deltas (previously `match dialect` arms in
+-- generator_v3/{operators,literals,identifiers}.rs). Canonical (SQLite)
+-- spellings stay in code: != , || , 1/0 booleans, "..." quoting.
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres',  'lit.bool_true',   'template', 'TRUE'),
+    ('postgres',  'lit.bool_false',  'template', 'FALSE'),
+    ('mysql',     'op.not_equal',    'template', '<>'),
+    ('mysql',     'op.concatenate',  'template', 'CONCAT'),
+    ('mysql',     'ident.quoted',    'template', '`{0}`'),
+    ('sqlserver', 'op.not_equal',    'template', '<>'),
+    ('sqlserver', 'op.concatenate',  'template', '+'),
+    ('sqlserver', 'lit.bool_true',   'template', 'TRUE'),
+    ('sqlserver', 'lit.bool_false',  'template', 'FALSE'),
+    ('sqlserver', 'ident.quoted',    'template', '[{0}]');
+
+-- ----------------------------------------------------------------------------
+-- Seed rows: the json/agg function family — the registry's first measured
+-- tenant (ALL-SQL-TARGETING-PLAN.md §2: PG 264 / DuckDB 183 failing pairs).
+-- fn.* body shapes: a bare NAME renames the call (shape and DISTINCT kept);
+-- a body containing '{' is a full positional template over rendered args.
+-- Deliberately NOT seeded (need `rust_handler` rules, not templates):
+--   postgres fn.json_extract  — '$.a.b' path literal must be transformed,
+--     not substituted;
+--   fn.group_concat           — 1-arg form needs a default separator arg
+--     (string_agg is 2-ary); a name-keyed template cannot add an argument.
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'fn.json_object',       'template', 'json_build_object({*})'),
+    ('postgres', 'fn.json_array',        'template', 'json_build_array'),
+    ('postgres', 'fn.json_group_object', 'template', 'json_object_agg'),
+    ('duckdb',   'fn.json_extract',      'template', 'json_extract_string');
+
+-- ----------------------------------------------------------------------------
+-- Seed rows: rust_handler rules — renders a positional template cannot
+-- express (DESIGN §4.4). Bodies name compiled handlers in
+-- pipeline/dialect_pack.rs (rust_render_handler).
+--   pg json paths: '$.a.b' literal is TRANSFORMED to '{a,b}';
+--     fn.json_extract (user scalar read) -> #>> (text flavor);
+--     fn.__dql_json_extract_raw (native-json provenance) -> #> (stays json).
+--   pg group_concat: 1-arg form SYNTHESIZES the implicit ',' separator
+--     (string_agg is 2-ary) + ::text coercion.
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'fn.json_extract',            'rust_handler', 'pg_json_path_text'),
+    ('postgres', 'fn.__dql_json_extract_raw',  'rust_handler', 'pg_json_path_jsonb'),
+    ('postgres', 'fn.group_concat',            'rust_handler', 'pg_group_concat');
+
+-- ----------------------------------------------------------------------------
+-- Seed rows: TVF spellings (`tvf.*`). Same contract as `fn.*`: internal
+-- `__dql_*` names key under their own render key and spell canonically
+-- (json_each) on a lookup miss, so sqlite/duckdb rows are unnecessary.
+--   pg __dql_json_each_array: sqlite's json_each is polymorphic
+--     (object|array), pg's is object-only — the array-provenance sites
+--     (melt packets, narrow/drill/destructure) become a LATERAL derived
+--     table over jsonb_array_elements. WITH ORDINALITY - 1 reproduces
+--     sqlite's 0-based `key`; the template renders the whole FROM item,
+--     code appends the alias. Works in both join shapes: after LEFT/CROSS
+--     JOIN, and comma-joined (LATERAL grants the preceding-item reference
+--     either way). (ALL-SQL-TARGETING-PLAN.md §2, json_each inventory.)
+-- ----------------------------------------------------------------------------
+--   pg __dql_json_each_object: the metadata-tree-group sites iterate a
+--     JSON_GROUP_OBJECT map — pg's jsonb_each is object-each exactly, and
+--     its natural output columns are already (key, value), so the plain
+--     call form suffices (function-call FROM items are implicitly LATERAL).
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'tvf.__dql_json_each_array', 'template',
+     'LATERAL (SELECT e.ordinality - 1 AS key, e.value AS value FROM jsonb_array_elements(CAST({0} AS jsonb)) WITH ORDINALITY AS e)'),
+    ('postgres', 'tvf.__dql_json_each_object', 'template',
+     'jsonb_each(CAST({0} AS jsonb))');
+
+-- ----------------------------------------------------------------------------
+-- Seed rows: cast type-name spellings (`type.*`). Canonical = the uppercased
+-- DQL type word (INTEGER/REAL/TEXT/NUMERIC/BOOLEAN); rows carry only deltas.
+-- SQLite REAL is an 8-byte float, so the faithful spelling is DOUBLE
+-- PRECISION on postgres and DOUBLE on duckdb (their REAL is 4-byte).
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'type.real', 'template', 'DOUBLE PRECISION'),
+    ('duckdb',   'type.real', 'template', 'DOUBLE');

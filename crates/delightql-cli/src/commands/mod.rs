@@ -9,6 +9,7 @@
 
 pub mod csvstruct;
 pub mod delegate;
+pub mod explain;
 pub mod filemunge;
 pub mod format;
 pub mod jstruct;

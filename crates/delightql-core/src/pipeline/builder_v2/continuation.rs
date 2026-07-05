@@ -838,6 +838,20 @@ fn extract_danger_from_annotation(
         danger_ann.raw_node().end_byte(),
     ));
 
+    // Canonicalize (annotation carries the bare hierarchy) and validate
+    // against the known-gate registry — unknown gates fail LOUD.
+    let uri = crate::pipeline::danger_gates::canonical_danger_uri(&uri);
+    if crate::pipeline::danger_gates::known_danger_hierarchies()
+        .iter()
+        .all(|known| uri != crate::pipeline::danger_gates::canonical_danger_uri(known))
+    {
+        return Err(DelightQLError::parse_error(format!(
+            "Unknown danger gate '{}'. Known gates: {}",
+            uri.trim_start_matches(crate::pipeline::danger_gates::DANGER_URI_SCHEME),
+            crate::pipeline::danger_gates::known_danger_hierarchies().join(", ")
+        )));
+    }
+
     Ok(Some(crate::pipeline::asts::core::DangerSpec {
         uri,
         state,
@@ -889,6 +903,20 @@ fn extract_option_from_annotation(
         option_ann.raw_node().start_byte(),
         option_ann.raw_node().end_byte(),
     ));
+
+    // Canonicalize (annotation carries the bare hierarchy) and validate
+    // against the known-config registry — unknown configs fail LOUD.
+    let uri = crate::pipeline::option_map::canonical_config_uri(&uri);
+    if crate::pipeline::option_map::known_config_hierarchies()
+        .iter()
+        .all(|known| uri != crate::pipeline::option_map::canonical_config_uri(known))
+    {
+        return Err(DelightQLError::parse_error(format!(
+            "Unknown config '{}'. Known configs: {}",
+            uri.trim_start_matches(crate::pipeline::option_map::CONFIG_URI_SCHEME),
+            crate::pipeline::option_map::known_config_hierarchies().join(", ")
+        )));
+    }
 
     Ok(Some(crate::pipeline::asts::core::OptionSpec {
         uri,

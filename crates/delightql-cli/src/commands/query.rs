@@ -13,9 +13,10 @@ use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 
 fn check_database_exists(db_path: &str, make_new_db_if_missing: bool) -> Result<()> {
-    // URI schemes are not files; their reachability is checked by their
-    // own connection paths (fail-closed at connect).
-    if db_path.starts_with("pipe://") || db_path.starts_with("fatboy://") {
+    // URI schemes are not files; their reachability (or refusal, for
+    // unsupported schemes) is handled by the connection path — never by
+    // file existence, and never by --make-new-db-if-missing.
+    if connection::looks_like_uri(db_path) {
         return Ok(());
     }
     if !make_new_db_if_missing && !Path::new(db_path).exists() {
@@ -30,10 +31,11 @@ fn check_database_exists(db_path: &str, make_new_db_if_missing: bool) -> Result<
 fn make_connection(
     db_path: &Option<String>,
     make_new_db_if_missing: bool,
+    via: Option<&str>,
 ) -> Result<connection::ConnectionManager> {
     if let Some(ref path) = db_path {
         check_database_exists(path, make_new_db_if_missing)?;
-        connection::ConnectionManager::new_file(path)
+        connection::ConnectionManager::open(path, via)
     } else {
         connection::ConnectionManager::new_memory()
     }
@@ -110,7 +112,7 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         anyhow::bail!("--consult flag not supported. Use consult!() in DQL source instead.");
     }
 
-    let conn = make_connection(&db_path, *make_new_db_if_missing)?;
+    let conn = make_connection(&db_path, *make_new_db_if_missing, base_args.via.as_deref())?;
     let mut handle = conn.open_handle()?;
 
     // mount! the user database as "main" (if specified)

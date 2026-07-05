@@ -235,12 +235,15 @@ fn select_items_from_cpr_schema(
 /// Build a `json_each(source.column) AS alias` table-valued function expression.
 ///
 /// Used by both `r_lower_melt_join` and `build_json_each_query` — the shared
-/// pattern for expanding a JSON array column into rows.
+/// pattern for expanding a JSON array column into rows. The column is always
+/// an array the transformer built (a melt packet), so the TVF carries the
+/// array-provenance internal name — spelled `json_each` canonically, but
+/// respellable per-dialect where each-over-array needs a different form.
 fn json_each_tvf(source_alias: &str, column: &str, tvf_alias: &str) -> TableExpression {
     use crate::pipeline::sql_ast_v3::TvfArgument;
     TableExpression::TVF {
         schema: None,
-        function: "json_each".to_string(),
+        function: crate::pipeline::naming::INTERNAL_JSON_EACH_ARRAY.to_string(),
         arguments: vec![TvfArgument::QualifiedRef {
             qualifier: source_alias.to_string(),
             column: column.to_string(),
@@ -937,12 +940,84 @@ pub(super) fn cte_cpr_columns(expr: &ast_addressed::RelationalExpression) -> Vec
     cols
 }
 
+/// RECURSION-CONTRACT.md B2 — argumentative binding on the recursive
+/// self-reference (`c(m)` inside c's own definition) does not bind today:
+/// the rename mis-merges into a NULL-padded two-column union and returns
+/// SILENTLY WRONG results. Hard-refuse until the rename-hoist legalization
+/// (`WITH c(m) AS (…)` — needs the Cte column list) lands. Checked here,
+/// at the one site that lowers every CTE binding, with its own walk — the
+/// upstream is_recursive flag is not trusted (it historically never
+/// engaged).
+fn check_recursive_argumentative_binding(binding: &ast_addressed::CteBinding) -> Result<()> {
+    if expr_has_positional_self_ref(&binding.expression, &binding.name) {
+        return Err(DelightQLError::ValidationError {
+            message: format!(
+                "the recursive reference to '{name}' uses argumentative binding \
+                 ('{name}(…)') — renames and constraints on the self-reference \
+                 do not bind inside a recursive definition yet. Use glob binding \
+                 '{name}(*)' and rename or filter in a pipe stage. \
+                 RECURSION-CONTRACT.md B2.",
+                name = binding.name,
+            ),
+            context: "transformer::lower_cte_binding".to_string(),
+            subcategory: Some("recursion/argumentative_binding"),
+        });
+    }
+    Ok(())
+}
+
+#[stacksafe::stacksafe]
+fn expr_has_positional_self_ref(
+    expr: &ast_addressed::RelationalExpression,
+    name: &str,
+) -> bool {
+    use ast_addressed::RelationalExpression as E;
+    match expr {
+        E::Relation(rel) => relation_is_positional_self_ref(rel, name),
+        E::Join { left, right, .. } => {
+            expr_has_positional_self_ref(left, name) || expr_has_positional_self_ref(right, name)
+        }
+        E::Filter { source, .. } => expr_has_positional_self_ref(source, name),
+        E::Pipe(pipe) => expr_has_positional_self_ref(&pipe.source, name),
+        E::SetOperation { operands, .. } | E::IntersectCorresponding { operands, .. } => operands
+            .iter()
+            .any(|op| expr_has_positional_self_ref(op, name)),
+        E::ErJoinChain { .. } | E::ErTransitiveJoin { .. } => false,
+    }
+}
+
+fn relation_is_positional_self_ref(rel: &ast_addressed::Relation, name: &str) -> bool {
+    match rel {
+        ast_addressed::Relation::Ground {
+            identifier,
+            domain_spec,
+            ..
+        } => {
+            identifier.name == delightql_types::SqlIdentifier::new(name)
+                && matches!(domain_spec, ast_addressed::DomainSpec::Positional(_))
+        }
+        ast_addressed::Relation::InnerRelation { pattern, .. } => {
+            use ast_addressed::InnerRelationPattern as P;
+            match pattern {
+                P::Indeterminate { subquery, .. }
+                | P::UncorrelatedDerivedTable { subquery, .. }
+                | P::CorrelatedScalarJoin { subquery, .. }
+                | P::CorrelatedGroupJoin { subquery, .. } => {
+                    expr_has_positional_self_ref(subquery, name)
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Lower a single CTE binding to a SQL CTE, reconciling body columns with CprSchema.
 pub(super) fn lower_cte_binding(
     binding: ast_addressed::CteBinding,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<crate::pipeline::sql_ast_v3::Cte> {
+    check_recursive_argumentative_binding(&binding)?;
     let cte_cpr = cte_cpr_columns(&binding.expression);
     let inner_builder = super::descend::descend_as_final(binding.expression, names, ctx)?;
     let cte_query = if cte_cpr.is_empty() {
@@ -2764,8 +2839,12 @@ fn build_pivot_outer_select(
                         .cloned()
                         .unwrap_or_else(|| pivot_value.to_lowercase());
                     let path = format!("$.{}.{}", pivot_value, val_name);
+                    // Provenance: compiler-internal packet read — the value
+                    // came from a typed column and may be compared
+                    // numerically downstream, so it must stay NATIVE json
+                    // (never a per-dialect *_string respell).
                     let extract = SqlDomainExpr::function(
-                        "json_extract",
+                        crate::pipeline::naming::INTERNAL_JSON_EXTRACT_RAW,
                         vec![
                             SqlDomainExpr::column(&packet_aliases[group_idx]),
                             SqlDomainExpr::literal(LiteralValue::String(path)),
@@ -3255,6 +3334,7 @@ pub(super) fn r_lower_narrowing_destructure(
     builder.expand_with_json_each(
         &column,
         "_narrow",
+        super::builder::JsonEachKind::Array,
         |_source_alias| vec![], // no context columns
         |tvf_alias| {
             let vref = SqlDomainExpr::with_qualifier(ColumnQualifier::table(tvf_alias), "value");
@@ -3349,6 +3429,7 @@ fn r_lower_interior_drill_down(
     builder.expand_with_json_each(
         &column,
         "_drill",
+        super::builder::JsonEachKind::Array,
         |source_alias| {
             let sq = ColumnQualifier::table(source_alias);
             context_col_names
@@ -3488,6 +3569,7 @@ fn lower_destructure_pattern(
                 .expand_with_json_each(
                     &temp_col,
                     "_je",
+                    super::builder::JsonEachKind::Object,
                     |source_alias| {
                         let sq = ColumnQualifier::table(source_alias);
                         context_cols
@@ -3592,14 +3674,14 @@ fn lower_destructure_pattern(
                 .collect();
             proj.extend(base_items);
             for (key, _) in &explosions {
-                proj.push(make_json_extract_item(
+                proj.push(make_json_extract_raw_item(
                     source,
                     &format!(".{}", key),
                     &format!("_nested_{}", key),
                 ));
             }
             for (key, _) in &nested_navigations {
-                proj.push(make_json_extract_item(
+                proj.push(make_json_extract_raw_item(
                     source,
                     &format!(".{}", key),
                     &format!("_nav_{}", key),
@@ -3684,6 +3766,7 @@ fn lower_with_json_each(
             .expand_with_json_each(
                 col_name_str,
                 "_je",
+                super::builder::JsonEachKind::Object,
                 |source_alias| {
                     let sq = ColumnQualifier::table(source_alias);
                     context_cols
@@ -3726,6 +3809,7 @@ fn lower_with_json_each(
         .expand_with_json_each(
             col_name_str,
             "_destr",
+            super::builder::JsonEachKind::Array,
             |source_alias| {
                 let sq = ColumnQualifier::table(source_alias);
                 context_cols
@@ -3809,6 +3893,32 @@ fn make_json_extract_item(
     json_path: &str,
     alias: &str,
 ) -> crate::pipeline::sql_ast_v3::SelectItem {
+    make_json_extract_item_named(source, json_path, alias, "json_extract")
+}
+
+/// Like [`make_json_extract_item`] but the extraction must stay NATIVE json
+/// (never a per-dialect *_string respell): the temp column is fed straight
+/// into `json_each`/recursive navigation, which breaks on a stringified
+/// subtree.
+fn make_json_extract_raw_item(
+    source: &crate::pipeline::sql_ast_v3::DomainExpression,
+    json_path: &str,
+    alias: &str,
+) -> crate::pipeline::sql_ast_v3::SelectItem {
+    make_json_extract_item_named(
+        source,
+        json_path,
+        alias,
+        crate::pipeline::naming::INTERNAL_JSON_EXTRACT_RAW,
+    )
+}
+
+fn make_json_extract_item_named(
+    source: &crate::pipeline::sql_ast_v3::DomainExpression,
+    json_path: &str,
+    alias: &str,
+    fn_name: &str,
+) -> crate::pipeline::sql_ast_v3::SelectItem {
     use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
 
     let full_path = if json_path.starts_with('[') || json_path.starts_with('.') {
@@ -3819,7 +3929,7 @@ fn make_json_extract_item(
 
     SelectItem::expression_with_alias(
         SqlDomainExpr::function(
-            "json_extract",
+            fn_name,
             vec![
                 source.clone(),
                 SqlDomainExpr::literal(ast_addressed::LiteralValue::String(full_path)),

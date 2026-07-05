@@ -63,11 +63,20 @@ impl delightql_types::ConnectionFactory for CabiConnectionFactory {
         let connection: Arc<Mutex<dyn delightql_types::DatabaseConnection>> =
             Arc::new(Mutex::new(adapter));
 
+        let identity = arc
+            .lock()
+            .ok()
+            .and_then(|c| c.path().map(|p| p.to_string()))
+            .filter(|p| !p.is_empty())
+            .and_then(|p| std::fs::canonicalize(&p).ok())
+            .map(|abs| format!("realpath:{}", abs.display()));
         Ok(delightql_types::ConnectionComponents {
             connection,
             schema,
             introspector,
             db_type: "sqlite".to_string(),
+            mechanism: "in-process".to_string(),
+            identity,
         })
     }
 }

@@ -38,12 +38,12 @@ pub struct PipeConnectionManager {
 impl PipeConnectionManager {
     /// Create a new pipe connection manager from a URI.
     ///
-    /// URI format: `pipe://profile_name` or `pipe://profile_name/target`
+    /// URI format: `delightql-siso://profile` or `delightql-siso://profile/target`
     ///
     /// Eagerly spawns the coprocess at construction time.
     pub fn from_uri(uri: &str) -> Result<Self> {
         let rest = uri
-            .strip_prefix("pipe://")
+            .strip_prefix("delightql-siso://")
             .ok_or_else(|| PipeError::QueryFailed(format!("Invalid pipe URI: {}", uri)))?;
 
         let (profile_name, target) = match rest.split_once('/') {

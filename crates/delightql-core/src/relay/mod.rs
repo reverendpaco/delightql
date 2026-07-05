@@ -133,7 +133,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 // Multi-query input must be sent as separate Query terms by the client.
                 return ServerTerm::Error {
                     kind: ErrorKind::Syntax,
-                    identity: b"dql/parse/multi_query".to_vec(),
+                    identity: b"delightql-error://parse/multi_query".to_vec(),
                     message: format!(
                         "multi-query input rejected: found {} queries in a single Query term \
                          (send each query as a separate Query message)",
@@ -240,7 +240,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     if !passed {
                         return ServerTerm::Error {
                             kind: ErrorKind::Permission,
-                            identity: b"dql/runtime/assertion".to_vec(),
+                            identity: b"delightql-error://runtime/assertion".to_vec(),
                             message: format!(
                                 "Assertion {} failed\n  SQL: {}",
                                 i + 1,
@@ -253,7 +253,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 Err(msg) => {
                     return ServerTerm::Error {
                         kind: ErrorKind::Permission,
-                        identity: b"dql/runtime/assertion".to_vec(),
+                        identity: b"delightql-error://runtime/assertion".to_vec(),
                         message: format!("Assertion {} execution error: {}", i + 1, msg)
                             .into_bytes(),
                     };
@@ -404,7 +404,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 SingleQueryOutcome::PendingRuntimeErrorHook { compiled, expected } => {
                     match self.execute_sql_routed(&compiled.primary_sql, compiled.connection_id) {
                         Err(e) => {
-                            let actual_uri = "dql/runtime/bug";
+                            let actual_uri = "delightql-error://runtime/bug";
                             let v = verdict::Verdict {
                                 outcome: if expected.matches(actual_uri) {
                                     verdict::VerdictOutcome::Pass
@@ -448,7 +448,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                             .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
                                             .unwrap_or(false);
                                         if !passed {
-                                            let actual_uri = "dql/runtime/assertion";
+                                            let actual_uri = "delightql-error://runtime/assertion";
                                             let v = verdict::Verdict {
                                                 outcome: if expected.matches(actual_uri) {
                                                     verdict::VerdictOutcome::Pass
@@ -487,7 +487,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     Err(msg) => {
                                         return ServerTerm::Error {
                                             kind: ErrorKind::Permission,
-                                            identity: b"dql/runtime/assertion".to_vec(),
+                                            identity: b"delightql-error://runtime/assertion".to_vec(),
                                             message: format!("Assertion execution error: {}", msg)
                                                 .into_bytes(),
                                         };
@@ -570,7 +570,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 if !passed {
                                     return ServerTerm::Error {
                                         kind: ErrorKind::Permission,
-                                        identity: b"dql/runtime/assertion".to_vec(),
+                                        identity: b"delightql-error://runtime/assertion".to_vec(),
                                         message: format!(
                                             "Assertion {} failed\n  SQL: {}",
                                             i + 1,
@@ -583,7 +583,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                             Err(msg) => {
                                 return ServerTerm::Error {
                                     kind: ErrorKind::Permission,
-                                    identity: b"dql/runtime/assertion".to_vec(),
+                                    identity: b"delightql-error://runtime/assertion".to_vec(),
                                     message: format!(
                                         "Assertion {} execution error: {}",
                                         i + 1,
@@ -763,16 +763,13 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         };
 
         // Compilation succeeded. Check if we expect a runtime error.
+        // Hooks carry the bare hierarchy (kind declared by the sigil):
+        // a first segment of "runtime" marks a runtime-error hook.
         let expects_runtime = expected
             .uri_segments
             .first()
-            .map(|s| s == "dql")
-            .unwrap_or(false)
-            && expected
-                .uri_segments
-                .get(1)
-                .map(|s| s == "runtime")
-                .unwrap_or(false);
+            .map(|s| s == "runtime")
+            .unwrap_or(false);
 
         if !expects_runtime {
             // Expected a compile error but query compiled successfully
@@ -802,7 +799,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         match self.execute_sql_routed(&primary_sql, connection_id) {
             Err(e) => {
                 // SQL execution failed — match against expected
-                let actual_uri = "dql/runtime/bug";
+                let actual_uri = "delightql-error://runtime/bug";
                 let v = verdict::Verdict {
                     outcome: if expected.matches(actual_uri) {
                         verdict::VerdictOutcome::Pass
@@ -829,7 +826,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
                                 .unwrap_or(false);
                             if !passed {
-                                let actual_uri = "dql/runtime/assertion";
+                                let actual_uri = "delightql-error://runtime/assertion";
                                 let v = verdict::Verdict {
                                     outcome: if expected.matches(actual_uri) {
                                         verdict::VerdictOutcome::Pass
@@ -849,7 +846,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         Err(msg) => {
                             return ServerTerm::Error {
                                 kind: ErrorKind::Permission,
-                                identity: b"dql/runtime/assertion".to_vec(),
+                                identity: b"delightql-error://runtime/assertion".to_vec(),
                                 message: format!("Assertion execution error: {}", msg).into_bytes(),
                             };
                         }

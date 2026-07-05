@@ -75,5 +75,9 @@ pub(crate) fn create_pipe_system_components(
         connection: conn_arc,
         introspector: Box::new(introspector),
         db_type: "sqlite".to_string(),
+        mechanism: "siso".to_string(),
+        // The siso channel is deliberately thin (and error-blind) — the
+        // resource asserts nothing through it.
+        identity: None,
     })
 }

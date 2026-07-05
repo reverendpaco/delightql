@@ -56,6 +56,15 @@ impl SourceType {
         self as i32
     }
 
+    /// Parse from integer (for reading from database)
+    pub fn from_i32(value: i32) -> Result<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|v| v.as_i32() == value)
+            .ok_or_else(|| anyhow!("Invalid source_type_enum value: {}", value))
+    }
+
     /// Get variant name for database
     pub fn variant_name(self) -> &'static str {
         match self {
@@ -113,6 +122,15 @@ impl Language {
     /// Convert to integer for database storage
     pub fn as_i32(self) -> i32 {
         self as i32
+    }
+
+    /// Parse from integer (for reading from database)
+    pub fn from_i32(value: i32) -> Result<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|v| v.as_i32() == value)
+            .ok_or_else(|| anyhow!("Invalid language value: {}", value))
     }
 
     /// Get base language name
@@ -372,6 +390,15 @@ impl ConnectionType {
     /// Convert to integer for database storage
     pub fn as_i32(self) -> i32 {
         self as i32
+    }
+
+    /// Parse from integer (for reading from database)
+    pub fn from_i32(value: i32) -> Result<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|v| v.as_i32() == value)
+            .ok_or_else(|| anyhow!("Invalid connection_type_enum value: {}", value))
     }
 
     /// Get variant name for database

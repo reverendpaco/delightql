@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+pub mod uri_registry;
 pub mod api;
 pub(crate) mod bin_cartridge;
 pub(crate) mod ddl;

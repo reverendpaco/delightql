@@ -9,7 +9,7 @@
 //! is the protocol's "spoken identically on both sides" claim made
 //! a type-level fact.
 //!
-//! Step 2 (ALL-SQL-TARGETING-FATBOY.md): the query path.
+//! Step 2 (ALL-SQL-TARGETING-STATE.md): the query path.
 //!
 //! ## Text-mode execution (the parity decision)
 //!
@@ -61,8 +61,8 @@ use postgres::{Client, NoTls, SimpleQueryMessage};
 
 /// Identity URI namespace for this adapter's own errors. Foreign-engine
 /// SQLSTATEs get their full identity mapping in step 8.
-const IDENT_UNIMPLEMENTED: &str = "dql/target/postgres/unimplemented";
-const IDENT_PG_ERROR: &str = "dql/target/postgres/error";
+const IDENT_UNIMPLEMENTED: &str = "delightql-error://target/postgres/unimplemented";
+const IDENT_PG_ERROR: &str = "delightql-error://target/postgres/error";
 
 struct ResultState {
     columns: Vec<String>,
@@ -92,6 +92,18 @@ impl PgParty {
     pub fn connect(conninfo: &str) -> Result<Self, postgres::Error> {
         Ok(Self {
             client: Client::connect(conninfo, NoTls)?,
+            handles: HashMap::new(),
+            loads: HashMap::new(),
+            next_handle_id: 1,
+        })
+    }
+
+    /// Connect from a prepared `Config` (the fatboy binary env-completes
+    /// URL conninfo — host/port/user/dbname from PG* variables — because
+    /// rust-postgres, unlike libpq, reads no environment itself).
+    pub fn connect_config(config: &postgres::Config) -> Result<Self, postgres::Error> {
+        Ok(Self {
+            client: config.connect(NoTls)?,
             handles: HashMap::new(),
             loads: HashMap::new(),
             next_handle_id: 1,
@@ -199,7 +211,7 @@ impl PgParty {
         if orientation != Orientation::Rows {
             return error(
                 ErrorKind::Connection,
-                "dql/target/postgres/orientation",
+                "delightql-error://target/postgres/orientation",
                 b"orientation Columns not supported".to_vec(),
             );
         }
@@ -270,7 +282,7 @@ impl PgParty {
         if orientation != Orientation::Rows {
             return error(
                 ErrorKind::Connection,
-                "dql/target/postgres/orientation",
+                "delightql-error://target/postgres/orientation",
                 b"orientation Columns not supported".to_vec(),
             );
         }
@@ -350,7 +362,7 @@ fn unknown_handle() -> ServerTerm {
 
 /// SQLSTATE → identity-URI class (step 8 — relay-role question 5).
 ///
-/// Identity = `dql/target/postgres/<class>/<sqlstate>` — the class for
+/// Identity = `delightql-error://target/postgres/<class>/<sqlstate>` — the class for
 /// programmatic matching by prefix, the exact SQLSTATE as the leaf for
 /// precision (feeds E11's diagnostics catalog). Exact codes override
 /// their class where the class default would mislead.
@@ -389,12 +401,12 @@ fn pg_error(e: &postgres::Error) -> ServerTerm {
         Some(db) => {
             let code = db.code().code();
             (
-                format!("dql/target/postgres/{}/{}", sqlstate_class(code), code),
+                format!("delightql-error://target/postgres/{}/{}", sqlstate_class(code), code),
                 format!("{}: {}", code, db.message()),
             )
         }
         None => (
-            "dql/target/postgres/connection".to_string(),
+            "delightql-error://target/postgres/connection".to_string(),
             e.to_string(),
         ),
     };
@@ -425,7 +437,7 @@ impl Handler for PgParty {
                 if agreed.is_empty() {
                     error(
                         ErrorKind::Connection,
-                        "dql/target/postgres/orientation",
+                        "delightql-error://target/postgres/orientation",
                         b"no common orientation".to_vec(),
                     )
                 } else {
@@ -671,7 +683,7 @@ mod tests {
         match session.query(b("SELECT * FROM table_that_does_not_exist")).unwrap() {
             QueryResponse::Error { kind, identity, message } => {
                 assert_eq!(kind, ErrorKind::Syntax);
-                assert_eq!(identity, b("dql/target/postgres/undefined-object/42P01"));
+                assert_eq!(identity, b("delightql-error://target/postgres/undefined-object/42P01"));
                 assert!(String::from_utf8_lossy(&message).contains("table_that_does_not_exist"));
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
@@ -679,14 +691,14 @@ mod tests {
         // 42601 -> syntax (exact-code override of the 42 class).
         match session.query(b("SELECTT 1")).unwrap() {
             QueryResponse::Error { identity, .. } => {
-                assert_eq!(identity, b("dql/target/postgres/syntax/42601"));
+                assert_eq!(identity, b("delightql-error://target/postgres/syntax/42601"));
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
         }
         // 42883 undefined_function -> undefined-object class.
         match session.query(b("SELECT json_extract('{}', 'x')")).unwrap() {
             QueryResponse::Error { identity, .. } => {
-                assert_eq!(identity, b("dql/target/postgres/undefined-object/42883"));
+                assert_eq!(identity, b("delightql-error://target/postgres/undefined-object/42883"));
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
         }
@@ -854,7 +866,7 @@ mod tests {
         match session.close(load).unwrap() {
             delightql_protocol::CloseResponse::Error { identity, message, .. } => {
                 assert!(String::from_utf8_lossy(&message).contains("22P02"));
-                assert_eq!(identity, b("dql/target/postgres/type-mismatch/22P02"));
+                assert_eq!(identity, b("delightql-error://target/postgres/type-mismatch/22P02"));
             }
             delightql_protocol::CloseResponse::Ok => {
                 panic!("COPY of bad data must error at close")

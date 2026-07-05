@@ -70,6 +70,7 @@ pub mod transformer_v4; // Phase 4: AST → SQL AST (PRODUCTION)
                         // pub mod generator_v2;  // Phase 5: SQL AST v2 → SQL String (OLD - for transformer_v2 - REMOVED)
 pub mod compiled_query; // Compiled query output bundle (primary SQL + assertions + emits)
 pub mod danger_gates; // Danger gate system (named safety boundaries, OFF by default)
+pub mod dialect_pack; // Per-compile image of the dialect_* targeting tables (ALL-SQL-TARGETING-DESIGN.md)
 pub mod generator_v3; // Phase 5: SQL AST v3 → SQL String (PRODUCTION)
 pub mod naming; // Common naming utilities for consistent naming across pipeline stages
 pub mod option_map; // Option map system (strategy/preference selection)
@@ -107,7 +108,7 @@ pub(crate) struct Pipeline<'a> {
     resolution_config: resolver::ResolutionConfig,
     sql_optimization_level: sql_optimizer::OptimizationLevel,
     inline_ctes: bool,
-    dialect: generator_v3::SqlDialect,
+    dialect_override: Option<generator_v3::SqlDialect>,
     is_repl: bool, // Whether this pipeline is for REPL mode (affects parsing)
 
     // Pipeline stages (cached after execution) - PRIVATE
@@ -203,7 +204,10 @@ impl<'a> Pipeline<'a> {
             resolution_config,
             sql_optimization_level,
             inline_ctes,
-            dialect: generator_v3::SqlDialect::SQLite, // Default to SQLite
+            // Explicit override only (--dialect / DQL_DIALECT); without it
+            // the dialect derives from the routed connection at compile
+            // time (effective_dialect).
+            dialect_override: generator_v3::SqlDialect::override_from_env(),
             is_repl,
             cst: None,
             query_unresolved: None,
@@ -292,8 +296,10 @@ impl<'a> Pipeline<'a> {
                     format!(
                         "Danger '{}' cannot be overridden from the CLI. \
                          It changes language semantics and must be specified inline \
-                         in the query text: (~~danger://{}~~)",
-                        spec.uri, spec.uri
+                         in the query text: (~~danger://{} ON~~)",
+                        spec.uri,
+                        spec.uri
+                            .trim_start_matches(danger_gates::DANGER_URI_SCHEME)
                     ),
                     "set_cli_danger_overrides",
                 ));
@@ -674,6 +680,34 @@ impl<'a> Pipeline<'a> {
         Ok(self.sql_ast.as_ref().unwrap())
     }
 
+    /// Resolve the dialect pack for this compile: one read of the
+    /// `dialect_*` bootstrap tables into an in-memory map, rebuilt at the
+    /// start of each query so a mid-session pack change is picked up by
+    /// the next compile (ALL-SQL-TARGETING-DESIGN.md §7.11).
+    fn load_dialect_pack(&self) -> Result<std::sync::Arc<dialect_pack::DialectPack>> {
+        let conn = self
+            .system
+            .bootstrap_connection()
+            .lock()
+            .expect("FATAL: Failed to acquire bootstrap lock for dialect pack");
+        let pack = dialect_pack::DialectPack::load(&conn).map_err(|e| {
+            crate::error::DelightQLError::database_error(
+                format!("Failed to load dialect pack: {}", e),
+                e.to_string(),
+            )
+        })?;
+        Ok(std::sync::Arc::new(pack))
+    }
+
+    /// The dialect this compile emits: an explicit `--dialect`/`DQL_DIALECT`
+    /// override wins; otherwise the dialect of the connection the query
+    /// routes to (dialect-from-connection — a mounted or primary
+    /// postgres/duckdb connection gets target-spelled SQL automatically).
+    fn effective_dialect(&self) -> generator_v3::SqlDialect {
+        self.dialect_override
+            .unwrap_or_else(|| self.system.dialect_for_connection(self.connection_id))
+    }
+
     /// Execute full pipeline to SQL string (Phase 2: uses injected schema)
     pub fn execute_to_sql(&mut self) -> Result<&str> {
         if self.sql_string.is_some() {
@@ -684,17 +718,27 @@ impl<'a> Pipeline<'a> {
         self.execute_to_sql_ast()?;
         let sql_ast = self.sql_ast.as_ref().unwrap();
 
-        // Dialect-aware rewriting, then optimize
-        let rewritten = sql_rewriter::rewrite(sql_ast.clone(), self.dialect)?;
-        let optimized =
-            sql_optimizer::optimize(rewritten, self.sql_optimization_level).map_err(|e| {
+        // Resolve the dialect AFTER resolution: connection routing is known
+        // by now, so dialect-from-connection can fire (override wins).
+        let dialect = self.effective_dialect();
+
+        // The lowering sandwich: expand → cleanup → legalize (final word).
+        let optimized = lower_statement(sql_ast.clone(), dialect, self.sql_optimization_level)
+            .map_err(|e| {
                 self.record_delightql_error(&e);
                 e
             })?;
 
+        // Resolve the dialect pack for this compile (ALL-SQL-TARGETING-DESIGN.md
+        // §7.11): one read of the dialect_* tables, shared by every generator
+        // this compile constructs (main + assertions + emits).
+        let dialect_pack = self.load_dialect_pack()?;
+
         // Generate SQL string
-        let generator =
-            generator_v3::SqlGenerator::new().with_bin_registry(self.system.bin_registry());
+        let generator = generator_v3::SqlGenerator::new()
+            .with_dialect(dialect)
+            .with_bin_registry(self.system.bin_registry())
+            .with_dialect_pack(dialect_pack.clone());
         let sql = generator
             .generate_statement(&optimized)
             .map_err(|e| e.into_delightql_error("SQL generation error"))?;
@@ -825,17 +869,18 @@ impl<'a> Pipeline<'a> {
                     e
                 })?;
 
-                // Dialect-aware rewriting, then optimize
-                let rewritten = sql_rewriter::rewrite(sql_ast, self.dialect)?;
-                let optimized = sql_optimizer::optimize(rewritten, self.sql_optimization_level)
+                // The lowering sandwich: expand → cleanup → legalize.
+                let optimized = lower_statement(sql_ast, dialect, self.sql_optimization_level)
                     .map_err(|e| {
                         self.record_delightql_error(&e);
                         e
                     })?;
 
                 // Generate SQL string
-                let generator =
-                    generator_v3::SqlGenerator::new().with_bin_registry(bin_registry.clone());
+                let generator = generator_v3::SqlGenerator::new()
+                    .with_dialect(dialect)
+                    .with_bin_registry(bin_registry.clone())
+                    .with_dialect_pack(dialect_pack.clone());
                 let assertion_sql = generator
                     .generate_statement(&optimized)
                     .map_err(|e| e.into_delightql_error("Assertion SQL generation error"))?;
@@ -892,11 +937,12 @@ impl<'a> Pipeline<'a> {
                             danger_gates: danger_gates::DangerGateMap::with_defaults(),
                         };
                         let right_sql_ast = transformer_v4::transform(right_addressed, &right_ctx)?;
-                        let right_rewritten = sql_rewriter::rewrite(right_sql_ast, self.dialect)?;
                         let right_optimized =
-                            sql_optimizer::optimize(right_rewritten, self.sql_optimization_level)?;
+                            lower_statement(right_sql_ast, dialect, self.sql_optimization_level)?;
                         let right_generator = generator_v3::SqlGenerator::new()
-                            .with_bin_registry(bin_registry.clone());
+                            .with_dialect(dialect)
+                            .with_bin_registry(bin_registry.clone())
+                            .with_dialect_pack(dialect_pack.clone());
                         let right_sql = right_generator
                             .generate_statement(&right_optimized)
                             .map_err(|e| {
@@ -974,15 +1020,16 @@ impl<'a> Pipeline<'a> {
                     e
                 })?;
 
-                let rewritten = sql_rewriter::rewrite(sql_ast, self.dialect)?;
-                let optimized = sql_optimizer::optimize(rewritten, self.sql_optimization_level)
+                let optimized = lower_statement(sql_ast, dialect, self.sql_optimization_level)
                     .map_err(|e| {
                         self.record_delightql_error(&e);
                         e
                     })?;
 
-                let generator =
-                    generator_v3::SqlGenerator::new().with_bin_registry(bin_registry.clone());
+                let generator = generator_v3::SqlGenerator::new()
+                    .with_dialect(dialect)
+                    .with_bin_registry(bin_registry.clone())
+                    .with_dialect_pack(dialect_pack.clone());
                 let emit_sql = generator
                     .generate_statement(&optimized)
                     .map_err(|e| e.into_delightql_error("Emit SQL generation error"))?;
@@ -1048,6 +1095,21 @@ fn query_has_meta_ize(query: &ast_resolved::Query) -> bool {
     }
 }
 
+/// The lowering sandwich (ALL-SQL-TARGETING-DESIGN.md §2.D): dialect
+/// expansions, then optional cleanup, then the mandatory legalization
+/// word. Legalization runs LAST — nothing rewrites the tree after it, so
+/// "never illegal SQL" holds by construction. Every path from SQL AST to
+/// the generator must go through here.
+fn lower_statement(
+    statement: sql_ast_v3::SqlStatement,
+    dialect: generator_v3::SqlDialect,
+    level: sql_optimizer::OptimizationLevel,
+) -> Result<sql_ast_v3::SqlStatement> {
+    let expanded = sql_rewriter::rewrite(statement, dialect)?;
+    let cleaned = sql_optimizer::optimize(expanded, level)?;
+    sql_rewriter::legalize(cleaned, dialect)
+}
+
 /// Generate SQL string from a single addressed relational expression
 fn generate_sql_v3_only(ast_addressed: ast_addressed::RelationalExpression) -> Result<String> {
     let ctx = transformer_v4::TransformCtx {
@@ -1058,8 +1120,11 @@ fn generate_sql_v3_only(ast_addressed: ast_addressed::RelationalExpression) -> R
     };
     let query = ast_addressed::Query::Relational(ast_addressed);
     let sql_ast_v3 = transformer_v4::transform(query, &ctx)?;
-    let rewritten = sql_rewriter::rewrite(sql_ast_v3, generator_v3::SqlDialect::SQLite)?;
-    let optimized_sql_ast_v3 = sql_optimizer::optimize(rewritten, sql_optimizer::level_from_env())?;
+    let optimized_sql_ast_v3 = lower_statement(
+        sql_ast_v3,
+        generator_v3::SqlDialect::SQLite,
+        sql_optimizer::level_from_env(),
+    )?;
     let generator = generator_v3::SqlGenerator::new();
     generator
         .generate_statement(&optimized_sql_ast_v3)
@@ -1118,9 +1183,12 @@ fn generate_sql_with_ctes(
     };
     let statement = SqlStatement::with_ctes(with_clause, main_query);
 
-    // Step 6: Rewrite, optimize, and generate
-    let rewritten = sql_rewriter::rewrite(statement, generator_v3::SqlDialect::SQLite)?;
-    let optimized = sql_optimizer::optimize(rewritten, sql_optimizer::level_from_env())?;
+    // Step 6: Lower (expand → cleanup → legalize) and generate
+    let optimized = lower_statement(
+        statement,
+        generator_v3::SqlDialect::SQLite,
+        sql_optimizer::level_from_env(),
+    )?;
     let generator = generator_v3::SqlGenerator::new();
     generator
         .generate_statement(&optimized)

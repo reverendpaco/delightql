@@ -45,6 +45,7 @@ pub mod query;
 pub mod select_items;
 pub mod statements;
 pub mod table;
+pub mod walk;
 
 // Re-export all public types for backward compatibility
 pub use builders::SelectBuilder;

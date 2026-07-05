@@ -10,7 +10,7 @@
 //! - **Query execution**: a `RemoteHandler` over `StdioTransport` — the
 //!   engine's own protocol terms (Version included) forward verbatim to
 //!   the fatboy. This is the relay's backend-facing side running for
-//!   real (ALL-SQL-TARGETING-FATBOY.md, step 4).
+//!   real (ALL-SQL-TARGETING-STATE.md, step 4).
 //! - **Mount/introspection**: `FatboyIntrospector`/`FatboySchema` issue
 //!   catalog queries as ORDINARY relay queries (`information_schema`
 //!   SQL) — relay-role question #4's convention: catalog discovery is
@@ -170,7 +170,7 @@ impl FatboyRelay {
 }
 
 /// Render a protocol Error for CLI-mode strings, keeping the identity
-/// URI visible: `[dql/target/postgres/<class>/<sqlstate>] <message>`.
+/// URI visible: `[delightql-error://target/postgres/<class>/<sqlstate>] <message>`.
 /// (Server mode needs none of this — the relay session forwards backend
 /// Error terms verbatim, identity included.)
 fn format_protocol_error(identity: &[u8], message: &[u8]) -> String {
@@ -183,7 +183,7 @@ fn format_protocol_error(identity: &[u8], message: &[u8]) -> String {
 }
 
 /// DelightQLError for fatboy failures, with the static subcategory so
-/// the outer error URI is `dql/runtime/target/postgres` (the precise
+/// the outer error URI is `delightql-error://target/postgres` (the precise
 /// per-error identity rides in the message via format_protocol_error).
 fn fatboy_db_error(context: &str, detail: String) -> delightql_types::DelightQLError {
     delightql_types::DelightQLError::DatabaseOperationError {
@@ -200,8 +200,22 @@ fn fatboy_db_error(context: &str, detail: String) -> delightql_types::DelightQLE
 
 pub struct FatboyManager {
     pub profile: String,
+    /// Display name of the database (path, dbname, or the resource URL's
+    /// path component) — for connection_info, never for spawning.
     pub db: String,
+    /// How to (re)spawn children for this connection.
+    spawn: SpawnSpec,
     relay: FatboyRelay,
+}
+
+/// The spawn contract for a fatboy child.
+#[derive(Clone)]
+enum SpawnSpec {
+    /// `--database <name-or-path>` (duckdb files; env-completed postgres).
+    Database(String),
+    /// `--conninfo <libpq-string-or-url>` (worldly postgres:// resources —
+    /// libpq accepts its own URL format verbatim).
+    Conninfo(String),
 }
 
 impl FatboyManager {
@@ -211,11 +225,26 @@ impl FatboyManager {
     /// lifecycle, and the transport reaps the child on drop, so it cannot
     /// outlive us. Portable across Linux/macOS/Windows with no per-OS code.
     pub fn connect(profile: &str, db: &str) -> Result<Self, String> {
-        let child = spawn_fatboy_stdio(profile, db)?;
+        Self::connect_spec(profile, db.to_string(), SpawnSpec::Database(db.to_string()))
+    }
+
+    /// Connect to a worldly `postgres://` resource: the URL is handed to
+    /// libpq verbatim as the conninfo (worldly syntax, worldly semantics).
+    pub fn connect_postgres_url(url: &str, display_db: &str) -> Result<Self, String> {
+        Self::connect_spec(
+            "postgres",
+            display_db.to_string(),
+            SpawnSpec::Conninfo(url.to_string()),
+        )
+    }
+
+    fn connect_spec(profile: &str, db: String, spawn: SpawnSpec) -> Result<Self, String> {
+        let child = spawn_fatboy_stdio(profile, &spawn)?;
         let relay = FatboyRelay::from_child(child)?;
         Ok(Self {
             profile: profile.to_string(),
-            db: db.to_string(),
+            db,
+            spawn,
             relay,
         })
     }
@@ -228,7 +257,7 @@ impl FatboyManager {
     /// foreign-engine session (1:1 pipe). Falls back to an always-erroring
     /// handler if the spawn fails (factories cannot return Err).
     pub fn new_remote_handler(&self) -> Box<dyn Handler + Send> {
-        match spawn_fatboy_stdio(&self.profile, &self.db) {
+        match spawn_fatboy_stdio(&self.profile, &self.spawn) {
             Ok(child) => match StdioTransport::from_child(child) {
                 Ok(t) => Box::new(RemoteHandler::new(t)),
                 Err(e) => Box::new(DeadFatboyHandler { message: e.message }),
@@ -241,11 +270,15 @@ impl FatboyManager {
 /// Spawn a fatboy child: relay protocol over its stdin/stdout, diagnostics
 /// inherited onto our stderr. The returned `Child` is handed to a
 /// `StdioTransport`, which reaps it on drop.
-fn spawn_fatboy_stdio(profile: &str, db: &str) -> Result<Child, String> {
+fn spawn_fatboy_stdio(profile: &str, spawn: &SpawnSpec) -> Result<Child, String> {
     let bin = fatboy_binary(profile);
+    let (flag, value) = match spawn {
+        SpawnSpec::Database(db) => ("--database", db.as_str()),
+        SpawnSpec::Conninfo(ci) => ("--conninfo", ci.as_str()),
+    };
     Command::new(&bin)
-        .arg("--database")
-        .arg(db)
+        .arg(flag)
+        .arg(value)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // stderr inherits — fatboy errors surface on dql's stderr.
@@ -274,7 +307,7 @@ impl Handler for DeadFatboyHandler {
     fn handle(&mut self, _term: delightql_protocol::ClientTerm) -> ServerTerm {
         ServerTerm::Error {
             kind: delightql_protocol::ErrorKind::Connection,
-            identity: b"dql/target/postgres/connect".to_vec(),
+            identity: b"delightql-error://target/postgres/connect".to_vec(),
             message: self.message.clone().into_bytes(),
         }
     }
@@ -470,7 +503,30 @@ pub fn create_fatboy_system_components(
         connection: std::sync::Arc::new(Mutex::new(FatboyConnection::new(mgr.clone()))),
         introspector: Box::new(FatboyIntrospector::new(mgr.clone())),
         db_type: mgr.profile.clone(),
+        mechanism: "fatboy".to_string(),
+        identity: fatboy_resource_identity(mgr),
     })
+}
+
+/// Resource-asserted identity, obtained at connect (URI-DESIGN.md §4):
+/// Postgres asserts its cluster system identifier; a DuckDB file's
+/// identity is filesystem identity (canonical path). Failure to obtain
+/// one degrades gracefully to None — identity strengthens dedupe, never
+/// blocks a mount.
+fn fatboy_resource_identity(mgr: &std::sync::Arc<FatboyManager>) -> Option<String> {
+    match mgr.profile.as_str() {
+        "postgres" => mgr
+            .relay()
+            .query_nullable("SELECT system_identifier FROM pg_control_system()")
+            .ok()
+            .and_then(|(_cols, rows)| rows.into_iter().next())
+            .and_then(|row| row.into_iter().next().flatten())
+            .map(|id| format!("pg-system-id:{id}")),
+        "duckdb" => std::fs::canonicalize(&mgr.db)
+            .ok()
+            .map(|abs| format!("realpath:{}", abs.display())),
+        _ => None,
+    }
 }
 
 /// Execute SQL through the fatboy and return QueryResults (string-mode,

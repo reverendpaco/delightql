@@ -478,7 +478,7 @@ fn validate_outer_join_markers(
 ///
 /// In join position, null-safe equality (`IS NOT DISTINCT FROM`) risks cartesian
 /// explosion when NULL values match. DQL's `=` compiles to traditional SQL `=`
-/// in ON clauses by default. The danger gate `dql/cardinality/nulljoin` can
+/// in ON clauses by default. The danger gate `delightql-danger://cardinality/nulljoin` can
 /// opt back into INDF (not yet wired — added when danger gates reach the refiner).
 fn downgrade_null_safe_eq(expr: refined::BooleanExpression) -> refined::BooleanExpression {
     match expr {

@@ -139,5 +139,15 @@ pub fn sync_bin_cartridges_to_bootstrap(
         }
     }
 
+    // Seed per-functor dialect_form_rule rows now that bin entities have
+    // entity ids (session-local, resolved by name in the seed SQL).
+    // Idempotent; covers both init and reinit_bootstrap.
+    conn.execute_batch(FORM_RULES_SEED)?;
+
     Ok(universal_namespaces)
 }
+
+/// Embedded seed for `dialect_form_rule` — per-functor targeting rules for
+/// bin entities (ALL-SQL-TARGETING-DESIGN.md §4.1). Runs after entity sync
+/// because the rows resolve `entity_id` by (name, type) subselect.
+const FORM_RULES_SEED: &str = include_str!("../../bootstrap/form_rules.sql");

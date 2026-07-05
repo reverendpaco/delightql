@@ -26,6 +26,18 @@ pub struct CliArgs {
     /// Set to any string for custom scripting (e.g. --error-prefix '@error ').
     #[arg(long, global = true, default_value = "\x1E")]
     pub error_prefix: String,
+
+    /// Target SQL dialect for generated SQL (sqlite|postgres|mysql|sqlserver|duckdb).
+    /// Default: sqlite (canonical); spellings come from the dialect_render
+    /// targeting table. Equivalent to setting DQL_DIALECT.
+    #[arg(long, global = true, value_name = "DIALECT")]
+    pub dialect: Option<String>,
+
+    /// Mechanism override for reaching a postgres resource
+    /// (fatboy = adapter co-process, default; siso = pipe-wrapped psql).
+    /// Resources name WHAT to reach; --via chooses HOW.
+    #[arg(long, global = true, value_name = "MECHANISM")]
+    pub via: Option<String>,
 }
 
 /// Subcommands for DelightQL CLI
@@ -138,18 +150,20 @@ pub enum Command {
         #[arg(long = "sink")]
         sinks: Vec<String>,
 
-        /// Open danger gates for this session (format: uri=STATE)
+        /// Open danger gates for this session (format: hierarchy=STATE)
         ///
         /// Override default danger gate states. STATE is ON, OFF, ALLOW, or 1-9.
-        /// Example: --danger dql/cardinality/nulljoin=ON
+        /// The flag declares the kind, so the bare hierarchy suffices.
+        /// Example: --danger cardinality/nulljoin=ON
         #[arg(long = "danger")]
         dangers: Vec<String>,
 
-        /// Set options for this session (format: uri=STATE)
+        /// Set configs for this session (format: hierarchy=STATE)
         ///
-        /// Override default option states. STATE is ON, OFF, ALLOW, or 1-9.
-        /// Example: --option generation/rule/inlining/view=ON
-        #[arg(long = "option")]
+        /// Override default config states. STATE is ON, OFF, ALLOW, or 1-9.
+        /// The flag declares the kind, so the bare hierarchy suffices.
+        /// Example: --config generation/rule/inlining/view=ON
+        #[arg(long = "config")]
         options: Vec<String>,
     },
 
@@ -182,6 +196,17 @@ pub enum Command {
     Tools {
         #[command(subcommand)]
         tool: ToolCommand,
+    },
+
+    /// Explain a DelightQL identifier (error, danger gate, or config)
+    ///
+    /// Accepts the badge form (delightql-error://semantic/cast), the
+    /// canonical URL (https://delightql.org/uri/error/semantic/cast), or
+    /// a bare hierarchy (searched across all kinds). Family nodes list
+    /// their registered members.
+    Explain {
+        /// The identifier to explain
+        identifier: String,
     },
 
     /// Start relay protocol server on a Unix socket

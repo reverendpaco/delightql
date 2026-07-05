@@ -510,7 +510,7 @@ impl<T: Transport> Handler for RemoteHandler<T> {
             Ok(response) => response,
             Err(e) => ServerTerm::Error {
                 kind: ErrorKind::Connection,
-                identity: b"dql/relay/transport".to_vec(),
+                identity: b"delightql-error://runtime/relay/transport".to_vec(),
                 message: e.message.into_bytes(),
             },
         }

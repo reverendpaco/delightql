@@ -175,6 +175,11 @@ fn run() -> Result<()> {
     // Parse command-line arguments
     let args = CliArgs::parse();
 
+    // --dialect is sugar for DQL_DIALECT (consumed at pipeline construction).
+    if let Some(ref dialect) = args.dialect {
+        std::env::set_var("DQL_DIALECT", dialect);
+    }
+
     // Store error prefix for use in main() error handler
     CLI_FLAGS.with(|f| {
         *f.borrow_mut() = Some(CliFlags {
@@ -200,6 +205,9 @@ fn run() -> Result<()> {
             }
             Command::Query { .. } => {
                 delightql_cli::commands::query::handle_query_subcommand(command, &args)
+            }
+            Command::Explain { identifier } => {
+                delightql_cli::commands::explain::handle_explain(identifier)
             }
             Command::Format { .. } => {
                 delightql_cli::commands::format::handle_format_subcommand(command, &args)

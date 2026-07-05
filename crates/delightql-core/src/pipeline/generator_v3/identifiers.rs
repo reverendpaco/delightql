@@ -2,28 +2,28 @@
 // Copyright 2026 Daniel Eklund
 use super::dialect::SqlDialect;
 use super::errors::GeneratorError;
+use crate::pipeline::dialect_pack::{apply_template, DialectPack};
 
 pub fn write_identifier(
     sql: &mut String,
     ident: &str,
     dialect: SqlDialect,
+    pack: &DialectPack,
 ) -> Result<(), GeneratorError> {
     if needs_quoting(ident) {
-        match dialect {
-            SqlDialect::SQLite | SqlDialect::PostgreSQL => {
+        // Canonical double-quote unless the pack carries an `ident.quoted`
+        // template ('`{0}`' for mysql, '[{0}]' for sqlserver).
+        match pack.render(dialect.family_name(), "ident.quoted") {
+            Some(rule) => {
+                let template = rule.template().map_err(GeneratorError::Error)?;
+                let quoted =
+                    apply_template(template, &[ident]).map_err(GeneratorError::Error)?;
+                sql.push_str(&quoted);
+            }
+            None => {
                 sql.push('"');
                 sql.push_str(ident);
                 sql.push('"');
-            }
-            SqlDialect::MySQL => {
-                sql.push('`');
-                sql.push_str(ident);
-                sql.push('`');
-            }
-            SqlDialect::SqlServer => {
-                sql.push('[');
-                sql.push_str(ident);
-                sql.push(']');
             }
         }
     } else {

@@ -191,13 +191,13 @@ mod tests {
     #[test]
     fn test_counts() {
         let mut registry = BinCartridgeRegistry::new();
-        assert_eq!(registry.cartridge_count(), 0);
-        assert_eq!(registry.entity_count(), 0);
+        assert_eq!(registry.cartridges().len(), 0);
+        assert!(registry.lookup_entity("test!").is_none());
 
         registry.register_cartridge(Arc::new(TestCartridge));
 
-        assert_eq!(registry.cartridge_count(), 1);
-        assert_eq!(registry.entity_count(), 1);
+        assert_eq!(registry.cartridges().len(), 1);
+        assert!(registry.lookup_entity("test!").is_some());
     }
 
     #[test]

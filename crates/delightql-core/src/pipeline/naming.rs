@@ -6,6 +6,58 @@
 /// used throughout the pipeline, ensuring consistency between resolver
 /// and transformer stages.
 
+/// Internal function name for provenance-tagged json extraction that must
+/// stay NATIVE json (subtree extraction, compiler-internal packet reads).
+///
+/// The transformer stamps this name where the extracted value must remain
+/// json-typed: `json:{...}` first-class reads (an object/array subtree gets
+/// embedded into a surrounding JSON_OBJECT), pivot's `_pivot_packet` reads
+/// (compared numerically), and destructure's `_nested_*`/`_nav_*` temp
+/// columns (fed straight into `json_each`/recursion). The generator renders
+/// it canonically as `json_extract` and per-dialect rules key on
+/// `fn.__dql_json_extract_raw` — so a dialect row that respells the
+/// user-facing scalar `fn.json_extract` (e.g. duckdb `json_extract_string`)
+/// can never stringify a subtree. "Code chooses the form, data spells it":
+/// the provenance choice is code; both spellings are data-overridable
+/// independently. (Measured motivation: ALL-SQL-TARGETING-PLAN.md §2,
+/// first-tenant results.)
+pub const INTERNAL_JSON_EXTRACT_RAW: &str = "__dql_json_extract_raw";
+
+/// Internal TVF name for compiler-built array iteration that must expand a
+/// JSON ARRAY into rows.
+///
+/// The transformer stamps this name at the sites where IT built the array
+/// being iterated — melt packets (`r_lower_melt_join`), and the
+/// narrow/drill/destructure family (`Builder::expand_with_json_each`) over
+/// tree_group / json_build_array columns. SQLite's `json_each` is
+/// polymorphic (object or array); postgres' is object-only, so the
+/// array-provenance sites need a different FORM there
+/// (`jsonb_array_elements WITH ORDINALITY`, spelled by the
+/// `tvf.__dql_json_each_array` render row). User-facing `json_each(...)`
+/// TVF calls (dynamic document, could be either) keep the plain name.
+/// (Measured motivation: ALL-SQL-TARGETING-PLAN.md §2, json_each TVF
+/// inventory.)
+pub const INTERNAL_JSON_EACH_ARRAY: &str = "__dql_json_each_array";
+
+/// Internal TVF name for compiler-built OBJECT-entry iteration: the
+/// metadata-tree-group destructure sites (`key:~>`), which walk a
+/// `JSON_GROUP_OBJECT` map as (.key, .value) rows. Same split as
+/// [`INTERNAL_JSON_EACH_ARRAY`], other branch of the polymorphism:
+/// postgres spells this `jsonb_each` (object-only, exactly right) via the
+/// `tvf.__dql_json_each_object` render row.
+pub const INTERNAL_JSON_EACH_OBJECT: &str = "__dql_json_each_object";
+
+/// Canonical SQL spelling for internal (`__dql_*`) function names.
+/// Returns None for ordinary names. Consulted by the generator before
+/// dialect-pack lookup so internal names never leak into emitted SQL.
+pub fn internal_fn_canonical(name: &str) -> Option<&'static str> {
+    match name {
+        INTERNAL_JSON_EXTRACT_RAW => Some("json_extract"),
+        INTERNAL_JSON_EACH_ARRAY | INTERNAL_JSON_EACH_OBJECT => Some("json_each"),
+        _ => None,
+    }
+}
+
 /// Generate a unique column name for a resolved function expression without an alias
 ///
 /// This is used when ordinal selectors (|1|, |2|) need to reference columns.
@@ -172,13 +224,6 @@ pub fn expression_base_name(expr_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_anonymous_column_names() {
-        assert_eq!(anonymous_column_name(0), "column1");
-        assert_eq!(anonymous_column_name(1), "column2");
-        assert_eq!(anonymous_column_name(9), "column10");
-    }
 
     #[test]
     fn test_expression_base_name() {

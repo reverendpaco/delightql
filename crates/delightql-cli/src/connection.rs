@@ -8,52 +8,139 @@ use delightql_backends::SqliteConnectionManager;
 use delightql_types::DatabaseConnection;
 use std::sync::{Arc, Mutex};
 
-/// Database type detected from file magic numbers
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DatabaseType {
-    SQLite,
+/// True when the string is URI-shaped (`scheme://...`) rather than a file
+/// path. One shared test so no caller can fall through to file handling.
+pub fn looks_like_uri(path: &str) -> bool {
+    match path.find("://") {
+        Some(end) if end > 0 => path[..end]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')),
+        _ => false,
+    }
 }
 
-impl DatabaseType {
-    /// Detect database type from file path by checking magic numbers
-    ///
-    /// SQLite files start with: "SQLite format 3\0" (16 bytes)
-    ///
-    /// DuckDB files (magic "DUCK" at offset 8, or .duckdb/.ddb extension)
-    /// are recognized only to redirect the user to `fatboy://duckdb/<path>`
-    /// — native in-process DuckDB was removed in favor of the fatboy.
-    pub fn from_path(path: &str) -> Result<Self> {
-        use std::io::Read;
+/// One classified route for a `--db` / `mount!()` input — THE single
+/// scheme-dispatch point (URI-DESIGN.md §4: users speak in resources,
+/// DelightQL chooses mechanisms). An unknown scheme teaches; it can never
+/// fall through to file-path handling.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Route {
+    /// A SQLite file — in-process.
+    Sqlite(String),
+    /// A DuckDB file (magic bytes / extension) — the duckdb fatboy.
+    DuckdbFatboy(String),
+    /// A worldly postgres resource — the postgres fatboy, with the URL
+    /// handed to libpq verbatim as conninfo (worldly syntax, worldly
+    /// semantics; `postgres:///db` is libpq's own env-completed form).
+    PostgresFatboy { url: String, display_db: String },
+    /// `delightql-siso://<profile>[/<target>]` — the pipe-coprocess
+    /// residue for resources with no worldly URI (osqueryi and kin).
+    Siso { rest: String },
+}
 
-        // Try to detect by reading file magic numbers
-        if let Ok(mut file) = std::fs::File::open(path) {
-            let mut header = [0u8; 16];
-            if file.read_exact(&mut header).is_ok() {
-                // Check for SQLite magic: "SQLite format 3\0"
-                if &header[0..16] == b"SQLite format 3\0" {
-                    return Ok(DatabaseType::SQLite);
-                }
+/// Classify a `--db` / mount input. `via` is the mechanism override
+/// (`--via`); it applies to postgres resources (fatboy | siso).
+pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
+    if let Some(v) = via {
+        if !matches!(v, "fatboy" | "siso") {
+            anyhow::bail!("unknown --via '{v}' (known mechanisms: fatboy, siso)");
+        }
+    }
 
-                // Check for DuckDB magic: "DUCK" at offset 8
-                if &header[8..12] == b"DUCK" {
+    if let Some(rest) = input.strip_prefix("delightql-siso://") {
+        if rest.is_empty() {
+            anyhow::bail!("delightql-siso:// needs a profile: delightql-siso://<profile>[/<target>]");
+        }
+        return Ok(Route::Siso { rest: rest.to_string() });
+    }
+
+    if looks_like_uri(input) {
+        let scheme_end = input.find("://").expect("looks_like_uri checked");
+        let scheme = input[..scheme_end].to_ascii_lowercase();
+        return match scheme.as_str() {
+            "postgres" | "postgresql" => {
+                let url = url::Url::parse(input).map_err(|e| {
+                    anyhow::anyhow!("'{input}': not a valid postgres URL: {e}")
+                })?;
+                if url.password().is_some() {
                     anyhow::bail!(
-                        "'{path}' is a DuckDB database. DuckDB is served by a fatboy \
-                         co-process, not linked in: use --db fatboy://duckdb/{path}"
+                        "'{input}': passwords are never accepted in connection URLs \
+                         (they would persist into session metadata). Set PGPASSWORD \
+                         in the environment instead."
                     );
                 }
+                let display_db = url.path().trim_start_matches('/').to_string();
+                match via {
+                    None | Some("fatboy") => Ok(Route::PostgresFatboy {
+                        url: input.to_string(),
+                        display_db,
+                    }),
+                    Some("siso") => Ok(Route::Siso {
+                        rest: if display_db.is_empty() {
+                            "postgres".to_string()
+                        } else {
+                            format!("postgres/{display_db}")
+                        },
+                    }),
+                    Some(_) => unreachable!("via validated above"),
+                }
             }
-        }
-
-        if path.ends_with(".duckdb") || path.ends_with(".ddb") {
-            anyhow::bail!(
-                "'{path}' looks like a DuckDB database. DuckDB is served by a fatboy \
-                 co-process, not linked in: use --db fatboy://duckdb/{path}"
-            );
-        }
-
-        // Default to SQLite for .db, .sqlite, .sqlite3, or no extension
-        Ok(DatabaseType::SQLite)
+            "file" => {
+                // RFC 8089: file:///path (empty authority) or file://localhost/path.
+                let url = url::Url::parse(input)
+                    .map_err(|e| anyhow::anyhow!("'{input}': not a valid file URL: {e}"))?;
+                match url.host_str() {
+                    None | Some("") | Some("localhost") => {}
+                    Some(h) => anyhow::bail!(
+                        "'{input}': file URLs with a remote host ('{h}') are not \
+                         supported — file:///absolute/path only."
+                    ),
+                }
+                classify_file_path(url.path(), via)
+            }
+            "fatboy" => anyhow::bail!(
+                "'{input}': fatboy:// is retired. Name the resource instead: \
+                 postgres:///<dbname> (or postgres://host:port/db) for Postgres, \
+                 or the file path for DuckDB — the right adapter is chosen \
+                 automatically."
+            ),
+            "pipe" => anyhow::bail!(
+                "'{input}': pipe:// is now delightql-siso:// (same \
+                 profile/target syntax)."
+            ),
+            other => anyhow::bail!(
+                "'{input}': unsupported URI scheme '{other}://'. Known: \
+                 postgres://, file://, delightql-siso://, or a plain file path."
+            ),
+        };
     }
+
+    classify_file_path(input, via)
+}
+
+/// Classify a filesystem path by magic bytes / extension.
+fn classify_file_path(path: &str, via: Option<&str>) -> Result<Route> {
+    use std::io::Read;
+
+    if let Some(v) = via {
+        if v != "fatboy" {
+            anyhow::bail!("--via {v} does not apply to file-backed databases");
+        }
+    }
+
+    // DuckDB magic: "DUCK" at offset 8 of the 16-byte header.
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let mut header = [0u8; 16];
+        if file.read_exact(&mut header).is_ok() && &header[8..12] == b"DUCK" {
+            return Ok(Route::DuckdbFatboy(path.to_string()));
+        }
+    }
+    if path.ends_with(".duckdb") || path.ends_with(".ddb") {
+        return Ok(Route::DuckdbFatboy(path.to_string()));
+    }
+
+    // SQLite for .db/.sqlite/anything else (including files to create).
+    Ok(Route::Sqlite(path.to_string()))
 }
 
 /// Connection information structure (unified across all database types)
@@ -76,51 +163,42 @@ pub enum ConnectionManager {
 }
 
 impl ConnectionManager {
-    /// Create a connection from a URI string.
-    ///
-    /// Supports `pipe://profile` and `pipe://profile/target` URIs.
-    pub fn from_uri(uri: &str) -> Result<Self> {
-        if uri.starts_with("pipe://") {
-            let mgr = delightql_cli_siso::PipeConnectionManager::from_uri(uri)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            Ok(ConnectionManager::Pipe(Arc::new(mgr)))
-        } else if let Some(rest) = uri.strip_prefix("fatboy://") {
-            // fatboy://<profile>/<db> — socket resolved by convention
-            // (see fatboy_exec::socket_path).
-            let (profile, db) = rest.split_once('/').ok_or_else(|| {
-                anyhow::anyhow!("fatboy URI needs a database: fatboy://postgres/<db>")
-            })?;
-            if !crate::fatboy_exec::PROFILES.contains(&profile) {
-                anyhow::bail!(
-                    "unknown fatboy profile '{}' (known: {})",
-                    profile,
-                    crate::fatboy_exec::PROFILES.join(", ")
-                );
+    /// Open a classified route (see [`classify`]).
+    pub fn open_route(route: Route) -> Result<Self> {
+        match route {
+            Route::Sqlite(path) => Ok(ConnectionManager::SQLite(
+                SqliteConnectionManager::new_file(&path)?,
+            )),
+            Route::DuckdbFatboy(path) => {
+                let mgr = crate::fatboy_exec::FatboyManager::connect("duckdb", &path)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(ConnectionManager::Fatboy(Arc::new(mgr)))
             }
-            let mgr = crate::fatboy_exec::FatboyManager::connect(profile, db)
+            Route::PostgresFatboy { url, display_db } => {
+                let mgr =
+                    crate::fatboy_exec::FatboyManager::connect_postgres_url(&url, &display_db)
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(ConnectionManager::Fatboy(Arc::new(mgr)))
+            }
+            Route::Siso { rest } => {
+                let mgr = delightql_cli_siso::PipeConnectionManager::from_uri(&format!(
+                    "delightql-siso://{rest}"
+                ))
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            Ok(ConnectionManager::Fatboy(Arc::new(mgr)))
-        } else {
-            anyhow::bail!("Unsupported URI scheme: {}", uri)
+                Ok(ConnectionManager::Pipe(Arc::new(mgr)))
+            }
         }
     }
 
-    /// Create a new connection from a file path, auto-detecting database type.
-    ///
-    /// Also accepts `pipe://` URIs for pipe-based connections.
+    /// Open from a `--db` / mount input string with a mechanism override.
+    pub fn open(input: &str, via: Option<&str>) -> Result<Self> {
+        Self::open_route(classify(input, via)?)
+    }
+
+    /// Create a new connection from a resource string (path or worldly
+    /// URI), default mechanisms. Kept as the factory-facing entry point.
     pub fn new_file(path: &str) -> Result<Self> {
-        // Check for URI schemes before treating as a file path
-        if path.starts_with("pipe://") || path.starts_with("fatboy://") {
-            return Self::from_uri(path);
-        }
-
-        let db_type = DatabaseType::from_path(path)?;
-
-        match db_type {
-            DatabaseType::SQLite => Ok(ConnectionManager::SQLite(
-                SqliteConnectionManager::new_file(path)?,
-            )),
-        }
+        Self::open(path, None)
     }
 
     /// Create a new in-memory connection (defaults to SQLite)
@@ -397,11 +475,20 @@ impl ConnectionManager {
                 let adapter =
                     delightql_backends::sqlite::SqliteConnection::new(raw_conn_arc.clone());
                 let conn_arc: Arc<Mutex<dyn DatabaseConnection>> = Arc::new(Mutex::new(adapter));
+                let identity = raw_conn_arc
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.path().map(|p| p.to_string()))
+                    .filter(|p| !p.is_empty())
+                    .and_then(|p| std::fs::canonicalize(&p).ok())
+                    .map(|abs| format!("realpath:{}", abs.display()));
                 Ok(delightql_types::ConnectionComponents {
                     schema,
                     connection: conn_arc,
                     introspector,
                     db_type: "sqlite".to_string(),
+                    mechanism: "in-process".to_string(),
+                    identity,
                 })
             }
             ConnectionManager::Pipe(mgr) => crate::pipe_exec::create_pipe_system_components(mgr),
@@ -423,5 +510,96 @@ impl ConnectionManager {
         let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
         delightql_core::api::open(factory, Some(mount_factory))
             .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_urls_route_to_the_fatboy() {
+        let r = classify("postgres://alice@db.example:5432/prod", None).unwrap();
+        assert_eq!(
+            r,
+            Route::PostgresFatboy {
+                url: "postgres://alice@db.example:5432/prod".into(),
+                display_db: "prod".into()
+            }
+        );
+        // libpq's env-completed form
+        let r = classify("postgres:///dql_core", None).unwrap();
+        assert_eq!(
+            r,
+            Route::PostgresFatboy {
+                url: "postgres:///dql_core".into(),
+                display_db: "dql_core".into()
+            }
+        );
+        // postgresql:// spelling too
+        assert!(matches!(
+            classify("postgresql://h/d", None).unwrap(),
+            Route::PostgresFatboy { .. }
+        ));
+        // --via siso reroutes to the pipe coprocess
+        assert_eq!(
+            classify("postgres:///dql_core", Some("siso")).unwrap(),
+            Route::Siso { rest: "postgres/dql_core".into() }
+        );
+    }
+
+    #[test]
+    fn secrets_never_enter_connection_urls() {
+        let err = classify("postgres://alice:hunter2@h/d", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("passwords are never accepted"), "{err}");
+        assert!(err.contains("PGPASSWORD"), "{err}");
+    }
+
+    #[test]
+    fn file_urls_and_paths_classify_by_content() {
+        assert_eq!(
+            classify("some/dir/data.db", None).unwrap(),
+            Route::Sqlite("some/dir/data.db".into())
+        );
+        assert_eq!(
+            classify("weird:name.db", None).unwrap(),
+            Route::Sqlite("weird:name.db".into())
+        );
+        // duckdb by extension routes to the fatboy — no teaching error
+        assert_eq!(
+            classify("analytics.duckdb", None).unwrap(),
+            Route::DuckdbFatboy("analytics.duckdb".into())
+        );
+        assert_eq!(
+            classify("file:///data/x.duckdb", None).unwrap(),
+            Route::DuckdbFatboy("/data/x.duckdb".into())
+        );
+        let err = classify("file://remotehost/x.db", None).unwrap_err().to_string();
+        assert!(err.contains("remote host"), "{err}");
+    }
+
+    #[test]
+    fn retired_and_unknown_schemes_teach() {
+        let err = classify("fatboy://postgres/db", None).unwrap_err().to_string();
+        assert!(err.contains("retired"), "{err}");
+        assert!(err.contains("postgres:///"), "{err}");
+        let err = classify("pipe://psql", None).unwrap_err().to_string();
+        assert!(err.contains("delightql-siso://"), "{err}");
+        let err = classify("mysql://host/db", None).unwrap_err().to_string();
+        assert!(err.contains("unsupported URI scheme 'mysql://'"), "{err}");
+    }
+
+    #[test]
+    fn siso_scheme_routes() {
+        assert_eq!(
+            classify("delightql-siso://osqueryi", None).unwrap(),
+            Route::Siso { rest: "osqueryi".into() }
+        );
+        assert_eq!(
+            classify("delightql-siso://postgres/dql_core", None).unwrap(),
+            Route::Siso { rest: "postgres/dql_core".into() }
+        );
     }
 }

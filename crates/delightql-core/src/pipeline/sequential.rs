@@ -227,16 +227,13 @@ fn compile_with_error_hook(
         }
         Ok(_) => {
             // Compilation succeeded — check if expected is runtime error
+            // Hooks carry the bare hierarchy (kind declared by the sigil):
+            // a first segment of "runtime" marks a runtime-error hook.
             let expects_runtime = expected
                 .uri_segments
                 .first()
-                .map(|s| s == "dql")
-                .unwrap_or(false)
-                && expected
-                    .uri_segments
-                    .get(1)
-                    .map(|s| s == "runtime")
-                    .unwrap_or(false);
+                .map(|s| s == "runtime")
+                .unwrap_or(false);
 
             if expects_runtime {
                 // Return compiled SQL + expected for CLI to handle runtime check

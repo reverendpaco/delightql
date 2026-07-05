@@ -93,6 +93,16 @@ pub enum DomainExpression {
     /// Literal value
     Literal(LiteralValue),
 
+    /// Type cast: CAST(expr AS type). `type_name` is the DQL-canonical
+    /// type word (integer|real|text|numeric|boolean); the generator spells
+    /// it per target via `dialect_render` `type.*` rows (canonical =
+    /// uppercased name). Semantics are the TARGET's cast — invalid-input
+    /// behavior is deliberately target-dependent (see the book's cast page).
+    Cast {
+        expr: Box<DomainExpression>,
+        type_name: String,
+    },
+
     /// Binary operation: left op right
     Binary {
         left: Box<DomainExpression>,
@@ -192,6 +202,14 @@ impl WhenClause {
 
     pub fn then(&self) -> &DomainExpression {
         &self.then
+    }
+
+    pub fn when_mut(&mut self) -> &mut DomainExpression {
+        &mut self.when
+    }
+
+    pub fn then_mut(&mut self) -> &mut DomainExpression {
+        &mut self.then
     }
 }
 
@@ -515,6 +533,14 @@ impl DomainExpression {
 
     pub fn subquery(query: QueryExpression) -> Self {
         DomainExpression::Subquery(Box::new(query))
+    }
+
+    /// CAST(expr AS type) — `type_name` is the DQL-canonical type word.
+    pub fn cast(expr: DomainExpression, type_name: impl Into<String>) -> Self {
+        DomainExpression::Cast {
+            expr: Box::new(expr),
+            type_name: type_name.into(),
+        }
     }
 
     /// Drop any table qualifier, keeping just the column name.

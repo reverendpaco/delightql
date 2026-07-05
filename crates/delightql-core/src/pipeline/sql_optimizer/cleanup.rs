@@ -756,6 +756,9 @@ fn has_unresolvable_column(
         DomainExpression::Unary { expr, .. } => {
             has_unresolvable_column(expr, subquery_alias, col_map)
         }
+        DomainExpression::Cast { expr, .. } => {
+            has_unresolvable_column(expr, subquery_alias, col_map)
+        }
         DomainExpression::Function { args, .. } => args
             .iter()
             .any(|a| has_unresolvable_column(a, subquery_alias, col_map)),
@@ -810,6 +813,7 @@ fn expr_contains_aggregate(expr: &DomainExpression) -> bool {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
         DomainExpression::Unary { expr, .. } => expr_contains_aggregate(expr),
+        DomainExpression::Cast { expr, .. } => expr_contains_aggregate(expr),
         DomainExpression::Parens(inner) => expr_contains_aggregate(inner),
         DomainExpression::Case {
             expr,
@@ -848,6 +852,7 @@ fn expr_contains_window(expr: &DomainExpression) -> bool {
             expr_contains_window(left) || expr_contains_window(right)
         }
         DomainExpression::Unary { expr, .. } => expr_contains_window(expr),
+        DomainExpression::Cast { expr, .. } => expr_contains_window(expr),
         DomainExpression::Parens(inner) => expr_contains_window(inner),
         DomainExpression::Function { args, .. } => args.iter().any(expr_contains_window),
         DomainExpression::Case {
@@ -914,6 +919,7 @@ fn expr_subqueries_reference_alias(expr: &DomainExpression, alias: &str) -> bool
                 || expr_subqueries_reference_alias(right, alias)
         }
         DomainExpression::Unary { expr, .. } => expr_subqueries_reference_alias(expr, alias),
+        DomainExpression::Cast { expr, .. } => expr_subqueries_reference_alias(expr, alias),
         DomainExpression::Parens(inner) => expr_subqueries_reference_alias(inner, alias),
         DomainExpression::Function { args, .. } => args
             .iter()
@@ -1035,6 +1041,7 @@ fn expr_references_alias(expr: &DomainExpression, alias: &str) -> bool {
             expr_references_alias(left, alias) || expr_references_alias(right, alias)
         }
         DomainExpression::Unary { expr, .. } => expr_references_alias(expr, alias),
+        DomainExpression::Cast { expr, .. } => expr_references_alias(expr, alias),
         DomainExpression::Parens(inner) => expr_references_alias(inner, alias),
         DomainExpression::Function { args, .. } => {
             args.iter().any(|a| expr_references_alias(a, alias))
@@ -1223,6 +1230,17 @@ fn rewrite_expr(
             Some(DomainExpression::Unary {
                 op: op.clone(),
                 expr: Box::new(rewritten),
+            })
+        }
+
+        DomainExpression::Cast {
+            expr: inner,
+            type_name,
+        } => {
+            let rewritten = rewrite_expr(inner, subquery_alias, col_map)?;
+            Some(DomainExpression::Cast {
+                expr: Box::new(rewritten),
+                type_name: type_name.clone(),
             })
         }
 
