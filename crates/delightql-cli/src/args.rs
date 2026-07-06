@@ -10,32 +10,45 @@ use std::path::PathBuf;
     name = "delightql",
     version = delightql_buildinfo::human_static(),
     about = "DelightQL - Query language transpiler",
-    long_about = None
+    long_about = None,
+    disable_help_subcommand = true,
+    after_help = "EXAMPLES:\n  \
+dql query --db app.db 'users(*), age > 30'\n  \
+echo 'users(*) ~> count:(*)' | dql query --db app.db\n  \
+dql query --db app.db --to sql -f raw 'users(*)'\n  \
+dql explain semantic/cast\n\n\
+Depth lives in the man pages: man dql, man dql-query."
 )]
 pub struct CliArgs {
     /// Subcommand to execute (if omitted and no flags, starts REPL)
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// SQLite database file to use (global option)
+    // Consumer lists in the doc one-liners below mirror the R6 matrix in
+    // main.rs: clap propagates global flags into every subcommand's
+    // --help, including subcommands that refuse them (ALPHA-CLI-UX-
+    // WORRIES #1) — so each flag's own text must say where it works.
+    /// SQLite database file (query and server; others refuse it)
     #[arg(long = "db", value_name = "DATABASE", global = true)]
     pub database: Option<PathBuf>,
 
-    /// Prefix for structured error lines on stderr (default: ASCII RS \x1E).
-    /// Machine-parseable error records are emitted as: <prefix>[uri] message.
-    /// Set to any string for custom scripting (e.g. --error-prefix '@error ').
+    /// With --db: create the database file if missing (query only)
+    #[arg(long = "make-new-db-if-missing", global = true, requires = "database")]
+    pub make_new_db_if_missing: bool,
+
+    /// Prefix for structured error records on stderr (default: ASCII RS; see dql(1))
     #[arg(long, global = true, default_value = "\x1E")]
     pub error_prefix: String,
 
-    /// Target SQL dialect for generated SQL (sqlite|postgres|mysql|sqlserver|duckdb).
-    /// Default: sqlite (canonical); spellings come from the dialect_render
-    /// targeting table. Equivalent to setting DQL_DIALECT.
-    #[arg(long, global = true, value_name = "DIALECT")]
+    /// Error record body format on stderr: text or json
+    #[arg(long, global = true, value_enum, default_value = "text")]
+    pub error_format: ErrorFormat,
+
+    /// Target SQL dialect: sqlite (default), postgres, mysql, sqlserver, duckdb (query, tools, server)
+    #[arg(long, global = true, value_name = "DIALECT", value_parser = parse_dialect)]
     pub dialect: Option<String>,
 
-    /// Mechanism override for reaching a postgres resource
-    /// (fatboy = adapter co-process, default; siso = pipe-wrapped psql).
-    /// Resources name WHAT to reach; --via chooses HOW.
+    /// Mechanism for reaching a postgres resource: fatboy (default) or siso (query only)
     #[arg(long, global = true, value_name = "MECHANISM")]
     pub via: Option<String>,
 }
@@ -43,10 +56,7 @@ pub struct CliArgs {
 /// Subcommands for DelightQL CLI
 #[derive(Subcommand)]
 pub enum Command {
-    /// Print build identity (version, burned identity or "dev", profile,
-    /// os/arch). Machine-readable with --json — the supply-contract
-    /// interface (TEST-ARCHITECTURE.md §11): supplied/CI mode must refuse
-    /// binaries whose identity is "dev".
+    /// Print build identity (machine-readable with --json)
     Version {
         /// Emit as a single-line JSON object
         #[arg(long)]
@@ -56,10 +66,10 @@ pub enum Command {
     /// Execute a query (from string, file, or stdin)
     #[command(visible_alias = "q")]
     Query {
-        /// Query string to execute (if omitted, reads from stdin or starts REPL)
+        /// Query string (if omitted: reads stdin, or starts the REPL on a TTY)
         query: Option<String>,
 
-        /// Read query from file
+        /// Read the query from FILE ('-' means stdin)
         #[arg(long, conflicts_with = "query")]
         file: Option<PathBuf>,
 
@@ -67,17 +77,9 @@ pub enum Command {
         #[arg(long, value_enum)]
         to: Option<Stage>,
 
-        /// Output format (table, json, csv, tsv, list)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
-
-        /// Assertion queries to run after main query
-        #[arg(long = "assert")]
-        assert_queries: Vec<String>,
-
-        /// Format errors with DelightQL query
-        #[arg(long = "if-errors")]
-        if_errors_query: Option<String>,
 
         /// Debug options (comma-separated)
         #[arg(long)]
@@ -87,10 +89,6 @@ pub enum Command {
         #[arg(long = "soptimize", default_value = "0")]
         sql_optimize: u8,
 
-        /// Inline CTEs as subqueries
-        #[arg(long)]
-        inline_ctes: bool,
-
         /// Suppress headers in results
         #[arg(long, short = 'n')]
         no_headers: bool,
@@ -99,19 +97,11 @@ pub enum Command {
         #[arg(long)]
         no_sanitize: bool,
 
-        /// Strict validation mode
-        #[arg(long)]
-        strict: bool,
-
-        /// Quiet mode
+        /// Suppress REPL banner and meta output (interactive mode only)
         #[arg(long, short = 'q')]
         quiet: bool,
 
-        /// Create new database if missing
-        #[arg(long = "make-new-db-if-missing")]
-        make_new_db_if_missing: bool,
-
-        /// Consult DDL file(s)
+        /// Unsupported: use consult!() in DQL source instead
         #[arg(long = "consult")]
         consult_files: Vec<PathBuf>,
 
@@ -123,10 +113,6 @@ pub enum Command {
         #[cfg(feature = "repl")]
         #[arg(long, short = 'i')]
         interactive: bool,
-
-        /// Verbose mode
-        #[arg(long)]
-        verbose: bool,
 
         /// Path to highlights.scm file
         #[cfg(feature = "repl")]
@@ -142,27 +128,15 @@ pub enum Command {
         #[arg(long)]
         sequential: bool,
 
-        /// Bind emit streams to sink destinations (format: name=path)
-        ///
-        /// Routes named emit streams to file sinks. Unbound streams
-        /// fall back to RS-prefixed records on stderr.
-        /// Example: --sink young=./young.jsonl --sink old=./old.jsonl
+        /// Bind a named emit stream to a file sink (name=path); repeatable
         #[arg(long = "sink")]
         sinks: Vec<String>,
 
-        /// Open danger gates for this session (format: hierarchy=STATE)
-        ///
-        /// Override default danger gate states. STATE is ON, OFF, ALLOW, or 1-9.
-        /// The flag declares the kind, so the bare hierarchy suffices.
-        /// Example: --danger cardinality/nulljoin=ON
+        /// Open a danger gate (hierarchy=STATE, e.g. cardinality/cartesian=ON); repeatable
         #[arg(long = "danger")]
         dangers: Vec<String>,
 
-        /// Set configs for this session (format: hierarchy=STATE)
-        ///
-        /// Override default config states. STATE is ON, OFF, ALLOW, or 1-9.
-        /// The flag declares the kind, so the bare hierarchy suffices.
-        /// Example: --config generation/rule/inlining/view=ON
+        /// Set a config for this session (hierarchy=STATE); repeatable
         #[arg(long = "config")]
         options: Vec<String>,
     },
@@ -198,22 +172,36 @@ pub enum Command {
         tool: ToolCommand,
     },
 
+    /// Show a manual page (tokens hyphen-join: `dql man dql target` = dql-target(1))
+    Man {
+        /// Optional leading section number, then name tokens
+        name: Vec<String>,
+
+        /// Write every embedded troff page into DIR (release staging)
+        #[arg(long, value_name = "DIR")]
+        dump: Option<PathBuf>,
+    },
+
+    /// Show a command's manual page (`dql help query` = `dql man query`; bare = usage)
+    Help {
+        /// Command name tokens (same grammar as `dql man`)
+        name: Vec<String>,
+    },
+
+    /// Generate shell completions to stdout
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
     /// Explain a DelightQL identifier (error, danger gate, or config)
-    ///
-    /// Accepts the badge form (delightql-error://semantic/cast), the
-    /// canonical URL (https://delightql.org/uri/error/semantic/cast), or
-    /// a bare hierarchy (searched across all kinds). Family nodes list
-    /// their registered members.
     Explain {
         /// The identifier to explain
         identifier: String,
     },
 
-    /// Manage target adapters (fatboys — the per-engine co-processes)
-    ///
-    /// The slim dql speaks SQLite natively; other engines are reached
-    /// through separate adapter binaries found via: DQL_FATBOY_DIR
-    /// (hard pin) → next to dql → the adapter store → PATH.
+    /// Manage target adapters (the per-engine fatboy binaries)
     Target {
         #[command(subcommand)]
         action: TargetCommand,
@@ -250,28 +238,17 @@ pub enum TargetCommand {
     #[command(visible_alias = "ls")]
     List,
 
-    /// Install an adapter into the adapter store
-    ///
-    /// Copies the adapter binary from a local artifact directory
-    /// (--from), verifying it against the digests burned into this
-    /// dql at release time — a mismatch refuses, nothing is installed.
-    /// Downloading from a published artifact host is a future source
-    /// behind the same verification; no host exists yet.
+    /// Install an adapter into the adapter store (digest-verified)
     Install {
         /// Adapter profile (e.g. postgres, duckdb)
         profile: String,
 
-        /// Directory holding the adapter: a bare dql-fatboy-<profile>
-        /// or a release artifact named
-        /// dql-fatboy-<profile>-<version>+<commit>-<os>-<arch>
-        /// (what scripts/release-build.py writes to dist/)
+        /// Local directory holding the adapter binary (see dql-target(1))
         #[arg(long)]
         from: Option<PathBuf>,
     },
 
-    /// Re-hash installed adapters against the digests burned into this
-    /// dql at release time. Refuses on dev builds (no digests burned);
-    /// exits nonzero on any mismatch.
+    /// Re-hash installed adapters against this dql's burned digests
     Verify,
 }
 
@@ -284,7 +261,7 @@ pub enum ToolCommand {
         /// DQL query to run against j(j TEXT)
         query: String,
 
-        /// Output format (table, json, csv, tsv)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
 
@@ -299,7 +276,7 @@ pub enum ToolCommand {
         /// DQL query to run against c(...)
         query: String,
 
-        /// Output format (table, json, csv, tsv)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
 
@@ -328,7 +305,7 @@ pub enum ToolCommand {
         #[arg(long = "table", num_args = 2, value_names = ["SPEC", "PATH"])]
         tables: Vec<String>,
 
-        /// Output format (table, json, csv, tsv)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
 
@@ -336,6 +313,17 @@ pub enum ToolCommand {
         #[arg(long, value_enum)]
         to: Option<Stage>,
     },
+}
+
+/// Body format for structured error records (R2.3). With the default
+/// RS prefix, json mode is exactly RFC 7464 (JSON text sequences —
+/// what `jq --seq` reads): RS + JSON + LF.
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum ErrorFormat {
+    /// `[uri] message` / `Error: message`
+    Text,
+    /// `{"uri": ..., "message": ...}` (uri null when unbadged)
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -381,6 +369,22 @@ pub enum Stage {
     /// Deprecated: use sys::execution.stack(*) instead
     #[value(name = "recursion-depth")]
     RecursionDepth,
+}
+
+/// Eager --dialect validation, mirroring --format's contract: a bogus
+/// value is a hard usage error before anything runs, never a lazy
+/// warning downstream (bugs/cli-surface-2026-07-05/PLAN.md #4). Accepts
+/// exactly what `SqlDialect::from_family_name` accepts, aliases included.
+fn parse_dialect(s: &str) -> Result<String, String> {
+    if delightql_core::is_known_dialect_family(s.trim()) {
+        Ok(s.trim().to_string())
+    } else {
+        Err(format!(
+            "unknown dialect '{}'. Valid dialects: sqlite, postgres (alias: postgresql), \
+             mysql, sqlserver, duckdb",
+            s
+        ))
+    }
 }
 
 fn parse_output_format(s: &str) -> Result<OutputFormat, String> {

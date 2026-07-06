@@ -169,13 +169,15 @@ struct TreeGroupToAnalyze<'a> {
 /// Searches through reducing_by and reducing_on for tree groups with nested reductions.
 /// Returns mutable references so we can populate their cte_requirements field.
 fn collect_tree_groups_needing_ctes<'a>(
-    reducing_by: &'a mut [ast::DomainExpression],
-    reducing_on: &'a mut [ast::DomainExpression],
+    reducing_by: &'a mut [ast::OutputDomainExpression],
+    reducing_on: &'a mut [ast::OutputDomainExpression],
 ) -> Vec<TreeGroupToAnalyze<'a>> {
     let mut result = Vec::new();
 
-    // Collect from reducing_by (scalar context)
-    for (idx, expr) in reducing_by.iter_mut().enumerate() {
+    // Collect from reducing_by (scalar context). Keys now carry their output
+    // stamp (slice 4); the CTE analysis reaches through `.expr` — stamps untouched.
+    for (idx, ode) in reducing_by.iter_mut().enumerate() {
+        let expr = &mut ode.expr;
         if has_nested_reductions(expr) {
             result.push(TreeGroupToAnalyze {
                 expr,
@@ -185,8 +187,11 @@ fn collect_tree_groups_needing_ctes<'a>(
         }
     }
 
-    // Collect from reducing_on (aggregate context)
-    for (idx, expr) in reducing_on.iter_mut().enumerate() {
+    // Collect from reducing_on (aggregate context). reducing_on now carries the
+    // resolver's per-expression output stamp (Batch 13); the CTE analysis reaches
+    // through `.expr` — stamps are untouched here.
+    for (idx, ode) in reducing_on.iter_mut().enumerate() {
+        let expr = &mut ode.expr;
         if has_nested_reductions(expr) {
             result.push(TreeGroupToAnalyze {
                 expr,
@@ -406,13 +411,15 @@ fn extract_nested_member_info(expr: &ast::DomainExpression) -> Vec<NestedMemberC
 /// Side effects:
 /// - Mutates tree groups in-place to set their cte_requirements field
 pub fn analyze_tree_groups_for_ctes(
-    reducing_by: &mut [ast::DomainExpression],
-    reducing_on: &mut [ast::DomainExpression],
+    reducing_by: &mut [ast::OutputDomainExpression],
+    reducing_on: &mut [ast::OutputDomainExpression],
 ) -> Result<()> {
     // Build outer grouping keys WITH KEY NAMES, expanding tree groups to their inner keys
     // This ensures we GROUP BY the actual identifiers, not the JSON construction
+    // (keys carry their output stamp now; reach through `.expr`).
     let mut outer_grouping_keys: Vec<(Option<String>, ast::DomainExpression)> = Vec::new();
-    for expr in reducing_by.iter() {
+    for ode in reducing_by.iter() {
+        let expr = &ode.expr;
         if has_nested_reductions(expr) {
             // For tree groups, use their inner grouping keys with key names
             outer_grouping_keys.extend(extract_inner_grouping_keys_with_names(expr));

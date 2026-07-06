@@ -2,10 +2,11 @@
 // Copyright 2026 Daniel Eklund
 // SqlParty Integration Tests
 //
-// Each test creates a raw rusqlite connection to the test database,
-// wraps it in SqlParty + DirectTransport + Client, does a version
-// handshake to obtain a Session, and runs a protocol conversation
-// with raw SQL (not DQL).
+// Each test builds a SELF-CONTAINED in-memory database (these tests
+// once pointed at the retired test_suite/ fixture tree and silently
+// rotted when it was deleted — never again), wraps it in SqlParty +
+// DirectTransport + Client, does a version handshake to obtain a
+// Session, and runs a protocol conversation with raw SQL (not DQL).
 
 use std::sync::{Arc, Mutex};
 
@@ -16,17 +17,31 @@ use delightql_protocol::{
 
 use crate::SqlParty;
 
-fn test_db_path() -> String {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent() // crates/
-        .unwrap()
-        .parent() // workspace root
+/// The fixture the retired core.db provided: users with 10 columns and
+/// 15 rows, first row (1, 'John', ...).
+fn fixture_conn() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE users (
+             id INTEGER, first_name TEXT, last_name TEXT, email TEXT,
+             age INTEGER, city TEXT, country TEXT, score REAL,
+             active INTEGER, notes TEXT
+         );",
+    )
+    .unwrap();
+    let names = [
+        "John", "Jane", "Ada", "Grace", "Alan", "Edsger", "Barbara", "Donald",
+        "Tony", "Leslie", "Ken", "Dennis", "Bjarne", "Guido", "Anders",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO users VALUES (?1, ?2, 'X', 'x@example.com', 30,
+                                       'Town', 'Land', 1.5, 1, NULL)",
+            rusqlite::params![i as i64 + 1, name],
+        )
         .unwrap();
-    workspace_root
-        .join("test_suite/side-effect-free/fixtures/core/core.db")
-        .to_string_lossy()
-        .to_string()
+    }
+    conn
 }
 
 fn b(s: &str) -> Vec<u8> {
@@ -54,8 +69,7 @@ fn cell_text(cell: &Option<Vec<u8>>) -> String {
 }
 
 fn make_sql_session() -> Session<DirectTransport<SqlParty>> {
-    let conn =
-        rusqlite::Connection::open(test_db_path()).expect("failed to open test database");
+    let conn = fixture_conn();
     let adapter = SqlParty::new(Arc::new(Mutex::new(conn)));
     let transport = DirectTransport::new(adapter);
     let client = Client::new(transport);
@@ -247,7 +261,7 @@ fn raw_sql_close_mid_stream() {
         }
     };
 
-    // Fetch just one batch (10 of 35 rows)
+    // Fetch just one batch (10 of 15 rows)
     let resp = session
         .fetch(&handle, Projection::All, 10, rows)
         .unwrap();
@@ -460,4 +474,57 @@ fn columns_orientation_not_agreed() {
     // Only Rows was agreed in version handshake
     assert!(session.agreed_orientation(Orientation::Rows).is_some());
     assert!(session.agreed_orientation(Orientation::Columns).is_none());
+}
+
+// --- Test 10: descriptor fallback for undeclared columns ---
+//
+// sqlite reports decl_type only for real table columns; expressions,
+// aggregates, and anonymous tables (SELECT 1 AS x) report none, which
+// downstream renders as stringly JSON (ALPHA-CLI-UX-WORRIES #3 — and
+// count(*) over a real table had the same disease). For undeclared
+// columns the relay peeks the first row and uses the engine's own
+// storage class as the declaration. NULL declares nothing.
+
+#[test]
+fn expression_descriptors_fall_back_to_storage_class() {
+    let mut session = make_sql_session();
+    let rows = session.agreed_orientation(Orientation::Rows).unwrap();
+
+    let resp = session
+        .query(b(
+            "SELECT id, count(*) AS c, 1.5 AS f, 'x' AS t, NULL AS n FROM users",
+        ))
+        .unwrap();
+    let handle = match resp {
+        QueryResponse::Header {
+            handle, dimensions, ..
+        } => {
+            assert_eq!(dimensions[0].descriptor, b("INTEGER")); // declared on the table
+            assert_eq!(dimensions[1].descriptor, b("INTEGER")); // aggregate: storage class
+            assert_eq!(dimensions[2].descriptor, b("REAL")); // literal: storage class
+            assert_eq!(dimensions[3].descriptor, b("TEXT"));
+            assert_eq!(dimensions[4].descriptor, b("")); // NULL declares nothing
+            handle
+        }
+        QueryResponse::Error { message, .. } => {
+            panic!(
+                "expected Header, got Error: {}",
+                String::from_utf8_lossy(&message)
+            );
+        }
+    };
+
+    // The peeked first row must still arrive as data — peeking must
+    // not eat it.
+    let resp = session
+        .fetch(&handle, Projection::All, 10, rows)
+        .unwrap();
+    match resp {
+        FetchResponse::Data { cells } => {
+            assert_eq!(cells.len(), 1);
+            assert_eq!(cell_text(&cells[0][1]), "15"); // count(*) over 15 users
+        }
+        other => panic!("expected Data, got {:?}", other),
+    }
+    session.close(handle).unwrap();
 }

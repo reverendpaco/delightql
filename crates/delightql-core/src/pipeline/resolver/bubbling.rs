@@ -428,17 +428,31 @@ pub(super) fn bubble_modulo_operator(
             reducing_on,
             delegates,
         } => {
-            let mut deps =
-                bubble_expressions_collect_deps(reducing_by, schema, system, cte_context)?;
+            // reducing_by keys now carry per-expression output stamps (slice 4);
+            // dependency collection reaches through `.expr`.
+            let reducing_by_exprs: Vec<_> =
+                reducing_by.iter().map(|ode| ode.expr.clone()).collect();
+            let mut deps = bubble_expressions_collect_deps(
+                &reducing_by_exprs,
+                schema,
+                system,
+                cte_context,
+            )?;
+            // reducing_on now carries per-expression output stamps (Batch 13);
+            // dependency collection reaches through `.expr`.
+            let reducing_on_exprs: Vec<_> =
+                reducing_on.iter().map(|ode| ode.expr.clone()).collect();
             deps.extend(bubble_expressions_collect_deps(
-                reducing_on,
+                &reducing_on_exprs,
                 schema,
                 system,
                 cte_context,
             )?);
             for w in delegates {
+                let payload_exprs: Vec<_> =
+                    w.payload.iter().map(|ode| ode.expr.clone()).collect();
                 deps.extend(bubble_expressions_collect_deps(
-                    &w.payload,
+                    &payload_exprs,
                     schema,
                     system,
                     cte_context,

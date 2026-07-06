@@ -1197,7 +1197,9 @@ impl SqlGenerator {
     ) -> Result<(), GeneratorError> {
         // DESIGN §4.1 precedence: (entity+form+dialect) → (form+dialect) →
         // canonical code (the bin entity below).
-        let form_type = crate::enums::EntityType::BinSigmaPredicate.as_i32();
+        // The call site IS the sigma form — code chooses the form (as the enum,
+        // STRING-FLOOR Tier 2c), data spells it.
+        let form_type = crate::enums::EntityType::BinSigmaPredicate;
         if let Some(rule) = self.config.dialect_pack.form_rule(
             self.config.dialect.family_name(),
             form_type,

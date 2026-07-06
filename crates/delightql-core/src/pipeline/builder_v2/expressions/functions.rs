@@ -641,7 +641,7 @@ fn parse_json_path(node: CstNode) -> Result<DomainExpression> {
                 .ok_or_else(|| DelightQLError::parse_error("Missing column in qualified_column"))?;
 
             DomainExpression::lvar_builder(column)
-                .with_qualifier(table)
+                .with_qualifier_opt(table.map(Into::into))
                 .build()
         }
         _ => {

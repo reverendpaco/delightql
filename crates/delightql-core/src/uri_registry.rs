@@ -40,15 +40,25 @@ impl UriKind {
     }
 }
 
-/// A registry entry: one documented identifier (or family node).
-pub struct RegistryEntry {
+/// One identifier row, as read from the burned `sys::help.identifier`
+/// table (SYS-HELP-DESIGN.md phase 1). The rows are AUTHORED in
+/// bootstrap/schema.sql — this module keeps only spelling
+/// normalization and identity vocabulary; the registry data itself
+/// lives as data.
+pub struct IdentifierEntry {
     pub kind: UriKind,
     /// Bare hierarchy, e.g. "semantic/resolution/column".
-    pub hierarchy: &'static str,
+    pub hierarchy: String,
     /// One-line summary.
-    pub summary: &'static str,
+    pub summary: String,
     /// Longer explanation shown by `dql explain`.
-    pub explanation: &'static str,
+    pub explanation: String,
+}
+
+/// UriKind from its URL word ("error" | "danger" | "config") — the
+/// spelling the `kind` column of sys::help.identifier uses.
+pub fn kind_from_word(word: &str) -> Option<UriKind> {
+    UriKind::all().iter().copied().find(|k| k.word() == word)
 }
 
 /// Parse any accepted identifier spelling into (kind, bare hierarchy).
@@ -83,31 +93,6 @@ pub fn canonical_url(kind: UriKind, hierarchy: &str) -> String {
     format!("https://delightql.org/uri/{}/{}", kind.word(), hierarchy)
 }
 
-/// Exact-match lookup.
-pub fn find(kind: UriKind, hierarchy: &str) -> Option<&'static RegistryEntry> {
-    REGISTRY
-        .iter()
-        .find(|e| e.kind == kind && e.hierarchy == hierarchy)
-}
-
-/// Bare-hierarchy search across all kinds (for kind-less input).
-pub fn find_bare(hierarchy: &str) -> Vec<&'static RegistryEntry> {
-    REGISTRY
-        .iter()
-        .filter(|e| e.hierarchy == hierarchy)
-        .collect()
-}
-
-/// Registered descendants of a hierarchy (segment-prefix semantics —
-/// the same family matching error hooks use).
-pub fn children(kind: UriKind, hierarchy: &str) -> Vec<&'static RegistryEntry> {
-    let prefix = format!("{}/", hierarchy);
-    REGISTRY
-        .iter()
-        .filter(|e| e.kind == kind && e.hierarchy.starts_with(&prefix))
-        .collect()
-}
-
 /// Whether a danger gate may be overridden from the CLI. Semantic-class
 /// gates (they change what the query MEANS) are inline-only. Delegates to
 /// the compiler's own enforcement so `dql explain` can never advertise a
@@ -128,292 +113,38 @@ pub const ERROR_TOP_SEGMENTS: &[&str] = &[
     "operational",
     "runtime",
     "target",
+    // Added 2026-07-05 with the CLI panic hook (main.rs mints
+    // delightql-error://internal/panic on any Rust panic): dql's own
+    // bugs get their own top segment, distinct from runtime/ (the
+    // query failed) — internal/ means DQL failed.
+    "internal",
 ];
 
-/// The registry. Curated by hand; append-only. Entries cover the
-/// structural family nodes and the identifiers users actually meet
-/// (corpus-surveyed); compiler-minted identifiers without an entry are
-/// still valid — `dql explain` shows their structure and canonical URL
-/// and says the prose is pending.
-pub const REGISTRY: &[RegistryEntry] = &[
-    // ---- error: family nodes -------------------------------------------
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "parse",
-        summary: "The source text is structurally invalid.",
-        explanation: "Parse errors mean the query text could not be read as \
-DelightQL at all — the grammar rejected it before any meaning was \
-assigned. Check delimiter balance, operator spelling, and clause order. \
-Hook family: (~~error://parse ~~) matches every parse error.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic",
-        summary: "The structure is valid but the meaning is wrong.",
-        explanation: "Semantic errors mean the query parsed, but a name \
-failed to resolve, an arity was wrong, or a constraint was violated \
-during compilation. The subhierarchy names what went wrong: resolution/ \
-(name binding), constraint/, arity, limitation/ (known gaps).",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "dml",
-        summary: "A data-modification query violated DML shape rules.",
-        explanation: "DML errors cover insert!/update!/delete!/keep! shape \
-and marker rules: marker/ (the !! mutation marker — missing, multiple, \
-forbidden, mismatch), shape/ (required or meaningless clauses), source/ \
-(what may feed a mutation).",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "operational",
-        summary: "The query is valid but this session refuses to run it.",
-        explanation: "Operational errors are policy, not meaning: the query \
-compiled, but session configuration forbids executing it (e.g. \
-federation-prohibited: a query may touch only one connection).",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "runtime",
-        summary: "Compilation succeeded; execution failed.",
-        explanation: "Runtime errors happen after SQL generation: the \
-database rejected the SQL, an assertion failed, a connection dropped, or \
-I/O failed. Subhierarchy: assertion, connection, io, bug (internal), \
-relay/transport (protocol channel).",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "target",
-        summary: "The foreign engine rejected or failed the query.",
-        explanation: "Target errors originate in the mounted engine, not in \
-DelightQL: target/<engine>/<class>/<code> embeds the world's taxonomy as \
-the leaf (Postgres: SQLSTATE, e.g. target/postgres/undefined-object/42883). \
-Hook family: (~~error://target/postgres ~~) matches any Postgres-side \
-failure. Lifecycle members: connect, orientation, unimplemented.",
-    },
-    // ---- error: common leaves ------------------------------------------
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "parse/general",
-        summary: "Generic parse failure.",
-        explanation: "The grammar rejected the text and no more specific \
-parse category applied. The caret in the message marks the first \
-unreadable token.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/resolution/table",
-        summary: "A named table (or relation) was not found.",
-        explanation: "The name does not exist in the current namespace. \
-Check spelling, the mounted namespace prefix (ns.table), and whether the \
-relation needs a mount!/consult! first.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/resolution/column",
-        summary: "A named column was not found in scope.",
-        explanation: "The column does not exist in the relation's schema at \
-this pipeline stage. Note that |> projection changes the visible \
-columns: a filter AFTER |> (a, b) sees only a and b.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/resolution/ambiguous",
-        summary: "A name matches more than one column in scope.",
-        explanation: "After a join, an unqualified column name exists on \
-more than one side. Qualify it with the relation alias (u.id).",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/arity",
-        summary: "Wrong number of arguments.",
-        explanation: "A function or predicate was called with the wrong \
-number of arguments for its declared arity.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/cast",
-        summary: "Invalid cast:() usage.",
-        explanation: "cast:(expr, type) takes a bare type name from the v1 \
-vocabulary: integer, real, text, numeric, boolean. Target engines apply \
-their own cast semantics (Postgres rounds real→integer; SQLite \
-truncates) — see the book's cast page.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/recursion",
-        summary: "A recursive definition breaks the recursion contract.",
-        explanation: "Family for refusals of recursive forms the language \
-does not permit (RECURSION-CONTRACT.md). DelightQL recursion is a \
-generator (co-recursion): each recursive clause sees only the previous \
-iteration's rows — never the accumulated result, never itself as a \
-callable. Forms outside that contract are refused here, each with its \
-rewrite path.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/recursion/nonlinear",
-        summary: "A recursive rule references itself more than once.",
-        explanation: "The frontier cannot join with itself (or with the \
-accumulated result) — forward evaluation carries one previous iteration. \
-Carry the values you need as columns of one frontier row instead: the \
-tupling transformation. fib is the canonical example — two self-calls \
-become one two-column state, (a, b) stepping to (b, a+b). \
-RECURSION-CONTRACT.md N1.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/recursion/aggregate",
-        summary: "Aggregation inside a recursive rule.",
-        explanation: "An aggregate over the frontier would need the \
-accumulated set, which a recursive rule never sees. Aggregate after the \
-fixpoint — strata are textual, so a later pipe stage aggregates the \
-finished recursion — or carry a running value as a column of the frontier \
-row when the aggregation is per-path. RECURSION-CONTRACT.md N3.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/recursion/self_subquery",
-        summary: "A recursive rule references itself inside a subquery.",
-        explanation: "Semi/anti-joins, IN, scalar subqueries, or derived \
-tables against the definition itself would need the accumulated set — a \
-recursive rule sees only the previous iteration's rows, as a direct \
-source. Track visited state in the frontier row (the visited-string \
-idiom), or deduplicate/filter after the fixpoint. \
-RECURSION-CONTRACT.md N4.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/recursion/argumentative_binding",
-        summary: "Argumentative binding on a recursive self-reference.",
-        explanation: "Renames and constraints on the self-reference \
-('c(m)' inside c's own definition) do not bind inside a recursive \
-definition yet — refused rather than returning wrong results. Use glob \
-binding 'c(*)' and rename or filter in a pipe stage. The proper fix (the \
-rename-hoist legalization: WITH c(m) AS (…)) is pending. \
-RECURSION-CONTRACT.md B2.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/recursion/limit_bound",
-        summary: "#<N inside a recursive rule has no spelling on this target.",
-        explanation: "DelightQL defines a row limit inside a recursive rule \
-as a TOTAL-ROW CAP on the fixpoint — a demand bound on the unfold. SQLite \
-and MySQL spell it natively (a trailing LIMIT on the recursive member); \
-this target has no single-statement equivalent, and the near-miss \
-spellings silently change meaning (a subquery LIMIT becomes per-iteration \
-— non-terminating). Rewrite the bound as a filter condition on the \
-recursive rule: a depth counter carried in the frontier row, or a value \
-predicate.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/recursion/consulted_clause_order",
-        summary: "Circular consulted-definition expansion (recursive clause \
-before base, or an indirect view cycle).",
-        explanation: "While inlining a consulted definition, the resolver \
-re-encountered a name it was already expanding — the self-reference did \
-not resolve as the in-progress recursive CTE, so expansion would never \
-terminate (this used to hang the compiler). The common cause: in a \
-consulted rules file, the recursive clause appears BEFORE the base clause \
-— clause order matters; a self-reference is only recursive once a prior \
-clause has established the name. Put the base (non-recursive) clause \
-first. If the cycle runs through another view (a uses v, v uses a), break \
-the cycle. The error message shows the expansion chain. \
-RECURSION-CONTRACT.md B5.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "semantic/compound/scalar_column",
-        summary: "A compound-value tool aimed at a plainly-scalar column.",
-        explanation: "Pathing ('col:{.field}', 'col:[0]') reaches into a \
-value; narrowing ('|> .col{.field}') iterates one. A column declared as a \
-plain scalar (INTEGER, REAL, BOOLEAN, dates) has no insides to reach into \
-and no rows to iterate — aiming these tools at it used to fail \
-target-dependently at runtime (sqlite: 'malformed JSON', or silent NULLs \
-when the scalar happened to parse as JSON). Refused at compile time \
-instead. TEXT columns stay permissive: documents live in TEXT, and \
-declarations cannot be trusted to deny it. Aim the tool at a compound \
-value: something built with {...}/[...], a tree-group, or a document \
-column.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "runtime/assertion",
-        summary: "An --assert query did not hold.",
-        explanation: "The main query executed, but an assertion attached to \
-the run returned false. Hookable for tests: (~~error://runtime/assertion ~~).",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "runtime/connection",
-        summary: "A database connection failed or was poisoned.",
-        explanation: "The connection to a mounted or primary database was \
-lost or unusable at execution time.",
-    },
-    RegistryEntry {
-        kind: UriKind::Error,
-        hierarchy: "operational/federation-prohibited",
-        summary: "One query may touch only one connection.",
-        explanation: "The query references namespaces served by different \
-connections. DelightQL deliberately does not federate: split the query, \
-or mount the data into one engine.",
-    },
-    // ---- danger ---------------------------------------------------------
-    RegistryEntry {
-        kind: UriKind::Danger,
-        hierarchy: "cardinality/nulljoin",
-        summary: "NULL-matching join equality (NULL = NULL → true).",
-        explanation: "OFF (default): join equality is SQL equality, where \
-NULL never matches. ON: NULLs match each other in join keys, which can \
-multiply rows AND changes what the join means — so this gate is \
-semantic-class: inline-only ((~~danger://cardinality/nulljoin ON~~)), \
-never a CLI flag. Consult sys.danger(*) for this session's states.",
-    },
-    RegistryEntry {
-        kind: UriKind::Danger,
-        hierarchy: "cardinality/cartesian",
-        summary: "Unrestricted cartesian product.",
-        explanation: "OFF (default): a join with no usable key is an error \
-(the classic accidental row explosion). ON: the cartesian product is \
-allowed. Guardrail-class: may be opened from the CLI (--danger \
-cardinality/cartesian=ON) or inline.",
-    },
-    RegistryEntry {
-        kind: UriKind::Danger,
-        hierarchy: "termination/unbounded",
-        summary: "Unbounded recursive query.",
-        explanation: "OFF (default): recursive queries must be bounded. ON: \
-unbounded recursion is allowed (the query may not terminate). \
-Guardrail-class: CLI-overridable.",
-    },
-    RegistryEntry {
-        kind: UriKind::Danger,
-        hierarchy: "semantics/min_multiplicity",
-        summary: "True INTERSECT ALL via ROW_NUMBER (min-multiplicity).",
-        explanation: "Changes what a set operator MEANS (bag semantics via \
-minimum multiplicity), so it is semantic-class: inline-only \
-((~~danger://semantics/min_multiplicity ON~~)), never a CLI flag — a \
-flag that silently changes query meaning would make the same text mean \
-different things in different shells.",
-    },
-    // ---- config ----------------------------------------------------------
-    RegistryEntry {
-        kind: UriKind::Config,
-        hierarchy: "generation/rule/inlining/view",
-        summary: "Inline consulted view rules instead of emitting CTEs.",
-        explanation: "Strategy selection, not meaning: with this ON the \
-compiler inlines view-rule bodies as subqueries rather than emitting \
-CTEs. Results are identical either way; generated SQL shape differs. \
-Inline: (~~config://generation/rule/inlining/view ON~~); CLI: --config.",
-    },
-    RegistryEntry {
-        kind: UriKind::Config,
-        hierarchy: "generation/rule/inlining/fact",
-        summary: "Inline consulted fact rules instead of emitting CTEs.",
-        explanation: "As generation/rule/inlining/view, for fact rules.",
-    },
-];
+/// Subcategory constants (STRING-FLOOR.md Tier 2a). Error sites reference
+/// these — never raw string literals — and the `subcategory_constants_are_
+/// registered` test below asserts every constant resolves to a registered
+/// hierarchy under its family's render prefix (`error_uri()`: Validation →
+/// `semantic/<sub>`, Parse → `parse/<sub>`). A typo'd subcategory can no
+/// longer silently mint a phantom identifier.
+pub mod subcat {
+    /// ValidationError family — rendered as `semantic/<const>`.
+    pub const RECURSION_LIMIT_BOUND: &str = "recursion/limit_bound";
+    pub const RECURSION_ARGUMENTATIVE_BINDING: &str = "recursion/argumentative_binding";
+    pub const RECURSION_CONSULTED_CLAUSE_ORDER: &str = "recursion/consulted_clause_order";
+    pub const COMPOUND_SCALAR_COLUMN: &str = "compound/scalar_column";
+    pub const SEMANTIC_FAMILY: &[&str] = &[
+        RECURSION_LIMIT_BOUND,
+        RECURSION_ARGUMENTATIVE_BINDING,
+        RECURSION_CONSULTED_CLAUSE_ORDER,
+        COMPOUND_SCALAR_COLUMN,
+    ];
+
+    /// ParseError family — rendered as `parse/<const>`.
+    pub const PARSE_DDL: &str = "ddl";
+    pub const PARSE_SIGIL: &str = "sigil";
+    pub const PARSE_FAMILY: &[&str] = &[PARSE_DDL, PARSE_SIGIL];
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -441,31 +172,67 @@ mod tests {
         );
     }
 
+    /// The burned rows, loaded exactly the way the live system loads
+    /// them: by executing bootstrap/schema.sql. The table is the source
+    /// (SYS-HELP-DESIGN.md phase 1); these tests keep it sound.
+    fn burned_rows() -> Vec<(UriKind, String, String, String)> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::bootstrap::BOOTSTRAP_SCHEMA).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT kind, hierarchy, summary, explanation FROM identifier")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .map(|(k, h, s, e)| (kind_from_word(&k).expect("bad kind word in identifier row"), h, s, e))
+            .collect::<Vec<_>>();
+        assert!(!rows.is_empty(), "identifier table must be seeded");
+        rows
+    }
+
     #[test]
-    fn registry_lookups() {
-        assert!(find(UriKind::Error, "semantic/resolution/column").is_some());
-        assert!(find(UriKind::Error, "not/a/thing").is_none());
-        // family listing
-        let kids = children(UriKind::Error, "semantic/resolution");
-        assert!(kids.len() >= 3);
-        // bare search
-        assert_eq!(find_bare("cardinality/nulljoin").len(), 1);
+    fn burned_registry_lookups() {
+        let rows = burned_rows();
+        let find = |kind: UriKind, h: &str| {
+            rows.iter().any(|(k, hh, _, _)| *k == kind && hh == h)
+        };
+        assert!(find(UriKind::Error, "semantic/resolution/column"));
+        assert!(!find(UriKind::Error, "not/a/thing"));
+        // family listing (segment-prefix semantics)
+        let kids = rows
+            .iter()
+            .filter(|(k, h, _, _)| *k == UriKind::Error && h.starts_with("semantic/resolution/"))
+            .count();
+        assert!(kids >= 3);
+        // bare search is unambiguous for this one
+        assert_eq!(
+            rows.iter().filter(|(_, h, _, _)| h == "cardinality/nulljoin").count(),
+            1
+        );
     }
 
     #[test]
     fn every_registered_danger_and_config_exists_in_its_runtime_registry() {
         use crate::pipeline::{danger_gates, option_map};
-        for e in REGISTRY {
-            match e.kind {
+        for (kind, hierarchy, _, _) in burned_rows() {
+            match kind {
                 UriKind::Danger => assert!(
-                    danger_gates::known_danger_hierarchies().contains(&e.hierarchy),
-                    "registry documents unknown danger {}",
-                    e.hierarchy
+                    danger_gates::known_danger_hierarchies().contains(&hierarchy.as_str()),
+                    "identifier row documents unknown danger {}",
+                    hierarchy
                 ),
                 UriKind::Config => assert!(
-                    option_map::known_config_hierarchies().contains(&e.hierarchy),
-                    "registry documents unknown config {}",
-                    e.hierarchy
+                    option_map::known_config_hierarchies().contains(&hierarchy.as_str()),
+                    "identifier row documents unknown config {}",
+                    hierarchy
                 ),
                 UriKind::Error => {}
             }
@@ -474,17 +241,15 @@ mod tests {
 
     #[test]
     fn error_entries_stay_inside_the_mintable_top_segments() {
-        // The error side can't be checked exhaustively (identities are
-        // minted dynamically), but soundness CAN be: a registry entry
-        // whose hierarchy starts outside the ratified top set documents
-        // a phantom the compiler can never mint.
-        for e in REGISTRY {
-            if e.kind == UriKind::Error {
-                let top = e.hierarchy.split('/').next().unwrap();
+        // Soundness: an identifier row whose hierarchy starts outside the
+        // ratified top set documents a phantom nothing can mint.
+        for (kind, hierarchy, _, _) in burned_rows() {
+            if kind == UriKind::Error {
+                let top = hierarchy.split('/').next().unwrap();
                 assert!(
                     ERROR_TOP_SEGMENTS.contains(&top),
-                    "error registry entry '{}' is outside the mintable top segments",
-                    e.hierarchy
+                    "error identifier row '{}' is outside the mintable top segments",
+                    hierarchy
                 );
             }
         }
@@ -493,18 +258,71 @@ mod tests {
     #[test]
     fn every_runtime_gate_and_config_is_documented() {
         use crate::pipeline::{danger_gates, option_map};
+        let rows = burned_rows();
+        let find = |kind: UriKind, h: &str| {
+            rows.iter().any(|(k, hh, _, _)| *k == kind && hh == h)
+        };
         for h in danger_gates::known_danger_hierarchies() {
             assert!(
-                find(UriKind::Danger, h).is_some(),
-                "danger {} has no registry entry — document it",
+                find(UriKind::Danger, h),
+                "danger {} has no identifier row — document it",
                 h
             );
         }
         for h in option_map::known_config_hierarchies() {
             assert!(
-                find(UriKind::Config, h).is_some(),
-                "config {} has no registry entry — document it",
+                find(UriKind::Config, h),
+                "config {} has no identifier row — document it",
                 h
+            );
+        }
+    }
+
+    /// STRING-FLOOR.md Tier 2a: every subcategory constant must resolve to
+    /// an identifier row under its family's render prefix (error_uri:
+    /// Validation → semantic/<sub>, Parse → parse/<sub>). Error sites use
+    /// the constants, never raw literals — so a typo'd subcategory fails
+    /// HERE instead of silently minting a phantom identifier at runtime.
+    /// (Ported to the burned rows at the sys::help phase-1 cutover.)
+    #[test]
+    fn subcategory_constants_are_registered() {
+        let rows = burned_rows();
+        let find = |h: &str| {
+            rows.iter()
+                .any(|(k, hh, _, _)| *k == UriKind::Error && hh == h)
+        };
+        for sub in subcat::SEMANTIC_FAMILY {
+            let h = format!("semantic/{}", sub);
+            assert!(
+                find(&h),
+                "subcategory constant '{}' has no identifier row at '{}' — \
+                 register it (append-only) or fix the constant",
+                sub,
+                h
+            );
+        }
+        for sub in subcat::PARSE_FAMILY {
+            let h = format!("parse/{}", sub);
+            assert!(
+                find(&h),
+                "subcategory constant '{}' has no identifier row at '{}' — \
+                 register it (append-only) or fix the constant",
+                sub,
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn identifier_rows_are_wellformed() {
+        // Append-only hygiene the schema cannot express: prose non-empty,
+        // hierarchies lowercase slash-paths, no accidental scheme prefixes.
+        for (_, hierarchy, summary, explanation) in burned_rows() {
+            assert!(!summary.trim().is_empty(), "{hierarchy}: empty summary");
+            assert!(!explanation.trim().is_empty(), "{hierarchy}: empty explanation");
+            assert!(
+                !hierarchy.contains("://") && !hierarchy.starts_with('/'),
+                "{hierarchy}: hierarchy must be a bare slash-path"
             );
         }
     }

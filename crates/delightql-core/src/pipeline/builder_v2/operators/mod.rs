@@ -140,7 +140,11 @@ fn parse_unary_operator_core(
                 containment_semantic: ContainmentSemantic::Parenthesis,
                 spec: ModuloSpec::GroupBy {
                     reducing_by: vec![],
-                    reducing_on: vec![aggregation],
+                    // Phantom-wrap: output decision stamped by the resolver.
+                    reducing_on: vec![OutputDomainExpression {
+                        expr: aggregation,
+                        output: PhaseBox::phantom(),
+                    }],
                     delegates: vec![],
                 },
             },

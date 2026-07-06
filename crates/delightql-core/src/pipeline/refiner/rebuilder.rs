@@ -438,7 +438,7 @@ fn build_tvf_relation(
                     .with_qualifier(qualifier)
                     .build()
             } else {
-                refined::DomainExpression::lvar_builder(s).build()
+                refined::DomainExpression::lvar_builder(s.as_str()).build()
             };
             crate::pipeline::asts::core::operators::HoArgument::Scalar(dom_expr)
         })

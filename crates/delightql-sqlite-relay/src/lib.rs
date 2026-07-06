@@ -53,6 +53,18 @@ pub struct SqlParty {
     next_handle_id: u64,
 }
 
+/// Convert a sqlite value to a wire cell plus the engine's storage class
+/// ("" for NULL — a null declares nothing about its column).
+fn value_to_cell(val: rusqlite::types::Value) -> (Cell, &'static str) {
+    match val {
+        rusqlite::types::Value::Null => (None, ""),
+        rusqlite::types::Value::Integer(n) => (Some(n.to_string().into_bytes()), "INTEGER"),
+        rusqlite::types::Value::Real(f) => (Some(f.to_string().into_bytes()), "REAL"),
+        rusqlite::types::Value::Text(s) => (Some(s.into_bytes()), "TEXT"),
+        rusqlite::types::Value::Blob(b) => (Some(b), "BLOB"),
+    }
+}
+
 impl SqlParty {
     pub fn new(connection: Arc<Mutex<rusqlite::Connection>>) -> Self {
         SqlParty {
@@ -118,10 +130,10 @@ impl SqlParty {
                 return;
             }
 
-            // Query: extract column names and declared types, then stream rows
+            // Query: extract column names and declared types, then stream rows.
             let columns: Vec<String> =
                 stmt.column_names().iter().map(|s| s.to_string()).collect();
-            let declared_types: Vec<String> = (0..stmt.column_count())
+            let mut declared_types: Vec<String> = (0..stmt.column_count())
                 .map(|i| {
                     stmt.columns()
                         .get(i)
@@ -130,20 +142,62 @@ impl SqlParty {
                         .to_string()
                 })
                 .collect();
-            if col_tx.send(Ok((columns, declared_types))).is_err() {
-                return; // receiver dropped
-            }
 
             let mut rows = match stmt.query([]) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(StreamBatch::Error(format!("{}", e)));
+                    let _ = col_tx.send(Err(format!("{}", e)));
                     return;
                 }
             };
 
+            // decl_type only exists for real table columns; expressions,
+            // aggregates, and anonymous tables (SELECT 1 AS x) report
+            // none, which downstream renders as stringly JSON. For those
+            // columns, peek the first row BEFORE the column handshake and
+            // let the engine's own storage class be the declaration —
+            // sqlite typed the value; this is not a parsing heuristic. A
+            // mixed column can make the first row unrepresentative, which
+            // is safe: the CLI's round-trip guard demotes any cell that
+            // does not match its descriptor back to a string.
+            let mut pending: Option<Vec<Cell>> = match rows.next() {
+                Ok(Some(row)) => {
+                    let ncols = row.as_ref().column_count();
+                    let mut cells: Vec<Cell> = Vec::with_capacity(ncols);
+                    for i in 0..ncols {
+                        let val: rusqlite::types::Value = row.get_unwrap(i);
+                        let (cell, storage_class) = value_to_cell(val);
+                        if declared_types[i].is_empty() && !storage_class.is_empty() {
+                            declared_types[i] = storage_class.to_string();
+                        }
+                        cells.push(cell);
+                    }
+                    Some(cells)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    // First-step failure: headers go out, then the error —
+                    // same shape a mid-stream step failure has always had.
+                    if col_tx.send(Ok((columns, declared_types))).is_err() {
+                        return;
+                    }
+                    let _ = tx.send(StreamBatch::Error(format!("{}", e)));
+                    return;
+                }
+            };
+            if col_tx.send(Ok((columns, declared_types))).is_err() {
+                return; // receiver dropped
+            }
+            if pending.is_none() {
+                let _ = tx.send(StreamBatch::Done);
+                return;
+            }
+
             loop {
                 let mut batch = Vec::with_capacity(BATCH_SIZE);
+                if let Some(first) = pending.take() {
+                    batch.push(first);
+                }
 
                 loop {
                     match rows.next() {
@@ -152,21 +206,7 @@ impl SqlParty {
                             let mut cells: Vec<Cell> = Vec::with_capacity(ncols);
                             for i in 0..ncols {
                                 let val: rusqlite::types::Value = row.get_unwrap(i);
-                                cells.push(match val {
-                                    rusqlite::types::Value::Null => None,
-                                    rusqlite::types::Value::Integer(n) => {
-                                        Some(n.to_string().into_bytes())
-                                    }
-                                    rusqlite::types::Value::Real(f) => {
-                                        Some(f.to_string().into_bytes())
-                                    }
-                                    rusqlite::types::Value::Text(s) => {
-                                        Some(s.into_bytes())
-                                    }
-                                    rusqlite::types::Value::Blob(b) => {
-                                        Some(b)
-                                    }
-                                });
+                                cells.push(value_to_cell(val).0);
                             }
                             batch.push(cells);
                             if batch.len() >= BATCH_SIZE {

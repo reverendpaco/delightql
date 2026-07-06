@@ -7,6 +7,7 @@ use crate::pipeline::{ast_resolved, ast_unresolved};
 
 use super::super::column_extraction::extract_provided_column_from_domain_expr;
 use super::helpers::{check_duplicate_user_names, restructure_tree_groups_for_grouping};
+use crate::pipeline::asts::core::PhaseBox;
 
 /// Extract all Lvar names from a resolved expression (recursing into concat chains).
 fn extract_lvar_names_from_expr(expr: &ast_resolved::DomainExpression) -> Vec<String> {
@@ -157,28 +158,6 @@ fn expand_concat_template(
             "catch-all hit in aggregation.rs expand_concat_template (DomainExpression): {:?}",
             other
         ),
-    }
-}
-
-/// Capture interior schemas for tree group columns in modulo output.
-///
-/// Scans reducing_on expressions for Curly functions (tree groups) with aliases,
-/// extracts their member schemas, and attaches them to the corresponding output columns.
-/// This enables InteriorDrillDown to know the schema of interior relations.
-fn capture_interior_schemas(
-    reducing_on: &[ast_resolved::DomainExpression],
-    output: &mut [ast_resolved::ColumnMetadata],
-) {
-    for expr in reducing_on {
-        if let Some((alias, schema)) = extract_interior_schema_from_expr(expr) {
-            // Find the output column with this alias and attach the schema
-            for col in output.iter_mut() {
-                if crate::pipeline::resolver::col_name_eq(col.name(), &alias) {
-                    col.interior_schema = Some(schema.clone());
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -410,29 +389,54 @@ pub(super) fn resolve_modulo_via_fold(
             reducing_on,
             delegates,
         } => {
-            // Complex GROUP BY with aggregations
-            let mut resolved_reducing_by =
+            // Complex GROUP BY with aggregations. Unwrap the phantom-stamped
+            // reducing_by keys to resolve them, then re-wrap EARLY with phantom
+            // stamps so the restructure/analyze helpers thread
+            // OutputDomainExpression once. The output decision is stamped in the
+            // keys stamping loop below (slice 4). Same idiom as reducing_on.
+            let reducing_by_exprs: Vec<_> =
+                reducing_by.into_iter().map(|ode| ode.expr).collect();
+            let mut resolved_reducing_by: Vec<ast_resolved::OutputDomainExpression> =
                 super::super::domain_expressions::projection::resolve_expressions_via_fold(
                     fold,
-                    reducing_by,
+                    reducing_by_exprs,
                     available,
                     false,
-                )?;
-            let mut resolved_reducing_on =
+                )?
+                .into_iter()
+                .map(|expr| ast_resolved::OutputDomainExpression {
+                    expr,
+                    output: PhaseBox::phantom(),
+                })
+                .collect();
+            // Unwrap the phantom-stamped reducing_on expressions to resolve them,
+            // then re-wrap EARLY with phantom stamps so the restructure/analyze/
+            // stamping helpers thread OutputDomainExpression once. The output
+            // decision is stamped in the output-assembly (stamping) loop below,
+            // after all restructuring moves.
+            let reducing_on_exprs: Vec<_> =
+                reducing_on.into_iter().map(|ode| ode.expr).collect();
+            let mut resolved_reducing_on: Vec<ast_resolved::OutputDomainExpression> =
                 super::super::domain_expressions::projection::resolve_expressions_via_fold(
                     fold,
-                    reducing_on,
+                    reducing_on_exprs,
                     available,
                     false,
-                )?;
+                )?
+                .into_iter()
+                .map(|expr| ast_resolved::OutputDomainExpression {
+                    expr,
+                    output: PhaseBox::phantom(),
+                })
+                .collect();
 
             // Populate pivot_values for PivotOf expressions from IN predicates
-            for expr in resolved_reducing_on.iter_mut() {
+            for ode in resolved_reducing_on.iter_mut() {
                 if let ast_resolved::DomainExpression::PivotOf {
                     pivot_key,
                     pivot_values,
                     ..
-                } = expr
+                } = &mut ode.expr
                 {
                     match pivot_key.as_ref() {
                         ast_resolved::DomainExpression::Lvar { name, .. } => {
@@ -508,21 +512,50 @@ pub(super) fn resolve_modulo_via_fold(
             // Compute output columns - GROUP BY columns plus aggregates
             let mut output = Vec::new();
 
-            // First add the GROUP BY columns
-            for (idx, expr) in resolved_reducing_by.iter().enumerate() {
-                if let Some(col) = extract_provided_column_from_domain_expr(expr, available, idx) {
-                    output.push(col);
-                }
+            // First add the GROUP BY columns. This loop is ALSO the stamping
+            // loop: each key expression records the output column it yields
+            // (slice 4). The push stays CONDITIONAL (a key whose extraction
+            // fails contributes no schema column, exactly as before), but the
+            // decision now rides on the expression as its stamp — so downstream
+            // lowering aliases keys from their own stamp instead of threading by
+            // position into the flat schema. That retires the offset-0 positional
+            // alias re-attach whose arithmetic silently shifted when a key stamped
+            // `None` made the flat key section shorter than `reducing_by.len()`.
+            // Position hint `idx` (0-based within
+            // reducing_by) is preserved byte-for-byte — it feeds computed-column
+            // name generation, not an index into `output`.
+            for (idx, ode) in resolved_reducing_by.iter_mut().enumerate() {
+                let stamp = match extract_provided_column_from_domain_expr(
+                    &ode.expr, available, idx,
+                ) {
+                    Some(col) => {
+                        output.push(col.clone());
+                        Some(col)
+                    }
+                    None => None,
+                };
+                ode.output = PhaseBox::new(stamp);
             }
 
-            // Then add aggregate/pivot columns
+            // Then add aggregate/pivot columns. This loop is ALSO the stamping
+            // loop: each reducing_on expression records the output column it
+            // yields (Batch 13, slice 4 step 2). A 1:1 aggregate stamps
+            // `Some(col)` in the same branch that pushes to the flat schema; a
+            // `PivotOf` is 1:N (one column per pivot value) and CANNOT stamp a
+            // single column — it stamps `None`. Pivot outputs stay
+            // node-schema-owned (the flat `output` below), consumed by
+            // `r_lower_pivot` over its own single list (the Batch-5 adjudicated
+            // positional residue). The stamp is the source of truth; `output` is
+            // a view assembled here.
             let base_idx = resolved_reducing_by.len();
-            for (idx, expr) in resolved_reducing_on.iter().enumerate() {
-                match expr {
+            for (idx, ode) in resolved_reducing_on.iter_mut().enumerate() {
+                match &ode.expr {
                     ast_resolved::DomainExpression::PivotOf { pivot_values, .. } => {
-                        // Add one output column per pivot value
+                        // 1:N — one output column per pivot value; node-schema-owned.
                         for value in pivot_values {
                             let col_name = value.to_lowercase();
+                            // Honest Fresh: a pivot output column is a computed
+                            // per-value aggregate, not a column of a source table.
                             output.push(ast_resolved::ColumnMetadata::new_with_name_flag(
                                 ast_resolved::ColumnProvenance::from_column(col_name),
                                 ast_resolved::TableName::Fresh,
@@ -530,15 +563,33 @@ pub(super) fn resolve_modulo_via_fold(
                                 true,
                             ));
                         }
+                        ode.output = PhaseBox::new(None);
                     }
                     _ => {
-                        if let Some(col) = extract_provided_column_from_domain_expr(
-                            expr,
+                        let stamp = match extract_provided_column_from_domain_expr(
+                            &ode.expr,
                             available,
                             base_idx + idx,
                         ) {
-                            output.push(col);
-                        }
+                            Some(mut col) => {
+                                // Attach the interior schema (tree-group members)
+                                // to the column BEFORE stamping, so the stamp
+                                // equals the flat-schema column byte-for-byte.
+                                // (Formerly a separate `capture_interior_schemas`
+                                // pass run AFTER assembly; folded in here so the
+                                // stamp == column invariant holds by
+                                // construction — see §3 of the batch report.)
+                                if let Some((_alias, schema)) =
+                                    extract_interior_schema_from_expr(&ode.expr)
+                                {
+                                    col.interior_schema = Some(schema);
+                                }
+                                output.push(col.clone());
+                                Some(col)
+                            }
+                            None => None,
+                        };
+                        ode.output = PhaseBox::new(stamp);
                     }
                 }
             }
@@ -573,10 +624,18 @@ pub(super) fn resolve_modulo_via_fold(
             // keys consumed later by the lowering.
             let mut resolved_delegates = Vec::with_capacity(delegates.len());
             for w in delegates {
-                let payload =
+                let payload_exprs = w.payload.into_iter().map(|ode| ode.expr).collect();
+                let payload: Vec<ast_resolved::OutputDomainExpression> =
                     super::super::domain_expressions::projection::resolve_expressions_via_fold(
-                        fold, w.payload, available, false,
-                    )?;
+                        fold, payload_exprs, available, false,
+                    )?
+                    .into_iter()
+                    // Output decision is stamped in the dedup/stamping loop below.
+                    .map(|expr| ast_resolved::OutputDomainExpression {
+                        expr,
+                        output: PhaseBox::phantom(),
+                    })
+                    .collect();
                 let order = w
                     .order
                     .into_iter()
@@ -601,36 +660,43 @@ pub(super) fn resolve_modulo_via_fold(
                 resolved_delegates.push(ast_resolved::DelegateSpec { payload, order });
             }
 
-            // Add delegate payload columns to output (order columns are not output).
-            // Dedup by name: a `(*)` payload expands to include the group key(s),
-            // which are already emitted in group position. The design rule is
-            // "grouping columns emit in their group position; `(*)` contributes
-            // everything else, deduped by name."
+            // Stamp each delegate payload expression with its output decision,
+            // and assemble the flat output schema FROM those stamps (stamps =
+            // source of truth, the flat Vec = a view). Dedup by name: a `(*)`
+            // payload expands to include the group key(s), which are already
+            // emitted in group position. The design rule is "grouping columns
+            // emit in their group position; `(*)` contributes everything else,
+            // deduped by name." A stamp of `None` = this expression yields no
+            // output column (dup-of-key, or extraction produced nothing); the
+            // lowering skips it instead of re-deriving the dedup.
             let mut seen_names: std::collections::HashSet<String> =
                 output.iter().map(|c| c.name().to_string()).collect();
             let base_idx = resolved_reducing_by.len() + resolved_reducing_on.len();
             let mut delegate_col_idx = 0;
-            for w in &resolved_delegates {
-                for expr in &w.payload {
-                    if let Some(col) = extract_provided_column_from_domain_expr(
-                        expr,
+            for w in &mut resolved_delegates {
+                for ode in &mut w.payload {
+                    let stamp = match extract_provided_column_from_domain_expr(
+                        &ode.expr,
                         available,
                         base_idx + delegate_col_idx,
                     ) {
-                        if seen_names.insert(col.name().to_string()) {
-                            output.push(col);
+                        Some(col) if seen_names.insert(col.name().to_string()) => {
+                            output.push(col.clone());
+                            Some(col)
                         }
-                    }
+                        _ => None,
+                    };
+                    ode.output = PhaseBox::new(stamp);
                     delegate_col_idx += 1;
                 }
             }
 
             check_duplicate_user_names(&output)?;
 
-            // Capture interior schemas for tree group columns
-            // When reducing_on contains a Curly function with an alias (e.g., ~> {name, type} as entities),
-            // attach the interior schema to the corresponding output column so drill-down can use it.
-            capture_interior_schemas(&resolved_reducing_on, &mut output);
+            // (Interior schemas for tree-group columns are attached in the
+            // stamping loop above, before each stamp is cloned, so stamp ==
+            // output column. The former standalone `capture_interior_schemas`
+            // pass is retired.)
 
             let spec = ast_resolved::ModuloSpec::GroupBy {
                 reducing_by: resolved_reducing_by,

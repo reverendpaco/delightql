@@ -45,10 +45,18 @@ impl SqlDialect {
             Ok(v) => match Self::from_family_name(v.trim()) {
                 Some(d) => Some(d),
                 None => {
-                    eprintln!(
-                        "warning: unknown DQL_DIALECT '{}' (expected sqlite|postgres|mysql|sqlserver|duckdb); ignoring",
-                        v
-                    );
+                    // The dql CLI refuses an unknown DQL_DIALECT at startup
+                    // (delightql-cli main.rs), so this lenient path serves
+                    // embedded/library contexts only. Once: this is consulted
+                    // per compile stage and used to warn three times for one
+                    // query (bugs/cli-surface-2026-07-05/PLAN.md #4).
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        eprintln!(
+                            "warning: unknown DQL_DIALECT '{}' (expected sqlite|postgres|mysql|sqlserver|duckdb); ignoring",
+                            v
+                        );
+                    });
                     None
                 }
             },

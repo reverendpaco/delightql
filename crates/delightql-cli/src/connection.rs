@@ -508,7 +508,11 @@ impl ConnectionManager {
         // Second factory (types-level) powers mount!/import! of URI-scheme
         // databases (pipe://, etc.). Same unit struct, both trait impls.
         let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
-        delightql_core::api::open(factory, Some(mount_factory))
+        delightql_core::api::open(
+            factory,
+            Some(mount_factory),
+            Some(crate::help_surface::build()),
+        )
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 }

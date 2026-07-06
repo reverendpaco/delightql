@@ -116,7 +116,7 @@ pub unsafe extern "C" fn dql_open(
     // powers mount!/import! of URI-scheme databases.
     let factory = Box::new(factory::CabiConnectionFactory);
     let mount_factory = Box::new(factory::CabiConnectionFactory);
-    let mut handle: Box<dyn api::DqlHandle> = match api::open(factory, Some(mount_factory)) {
+    let mut handle: Box<dyn api::DqlHandle> = match api::open(factory, Some(mount_factory), None) {
         Ok(h) => h,
         Err(e) => {
             set_error(error_out, &e);

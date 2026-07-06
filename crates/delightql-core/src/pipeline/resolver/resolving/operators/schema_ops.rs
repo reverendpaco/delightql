@@ -36,7 +36,7 @@ pub(super) fn resolve_project_out(
                 any_qualified = true;
             }
             output_columns.retain(|col| {
-                if !crate::pipeline::resolver::col_name_eq(col.name(), name) {
+                if !delightql_types::SqlIdentifier::str_eq(col.name(), name) {
                     return true; // Different name, keep
                 }
                 // Same name — if qualifier specified, only remove from matching table
@@ -116,13 +116,13 @@ pub(super) fn resolve_rename_cover(
                 // Find the column metadata for template expansion, respecting qualifier
                 let col_idx = if let Some(qual) = qualifier {
                     available.iter().position(|col| {
-                        crate::pipeline::resolver::col_name_eq(col.name(), name)
+                        delightql_types::SqlIdentifier::str_eq(col.name(), name)
                             && matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
                     })
                 } else {
                     available
                         .iter()
-                        .position(|col| crate::pipeline::resolver::col_name_eq(col.name(), name))
+                        .position(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
                 };
 
                 let col_idx = col_idx.ok_or_else(|| {
@@ -163,7 +163,7 @@ pub(super) fn resolve_rename_cover(
         let collides_with_passthrough = available.iter().enumerate().any(|(i, col)| {
             i != *idx
                 && !rename_map.contains_key(&i)
-                && crate::pipeline::resolver::col_name_eq(col.name(), new_name)
+                && delightql_types::SqlIdentifier::str_eq(col.name(), new_name)
         });
         if collides_with_passthrough {
             return Err(DelightQLError::validation_error_categorized(
@@ -250,7 +250,7 @@ pub(super) fn resolve_reposition(
         let column_idx = match &spec.column {
             ast_unresolved::DomainExpression::Lvar { name, .. } => available
                 .iter()
-                .position(|col| crate::pipeline::resolver::col_name_eq(col.name(), name))
+                .position(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
                 .ok_or_else(|| {
                     crate::error::DelightQLError::column_not_found_error(
                         name.as_str(),
@@ -372,6 +372,7 @@ pub(super) fn resolve_witness(
 )> {
     // Helper to create a synthetic column for the witness relation
     fn make_witness_column(name: &str, position: usize) -> ast_resolved::ColumnMetadata {
+        // Honest Fresh: "met" is a synthesized existence flag, not a table column.
         ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(name.to_string()),
             ast_resolved::TableName::Fresh,
@@ -408,6 +409,8 @@ pub(super) fn resolve_meta_ize(
 )> {
     // Helper to create a synthetic column for the meta relation
     fn make_meta_column(name: &str, position: usize) -> ast_resolved::ColumnMetadata {
+        // Honest Fresh: meta columns (scope, column_name, ...) are a synthesized
+        // schema vocabulary, not columns of any source table.
         ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(name.to_string()),
             ast_resolved::TableName::Fresh,
@@ -485,7 +488,7 @@ pub(super) fn resolve_using(
     for col_name in &columns {
         let exists = available.iter().any(|c| {
             c.info.name().map_or(false, |n| {
-                crate::pipeline::resolver::col_name_eq(n, col_name)
+                delightql_types::SqlIdentifier::str_eq(n, col_name)
             })
         });
         if !exists {
@@ -605,7 +608,7 @@ pub(super) fn resolve_interior_drill_down(
     let drilled_col =
         available
             .iter()
-            .find(|col| crate::pipeline::resolver::col_name_eq(col.name(), &column))
+            .find(|col| delightql_types::SqlIdentifier::str_eq(col.name(), &column))
             .ok_or_else(|| {
                 crate::error::DelightQLError::validation_error(
                     format!(
@@ -635,7 +638,7 @@ pub(super) fn resolve_interior_drill_down(
 
     // 3a. Add all input columns EXCEPT the drilled column (context carry-forward)
     for col in available {
-        if !crate::pipeline::resolver::col_name_eq(col.name(), &column) {
+        if !delightql_types::SqlIdentifier::str_eq(col.name(), &column) {
             output_columns.push(col.clone());
         }
     }
@@ -710,8 +713,13 @@ pub(super) fn resolve_interior_drill_down(
             continue;
         }
         resolved_col_list.push(def.name.clone());
+        // The drilled column stands as the interior fields' source table.
         let mut col = ast_resolved::ColumnMetadata::new(
-            ast_resolved::ColumnProvenance::from_column(output_name.clone()),
+            ast_resolved::ColumnProvenance::from_table_column(
+                output_name.clone(),
+                ast_resolved::TableName::Named(column.clone().into()),
+                crate::pipeline::asts::core::QualificationSource::None,
+            ),
             ast_resolved::TableName::Named(column.clone().into()),
             Some(output_columns.len() + idx + 1),
         );
@@ -767,7 +775,7 @@ pub(super) fn resolve_narrowing_destructure(
     // 1. Verify column exists in input schema
     let col = available
         .iter()
-        .find(|col| crate::pipeline::resolver::col_name_eq(col.name(), &column))
+        .find(|col| delightql_types::SqlIdentifier::str_eq(col.name(), &column))
         .ok_or_else(|| {
             crate::error::DelightQLError::validation_error(
                 format!(
@@ -797,7 +805,7 @@ pub(super) fn resolve_narrowing_destructure(
                 column, decl
             ),
             context: "resolver::narrowing_destructure".to_string(),
-            subcategory: Some("compound/scalar_column"),
+            subcategory: Some(crate::uri_registry::subcat::COMPOUND_SCALAR_COLUMN),
         });
     }
 
@@ -806,6 +814,8 @@ pub(super) fn resolve_narrowing_destructure(
     let mut output_columns = Vec::new();
     for (idx, field) in fields.iter().enumerate() {
         let output_name = field.rsplit('.').next().unwrap_or(field).to_string();
+        // Honest Fresh: a destructured field is an extracted value with no context
+        // carry-forward (see above) — no source table.
         let col = ast_resolved::ColumnMetadata::new(
             ast_resolved::ColumnProvenance::from_column(output_name),
             ast_resolved::TableName::Fresh,

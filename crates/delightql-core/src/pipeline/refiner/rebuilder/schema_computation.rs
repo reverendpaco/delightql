@@ -41,7 +41,11 @@ pub(super) fn extract_schema(expr: &refined::RelationalExpression) -> CprSchema 
                                     _ => format!("expr_{}", i + 1).into(),
                                 };
                                 ColumnMetadata::new(
-                                    resolved::ColumnProvenance::from_column(col_name),
+                                    resolved::ColumnProvenance::from_table_column(
+                                        col_name,
+                                        table_name.clone(),
+                                        crate::pipeline::asts::core::QualificationSource::None,
+                                    ),
                                     table_name.clone(),
                                     Some(i),
                                 )
@@ -276,6 +280,7 @@ pub(super) fn compute_pipe_schema(
                         TableName::Fresh,
                         Some(i),
                     ),
+                    // Honest Fresh: a literal has no source table.
                     refined::DomainExpression::Literal { .. } => ColumnMetadata::new(
                         resolved::ColumnProvenance::from_column(format!("literal_{}", i + 1)),
                         TableName::Fresh,
@@ -283,6 +288,8 @@ pub(super) fn compute_pipe_schema(
                     ),
                     _ => {
                         // Other expressions without alias: generate a name
+                        // Honest Fresh: a generated name for a computed (non-column)
+                        // expression has no source table.
                         ColumnMetadata::new(
                             resolved::ColumnProvenance::from_column(
                                 crate::pipeline::naming::generate_refined_domain_expression_column_name(expr, i)

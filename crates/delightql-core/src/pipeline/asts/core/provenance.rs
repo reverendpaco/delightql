@@ -110,6 +110,17 @@ pub enum IdentityContext {
     /// MAP-COVER transformation applied
     MapCoverTransform { function: String },
 
+    /// Output column derived from exactly one source column through a
+    /// value-transforming expression (cast, function, arithmetic, …).
+    /// Unlike UserAlias/PipeBarrier, the value changed: the source column
+    /// is lineage, not a usable-as-is synonym.
+    Derived {
+        previous_name: String,
+        /// What transformed it: SQL function name, "cast", or an operator
+        /// spelling — diagnostic only, never rendered.
+        via: String,
+    },
+
     /// Generated name for expression/function
     Generated { reason: String, position: usize },
 
@@ -168,6 +179,7 @@ impl IdentityContext {
             IdentityContext::CteRegistration { .. } => "CteRegistration",
             IdentityContext::SubqueryAlias { .. } => "SubqueryAlias",
             IdentityContext::MapCoverTransform { .. } => "MapCoverTransform",
+            IdentityContext::Derived { .. } => "Derived",
             IdentityContext::Generated { .. } => "Generated",
             IdentityContext::PositionalPattern { .. } => "PositionalPattern",
             IdentityContext::UsingUnification { .. } => "UsingUnification",

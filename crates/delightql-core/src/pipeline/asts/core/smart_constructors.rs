@@ -5,16 +5,17 @@
 
 use crate::pipeline::asts::core::{
     BooleanExpression, ContainmentSemantic, DomainExpression, FilterOrigin, FunctionExpression,
-    JoinType, LiteralValue, ModuloSpec, OrderingSpec, PhaseBox, RelationalExpression, RenameSpec,
-    SigmaCondition, UnaryRelationalOperator, UsingColumn,
+    JoinType, LiteralValue, ModuloSpec, OrderingSpec, OutputDomainExpression, PhaseBox,
+    RelationalExpression, RenameSpec, SigmaCondition, UnaryRelationalOperator, UsingColumn,
 };
+use delightql_types::SqlIdentifier;
 
 // ============================================================================
 // DomainExpression Builders
 // ============================================================================
 
 impl<Phase> DomainExpression<Phase> {
-    pub fn lvar_builder(name: impl Into<String>) -> LvarBuilder<Phase> {
+    pub fn lvar_builder(name: impl Into<SqlIdentifier>) -> LvarBuilder<Phase> {
         LvarBuilder {
             name: name.into(),
             qualifier: None,
@@ -52,16 +53,25 @@ impl<Phase> DomainExpression<Phase> {
 // ============================================================================
 
 pub struct LvarBuilder<Phase> {
-    name: String,
-    qualifier: Option<String>,
+    name: SqlIdentifier,
+    qualifier: Option<SqlIdentifier>,
     namespace_path: Vec<String>,
-    alias: Option<String>,
+    alias: Option<SqlIdentifier>,
     _phase: std::marker::PhantomData<Phase>,
 }
 
 impl<Phase> LvarBuilder<Phase> {
-    pub fn with_qualifier<T: Into<Option<String>>>(mut self, qualifier: T) -> Self {
-        self.qualifier = qualifier.into();
+    /// Set the qualifier, preserving the caller's SqlIdentifier (stroppedness
+    /// survives). `String`/`&str` land unstropped via the From impls.
+    pub fn with_qualifier(mut self, qualifier: impl Into<SqlIdentifier>) -> Self {
+        self.qualifier = Some(qualifier.into());
+        self
+    }
+
+    /// Optional-qualifier form: for callers that already hold an
+    /// `Option<SqlIdentifier>` (e.g. parse_lvar). `None` clears the qualifier.
+    pub fn with_qualifier_opt(mut self, qualifier: Option<SqlIdentifier>) -> Self {
+        self.qualifier = qualifier;
         self
     }
 
@@ -70,19 +80,26 @@ impl<Phase> LvarBuilder<Phase> {
         self
     }
 
-    pub fn with_alias<T: Into<Option<String>>>(mut self, alias: T) -> Self {
-        self.alias = alias.into();
+    /// Set the alias, preserving the caller's SqlIdentifier.
+    pub fn with_alias(mut self, alias: impl Into<SqlIdentifier>) -> Self {
+        self.alias = Some(alias.into());
+        self
+    }
+
+    /// Optional-alias form (mirrors `with_qualifier_opt`).
+    pub fn with_alias_opt(mut self, alias: Option<SqlIdentifier>) -> Self {
+        self.alias = alias;
         self
     }
 
     pub fn build(self) -> DomainExpression<Phase> {
         use crate::pipeline::asts::unresolved::NamespacePath;
         DomainExpression::Lvar {
-            name: self.name.into(),
-            qualifier: self.qualifier.map(|s| s.into()),
+            name: self.name,
+            qualifier: self.qualifier,
             namespace_path: NamespacePath::from_parts(self.namespace_path)
                 .expect("Invalid namespace path"),
-            alias: self.alias.map(|s| s.into()),
+            alias: self.alias,
             provenance: PhaseBox::phantom(),
         }
     }
@@ -456,8 +473,21 @@ impl<Phase> PipeBuilder<Phase> {
         self.operator = Some(UnaryRelationalOperator::Modulo {
             containment_semantic: ContainmentSemantic::Parenthesis,
             spec: ModuloSpec::GroupBy {
-                reducing_by,
-                reducing_on,
+                // Phantom-wrap: the output decision is stamped by the resolver.
+                reducing_by: reducing_by
+                    .into_iter()
+                    .map(|expr| OutputDomainExpression {
+                        expr,
+                        output: PhaseBox::phantom(),
+                    })
+                    .collect(),
+                reducing_on: reducing_on
+                    .into_iter()
+                    .map(|expr| OutputDomainExpression {
+                        expr,
+                        output: PhaseBox::phantom(),
+                    })
+                    .collect(),
                 delegates: vec![], // Default to empty
             },
         });

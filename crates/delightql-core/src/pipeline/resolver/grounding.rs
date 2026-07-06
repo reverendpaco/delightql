@@ -90,7 +90,7 @@ fn lookup_borrowed_function(
         let fq = namespace_path_to_fq(ns);
         Ok(consult
             .lookup_entity(name, &fq)
-            .filter(|e| e.entity_type == EntityType::DqlFunctionExpression.as_i32()))
+            .filter(|e| e.entity_type == EntityType::DqlFunctionExpression))
     } else {
         consult.lookup_enlisted_function(name)
     }
@@ -106,7 +106,7 @@ fn lookup_borrowed_context_aware_function(
         let fq = namespace_path_to_fq(ns);
         Ok(consult
             .lookup_entity(name, &fq)
-            .filter(|e| e.entity_type == EntityType::DqlContextAwareFunctionExpression.as_i32()))
+            .filter(|e| e.entity_type == EntityType::DqlContextAwareFunctionExpression))
     } else {
         consult.lookup_enlisted_context_aware_function(name)
     }
@@ -663,13 +663,13 @@ impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
                     let fq = namespace_path_to_fq(ns);
                     self.consult
                         .lookup_entity(&name, &fq)
-                        .filter(|e| e.entity_type == EntityType::DqlFunctionExpression.as_i32())
+                        .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
                 } else {
                     self.grounding.grounded_ns.iter().find_map(|ns| {
                         let fq = namespace_path_to_fq(ns);
                         self.consult
                             .lookup_entity(&name, &fq)
-                            .filter(|e| e.entity_type == EntityType::DqlFunctionExpression.as_i32())
+                            .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
                     })
                 };
 
@@ -729,13 +729,13 @@ impl GroundedInliner<'_> {
                 let fq = namespace_path_to_fq(ns);
                 self.consult
                     .lookup_entity(&name, &fq)
-                    .filter(|e| e.entity_type == EntityType::DqlFunctionExpression.as_i32())
+                    .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
             } else {
                 self.grounding.grounded_ns.iter().find_map(|ns| {
                     let fq = namespace_path_to_fq(ns);
                     self.consult
                         .lookup_entity(&name, &fq)
-                        .filter(|e| e.entity_type == EntityType::DqlFunctionExpression.as_i32())
+                        .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
                 })
             };
             if let Some(entity) = entity {

@@ -79,6 +79,11 @@ impl<'a> CstNode<'a> {
         })
     }
 
+    /// `field_text` that preserves stroppedness (see `unstrop_identifier`).
+    pub fn field_identifier(&self, field_name: &str) -> Option<delightql_types::SqlIdentifier> {
+        self.field(field_name).map(|n| unstrop_identifier(n.text()))
+    }
+
     pub fn has_child(&self, kind: &str) -> bool {
         self.children().any(|child| child.is_kind(kind))
     }
@@ -155,6 +160,45 @@ pub fn unstrop(text: &str) -> String {
         .and_then(|s| s.strip_suffix('`'))
         .unwrap_or(text)
         .to_string()
+}
+
+/// Identifier from CST text, PRESERVING stroppedness: backtick-wrapped
+/// becomes a stropped (case-sensitive) SqlIdentifier, bare text an
+/// unstropped one. Prefer this over `unstrop` wherever the result is an
+/// identifier — `unstrop` erases the case-sensitivity contract.
+pub fn unstrop_identifier(text: &str) -> delightql_types::SqlIdentifier {
+    match text.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+        Some(inner) => delightql_types::SqlIdentifier::stropped(inner),
+        None => delightql_types::SqlIdentifier::new(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unstrop_identifier;
+
+    #[test]
+    fn unstrop_identifier_bare_is_unstropped() {
+        let id = unstrop_identifier("mycol");
+        assert!(!id.is_stropped());
+        assert_eq!(id.as_str(), "mycol");
+    }
+
+    #[test]
+    fn unstrop_identifier_backticked_is_stropped_inner_text() {
+        let id = unstrop_identifier("`MyCol`");
+        assert!(id.is_stropped());
+        assert_eq!(id.as_str(), "MyCol");
+    }
+
+    #[test]
+    fn unstrop_identifier_backticked_lowercase_reserved_word_is_stropped() {
+        // The common reserved-word case: `null`. Stropped, but fold and exact
+        // agree on lowercase so it still matches an unstropped `null`.
+        let id = unstrop_identifier("`null`");
+        assert!(id.is_stropped());
+        assert_eq!(id.as_str(), "null");
+    }
 }
 
 /// Check if a CST node or any of its descendants is an error or missing

@@ -683,14 +683,14 @@ fn remap_operator_qualifiers(
                 delegates,
             } => {
                 for e in reducing_by {
-                    remap_domexpr_qualifiers(e, remap);
+                    remap_domexpr_qualifiers(&mut e.expr, remap);
                 }
                 for e in reducing_on {
-                    remap_domexpr_qualifiers(e, remap);
+                    remap_domexpr_qualifiers(&mut e.expr, remap);
                 }
                 for w in delegates {
                     for e in &mut w.payload {
-                        remap_domexpr_qualifiers(e, remap);
+                        remap_domexpr_qualifiers(&mut e.expr, remap);
                     }
                     for o in &mut w.order {
                         remap_domexpr_qualifiers(&mut o.column, remap);

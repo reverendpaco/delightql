@@ -62,7 +62,7 @@ pub(super) fn resolve_general_via_fold(
             if let Some(alias_name) = alias {
                 if available
                     .iter()
-                    .any(|col| col.name() == alias_name.as_str())
+                    .any(|col| alias_name == col.name())
                 {
                     return Err(DelightQLError::validation_error_categorized(
                         "constraint",

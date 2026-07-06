@@ -113,6 +113,44 @@ pub trait ConnectionFactory: Send + Sync {
     ) -> std::result::Result<CreatedConnection, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+// --- sys::help ring 1 (SYS-HELP-DESIGN.md phase 2) ---
+
+/// The host binary's own surface, described as plain data and seeded
+/// into the `sys::help` ring-1 tables at session init. The clap tree
+/// lives in the CLI and the burn-in lives here, so DATA crosses the
+/// boundary and core owns the writes — runtime generation means the
+/// rows structurally cannot drift from the binary that serves them.
+/// Headless hosts (wasm, cabi) pass None: no surface, empty tables.
+#[derive(Default)]
+pub struct HelpSurface {
+    /// (name, parent command or None for root, comma-joined aliases, summary)
+    pub commands: Vec<(String, Option<String>, Option<String>, String)>,
+    /// (command, long, short, value_name, default, global, repeatable, summary)
+    pub options: Vec<HelpOption>,
+    /// (command, option, value, summary, class, grade)
+    pub option_values: Vec<(String, String, String, Option<String>, Option<String>, Option<String>)>,
+    /// (name, summary)
+    pub dot_commands: Vec<(String, String)>,
+    /// (name, effect, equivalent flag)
+    pub envs: Vec<(String, String, Option<String>)>,
+    /// (code, context, meaning, class, grade)
+    pub exit_codes: Vec<(i64, String, String, Option<String>, Option<String>)>,
+    /// (name, section, troff, plain) — plain scrubbed from troff by the
+    /// host at surface-build time (in sync by construction)
+    pub man_pages: Vec<(String, i64, String, String)>,
+}
+
+pub struct HelpOption {
+    pub command: String,
+    pub long: String,
+    pub short: Option<String>,
+    pub value_name: Option<String>,
+    pub default_value: Option<String>,
+    pub global: bool,
+    pub repeatable: bool,
+    pub summary: String,
+}
+
 // --- Entry point ---
 pub use crate::open::open;
 

@@ -2,7 +2,7 @@
 // Copyright 2026 Daniel Eklund
 //! Specification types for various operations
 
-use super::{Addressed, DomainExpression, Refined, Resolved, Unresolved};
+use super::{Addressed, ColumnMetadata, DomainExpression, PhaseBox, Refined, Resolved, Unresolved};
 use crate::{lispy::ToLispy, PhaseConvert, ToLispy};
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +24,8 @@ pub enum ModuloSpec<Phase = Unresolved> {
     /// Complex grouping with aggregations
     #[lispy("modulo_spec:group_by")]
     GroupBy {
-        reducing_by: Vec<DomainExpression<Phase>>,
-        reducing_on: Vec<DomainExpression<Phase>>,
+        reducing_by: Vec<OutputDomainExpression<Phase>>,
+        reducing_on: Vec<OutputDomainExpression<Phase>>,
         /// Delegate selections: pull the reduction back to a representative row.
         /// Each spec carries a payload (the columns surfaced) and an ordering
         /// (empty == arbitrary delegate; non-empty == ordered delegate / DISTINCT ON).
@@ -40,8 +40,23 @@ pub enum ModuloSpec<Phase = Unresolved> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
 #[lispy("delegate_spec")]
 pub struct DelegateSpec<Phase = Unresolved> {
-    pub payload: Vec<DomainExpression<Phase>>,
+    pub payload: Vec<OutputDomainExpression<Phase>>,
     pub order: Vec<OrderingSpec<Phase>>,
+}
+
+/// An output-producing DOMAIN expression paired with the resolver's
+/// decision about the column it yields. Phantom before resolution.
+/// `None` after resolution = the resolver decided this expression
+/// contributes NO output column (today: a delegate payload that
+/// duplicates a group key, which is already emitted in group position).
+/// (Named to keep the domain/relational distinction loud: relational
+/// nodes advertise whole schemas; this pairs one scalar-level
+/// expression with its one output decision.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
+#[lispy("output_domain_expression")]
+pub struct OutputDomainExpression<Phase = Unresolved> {
+    pub expr: DomainExpression<Phase>,
+    pub output: PhaseBox<Option<ColumnMetadata>, Phase>,
 }
 
 /// Ordering direction for ORDER BY

@@ -1,0 +1,81 @@
+.TH DQL-TARGET 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-target \- manage target adapters (fatboys, the per-engine co-processes)
+.SH SYNOPSIS
+.B dql target list
+.br
+.B dql target install
+.I PROFILE
+.BI \-\-from " DIR"
+.br
+.B dql target verify
+.SH DESCRIPTION
+The slim
+.B dql
+binary speaks SQLite natively; other engines are reached through
+separate adapter binaries named
+.IR dql\-fatboy\-<profile> .
+An adapter is resolved by searching, in order:
+.IP 1. 3
+.B DQL_FATBOY_DIR
+(hard pin \(em when set, nothing else is searched);
+.IP 2. 3
+next to the
+.B dql
+binary;
+.IP 3. 3
+the adapter store
+.RI ( ~/.local/share/delightql/fatboys/<version> );
+.IP 4. 3
+.BR PATH .
+.SH COMMANDS
+.TP
+.BR list ", " ls
+Show each known adapter profile, whether it is installed, where it
+resolves from, and its size. Also prints the adapter store path.
+.TP
+.BI install " PROFILE " \-\-from " DIR"
+Copy the adapter binary for
+.I PROFILE
+(e.g.
+.BR postgres ,
+.BR duckdb )
+from a local artifact directory into the adapter store.
+.I DIR
+holds either a bare
+.I dql\-fatboy\-<profile>
+or a release artifact named
+.I dql\-fatboy\-<profile>\-<version>+<commit>\-<os>\-<arch>
+(what scripts/release-build.py writes to dist/). The binary is verified
+against the digests burned into this
+.B dql
+at release time \(em a mismatch refuses and nothing is installed.
+Downloading from a published artifact host is a future source behind
+the same verification; no host exists yet, so
+.B \-\-from
+is effectively required.
+.TP
+.B verify
+Re-hash installed adapters against the digests burned into this
+.B dql
+at release time. Exits nonzero on any mismatch. Refuses on dev builds,
+which carry no digests (see
+.BR dql-version (1)).
+.SH EXIT STATUS
+0 on success; 1 on refusal (missing
+.BR \-\-from ,
+dev-build verify, digest mismatch).
+.SH ENVIRONMENT
+.TP
+.B DQL_FATBOY_DIR
+Hard-pins adapter resolution to one directory.
+.SH EXAMPLES
+.EX
+$ dql target list
+$ dql target install postgres --from dist/
+$ dql target verify
+.EE
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-version (1),
+.BR dql-server (1)

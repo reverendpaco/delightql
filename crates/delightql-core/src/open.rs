@@ -223,6 +223,7 @@ impl DqlHandleImpl {
 pub fn open(
     factory: Box<dyn ConnectionFactory>,
     mount_factory: Option<Box<dyn delightql_types::ConnectionFactory>>,
+    help_surface: Option<api::HelpSurface>,
 ) -> Result<Box<dyn api::DqlHandle>, String> {
     let created = factory
         .create(":memory:")
@@ -234,6 +235,17 @@ pub fn open(
     if let Some(mf) = mount_factory {
         system.set_connection_factory(mf);
     }
+
+    // sys::help ring 1: seed the host's surface rows (SYS-HELP-DESIGN.md
+    // phase 2). None (wasm/cabi) = no surface = legitimately empty tables.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ref surface) = help_surface {
+        system
+            .seed_help_surface(surface)
+            .map_err(|e| format!("{}", e))?;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = help_surface;
 
     Ok(Box::new(DqlHandleImpl {
         system: Box::new(system),

@@ -113,7 +113,7 @@ pub(super) fn apply_pattern_resolver(
         for col_name in using_cols {
             let exists = base_cols
                 .iter()
-                .any(|c| super::col_name_eq(c.name(), col_name));
+                .any(|c| delightql_types::SqlIdentifier::str_eq(c.name(), col_name));
             if !exists {
                 return Err(DelightQLError::column_not_found_error(
                     col_name.clone(),
@@ -298,12 +298,12 @@ pub(super) fn resolve_ground(
     // CTEs can't have namespace paths (they're query-local), so this is safe
     let resolution = if let Some(ref grounding) = identifier.grounding {
         // F^S.e(*) — only entities in S are visible. Never look in F.
-        let mut found_entity: Option<(String, i32, String)> = None;
+        let mut found_entity: Option<(String, crate::enums::EntityType, String)> = None;
         for ns in &grounding.grounded_ns {
             let fq = super::grounding::namespace_path_to_fq(ns);
             if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &fq) {
-                if entity.entity_type == BootstrapEntityType::DqlTemporaryViewExpression.as_i32()
-                    || entity.entity_type == BootstrapEntityType::DqlFactExpression.as_i32()
+                if entity.entity_type == BootstrapEntityType::DqlTemporaryViewExpression
+                    || entity.entity_type == BootstrapEntityType::DqlFactExpression
                 {
                     log::debug!(
                         "Expanding consulted entity '{}' from namespace '{}'",
@@ -334,7 +334,7 @@ pub(super) fn resolve_ground(
                 .map(|ns| super::grounding::namespace_path_to_fq(ns))
                 .unwrap_or_default();
 
-            if entity_type == BootstrapEntityType::DqlFactExpression.as_i32() {
+            if entity_type == BootstrapEntityType::DqlFactExpression {
                 // Fact: parse all clauses and merge into one anonymous table
                 let expanded = expand_fact_body(&body_source, &view_name).map_err(|e| {
                     DelightQLError::database_error(
@@ -496,7 +496,7 @@ pub(super) fn resolve_ground(
                     canonical_name: Some(canonical_name),
                     resolved_namespace: Some(data_ns_path.clone()),
                     backend_schema: bs_opt,
-                    entity_type: crate::resolution::EntityType::Relation,
+                    entity_type: crate::resolution::ResolvedEntityKind::Relation,
                     registry_source: crate::resolution::RegistrySource::Database,
                     schema_source: crate::resolution::SchemaSource::DatabaseCatalog,
                     definition: EntityDefinition::RelationSchema(table_schema),
@@ -523,7 +523,7 @@ pub(super) fn resolve_ground(
                     canonical_name: Some(canonical_name),
                     resolved_namespace: Some(identifier.namespace_path.clone()),
                     backend_schema: bs_opt,
-                    entity_type: crate::resolution::EntityType::Relation,
+                    entity_type: crate::resolution::ResolvedEntityKind::Relation,
                     registry_source: crate::resolution::RegistrySource::Database,
                     schema_source: crate::resolution::SchemaSource::DatabaseCatalog,
                     definition: EntityDefinition::RelationSchema(table_schema),
@@ -534,14 +534,14 @@ pub(super) fn resolve_ground(
                 let fq = super::grounding::namespace_path_to_fq(&identifier.namespace_path);
                 if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &fq) {
                     if entity.entity_type
-                        == BootstrapEntityType::DqlTemporaryViewExpression.as_i32()
+                        == BootstrapEntityType::DqlTemporaryViewExpression
                     {
                         ResolutionResult::ConsultedView {
                             name: entity.name.clone(),
                             body_source: entity.definition.clone(),
                             namespace: fq.clone(),
                         }
-                    } else if entity.entity_type == BootstrapEntityType::DqlFactExpression.as_i32()
+                    } else if entity.entity_type == BootstrapEntityType::DqlFactExpression
                     {
                         ResolutionResult::ConsultedFact {
                             name: entity.name.clone(),
@@ -562,7 +562,7 @@ pub(super) fn resolve_ground(
                         if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &gfq)
                         {
                             if entity.entity_type
-                                == BootstrapEntityType::DqlTemporaryViewExpression.as_i32()
+                                == BootstrapEntityType::DqlTemporaryViewExpression
                             {
                                 fallback_result = Some(ResolutionResult::ConsultedView {
                                     name: entity.name.clone(),
@@ -570,7 +570,7 @@ pub(super) fn resolve_ground(
                                     namespace: gfq,
                                 });
                             } else if entity.entity_type
-                                == BootstrapEntityType::DqlFactExpression.as_i32()
+                                == BootstrapEntityType::DqlFactExpression
                             {
                                 fallback_result = Some(ResolutionResult::ConsultedFact {
                                     name: entity.name.clone(),
@@ -1269,6 +1269,8 @@ pub(super) fn r_resolve_consulted_view(
     // that don't exist in the subquery output.
     fn seal_column_provenance(col: &mut ast_resolved::ColumnMetadata) {
         let display_name = col.info.name().unwrap_or("?").to_string();
+        // Honest Fresh: the seal deliberately resets to the bare display name; the
+        // view-table qualifier is (re)applied downstream at the ConsultedView relabel.
         col.info = ast_resolved::ColumnProvenance::from_column(display_name);
     }
 
@@ -1953,7 +1955,7 @@ pub(super) fn resolve_tvf(
         for ns in &grounding.grounded_ns {
             let fq = super::grounding::namespace_path_to_fq(ns);
             if let Some(entity) = registry.consult.lookup_entity(&function, &fq) {
-                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression.as_i32()
+                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
                     let (table_bindings, scalar_spec, _pipe_idx) =
                         super::grounding::split_ho_first_parens(
@@ -1987,7 +1989,7 @@ pub(super) fn resolve_tvf(
         if let Some(ref ns) = namespace {
             let fq = super::grounding::namespace_path_to_fq(ns);
             if let Some(entity) = registry.consult.lookup_entity(&function, &fq) {
-                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression.as_i32()
+                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
                     let ho_grounding = ast_unresolved::GroundedPath {
                         data_ns: ast_unresolved::NamespacePath::empty(),
@@ -2144,7 +2146,7 @@ pub(super) fn resolve_tvf(
                     None
                 };
 
-                let mut builder = ast_unresolved::DomainExpression::lvar_builder(&col_name);
+                let mut builder = ast_unresolved::DomainExpression::lvar_builder(col_name);
                 if let Some(q) = qualifier {
                     builder = builder.with_qualifier(q);
                 }

@@ -35,6 +35,8 @@ pub type OrderingSpec =
     crate::pipeline::asts::core::OrderingSpec<crate::pipeline::asts::core::Refined>;
 pub type DelegateSpec =
     crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Refined>;
+pub type OutputDomainExpression =
+    crate::pipeline::asts::core::OutputDomainExpression<crate::pipeline::asts::core::Refined>;
 pub type WindowFrame =
     crate::pipeline::asts::core::WindowFrame<crate::pipeline::asts::core::Refined>;
 pub type FrameBound = crate::pipeline::asts::core::FrameBound<crate::pipeline::asts::core::Refined>;

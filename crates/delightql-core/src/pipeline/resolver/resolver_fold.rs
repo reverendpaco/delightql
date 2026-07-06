@@ -543,6 +543,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     if std::env::var("DQL_DEBUG").is_ok() {
                         eprintln!("Adding destructured column: {}", mapping.column_name);
                     }
+                    // Honest Fresh: a destructured column is an extracted value, not
+                    // a column of a source table.
                     updated_columns.push(ast_resolved::ColumnMetadata::new(
                         ast_resolved::ColumnProvenance::from_column(mapping.column_name.clone()),
                         ast_resolved::TableName::Fresh,
@@ -567,6 +569,8 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 let mut updated_bubbled = source_bubbled;
                 for mapping in destructured_schema.data() {
                     // Create ColumnMetadata for the destructured column
+                    // Honest Fresh: a destructured column is an extracted value, not
+                    // a column of a source table.
                     updated_bubbled
                         .i_provide
                         .push(ast_resolved::ColumnMetadata::new(
@@ -717,8 +721,10 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                                 .enumerate()
                                 .map(|(idx, col)| {
                                     ast_resolved::ColumnMetadata::new(
-                                        ast_resolved::ColumnProvenance::from_column(
+                                        ast_resolved::ColumnProvenance::from_table_column(
                                             col.name.clone(),
+                                            ast_resolved::TableName::Named(visible_name.into()),
+                                            crate::pipeline::asts::core::QualificationSource::None,
                                         ),
                                         ast_resolved::TableName::Named(visible_name.into()),
                                         Some(idx + 1),
@@ -902,7 +908,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             .filter(|rc| {
                                 left_columns
                                     .iter()
-                                    .any(|lc| super::col_name_eq(lc.name(), rc.name()))
+                                    .any(|lc| delightql_types::SqlIdentifier::str_eq(lc.name(), rc.name()))
                             })
                             .map(|rc| rc.name().to_string())
                             .collect();
@@ -1112,7 +1118,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     .lookup_entity(function, &fq)
                     .filter(|e| {
                         e.entity_type
-                            == crate::enums::EntityType::DqlHoTemporaryViewExpression.as_i32()
+                            == crate::enums::EntityType::DqlHoTemporaryViewExpression
                     })
                     .ok_or_else(|| {
                         crate::error::DelightQLError::validation_error(
@@ -2222,7 +2228,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                                     decl
                                 ),
                                 context: "resolver::json_path".to_string(),
-                                subcategory: Some("compound/scalar_column"),
+                                subcategory: Some(crate::uri_registry::subcat::COMPOUND_SCALAR_COLUMN),
                             });
                         }
                     }
@@ -2343,7 +2349,7 @@ fn scalar_only_declaration<'a>(
         .find(|c| {
             c.name() == name
                 && qualifier.map_or(true, |q| match c.qualifier() {
-                    ast_resolved::TableName::Named(t) => t.as_str() == q,
+                    ast_resolved::TableName::Named(t) => t == q,
                     _ => false,
                 })
         })

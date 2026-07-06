@@ -117,6 +117,8 @@ pub(crate) fn precompile_cfe_definition(
 
     // Add fake columns for curried parameters first
     for (idx, param) in cfe.curried_params.iter().enumerate() {
+        // Honest Fresh: a parameter hole has no source table; the Named qualifier
+        // below is a synthetic ref-matching marker, not a data source.
         fake_columns.push(resolved::ColumnMetadata::new_with_name_flag(
             resolved::ColumnProvenance::from_column(param.clone()),
             resolved::TableName::Named("__cfe_curried_params__".into()),
@@ -128,6 +130,8 @@ pub(crate) fn precompile_cfe_definition(
     // Add fake columns for regular parameters
     let curried_count = cfe.curried_params.len();
     for (idx, param) in cfe.parameters.iter().enumerate() {
+        // Honest Fresh: a parameter hole has no source table; the Named qualifier
+        // below is a synthetic ref-matching marker, not a data source.
         fake_columns.push(resolved::ColumnMetadata::new_with_name_flag(
             resolved::ColumnProvenance::from_column(param.clone()),
             resolved::TableName::Named("__cfe_params__".into()),
@@ -140,6 +144,8 @@ pub(crate) fn precompile_cfe_definition(
     let param_count = curried_count + cfe.parameters.len();
     if let unresolved::ContextMode::Explicit(ref ctx_params) = cfe.context_mode {
         for (idx, ctx_param) in ctx_params.iter().enumerate() {
+            // Honest Fresh: a context-parameter hole has no source table; the Named
+            // qualifier below is a synthetic ref-matching marker, not a data source.
             fake_columns.push(resolved::ColumnMetadata::new_with_name_flag(
                 resolved::ColumnProvenance::from_column(ctx_param.clone()),
                 resolved::TableName::Named("__cfe_context__".into()),
@@ -282,9 +288,9 @@ fn discover_nested_consulted_functions(
             let entity = if let Some(ns) = &namespace {
                 let fq = crate::pipeline::resolver::grounding::namespace_path_to_fq(ns);
                 consult.lookup_entity(&name, &fq).filter(|e| {
-                    e.entity_type == crate::enums::EntityType::DqlFunctionExpression.as_i32()
+                    e.entity_type == crate::enums::EntityType::DqlFunctionExpression
                         || e.entity_type
-                            == crate::enums::EntityType::DqlContextAwareFunctionExpression.as_i32()
+                            == crate::enums::EntityType::DqlContextAwareFunctionExpression
                 })
             } else {
                 let e = consult.lookup_enlisted_function(&name)?;

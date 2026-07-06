@@ -44,7 +44,10 @@ pub(super) fn parse_column_spec(
                     super::expressions::parse_expression(paren, &mut FeatureCollector::new())?
                 } else if let Some(id) = item.find_child("identifier") {
                     // Simple identifier - must be last since identifiers appear in other constructs
-                    DomainExpression::lvar_builder(crate::pipeline::cst::unstrop(id.text())).build()
+                    DomainExpression::lvar_builder(crate::pipeline::cst::unstrop_identifier(
+                        id.text(),
+                    ))
+                    .build()
                 } else {
                     continue;
                 };
@@ -433,7 +436,7 @@ fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<DomainExpres
                     .field_text("column")
                     .unwrap_or_else(|| child.text().to_string());
                 return Ok(DomainExpression::lvar_builder(name)
-                    .with_qualifier(qualifier)
+                    .with_qualifier_opt(qualifier.map(Into::into))
                     .build());
             }
             "table_access" => {
@@ -1279,6 +1282,64 @@ fn apply_alias_to_relational_expr(expr: &mut RelationalExpression, alias: String
         }
         RelationalExpression::IntersectCorresponding { .. } => {
             unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        }
+    }
+}
+
+#[cfg(test)]
+mod column_spec_tests {
+    use super::*;
+    use crate::pipeline::cst::{CstNode, CstTree};
+
+    /// Depth-first search for the first CST node of a given kind.
+    fn find_kind<'a>(node: CstNode<'a>, kind: &str) -> Option<CstNode<'a>> {
+        if node.is_kind(kind) {
+            return Some(node);
+        }
+        for child in node.children() {
+            if let Some(found) = find_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Parse `source`, locate its `column_spec` node, and run it through
+    /// parse_column_spec — the bare-projection construction path that
+    /// bypasses parse_lvar.
+    fn column_spec_from_source(source: &str) -> DomainSpec {
+        let tree = crate::pipeline::parser::parse(source).expect("parse failed");
+        let cst = CstTree::new(&tree, source);
+        let spec_node =
+            find_kind(cst.root(), "column_spec").expect("no column_spec node in source");
+        let mut features = crate::pipeline::query_features::FeatureCollector::new();
+        parse_column_spec(spec_node, &mut features).expect("parse_column_spec failed")
+    }
+
+    #[test]
+    fn stropped_bare_projection_column_survives_to_unresolved_ast() {
+        let DomainSpec::Positional(columns) = column_spec_from_source("t(`MyCol`)") else {
+            panic!("expected Positional spec");
+        };
+        match &columns[0] {
+            DomainExpression::Lvar { name, .. } => {
+                assert!(name.is_stropped(), "stropped bare column lost its bit");
+                assert_eq!(name.as_str(), "MyCol");
+            }
+            other => panic!("expected Lvar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_projection_column_unstropped_by_default() {
+        let DomainSpec::Positional(columns) = column_spec_from_source("t(mycol)") else {
+            panic!("expected Positional spec");
+        };
+        match &columns[0] {
+            DomainExpression::Lvar { name, .. } => {
+                assert!(!name.is_stropped());
+            }
+            other => panic!("expected Lvar, got {other:?}"),
         }
     }
 }

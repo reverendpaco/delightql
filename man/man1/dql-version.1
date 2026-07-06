@@ -1,0 +1,36 @@
+.TH DQL-VERSION 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-version \- print build identity
+.SH SYNOPSIS
+.B dql version
+.RB [ \-\-json ]
+.SH DESCRIPTION
+Prints the binary's build identity: version, burned identity (or
+.B dev
+for local builds), profile, and os/arch.
+.PP
+.EX
+$ dql version
+0.1.0 (dev, debug, linux/aarch64)
+.EE
+.PP
+With
+.B \-\-json
+a single-line JSON object is emitted \(em the supply-contract interface
+(TEST-ARCHITECTURE.md \(sc11): supplied/CI mode must refuse binaries
+whose identity is
+.BR dev .
+.PP
+.EX
+$ dql version --json
+{"version":"0.1.0","identity":"dev","profile":"debug",
+ "os":"linux","arch":"aarch64","fatboy_digests":null}
+.EE
+.PP
+.I fatboy_digests
+is null on dev builds; release builds carry the adapter digests that
+.B dql target verify
+checks against.
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-target (1)

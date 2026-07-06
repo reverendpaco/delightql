@@ -16,6 +16,8 @@ pub mod file_inputs; // File input tracking with auto-numbering
 pub mod modifiers; // Modifier parsing for CSV/TSV files
 pub mod output_format;
 pub mod fatboy_exec;
+pub mod help_surface;
+pub mod man_scrub;
 pub mod pipe_exec;
 pub mod sanitize;
 pub mod server;

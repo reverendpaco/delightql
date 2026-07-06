@@ -222,7 +222,7 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
             schema: _,
         } => {
             // Check column name (using effective name for matching)
-            if !super::col_name_eq(col.name(), name) {
+            if !delightql_types::SqlIdentifier::str_eq(col.name(), name) {
                 return false;
             }
 

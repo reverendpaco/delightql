@@ -220,7 +220,7 @@ fn create_ddl_error(tree: &Tree, source: &str) -> DelightQLError {
                     display,
                 ),
                 source: None,
-                subcategory: Some("ddl"),
+                subcategory: Some(crate::uri_registry::subcat::PARSE_DDL),
             };
         }
     }
@@ -229,7 +229,7 @@ fn create_ddl_error(tree: &Tree, source: &str) -> DelightQLError {
     DelightQLError::ParseError {
         message: "DDL parse error: source contains syntax errors".to_string(),
         source: None,
-        subcategory: Some("ddl"),
+        subcategory: Some(crate::uri_registry::subcat::PARSE_DDL),
     }
 }
 
@@ -280,7 +280,7 @@ pub fn parse_sigil_expression(source: &str) -> Result<Tree> {
         return Err(DelightQLError::ParseError {
             message: error_msg,
             source: None,
-            subcategory: Some("sigil"),
+            subcategory: Some(crate::uri_registry::subcat::PARSE_SIGIL),
         });
     }
 
@@ -716,7 +716,7 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
                     display,
                 ),
                 source: None,
-                subcategory: Some("ddl"),
+                subcategory: Some(crate::uri_registry::subcat::PARSE_DDL),
             });
         }
 

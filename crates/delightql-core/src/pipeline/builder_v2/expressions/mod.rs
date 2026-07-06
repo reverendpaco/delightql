@@ -166,7 +166,7 @@ pub(super) fn parse_expression(
                 .ok_or_else(|| DelightQLError::parse_error("Missing column in qualified_column"))?;
 
             Ok(DomainExpression::lvar_builder(column)
-                .with_qualifier(table)
+                .with_qualifier_opt(table.map(Into::into))
                 .build())
         }
         "value_placeholder" => Ok(DomainExpression::ValuePlaceholder { alias: None }),

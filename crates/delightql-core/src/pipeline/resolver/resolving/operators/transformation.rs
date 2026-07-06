@@ -14,7 +14,7 @@ use super::helpers::{emit_validation_warning, expand_column_template};
 /// Check if a column's table provenance matches a qualifier string
 fn matches_table_qualifier(col: &ast_resolved::ColumnMetadata, qualifier: &str) -> bool {
     match col.qualifier() {
-        ast_resolved::TableName::Named(name) => name.as_ref() == qualifier,
+        ast_resolved::TableName::Named(name) => name == qualifier,
         ast_resolved::TableName::Fresh => false,
     }
 }

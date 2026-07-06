@@ -96,6 +96,188 @@ const SYS_META_SOURCE: &str = include_str!("../autoload/sys/meta.dql");
 ///
 /// Creates an entity like `main::` with definition `sys::meta.generator("main")(*)`
 /// so that `main::(*)` resolves through normal HO view expansion.
+/// Register the `sys::help` tables (SYS-HELP-DESIGN.md) so they are
+/// addressable as `sys::help.<name>(*)`. Ring 2 (`identifier`) is
+/// burned from bootstrap/schema.sql rows; ring 1 (command/option/...)
+/// is seeded at session init from the host binary's live surface
+/// (`seed_help_surface`). Follows the sys.danger pattern (entity type
+/// 10 = physical table on the bootstrap connection), on a dedicated
+/// cartridge so nothing else's bulk activation sweeps these entities
+/// into a different namespace.
+fn register_sys_help_tables(bootstrap_conn: &Connection, bootstrap_conn_id: i64) -> Result<()> {
+    bootstrap_conn
+        .execute(
+            "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+             VALUES (?1, ?2, 'sys://help', NULL, 1, ?3, 0)",
+            rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to create sys::help cartridge: {}", e),
+                e.to_string(),
+            )
+        })?;
+    let help_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
+
+    let help_ns_id: i32 = bootstrap_conn
+        .query_row(
+            "SELECT id FROM namespace WHERE fq_name = 'sys::help'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to query sys::help namespace: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    // (table/entity name, columns as (name, sqlite type, nullable))
+    type Col = (&'static str, &'static str, bool);
+    let tables: &[(&str, &[Col])] = &[
+        (
+            "identifier",
+            &[
+                ("kind", "TEXT", false),
+                ("hierarchy", "TEXT", false),
+                ("summary", "TEXT", false),
+                ("explanation", "TEXT", false),
+            ],
+        ),
+        (
+            "command",
+            &[
+                ("name", "TEXT", false),
+                ("parent", "TEXT", true),
+                ("alias", "TEXT", true),
+                ("summary", "TEXT", false),
+            ],
+        ),
+        (
+            "option",
+            &[
+                ("command", "TEXT", false),
+                ("long", "TEXT", false),
+                ("short", "TEXT", true),
+                ("value_name", "TEXT", true),
+                ("default_value", "TEXT", true),
+                ("global", "INTEGER", false),
+                ("repeatable", "INTEGER", false),
+                ("summary", "TEXT", false),
+            ],
+        ),
+        (
+            "option_value",
+            &[
+                ("command", "TEXT", false),
+                ("option", "TEXT", false),
+                ("value", "TEXT", false),
+                ("summary", "TEXT", true),
+                ("class", "TEXT", true),
+                ("grade", "TEXT", true),
+            ],
+        ),
+        (
+            "dot_command",
+            &[("name", "TEXT", false), ("summary", "TEXT", false)],
+        ),
+        (
+            "env",
+            &[
+                ("name", "TEXT", false),
+                ("effect", "TEXT", false),
+                ("equivalent_flag", "TEXT", true),
+            ],
+        ),
+        (
+            "man_page",
+            &[
+                ("name", "TEXT", false),
+                ("section", "INTEGER", false),
+                ("troff", "TEXT", false),
+                ("plain", "TEXT", false),
+            ],
+        ),
+        (
+            "exit_code",
+            &[
+                ("code", "INTEGER", false),
+                ("context", "TEXT", false),
+                ("meaning", "TEXT", false),
+                ("class", "TEXT", true),
+                ("grade", "TEXT", true),
+            ],
+        ),
+    ];
+
+    for (table, columns) in tables {
+        bootstrap_conn
+            .execute(
+                "INSERT INTO entity (name, type, cartridge_id) VALUES (?1, 10, ?2)",
+                rusqlite::params![table, help_cartridge_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to insert sys::help.{} entity: {}", table, e),
+                    e.to_string(),
+                )
+            })?;
+        let entity_id = bootstrap_conn.last_insert_rowid() as i32;
+
+        bootstrap_conn
+            .execute(
+                "INSERT INTO entity_clause (entity_id, ordinal, definition)
+                 VALUES (?1, 1, '-- sys::help burned/seeded table (SYS-HELP-DESIGN.md)')",
+                rusqlite::params![entity_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to insert sys::help.{} clause: {}", table, e),
+                    e.to_string(),
+                )
+            })?;
+
+        for (position, (col_name, data_type, nullable)) in columns.iter().enumerate() {
+            bootstrap_conn
+                .execute(
+                    "INSERT INTO entity_attribute
+                     (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
+                     VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
+                    rusqlite::params![
+                        entity_id,
+                        col_name,
+                        data_type,
+                        (position + 1) as i32,
+                        *nullable
+                    ],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!(
+                            "Failed to insert sys::help.{} column '{}': {}",
+                            table, col_name, e
+                        ),
+                        e.to_string(),
+                    )
+                })?;
+        }
+
+        bootstrap_conn
+            .execute(
+                "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![entity_id, help_ns_id, help_cartridge_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to activate sys::help.{}: {}", table, e),
+                    e.to_string(),
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
 fn register_catalog_wrapper(
     conn: &Connection,
     ns_fq: &str,
@@ -670,6 +852,12 @@ impl DelightQLSystem {
                 e.to_string(),
             )
         })?;
+
+        // sys::help ring 2 (SYS-HELP-DESIGN.md phase 1): register the
+        // burned identifier table (rows authored in bootstrap/schema.sql)
+        // as sys::help.identifier. Its own cartridge so the bulk
+        // activation above cannot leak it into bare `sys`.
+        register_sys_help_tables(&bootstrap_conn, bootstrap_conn_id)?;
 
         // Initialize connection routing map
         let mut connection_map: HashMap<i64, Arc<Mutex<dyn DatabaseConnection>>> = HashMap::new();
@@ -1585,6 +1773,88 @@ impl DelightQLSystem {
     /// (`pipe://`, etc.). Without it, `mount_database` on a URI errors with
     /// "connection factory not available in this context". Installed by
     /// `open()` when the embedding provides a types-level factory.
+    /// Seed the sys::help ring-1 tables from the host binary's surface
+    /// (SYS-HELP-DESIGN.md phase 2). Called once at open(); the tables
+    /// were created empty by bootstrap/schema.sql and registered by
+    /// register_sys_help_tables. Runtime generation from the live clap
+    /// tree: the rows structurally cannot drift from the binary.
+    pub fn seed_help_surface(&self, surface: &crate::api::HelpSurface) -> Result<()> {
+        let conn = self.bootstrap_connection.lock().map_err(|_| {
+            DelightQLError::database_error(
+                "seed_help_surface: bootstrap connection poisoned".to_string(),
+                String::new(),
+            )
+        })?;
+        let db_err = |what: &str, e: rusqlite::Error| {
+            DelightQLError::database_error(
+                format!("seed_help_surface: {} insert failed: {}", what, e),
+                e.to_string(),
+            )
+        };
+        for (name, parent, alias, summary) in &surface.commands {
+            conn.execute(
+                "INSERT INTO command (name, parent, alias, summary) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![name, parent, alias, summary],
+            )
+            .map_err(|e| db_err("command", e))?;
+        }
+        for o in &surface.options {
+            conn.execute(
+                "INSERT INTO option (command, long, short, value_name, default_value, global, repeatable, summary)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    o.command,
+                    o.long,
+                    o.short,
+                    o.value_name,
+                    o.default_value,
+                    o.global,
+                    o.repeatable,
+                    o.summary
+                ],
+            )
+            .map_err(|e| db_err("option", e))?;
+        }
+        for (command, option, value, summary, class, grade) in &surface.option_values {
+            conn.execute(
+                "INSERT INTO option_value (command, option, value, summary, class, grade)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![command, option, value, summary, class, grade],
+            )
+            .map_err(|e| db_err("option_value", e))?;
+        }
+        for (name, summary) in &surface.dot_commands {
+            conn.execute(
+                "INSERT INTO dot_command (name, summary) VALUES (?1, ?2)",
+                rusqlite::params![name, summary],
+            )
+            .map_err(|e| db_err("dot_command", e))?;
+        }
+        for (name, effect, flag) in &surface.envs {
+            conn.execute(
+                "INSERT INTO env (name, effect, equivalent_flag) VALUES (?1, ?2, ?3)",
+                rusqlite::params![name, effect, flag],
+            )
+            .map_err(|e| db_err("env", e))?;
+        }
+        for (name, section, troff, plain) in &surface.man_pages {
+            conn.execute(
+                "INSERT INTO man_page (name, section, troff, plain) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![name, section, troff, plain],
+            )
+            .map_err(|e| db_err("man_page", e))?;
+        }
+        for (code, context, meaning, class, grade) in &surface.exit_codes {
+            conn.execute(
+                "INSERT INTO exit_code (code, context, meaning, class, grade)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![code, context, meaning, class, grade],
+            )
+            .map_err(|e| db_err("exit_code", e))?;
+        }
+        Ok(())
+    }
+
     pub fn set_connection_factory(&mut self, factory: Box<dyn ConnectionFactory>) {
         self.connection_factory = Some(factory);
     }
@@ -6713,8 +6983,8 @@ fn walk_relational_for_tree_groups(
             match &pipe.operator {
                 UnaryRelationalOperator::Modulo { spec, .. } => {
                     if let ModuloSpec::GroupBy { reducing_on, .. } = spec {
-                        for domain_expr in reducing_on {
-                            register_tree_group_from_domain_expr(conn, entity_id, domain_expr)?;
+                        for ode in reducing_on {
+                            register_tree_group_from_domain_expr(conn, entity_id, &ode.expr)?;
                         }
                     }
                 }

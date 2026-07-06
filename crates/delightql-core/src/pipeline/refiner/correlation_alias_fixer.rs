@@ -79,7 +79,7 @@ impl AstTransform<Resolved, Resolved> for CorrelationAliasFold {
                 let inner_name = extract_base_relation_name(&subquery);
                 let allow_short = inner_name
                     .as_deref()
-                    .map_or(true, |n| n == identifier.name.as_str());
+                    .map_or(true, |n| &identifier.name == n);
 
                 let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
                 let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
@@ -111,7 +111,7 @@ impl AstTransform<Resolved, Resolved> for CorrelationAliasFold {
                 let inner_name = extract_base_relation_name(&subquery);
                 let allow_short = inner_name
                     .as_deref()
-                    .map_or(true, |n| n == identifier.name.as_str());
+                    .map_or(true, |n| &identifier.name == n);
 
                 let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
                 let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
@@ -402,11 +402,23 @@ fn extract_qualifiers_from_operator(
                 reducing_on,
                 delegates,
             } => {
-                for expr in reducing_by.iter().chain(reducing_on) {
-                    extract_qualifiers_from_domain(expr, qualifiers);
+                // reducing_by keys carry per-expression output stamps (slice 4);
+                // reach through `.expr`.
+                for ode in reducing_by.iter() {
+                    extract_qualifiers_from_domain(&ode.expr, qualifiers);
+                }
+                // reducing_on carries per-expression output stamps (Batch 13);
+                // reach through `.expr`.
+                for ode in reducing_on.iter() {
+                    extract_qualifiers_from_domain(&ode.expr, qualifiers);
                 }
                 for w in delegates {
-                    for expr in w.payload.iter().chain(w.order.iter().map(|o| &o.column)) {
+                    for expr in w
+                        .payload
+                        .iter()
+                        .map(|ode| &ode.expr)
+                        .chain(w.order.iter().map(|o| &o.column))
+                    {
                         extract_qualifiers_from_domain(expr, qualifiers);
                     }
                 }

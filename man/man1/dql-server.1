@@ -1,0 +1,42 @@
+.TH DQL-SERVER 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-server \- serve the DelightQL relay protocol on a Unix socket
+.SH SYNOPSIS
+.B dql server
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Starts a relay-protocol server on a Unix domain socket. On startup the
+socket path is printed alone on the first stdout line (convenient for
+scripts), followed by a human-readable status line naming the worker
+count, database, and timeouts. This is the execution backend used by
+the test-ball runner.
+.SH OPTIONS
+.TP
+.BI \-\-socket " PATH"
+Unix socket path. Default:
+.IR /tmp/dql\-{pid}.sock .
+.TP
+.BI \-\-workers " N"
+Number of worker threads. Default 0 = available CPUs.
+.TP
+.BI \-\-idle\-timeout " SECONDS"
+Shut down after N seconds with no messages. 0 (default) disables.
+.TP
+.BI \-\-socket\-idle\-timeout " SECONDS"
+Shut down after N seconds with zero active connections. 0 (default)
+disables.
+.TP
+.BI \-\-db " DATABASE"
+SQLite database file; default is in-memory (shown as
+.IR db=<none> ).
+.SH EXIT STATUS
+0 on clean shutdown (including timeout-triggered shutdown).
+.SH EXAMPLES
+Run a self-reaping server for a scripted session:
+.PP
+.EX
+$ sock=$(dql server --socket-idle-timeout 30 | head -1)
+.EE
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-target (1)

@@ -92,7 +92,7 @@ pub(in crate::pipeline::builder_v2) fn parse_transform(
 fn parse_reduction_items(
     list_node: CstNode,
     features: &mut FeatureCollector,
-) -> Result<(Vec<DomainExpression>, Vec<DelegateSpec>)> {
+) -> Result<(Vec<OutputDomainExpression>, Vec<DelegateSpec>)> {
     let mut aggregates = Vec::new();
     let mut delegates = Vec::new();
     for item in list_node
@@ -104,6 +104,15 @@ fn parse_reduction_items(
                 .field("payload")
                 .ok_or_else(|| DelightQLError::parse_error("No payload in delegate_item"))?;
             let payload = parse_delegate_payload_columns(payload_node, features)?;
+            // Phantom-wrap each payload expression: its output decision (which
+            // column, or none) is stamped by the resolver, phantom until then.
+            let payload = payload
+                .into_iter()
+                .map(|expr| OutputDomainExpression {
+                    expr,
+                    output: PhaseBox::phantom(),
+                })
+                .collect();
             // Empty ordering (bare `<~`) == arbitrary delegate.
             let order = if let Some(order_node) = delegate.field("order") {
                 parse_delegate_order(order_node, features)?
@@ -112,7 +121,13 @@ fn parse_reduction_items(
             };
             delegates.push(DelegateSpec { payload, order });
         } else if let Some(de) = item.find_child("domain_expression") {
-            aggregates.push(parse_domain_expression_wrapper(de, features)?);
+            // Phantom-wrap: this aggregate's output decision (which column) is
+            // stamped by the resolver, phantom until then — same idiom as the
+            // delegate payload wrap above.
+            aggregates.push(OutputDomainExpression {
+                expr: parse_domain_expression_wrapper(de, features)?,
+                output: PhaseBox::phantom(),
+            });
         } else {
             return Err(DelightQLError::parse_error("Empty reduction_item"));
         }
@@ -190,7 +205,16 @@ pub(in crate::pipeline::builder_v2) fn parse_grouping(
             let reducing_by_node = grouping_node.field("reducing_by");
 
             if let (Some(by_node), Some(on_node)) = (reducing_by_node, reducing_on_node) {
-                let reducing_by = parse_domain_expression_list(by_node, features)?;
+                // Phantom-wrap each grouping key: its output decision (which
+                // column, or none) is stamped by the resolver, phantom until
+                // then — same idiom as the reducing_on/delegate payload wraps.
+                let reducing_by = parse_domain_expression_list(by_node, features)?
+                    .into_iter()
+                    .map(|expr| OutputDomainExpression {
+                        expr,
+                        output: PhaseBox::phantom(),
+                    })
+                    .collect();
                 let (reducing_on, delegates) = parse_reduction_items(on_node, features)?;
                 ModuloSpec::GroupBy {
                     reducing_by,

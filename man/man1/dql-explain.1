@@ -1,0 +1,45 @@
+.TH DQL-EXPLAIN 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-explain \- explain a DelightQL identifier (error, danger gate, or config)
+.SH SYNOPSIS
+.B dql explain
+[\fIOPTIONS\fR]
+.I IDENTIFIER
+.SH DESCRIPTION
+Looks the identifier up in the built-in registry and prints its badge
+form, canonical URL, and prose explanation. Error records on stderr
+carry these identifiers in brackets; this command is how you ask what
+one means.
+.PP
+Accepted identifier forms:
+.IP \(bu 3
+badge form:
+.B delightql\-error://semantic/cast
+(kinds:
+.BR error ", " danger ", " config );
+.IP \(bu 3
+canonical URL:
+.BR https://delightql.org/uri/error/semantic/cast ;
+.IP \(bu 3
+bare hierarchy:
+.B semantic/cast
+(searched across all kinds).
+.PP
+Family nodes list their registered members.
+.SH EXIT STATUS
+0 if the identifier resolved; 1 if it is not a DelightQL identifier
+(the error lists the accepted forms).
+.SH EXAMPLES
+.EX
+$ dql query --db app.db 'nope(*)'
+[delightql-error://semantic/resolution/table] Table not found: nope
+$ dql explain semantic/resolution/table
+delightql-error://semantic/resolution/table
+  -> https://delightql.org/uri/error/semantic/resolution/table
+
+A named table (or relation) was not found.
+\&...
+.EE
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-query (1)

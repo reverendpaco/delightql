@@ -32,6 +32,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete = "4.5"
 rusqlite.workspace = true
 tree-sitter.workspace = true
 # CLI-specific dependencies
@@ -50,6 +51,9 @@ flate2 = "1"
 # The fatboy store lookup (fatboy_exec.rs) needs the platform data dir
 # in every build shape, so this is not gated behind the repl feature.
 directories = "5.0"
+# dql man renders via a temp file: BSD/macOS man has no -l and cannot
+# read stdin, but every man treats a slash-containing arg as a file.
+tempfile.workspace = true
 # REPL dependencies (optional, enabled via 'repl' feature)
 rustyline = { path = "../rustyline", optional = true }
 ratatui = { version = "0.29", optional = true }

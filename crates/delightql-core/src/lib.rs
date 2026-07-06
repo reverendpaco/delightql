@@ -39,6 +39,15 @@ pub(crate) use wasm_system as system;
 pub use delightql_types::error;
 pub use delightql_types::{DelightQLError, Result};
 
+/// Whether `name` is a dialect family the compiler accepts (aliases
+/// included: "postgresql" for postgres). The CLI's eager --dialect /
+/// DQL_DIALECT validation consults this so flag validation and pipeline
+/// behavior cannot drift — a function, not a type re-export, because
+/// `pipeline` stays pub(crate) (the decoupling boundary).
+pub fn is_known_dialect_family(name: &str) -> bool {
+    pipeline::generator_v3::SqlDialect::from_family_name(name).is_some()
+}
+
 // Re-export derive macros (crate-internal only — used by #[derive] on AST types)
 pub(crate) use delightql_macros::PhaseConvert;
 pub(crate) use delightql_macros::ToLispy;

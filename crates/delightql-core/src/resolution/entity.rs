@@ -23,15 +23,17 @@ pub struct EntityInfo {
     /// Physical backend schema name for SQL generation (e.g., "_c" for logical namespace "c").
     /// Populated by the registry from namespace resolution.
     pub backend_schema: Option<String>,
-    pub entity_type: EntityType,
+    pub entity_type: ResolvedEntityKind,
     pub registry_source: RegistrySource,
     pub schema_source: SchemaSource,
     pub definition: EntityDefinition,
 }
 
-/// What kind of thing the entity is
+/// What kind of thing the entity is (resolution-level; renamed from
+/// EntityType 2026-07-05, STRING-FLOOR Batch 2, to end the collision with
+/// the 19-variant catalog enums::EntityType).
 #[derive(Debug, Clone, PartialEq)]
-pub enum EntityType {
+pub enum ResolvedEntityKind {
     /// Tables, views, CTEs, TVFs - has rows and columns
     Relation,
 }

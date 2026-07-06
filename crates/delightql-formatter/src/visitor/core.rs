@@ -20,6 +20,9 @@ pub struct Formatter<'a> {
     /// Signals that the output may be incomplete — caller should fall back
     /// to the original input.
     pub(crate) hit_unknown: bool,
+    /// The kind of the FIRST unrecognized named node, so pass-through can
+    /// name what blocked it (PLAN.md #3A).
+    pub(crate) unknown_kind: Option<String>,
 }
 
 impl<'a> Formatter<'a> {
@@ -31,6 +34,7 @@ impl<'a> Formatter<'a> {
             at_statement_start: true,
             base_indent: 0,
             hit_unknown: false,
+            unknown_kind: None,
         }
     }
 
@@ -48,6 +52,9 @@ impl<'a> Formatter<'a> {
     /// Anonymous tokens (punctuation, keywords) are expected to be skipped.
     pub(super) fn flag_unhandled(&mut self, node: &Node) {
         if node.is_named() {
+            if !self.hit_unknown {
+                self.unknown_kind = Some(node.kind().to_string());
+            }
             self.hit_unknown = true;
         }
     }

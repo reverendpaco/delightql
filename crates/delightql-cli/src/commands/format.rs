@@ -85,7 +85,28 @@ fn format_with_library(
     }
     let language = unsafe { tree_sitter_delightql_v2() };
     let config = delightql_formatter::load_config(None);
-    let formatted = delightql_formatter::format(&input, &language, &config)?;
+    let outcome = delightql_formatter::format_outcome(&input, &language, &config)?;
+
+    // Pass-through is safe but must be LOUD (PLAN.md #3A): the formatter
+    // met a construct it doesn't handle and returned the input unchanged.
+    if let delightql_formatter::FormatOutcome::PassedThrough { ref node_kind, .. } = outcome {
+        match node_kind {
+            Some(kind) => eprintln!(
+                "warning: formatter does not yet handle node '{kind}'; \
+                 input returned unchanged"
+            ),
+            None => eprintln!(
+                "warning: formatted output did not re-parse cleanly; \
+                 input returned unchanged"
+            ),
+        }
+        // "Cannot verify" must not report "formatted": exit 2 so CI can
+        // tell a formatter gap (2) from needs-formatting (1).
+        if fail_if_not_formatted {
+            std::process::exit(2);
+        }
+    }
+    let formatted = outcome.text().to_string();
 
     // Check mode: exit 1 if input differs from formatted
     if fail_if_not_formatted {
@@ -96,10 +117,14 @@ fn format_with_library(
     }
 
     // Apply syntax highlighting if requested
+    // NO_COLOR convention (no-color.org): when set, auto-detection
+    // yields no color; the explicit flag always wins (R2.5).
     let use_colors = match color {
         ColorMode::Always => true,
         ColorMode::Never => false,
-        ColorMode::Auto => io::stdout().is_terminal(),
+        ColorMode::Auto => {
+            io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+        }
     };
 
     let output = if use_colors {

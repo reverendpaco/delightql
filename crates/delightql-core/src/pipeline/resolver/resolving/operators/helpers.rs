@@ -94,14 +94,17 @@ pub(in crate::pipeline::resolver) fn sanitize_engine_managed_columns(
 /// reducing_on: [{"people": ~> {...}}]
 /// ```
 pub(super) fn restructure_tree_groups_for_grouping(
-    reducing_by: &mut Vec<ast_resolved::DomainExpression>,
-    reducing_on: &mut Vec<ast_resolved::DomainExpression>,
+    reducing_by: &mut Vec<ast_resolved::OutputDomainExpression>,
+    reducing_on: &mut Vec<ast_resolved::OutputDomainExpression>,
 ) -> Result<()> {
     use ast_resolved::{DomainExpression, FunctionExpression};
 
-    let mut new_reducing_on = Vec::new();
+    let mut new_reducing_on: Vec<ast_resolved::OutputDomainExpression> = Vec::new();
 
-    for expr in reducing_on.drain(..) {
+    for ode in reducing_on.drain(..) {
+        // The phantom output stamp rides along untouched — restructuring runs
+        // before the resolver stamps the output decision (Batch 13, slice 4).
+        let ast_resolved::OutputDomainExpression { expr, output } = ode;
         match expr {
             DomainExpression::Function(FunctionExpression::Curly {
                 members,
@@ -217,33 +220,45 @@ pub(super) fn restructure_tree_groups_for_grouping(
                     }
 
                     // Create tree group with inner_grouping_keys and only nested members
-                    new_reducing_on.push(DomainExpression::Function(FunctionExpression::Curly {
-                        members: nested_members,
-                        inner_grouping_keys,    // Store promoted columns here!
-                        cte_requirements: None, // Phase R2+ will populate this
-                        alias,
-                    }));
+                    new_reducing_on.push(ast_resolved::OutputDomainExpression {
+                        expr: DomainExpression::Function(FunctionExpression::Curly {
+                            members: nested_members,
+                            inner_grouping_keys,    // Store promoted columns here!
+                            cte_requirements: None, // Phase R2+ will populate this
+                            alias,
+                        }),
+                        output,
+                    });
                 } else {
                     // No nested reductions - keep the tree group as-is in reducing_on
-                    new_reducing_on.push(DomainExpression::Function(FunctionExpression::Curly {
-                        members,
-                        inner_grouping_keys: vec![], // No promotions needed
-                        cte_requirements: None,      // Phase R2+ will populate this
-                        alias,
-                    }));
+                    new_reducing_on.push(ast_resolved::OutputDomainExpression {
+                        expr: DomainExpression::Function(FunctionExpression::Curly {
+                            members,
+                            inner_grouping_keys: vec![], // No promotions needed
+                            cte_requirements: None,      // Phase R2+ will populate this
+                            alias,
+                        }),
+                        output,
+                    });
                 }
             }
             // Non-tree-group expressions stay in reducing_on
-            other => new_reducing_on.push(other),
+            other => new_reducing_on.push(ast_resolved::OutputDomainExpression {
+                expr: other,
+                output,
+            }),
         }
     }
 
     *reducing_on = new_reducing_on;
 
-    // Also process tree groups in reducing_by to populate their inner_grouping_keys
-    let mut new_reducing_by = Vec::new();
+    // Also process tree groups in reducing_by to populate their inner_grouping_keys.
+    // reducing_by keys now carry their phantom output stamp (slice 4); it rides
+    // untouched — restructuring runs before the resolver stamps.
+    let mut new_reducing_by: Vec<ast_resolved::OutputDomainExpression> = Vec::new();
 
-    for expr in reducing_by.drain(..) {
+    for ode in reducing_by.drain(..) {
+        let ast_resolved::OutputDomainExpression { expr, output } = ode;
         match expr {
             DomainExpression::Function(FunctionExpression::Curly {
                 members,
@@ -358,24 +373,33 @@ pub(super) fn restructure_tree_groups_for_grouping(
                     }
 
                     // Create tree group with inner_grouping_keys and all members
-                    new_reducing_by.push(DomainExpression::Function(FunctionExpression::Curly {
-                        members: nested_members,
-                        inner_grouping_keys,
-                        cte_requirements: None, // Phase R2+ will populate this
-                        alias,
-                    }));
+                    new_reducing_by.push(ast_resolved::OutputDomainExpression {
+                        expr: DomainExpression::Function(FunctionExpression::Curly {
+                            members: nested_members,
+                            inner_grouping_keys,
+                            cte_requirements: None, // Phase R2+ will populate this
+                            alias,
+                        }),
+                        output,
+                    });
                 } else {
                     // No nested reductions - keep the tree group as-is
-                    new_reducing_by.push(DomainExpression::Function(FunctionExpression::Curly {
-                        members,
-                        inner_grouping_keys: vec![],
-                        cte_requirements: None,
-                        alias,
-                    }));
+                    new_reducing_by.push(ast_resolved::OutputDomainExpression {
+                        expr: DomainExpression::Function(FunctionExpression::Curly {
+                            members,
+                            inner_grouping_keys: vec![],
+                            cte_requirements: None,
+                            alias,
+                        }),
+                        output,
+                    });
                 }
             }
             // Non-tree-group expressions stay in reducing_by
-            other => new_reducing_by.push(other),
+            other => new_reducing_by.push(ast_resolved::OutputDomainExpression {
+                expr: other,
+                output,
+            }),
         }
     }
 

@@ -220,11 +220,11 @@ fn walk_operator_for_tree_groups(
                 ..
             } = spec
             {
-                for expr in reducing_by.iter_mut() {
-                    walk_domain_for_tree_groups(expr, counter);
+                for ode in reducing_by.iter_mut() {
+                    walk_domain_for_tree_groups(&mut ode.expr, counter);
                 }
-                for expr in reducing_on.iter_mut() {
-                    walk_domain_for_tree_groups(expr, counter);
+                for ode in reducing_on.iter_mut() {
+                    walk_domain_for_tree_groups(&mut ode.expr, counter);
                 }
             }
         }

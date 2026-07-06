@@ -22,7 +22,7 @@ pub struct ResultMetadata {
 }
 
 /// Fetch ALL rows from a DQL session into QueryResults.
-fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<QueryResults> {
+pub(crate) fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<QueryResults> {
     let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
@@ -160,11 +160,108 @@ fn display_results(
 }
 
 /// Stream raw cell bytes to stdout (no text conversion, no formatting).
-fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<ResultMetadata> {
+/// `-f json` / `-f jsonl` — the typed emission path (PLAN.md #5).
+/// Reads the protocol's nullable cells and column descriptors directly:
+/// NULL is null (never the string "NULL"), numbers are unquoted when
+/// the column's declared type is numeric AND the text round-trips, and
+/// columns keep relation order. Streaming: json emits one valid array
+/// across all batches (the old per-batch path emitted concatenated
+/// arrays past 100 rows — invalid JSON); jsonl emits one object per
+/// line, pipe-friendly.
+fn display_results_json(
+    session: &mut dyn DqlSession,
+    dql: &str,
+    array_mode: bool,
+) -> Result<ResultMetadata> {
+    use crate::output_format::json_object_row;
     use std::io::Write;
 
     let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+    let descriptors: Vec<String> = qr.columns.iter().map(|c| c.descriptor.clone()).collect();
+
+    let stdout = std::io::stdout().lock();
+    let mut out = std::io::BufWriter::new(stdout);
+    let mut total_rows = 0usize;
+
+    if array_mode {
+        out.write_all(b"[")?;
+    }
+    loop {
+        let fr = session
+            .fetch(&qr.handle, 100)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        if fr.finished {
+            break;
+        }
+        for row in &fr.rows {
+            let cells: Vec<Option<String>> = row
+                .iter()
+                .map(|c| {
+                    c.as_ref()
+                        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                })
+                .collect();
+            let line = json_object_row(&columns, &descriptors, &cells);
+            if array_mode {
+                if total_rows > 0 {
+                    out.write_all(b",")?;
+                }
+                out.write_all(b"\n  ")?;
+                out.write_all(line.as_bytes())?;
+            } else {
+                out.write_all(line.as_bytes())?;
+                out.write_all(b"\n")?;
+            }
+            total_rows += 1;
+        }
+    }
+    if array_mode {
+        if total_rows > 0 {
+            out.write_all(b"\n")?;
+        }
+        out.write_all(b"]\n")?;
+    }
+    out.flush()?;
+
+    let _ = session
+        .close(qr.handle)
+        .map_err(|e| anyhow::anyhow!("{}", e));
+
+    Ok(ResultMetadata {
+        columns,
+        row_count: total_rows,
+    })
+}
+
+/// `-f raw` — the byte-preservation doctrine's user-facing exit
+/// (PORCELAIN-AND-PLUMBING.md §7 knob 4, ratified 2026-07-05): verbatim
+/// cell bytes, no separators ever (a separator would corrupt binary),
+/// NULL writes zero bytes, multi-row = byte-stream concatenation.
+/// Single column ONLY — multi-column concatenation ("1John2Jane") is
+/// never what anyone wants; refuse and teach.
+fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<ResultMetadata> {
+    use std::io::{IsTerminal, Write};
+
+    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+    if columns.len() != 1 {
+        anyhow::bail!(
+            "raw is byte-faithful extraction of ONE column; this result has \
+             {} ({}). Project the column you want: |> (col)",
+            columns.len(),
+            columns.join(", ")
+        );
+    }
+    if std::io::stdout().is_terminal() {
+        // The poweruser sharp edge, --no-sanitize style: verbatim bytes
+        // to a terminal are an injection surface. Warn, never block;
+        // silent when piped (the intended use).
+        eprintln!(
+            "warning: -f raw writes verbatim bytes (terminal control \
+             sequences included); intended for pipes and files"
+        );
+    }
     let mut stdout = std::io::stdout().lock();
     let mut total_rows = 0usize;
 
@@ -319,6 +416,10 @@ fn execute_single_query(
         let meta = display_results_raw(session, &dql)?;
         return Ok(Some(meta));
     }
+    if matches!(output_format, OutputFormat::Json | OutputFormat::Jsonl) {
+        let meta = display_results_json(session, &dql, output_format == OutputFormat::Json)?;
+        return Ok(Some(meta));
+    }
 
     let meta = display_results(
         session,
@@ -338,7 +439,7 @@ fn compile_stage_dql(stage: &str, source: &str) -> String {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(source.as_bytes());
     format!(
-        "sys::execution.compile(\"{}\", b64:\"{}\") |> (representation, error)",
+        "sys::execution.compile(\"{}\", b64:\"{}\") |> (representation, error, error_message)",
         stage, encoded
     )
 }
@@ -365,11 +466,18 @@ fn display_compile_stage(
         .ok_or_else(|| anyhow::anyhow!("sys::execution.compile returned no rows"))?;
 
     if let Some(uri) = &row[1] {
+        // The full message rides alongside the URI (ALPHA-CLI-UX-WORRIES
+        // #4: this path used to print the URI and tell the user to re-run
+        // without --to for a message it already had — withholding, at
+        // exactly the moment the user asked the CLI to explain itself).
         let uri = String::from_utf8_lossy(uri);
+        let message = row[2]
+            .as_ref()
+            .map(|m| String::from_utf8_lossy(m).to_string())
+            .unwrap_or_else(|| "compilation failed".to_string());
         anyhow::bail!(
-            "compilation failed: {uri}\n\
-             (run `dql explain {uri}` for the identifier's prose, or run \
-             the query without --to for the full message)"
+            "[{uri}] {message}\n\
+             (run `dql explain {uri}` for the identifier's prose)"
         );
     }
 
@@ -378,6 +486,20 @@ fn display_compile_stage(
         None => anyhow::bail!("sys::execution.compile returned neither output nor error"),
     };
     let columns = vec!["representation".to_string()];
+
+    // Raw = the pasteable artifact itself: bare text, real newlines, no
+    // header. This caller previously fell through to display paths whose
+    // Raw arm is (correctly) unreachable!() — the panic of
+    // bugs/cli-surface-2026-07-05/PLAN.md #1. It also closes the audit's
+    // "no clean just-the-SQL spelling" gap: `--to sql -f raw` is it.
+    if output_format == OutputFormat::Raw {
+        println!("{}", representation);
+        return Ok(Some(ResultMetadata {
+            columns,
+            row_count: 1,
+        }));
+    }
+
     let display_rows = vec![vec![representation]];
     let output = format_output_with_zebra(
         &columns,

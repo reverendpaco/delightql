@@ -73,7 +73,7 @@ pub fn resolve_entity_with_alias(
             canonical_name: None, // CTEs don't have canonical names from bootstrap
             resolved_namespace: None,
             backend_schema: None,
-            entity_type: EntityType::Relation,
+            entity_type: ResolvedEntityKind::Relation,
             registry_source: RegistrySource::QueryLocal,
             schema_source: SchemaSource::SelectClause,
             definition: EntityDefinition::RelationSchema(cte_schema_clone),
@@ -128,7 +128,7 @@ pub fn resolve_entity_with_alias(
                             canonical_name: Some(canonical_name),
                             resolved_namespace: Some(core_namespace_path.clone()),
                             backend_schema: backend_schema_opt,
-                            entity_type: EntityType::Relation,
+                            entity_type: ResolvedEntityKind::Relation,
                             registry_source: RegistrySource::Database,
                             schema_source: SchemaSource::DatabaseCatalog,
                             definition: EntityDefinition::RelationSchema(table_schema),
@@ -145,7 +145,7 @@ pub fn resolve_entity_with_alias(
                             .join("::");
                         if let Some(entity) = registry.consult.lookup_entity(&actual_name, &fq) {
                             if entity.entity_type
-                                == BootstrapEntityType::DqlTemporaryViewExpression.as_i32()
+                                == BootstrapEntityType::DqlTemporaryViewExpression
                             {
                                 return ResolutionResult::ConsultedView {
                                     name: entity.name.clone(),
@@ -153,7 +153,7 @@ pub fn resolve_entity_with_alias(
                                     namespace: fq.clone(),
                                 };
                             }
-                            if entity.entity_type == BootstrapEntityType::DqlFactExpression.as_i32()
+                            if entity.entity_type == BootstrapEntityType::DqlFactExpression
                             {
                                 return ResolutionResult::ConsultedFact {
                                     name: entity.name.clone(),
@@ -177,7 +177,7 @@ pub fn resolve_entity_with_alias(
                             canonical_name: None, // No canonical name available in fallback path
                             resolved_namespace: None,
                             backend_schema: None,
-                            entity_type: EntityType::Relation,
+                            entity_type: ResolvedEntityKind::Relation,
                             registry_source: RegistrySource::Database,
                             schema_source: SchemaSource::DatabaseCatalog,
                             definition: EntityDefinition::RelationSchema(table_schema),
@@ -206,7 +206,7 @@ pub fn resolve_entity_with_alias(
                 canonical_name: None, // No system, no canonical name
                 resolved_namespace: None,
                 backend_schema: None,
-                entity_type: EntityType::Relation,
+                entity_type: ResolvedEntityKind::Relation,
                 registry_source: RegistrySource::Database,
                 schema_source: SchemaSource::DatabaseCatalog,
                 definition: EntityDefinition::RelationSchema(table_schema),

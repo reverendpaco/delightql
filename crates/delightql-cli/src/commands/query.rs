@@ -73,11 +73,9 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         format,
         no_headers,
         no_sanitize,
-        make_new_db_if_missing,
         consult_files,
         attach,
         sql_optimize,
-        inline_ctes,
         sequential,
         #[cfg(feature = "repl")]
             interactive: _,
@@ -100,10 +98,6 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
     if *sql_optimize > 0 {
         std::env::set_var("DQL_SOPTIMIZE", sql_optimize.to_string());
     }
-    if *inline_ctes {
-        eprintln!("warning: --inline-ctes currently does nothing");
-    }
-
     if *no_sanitize {
         eprintln!("warning: output sanitization disabled, terminal injection possible");
     }
@@ -112,7 +106,11 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         anyhow::bail!("--consult flag not supported. Use consult!() in DQL source instead.");
     }
 
-    let conn = make_connection(&db_path, *make_new_db_if_missing, base_args.via.as_deref())?;
+    let conn = make_connection(
+        &db_path,
+        base_args.make_new_db_if_missing,
+        base_args.via.as_deref(),
+    )?;
     let mut handle = conn.open_handle()?;
 
     // mount! the user database as "main" (if specified)
@@ -136,7 +134,15 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
             *sequential,
         )
     } else if let Some(ref f) = file {
-        let source_code = std::fs::read_to_string(f)?;
+        // `--file -` means stdin, per convention (R2.4) — otherwise the
+        // OS goes looking for a file literally named "-".
+        let source_code = if f.as_os_str() == "-" {
+            let mut buffer = String::new();
+            io::stdin().read_to_string(&mut buffer)?;
+            buffer
+        } else {
+            std::fs::read_to_string(f)?
+        };
         run_query(
             &source_code,
             &mut *handle,

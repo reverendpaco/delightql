@@ -12,6 +12,7 @@ pub enum OutputFormat {
     Table, // Default pipe-delimited table
     Box,  // Unicode box-drawing table (like SQLite's .mode box)
     Json, // JSON array of objects
+    Jsonl, // One JSON object per row (streams; composes with jq)
     Csv,  // Comma-separated values
     Tsv,  // Tab-separated values
     List, // Key=value pairs
@@ -48,6 +49,7 @@ impl OutputFormat {
             "table" => Some(OutputFormat::Table),
             "box" => Some(OutputFormat::Box),
             "json" => Some(OutputFormat::Json),
+            "jsonl" => Some(OutputFormat::Jsonl),
             "csv" => Some(OutputFormat::Csv),
             "tsv" => Some(OutputFormat::Tsv),
             "list" => Some(OutputFormat::List),
@@ -57,7 +59,7 @@ impl OutputFormat {
     }
 
     pub fn all_formats() -> &'static [&'static str] {
-        &["table", "box", "json", "csv", "tsv", "list", "raw"]
+        &["table", "box", "json", "jsonl", "csv", "tsv", "list", "raw"]
     }
 }
 
@@ -118,6 +120,7 @@ fn format_output_inner(
             }
         }
         OutputFormat::Json => format_as_json(columns, rows),
+        OutputFormat::Jsonl => format_as_jsonl(columns, rows),
         OutputFormat::Csv => format_as_csv(columns, rows, no_headers),
         OutputFormat::Tsv => format_as_tsv(columns, rows, no_headers),
         OutputFormat::List => format_as_list_with_zebra(columns, rows, zebra_mode),
@@ -429,20 +432,133 @@ fn format_as_box_with_zebra(
     output
 }
 
-fn format_as_json(columns: &[String], rows: &[Vec<String>]) -> String {
-    let mut json_rows = Vec::new();
+/// SQLite type affinity of a declared type, reduced to what JSON
+/// emission needs (bugs/cli-surface-2026-07-05/PLAN.md #5).
+enum JsonAffinity {
+    Integer,
+    Numeric, // REAL / NUMERIC / BOOLEAN — try integer, then float
+    Text,
+}
 
-    for row in rows {
-        let mut json_object = serde_json::Map::new();
-        for (i, column) in columns.iter().enumerate() {
-            let value = row.get(i).unwrap_or(&String::new()).clone();
-            json_object.insert(column.clone(), serde_json::Value::String(value));
-        }
-        json_rows.push(serde_json::Value::Object(json_object));
+fn json_affinity(descriptor: &str) -> JsonAffinity {
+    let d = descriptor.to_ascii_uppercase();
+    if d.contains("INT") {
+        JsonAffinity::Integer
+    } else if d.contains("CHAR") || d.contains("CLOB") || d.contains("TEXT") {
+        JsonAffinity::Text
+    } else if d.is_empty() || d.contains("BLOB") {
+        // No declaration (expression/CTE column) or blob: no knowledge,
+        // no typed strengthening — the typed-gate doctrine at the
+        // presentation seam. Strings.
+        JsonAffinity::Text
+    } else {
+        JsonAffinity::Numeric // REAL, FLOAT, DOUBLE, NUMERIC, DECIMAL, BOOLEAN
     }
+}
 
-    let json_array = serde_json::Value::Array(json_rows);
-    serde_json::to_string_pretty(&json_array).unwrap_or_else(|_| "[]".to_string())
+/// One JSON scalar from a nullable cell + its column's declared type.
+/// Numbers are emitted ONLY when the declaration is numeric AND the
+/// text round-trips exactly (parse-then-reprint equality) — a TEXT
+/// '007' stays "007", a REAL '3.50' stays "3.50". NULL is null.
+/// Emission never loses bytes; it only unquotes what is provably a
+/// number (PLAN.md #5: the JSON formatter must not lie about types).
+pub fn json_cell(descriptor: &str, cell: Option<&str>) -> String {
+    let Some(s) = cell else {
+        return "null".to_string();
+    };
+    match json_affinity(descriptor) {
+        JsonAffinity::Text => json_escape(s),
+        JsonAffinity::Integer | JsonAffinity::Numeric => {
+            if let Ok(i) = s.parse::<i64>() {
+                if i.to_string() == s {
+                    return s.to_string();
+                }
+            }
+            if let Ok(f) = s.parse::<f64>() {
+                if f.is_finite() && f.to_string() == s {
+                    return s.to_string();
+                }
+            }
+            json_escape(s) // declared numeric but doesn't round-trip: keep the bytes
+        }
+    }
+}
+
+/// One JSON object per row, columns in RELATION ORDER (the old serde
+/// Map alphabetized them), compact.
+pub fn json_object_row(
+    columns: &[String],
+    descriptors: &[String],
+    row: &[Option<String>],
+) -> String {
+    let mut out = String::from("{");
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&json_escape(col));
+        out.push_str(": ");
+        let desc = descriptors.get(i).map(|s| s.as_str()).unwrap_or("");
+        out.push_str(&json_cell(desc, row.get(i).and_then(|c| c.as_deref())));
+    }
+    out.push('}');
+    out
+}
+
+/// JSON string escaping per RFC 8259: quotes, backslash, and all
+/// control chars (so terminal-injection sanitization is inherent).
+/// Also used by main's --error-format json records (R2.3).
+pub fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Stringly-caller face of JSON output (tools paths, which have no
+/// descriptors and no NULL fidelity — their cells arrive as the string
+/// "NULL"). Everything emits as strings, in relation order. The typed
+/// path is exec_ng's display_results_json, which reads nullable cells
+/// and descriptors; upgrading the tools paths to it is PLAN.md #5's
+/// recorded residue.
+fn format_as_json(columns: &[String], rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return "[]\n".to_string();
+    }
+    let descriptors: Vec<String> = vec![String::new(); columns.len()];
+    let mut out = String::from("[\n");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str("  ");
+        let cells: Vec<Option<String>> = row.iter().map(|c| Some(c.clone())).collect();
+        out.push_str(&json_object_row(columns, &descriptors, &cells));
+    }
+    out.push_str("\n]\n");
+    out
+}
+
+fn format_as_jsonl(columns: &[String], rows: &[Vec<String>]) -> String {
+    let descriptors: Vec<String> = vec![String::new(); columns.len()];
+    let mut out = String::new();
+    for row in rows {
+        let cells: Vec<Option<String>> = row.iter().map(|c| Some(c.clone())).collect();
+        out.push_str(&json_object_row(columns, &descriptors, &cells));
+        out.push('\n');
+    }
+    out
 }
 
 fn format_as_csv(columns: &[String], rows: &[Vec<String>], no_headers: bool) -> String {
@@ -577,7 +693,8 @@ mod tests {
     #[test]
     fn test_output_format_all_formats() {
         let formats = OutputFormat::all_formats();
-        assert_eq!(formats.len(), 7);
+        assert_eq!(formats.len(), 8);
+        assert!(formats.contains(&"jsonl"));
         assert!(formats.contains(&"table"));
         assert!(formats.contains(&"box"));
         assert!(formats.contains(&"json"));
@@ -688,7 +805,7 @@ mod tests {
         let rows = vec![];
 
         assert_eq!(format_as_table(&columns, &rows), "");
-        assert_eq!(format_as_json(&columns, &rows), "[]");
+        assert_eq!(format_as_json(&columns, &rows), "[]\n");
         assert_eq!(format_as_csv(&columns, &rows, false), "");
         assert_eq!(format_as_tsv(&columns, &rows, false), "");
         assert_eq!(format_as_list(&columns, &rows), "");
@@ -706,7 +823,7 @@ mod tests {
         assert_eq!(csv_result, "name,age\n");
 
         let json_result = format_as_json(&columns, &rows);
-        assert_eq!(json_result, "[]");
+        assert_eq!(json_result, "[]\n");
     }
 
     #[test]

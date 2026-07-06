@@ -428,7 +428,7 @@ pub fn build_ddl_head(source: &str) -> Result<(String, DdlHead)> {
                     truncate_for_display(child.text(), 80),
                 ),
                 source: None,
-                subcategory: Some("ddl"),
+                subcategory: Some(crate::uri_registry::subcat::PARSE_DDL),
             });
         }
 
@@ -482,7 +482,7 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
                     truncate_for_display(child.text(), 80),
                 ),
                 source: None,
-                subcategory: Some("ddl"),
+                subcategory: Some(crate::uri_registry::subcat::PARSE_DDL),
             });
         }
 

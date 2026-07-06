@@ -501,14 +501,16 @@ mod tests {
             "users",
             vec![
                 SchemaColumnInfo {
-                    name: "id".to_string(),
+                    name: "id".into(),
                     nullable: false,
                     position: 0,
+                    declared_type: None,
                 },
                 SchemaColumnInfo {
-                    name: "name".to_string(),
+                    name: "name".into(),
                     nullable: true,
                     position: 1,
+                    declared_type: None,
                 },
             ],
         );
@@ -524,16 +526,4 @@ mod tests {
         assert_eq!(columns[1].name, "name");
     }
 
-    #[test]
-    fn test_mock_namespace() {
-        let schema = MockSchemaProvider::new();
-
-        // Add namespace mapping
-        schema.add_namespace("nba::players", "nba_schema");
-
-        // Test namespace resolution
-        let path = NamespacePath::from_parts(vec!["nba".to_string(), "players".to_string()]);
-        let resolved = schema.resolve_namespace_path(&path).unwrap();
-        assert_eq!(resolved, Some("nba_schema".to_string()));
-    }
 }

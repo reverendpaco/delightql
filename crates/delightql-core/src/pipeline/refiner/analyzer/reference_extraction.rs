@@ -198,7 +198,7 @@ pub(super) fn table_has_column(schema: &resolved::CprSchema, column_name: &str) 
     if let resolved::CprSchema::Resolved(columns) = schema {
         columns
             .iter()
-            .any(|col| col.name().eq_ignore_ascii_case(column_name))
+            .any(|col| delightql_types::SqlIdentifier::str_eq(col.name(), column_name))
     } else {
         false
     }

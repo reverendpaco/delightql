@@ -17,9 +17,9 @@ use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
 use crate::pipeline::asts::core::operators::{ColumnSelector, FrameBound, WindowFrame};
 use crate::pipeline::asts::core::{
     ArrayMember, BooleanExpression, CteBinding, CurlyMember, DomainExpression, DomainSpec,
-    FunctionExpression, ModuloSpec, OrderingSpec, PhaseBox, PipeExpression, Query, Relation,
-    RelationalExpression, RenameSpec, RepositionSpec, Row, SigmaCondition, UnaryRelationalOperator,
-    DelegateSpec,
+    FunctionExpression, ModuloSpec, OrderingSpec, OutputDomainExpression, PhaseBox, PipeExpression,
+    Query, Relation, RelationalExpression, RenameSpec, RepositionSpec, Row, SigmaCondition,
+    UnaryRelationalOperator, DelegateSpec,
 };
 
 // =============================================================================
@@ -240,11 +240,23 @@ pub fn walk_transform_modulo_spec<P, Q, F: AstTransform<P, Q> + ?Sized>(
         } => Ok(ModuloSpec::GroupBy {
             reducing_by: reducing_by
                 .into_iter()
-                .map(|e| t.transform_domain(e))
+                .map(|ode| {
+                    Ok(OutputDomainExpression {
+                        expr: t.transform_domain(ode.expr)?,
+                        // Q-phase output stamp: rephase preserves data.
+                        output: ode.output.rephase(),
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?,
             reducing_on: reducing_on
                 .into_iter()
-                .map(|e| t.transform_domain(e))
+                .map(|ode| {
+                    Ok(OutputDomainExpression {
+                        expr: t.transform_domain(ode.expr)?,
+                        // Q-phase output stamp: rephase preserves data.
+                        output: ode.output.rephase(),
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?,
             delegates: delegates
                 .into_iter()
@@ -253,7 +265,13 @@ pub fn walk_transform_modulo_spec<P, Q, F: AstTransform<P, Q> + ?Sized>(
                         payload: w
                             .payload
                             .into_iter()
-                            .map(|e| t.transform_domain(e))
+                            .map(|ode| {
+                                Ok(OutputDomainExpression {
+                                    expr: t.transform_domain(ode.expr)?,
+                                    // Q-phase output stamp: rephase preserves data.
+                                    output: ode.output.rephase(),
+                                })
+                            })
                             .collect::<Result<Vec<_>>>()?,
                         order: w
                             .order

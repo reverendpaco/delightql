@@ -2,24 +2,61 @@
 // Copyright 2026 Daniel Eklund
 // `dql explain <identifier>` — the registry-backed identifier explainer.
 //
-// The window into the compiler's identifier taxonomy (URI-DESIGN.md §3):
-// reads the same compiler-owned registry the delightql.org/uri/ pages are
-// generated from, so the CLI and the website cannot disagree.
+// The window into the compiler's identifier taxonomy (URI-DESIGN.md §3).
+// Since SYS-HELP-DESIGN.md phase 1, the registry IS a burned relation:
+// this command queries `sys::help.identifier(*)` from the in-memory
+// bootstrap (rows authored in bootstrap/schema.sql), so `dql explain`,
+// `sys::help.identifier(*)` in a query, and every future projection
+// (website, man pages) read one source and can never disagree.
+// Spelling normalization (badge form / canonical URL / bare hierarchy)
+// stays in code: delightql_core::uri_registry.
 
 use anyhow::Result;
 use delightql_core::uri_registry::{
-    canonical_url, children, find, find_bare, parse_identifier, RegistryEntry, UriKind,
+    canonical_url, kind_from_word, parse_identifier, IdentifierEntry, UriKind,
 };
 
+/// Load the identifier rows by standing up the in-memory system and
+/// querying the burned table — the same ~25ms a `dql query` pays, so
+/// explain's latency is unchanged (measured, SYS-HELP finding #5).
+fn load_rows() -> Result<Vec<IdentifierEntry>> {
+    let conn = crate::connection::ConnectionManager::new_memory()?;
+    let mut handle = conn.open_handle()?;
+    let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let results = crate::exec_ng::fetch_all(
+        &mut *session,
+        "sys::help.identifier(*) |> (kind, hierarchy, summary, explanation)",
+    )?;
+    results
+        .rows
+        .into_iter()
+        .map(|row| {
+            let kind = kind_from_word(&row[0])
+                .ok_or_else(|| anyhow::anyhow!("bad kind word in identifier row: {}", row[0]))?;
+            Ok(IdentifierEntry {
+                kind,
+                hierarchy: row[1].clone(),
+                summary: row[2].clone(),
+                explanation: row[3].clone(),
+            })
+        })
+        .collect()
+}
+
 pub fn handle_explain(identifier: &str) -> Result<()> {
+    let rows = load_rows()?;
     match parse_identifier(identifier) {
-        Some((kind, hierarchy)) => explain_one(kind, &hierarchy),
+        Some((kind, hierarchy)) => explain_one(&rows, kind, &hierarchy),
         None => {
             // Bare hierarchy: search across kinds.
             let bare = identifier.trim_matches('/');
-            let hits = find_bare(bare);
+            let hits: Vec<&IdentifierEntry> =
+                rows.iter().filter(|e| e.hierarchy == bare).collect();
             match hits.len() {
-                1 => explain_one(hits[0].kind, hits[0].hierarchy),
+                1 => {
+                    let (kind, hierarchy) = (hits[0].kind, hits[0].hierarchy.clone());
+                    explain_one(&rows, kind, &hierarchy)
+                }
                 0 => {
                     anyhow::bail!(
                         "'{identifier}' is not a DelightQL identifier.\n\
@@ -42,16 +79,19 @@ pub fn handle_explain(identifier: &str) -> Result<()> {
     }
 }
 
-fn explain_one(kind: UriKind, hierarchy: &str) -> Result<()> {
+fn explain_one(rows: &[IdentifierEntry], kind: UriKind, hierarchy: &str) -> Result<()> {
     println!("{}{}", kind.scheme(), hierarchy);
     println!("  → {}", canonical_url(kind, hierarchy));
     println!();
 
-    match find(kind, hierarchy) {
+    match rows
+        .iter()
+        .find(|e| e.kind == kind && e.hierarchy == hierarchy)
+    {
         Some(entry) => {
             println!("{}", entry.summary);
             println!();
-            println!("{}", wrap(entry.explanation, 74));
+            println!("{}", wrap(&entry.explanation, 74));
             print_kind_facts(entry);
         }
         None => {
@@ -64,7 +104,13 @@ fn explain_one(kind: UriKind, hierarchy: &str) -> Result<()> {
         }
     }
 
-    let kids = children(kind, hierarchy);
+    // Registered descendants (segment-prefix semantics — the same
+    // family matching error hooks use).
+    let prefix = format!("{}/", hierarchy);
+    let kids: Vec<&IdentifierEntry> = rows
+        .iter()
+        .filter(|e| e.kind == kind && e.hierarchy.starts_with(&prefix))
+        .collect();
     if !kids.is_empty() {
         println!();
         println!("Registered under this family:");
@@ -75,14 +121,14 @@ fn explain_one(kind: UriKind, hierarchy: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_kind_facts(entry: &RegistryEntry) {
+fn print_kind_facts(entry: &IdentifierEntry) {
     match entry.kind {
         UriKind::Danger => {
             // Semantic-class gates are inline-only; the registry delegates
             // to the compiler's own enforcement, so this cannot disagree
             // with what the CLI actually accepts.
             let overridable =
-                delightql_core::uri_registry::danger_cli_overridable(entry.hierarchy);
+                delightql_core::uri_registry::danger_cli_overridable(&entry.hierarchy);
             println!();
             if overridable {
                 println!(

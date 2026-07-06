@@ -59,9 +59,55 @@ fn has_bang_operator_error_pattern(tree: &tree_sitter::Tree, source: &str) -> bo
     has_error && has_success
 }
 
+/// What `format_outcome` actually did — the safety fallbacks (return the
+/// input unchanged rather than risk corrupting code) are sound, but they
+/// must be VISIBLE to callers: a CI gate that can't tell "already
+/// formatted" from "formatter gave up" blesses unformatted code
+/// (bugs/cli-surface-2026-07-05/PLAN.md #3, half A).
+#[derive(Debug)]
+pub enum FormatOutcome {
+    /// The visitor handled everything and the result re-parses.
+    Formatted(String),
+    /// Input returned byte-for-byte unchanged. `node_kind` names the
+    /// first construct the visitor doesn't handle; `None` means the
+    /// formatted text re-parsed worse than the input did (level-1 bail).
+    PassedThrough {
+        source: String,
+        node_kind: Option<String>,
+    },
+}
+
+impl FormatOutcome {
+    /// The output text, whichever outcome occurred.
+    pub fn text(&self) -> &str {
+        match self {
+            FormatOutcome::Formatted(s) => s,
+            FormatOutcome::PassedThrough { source, .. } => source,
+        }
+    }
+}
+
 /// Format a DelightQL query string.
 /// Caller provides the tree-sitter Language (avoids grammar compilation in this crate).
+///
+/// Compatibility wrapper over [`format_outcome`]: flattens pass-through
+/// to the unchanged source. Callers that gate on "is this formatted?"
+/// must use `format_outcome` instead — this wrapper cannot distinguish
+/// clean output from a formatter gap.
 pub fn format(source: &str, language: &Language, config: &FormatConfig) -> Result<String> {
+    Ok(match format_outcome(source, language, config)? {
+        FormatOutcome::Formatted(s) => s,
+        FormatOutcome::PassedThrough { source, .. } => source,
+    })
+}
+
+/// Format a DelightQL query string, reporting whether the formatter
+/// actually formatted or safely passed the input through.
+pub fn format_outcome(
+    source: &str,
+    language: &Language,
+    config: &FormatConfig,
+) -> Result<FormatOutcome> {
     // Parse the source using tree-sitter
     let mut parser = Parser::new();
     parser
@@ -83,9 +129,13 @@ pub fn format(source: &str, language: &Language, config: &FormatConfig) -> Resul
     formatter.format_node(&tree.root_node())?;
 
     // Level 2: If the visitor hit an unrecognized named node, the output
-    // may be incomplete — bail to the original input.
+    // may be incomplete — bail to the original input, naming the node.
     if formatter.hit_unknown {
-        return Ok(source.to_string());
+        let node_kind = formatter.unknown_kind.clone();
+        return Ok(FormatOutcome::PassedThrough {
+            source: source.to_string(),
+            node_kind,
+        });
     }
 
     let formatted = formatter.output();
@@ -101,10 +151,13 @@ pub fn format(source: &str, language: &Language, config: &FormatConfig) -> Resul
 
     if formatted_has_error && !original_has_error {
         // Formatting broke something — return original unchanged
-        return Ok(source.to_string());
+        return Ok(FormatOutcome::PassedThrough {
+            source: source.to_string(),
+            node_kind: None,
+        });
     }
 
-    Ok(formatted)
+    Ok(FormatOutcome::Formatted(formatted))
 }
 
 /// Load format configuration from a .dql-format file.

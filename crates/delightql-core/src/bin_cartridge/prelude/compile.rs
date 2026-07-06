@@ -4,10 +4,15 @@
 //!
 //! Syntax: `sys::execution.compile("stage", """source""")`
 //!
-//! Returns a 1-row relation: `(stage, query, representation, error)`
+//! Returns a 1-row relation:
+//! `(stage, query, representation, error, error_message)`
 //!
-//! On success, `representation` contains the compiled output and `error` is NULL.
-//! On failure, `representation` is NULL and `error` contains the error URI.
+//! On success, `representation` contains the compiled output and `error`
+//! and `error_message` are NULL. On failure, `representation` is NULL,
+//! `error` contains the error URI, and `error_message` the full prose —
+//! the inspection surface must never know less than the execution
+//! surface about why a compile failed (error_message added additively;
+//! `error` stays URI-only for consumers that parse it).
 //!
 //! Stages: "cst", "ast-unresolved", "ast-resolved", "ast-refined", "sql"
 
@@ -50,6 +55,7 @@ impl BinEntity for CompilePredicate {
                 ("query".to_string(), "String".to_string()),
                 ("representation".to_string(), "String".to_string()),
                 ("error".to_string(), "String".to_string()),
+                ("error_message".to_string(), "String".to_string()),
             ]),
         }
     }
@@ -85,7 +91,7 @@ impl EffectExecutable for CompilePredicate {
 
         let (representation, error) = match compile_to_stage(system, &stage, &source) {
             Ok(repr) => (Some(repr), None),
-            Err(e) => (None, Some(e.error_uri())),
+            Err(e) => (None, Some((e.error_uri(), e.to_string()))),
         };
 
         let relation = build_compile_result(&stage, &source, representation, error, alias);
@@ -136,7 +142,7 @@ fn build_compile_result(
     stage: &str,
     query: &str,
     representation: Option<String>,
-    error: Option<String>,
+    error: Option<(String, String)>,
     alias: Option<String>,
 ) -> Relation {
     let headers = vec![
@@ -144,6 +150,7 @@ fn build_compile_result(
         DomainExpression::lvar_builder("query".to_string()).build(),
         DomainExpression::lvar_builder("representation".to_string()).build(),
         DomainExpression::lvar_builder("error".to_string()).build(),
+        DomainExpression::lvar_builder("error_message".to_string()).build(),
     ];
     let row = Row {
         values: vec![
@@ -154,7 +161,11 @@ fn build_compile_result(
                 None => null_literal(),
             },
             match &error {
-                Some(uri) => string_literal(uri),
+                Some((uri, _)) => string_literal(uri),
+                None => null_literal(),
+            },
+            match &error {
+                Some((_, message)) => string_literal(message),
                 None => null_literal(),
             },
         ],

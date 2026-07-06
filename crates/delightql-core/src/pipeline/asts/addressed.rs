@@ -38,6 +38,8 @@ pub type OrderingSpec =
     crate::pipeline::asts::core::OrderingSpec<crate::pipeline::asts::core::Addressed>;
 pub type DelegateSpec =
     crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Addressed>;
+pub type OutputDomainExpression =
+    crate::pipeline::asts::core::OutputDomainExpression<crate::pipeline::asts::core::Addressed>;
 pub type RenameSpec =
     crate::pipeline::asts::core::RenameSpec<crate::pipeline::asts::core::Addressed>;
 pub type RepositionSpec =

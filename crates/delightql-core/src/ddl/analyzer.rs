@@ -545,15 +545,15 @@ fn walk_modulo_spec(spec: &ModuloSpec, refs: &mut Vec<ExtractedReference>) {
             reducing_on,
             delegates,
         } => {
-            for expr in reducing_by {
-                walk_domain(expr, refs);
+            for ode in reducing_by {
+                walk_domain(&ode.expr, refs);
             }
-            for expr in reducing_on {
-                walk_domain(expr, refs);
+            for ode in reducing_on {
+                walk_domain(&ode.expr, refs);
             }
             for w in delegates {
-                for expr in &w.payload {
-                    walk_domain(expr, refs);
+                for ode in &w.payload {
+                    walk_domain(&ode.expr, refs);
                 }
                 for o in &w.order {
                     walk_domain(&o.column, refs);

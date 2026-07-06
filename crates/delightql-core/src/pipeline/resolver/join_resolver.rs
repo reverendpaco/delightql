@@ -32,7 +32,7 @@ pub(super) fn detect_anonymous_table_unification(
                 // The qualifier is a reference to the left table, so we look for the column name
                 if left_columns
                     .iter()
-                    .any(|col| super::col_name_eq(col.name(), name))
+                    .any(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
                 {
                     using_columns.push(name.clone());
                 }
@@ -46,7 +46,7 @@ pub(super) fn detect_anonymous_table_unification(
                 // Check if a column with this name exists on the left side
                 if left_columns
                     .iter()
-                    .any(|col| super::col_name_eq(col.name(), name))
+                    .any(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
                 {
                     using_columns.push(name.clone());
                 }
@@ -125,7 +125,7 @@ fn extract_function_unification(
             // Check if this column exists on the left side
             if let Some(_left_col) = left_columns
                 .iter()
-                .find(|col| super::col_name_eq(col.name(), col_name))
+                .find(|col| delightql_types::SqlIdentifier::str_eq(col.name(), col_name))
             {
                 // Get the actual column name from the right-side resolved schema
                 // The column at this index in the right table has already been resolved

@@ -1,0 +1,72 @@
+.TH DQL-FORMAT 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-format \- format/prettify DelightQL source
+.SH SYNOPSIS
+.B dql format
+[\fIOPTIONS\fR]
+[\fISOURCE\fR]
+.SH DESCRIPTION
+Formats DelightQL source and prints the result to stdout.
+.I SOURCE
+is either literal source code or a path to a file containing it; if it
+names a readable file the file is formatted, otherwise the argument
+itself is treated as source. If
+.I SOURCE
+is omitted, stdin is read.
+.PP
+Unparseable input is refused (exit 1, "Parse error in input query").
+.SH OPTIONS
+.TP
+.BI \-\-color " WHEN"
+Colored output:
+.BR always ,
+.B auto
+(default: detect terminal; honors
+.BR NO_COLOR ),
+or
+.BR never .
+.TP
+.B \-\-fail\-if\-not\-formatted
+Print nothing; exit 1 if the input is not already formatted, 0 if it
+is, 2 if the formatter cannot verify the input (see PASS-THROUGH).
+For CI enforcement.
+.TP
+.BI \-\-highlights " FILE"
+Path to a highlights.scm file.
+.TP
+.BI \-\-theme " FILE"
+Path to a theme file.
+.SH EXIT STATUS
+0 on success (or already formatted); 1 on parse error or, with
+.BR \-\-fail\-if\-not\-formatted ,
+on unformatted input; 2, with
+.BR \-\-fail\-if\-not\-formatted ,
+when the formatter passed the input through unverified.
+.SH PASS-THROUGH
+Constructs the formatter does not yet handle are passed through
+byte-for-byte rather than risk corrupting code \(em but loudly: a
+warning on stderr names the first unhandled construct
+(\(dqformatter does not yet handle node 'pipe_operator'\(dq), and
+.B \-\-fail\-if\-not\-formatted
+exits 2 (\(dqcannot verify\(dq), never 0, so a CI gate can
+distinguish a formatter gap from verified-formatted code.
+.SH EXAMPLES
+.EX
+$ dql format 'a(*),b(*),a.id=b.id'
+a(*), b(*), a.id = b.id
+$ dql format query.dql
+$ dql format --fail-if-not-formatted query.dql || echo needs formatting
+.EE
+.SH BUGS
+Formatter coverage is incomplete: pipes
+.RB ( |> ),
+group-pipes
+.RB ( ~> ),
+and anonymous tables
+.RB ( _(1,2;3,4) )
+currently pass through (loudly \(em see PASS-THROUGH) instead of
+being formatted. Coverage work is tracked as
+bugs/cli-surface-2026-07-05/PLAN.md #3B.
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-query (1)

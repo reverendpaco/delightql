@@ -89,13 +89,13 @@ impl JoinContext {
     pub fn has_column(&self, name: &str) -> bool {
         self.left_columns
             .iter()
-            .any(|col| super::col_name_eq(col.name(), name))
+            .any(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
     }
 
     pub fn find_column(&self, name: &str) -> Option<&ast_resolved::ColumnMetadata> {
         self.left_columns
             .iter()
-            .find(|col| super::col_name_eq(col.name(), name))
+            .find(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
     }
 }
 

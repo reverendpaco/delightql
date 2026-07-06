@@ -612,12 +612,16 @@ fn expand_single_glob_correlation(
             let left_cols = find_columns_for_qualifier(&left, operand_table_groups)?;
             let right_cols = find_columns_for_qualifier(&right, operand_table_groups)?;
 
-            // Find shared column names (by name, case-insensitive via SqlIdentifier)
-            let left_set: std::collections::HashSet<String> =
-                left_cols.iter().map(|c| c.to_lowercase()).collect();
+            // Find shared column names (by name, case-insensitive via SqlIdentifier).
+            // The set keys on SqlIdentifier so membership folds through the
+            // identifier equality authority — no call-site .to_lowercase().
+            let left_set: std::collections::HashSet<delightql_types::SqlIdentifier> = left_cols
+                .iter()
+                .map(|c| delightql_types::SqlIdentifier::from(c.as_str()))
+                .collect();
             let shared: Vec<String> = right_cols
                 .iter()
-                .filter(|c| left_set.contains(&c.to_lowercase()))
+                .filter(|c| left_set.contains(&delightql_types::SqlIdentifier::from(c.as_str())))
                 .cloned()
                 .collect();
 
@@ -719,13 +723,12 @@ fn find_columns_for_qualifier(
             let matches = table
                 .alias
                 .as_ref()
-                .map(|a| a.eq_ignore_ascii_case(qualifier.as_ref()))
+                .map(|a| delightql_types::SqlIdentifier::str_eq(a, qualifier.as_ref()))
                 .unwrap_or(false)
-                || table
-                    .identifier
-                    .name
-                    .as_ref()
-                    .eq_ignore_ascii_case(qualifier.as_ref());
+                || delightql_types::SqlIdentifier::str_eq(
+                    table.identifier.name.as_ref(),
+                    qualifier.as_ref(),
+                );
 
             if matches {
                 if let CprSchema::Resolved(cols) = &table.schema {

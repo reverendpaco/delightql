@@ -11,6 +11,7 @@
 //! code-resident canonical default" (DESIGN §7.10).
 
 use rusqlite::Connection;
+use crate::enums::EntityType;
 use std::collections::HashMap;
 
 /// One rule body plus its interpreter discriminator (DESIGN §4.4).
@@ -49,7 +50,7 @@ struct FormRules {
 pub struct DialectPack {
     render: HashMap<String, HashMap<String, RenderRule>>,
     /// dialect-family → form_type (entity_type_enum id) → rules.
-    form: HashMap<String, HashMap<i32, FormRules>>,
+    form: HashMap<String, HashMap<EntityType, FormRules>>,
 }
 
 impl DialectPack {
@@ -84,7 +85,7 @@ impl DialectPack {
             render.entry(dialect).or_default().insert(key, rule);
         }
 
-        let mut form: HashMap<String, HashMap<i32, FormRules>> = HashMap::new();
+        let mut form: HashMap<String, HashMap<EntityType, FormRules>> = HashMap::new();
         let mut stmt = conn.prepare(
             "SELECT f.dialect, f.form_type, e.name, f.rule_kind, f.body
              FROM dialect_form_rule f LEFT JOIN entity e ON e.id = f.entity_id",
@@ -102,6 +103,15 @@ impl DialectPack {
         })?;
         for row in rows {
             let (dialect, form_type, entity_name, rule) = row?;
+            // Unknown form_type = a row from a newer/corrupt catalog; convert
+            // at the load border (STRING-FLOOR Tier 2c), refuse loudly.
+            let form_type = EntityType::from_i32(form_type).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Integer,
+                    format!("dialect_form_rule.form_type: {}", e).into(),
+                )
+            })?;
             let rules = form
                 .entry(dialect)
                 .or_default()
@@ -129,7 +139,7 @@ impl DialectPack {
     pub fn form_rule(
         &self,
         dialect: &str,
-        form_type: i32,
+        form_type: EntityType,
         entity_name: &str,
     ) -> Option<&RenderRule> {
         let rules = self.form.get(dialect)?.get(&form_type)?;
@@ -423,15 +433,15 @@ mod tests {
         .unwrap();
         let pack = DialectPack::load(&conn).unwrap();
         // entity-specific wins for 'like'
-        assert_eq!(pack.form_rule("postgres", 15, "like").unwrap().body, "ENTITY-RULE");
+        assert_eq!(pack.form_rule("postgres", EntityType::BinSigmaPredicate, "like").unwrap().body, "ENTITY-RULE");
         // any other entity in the form falls to the form default
         assert_eq!(
-            pack.form_rule("postgres", 15, "between").unwrap().body,
+            pack.form_rule("postgres", EntityType::BinSigmaPredicate, "between").unwrap().body,
             "FORM-DEFAULT"
         );
         // other dialect / other form: canonical
-        assert!(pack.form_rule("sqlite", 15, "like").is_none());
-        assert!(pack.form_rule("postgres", 14, "like").is_none());
+        assert!(pack.form_rule("sqlite", EntityType::BinSigmaPredicate, "like").is_none());
+        assert!(pack.form_rule("postgres", EntityType::BinPseudoPredicate, "like").is_none());
     }
 
     #[test]

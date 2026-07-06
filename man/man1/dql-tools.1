@@ -1,0 +1,82 @@
+.TH DQL-TOOLS 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-tools \- ad-hoc data munging: query JSON, CSV, and files with DelightQL
+.SH SYNOPSIS
+.B dql tools jstruct
+[\fIOPTIONS\fR]
+.I QUERY
+.br
+.B dql tools csvstruct
+[\fIOPTIONS\fR]
+.I QUERY
+.br
+.B dql tools filemunge
+[\fIOPTIONS\fR]
+.BI \-\-table " SPEC PATH"
+\&...
+.I QUERY
+.PP
+Aliases:
+.BR "dql t j" ", " "dql t c" ", " "dql t m" .
+.SH DESCRIPTION
+Three entry points that load external data into an ephemeral database
+and run one DelightQL query against it, in the spirit of
+.BR jq (1)
+and
+.BR awk (1).
+.SS jstruct
+Reads JSON from stdin and exposes it as the single-column relation
+.BR j(j\ TEXT) ;
+the query addresses the JSON through DelightQL's path and destructure
+operators.
+.SS csvstruct
+Reads CSV from stdin and exposes it as the relation
+.BR c(...) .
+Without
+.B \-\-has\-headers
+the columns are named
+.BR c1 ", " c2 ", ..."
+.SS filemunge
+Loads one relation per
+.B \-\-table
+spec from files, then runs the query against them.
+.SH OPTIONS
+.TP
+.BI \-\-table " SPEC PATH"
+(filemunge) Table spec of the form
+.IR name : format [: noheader ]
+followed by the file path. Formats:
+.BR csv ,
+.BR tsv ,
+.BR json\-singleton .
+csv/tsv default to a header row; add
+.B :noheader
+to override. May be repeated.
+.TP
+.B \-\-has\-headers
+(csvstruct) Treat the first row as column headers.
+.TP
+.BI \-\-delimiter " CHAR"
+(csvstruct) Field delimiter; default comma.
+.TP
+.BI \-f ", " \-\-format " FORMAT"
+Output format. Unlike
+.BR dql-query (1),
+the default here is
+.BR table .
+.TP
+.BI \-\-to " STAGE"
+Stop at an intermediate compilation stage; same values as
+.BR dql-query (1).
+.SH EXAMPLES
+.EX
+$ echo '[{"name":"Alice","age":30}]' | dql tools jstruct 'j(j)'
+$ cat people.csv | dql tools csvstruct --has-headers 'c(*), age > 26'
+$ printf 'Alice,30\en' | dql tools c 'c(*) |> (c1)'
+$ dql tools filemunge --table people:csv people.csv \e
+      --table orders:csv orders.csv \e
+      'people(*), orders(*.(id))'
+.EE
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-query (1)

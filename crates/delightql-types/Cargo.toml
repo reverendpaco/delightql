@@ -18,3 +18,7 @@ tree-sitter.workspace = true
 
 # NO dependency on delightql-core - this breaks the circular dependency!
 # NO dependency on rusqlite - backend-specific errors belong in delightql-backends!
+
+[dev-dependencies]
+# Serde roundtrip tests for SqlIdentifier (dev-only)
+serde_json.workspace = true

@@ -32,6 +32,7 @@ pub use queries::{
     PrecompiledCfeDefinition, Query,
 };
 pub use specs::{
-    ContainmentSemantic, ModuloSpec, OrderDirection, OrderingSpec, RenameSpec, RenameTarget,
-    RepositionSpec, Row, TupleOrdinalClause, TupleOrdinalOperator, DelegateSpec,
+    ContainmentSemantic, ModuloSpec, OrderDirection, OrderingSpec, OutputDomainExpression,
+    RenameSpec, RenameTarget, RepositionSpec, Row, TupleOrdinalClause, TupleOrdinalOperator,
+    DelegateSpec,
 };

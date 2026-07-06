@@ -155,6 +155,13 @@ impl PhantomAble for Option<super::expressions::domain::LvarProvenance> {
     }
 }
 
+// Implement PhantomAble for Option<ColumnMetadata> (delegate payload output stamp)
+impl PhantomAble for Option<super::ColumnMetadata> {
+    fn phantom_data() -> Self {
+        None
+    }
+}
+
 // Implement PhantomAble for Option<String> (used by CteRequirements.cte_name)
 impl PhantomAble for Option<String> {
     fn phantom_data() -> Self {
@@ -437,6 +444,65 @@ impl PhaseBoxable for Option<super::expressions::domain::LvarProvenance> {
 impl PhaseBox<Option<super::expressions::domain::LvarProvenance>, Refined> {
     pub fn get(&self) -> &Option<super::expressions::domain::LvarProvenance> {
         &self.data
+    }
+}
+
+// =============================================================================
+// PhaseBox for Option<ColumnMetadata> (delegate payload output stamp)
+// =============================================================================
+// The resolver decides, per payload expression, which output column it yields
+// (Some) or that it contributes none (None — duplicates a group key). Stamped
+// at Resolved, read through Refined/Addressed by the lowering.
+
+// Option<ColumnMetadata> belongs in Resolved phase (the resolver stamps it)
+impl PhaseBoxable for Option<super::ColumnMetadata> {
+    type Phase = Resolved;
+
+    fn new(self) -> PhaseBox<Self, Self::Phase> {
+        PhaseBox {
+            data: self,
+            _phase: PhantomData,
+        }
+    }
+}
+
+impl PhaseBox<Option<super::ColumnMetadata>, Resolved> {
+    pub fn get(&self) -> &Option<super::ColumnMetadata> {
+        &self.data
+    }
+}
+
+impl PhaseBox<Option<super::ColumnMetadata>, Refined> {
+    pub fn get(&self) -> &Option<super::ColumnMetadata> {
+        &self.data
+    }
+}
+
+impl PhaseBox<Option<super::ColumnMetadata>, Addressed> {
+    pub fn get(&self) -> &Option<super::ColumnMetadata> {
+        &self.data
+    }
+}
+
+impl From<PhaseBox<Option<super::ColumnMetadata>, Resolved>>
+    for PhaseBox<Option<super::ColumnMetadata>, Refined>
+{
+    fn from(resolved: PhaseBox<Option<super::ColumnMetadata>, Resolved>) -> Self {
+        PhaseBox {
+            data: resolved.data,
+            _phase: PhantomData,
+        }
+    }
+}
+
+impl From<PhaseBox<Option<super::ColumnMetadata>, Refined>>
+    for PhaseBox<Option<super::ColumnMetadata>, Addressed>
+{
+    fn from(refined: PhaseBox<Option<super::ColumnMetadata>, Refined>) -> Self {
+        PhaseBox {
+            data: refined.data,
+            _phase: PhantomData,
+        }
     }
 }
 

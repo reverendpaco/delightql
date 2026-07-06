@@ -15,30 +15,31 @@ pub(in crate::pipeline::builder_v2) fn parse_lvar(node: CstNode) -> Result<Domai
         .ok_or_else(|| DelightQLError::parse_error("Empty lvar"))?;
 
     match child.kind() {
-        "identifier" => {
-            Ok(DomainExpression::lvar_builder(crate::pipeline::cst::unstrop(child.text())).build())
-        }
+        "identifier" => Ok(DomainExpression::lvar_builder(
+            crate::pipeline::cst::unstrop_identifier(child.text()),
+        )
+        .build()),
         "qualified_column" => {
             let _schema = child.field_text("schema");
 
             let qualifier = if let Some(table_field) = child.field("table") {
                 if table_field.kind() == "cpr_reference" {
                     // Special marker for CPR reference
-                    Some("_".to_string())
+                    Some(delightql_types::SqlIdentifier::new("_"))
                 } else {
-                    Some(crate::pipeline::cst::unstrop(table_field.text()))
+                    Some(crate::pipeline::cst::unstrop_identifier(table_field.text()))
                 }
             } else {
-                child.field_text("qualifier")
+                child.field_identifier("qualifier")
             };
 
             let name = child
-                .field_text("column")
+                .field_identifier("column")
                 .ok_or_else(|| DelightQLError::parse_error("No column in qualified_column"))?;
 
             // Note: schema parsing will be updated later, for now ignore it
             Ok(DomainExpression::lvar_builder(name)
-                .with_qualifier(qualifier)
+                .with_qualifier_opt(qualifier)
                 .build())
         }
         _ => Err(DelightQLError::parse_error("Invalid lvar")),
@@ -295,4 +296,59 @@ pub(in crate::pipeline::builder_v2) fn parse_column_range(
     Ok(DomainExpression::Projection(ProjectionExpr::ColumnRange(
         PhaseBoxable::new(range),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::cst::{CstNode, CstTree};
+
+    /// Depth-first search for the first CST node of a given kind.
+    fn find_kind<'a>(node: CstNode<'a>, kind: &str) -> Option<CstNode<'a>> {
+        if node.is_kind(kind) {
+            return Some(node);
+        }
+        for child in node.children() {
+            if let Some(found) = find_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Parse `source`, locate the first `lvar` node, and run it through
+    /// parse_lvar — exercising the real CST border. The parenthesized-binary
+    /// column context `t((col = 4))` is the surface whose operand routes an
+    /// `lvar` node into parse_lvar (a bare projection column takes a
+    /// different, out-of-scope construction path).
+    fn lvar_from_source(source: &str) -> DomainExpression {
+        let tree = crate::pipeline::parser::parse(source).expect("parse failed");
+        let cst = CstTree::new(&tree, source);
+        let lvar_node = find_kind(cst.root(), "lvar").expect("no lvar node in source");
+        parse_lvar(lvar_node).expect("parse_lvar failed")
+    }
+
+    #[test]
+    fn stropped_column_reference_survives_to_unresolved_ast() {
+        // A backtick-stropped column reference must reach the unresolved AST
+        // with its stroppedness intact (case-sensitive semantics).
+        match lvar_from_source("t((`MyCol` = 4))") {
+            DomainExpression::Lvar { name, .. } => {
+                assert!(name.is_stropped(), "stropped reference lost its bit");
+                assert_eq!(name.as_str(), "MyCol");
+            }
+            other => panic!("expected Lvar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_column_reference_is_unstropped() {
+        match lvar_from_source("t((mycol = 4))") {
+            DomainExpression::Lvar { name, .. } => {
+                assert!(!name.is_stropped(), "bare reference should be unstropped");
+                assert_eq!(name.as_str(), "mycol");
+            }
+            other => panic!("expected Lvar, got {other:?}"),
+        }
+    }
 }

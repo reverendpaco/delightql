@@ -405,7 +405,7 @@ impl Builder<Unprojected> {
                     right
                         .columns
                         .into_iter()
-                        .filter(|c| !using_cols.iter().any(|uc| uc == col_name(c))),
+                        .filter(|c| !using_cols.iter().any(|uc| delightql_types::SqlIdentifier::str_eq(uc, col_name(c)))),
                 );
             }
             _ => {
@@ -905,8 +905,26 @@ impl Builder<Unprojected> {
                     let lookup = source_col.as_deref().unwrap_or(original);
                     let mut p = source_columns
                         .iter()
-                        .find(|c| col_name(c) == lookup)
+                        .find(|c| delightql_types::SqlIdentifier::str_eq(col_name(c), lookup))
                         .map(|c| c.info.clone())
+                        .or_else(|| {
+                            // Identity walk before fresh: recover a source column
+                            // whose current spelling has diverged from the referenced
+                            // name. Uniqueness-guarded — zero or ≥2 stack matches fall
+                            // through; ambiguity is never resolved by first-match.
+                            let mut historical = source_columns.iter().filter(|c| {
+                                c.info
+                                    .identity_stack()
+                                    .iter()
+                                    .any(|id| id.name == lookup)
+                            });
+                            match (historical.next(), historical.next()) {
+                                (Some(c), None) => Some(c.info.clone()),
+                                _ => None,
+                            }
+                        })
+                        // Honest Fresh: the name matches nothing in the source
+                        // scope, current or historical — no identity to inherit.
                         .unwrap_or_else(|| ColumnProvenance::from_column(original));
                     if name != original {
                         p = p.with_alias(name);
@@ -1278,9 +1296,8 @@ impl Builder<Projected> {
 
 /// Qualify an unqualified column name against a column list.
 ///
-/// Tier 1: exact name match
-/// Tier 2: case-insensitive match
-/// Tier 3: identity stack walk (renamed by disambiguation)
+/// Tier 1: spelling match (ASCII case-insensitive, per the equality authority)
+/// Tier 2: identity stack walk (renamed by disambiguation)
 pub(in crate::pipeline::transformer_v4) fn qualify_in_columns(
     col_name_str: &str,
     columns: &[ColumnMetadata],
@@ -1295,10 +1312,10 @@ pub(in crate::pipeline::transformer_v4) fn qualify_in_columns(
         });
     }
 
-    // Tier 1: exact name match.
+    // Tier 1: spelling match (ASCII case-insensitive per the equality authority).
     let matches: Vec<_> = columns
         .iter()
-        .filter(|c| col_name(c) == col_name_str)
+        .filter(|c| delightql_types::SqlIdentifier::str_eq(col_name(c), col_name_str))
         .collect();
 
     match matches.len() {
@@ -1307,22 +1324,10 @@ pub(in crate::pipeline::transformer_v4) fn qualify_in_columns(
             qualifier: col_qualifier(matches[0]).map(|s| s.to_string()),
         }),
         0 => {
-            // Tier 2: case-insensitive match.
-            let ci_lower = col_name_str.to_ascii_lowercase();
-            let ci_matches: Vec<_> = columns.iter().filter(|c| {
-                col_name(c).to_ascii_lowercase() == ci_lower
-            }).collect();
-            if ci_matches.len() == 1 {
-                return Ok(QualifiedColumn {
-                    name: col_name(ci_matches[0]).to_string(),
-                    qualifier: col_qualifier(ci_matches[0]).map(|s| s.to_string()),
-                });
-            }
-
-            // Tier 3: identity stack walk.
+            // Tier 2: identity stack walk.
             let historical: Vec<_> = columns.iter().filter(|c| {
                 c.info.identity_stack().iter().any(|id| {
-                    id.name.as_str() == col_name_str
+                    id.name == col_name_str
                 })
             }).collect();
             match historical.len() {
@@ -1369,9 +1374,10 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
     columns: &[ColumnMetadata],
 ) -> Option<QualifiedColumn> {
     // Tier 1: exact match — column name AND current qualifier both match.
-    let found = columns
-        .iter()
-        .find(|c| col_name(c) == col_name_str && col_qualifier(c).map_or(false, |q| q == table));
+    let found = columns.iter().find(|c| {
+        delightql_types::SqlIdentifier::str_eq(col_name(c), col_name_str)
+            && delightql_types::SqlIdentifier::opt_str_eq(col_qualifier(c), Some(table))
+    });
 
     if let Some(col) = found {
         return Some(QualifiedColumn {
@@ -1383,9 +1389,9 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
     // Tier 2: identity stack walk.
     let historical = columns.iter().find(|c| {
         c.info.identity_stack().iter().any(|id| {
-            id.name.as_str() == col_name_str
+            id.name == col_name_str
                 && match &id.table_qualifier {
-                    TableName::Named(s) => s.as_str() == table,
+                    TableName::Named(s) => *s == table,
                     TableName::Fresh => false,
                 }
         })
@@ -1407,7 +1413,7 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
     if table == "_" {
         use crate::pipeline::asts::core::provenance::IdentityContext;
         let anon = columns.iter().find(|c| {
-            col_name(c) == col_name_str
+            delightql_types::SqlIdentifier::str_eq(col_name(c), col_name_str)
                 && c.info.identity_stack().first().map_or(false, |id| {
                     matches!(
                         &id.context,
@@ -1681,13 +1687,35 @@ fn derive_columns_from_items(
                 // This preserves the identity stack so that Tier 2 lookups
                 // (identity stack walk) can resolve renamed columns back to
                 // their original (table, name) pair.
-                let provenance = if let Some(input_col) = find_input_column(&expr, input_columns) {
-                    let mut prov = input_col.info.clone();
-                    // If the output name differs from the input name (e.g.,
-                    // disambiguation renamed "id" → "id_2"), push a scope
-                    // transition so the stack records the rename.
-                    if col_name(input_col) != name {
-                        push_scope_transition_on_provenance(&mut prov, name.as_str(), scope_name);
+                let provenance = if let Some(m) = find_input_column(&expr, input_columns) {
+                    let mut prov = m.col.info.clone();
+                    match m.derived_via {
+                        None => {
+                            // Direct column reference. If the output name differs
+                            // from the input name (e.g., disambiguation renamed
+                            // "id" → "id_2"), push a scope transition so the stack
+                            // records the rename.
+                            if !delightql_types::SqlIdentifier::str_eq(col_name(m.col), name.as_str()) {
+                                push_scope_transition_on_provenance(
+                                    &mut prov,
+                                    name.as_str(),
+                                    scope_name,
+                                );
+                            }
+                        }
+                        Some(via) => {
+                            // The value changed (cast/function/arithmetic). The
+                            // stack records a derivation ALWAYS — even when the
+                            // output name equals the source, the underlying column
+                            // is no longer usable as-is.
+                            push_derived_on_provenance(
+                                &mut prov,
+                                name.as_str(),
+                                col_name(m.col),
+                                via,
+                                scope_name,
+                            );
+                        }
                     }
                     prov
                 } else {
@@ -1709,27 +1737,204 @@ fn derive_columns_from_items(
     (out_items, columns)
 }
 
+/// The single distinct column reference feeding a value-transforming
+/// expression, if there is exactly one. Opaque subtrees (raw SQL,
+/// subqueries, window functions, stars) poison the answer to None —
+/// they can reference columns invisibly.
+fn single_source_column(expr: &DomainExpression) -> Option<(&str, Option<&str>)> {
+    use delightql_types::SqlIdentifier;
+
+    let mut refs: Vec<(&str, Option<&str>)> = Vec::new();
+    // None from the walk = a poisoning (opaque) subtree.
+    collect_source_columns(expr, &mut refs)?;
+
+    // Distinctness is by identifier value, not spelling: SqlIdentifier's
+    // Eq/Hash already fold ASCII case (STRING-FLOOR Tier 3 — no ad hoc
+    // case ops at the site).
+    let mut seen: Vec<(SqlIdentifier, Option<SqlIdentifier>)> = Vec::new();
+    let mut unique: Option<(&str, Option<&str>)> = None;
+    for (name, qual) in refs {
+        let key = (SqlIdentifier::from(name), qual.map(SqlIdentifier::from));
+        if !seen.contains(&key) {
+            seen.push(key);
+            unique = Some((name, qual));
+        }
+    }
+    match seen.len() {
+        1 => unique,
+        _ => None,
+    }
+}
+
+/// Walk `expr`, pushing every column reference into `out`. Returns None the
+/// moment an opaque subtree is hit (it may reference columns the walk cannot
+/// see). Exhaustive by construction: a future `DomainExpression` variant must
+/// decide here whether it is transparent, recursive, or poisoning.
+fn collect_source_columns<'a>(
+    expr: &'a DomainExpression,
+    out: &mut Vec<(&'a str, Option<&'a str>)>,
+) -> Option<()> {
+    match expr {
+        DomainExpression::Column { name, qualifier } => {
+            out.push((name.as_str(), qualifier.as_ref().map(|q| q.table_name())));
+            Some(())
+        }
+        DomainExpression::Literal(_) => Some(()),
+        DomainExpression::Cast { expr, .. }
+        | DomainExpression::Unary { expr, .. }
+        | DomainExpression::Parens(expr) => collect_source_columns(expr, out),
+        DomainExpression::Binary { left, right, .. } => {
+            collect_source_columns(left, out)?;
+            collect_source_columns(right, out)
+        }
+        DomainExpression::Function { args, .. } => {
+            for arg in args {
+                collect_source_columns(arg, out)?;
+            }
+            Some(())
+        }
+        DomainExpression::Case {
+            expr,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(scrutinee) = expr {
+                collect_source_columns(scrutinee, out)?;
+            }
+            for clause in when_clauses {
+                collect_source_columns(clause.when(), out)?;
+                collect_source_columns(clause.then(), out)?;
+            }
+            if let Some(else_expr) = else_clause {
+                collect_source_columns(else_expr, out)?;
+            }
+            Some(())
+        }
+        DomainExpression::InList { expr, values, .. } => {
+            collect_source_columns(expr, out)?;
+            for value in values {
+                collect_source_columns(value, out)?;
+            }
+            Some(())
+        }
+        DomainExpression::Tuple(items) => {
+            for item in items {
+                collect_source_columns(item, out)?;
+            }
+            Some(())
+        }
+        // Opaque: these can reference columns the walk cannot enumerate, so a
+        // single-source claim over them would be unsound. Poison to None.
+        DomainExpression::Star
+        | DomainExpression::RawSql(_)
+        | DomainExpression::Subquery(_)
+        | DomainExpression::InSubquery { .. }
+        | DomainExpression::Exists { .. }
+        | DomainExpression::WindowFunction { .. }
+        | DomainExpression::PredicateRewrite { .. } => None,
+    }
+}
+
+/// A matched input column, plus how the output derives from it.
+struct InputColumnMatch<'a> {
+    col: &'a ColumnMetadata,
+    /// Set when the match came through a value-transforming expression
+    /// (single-source rule) rather than a direct column reference.
+    derived_via: Option<String>,
+}
+
+/// Match a `(name, qualifier)` reference against the input columns.
+///
+/// Tier 1: current (name, qualifier) spelling match.
+/// Tier 2: identity stack walk — recover a column whose current spelling has
+///         diverged from the referenced (historical) name. Same matching
+///         semantics as `try_qualify_with_table_in_columns` Tier 2. Guarded:
+///         zero or ≥2 matches return None so ambiguity is never resolved by
+///         first-match.
+fn find_by_name_and_qual<'a>(
+    name: &str,
+    qual: Option<&str>,
+    input_columns: &'a [ColumnMetadata],
+) -> Option<&'a ColumnMetadata> {
+    // Tier 1.
+    if let Some(col) = input_columns.iter().find(|c| {
+        delightql_types::SqlIdentifier::str_eq(col_name(c), name)
+            && (qual.is_none() || delightql_types::SqlIdentifier::opt_str_eq(col_qualifier(c), qual))
+    }) {
+        return Some(col);
+    }
+
+    // Tier 2.
+    let mut historical = input_columns.iter().filter(|c| {
+        c.info.identity_stack().iter().any(|id| {
+            id.name == name
+                && match qual {
+                    Some(q) => {
+                        matches!(&id.table_qualifier, TableName::Named(s) if *s == q)
+                    }
+                    None => true,
+                }
+        })
+    });
+    match (historical.next(), historical.next()) {
+        (Some(col), None) => Some(col),
+        _ => None,
+    }
+}
+
 /// Find the input column matching a SQL column expression.
 ///
-/// For simple column references (`qualifier.name`), returns the matching
-/// input column so its identity stack can be inherited by the output column.
+/// For simple column references (`qualifier.name`), returns the matching input
+/// column so its identity stack can be inherited by the output column.
+///
+/// Parens are unwrapped first (notation, not value transformation). A direct
+/// column reference inherits verbatim (`derived_via: None`). A value-
+/// transforming expression inherits iff exactly one distinct source column
+/// feeds it (STRING-FLOOR cast-lineage ruling), reported with the transform's
+/// diagnostic spelling in `derived_via`.
 fn find_input_column<'a>(
     expr: &DomainExpression,
     input_columns: &'a [ColumnMetadata],
-) -> Option<&'a ColumnMetadata> {
+) -> Option<InputColumnMatch<'a>> {
+    // Parens are notation, not value transformation — see through them.
+    if let DomainExpression::Parens(inner) = expr {
+        return find_input_column(inner, input_columns);
+    }
+
+    // Direct column reference: inherit the stack as a synonym, not a derivation.
     if let DomainExpression::Column {
         name: expr_name,
         qualifier,
     } = expr
     {
         let expr_qual = qualifier.as_ref().map(|q| q.table_name());
-        input_columns.iter().find(|c| {
-            col_name(c) == expr_name.as_str()
-                && (expr_qual.is_none() || col_qualifier(c) == expr_qual)
-        })
-    } else {
-        None
+        return find_by_name_and_qual(expr_name.as_str(), expr_qual, input_columns)
+            .map(|col| InputColumnMatch {
+                col,
+                derived_via: None,
+            });
     }
+
+    // Value-transforming expression: name-lineage extends iff exactly one
+    // distinct source column feeds it; opaque subtrees poison to None.
+    let (src_name, src_qual) = single_source_column(expr)?;
+    let col = find_by_name_and_qual(src_name, src_qual, input_columns)?;
+    // `via` is diagnostic only (never rendered) and reflects the top-level
+    // transform kind — parens are already unwrapped above.
+    let via = match expr {
+        DomainExpression::Cast { .. } => "cast".to_string(),
+        DomainExpression::Function { name, .. } => name.clone(),
+        DomainExpression::Unary { op, .. } => format!("{:?}", op),
+        DomainExpression::Binary { op, .. } => format!("{:?}", op),
+        DomainExpression::Case { .. } => "case".to_string(),
+        DomainExpression::InList { .. } => "in".to_string(),
+        DomainExpression::Tuple(_) => "tuple".to_string(),
+        _ => "derived".to_string(),
+    };
+    Some(InputColumnMatch {
+        col,
+        derived_via: Some(via),
+    })
 }
 
 /// Push a scope transition directly on a ColumnProvenance.
@@ -1749,6 +1954,30 @@ fn push_scope_transition_on_provenance(
         context: IdentityContext::PipeBarrier {
             previous_table: TableName::Fresh,
             fresh_scope: 0,
+        },
+        phase: TransformationPhase::Transformer,
+        table_qualifier: scope.clone(),
+    });
+}
+
+/// Push a Derived identity — the output column came through a value-
+/// transforming expression fed by a single source column (`previous_name`).
+/// `via` is the transform's diagnostic spelling; it is never rendered.
+fn push_derived_on_provenance(
+    prov: &mut crate::pipeline::asts::core::provenance::ColumnProvenance,
+    name: &str,
+    previous_name: &str,
+    via: String,
+    scope: &TableName,
+) {
+    use crate::pipeline::asts::core::provenance::{
+        ColumnIdentity, IdentityContext, TransformationPhase,
+    };
+    prov.push_identity(ColumnIdentity {
+        name: delightql_types::SqlIdentifier::from(name),
+        context: IdentityContext::Derived {
+            previous_name: previous_name.to_string(),
+            via,
         },
         phase: TransformationPhase::Transformer,
         table_qualifier: scope.clone(),
@@ -1889,5 +2118,175 @@ fn effective_column_name(expr: &DomainExpression) -> Option<&str> {
     match expr {
         DomainExpression::Column { name, .. } => Some(name.as_str()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod find_input_column_tests {
+    use super::*;
+    use crate::pipeline::asts::core::provenance::{
+        ColumnIdentity, ColumnProvenance, IdentityContext, QualificationSource,
+        TransformationPhase,
+    };
+    use crate::pipeline::ast_refined::LiteralValue;
+    use crate::pipeline::sql_ast_v3::{BinaryOperator, ColumnQualifier};
+
+    /// Column whose current spelling is `current` but whose stack carries a
+    /// historical `(hist_qual, hist_name)` entry underneath.
+    fn renamed_col(current: &str, hist_name: &str, hist_qual: &str) -> ColumnMetadata {
+        let mut prov = ColumnProvenance::from_table_column(
+            hist_name,
+            TableName::Named(hist_qual.into()),
+            QualificationSource::Resolver,
+        );
+        prov.push_identity(ColumnIdentity {
+            name: delightql_types::SqlIdentifier::from(current),
+            context: IdentityContext::PipeBarrier {
+                previous_table: TableName::Fresh,
+                fresh_scope: 0,
+            },
+            phase: TransformationPhase::Transformer,
+            table_qualifier: TableName::Fresh,
+        });
+        ColumnMetadata::new(prov, TableName::Fresh, None)
+    }
+
+    /// Column whose current spelling equals its original table name.
+    fn simple_col(name: &str, qual: &str) -> ColumnMetadata {
+        let prov = ColumnProvenance::from_table_column(
+            name,
+            TableName::Named(qual.into()),
+            QualificationSource::Resolver,
+        );
+        ColumnMetadata::new(prov, TableName::Named(qual.into()), None)
+    }
+
+    fn col_expr(name: &str, qualifier: Option<&str>) -> DomainExpression {
+        DomainExpression::Column {
+            name: name.to_string(),
+            qualifier: qualifier.map(ColumnQualifier::table),
+        }
+    }
+
+    fn cast_expr(inner: DomainExpression) -> DomainExpression {
+        DomainExpression::Cast {
+            expr: Box::new(inner),
+            type_name: "text".to_string(),
+        }
+    }
+
+    fn add_expr(left: DomainExpression, right: DomainExpression) -> DomainExpression {
+        DomainExpression::Binary {
+            left: Box::new(left),
+            op: BinaryOperator::Add,
+            right: Box::new(right),
+        }
+    }
+
+    fn func_expr(name: &str, args: Vec<DomainExpression>) -> DomainExpression {
+        DomainExpression::Function {
+            name: name.to_string(),
+            args,
+            distinct: false,
+        }
+    }
+
+    #[test]
+    fn tier2_recovers_renamed_column() {
+        let cols = vec![renamed_col("id_2", "id", "o")];
+        let expr = col_expr("id", Some("o"));
+        let found = find_input_column(&expr, &cols).expect("stack match");
+        assert_eq!(col_name(found.col), "id_2");
+        assert!(found.derived_via.is_none());
+    }
+
+    #[test]
+    fn tier2_unqualified_historical() {
+        let cols = vec![renamed_col("id_2", "id", "o")];
+        let expr = col_expr("id", None);
+        let found = find_input_column(&expr, &cols).expect("unique stack match");
+        assert_eq!(col_name(found.col), "id_2");
+    }
+
+    #[test]
+    fn tier2_ambiguity_returns_none() {
+        let cols = vec![
+            renamed_col("id_2", "id", "o"),
+            renamed_col("id_3", "id", "c"),
+        ];
+        let expr = col_expr("id", None);
+        assert!(find_input_column(&expr, &cols).is_none());
+    }
+
+    #[test]
+    fn tier1_still_wins() {
+        let cols = vec![simple_col("id", "o"), renamed_col("id_2", "id", "c")];
+        let expr = col_expr("id", None);
+        let found = find_input_column(&expr, &cols).expect("current-name match");
+        assert_eq!(col_name(found.col), "id");
+    }
+
+    #[test]
+    fn parens_unwrap() {
+        let cols = vec![simple_col("id", "o")];
+        let expr = DomainExpression::Parens(Box::new(col_expr("id", None)));
+        let found = find_input_column(&expr, &cols).expect("unwrapped parens match");
+        assert_eq!(col_name(found.col), "id");
+    }
+
+    #[test]
+    fn derived_cast_inherits() {
+        let cols = vec![simple_col("id", "o")];
+        let expr = cast_expr(col_expr("id", Some("o")));
+        let found = find_input_column(&expr, &cols).expect("single-source cast match");
+        assert_eq!(col_name(found.col), "id");
+        assert_eq!(found.derived_via.as_deref(), Some("cast"));
+    }
+
+    #[test]
+    fn derived_two_sources_none() {
+        let cols = vec![simple_col("a", "o"), simple_col("b", "o")];
+        let expr = add_expr(col_expr("a", None), col_expr("b", None));
+        assert!(find_input_column(&expr, &cols).is_none());
+    }
+
+    #[test]
+    fn derived_same_column_twice_ok() {
+        let cols = vec![simple_col("a", "o")];
+        let expr = add_expr(col_expr("a", None), col_expr("a", None));
+        let found = find_input_column(&expr, &cols).expect("one distinct source");
+        assert_eq!(col_name(found.col), "a");
+        assert!(found.derived_via.is_some());
+    }
+
+    #[test]
+    fn derived_poisoned_none() {
+        let cols = vec![simple_col("id", "o")];
+        let expr = func_expr(
+            "coalesce",
+            vec![col_expr("id", None), DomainExpression::RawSql("x".to_string())],
+        );
+        assert!(find_input_column(&expr, &cols).is_none());
+    }
+
+    #[test]
+    fn derived_through_rename() {
+        // Cast of the historical name recovers the renamed column via Tier 2,
+        // reported through the derived path.
+        let cols = vec![renamed_col("id_2", "id", "o")];
+        let expr = cast_expr(col_expr("id", Some("o")));
+        let found = find_input_column(&expr, &cols).expect("Tier-2 recovery through derive");
+        assert_eq!(col_name(found.col), "id_2");
+        assert_eq!(found.derived_via.as_deref(), Some("cast"));
+    }
+
+    #[test]
+    fn derived_literal_only_none() {
+        let cols = vec![simple_col("id", "o")];
+        let expr = func_expr(
+            "abs",
+            vec![DomainExpression::Literal(LiteralValue::Number("1".to_string()))],
+        );
+        assert!(find_input_column(&expr, &cols).is_none());
     }
 }

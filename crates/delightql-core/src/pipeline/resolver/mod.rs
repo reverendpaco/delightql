@@ -7,12 +7,6 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// Case-insensitive column name comparison, matching SQL semantics
-/// where unquoted identifiers are case-insensitive.
-pub(crate) fn col_name_eq(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
-}
-
 mod pattern_resolver;
 pub use pattern_resolver::{JoinContext, PatternResolver};
 
@@ -82,7 +76,7 @@ impl ExpansionGuard {
                          view, break the cycle. RECURSION-CONTRACT.md B5."
                     ),
                     context: context.to_string(),
-                    subcategory: Some("recursion/consulted_clause_order"),
+                    subcategory: Some(crate::uri_registry::subcat::RECURSION_CONSULTED_CLAUSE_ORDER),
                 });
             }
         }
@@ -1842,7 +1836,7 @@ fn rename_schema(
             cols.into_iter()
                 .map(|mut col| {
                     if let ast_resolved::TableName::Named(tn) = col.qualifier() {
-                        if tn.as_str() == old_name {
+                        if tn == old_name {
                             let prev = tn.to_string();
                             col.push_scope(
                                 ast_resolved::TableName::Named(new_name.clone()),
@@ -1870,7 +1864,7 @@ fn rename_bubbled_columns(
 ) {
     for col in &mut bubbled.i_provide {
         if let ast_resolved::TableName::Named(tn) = col.qualifier() {
-            if tn.as_str() == old_name {
+            if tn == old_name {
                 let prev = tn.to_string();
                 col.push_scope(
                     ast_resolved::TableName::Named(new_name.clone()),
@@ -1917,7 +1911,7 @@ fn rename_qualifier_in_resolved_domain(
     match expr {
         ast_resolved::DomainExpression::Lvar {
             qualifier: Some(q), ..
-        } if q.as_str() == old_name => {
+        } if q == old_name => {
             *q = new_name.clone();
         }
         ast_resolved::DomainExpression::Function(func) => match func {

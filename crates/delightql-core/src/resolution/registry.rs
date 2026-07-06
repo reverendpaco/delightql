@@ -123,7 +123,15 @@ impl<'a> DatabaseRegistry<'a> {
                     .enumerate()
                     .map(|(idx, col)| {
                         ColumnMetadata::new(
-                            ColumnProvenance::from_column(col.name.clone()),
+                            // The catalog table name is in hand — record it in
+                            // the identity stack too, not just the qualifier
+                            // (STRING-FLOOR Tier 1a: provenance stops lying
+                            // Fresh at the catalog boundary).
+                            ColumnProvenance::from_table_column(
+                                col.name.clone(),
+                                TableName::Named(table_name.to_string().into()),
+                                crate::pipeline::asts::core::QualificationSource::None,
+                            ),
                             TableName::Named(table_name.to_string().into()),
                             Some(idx + 1), // 1-based position
                         )
@@ -323,7 +331,13 @@ impl<'a> DatabaseRegistry<'a> {
                 .enumerate()
                 .map(|(idx, col)| {
                     ColumnMetadata::new(
-                        ColumnProvenance::from_column(col.name.clone()),
+                        // STRING-FLOOR Tier 1a: same as lookup_table — the
+                        // canonical name is in hand; the stack records it.
+                        ColumnProvenance::from_table_column(
+                            col.name.clone(),
+                            TableName::Named(canonical_name.clone()),
+                            crate::pipeline::asts::core::QualificationSource::None,
+                        ),
                         TableName::Named(canonical_name.clone()),
                         Some(idx + 1), // 1-based position
                     )
@@ -480,8 +494,9 @@ impl HoParamInfo {
 pub struct ConsultedEntity {
     /// Entity name
     pub name: delightql_types::SqlIdentifier,
-    /// Entity type (1=Function, 4=View)
-    pub entity_type: i32,
+    /// Entity kind (STRING-FLOOR.md Tier 2b: the enum, not its i32
+    /// encoding — the catalog stores i32; conversion happens at load).
+    pub entity_type: crate::enums::EntityType,
     /// Full definition source text (head + neck + body, e.g. "double:(x) :- x * 2").
     /// body_parser extracts the body portion automatically.
     pub definition: String,
@@ -579,12 +594,12 @@ impl ConsultRegistry {
     fn query_params(
         conn: &rusqlite::Connection,
         entity_id: i32,
-        entity_type: i32,
+        entity_type: crate::enums::EntityType,
     ) -> Vec<HoParamInfo> {
         use crate::enums::EntityType as BootstrapEntityType;
 
         // Try ho_param table first for HO views
-        if entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression.as_i32() {
+        if entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression {
             if let Ok(params) = Self::query_ho_params(conn, entity_id) {
                 if !params.is_empty() {
                     return params;
@@ -822,10 +837,13 @@ impl ConsultRegistry {
 
         let (entity_id, entity_name, entity_type, definition, namespace) = result;
         let definition = definition.unwrap_or_default();
+        // Unknown entity_type in the catalog = treat as lookup miss (the
+        // catalog is compiler-owned; this is unreachable short of corruption).
+        let entity_type = EntityType::from_i32(entity_type).ok()?;
 
         // Look up parameters for functions (type 1, 3) and HO views (type 8)
-        let is_ho = entity_type == EntityType::DqlHoTemporaryViewExpression.as_i32();
-        let params = if EntityType::from_i32(entity_type).map_or(false, |t| t.is_fn()) || is_ho {
+        let is_ho = entity_type == EntityType::DqlHoTemporaryViewExpression;
+        let params = if entity_type.is_fn() || is_ho {
             Self::query_params(&conn, entity_id, entity_type)
         } else {
             Vec::new()
@@ -929,6 +947,9 @@ impl ConsultRegistry {
                 let (entity_id, entity_name, entity_type, definition, namespace) =
                     rows.into_iter().next().unwrap();
                 let definition = definition.unwrap_or_default();
+                let entity_type = EntityType::from_i32(entity_type).map_err(|e| {
+                    DelightQLError::database_error("corrupt catalog: unknown entity_type", e.to_string())
+                })?;
                 let params = Self::query_params(&conn, entity_id, entity_type);
                 Ok(Some(ConsultedEntity {
                     name: entity_name.into(),
@@ -1044,6 +1065,9 @@ impl ConsultRegistry {
                 let (entity_id, entity_name, entity_type, definition, namespace) =
                     rows.into_iter().next().unwrap();
                 let definition = definition.unwrap_or_default();
+                let entity_type = EntityType::from_i32(entity_type).map_err(|e| {
+                    DelightQLError::database_error("corrupt catalog: unknown entity_type", e.to_string())
+                })?;
                 let params = Self::query_params(&conn, entity_id, entity_type);
                 Ok(Some(ConsultedEntity {
                     name: entity_name.into(),
@@ -1156,6 +1180,9 @@ impl ConsultRegistry {
                 let (entity_id, entity_name, entity_type, definition, namespace) =
                     rows.into_iter().next().unwrap();
                 let definition = definition.unwrap_or_default();
+                let entity_type = EntityType::from_i32(entity_type).map_err(|e| {
+                    DelightQLError::database_error("corrupt catalog: unknown entity_type", e.to_string())
+                })?;
                 let params = Self::query_params(&conn, entity_id, entity_type);
                 Ok(Some(ConsultedEntity {
                     name: entity_name.into(),
@@ -1316,6 +1343,9 @@ impl ConsultRegistry {
                 let (entity_id, entity_name, entity_type, definition, namespace) =
                     rows.into_iter().next().unwrap();
                 let definition = definition.unwrap_or_default();
+                let entity_type = EntityType::from_i32(entity_type).map_err(|e| {
+                    DelightQLError::database_error("corrupt catalog: unknown entity_type", e.to_string())
+                })?;
                 let params = Self::query_params(&conn, entity_id, entity_type);
                 let positions = Self::query_ho_positions(&conn, entity_id);
                 Ok(Some(ConsultedEntity {
@@ -1537,7 +1567,12 @@ impl ConsultRegistry {
             None => Ok(None),
             Some((entity_name, entity_type, definition, namespace)) => Ok(Some(ConsultedEntity {
                 name: entity_name.into(),
-                entity_type,
+                entity_type: EntityType::from_i32(entity_type).map_err(|e| {
+                    DelightQLError::database_error(
+                        "corrupt catalog: unknown entity_type",
+                        e.to_string(),
+                    )
+                })?,
                 definition: definition.unwrap_or_default(),
                 params: Vec::new(),
                 positions: Vec::new(),
@@ -1606,9 +1641,12 @@ impl ConsultRegistry {
 
         Ok(rows
             .into_iter()
-            .map(
+            // Unknown entity_type = corrupt catalog; skip the row (this
+            // listing path has no error channel per row).
+            .filter_map(
                 |(entity_name, entity_type, definition, namespace, left, right)| {
-                    (
+                    let entity_type = EntityType::from_i32(entity_type).ok()?;
+                    Some((
                         left,
                         right,
                         ConsultedEntity {
@@ -1619,7 +1657,7 @@ impl ConsultRegistry {
                             positions: Vec::new(),
                             namespace,
                         },
-                    )
+                    ))
                 },
             )
             .collect())

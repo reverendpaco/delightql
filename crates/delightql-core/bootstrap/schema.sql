@@ -566,3 +566,132 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
 INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
     ('postgres', 'type.real', 'template', 'DOUBLE PRECISION'),
     ('duckdb',   'type.real', 'template', 'DOUBLE');
+
+-- ----------------------------------------------------------------------------
+-- sys::help ring 2 — the identifier registry as burned rows
+-- (SYS-HELP-DESIGN.md phase 1). AUTHORED-AS-DATA: these rows are the
+-- SOURCE of truth for `dql explain` and every future projection (the
+-- former uri_registry.rs Rust static is gone; spelling-normalization
+-- stays in code). One upstream per table — never also generate these.
+--
+-- Invariants (PORCELAIN-AND-PLUMBING.md): (kind, hierarchy) is a FROZEN
+-- identity — append-only, a hierarchy once minted is never reused or
+-- reworded (URI-DESIGN.md §3); summary/explanation are porcelain and
+-- may improve freely. kind ∈ error | danger | config.
+-- Addressed as sys::help.identifier(*) (registered in system.rs
+-- alongside the other sys tables).
+-- ----------------------------------------------------------------------------
+CREATE TABLE identifier (
+    kind        TEXT NOT NULL,
+    hierarchy   TEXT NOT NULL,
+    summary     TEXT NOT NULL,
+    explanation TEXT NOT NULL,
+    PRIMARY KEY (kind, hierarchy)
+);
+
+INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
+    ('error', 'parse', 'The source text is structurally invalid.', 'Parse errors mean the query text could not be read as DelightQL at all — the grammar rejected it before any meaning was assigned. Check delimiter balance, operator spelling, and clause order. Hook family: (~~error://parse ~~) matches every parse error.'),
+    ('error', 'parse/ddl', 'A definition (DDL) source failed to parse.', 'The text of a definition — a consulted rules file, a view/rule body, or inline DDL — contains syntax the DDL grammar rejects. The message carries the offending line and tree-sitter''s recovery note. Common causes: operator ambiguity needing spaces (`x / 2`, not `x/2`), unbalanced delimiters, or query-mode clause syntax (`… : name`) used in a rules file where definition syntax (`name(*) :- …`) is required.'),
+    ('error', 'parse/sigil', 'A sigil expression contains syntax errors.', 'A sigil-introduced expression (the compact operator forms) parsed as structurally invalid. Check the sigil''s expected operand shape and delimiter balance near the reported position.'),
+    ('error', 'semantic', 'The structure is valid but the meaning is wrong.', 'Semantic errors mean the query parsed, but a name failed to resolve, an arity was wrong, or a constraint was violated during compilation. The subhierarchy names what went wrong: resolution/ (name binding), constraint/, arity, limitation/ (known gaps).'),
+    ('error', 'dml', 'A data-modification query violated DML shape rules.', 'DML errors cover insert!/update!/delete!/keep! shape and marker rules: marker/ (the !! mutation marker — missing, multiple, forbidden, mismatch), shape/ (required or meaningless clauses), source/ (what may feed a mutation).'),
+    ('error', 'operational', 'The query is valid but this session refuses to run it.', 'Operational errors are policy, not meaning: the query compiled, but session configuration forbids executing it (e.g. federation-prohibited: a query may touch only one connection).'),
+    ('error', 'runtime', 'Compilation succeeded; execution failed.', 'Runtime errors happen after SQL generation: the database rejected the SQL, an assertion failed, a connection dropped, or I/O failed. Subhierarchy: assertion, connection, io, bug (internal), relay/transport (protocol channel).'),
+    ('error', 'target', 'The foreign engine rejected or failed the query.', 'Target errors originate in the mounted engine, not in DelightQL: target/<engine>/<class>/<code> embeds the world''s taxonomy as the leaf (Postgres: SQLSTATE, e.g. target/postgres/undefined-object/42883). Hook family: (~~error://target/postgres ~~) matches any Postgres-side failure. Lifecycle members: connect, orientation, unimplemented.'),
+    ('error', 'parse/general', 'Generic parse failure.', 'The grammar rejected the text and no more specific parse category applied. The caret in the message marks the first unreadable token.'),
+    ('error', 'semantic/resolution/table', 'A named table (or relation) was not found.', 'The name does not exist in the current namespace. Check spelling, the mounted namespace prefix (ns.table), and whether the relation needs a mount!/consult! first.'),
+    ('error', 'semantic/resolution/column', 'A named column was not found in scope.', 'The column does not exist in the relation''s schema at this pipeline stage. Note that |> projection changes the visible columns: a filter AFTER |> (a, b) sees only a and b.'),
+    ('error', 'semantic/resolution/ambiguous', 'A name matches more than one column in scope.', 'After a join, an unqualified column name exists on more than one side. Qualify it with the relation alias (u.id).'),
+    ('error', 'semantic/arity', 'Wrong number of arguments.', 'A function or predicate was called with the wrong number of arguments for its declared arity.'),
+    ('error', 'semantic/cast', 'Invalid cast:() usage.', 'cast:(expr, type) takes a bare type name from the v1 vocabulary: integer, real, text, numeric, boolean. Target engines apply their own cast semantics (Postgres rounds real→integer; SQLite truncates) — see the book''s cast page.'),
+    ('error', 'semantic/recursion', 'A recursive definition breaks the recursion contract.', 'Family for refusals of recursive forms the language does not permit (RECURSION-CONTRACT.md). DelightQL recursion is a generator (co-recursion): each recursive clause sees only the previous iteration''s rows — never the accumulated result, never itself as a callable. Forms outside that contract are refused here, each with its rewrite path.'),
+    ('error', 'semantic/recursion/nonlinear', 'A recursive rule references itself more than once.', 'The frontier cannot join with itself (or with the accumulated result) — forward evaluation carries one previous iteration. Carry the values you need as columns of one frontier row instead: the tupling transformation. fib is the canonical example — two self-calls become one two-column state, (a, b) stepping to (b, a+b). RECURSION-CONTRACT.md N1.'),
+    ('error', 'semantic/recursion/aggregate', 'Aggregation inside a recursive rule.', 'An aggregate over the frontier would need the accumulated set, which a recursive rule never sees. Aggregate after the fixpoint — strata are textual, so a later pipe stage aggregates the finished recursion — or carry a running value as a column of the frontier row when the aggregation is per-path. RECURSION-CONTRACT.md N3.'),
+    ('error', 'semantic/recursion/self_subquery', 'A recursive rule references itself inside a subquery.', 'Semi/anti-joins, IN, scalar subqueries, or derived tables against the definition itself would need the accumulated set — a recursive rule sees only the previous iteration''s rows, as a direct source. Track visited state in the frontier row (the visited-string idiom), or deduplicate/filter after the fixpoint. RECURSION-CONTRACT.md N4.'),
+    ('error', 'semantic/recursion/argumentative_binding', 'Argumentative binding on a recursive self-reference.', 'Renames and constraints on the self-reference (''c(m)'' inside c''s own definition) do not bind inside a recursive definition yet — refused rather than returning wrong results. Use glob binding ''c(*)'' and rename or filter in a pipe stage. The proper fix (the rename-hoist legalization: WITH c(m) AS (…)) is pending. RECURSION-CONTRACT.md B2.'),
+    ('error', 'semantic/recursion/limit_bound', '#<N inside a recursive rule has no spelling on this target.', 'DelightQL defines a row limit inside a recursive rule as a TOTAL-ROW CAP on the fixpoint — a demand bound on the unfold. SQLite and MySQL spell it natively (a trailing LIMIT on the recursive member); this target has no single-statement equivalent, and the near-miss spellings silently change meaning (a subquery LIMIT becomes per-iteration — non-terminating). Rewrite the bound as a filter condition on the recursive rule: a depth counter carried in the frontier row, or a value predicate.'),
+    ('error', 'semantic/recursion/consulted_clause_order', 'Circular consulted-definition expansion (recursive clause before base, or an indirect view cycle).', 'While inlining a consulted definition, the resolver re-encountered a name it was already expanding — the self-reference did not resolve as the in-progress recursive CTE, so expansion would never terminate (this used to hang the compiler). The common cause: in a consulted rules file, the recursive clause appears BEFORE the base clause — clause order matters; a self-reference is only recursive once a prior clause has established the name. Put the base (non-recursive) clause first. If the cycle runs through another view (a uses v, v uses a), break the cycle. The error message shows the expansion chain. RECURSION-CONTRACT.md B5.'),
+    ('error', 'semantic/compound/scalar_column', 'A compound-value tool aimed at a plainly-scalar column.', 'Pathing (''col:{.field}'', ''col:[0]'') reaches into a value; narrowing (''|> .col{.field}'') iterates one. A column declared as a plain scalar (INTEGER, REAL, BOOLEAN, dates) has no insides to reach into and no rows to iterate — aiming these tools at it used to fail target-dependently at runtime (sqlite: ''malformed JSON'', or silent NULLs when the scalar happened to parse as JSON). Refused at compile time instead. TEXT columns stay permissive: documents live in TEXT, and declarations cannot be trusted to deny it. Aim the tool at a compound value: something built with {...}/[...], a tree-group, or a document column.'),
+    ('error', 'runtime/assertion', 'An assertion hook did not hold.', 'The main query executed, but an assertion hook attached in the source ((~~assert ...~~)) returned false. Hookable for tests: (~~error://runtime/assertion ~~).'),
+    ('error', 'internal/panic', 'dql itself crashed. This is a bug in dql, not in your query.', 'An internal invariant failed (a Rust panic). The CLI catches it and emits this record instead of a raw backtrace; rerun with RUST_BACKTRACE=1 for the developer trace, and please report the message and the query that triggered it. Your query may be perfectly valid — do not rewrite it to dodge this error; the bug is ours.'),
+    ('error', 'runtime/connection', 'A database connection failed or was poisoned.', 'The connection to a mounted or primary database was lost or unusable at execution time.'),
+    ('error', 'operational/federation-prohibited', 'One query may touch only one connection.', 'The query references namespaces served by different connections. DelightQL deliberately does not federate: split the query, or mount the data into one engine.'),
+    ('danger', 'cardinality/nulljoin', 'NULL-matching join equality (NULL = NULL → true).', 'OFF (default): join equality is SQL equality, where NULL never matches. ON: NULLs match each other in join keys, which can multiply rows AND changes what the join means — so this gate is semantic-class: inline-only ((~~danger://cardinality/nulljoin ON~~)), never a CLI flag. Consult sys.danger(*) for this session''s states.'),
+    ('danger', 'cardinality/cartesian', 'Unrestricted cartesian product.', 'OFF (default): a join with no usable key is an error (the classic accidental row explosion). ON: the cartesian product is allowed. Guardrail-class: may be opened from the CLI (--danger cardinality/cartesian=ON) or inline.'),
+    ('danger', 'termination/unbounded', 'Unbounded recursive query.', 'OFF (default): recursive queries must be bounded. ON: unbounded recursion is allowed (the query may not terminate). Guardrail-class: CLI-overridable.'),
+    ('danger', 'semantics/min_multiplicity', 'True INTERSECT ALL via ROW_NUMBER (min-multiplicity).', 'Changes what a set operator MEANS (bag semantics via minimum multiplicity), so it is semantic-class: inline-only ((~~danger://semantics/min_multiplicity ON~~)), never a CLI flag — a flag that silently changes query meaning would make the same text mean different things in different shells.'),
+    ('config', 'generation/rule/inlining/view', 'Inline consulted view rules instead of emitting CTEs.', 'Strategy selection, not meaning: with this ON the compiler inlines view-rule bodies as subqueries rather than emitting CTEs. Results are identical either way; generated SQL shape differs. Inline: (~~config://generation/rule/inlining/view ON~~); CLI: --config.'),
+    ('config', 'generation/rule/inlining/fact', 'Inline consulted fact rules instead of emitting CTEs.', 'As generation/rule/inlining/view, for fact rules.');
+
+-- ----------------------------------------------------------------------------
+-- sys::help ring 1 — the CLI's own shape (SYS-HELP-DESIGN.md phase 2).
+-- GENERATED AT SESSION INIT by the host binary from its live clap tree
+-- (api::HelpSurface → DelightQLSystem::seed_help_surface): runtime
+-- generation means these rows structurally cannot drift from the binary
+-- that serves them. One upstream per table — never also author rows
+-- here. Headless hosts (wasm, cabi) have no CLI surface; their ring-1
+-- tables are legitimately empty.
+--
+-- class/grade columns carry the porcelain/plumbing declaration
+-- (PORCELAIN-AND-PLUMBING.md): class ∈ porcelain | plumbing |
+-- 'porcelain+semantic-warranty'; grade ∈ frozen | versioned. NULL =
+-- not an output surface (most flags).
+-- ----------------------------------------------------------------------------
+CREATE TABLE command (
+    name    TEXT NOT NULL,
+    parent  TEXT,
+    alias   TEXT,
+    summary TEXT NOT NULL,
+    PRIMARY KEY (name, parent)
+);
+CREATE TABLE option (
+    command       TEXT NOT NULL,
+    long          TEXT NOT NULL,
+    short         TEXT,
+    value_name    TEXT,
+    default_value TEXT,
+    global        INTEGER NOT NULL,
+    repeatable    INTEGER NOT NULL,
+    summary       TEXT NOT NULL,
+    PRIMARY KEY (command, long)
+);
+CREATE TABLE option_value (
+    command TEXT NOT NULL,
+    option  TEXT NOT NULL,
+    value   TEXT NOT NULL,
+    summary TEXT,
+    class   TEXT,
+    grade   TEXT,
+    PRIMARY KEY (command, option, value)
+);
+CREATE TABLE dot_command (
+    name    TEXT PRIMARY KEY,
+    summary TEXT NOT NULL
+);
+CREATE TABLE env (
+    name            TEXT PRIMARY KEY,
+    effect          TEXT NOT NULL,
+    equivalent_flag TEXT
+);
+CREATE TABLE exit_code (
+    code    INTEGER NOT NULL,
+    context TEXT NOT NULL,
+    meaning TEXT NOT NULL,
+    class   TEXT,
+    grade   TEXT,
+    PRIMARY KEY (code, context)
+);
+
+-- sys::help ring 2: man pages, seeded by the host via HelpSurface
+-- (phase 3). troff is the source (authored in the host's man/ tree,
+-- embedded at compile time); plain is scrubbed from it AT SEED TIME
+-- by the host's closed-dialect scrubber — in sync by construction,
+-- the last rung of the dql-man rendering chain. Sections per the
+-- ruling: 1 = commands, 7 = language/concepts.
+CREATE TABLE man_page (
+    name    TEXT NOT NULL,
+    section INTEGER NOT NULL,
+    troff   TEXT NOT NULL,
+    plain   TEXT NOT NULL,
+    PRIMARY KEY (name, section)
+);

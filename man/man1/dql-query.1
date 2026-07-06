@@ -1,0 +1,237 @@
+.TH DQL-QUERY 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-query \- compile and execute a DelightQL query
+.SH SYNOPSIS
+.B dql query
+[\fIOPTIONS\fR]
+[\fIQUERY\fR]
+.br
+.B dql q
+[\fIOPTIONS\fR]
+[\fIQUERY\fR]
+.SH DESCRIPTION
+Compiles a DelightQL query to SQL and, by default, executes it and
+prints the results. The query source is chosen in this order:
+.IP \(bu 3
+the
+.I QUERY
+argument, if present;
+.IP \(bu 3
+the file named by
+.BR \-\-file ;
+.IP \(bu 3
+standard input, when stdin is not a terminal;
+.IP \(bu 3
+otherwise an interactive REPL is started.
+.PP
+A file (or stdin) may contain multiple statements; all of them are
+executed and their output concatenated.
+.SH OPTIONS
+.SS Input
+.TP
+.BI \-\-file " FILE"
+Read the query from
+.IR FILE ;
+a
+.I FILE
+of
+.B \-
+means stdin.
+.TP
+.B \-\-sequential
+Execute multiple queries sequentially (for files with multiple
+queries).
+.TP
+.BI \-\-consult " FILE"
+Unsupported \(em refuses with a pointer: use
+.B consult!()
+in the DQL source instead, which also works in files, test balls, and
+the REPL.
+.TP
+.BI \-\-attach " ATTACH"
+Attach an external database.
+.TP
+.B \-i, \-\-interactive
+Interactive mode \(em allow dot commands.
+.SS Compilation
+.TP
+.BI \-\-to " STAGE"
+Stop at an intermediate stage and print its representation instead of
+executing. Stages, in pipeline order:
+.BR cst ,
+.BR ast\-unresolved ,
+.BR ast\-resolved ,
+.BR ast\-refined ,
+.BR ast\-sql ,
+.BR sql ,
+.B results
+(default),
+.BR fingerprint ,
+.BR hash ,
+.BR bhash ,
+.BR totalhash .
+.RB ( recursion\-depth
+is deprecated; use sys::execution.stack(*) instead.)
+.IP
+.B hash
+prints a column-name-independent data hash;
+.B totalhash
+includes column names;
+.B bhash
+is the byte-level, type-preserving, platform-independent hash;
+.B fingerprint
+prints result-fingerprint JSON for semantic comparison.
+.IP
+A query that fails to compile under
+.B \-\-to
+emits the same structured error record as normal execution \(em URI
+and full message \(em and exits 1; the inspection surface never knows
+less than the execution surface about why a compile failed. (Under
+the hood both are projections of
+.IR sys::execution.compile ,
+whose relation carries
+.I error
+= the URI and
+.I error_message
+= the prose.)
+.IP
+Note that stage output is itself delivered as a one-column relation
+named
+.IR representation ,
+so
+.B \-\-to sql
+in the default format prints a header line and the SQL with newlines
+escaped as \en. Use
+.B \-f list
+for readable multi-line SQL, or
+.B \-n
+to drop the header.
+.TP
+.BI \-\-dialect " DIALECT"
+Target dialect for the generated SQL. See
+.BR dql (1).
+.TP
+.BI \-\-soptimize " N"
+SQL optimization level, 0\-3. Default 0.
+.SS Output
+.TP
+.BI \-f ", " \-\-format " FORMAT"
+Output format. One of
+.BR table ,
+.BR box ,
+.BR json ,
+.BR jsonl ,
+.BR csv ,
+.BR tsv ,
+.BR list ,
+.BR raw .
+The default is tab-separated values with a header row.
+.B json
+emits one array;
+.B jsonl
+emits one object per row (streams; composes with jq). Both are typed:
+a column DECLARED numeric whose text round-trips emits an unquoted
+number, SQL NULL emits
+.BR null ,
+everything else is a string \(em a TEXT '007' stays "007", and
+undeclared columns (expressions, CTE results) stay strings. Keys keep
+the relation's column order.
+.B table
+and
+.B box
+draw an aligned pipe-separated grid.
+.B list
+prints one
+.I column = value
+line per value with a blank line between rows.
+.B raw
+is byte-faithful extraction of exactly ONE column: cell bytes are
+written verbatim with no separators (a separator would corrupt binary
+data), NULL writes zero bytes, and rows concatenate as a byte stream.
+Multi-column results are refused. Writing raw bytes to a terminal
+prints a warning on stderr (control sequences pass through verbatim);
+raw is intended for pipes and files \(em it is the one output path
+that never converts bytes to text. With
+.BR \-\-to " sql"
+it instead prints the bare compile artifact with a trailing newline.
+.TP
+.B \-n, \-\-no\-headers
+Suppress the header row.
+.TP
+.B \-q, \-\-quiet
+Suppress the REPL banner and meta output. Only meaningful in
+interactive mode; no effect on query output paths.
+.TP
+.B \-\-no\-sanitize
+Disable output sanitization (allows raw terminal control sequences
+through).
+.TP
+.BI \-\-highlights " FILE"
+Path to a highlights.scm file.
+.TP
+.BI \-\-theme " FILE"
+Path to a theme file.
+.SS Database
+.TP
+.BI \-\-db " DATABASE"
+SQLite database file. Optional; default is an in-memory database.
+.TP
+.B \-\-make\-new\-db\-if\-missing
+Create the
+.B \-\-db
+file if it does not exist. Without this flag a missing file is a
+refusal, not a creation. Global, like
+.B \-\-db
+itself \(em it also works with bare
+.B dql
+to start the REPL on a fresh database (see
+.BR dql (1)).
+.SS Instrumentation and gates
+.TP
+.BI \-\-debug " OPTS"
+Debug options, comma-separated.
+.TP
+.BI \-\-sink " NAME=PATH"
+Bind a named emit stream to a file sink. Unbound streams fall back to
+RS-prefixed records on stderr. May be repeated.
+.TP
+.BI \-\-danger " HIERARCHY=STATE"
+Open a danger gate for this session. STATE is ON, OFF, ALLOW, or 1\-9.
+Example:
+.BR "\-\-danger cardinality/nulljoin=ON" .
+.TP
+.BI \-\-config " HIERARCHY=STATE"
+Set a config for this session. Same STATE grammar as
+.BR \-\-danger .
+.TP
+.BI \-\-error\-prefix " PREFIX"
+See
+.BR dql (1).
+.SH EXIT STATUS
+.TP
+.B 0
+Query compiled and executed.
+.TP
+.B 1
+Compile or runtime error; one structured record per error on stderr:
+.IP
+.EX
+<RS>[delightql-error://semantic/resolution/table] Table not found: nope
+.EE
+.IP
+Feed the bracketed identifier to
+.BR dql-explain (1)
+for the full story.
+.SH EXAMPLES
+.EX
+$ dql query --db app.db 'users(*), age > 30 |> (id, first_name)'
+$ echo 'users(*) ~> count:(*)' | dql query --db app.db
+$ dql query --db app.db --to sql -f list 'users(*), age > 30'
+$ dql query --db app.db --to bhash 'orders(*)'   # regression pin
+$ dql query -f json '_(name, age @ "Ada", 36)'   # no db needed
+$ dql query --db app.db --to sql -f raw 'users(*)'  # bare pasteable SQL
+.EE
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-explain (1),
+.BR dql-format (1)

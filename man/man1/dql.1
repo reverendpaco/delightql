@@ -1,0 +1,271 @@
+.TH DQL 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql \- DelightQL query language transpiler and runner
+.SH SYNOPSIS
+.B dql
+[\fIGLOBAL OPTIONS\fR]
+.I COMMAND
+[\fIARGS\fR]
+.br
+.B dql
+[\fIGLOBAL OPTIONS\fR]
+.SH DESCRIPTION
+.B dql
+compiles DelightQL \(em a query language with left-to-right pipe flow
+(\fB|>\fR) \(em to SQL and optionally executes it. SQLite is spoken
+natively; other engines (postgres, duckdb) are reached through separate
+per-engine adapter binaries ("fatboys") managed by
+.BR dql-target (1).
+.PP
+Invoked with no command,
+.B dql
+behaves exactly as
+.B dql query
+with no arguments: on a terminal it starts the interactive REPL;
+with piped stdin it reads and executes the piped source, so
+.B "dql < queries.dql"
+and
+.B "dql query < queries.dql"
+are the same command.
+.PP
+Without a
+.B \-\-db
+option, commands operate on an ephemeral in-memory SQLite database.
+Anonymous tables make this useful on its own:
+.B "dql query '_(1,2;3,4)'"
+needs no database at all.
+.SH COMMANDS
+.TP
+.BR query ", " q
+Compile and execute a query from an argument, a file, or stdin. The
+workhorse. See
+.BR dql-query (1).
+.TP
+.B format
+Format/prettify DelightQL source. See
+.BR dql-format (1).
+.TP
+.BR tools ", " t
+Ad-hoc data munging: query JSON or CSV piped on stdin, or files loaded
+as tables. See
+.BR dql-tools (1).
+.TP
+.B explain
+Explain a DelightQL identifier (error, danger gate, or config) from the
+built-in registry. See
+.BR dql-explain (1).
+.TP
+.B target
+Manage per-engine adapter binaries. See
+.BR dql-target (1).
+.TP
+.B server
+Serve the relay protocol on a Unix socket. See
+.BR dql-server (1).
+.TP
+.B version
+Print build identity; machine-readable with
+.BR \-\-json .
+See
+.BR dql-version (1).
+.TP
+.B man
+Show one of these manual pages, rendered from the copies embedded in
+the binary (a projection of
+.IR sys::help.man_page(*) ).
+Name tokens hyphen-join, so
+.B dql man dql target
+and
+.B dql man target
+both reach
+.BR dql-target (1);
+a leading number selects a section. On a terminal, rendering hands the
+troff (via a temporary file, so BSD and Linux man both work) to
+.BR man ,
+falling back to groff, then to embedded plain text. When stdout is a
+pipe or file, the embedded plain text is emitted directly \(em
+byte-identical on every platform \(em so
+.B dql man query | bat
+composes as expected.
+.B \-\-dump
+.I DIR
+writes every embedded troff page into
+.I DIR
+(for packaging and MANPATH installs). To search pages, query them:
+.EX
+$ dql query 'sys::help.man_page(*), +like(plain, "%adapter%")'
+.EE
+.TP
+.B help
+.B dql help
+.I COMMAND
+shows the same page as
+.B dql man
+.IR COMMAND ;
+one mechanism, so the two can never drift apart. Without a command it
+prints the usage summary (same as
+.BR \-\-help ).
+.TP
+.B completions
+Generate shell completions to stdout
+.RB ( bash ", " zsh ", " fish ", " elvish ", " powershell ):
+.EX
+$ dql completions bash > /etc/bash_completion.d/dql
+.EE
+.SH GLOBAL OPTIONS
+These may be given before or after the subcommand. A global option the
+chosen subcommand cannot consume is refused, not silently ignored
+.RB ( \-\-db " means nothing to " "dql version" ).
+.B \-\-error\-prefix
+and
+.B \-\-error\-format
+apply everywhere;
+.B \-\-db
+applies to query and server;
+.B \-\-make\-new\-db\-if\-missing
+to query (and bare
+.BR dql ,
+which is query);
+.B \-\-dialect
+to query, tools, and server;
+.B \-\-via
+to query.
+.TP
+.BI \-\-db " DATABASE"
+SQLite database file to operate on. Optional; the default is an
+in-memory database. If the named file does not exist, query refuses
+unless
+.B \-\-make\-new\-db\-if\-missing
+is given \(em a typo'd path silently opening an empty database is a
+silent wrong.
+.TP
+.B \-\-make\-new\-db\-if\-missing
+With
+.BR \-\-db :
+create the database file if it does not exist. Requires
+.B \-\-db
+(alone it configures nothing and is refused). Works at the bare door
+too:
+.B "dql --db new.db --make-new-db-if-missing"
+starts the REPL on a freshly created database.
+.TP
+.BI \-\-dialect " DIALECT"
+Target SQL dialect for generated SQL: one of
+.BR sqlite " (default, canonical), " postgres ", " mysql ", " sqlserver ", " duckdb .
+Spellings come from the dialect_render targeting table. Equivalent to
+setting
+.BR DQL_DIALECT .
+An unrecognized value is a hard usage error;
+.B postgresql
+is accepted as an alias for postgres.
+.TP
+.BI \-\-via " MECHANISM"
+Mechanism override for reaching a postgres resource:
+.B fatboy
+(adapter co-process, default) or
+.B siso
+(pipe-wrapped psql). Resources name WHAT to reach;
+.B \-\-via
+chooses HOW.
+.TP
+.BI \-\-error\-prefix " PREFIX"
+Prefix for structured error records on stderr. Default is a single
+ASCII RS byte (0x1E). Records have the form:
+.IP
+.EX
+<prefix>[delightql-error://<hierarchy>] message
+.EE
+.IP
+Set to any string for custom scripting, e.g.
+.BR "\-\-error\-prefix '@error '" .
+.TP
+.BI \-\-error\-format " FORMAT"
+Body format of the structured error records:
+.B text
+(default,
+.IR "[uri] message" )
+or
+.B json
+.RI ( '{"uri": ..., "message": ...}' ,
+uri null when the error carries no identity). With the default RS
+prefix, json mode is exactly RFC 7464 \(em JSON text sequences, which
+.B jq \-\-seq
+reads directly. Additive fields may appear in later versions;
+consumers must tolerate them.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Compile or runtime error; a structured error record is emitted on
+stderr (see
+.BR \-\-error\-prefix ).
+Internal crashes (Rust panics) are caught and reported the same way,
+as
+.IR delightql\-error://internal/panic ,
+never as a raw backtrace with exit 101; set
+.B RUST_BACKTRACE=1
+for the developer trace.
+.TP
+.B 2
+Command-line usage error (unknown flag or invalid value).
+.PP
+Dedicated gate flags may document additional codes \(em see
+.BR dql\-format (1)
+.RB ( \-\-fail\-if\-not\-formatted :
+2 = cannot verify).
+.SH ENVIRONMENT
+.TP
+.B DQL_DIALECT
+Same effect as
+.BR \-\-dialect .
+An unrecognized value refuses at startup with exit 1 \(em an ignored
+explicit override would be a silent wrong.
+.TP
+.B DQL_FATBOY_DIR
+Hard-pins the directory searched for adapter binaries, overriding all
+other resolution steps. See
+.BR dql-target (1).
+.TP
+.B NO_COLOR
+When set (any value), color auto-detection yields no color
+(no-color.org convention). An explicit
+.B \-\-color always
+still wins.
+.SH FILES
+.TP
+.I ~/.local/share/delightql/fatboys/<version>
+The adapter store, one directory per dql version.
+.SH EXAMPLES
+Query an SQLite file:
+.PP
+.EX
+$ dql query --db app.db 'users(*), age > 30 |> (id, name)'
+.EE
+.PP
+Show the SQL a query compiles to:
+.PP
+.EX
+$ dql query --db app.db --to sql 'users(*), age > 30'
+.EE
+.PP
+Query a CSV from stdin:
+.PP
+.EX
+$ cat people.csv | dql tools csvstruct --has-headers 'c(*), age > 26'
+.EE
+.PP
+Ask what an error identifier means:
+.PP
+.EX
+$ dql explain semantic/resolution/table
+.EE
+.SH SEE ALSO
+.BR dql-query (1),
+.BR dql-format (1),
+.BR dql-tools (1),
+.BR dql-explain (1),
+.BR dql-target (1),
+.BR dql-server (1),
+.BR dql-version (1)

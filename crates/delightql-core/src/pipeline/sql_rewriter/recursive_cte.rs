@@ -330,7 +330,7 @@ fn inline_limit_wrapper(outer: &SelectStatement, wrapper_alias: &str) -> Result<
     builder.build().map_err(|e| DelightQLError::ValidationError {
         message: format!("recursive limit legalization rebuild: {}", e),
         context: "sql_rewriter::recursive_cte".to_string(),
-        subcategory: Some("recursion/limit_bound"),
+        subcategory: Some(crate::uri_registry::subcat::RECURSION_LIMIT_BOUND),
     })
 }
 
@@ -395,7 +395,7 @@ fn limit_bound_error(cte_name: &str, dialect: SqlDialect) -> DelightQLError {
              recursive rule (e.g. a depth or value predicate)."
         ),
         context: "sql_rewriter::recursive_cte".to_string(),
-        subcategory: Some("recursion/limit_bound"),
+        subcategory: Some(crate::uri_registry::subcat::RECURSION_LIMIT_BOUND),
     }
 }
 
@@ -406,7 +406,7 @@ fn shape_error(detail: &str) -> DelightQLError {
              Rewrite the bound as a filter condition on the recursive rule."
         ),
         context: "sql_rewriter::recursive_cte".to_string(),
-        subcategory: Some("recursion/limit_bound"),
+        subcategory: Some(crate::uri_registry::subcat::RECURSION_LIMIT_BOUND),
     }
 }
 

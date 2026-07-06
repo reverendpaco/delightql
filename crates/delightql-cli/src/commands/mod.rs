@@ -13,5 +13,6 @@ pub mod explain;
 pub mod filemunge;
 pub mod format;
 pub mod jstruct;
+pub mod man;
 pub mod query;
 pub mod target;

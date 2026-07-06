@@ -155,18 +155,18 @@ fn select_items_from_cpr_schema(
             if let Some(bc_orig) = bc.info.original_name() {
                 // Primary: match original names (both sides look through renames/disambiguation)
                 let schema_orig = target_original.unwrap_or(target_name);
-                if bc_orig.eq_ignore_ascii_case(schema_orig) {
+                if SqlIdentifier::str_eq(bc_orig, schema_orig) {
                     // Verify table scope matches to handle same-named columns
                     // from different tables (e.g., two `name` columns)
                     if let (TableName::Named(a), TableName::Named(b)) =
                         (schema_col.qualifier(), bc.qualifier())
                     {
-                        return a.as_str().eq_ignore_ascii_case(b.as_str());
+                        return a == b;
                     }
                     // Check identity stack for matching table qualifier
                     if let TableName::Named(schema_table) = schema_col.qualifier() {
                         if bc.info.identity_stack().iter().any(|id| {
-                            matches!(&id.table_qualifier, TableName::Named(t) if t.as_str().eq_ignore_ascii_case(schema_table.as_str()))
+                            matches!(&id.table_qualifier, TableName::Named(t) if t == schema_table)
                         }) {
                             return true;
                         }
@@ -190,14 +190,14 @@ fn select_items_from_cpr_schema(
                             // The column came from a named table before the pipe.
                             // Check bc's qualifier or identity stack for that name.
                             if let TableName::Named(bt) = bc.qualifier() {
-                                if bt.as_str().eq_ignore_ascii_case(prev_table) {
+                                if bt == prev_table {
                                     return true;
                                 }
                             }
                             // Builder may use an alias — check if the table
                             // name appears anywhere in bc's provenance history.
                             let bc_knows_table = bc.info.identity_stack().iter().any(|id| {
-                                matches!(&id.table_qualifier, TableName::Named(t) if t.as_str().eq_ignore_ascii_case(prev_table))
+                                matches!(&id.table_qualifier, TableName::Named(t) if t == prev_table)
                             });
                             return bc_knows_table;
                         }
@@ -208,12 +208,12 @@ fn select_items_from_cpr_schema(
                     return true;
                 }
                 // Secondary: match current name (for non-renamed columns)
-                if bc_orig.eq_ignore_ascii_case(target_name) {
+                if SqlIdentifier::str_eq(bc_orig, target_name) {
                     return true;
                 }
             }
             // Fall back to current name
-            col_name(bc).eq_ignore_ascii_case(target_name)
+            SqlIdentifier::str_eq(col_name(bc), target_name)
         });
 
         if let Some(idx) = found_idx {
@@ -960,7 +960,7 @@ fn check_recursive_argumentative_binding(binding: &ast_addressed::CteBinding) ->
                 name = binding.name,
             ),
             context: "transformer::lower_cte_binding".to_string(),
-            subcategory: Some("recursion/argumentative_binding"),
+            subcategory: Some(crate::uri_registry::subcat::RECURSION_ARGUMENTATIVE_BINDING),
         });
     }
     Ok(())
@@ -1154,47 +1154,38 @@ fn columns_from_cpr_schema(schema: &CprSchema, scope_name: &TableName) -> Vec<Co
     result
 }
 
-/// Extract column names from a CprSchema.
-fn cpr_column_names(schema: &CprSchema) -> Vec<String> {
-    let cols = match schema {
+/// The resolver's output schema as typed columns. Unknown → empty.
+fn cpr_output_columns(schema: &CprSchema) -> &[ColumnMetadata] {
+    match schema {
         CprSchema::Resolved(cols)
         | CprSchema::Failed {
             resolved_columns: cols,
             ..
         } => cols,
         CprSchema::Unresolved(cols) => cols,
-        CprSchema::Unknown => return Vec::new(),
-    };
-    cols.iter()
-        .map(|c| {
-            c.info
-                .name()
-                .or_else(|| c.info.original_name())
-                .unwrap_or("?")
-                .to_string()
-        })
-        .collect()
+        CprSchema::Unknown => &[],
+    }
 }
 
-/// Thread resolver-assigned aliases onto un-aliased SelectItems.
-///
-/// `output_names` is the full list of resolver-computed column names; `offset`
-/// is the index into that list where `items` start.
-fn thread_resolver_aliases(
-    items: &mut [crate::pipeline::sql_ast_v3::SelectItem],
-    output_names: &[String],
-    offset: usize,
-) {
-    for (i, item) in items.iter_mut().enumerate() {
-        if let crate::pipeline::sql_ast_v3::SelectItem::Expression {
-            alias: alias @ None,
-            ..
-        } = item
-        {
-            if let Some(name) = output_names.get(offset + i) {
-                *alias = Some(name.clone());
-            }
-        }
+/// Spelling of a resolver output column where it crosses into SQL (alias
+/// stamping). Fallback chain preserved from the retired Vec<String> seam —
+/// NOT the same as the builder's col_name() ("_unnamed" fallback).
+fn cpr_display_name(c: &ColumnMetadata) -> &str {
+    c.info.name().or_else(|| c.info.original_name()).unwrap_or("?")
+}
+
+/// Stamp a resolver-assigned alias onto a single SelectItem iff it is
+/// un-aliased. The name comes from an expression's own output stamp (the
+/// per-expression source of truth) rather than a positional cpr lookup — the
+/// seam carries typed columns and the spelling is extracted here at the
+/// stamping border.
+fn alias_unaliased(item: &mut crate::pipeline::sql_ast_v3::SelectItem, name: &str) {
+    if let crate::pipeline::sql_ast_v3::SelectItem::Expression {
+        alias: alias @ None,
+        ..
+    } = item
+    {
+        *alias = Some(name.to_string());
     }
 }
 
@@ -1372,7 +1363,10 @@ fn r_lower_melt_join(
         SelectStatement,
     };
 
-    let melt_col_names: Vec<String> = cpr_column_names(anon_cpr_schema.get());
+    let melt_col_names: Vec<String> = cpr_output_columns(anon_cpr_schema.get())
+        .iter()
+        .map(|c| cpr_display_name(c).to_string())
+        .collect();
     let packet_col = "_melt_packet";
     let source_columns: Vec<ColumnMetadata> = left.columns().to_vec();
     let num_left = source_columns.len();
@@ -1464,7 +1458,13 @@ fn r_lower_melt_join(
                 source_columns
                     .get(i)
                     .map(|c| c.info.clone())
-                    .unwrap_or_else(|| ColumnProvenance::from_column(name))
+                    .unwrap_or_else(|| {
+                        ColumnProvenance::from_table_column(
+                            name,
+                            scope_name.clone(),
+                            QualificationSource::Resolver,
+                        )
+                    })
             } else {
                 ColumnProvenance::from_table_column(
                     name,
@@ -1871,7 +1871,7 @@ pub(super) fn r_lower_projection(
     // Now use CprSchema to fix up aliases. The CprSchema has the resolver's
     // authoritative output names. Apply them positionally to the lowered items.
     let mut items = if let Some(cpr) = cpr_schema {
-        let cpr_names = cpr_column_names(cpr.get());
+        let cpr_columns = cpr_output_columns(cpr.get());
         let mut name_idx = 0;
         items
             .into_iter()
@@ -1882,7 +1882,10 @@ pub(super) fn r_lower_projection(
                     item
                 }
                 crate::pipeline::sql_ast_v3::SelectItem::Expression { expr, alias } => {
-                    let cpr_alias = cpr_names.get(name_idx).cloned().or(alias);
+                    let cpr_alias = cpr_columns
+                        .get(name_idx)
+                        .map(|c| cpr_display_name(c).to_string())
+                        .or(alias);
                     name_idx += 1;
                     crate::pipeline::sql_ast_v3::SelectItem::Expression {
                         expr,
@@ -1978,7 +1981,14 @@ fn r_lower_modulo(
             // All-arbitrary (empty-order) delegates lower as bare columns,
             // exactly as the old `~?` arbitrary did (Phase 0/1a behavior).
             if !any_ordered {
-                let arbitrary = delegates.into_iter().flat_map(|d| d.payload).collect();
+                // Arbitrary path lowers payloads as bare columns via the group-by
+                // spec. The payload OutputDomainExpressions thread through with
+                // their stamps intact so each arb item aliases from its own
+                // delegate stamp (Batch 13) — no positional re-threading.
+                let arbitrary = delegates
+                    .into_iter()
+                    .flat_map(|d| d.payload)
+                    .collect();
                 return r_lower_group_by_spec(
                     builder,
                     reducing_by,
@@ -2035,7 +2045,7 @@ fn r_lower_modulo(
 /// ORDER BY — one arbitrary row per group.
 fn build_delegate_relation(
     builder: Builder<Unprojected>,
-    reducing_by: &[ast_addressed::DomainExpression],
+    reducing_by: &[ast_addressed::OutputDomainExpression],
     order: &[ast_addressed::OrderingSpec],
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
@@ -2057,9 +2067,10 @@ fn build_delegate_relation(
         })
     };
 
+    // Keys carry an output stamp now (slice 4); the PARTITION BY reads `.expr`.
     let partition: Vec<SqlDomainExpr> = reducing_by
         .iter()
-        .map(|e| bare(e.clone(), &builder))
+        .map(|e| bare(e.expr.clone(), &builder))
         .collect::<Result<_>>()?;
     let sql_order: Vec<(SqlDomainExpr, OrderDirection)> = order
         .iter()
@@ -2092,41 +2103,43 @@ fn build_delegate_relation(
 /// automatically.
 fn r_lower_single_ordered_delegate(
     builder: Builder<Unprojected>,
-    reducing_by: Vec<ast_addressed::DomainExpression>,
+    reducing_by: Vec<ast_addressed::OutputDomainExpression>,
     delegate: ast_addressed::DelegateSpec,
-    cpr_schema: &PhaseBox<CprSchema, Addressed>,
+    _cpr_schema: &PhaseBox<CprSchema, Addressed>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     let filtered = build_delegate_relation(builder, &reducing_by, &delegate.order, ctx)?;
 
     // Output = group keys + delegate payload, lowered against the POST-WRAP
     // builder so identities resolve through the wrap chain (trust the builder).
-    // Dedup payload columns that duplicate a group key — a `(*)` payload
-    // expands to include the key, which is already emitted in group position
-    // (matches the resolver's output-schema dedup).
-    let key_names: std::collections::HashSet<String> = reducing_by
-        .iter()
-        .filter_map(|e| match e {
-            ast_addressed::DomainExpression::Lvar { name, .. } => Some(name.to_string()),
-            _ => None,
-        })
-        .collect();
-    let mut output_items: Vec<_> = reducing_by
-        .into_iter()
-        .map(|e| scalar::s_lower_select_item(e, &filtered, ctx))
-        .collect::<Result<Vec<_>>>()?;
-    for e in delegate.payload {
-        let dups_key = matches!(
-            &e,
-            ast_addressed::DomainExpression::Lvar { name, .. } if key_names.contains(name.as_str())
-        );
-        if !dups_key {
-            output_items.push(scalar::s_lower_select_item(e, &filtered, ctx)?);
+    // Group keys now carry their own output stamp (slice 4): each key aliases
+    // from its stamp instead of being threaded by position over the cpr schema.
+    // Keys are always lowered (a key still projects even if it stamped `None`);
+    // the alias is attached only when the stamp is `Some` — byte-identical to
+    // the retired offset-0 positional alias re-attach, whose arithmetic silently
+    // shifted whenever a `None`-stamped key shortened the flat schema.
+    let mut output_items: Vec<crate::pipeline::sql_ast_v3::SelectItem> = Vec::new();
+    for ode in reducing_by {
+        let ast_addressed::OutputDomainExpression { expr, output } = ode;
+        let mut item = scalar::s_lower_select_item(expr, &filtered, ctx)?;
+        if let Some(col) = output.get() {
+            alias_unaliased(&mut item, cpr_display_name(col));
         }
+        output_items.push(item);
     }
-
-    let output_names = cpr_column_names(cpr_schema.get());
-    thread_resolver_aliases(&mut output_items, &output_names, 0);
+    // Each payload expression carries its own output stamp: `None` = the
+    // resolver decided it yields no output column (a `(*)` payload that
+    // duplicates a group key, already emitted in group position), `Some(col)`
+    // = emit, aliased from the stamp. The dedup no longer lives here.
+    for ode in delegate.payload {
+        let Some(col) = ode.output.get() else {
+            continue; // resolver stamped None — no output column
+        };
+        let name = cpr_display_name(col).to_string();
+        let mut item = scalar::s_lower_select_item(ode.expr, &filtered, ctx)?;
+        alias_unaliased(&mut item, &name);
+        output_items.push(item);
+    }
 
     filtered.add_projection(output_items)
 }
@@ -2152,8 +2165,8 @@ fn r_lower_single_ordered_delegate(
 /// explicitly qualified to the operand that owns it.
 fn r_lower_n_way_delegate_join(
     builder: Builder<Unprojected>,
-    reducing_by: Vec<ast_addressed::DomainExpression>,
-    reducing_on: Vec<ast_addressed::DomainExpression>,
+    reducing_by: Vec<ast_addressed::OutputDomainExpression>,
+    reducing_on: Vec<ast_addressed::OutputDomainExpression>,
     delegates: Vec<ast_addressed::DelegateSpec>,
     cpr_schema: &PhaseBox<CprSchema, Addressed>,
     ctx: &TransformCtx,
@@ -2169,7 +2182,7 @@ fn r_lower_n_way_delegate_join(
     let key_names: Vec<String> = reducing_by
         .iter()
         .map(
-            |e| match scalar::s_lower_expression(e.clone(), &builder, ctx)? {
+            |e| match scalar::s_lower_expression(e.expr.clone(), &builder, ctx)? {
                 SqlDomainExpr::Column { name, .. } => Ok(name),
                 _ => Err(DelightQLError::ParseError {
                     message: "N-way delegate join requires plain column group keys \
@@ -2217,7 +2230,7 @@ fn r_lower_n_way_delegate_join(
 
     // Each delegate → one `row_number()=1` relation. Remember its operand index
     // and payload so output columns can be mapped back to it.
-    let mut delegate_slots: Vec<(usize, Vec<ast_addressed::DomainExpression>)> = Vec::new();
+    let mut delegate_slots: Vec<(usize, Vec<ast_addressed::OutputDomainExpression>)> = Vec::new();
     for d in delegates {
         let rel = build_delegate_relation(fresh_source("dlg"), &reducing_by, &d.order, ctx)?;
         delegate_slots.push((operands.len(), d.payload));
@@ -2267,59 +2280,73 @@ fn r_lower_n_way_delegate_join(
     // though all operands share the source column names.
     let mut output_items: Vec<SelectItem> = Vec::new();
 
-    // (a) group keys — from the anchor operand.
-    for k in &key_names {
-        output_items.push(SelectItem::Expression {
+    // (a) group keys — from the anchor operand, each aliased from its OWN output
+    // stamp (slice 4). The n-way path admits only plain-column keys (checked
+    // above), so every key stamps `Some`; aliasing from the stamp is
+    // byte-identical to the retired offset-0 positional re-attach, which
+    // pulled the same name from the cpr schema by position.
+    for (k, ode) in key_names.iter().zip(reducing_by.iter()) {
+        let mut item = SelectItem::Expression {
             expr: SqlDomainExpr::with_qualifier(ColumnQualifier::table(&anchor_qual), k),
             alias: None,
-        });
+        };
+        if let Some(col) = ode.output.get() {
+            alias_unaliased(&mut item, cpr_display_name(col));
+        }
+        output_items.push(item);
     }
 
     // (b) aggregates — from the aggregate operand (operands[0] when present).
     // Its columns are keys + aggregate outputs; the aggregates are the columns
-    // whose names are not group keys, in order.
+    // whose names are not group keys, in order. Each aggregate column already
+    // carries the resolver's chosen name (the agg subquery aliased it from its
+    // own reducing_on stamp), so it self-aliases by its column name — again
+    // byte-identical to the retired positional thread.
     if has_agg {
         for col in &operands[0].columns {
             let name = col_name(col);
             if !key_set.contains(name) {
-                output_items.push(SelectItem::Expression {
+                let mut item = SelectItem::Expression {
                     expr: SqlDomainExpr::with_qualifier(ColumnQualifier::table(&anchor_qual), name),
                     alias: None,
-                });
+                };
+                alias_unaliased(&mut item, name);
+                output_items.push(item);
             }
         }
     }
 
-    // (c) delegate payloads — each from its own operand, deduping any payload
-    // column that duplicates a group key (matches the resolver dedup and the
-    // single-delegate path).
+    // (c) delegate payloads — each from its own operand. Each payload
+    // expression carries its own output stamp: `None` = the resolver decided
+    // it yields no output column (duplicates a group key already emitted in
+    // group position), `Some(col)` = emit, aliased from the stamp. The dedup
+    // no longer lives here; the stamp replaces the `key_set` membership check.
     for (op_idx, payload) in &delegate_slots {
         let op_qual = &quals[*op_idx];
-        for e in payload {
-            let name = match scalar::s_lower_expression(e.clone(), &operands[*op_idx], ctx)? {
-                SqlDomainExpr::Column { name, .. } => name,
-                other => {
-                    // Non-column payload: emit the lowered expression as-is.
-                    output_items.push(SelectItem::Expression {
+        for ode in payload {
+            let Some(col) = ode.output.get() else {
+                continue; // resolver stamped None — no output column
+            };
+            let mut item =
+                match scalar::s_lower_expression(ode.expr.clone(), &operands[*op_idx], ctx)? {
+                    SqlDomainExpr::Column { name, .. } => SelectItem::Expression {
+                        expr: SqlDomainExpr::with_qualifier(ColumnQualifier::table(op_qual), &name),
+                        alias: None,
+                    },
+                    other => SelectItem::Expression {
+                        // Non-column payload: emit the lowered expression as-is.
                         expr: other,
                         alias: None,
-                    });
-                    continue;
-                }
-            };
-            if key_set.contains(name.as_str()) {
-                continue;
-            }
-            output_items.push(SelectItem::Expression {
-                expr: SqlDomainExpr::with_qualifier(ColumnQualifier::table(op_qual), &name),
-                alias: None,
-            });
+                    },
+                };
+            alias_unaliased(&mut item, cpr_display_name(col));
+            output_items.push(item);
         }
     }
 
-    // Thread the resolver/cpr output names positionally over the whole list.
-    let output_names = cpr_column_names(cpr_schema.get());
-    thread_resolver_aliases(&mut output_items, &output_names, 0);
+    // Keys and aggregates are aliased inline from their stamps / self-names
+    // (slice 4); payloads arrive aliased from their delegate stamps. The
+    // positional alias re-attach is retired.
 
     // Assemble the flat join and project.
     let joined = Builder::from_joins(operands, conditions);
@@ -2334,20 +2361,35 @@ fn r_lower_n_way_delegate_join(
 /// 3. Tree group in reducing_on with CTE (nested `~>`) — CTE chain via push_cte
 fn r_lower_group_by_spec(
     builder: Builder<Unprojected>,
-    reducing_by: Vec<ast_addressed::DomainExpression>,
-    reducing_on: Vec<ast_addressed::DomainExpression>,
-    arbitrary: Vec<ast_addressed::DomainExpression>,
+    reducing_by: Vec<ast_addressed::OutputDomainExpression>,
+    reducing_on: Vec<ast_addressed::OutputDomainExpression>,
+    arbitrary: Vec<ast_addressed::OutputDomainExpression>,
     cpr_schema: &PhaseBox<CprSchema, Addressed>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use super::builder::GroupBySpec;
 
+    // Group keys carry an output stamp now (slice 4), but this straight GROUP BY
+    // path emits keys BARE (no alias) — verified byte-for-byte against the corpus
+    // (e.g. `SELECT products.category_id, ...` renders unaliased today). Unlike
+    // the delegate paths (which aliased keys via the retired positional thread),
+    // nothing aliased these keys, so the stamp is unwrapped at the boundary and
+    // the key SELECT items are lowered from `.expr` exactly as before. (Aliasing
+    // them from stamps here would add redundant `AS <key>` clauses — a real diff,
+    // NOT the sanctioned misalignment fix — so it is deliberately not done.)
+    let reducing_by: Vec<ast_addressed::DomainExpression> =
+        reducing_by.into_iter().map(|ode| ode.expr).collect();
+
     // Check for pivot expressions
     let has_pivot = reducing_on
         .iter()
-        .any(|e| matches!(e, ast_addressed::DomainExpression::PivotOf { .. }));
+        .any(|ode| matches!(&ode.expr, ast_addressed::DomainExpression::PivotOf { .. }));
 
     if has_pivot {
+        // Pivot is 1:N and node-schema-owned: r_lower_pivot indexes over its own
+        // single expression list, so unwrap the stamps at the boundary (stamps
+        // are None for pivots anyway).
+        let reducing_on = reducing_on.into_iter().map(|ode| ode.expr).collect();
         return r_lower_pivot(builder, reducing_by, reducing_on, cpr_schema, ctx);
     }
 
@@ -2365,6 +2407,9 @@ fn r_lower_group_by_spec(
     });
 
     if by_needs_cte {
+        // Tree-group-in-reducing_by lowering owns its output schema; unwrap the
+        // reducing_on stamps at the boundary.
+        let reducing_on = reducing_on.into_iter().map(|ode| ode.expr).collect();
         return tree_group::r_lower_tree_group_in_reducing_by(
             builder,
             reducing_by,
@@ -2375,7 +2420,7 @@ fn r_lower_group_by_spec(
     }
 
     // Check if any reducing_on expression is a Curly or MetadataTreeGroup needing CTEs
-    let needs_cte = reducing_on.iter().any(|e| match e {
+    let needs_cte = reducing_on.iter().any(|ode| match &ode.expr {
         ast_addressed::DomainExpression::Function(ast_addressed::FunctionExpression::Curly {
             cte_requirements: Some(req),
             ..
@@ -2394,6 +2439,8 @@ fn r_lower_group_by_spec(
     });
 
     if needs_cte {
+        // Tree-group CTE lowering owns its output schema; unwrap the stamps.
+        let reducing_on = reducing_on.into_iter().map(|ode| ode.expr).collect();
         return tree_group::r_lower_tree_group_cte(
             builder,
             reducing_by,
@@ -2409,12 +2456,20 @@ fn r_lower_group_by_spec(
         .map(|e| scalar::s_lower_select_item(e, &builder, ctx))
         .collect::<Result<_>>()?;
 
-    // Lower aggregate reductions → SelectItems.
-    // Curly expressions get the aggregate wrapper; others use normal lowering.
-    let mut aggregates: Vec<_> = reducing_on
-        .into_iter()
-        .map(|e| tree_group::s_lower_reducing_on_item(e, &builder, ctx))
-        .collect::<Result<_>>()?;
+    // Lower aggregate reductions → SelectItems, aliasing each from its OWN output
+    // stamp. The resolver assigns names like "count", "count_2" to aggregate
+    // expressions; the stamp carries that decision on the expression, so no
+    // positional cpr threading is needed. Curly expressions get the aggregate
+    // wrapper; others use normal lowering.
+    let mut aggregates: Vec<crate::pipeline::sql_ast_v3::SelectItem> = Vec::new();
+    for ode in reducing_on {
+        let ast_addressed::OutputDomainExpression { expr, output } = ode;
+        let mut item = tree_group::s_lower_reducing_on_item(expr, &builder, ctx)?;
+        if let Some(col) = output.get() {
+            alias_unaliased(&mut item, cpr_display_name(col));
+        }
+        aggregates.push(item);
+    }
 
     // Lower arbitrary delegate columns (bare `<~`, formerly `~?`) and stamp
     // each with the arbitrary-witness form (`__dql_arbitrary`). This is the
@@ -2422,34 +2477,30 @@ fn r_lower_group_by_spec(
     // here; the SPELLING is per-dialect — canonical/sqlite unwraps to the
     // bare column (relaxed GROUP BY), strict targets render `any_value(...)`.
     // Ordered delegates (`<~ #(order)`) lower via the N-way join, not here.
-    let arb_items: Vec<_> = arbitrary
-        .into_iter()
-        .map(|e| {
-            use crate::pipeline::sql_ast_v3::{
-                DomainExpression as SqlDomainExpr, SelectItem,
-            };
-            scalar::s_lower_select_item(e, &builder, ctx).map(|item| match item {
-                SelectItem::Expression { expr, alias } => SelectItem::Expression {
-                    expr: SqlDomainExpr::function(
-                        crate::pipeline::naming::INTERNAL_ARBITRARY,
-                        vec![expr],
-                    ),
-                    alias,
-                },
-                other => other,
-            })
-        })
-        .collect::<Result<_>>()?;
+    // Each arb item aliases from its own delegate stamp; a `None` stamp = the
+    // resolver decided this payload yields no column (dup-of-key already emitted
+    // in group position), so it is skipped rather than positionally threaded.
+    for ode in arbitrary {
+        use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
+        let ast_addressed::OutputDomainExpression { expr, output } = ode;
+        let Some(col) = output.get() else {
+            continue; // resolver stamped None — no output column
+        };
+        let name = cpr_display_name(col).to_string();
+        let mut item = match scalar::s_lower_select_item(expr, &builder, ctx)? {
+            SelectItem::Expression { expr, alias } => SelectItem::Expression {
+                expr: SqlDomainExpr::function(
+                    crate::pipeline::naming::INTERNAL_ARBITRARY,
+                    vec![expr],
+                ),
+                alias,
+            },
+            other => other,
+        };
+        alias_unaliased(&mut item, &name);
+        aggregates.push(item);
+    }
 
-    // Thread resolver names onto un-aliased items. The resolver assigns
-    // names like "count", "count_2" to aggregate expressions; without this,
-    // derive_columns_from_items invents "_expr_N" and scope diverges from SQL.
-    let output_names = cpr_column_names(cpr_schema.get());
-    thread_resolver_aliases(&mut aggregates, &output_names, keys.len());
-    let mut arb_items = arb_items;
-    thread_resolver_aliases(&mut arb_items, &output_names, keys.len() + aggregates.len());
-
-    aggregates.extend(arb_items);
     builder.add_group_by(GroupBySpec { keys, aggregates })
 }
 
@@ -2466,9 +2517,11 @@ fn r_lower_pivot(
     cpr_schema: &PhaseBox<CprSchema, Addressed>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    let output_col_names: Vec<String> = match cpr_schema.get() {
-        CprSchema::Resolved(cols) => cols.iter().map(|c| col_name(c).to_string()).collect(),
-        _ => Vec::new(),
+    // Resolved only — pivot trusts a fully resolved output schema and aliases
+    // nothing otherwise (unlike cpr_output_columns, which admits partial schemas).
+    let output_columns: &[ColumnMetadata] = match cpr_schema.get() {
+        CprSchema::Resolved(cols) => cols,
+        _ => &[],
     };
 
     let (pivot_groups, key_to_group, regular_aggs) = classify_pivot_groups(&reducing_on);
@@ -2525,7 +2578,7 @@ fn r_lower_pivot(
         &regular_aggs,
         &key_to_group,
         &packet_aliases,
-        &output_col_names,
+        output_columns,
     );
 
     projected.add_projection(outer_items)
@@ -2831,13 +2884,15 @@ fn push_prepivot_cte(
 }
 
 /// Build the outer SELECT items: json_extract per pivot value column.
+/// The seam carries typed columns; spelling is extracted at the alias
+/// borders via `col_name` ("_unnamed" fallback chain).
 fn build_pivot_outer_select(
     reducing_on: &[ast_addressed::DomainExpression],
     group_key_names: &[String],
     regular_aggs: &[(String, ast_addressed::DomainExpression)],
     key_to_group: &std::collections::HashMap<String, usize>,
     packet_aliases: &[String],
-    output_col_names: &[String],
+    output_columns: &[ColumnMetadata],
 ) -> Vec<crate::pipeline::sql_ast_v3::SelectItem> {
     use crate::pipeline::asts::core::literals::LiteralValue;
     use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
@@ -2846,9 +2901,9 @@ fn build_pivot_outer_select(
     let mut col_idx = 0;
 
     for key_name in group_key_names {
-        let alias = output_col_names
+        let alias = output_columns
             .get(col_idx)
-            .cloned()
+            .map(|c| col_name(c).to_string())
             .unwrap_or_else(|| key_name.clone());
         outer_items.push(SelectItem::expression_with_alias(
             SqlDomainExpr::column(key_name),
@@ -2872,9 +2927,9 @@ fn build_pivot_outer_select(
                 let group_idx = key_to_group[&key_name];
 
                 for pivot_value in pivot_values {
-                    let alias = output_col_names
+                    let alias = output_columns
                         .get(col_idx)
-                        .cloned()
+                        .map(|c| col_name(c).to_string())
                         .unwrap_or_else(|| pivot_value.to_lowercase());
                     let path = format!("$.{}.{}", pivot_value, val_name);
                     // Provenance: compiler-internal packet read — the value
@@ -2894,9 +2949,9 @@ fn build_pivot_outer_select(
             }
             _ => {
                 if let Some((agg_alias, _)) = agg_iter.next() {
-                    let alias = output_col_names
+                    let alias = output_columns
                         .get(col_idx)
-                        .cloned()
+                        .map(|c| col_name(c).to_string())
                         .unwrap_or_else(|| agg_alias.clone());
                     outer_items.push(SelectItem::expression_with_alias(
                         SqlDomainExpr::column(agg_alias),
@@ -3067,7 +3122,7 @@ pub(super) fn r_lower_transform(
                     // Qualified: match against the column's original table name
                     // (not the current scope qualifier, which changes through joins)
                     Some(q) => match c.qualifier() {
-                        TableName::Named(tn) => tn.as_str() == q.as_str(),
+                        TableName::Named(tn) => tn == q,
                         TableName::Fresh => false,
                     },
                     None => true, // unqualified matches any
@@ -3271,6 +3326,8 @@ pub(super) fn r_lower_meta_ize(
         .iter()
         .enumerate()
         .map(|(i, name)| {
+            // Honest Fresh: meta-ize output columns are a synthetic name-as-data
+            // vocabulary; scope_name is an internal scope, not a source table.
             ColumnMetadata::new(
                 ColumnProvenance::from_column(*name),
                 scope_name.clone(),
@@ -3325,6 +3382,8 @@ pub(super) fn r_lower_witness(
 
     let query = QueryExpression::Select(Box::new(select));
     let scope_name = TableName::Named(SqlIdentifier::from("_witness"));
+    // Honest Fresh: "met" is the compiler-generated EXISTS result; "_witness" is a
+    // synthetic scope, not a source table.
     let columns = vec![ColumnMetadata::new(
         ColumnProvenance::from_column("met"),
         scope_name.clone(),
@@ -3367,7 +3426,7 @@ pub(super) fn r_lower_narrowing_destructure(
         ColumnQualifier, DomainExpression as SqlDomainExpr, SelectItem,
     };
 
-    let output_names = cpr_column_names(cpr_schema.get());
+    let output_columns = cpr_output_columns(cpr_schema.get());
 
     builder.expand_with_json_each(
         &column,
@@ -3380,9 +3439,9 @@ pub(super) fn r_lower_narrowing_destructure(
                 .iter()
                 .enumerate()
                 .map(|(i, field)| {
-                    let alias = output_names
+                    let alias = output_columns
                         .get(i)
-                        .cloned()
+                        .map(|c| cpr_display_name(c).to_string())
                         .unwrap_or_else(|| field.rsplit('.').next().unwrap_or(field).to_string());
                     SelectItem::expression_with_alias(
                         SqlDomainExpr::function(
@@ -3447,7 +3506,7 @@ fn r_lower_interior_drill_down(
             .collect()
     };
 
-    let output_names = cpr_column_names(cpr_schema.get());
+    let output_columns = cpr_output_columns(cpr_schema.get());
 
     // Context = everything except the drilled column.
     let context_col_names: Vec<String> = builder
@@ -3455,7 +3514,7 @@ fn r_lower_interior_drill_down(
         .iter()
         .filter_map(|c| {
             let name = col_name(c);
-            if name.eq_ignore_ascii_case(&column) {
+            if SqlIdentifier::str_eq(name, &column) {
                 None
             } else {
                 Some(name.to_string())
@@ -3474,7 +3533,7 @@ fn r_lower_interior_drill_down(
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
-                    let alias = output_names.get(i).map(|s| s.as_str()).unwrap_or(name);
+                    let alias = output_columns.get(i).map(|c| cpr_display_name(c)).unwrap_or(name);
                     SelectItem::expression_with_alias(
                         SqlDomainExpr::with_qualifier(sq.clone(), name.as_str()),
                         alias,
@@ -3487,9 +3546,9 @@ fn r_lower_interior_drill_down(
                 .iter()
                 .enumerate()
                 .map(|(i, def)| {
-                    let alias = output_names
+                    let alias = output_columns
                         .get(num_context + i)
-                        .cloned()
+                        .map(|c| cpr_display_name(c).to_string())
                         .unwrap_or_else(|| def.name.clone());
                     SelectItem::expression_with_alias(
                         SqlDomainExpr::function(
@@ -4515,5 +4574,54 @@ fn rewrite_corr_domain_expr(
             source: None,
             subcategory: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod resolver_alias_seam_tests {
+    use super::*;
+    use crate::pipeline::asts::core::provenance::ColumnProvenance;
+    use crate::pipeline::sql_ast_v3::{DomainExpression, SelectItem};
+
+    /// Column whose current spelling is `name`.
+    fn col(name: &str) -> ColumnMetadata {
+        ColumnMetadata::new(ColumnProvenance::from_column(name), TableName::Fresh, None)
+    }
+
+    fn unaliased_item() -> SelectItem {
+        SelectItem::expression(DomainExpression::column("_"))
+    }
+
+    fn alias_of(item: &SelectItem) -> Option<&str> {
+        match item {
+            SelectItem::Expression { alias, .. } => alias.as_deref(),
+            _ => None,
+        }
+    }
+
+    // The positional multi-item alias re-attach was retired in slice 4 — every
+    // consumer now aliases each item from its own output stamp via
+    // `alias_unaliased`. The old positional-offset test is retired with the
+    // function; the stamp-a-name and skip-aliased behaviors that still matter
+    // carry over to `alias_unaliased` below. `col(..)` / `unaliased_item()`
+    // remain the shared fixtures.
+
+    #[test]
+    fn alias_unaliased_stamps_name() {
+        let mut item = unaliased_item();
+        alias_unaliased(&mut item, cpr_display_name(&col("count_2")));
+        assert_eq!(alias_of(&item), Some("count_2"));
+    }
+
+    #[test]
+    fn alias_unaliased_leaves_aliased_item_untouched() {
+        let mut item = SelectItem::expression_with_alias(DomainExpression::column("_"), "keep");
+        alias_unaliased(&mut item, "count_2");
+        assert_eq!(alias_of(&item), Some("keep"));
+    }
+
+    #[test]
+    fn unknown_schema_empty() {
+        assert!(cpr_output_columns(&CprSchema::Unknown).is_empty());
     }
 }
