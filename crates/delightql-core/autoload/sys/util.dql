@@ -1,3 +1,11 @@
+
+  style_mapper2:(variant) :-
+     _:( variant
+         @
+        "DBPermanentTable" -> :"style.fill: \Q#f4a261\Q";
+        "DBPermanentView" -> "style.fill: black"
+         )
+
 tables_as_d2(*) :-
   (~~docs
     The live entity catalog rendered as a d2 diagram source document
@@ -17,6 +25,12 @@ tables_as_d2(*) :-
       d2 schema.d2 schema.svg
   ~~)
 
+  style_mapper:(variant) :
+     _:( variant
+         @
+        "DBPermanentTable" -> :"style.fill: \Q#f4a261\Q";
+        "DBPermanentView" -> "style.fill: black"
+         )
   sys::ns.namespace(*) as n, n.fq_name != "_"
   , sys::ns.activated_entity(*) as ae, ae.namespace_id = n.id
   , sys::entities.entity(*) as e, e.id = ae.entity_id
@@ -28,10 +42,10 @@ tables_as_d2(*) :-
   : base
 
   base(*),  variant in ("DBPermanentTable"; "DBPermanentView")
-   |> #(ns, tname, pos)
-   |> %(ns, tname ~> group_concat:(colline, char:(10)) as cols)
+   |> #(ns, tname, pos, variant)
+   |> %(ns, tname , variant~> group_concat:(colline, char:(10)) as cols)
    |> (ns, tname,
-       :"{tname}: {char:(123)}{char:(10)}  shape: sql_table{char:(10)}{cols}{char:(10)}{char:(125)}"
+       :"{tname}: {char:(123)}{char:(10)}  shape: sql_table{char:(10)}{cols}{char:(10)}{ style_mapper:(variant)}{char:(125)}"
          as block)
   : tbls
 

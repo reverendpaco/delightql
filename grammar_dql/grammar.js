@@ -85,6 +85,10 @@ module.exports = grammar({
     [$.lvar, $.tvf_argument],
     // HO argument list: ho_argument_row has same structure as argument_list (comma-separated tvf_args)
     [$.argument_list, $.ho_argument_row],
+    // Inline directive table: name!(*)... — bare * could be glob (directive-terminal
+    // argument) or tvf_argument (inline_directive_table's ho_argument_list value).
+    // GLR forks; the token after ')' (another '(' => inline, else directive) disambiguates.
+    [$.glob, $.tvf_argument],
     // Catalog functor: identifier could start catalog_functor (main::) or table_access (main. or main/) or CTE
     [$.catalog_functor, $.table_access],
     [$.catalog_functor, $.table_access, $.cte_definition],
@@ -254,6 +258,7 @@ module.exports = grammar({
     // Base expressions - the atomic units (tables only, no predicates!)
     // Predicates can only appear after commas in continuations
     base_expression: $ => choice(
+      prec(3, $.inline_directive_table), // Inline directive table-value: doc!("a","b")(*)
       prec(3, $.pseudo_predicate_call),  // Highest precedence for pseudo-predicates (! suffix is unambiguous)
       prec(2, $.catalog_functor),        // Catalog functor: ns::(*)
       prec(2, $.table_access),           // Higher precedence for table access (passthrough via / separator)
@@ -1945,17 +1950,19 @@ module.exports = grammar({
     // 2. Simple case continuation: value -> result (just a literal)
     // 3. Searched case: condition -> result (non-literal expression)
     case_arm: $ => choice(
-      // Curried simple case: @ value -> result (for use with lambdas)
+      // Curried simple case: @ value -> result (for use with lambdas).
+      // The head separator accepts `@` or `---` (3+ hyphens), mirroring
+      // anonymous_table_separator — stacked notation for case functions.
       seq(
-        '@',
+        choice('@', /---+/),
         field('value', $.literal),
         '->',
         field('result', $.domain_expression)
       ),
-      // Simple case first arm: expr @ value -> result
+      // Simple case first arm: expr @ value -> result (or expr --- value)
       seq(
         field('test_expr', $.domain_expression),
-        '@',
+        choice('@', /---+/),
         field('value', $.literal),
         '->',
         field('result', $.domain_expression)
@@ -2056,6 +2063,30 @@ module.exports = grammar({
         ')',
       )),
     ),
+
+    // Inline directive table-value: doc!("a","b")(*), doc!("a","b"; "c","d")(*)
+    // First paren = positional ho_argument_list (the table value, ;-rows).
+    // Second paren = output spec (column_spec|continuation, mirrors DML alts).
+    // Desugars in the builder to _(rows) |> name!(output) — same AST as the
+    // piped form, so the runtime is unchanged. Reachable standalone via
+    // base_expression (NOT via bang_pipe_operation): the piped context reaches
+    // only DML/directive-terminal, so keeping this out of bang_pipe_operation
+    // avoids DML/directive GLR conflicts while the standalone two-paren form
+    // still parses. prec.dynamic(15) wins over pseudo_predicate_call so
+    // doc!("a","b")(*) is the two-paren form, not a one-paren call + trailing.
+    inline_directive_table: $ => prec.dynamic(15, seq(
+      field('name', $.identifier),
+      token.immediate('!'),
+      '(',
+      field('table_value', $.ho_argument_list),
+      ')',
+      '(',
+      choice(
+        prec(2, field('columns', $.column_spec)),
+        field('continuation', $.relational_continuation)
+      ),
+      ')',
+    )),
 
     // Unicode assertion view symbols: ∃ ∄ ∀ ≡
     assertion_view_symbol: $ => choice('∃', '∄', '∀', '≡'),

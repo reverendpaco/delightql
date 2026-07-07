@@ -277,8 +277,13 @@ pub fn process_inline_ddl_block(
         return Ok(Vec::new());
     }
 
-    let mut ddl = parser::parse_ddl_file(body)
-        .map_err(|e| anyhow::anyhow!("Inline DDL parse error: {}", e))?;
+    // Shared DDL front end (DDL-LOADING-PATHS.md Tier 1): same parsing as
+    // consult!() files, with embedded directives refused loudly.
+    let mut ddl = crate::bin_cartridge::prelude::consult::parse_ddl_source_no_directives(
+        body,
+        "inline (~~ddl ~~) block",
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // Guard: inline DDL must contain definitions, not queries
     if ddl.definitions.is_empty() && ddl.inline_ddl_blocks.is_empty() {

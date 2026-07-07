@@ -18,6 +18,90 @@ use crate::pipeline::cst::CstNode;
 use crate::pipeline::parser::parse_ddl;
 use tree_sitter::Tree;
 
+/// A `named_case_definition` desugared to its equivalent case-bodied function.
+///
+/// `style_of(variant -> style ---- "a" -> "x"; _ -> "y")` becomes the already
+/// working function `style_of:(variant) :- _:( variant @ "a" -> "x"; _ -> "y" )`.
+pub struct DesugaredNamedCase {
+    pub name: String,
+    /// The single input column — becomes the function parameter.
+    pub input: String,
+    /// The case-expression body, e.g. `_:( variant @ "a" -> "x"; _ -> "y" )`.
+    pub body_source: String,
+    /// The full function definition source (head `:-` body).
+    pub full_source: String,
+}
+
+/// Desugar a `named_case_definition` CST node into its case-bodied-function form.
+///
+/// The `input -> output` head is a Prolog-style mode adornment: `input` is the
+/// function parameter the caller binds; `output` is documentation only and is
+/// intentionally not used. The arms (`case_arm`/`case_default` children) are the
+/// inherited grammar_dql case arms; prepending `input @` in front of them yields
+/// exactly the anonymous `_:()` body. Downstream registration, inlining, and
+/// lowering are the plain-function paths (guarded by the `case1_reusable` test).
+pub fn desugar_named_case(node: &CstNode, source: &str) -> Result<DesugaredNamedCase> {
+    let name = node
+        .field("name")
+        .ok_or_else(|| DelightQLError::parse_error("named case function missing name"))?
+        .text()
+        .to_string();
+    let input = node
+        .field("input")
+        .ok_or_else(|| {
+            DelightQLError::parse_error(
+                "named case function missing input column (the `in -> out` head)",
+            )
+        })?
+        .text()
+        .to_string();
+    // `output` field is the functional-dependency's output name — documentation
+    // only; it never names the result column, so it is intentionally unused.
+    let arm_nodes: Vec<CstNode> = node
+        .children()
+        .filter(|c| c.kind() == "case_arm" || c.kind() == "case_default")
+        .collect();
+    let first = arm_nodes
+        .first()
+        .ok_or_else(|| DelightQLError::parse_error("named case function has no arms"))?;
+    let last = arm_nodes.last().expect("arm_nodes is non-empty");
+    let arms_src = source[first.raw_node().start_byte()..last.raw_node().end_byte()]
+        .trim()
+        .to_string();
+
+    // Whether the arms are value-match (`"a" -> …`, first arm a bare literal) or
+    // searched (`score > 90 -> …`, a condition) decides the desugar, exactly as
+    // the anonymous `_:()` first arm sets the CASE operand:
+    //   value-match → `_:( input @ arms )`   (CASE input WHEN 'a' …)
+    //   searched    → `_:( arms )`           (CASE WHEN cond …), input referenced in the conditions
+    // Detection: the first non-default arm's condition is a single literal.
+    let first_arm_is_literal = arm_nodes
+        .iter()
+        .find(|a| a.kind() == "case_arm")
+        .and_then(|a| a.field("condition"))
+        .map(|cond| {
+            let des: Vec<CstNode> = cond
+                .children()
+                .filter(|c| c.kind() == "domain_expression")
+                .collect();
+            des.len() == 1 && des[0].child(0).map(|n| n.kind() == "literal").unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    let body_source = if first_arm_is_literal {
+        format!("_:( {input} @ {arms_src} )")
+    } else {
+        format!("_:( {arms_src} )")
+    };
+    let full_source = format!("{name}:({input}) :- {body_source}");
+    Ok(DesugaredNamedCase {
+        name,
+        input,
+        body_source,
+        full_source,
+    })
+}
+
 /// Extract just the name and head from a definition CST node.
 ///
 /// Parses the head structure (params, HO params, etc.) without touching the body.
@@ -222,6 +306,12 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
             }
         }
         "fact_definition" => DdlHead::Fact,
+        "named_case_definition" => {
+            // Head-only view of a named case function: desugar and take the
+            // equivalent function head (a single `input` param, no context).
+            let desugared = desugar_named_case(node, source)?;
+            return build_ddl_head(&desugared.full_source);
+        }
         _ => {
             return Err(DelightQLError::parse_error(format!(
                 "Unknown definition node type: {}",
@@ -239,6 +329,14 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
 /// `ho_view_definition` node from the DDL parser's CST.
 pub fn build_ddl_definition(node: &CstNode, source: &str) -> Result<DdlDefinition> {
     let cst_node_type = node.kind();
+
+    // Named case function: pure surface sugar. Desugar to the equivalent
+    // case-bodied function source and build that through the normal path — the
+    // registered definition is byte-identical to a hand-written case function.
+    if cst_node_type == "named_case_definition" {
+        let desugared = desugar_named_case(node, source)?;
+        return build_single_definition(&desugared.full_source);
+    }
 
     // HO fact sugar: like fact_definition but with HO params in first parens, data in second parens.
     // No explicit neck in source — defaults to Session (:-) since facts are view-like definitions.
@@ -447,6 +545,7 @@ pub fn build_ddl_head(source: &str) -> Result<(String, DdlHead)> {
             | "ho_fact_definition"
             | "sigma_definition"
             | "fact_definition"
+            | "named_case_definition"
             | "er_rule_definition" => {
                 return extract_name_and_head(&child, source);
             }
@@ -501,6 +600,7 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
             | "ho_fact_definition"
             | "sigma_definition"
             | "fact_definition"
+            | "named_case_definition"
             | "er_rule_definition" => {
                 definitions.push(build_ddl_definition(&child, source)?);
             }

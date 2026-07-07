@@ -401,7 +401,7 @@ pub(super) fn extract_tvf_argument_text(node: CstNode) -> String {
 /// - `table_access` → Lvar (table reference — Step 4 separates table params)
 /// - `value_placeholder` (@) → ValuePlaceholder
 /// - `*` → Projection(Glob)
-fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<DomainExpression> {
+pub(super) fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<DomainExpression> {
     for child in node.children() {
         match child.kind() {
             "string_literal" => {

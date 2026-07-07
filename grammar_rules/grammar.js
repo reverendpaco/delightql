@@ -171,6 +171,7 @@ module.exports = grammar(dqlGrammar, {
     definition: $ => choice(
       $.function_definition,
       $.constant_definition,  // nl :- char:(10) — zero-arity function without parens
+      $.named_case_definition, // name(in -> out ---- arms) — before fact; the `->` head disambiguates
       $.ho_fact_definition,   // name(ho_params)(data) — before fact for priority
       $.fact_definition,
       $.sigma_definition,
@@ -323,6 +324,29 @@ module.exports = grammar(dqlGrammar, {
       field('neck', $.definition_neck),
       optional(field('doc', $.annotation_body)),
       field('body', $.query),
+    ),
+
+    // Named case function definition (Prolog-mode case predicate):
+    //   name( input -> output ---- "a" -> "x"; "b" -> "y"; _ -> "z" )
+    // The `input -> output` head is a functional-dependency adornment: `input`
+    // is the function parameter the caller binds (`name:(input)`); `output` is
+    // documentation only and never names the result column. The `/---+/` (3+
+    // hyphens) divides the head from the arms. The arms are the inherited
+    // grammar_dql case arms (value -> result; _ -> default). Desugars in the
+    // builder to the already-working case-bodied function
+    //   name:(input) :- _:( input @ <arms> )
+    // so registration/inlining/lowering are all reused (see case1_reusable).
+    named_case_definition: $ => seq(
+      field('name', $.identifier),
+      '(',
+      field('input', $.identifier),
+      '->',
+      field('output', $.identifier),
+      /---+/,
+      $.case_arm,
+      repeat(seq(';', $.case_arm)),
+      optional(seq(';', $.case_default)),
+      ')'
     ),
 
     // Fact definition: name(data) — inline data literal, no neck required

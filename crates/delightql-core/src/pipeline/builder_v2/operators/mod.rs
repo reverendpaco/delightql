@@ -12,6 +12,7 @@ pub(super) use covers::parse_rename_cover;
 pub(super) use covers::{parse_embed_cover, parse_embed_map_cover, parse_map_cover};
 pub(super) use grouping::{parse_grouping, parse_metadata_tree_group, parse_transform};
 pub(super) use invocations::parse_ho_argument_list;
+pub(super) use invocations::parse_inline_directive_table;
 pub(super) use projections::{
     parse_generalized_projection, parse_ordering, parse_project_out, parse_reposition,
 };

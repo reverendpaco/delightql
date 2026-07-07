@@ -19,6 +19,7 @@ mod compile;
 pub(crate) mod consult;
 mod consult_tree;
 mod delist;
+mod doc;
 mod enlist;
 mod ground;
 mod imprint;
@@ -34,9 +35,10 @@ pub use compile::CompilePredicate;
 pub use consult::ConsultPredicate;
 pub use consult_tree::ConsultTreePredicate;
 pub use delist::DelistPredicate;
+pub use doc::DocPredicate;
 pub use enlist::EnlistPredicate;
 pub use ground::GroundPredicate;
-pub use imprint::ImprintPredicate;
+pub use imprint::{ImprintPredicate, ImprintReplacePredicate};
 pub use mount::MountPredicate;
 pub use reconsult::ReconsultPredicate;
 pub use refresh::RefreshPredicate;
@@ -96,12 +98,14 @@ impl BinCartridge for PreludeCartridge {
             Arc::new(ConsultTreePredicate) as Arc<dyn BinEntity>,
             Arc::new(GroundPredicate) as Arc<dyn BinEntity>,
             Arc::new(ImprintPredicate) as Arc<dyn BinEntity>,
+            Arc::new(ImprintReplacePredicate) as Arc<dyn BinEntity>,
             Arc::new(AliasPredicate) as Arc<dyn BinEntity>,
             Arc::new(UnmountPredicate) as Arc<dyn BinEntity>,
             Arc::new(UnconsultPredicate) as Arc<dyn BinEntity>,
             Arc::new(RefreshPredicate) as Arc<dyn BinEntity>,
             Arc::new(ReconsultPredicate) as Arc<dyn BinEntity>,
             Arc::new(CompilePredicate) as Arc<dyn BinEntity>,
+            Arc::new(DocPredicate) as Arc<dyn BinEntity>,
         ]
     }
 }

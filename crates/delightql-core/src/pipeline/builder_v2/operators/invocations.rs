@@ -189,6 +189,109 @@ fn parse_dml_pipe_target(
     )))
 }
 
+/// Parse the inline directive table-value form: `doc!("a","b")(*)`.
+///
+/// Desugars to the SAME unresolved AST as the piped form `_("a","b") |> doc!(*)`:
+/// an `AnonymousTable` source (positional values → ordinal columns, one `Row`
+/// per `;`-row) wrapped as the source of a `DirectiveTerminal`. The runtime
+/// (`execute_directive_pipe`) is unchanged.
+///
+/// Reached from `base_expression` (standalone) — there is no piped input, the
+/// source IS the inline table.
+pub(in crate::pipeline::builder_v2) fn parse_inline_directive_table(
+    node: CstNode,
+    features: &mut FeatureCollector,
+) -> Result<RelationalExpression> {
+    use crate::pipeline::asts::core::expressions::DomainSpec;
+    use crate::pipeline::query_features::QueryFeature;
+
+    features.mark(QueryFeature::PseudoPredicates);
+    features.mark(QueryFeature::AnonymousTables);
+
+    let name = node
+        .field_text("name")
+        .ok_or_else(|| DelightQLError::parse_error("No name in inline directive table"))?;
+    let full_name = format!("{}!", name);
+
+    // Build the anonymous-table source from the ho_argument_list rows.
+    // Positional values → ordinal columns (no headers); one Row per ;-row.
+    let table_value = node
+        .field("table_value")
+        .ok_or_else(|| DelightQLError::parse_error("No table_value in inline directive table"))?;
+    let mut rows: Vec<Row> = Vec::new();
+    for group in table_value.children() {
+        if group.kind() != "ho_argument_group" {
+            continue;
+        }
+        for row_node in group.children() {
+            if row_node.kind() != "ho_argument_row" {
+                continue;
+            }
+            let mut values = Vec::new();
+            for arg in row_node.children() {
+                if arg.kind() == "tvf_argument" {
+                    values.push(relations::parse_tvf_argument_as_domain_expression(arg)?);
+                }
+            }
+            if !values.is_empty() {
+                rows.push(Row { values });
+            }
+        }
+    }
+
+    // Rectangularity check (mirror parse_anonymous_table's row-width validation).
+    if let Some(first) = rows.first() {
+        let width = first.values.len();
+        for (i, r) in rows.iter().enumerate().skip(1) {
+            if r.values.len() != width {
+                return Err(DelightQLError::parse_error_categorized(
+                    "anon",
+                    format!(
+                        "Inline directive table row {} has {} value(s) but row 1 has {}",
+                        i + 1,
+                        r.values.len(),
+                        width
+                    ),
+                ));
+            }
+        }
+    }
+
+    let source = RelationalExpression::Relation(Relation::Anonymous {
+        column_headers: None,
+        rows,
+        alias: None,
+        outer: false,
+        exists_mode: false,
+        qua_target: None,
+        cpr_schema: PhaseBox::phantom(),
+    });
+
+    // Output spec (second paren) → directive arguments. `(*)` → [glob], which
+    // bind_directive_args expands to all row values in column order.
+    let arguments: Vec<DomainExpression> = if let Some(cols) = node.field("columns") {
+        match relations::parse_column_spec(cols, features)? {
+            DomainSpec::Positional(exprs) => exprs,
+            DomainSpec::Bare => Vec::new(),
+            _ => vec![DomainExpression::glob_builder().build()],
+        }
+    } else {
+        // Non-column_spec output (continuation) — no explicit columns; glob.
+        vec![DomainExpression::glob_builder().build()]
+    };
+
+    Ok(RelationalExpression::Pipe(Box::new(
+        stacksafe::StackSafe::new(PipeExpression {
+            source,
+            operator: UnaryRelationalOperator::DirectiveTerminal {
+                name: full_name,
+                arguments,
+            },
+            cpr_schema: PhaseBox::phantom(),
+        }),
+    )))
+}
+
 /// Parse HO argument list from CST node.
 ///
 /// Supports three structures:

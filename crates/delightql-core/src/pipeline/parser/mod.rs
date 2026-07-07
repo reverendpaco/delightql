@@ -734,7 +734,8 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
             | "argumentative_view_definition"
             | "ho_view_definition"
             | "sigma_definition"
-            | "fact_definition" => {
+            | "fact_definition"
+            | "named_case_definition" => {
                 definitions.push(extract_definition(&child, source)?);
             }
             "query_statement" => {
@@ -933,6 +934,29 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
                 full_source: full_source.clone(),
                 body_source: full_source, // full source is the body for facts
                 cst_node_type: cst_node_type.to_string(),
+                source_range: (start, end),
+            });
+        }
+        "named_case_definition" => {
+            // Named case function is pure surface sugar for a case-bodied
+            // function: `name(in -> out ---- arms)` == `name:(in) :- _:(in @ arms)`.
+            // Desugar here so the whole registration path (grouping, entity
+            // type, inlining) treats it as an ordinary function — the stored
+            // `full_source` is the function form, byte-identical to what a hand
+            // written case function produces (guarded by case1_reusable).
+            let desugared =
+                crate::ddl::ddl_builder::desugar_named_case(node, source)?;
+            let start = node.raw_node().start_byte();
+            let end = node.raw_node().end_byte();
+            return Ok(Definition {
+                name: desugared.name,
+                def_type: DefinitionType::Function,
+                neck: DefinitionNeck::Session,
+                params: vec![desugared.input],
+                full_source: desugared.full_source,
+                body_source: desugared.body_source,
+                // Present as a function to every downstream `match cst_node_type`.
+                cst_node_type: "function_definition".to_string(),
                 source_range: (start, end),
             });
         }

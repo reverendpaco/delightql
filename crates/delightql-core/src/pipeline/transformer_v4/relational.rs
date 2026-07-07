@@ -1658,7 +1658,21 @@ pub(super) fn r_lower_pipe(
             | UnaryRelationalOperator::UsingAll => current.project_all()?,
 
             UnaryRelationalOperator::DmlTerminal { .. } => {
-                unreachable!("DmlTerminal intercepted by dml.rs before r_lower_pipe")
+                // A DmlTerminal reaches r_lower_pipe only when it is NOT the
+                // final segment: dml.rs (transform_dml_pipe) pops the LAST
+                // segment, so terminal-position DML is intercepted there and
+                // never arrives here. Getting here means a DML terminal was
+                // followed by `,`/`;` and a further term — the multi-step DML
+                // shape (comma=dataflow, semicolon=sequential), documented
+                // scripting but not implemented. Refuse cleanly instead of
+                // the old unreachable!() panic (bugs/dml-multiterminal-panic).
+                return Err(DelightQLError::validation_error_categorized(
+                    "dml/shape/multi_terminal",
+                    "a DML terminal (insert!/update!/delete!/keep!) must be the \
+                     final operation of a statement; multi-step DML via `,` \
+                     (dataflow) or `;` (sequential) is not yet supported",
+                    "run each mutation as a separate statement",
+                ));
             }
 
             other => {

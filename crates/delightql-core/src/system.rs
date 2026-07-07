@@ -456,6 +456,104 @@ fn register_catalog_wrapper(
     Ok(())
 }
 
+/// Linear imprint: consume the source lib namespace into a versioned blueprint
+/// archive under the target, freeing the source path.
+///
+/// `imprint!` is linear (namespace-catechism §V): after a successful
+/// materialization the source is *moved, not destroyed* to
+/// `{target}::_{N}_blueprint`. The move is a rename/re-parent of the source
+/// namespace (and its `_internal`/descendants), which both vacates the original
+/// path — so use-after-imprint errors and the path is free to re-consult
+/// (D1: delete-and-reuse) — and creates the archive. The archive is visible
+/// (a catalog wrapper is registered for it) but inert (`kind='blueprint'`,
+/// enlistment removed). Returns the blueprint fq_name.
+#[allow(clippy::too_many_arguments)]
+fn consume_source_to_blueprint(
+    conn: &Connection,
+    source_ns: &str,
+    source_ns_id: i32,
+    target_ns: &str,
+    target_ns_id: i32,
+    sys_meta_ns_id: i32,
+    catalog_id: i32,
+) -> Result<String> {
+    // D3: version N = count of existing `_*_blueprint` children of the target.
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM namespace WHERE pid = ?1 AND name GLOB '_[0-9]*_blueprint'",
+            [target_ns_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let bp_name = format!("_{}_blueprint", n);
+    let bp_fq = format!("{}::{}", target_ns, bp_name);
+
+    // Descendants (e.g. `_internal`), captured before renaming so we can rewrite
+    // their fq_names / cartridges / catalog wrappers by prefix.
+    let descendants: Vec<(i32, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, fq_name FROM namespace WHERE fq_name LIKE ?1")
+            .map_err(|e| DelightQLError::database_error("prepare descendants", e.to_string()))?;
+        let rows = stmt
+            .query_map([format!("{}::%", source_ns)], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| DelightQLError::database_error("query descendants", e.to_string()))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // Drop a namespace's sys::meta catalog wrapper (entity named `{fq}::`).
+    let drop_wrapper = |wrapper_name: &str| {
+        let _ = conn.execute(
+            "DELETE FROM activated_entity WHERE entity_id IN (SELECT id FROM entity WHERE name = ?1)",
+            [wrapper_name],
+        );
+        let _ = conn.execute(
+            "DELETE FROM entity_clause WHERE entity_id IN (SELECT id FROM entity WHERE name = ?1)",
+            [wrapper_name],
+        );
+        let _ = conn.execute("DELETE FROM entity WHERE name = ?1", [wrapper_name]);
+    };
+
+    for (id, old_fq) in &descendants {
+        let new_fq = format!("{}{}", bp_fq, &old_fq[source_ns.len()..]);
+        conn.execute(
+            "UPDATE namespace SET fq_name = ?1 WHERE id = ?2",
+            rusqlite::params![new_fq, id],
+        )
+        .map_err(|e| DelightQLError::database_error("rename descendant ns", e.to_string()))?;
+        conn.execute(
+            "UPDATE cartridge SET source_ns = ?1 WHERE source_ns = ?2",
+            rusqlite::params![new_fq, old_fq],
+        )
+        .map_err(|e| DelightQLError::database_error("move descendant cartridge", e.to_string()))?;
+        drop_wrapper(&format!("{}::", old_fq));
+    }
+
+    // Root: rename, re-parent under target, mark inert.
+    conn.execute(
+        "UPDATE namespace SET name = ?1, fq_name = ?2, pid = ?3, kind = 'blueprint' WHERE id = ?4",
+        rusqlite::params![bp_name, bp_fq, target_ns_id, source_ns_id],
+    )
+    .map_err(|e| DelightQLError::database_error("rename source ns to blueprint", e.to_string()))?;
+    conn.execute(
+        "UPDATE cartridge SET source_ns = ?1 WHERE source_ns = ?2",
+        rusqlite::params![bp_fq, source_ns],
+    )
+    .map_err(|e| DelightQLError::database_error("move source cartridge", e.to_string()))?;
+    drop_wrapper(&format!("{}::", source_ns));
+
+    // Remove enlistment of the consumed ns (no unqualified leak).
+    conn.execute(
+        "DELETE FROM enlisted_namespace WHERE to_namespace_id = ?1",
+        [source_ns_id],
+    )
+    .map_err(|e| DelightQLError::database_error("delist consumed ns", e.to_string()))?;
+
+    // D2: register a catalog wrapper for the blueprint so it is visible.
+    register_catalog_wrapper(conn, &bp_fq, sys_meta_ns_id, catalog_id)?;
+
+    Ok(bp_fq)
+}
+
 /// Register catalog views in sys::meta at bootstrap time.
 ///
 /// 1. Loads the generator HO view from embedded sys/meta.dql
@@ -464,13 +562,12 @@ fn register_catalog_wrapper(
 ///
 /// Returns the cartridge_id used for catalog wrapper entities.
 fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
-    // Parse and register the generator HO view via consult_file_inner
-    let ddl = crate::pipeline::parser::parse_ddl_file(SYS_META_SOURCE).map_err(|e| {
-        DelightQLError::database_error(
-            format!("Failed to parse sys/meta.dql: {}", e),
-            e.to_string(),
-        )
-    })?;
+    // Parse and register the generator HO view via consult_file_inner.
+    // Shared DDL front end (DDL-LOADING-PATHS.md Tier 1).
+    let ddl = crate::bin_cartridge::prelude::consult::parse_ddl_source_no_directives(
+        SYS_META_SOURCE,
+        "sys::meta",
+    )?;
     let count = ddl.definitions.len();
     DelightQLSystem::consult_file_inner(
         bootstrap_conn,
@@ -1774,6 +1871,10 @@ impl DelightQLSystem {
             self.ensure_stdlib_loaded(ns);
         }
 
+        // 12. Run embedded seed programs for their effects (idempotent).
+        //     Mirrors the post-construction seed step in open().
+        self.run_seed_programs()?;
+
         Ok(())
     }
 
@@ -1832,8 +1933,14 @@ impl DelightQLSystem {
             return StdlibLoad::AlreadyLoaded;
         }
 
-        // Consult the module
-        let ddl = match crate::pipeline::parser::parse_ddl_file(source) {
+        // Consult the module. Route through the shared DDL front end
+        // (DDL-LOADING-PATHS.md Tier 1) so autoloads parse identically to
+        // consult!() files — same whitespace handling, and embedded
+        // directives are refused loudly rather than silently misparsed.
+        let ddl = match crate::bin_cartridge::prelude::consult::parse_ddl_source_no_directives(
+            source,
+            &format!("autoload module '{namespace_fq}'"),
+        ) {
             Ok(d) => d,
             Err(e) => {
                 report_stdlib_load_failure(namespace_fq, &e);
@@ -1880,6 +1987,59 @@ impl DelightQLSystem {
                 }
             }
         }
+    }
+
+    /// Compile and execute the effects of every statement in a seed program.
+    ///
+    /// Seed programs (the embedded `seed/` bucket) are effect programs RUN at
+    /// startup — distinct from autoload modules, which INSTALL definitions via
+    /// consult. This is the core-internal entry reachable from both `open()`
+    /// (system fully built) and `reinit_bootstrap` (`&mut self`, no handle),
+    /// mirroring what `session.query()` does under the hood minus result
+    /// formatting: split the source into statements, then for each statement
+    /// build the unresolved AST and run the effect executor (Phase 1.X).
+    ///
+    /// Seeds run on EVERY startup and every reinit, so each program must be
+    /// idempotent. `doc!` qualifies (setting the same doc is a no-op-in-effect).
+    pub fn run_seed_program(&mut self, src: &str) -> Result<()> {
+        use crate::pipeline::{builder_v2, parser};
+
+        let tree = parser::parse(src).map_err(|e| {
+            DelightQLError::database_error(
+                format!("seed program failed to parse: {}", e),
+                "Seed parse error",
+            )
+        })?;
+
+        let (queries, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
+            builder_v2::parse_queries(&tree, src).map_err(|e| {
+                DelightQLError::database_error(
+                    format!("seed program failed to build AST: {}", e),
+                    "Seed build error",
+                )
+            })?;
+
+        for query in queries {
+            crate::pipeline::effect_executor::execute_effects(query, self)?;
+        }
+
+        Ok(())
+    }
+
+    /// Run every embedded seed program (the `seed/` bucket) for its effects.
+    ///
+    /// Called after the system is fully constructed. Seeds are idempotent, so
+    /// this is safe to invoke on both fresh `open()` and `reinit_bootstrap`.
+    pub fn run_seed_programs(&mut self) -> Result<()> {
+        for (name, source) in crate::seed_manifest::SEED_PROGRAMS {
+            self.run_seed_program(source).map_err(|e| {
+                DelightQLError::database_error(
+                    format!("seed program '{}' failed: {}", name, e),
+                    "Seed execution error",
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Get the appropriate connection for executing a query based on connection_id
@@ -5546,6 +5706,79 @@ impl DelightQLSystem {
         Ok(count)
     }
 
+    /// Set the `doc` string on a catalog entity, addressed by its
+    /// fully-qualified name (e.g. `"sys::help.identifier"`).
+    ///
+    /// The fq name is `<namespace fq_name>.<entity name>`, so it is matched
+    /// against `n.fq_name || '.' || e.name` over activated entities — the same
+    /// namespace/activated_entity join every other catalog lookup uses. Only
+    /// activated entities are considered; if the name still resolves to more
+    /// than one entity (a same-name collision within one namespace across
+    /// cartridges) it is reported as ambiguous.
+    ///
+    /// Session-scoped: writes the in-memory bootstrap catalog for this session.
+    pub fn set_entity_doc(&mut self, target: &str, doc: &str) -> Result<(String, String)> {
+        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for doc",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+
+        let mut stmt = bootstrap_conn
+            .prepare(
+                "SELECT DISTINCT e.id FROM entity e
+                 JOIN activated_entity ae ON ae.entity_id = e.id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 WHERE n.fq_name || '.' || e.name = ?1",
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to prepare entity lookup for doc!()",
+                    e.to_string(),
+                )
+            })?;
+
+        let ids: Vec<i64> = stmt
+            .query_map([target], |row| row.get(0))
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
+            })?
+            .collect::<std::result::Result<Vec<i64>, _>>()
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
+            })?;
+
+        match ids.as_slice() {
+            [] => Err(DelightQLError::database_error(
+                format!("no such entity '{}'", target),
+                "doc!() target not found",
+            )),
+            [entity_id] => {
+                bootstrap_conn
+                    .execute(
+                        "UPDATE entity SET doc = ?1 WHERE id = ?2",
+                        rusqlite::params![doc, entity_id],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            format!("Failed to set doc on entity '{}'", target),
+                            e.to_string(),
+                        )
+                    })?;
+                Ok((target.to_string(), doc.to_string()))
+            }
+            many => Err(DelightQLError::database_error(
+                format!(
+                    "ambiguous doc!() target '{}' resolves to {} entities",
+                    target,
+                    many.len()
+                ),
+                "Ambiguous entity reference",
+            )),
+        }
+    }
+
     /// Imprint definitions from a library namespace into a data namespace.
     ///
     /// Reads manifest data from the `_internal` child namespace (schema, constraints,
@@ -5553,10 +5786,15 @@ impl DelightQLSystem {
     /// on the target database. For CTAS entities, populates via INSERT INTO ... SELECT.
     ///
     /// Returns a list of (entity_name, status, sql) tuples for reporting.
+    /// `replace = false` (imprint!): a pre-flight clash on any target object
+    /// fails the whole operation before anything is created. `replace = true`
+    /// (imprint_replace!): each clashing target object is dropped first, then
+    /// recreated. Either way the check/drop happens up front, atomically.
     pub fn imprint_namespace(
         &mut self,
         source_ns: &str,
         target_ns: &str,
+        replace: bool,
     ) -> Result<Vec<(String, String, String)>> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
@@ -5869,6 +6107,11 @@ impl DelightQLSystem {
             qualified_create: String,
             ctas_insert_sql: Option<String>,
             effective_schema: Vec<manifest::SchemaRow>,
+            // True when `qualified_create` is a `CREATE TABLE … AS SELECT` that
+            // both creates and populates. The engine derives real column types,
+            // so `effective_schema` is empty and attributes are read back from
+            // the created table after execution.
+            is_ctas: bool,
         }
 
         let mut prepared: Vec<PreparedEntity> = Vec::new();
@@ -5876,99 +6119,157 @@ impl DelightQLSystem {
         for item in &manifest_items {
             let entity_name = &item.name;
 
-            if item.materialization == "view" {
-                return Err(DelightQLError::database_error(
-                    format!(
-                        "imprint!() entity '{}' has materialization 'view' which is not yet supported",
-                        entity_name
-                    ),
-                    "View materialization in imprint is deferred",
-                ));
-            }
-
             let temp = item.extent == "temporary";
 
-            // Compile CTAS body (schema access locks bootstrap internally -- safe now)
+            // Compile the rule body to SELECT once — used by view, CTAS, and the
+            // declared-path INSERT (schema access locks bootstrap internally, safe now).
             let ctas_select_sql = if let Some(body) = &item.ctas_body {
                 Some(crate::pipeline::compile_source_to_sql(body, schema)?)
             } else {
                 None
             };
 
-            // For CTAS without explicit schema, infer from LIMIT 0 query on target
-            let effective_schema = if item.schema_rows.is_empty() && ctas_select_sql.is_some() {
-                let select_sql = ctas_select_sql.as_ref().unwrap();
-                let limit_sql = format!("SELECT * FROM ({}) LIMIT 0", select_sql);
-                let target_conn_tmp = target_conn.lock().map_err(|e| {
-                    DelightQLError::connection_poison_error(
-                        "Failed to acquire target connection for schema inference",
-                        format!("Connection was poisoned: {}", e),
+            let qualified_table = |name: &str| -> String {
+                if let Some(schema_name) = target_schema_alias.as_deref() {
+                    format!("\"{}\".\"{}\"", schema_name, name)
+                } else {
+                    format!("\"{}\"", name)
+                }
+            };
+
+            // Does the entity carry a declaration (schema / constraints / defaults)?
+            let has_decl = !item.schema_rows.is_empty()
+                || !item.constraint_rows.is_empty()
+                || !item.default_rows.is_empty();
+
+            // --- View materialization: a stored query, evaluated live on read;
+            // no own data. Orthogonal to extent (TEMP applies as it does to tables). ---
+            if item.materialization == "view" {
+                // A view cannot carry a declaration — no column types/constraints/
+                // defaults on a view. v1 requires a bare rule.
+                if has_decl {
+                    return Err(DelightQLError::database_error(
+                        format!(
+                            "imprint!() entity '{}' is a view but declares schema/constraints/defaults — \
+                             a view cannot carry them; drop the companions or materialize it as a table",
+                            entity_name
+                        ),
+                        "View with a declaration",
+                    ));
+                }
+                let select_sql = ctas_select_sql.ok_or_else(|| {
+                    DelightQLError::database_error(
+                        format!(
+                            "imprint!() view '{}' has no rule body — a view is a query",
+                            entity_name
+                        ),
+                        "View without a rule body",
                     )
                 })?;
-                let (col_names, _rows) = target_conn_tmp
-                    .query_all_string_rows(&limit_sql, &[])
-                    .map_err(|e| {
-                        DelightQLError::database_error(
-                            format!(
-                                "Failed to infer schema for CTAS entity '{}': {}",
-                                entity_name, limit_sql
-                            ),
-                            e.to_string(),
-                        )
-                    })?;
-                drop(target_conn_tmp);
-                col_names
-                    .into_iter()
-                    .map(|name| manifest::SchemaRow {
-                        name,
-                        col_type: "TEXT".to_string(),
-                    })
-                    .collect()
-            } else {
-                item.schema_rows.clone()
-            };
+                let temp_kw = if temp { "TEMP " } else { "" };
+                let qualified_create = format!(
+                    "CREATE {}VIEW {} AS {}",
+                    temp_kw,
+                    qualified_table(entity_name),
+                    select_sql
+                );
+                prepared.push(PreparedEntity {
+                    name: entity_name.clone(),
+                    materialization: item.materialization.clone(),
+                    temp,
+                    qualified_create,
+                    ctas_insert_sql: None,
+                    effective_schema: Vec::new(),
+                    is_ctas: false,
+                });
+                continue;
+            }
 
-            // Assemble CREATE TABLE from manifest via DDL pipeline
-            let unresolved = crate::ddl_pipeline::assemble_manifest::assemble_from_manifest(
-                entity_name,
-                temp,
-                &effective_schema,
-                &item.constraint_rows,
-                &item.default_rows,
-            )?;
-            let resolved = crate::ddl_pipeline::resolver::resolve(unresolved)?;
-            let sql_ast = crate::ddl_pipeline::transformer::transform(resolved)?;
-            let create_sql = crate::ddl_pipeline::generator::generate(&sql_ast);
+            // --- Table materialization forks on the declaration signal:
+            //   declared  → typed CREATE TABLE (from schema) [+ INSERT … SELECT]
+            //   bare rule → CREATE TABLE … AS SELECT (engine derives real types)
+            // Option A (doeklund 2026-07-07): constraints/defaults require a
+            // schema() so column types are always declared, not guessed.
+            if item.schema_rows.is_empty()
+                && (!item.constraint_rows.is_empty() || !item.default_rows.is_empty())
+            {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "imprint!() entity '{}' declares constraints/defaults but no schema() — \
+                         declare column types in a schema(\"{}\") companion",
+                        entity_name, entity_name
+                    ),
+                    "Constraints/defaults without a schema declaration",
+                ));
+            }
 
-            // Schema-qualify for ATTACHed databases
-            let qualified_create = if let Some(schema_name) = target_schema_alias.as_deref() {
-                create_sql.replacen(
-                    &format!("CREATE TABLE \"{}\"", entity_name),
-                    &format!("CREATE TABLE \"{}\".\"{}\"", schema_name, entity_name),
-                    1,
-                )
-            } else {
-                create_sql
-            };
+            if has_decl {
+                // Declared path: typed CREATE from schema/constraints/defaults,
+                // then INSERT … SELECT to populate if there is a rule body.
+                let unresolved = crate::ddl_pipeline::assemble_manifest::assemble_from_manifest(
+                    entity_name,
+                    temp,
+                    &item.schema_rows,
+                    &item.constraint_rows,
+                    &item.default_rows,
+                )?;
+                let resolved = crate::ddl_pipeline::resolver::resolve(unresolved)?;
+                let sql_ast = crate::ddl_pipeline::transformer::transform(resolved)?;
+                let create_sql = crate::ddl_pipeline::generator::generate(&sql_ast);
 
-            // Build CTAS insert statement
-            let ctas_insert_sql = ctas_select_sql.map(|select_sql| {
-                let qualified_table = if let Some(schema_name) = target_schema_alias.as_deref() {
-                    format!("\"{}\".\"{}\"", schema_name, entity_name)
+                let qualified_create = if let Some(schema_name) = target_schema_alias.as_deref() {
+                    create_sql.replacen(
+                        &format!("CREATE TABLE \"{}\"", entity_name),
+                        &format!("CREATE TABLE \"{}\".\"{}\"", schema_name, entity_name),
+                        1,
+                    )
                 } else {
-                    format!("\"{}\"", entity_name)
+                    create_sql
                 };
-                format!("INSERT INTO {} {}", qualified_table, select_sql)
-            });
 
-            prepared.push(PreparedEntity {
-                name: entity_name.clone(),
-                materialization: item.materialization.clone(),
-                temp,
-                qualified_create,
-                ctas_insert_sql,
-                effective_schema,
-            });
+                let ctas_insert_sql = ctas_select_sql.map(|select_sql| {
+                    format!("INSERT INTO {} {}", qualified_table(entity_name), select_sql)
+                });
+
+                prepared.push(PreparedEntity {
+                    name: entity_name.clone(),
+                    materialization: item.materialization.clone(),
+                    temp,
+                    qualified_create,
+                    ctas_insert_sql,
+                    effective_schema: item.schema_rows.clone(),
+                    is_ctas: false,
+                });
+            } else if let Some(select_sql) = ctas_select_sql {
+                // Bare rule, no declaration: CREATE TABLE … AS SELECT. The engine
+                // derives real column types; attributes are read back post-create.
+                let temp_kw = if temp { "TEMP " } else { "" };
+                let qualified_create = format!(
+                    "CREATE {}TABLE {} AS {}",
+                    temp_kw,
+                    qualified_table(entity_name),
+                    select_sql
+                );
+
+                prepared.push(PreparedEntity {
+                    name: entity_name.clone(),
+                    materialization: item.materialization.clone(),
+                    temp,
+                    qualified_create,
+                    ctas_insert_sql: None,
+                    effective_schema: Vec::new(),
+                    is_ctas: true,
+                });
+            } else {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "imprint!() entity '{}' has neither a schema() nor a rule body — \
+                         nothing to materialize",
+                        entity_name
+                    ),
+                    "No schema and no rule body",
+                ));
+            }
         }
 
         // --- Phase 2: Execute (re-acquire bootstrap + target locks) ---
@@ -5987,6 +6288,94 @@ impl DelightQLSystem {
 
         // Enable FK enforcement on target
         let _ = target_conn_guard.execute("PRAGMA foreign_keys = ON", &[]);
+
+        // --- Two-verb imprint: pre-flight clash pass (atomic, before any create) ---
+        // imprint! (replace=false) fails if ANY target object already exists;
+        // imprint_replace! (replace=true) drops each clashing object first. Doing
+        // this up front means a strict clash leaves the target untouched.
+        {
+            let master = match target_schema_alias.as_deref() {
+                Some(a) => format!("\"{}\".sqlite_master", a),
+                None => "sqlite_master".to_string(),
+            };
+            let mut clashes: Vec<String> = Vec::new();
+            let mut to_drop: Vec<(String, String)> = Vec::new(); // (name, type)
+            for entity in &prepared {
+                let name_lit = entity.name.replace('\'', "''");
+                let sql = format!("SELECT type FROM {} WHERE name = '{}'", master, name_lit);
+                let existing_type = target_conn_guard
+                    .query_all_string_rows(&sql, &[])
+                    .ok()
+                    .and_then(|(_c, rows)| rows.first().and_then(|r| r.first().cloned()));
+                if let Some(ty) = existing_type {
+                    if replace {
+                        to_drop.push((entity.name.clone(), ty));
+                    } else {
+                        clashes.push(entity.name.clone());
+                    }
+                }
+            }
+            if !clashes.is_empty() {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "imprint!() target object(s) already exist in '{}': {} — \
+                         use imprint_replace!() to overwrite",
+                        target_ns,
+                        clashes.join(", ")
+                    ),
+                    "Imprint target clash",
+                ));
+            }
+            if !to_drop.is_empty() {
+                // Drop with FK enforcement off so drop order is not constrained.
+                let _ = target_conn_guard.execute("PRAGMA foreign_keys = OFF", &[]);
+                for (name, ty) in &to_drop {
+                    let qualified = match target_schema_alias.as_deref() {
+                        Some(a) => format!("\"{}\".\"{}\"", a, name),
+                        None => format!("\"{}\"", name),
+                    };
+                    let kw = if ty == "view" { "VIEW" } else { "TABLE" };
+                    target_conn_guard
+                        .execute(&format!("DROP {} IF EXISTS {}", kw, qualified), &[])
+                        .map_err(|e| {
+                            DelightQLError::database_error(
+                                format!("imprint_replace!() failed to drop existing '{}'", name),
+                                e.to_string(),
+                            )
+                        })?;
+
+                    // Also deregister the stale bootstrap entity in the target,
+                    // else re-materializing duplicates its columns (id/id_2/…).
+                    let stale_ids: Vec<i32> = {
+                        let mut stmt = bootstrap_conn
+                            .prepare(
+                                "SELECT e.id FROM entity e
+                                 JOIN activated_entity ae ON ae.entity_id = e.id
+                                 WHERE ae.namespace_id = ?1 AND e.name = ?2",
+                            )
+                            .map_err(|e| {
+                                DelightQLError::database_error("prepare stale entity lookup", e.to_string())
+                            })?;
+                        let rows = stmt
+                            .query_map(rusqlite::params![target_ns_id, name], |r| r.get(0))
+                            .map_err(|e| {
+                                DelightQLError::database_error("query stale entity", e.to_string())
+                            })?;
+                        rows.filter_map(|r| r.ok()).collect()
+                    };
+                    for eid in stale_ids {
+                        let _ = bootstrap_conn
+                            .execute("DELETE FROM activated_entity WHERE entity_id = ?1", [eid]);
+                        let _ = bootstrap_conn
+                            .execute("DELETE FROM entity_attribute WHERE entity_id = ?1", [eid]);
+                        let _ = bootstrap_conn
+                            .execute("DELETE FROM entity_clause WHERE entity_id = ?1", [eid]);
+                        let _ = bootstrap_conn.execute("DELETE FROM entity WHERE id = ?1", [eid]);
+                    }
+                }
+                let _ = target_conn_guard.execute("PRAGMA foreign_keys = ON", &[]);
+            }
+        }
 
         // Create a cartridge for the imprinted entities
         let imprint_cartridge_id = {
@@ -6066,17 +6455,52 @@ impl DelightQLSystem {
                 })?;
             let new_entity_id = bootstrap_conn.last_insert_rowid() as i32;
 
-            // Register entity attributes from manifest schema rows
-            for (position, sr) in entity.effective_schema.iter().enumerate() {
+            // Attribute (name, type) pairs for the bootstrap catalog. For the
+            // declared path these come from the manifest schema; for CTAS tables
+            // and views the engine chose the columns, so read them back from the
+            // created object (PRAGMA table_info works on both tables and views).
+            let attr_cols: Vec<(String, String)> = if entity.effective_schema.is_empty() {
+                let pragma = match target_schema_alias.as_deref() {
+                    Some(schema_name) => {
+                        format!("PRAGMA \"{}\".table_info(\"{}\")", schema_name, entity_name)
+                    }
+                    None => format!("PRAGMA table_info(\"{}\")", entity_name),
+                };
+                let (_cols, rows) =
+                    target_conn_guard
+                        .query_all_string_rows(&pragma, &[])
+                        .map_err(|e| {
+                            DelightQLError::database_error(
+                                format!(
+                                    "Failed to read back schema for materialized entity '{}'",
+                                    entity_name
+                                ),
+                                e.to_string(),
+                            )
+                        })?;
+                // table_info columns: cid(0), name(1), type(2), …
+                rows.iter()
+                    .filter_map(|r| Some((r.get(1)?.clone(), r.get(2)?.clone())))
+                    .collect()
+            } else {
+                entity
+                    .effective_schema
+                    .iter()
+                    .map(|sr| (sr.name.clone(), sr.col_type.clone()))
+                    .collect()
+            };
+
+            // Register entity attributes
+            for (position, (col_name, col_type)) in attr_cols.iter().enumerate() {
                 bootstrap_conn
                     .execute(
                         "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, data_type, position, is_nullable, default_value)
                          VALUES (?1, ?2, 'output_column', ?3, ?4, 1, NULL)",
-                        rusqlite::params![new_entity_id, &sr.name, &sr.col_type, position as i32 + 1],
+                        rusqlite::params![new_entity_id, col_name, col_type, position as i32 + 1],
                     )
                     .map_err(|e| {
                         DelightQLError::database_error(
-                            format!("Failed to register attribute '{}' for '{}'", sr.name, entity_name),
+                            format!("Failed to register attribute '{}' for '{}'", col_name, entity_name),
                             e.to_string(),
                         )
                     })?;
@@ -6095,7 +6519,7 @@ impl DelightQLSystem {
                     )
                 })?;
 
-            let status = if entity.ctas_insert_sql.is_some() {
+            let status = if entity.is_ctas || entity.ctas_insert_sql.is_some() {
                 "created+populated"
             } else {
                 "created"
@@ -6108,8 +6532,40 @@ impl DelightQLSystem {
             ));
         }
 
+        // Linear imprint: consume the source into a blueprint archive under the
+        // target (namespace-catechism §V). Moves the source namespace, vacating
+        // its path (use-after-imprint = error; path free to re-consult) and
+        // leaving the tables as the single source of truth.
+        let catalog_id = ensure_catalog_initialized(&self.catalog_cartridge_id, &bootstrap_conn)?;
+        let sys_meta_ns_id: i32 = bootstrap_conn
+            .query_row(
+                "SELECT id FROM namespace WHERE fq_name = 'sys::meta'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to query sys::meta namespace for imprint consume",
+                    e.to_string(),
+                )
+            })?;
+        let blueprint_fq = consume_source_to_blueprint(
+            &bootstrap_conn,
+            source_ns,
+            source_ns_id,
+            target_ns,
+            target_ns_id,
+            sys_meta_ns_id,
+            catalog_id,
+        )?;
+
         drop(target_conn_guard);
         drop(bootstrap_conn);
+
+        debug!(
+            "imprint_namespace: Consumed '{}' → archived at '{}'",
+            source_ns, blueprint_fq
+        );
 
         debug!(
             "imprint_namespace: Materialized {} entities from '{}' into '{}'",

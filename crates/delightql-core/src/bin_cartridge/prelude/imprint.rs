@@ -70,28 +70,96 @@ impl EffectExecutable for ImprintPredicate {
         alias: Option<String>,
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
-        if arguments.len() != 2 {
-            return Err(DelightQLError::database_error(
-                format!(
-                    "imprint!() expects 2 arguments (source_ns, target_ns), got {}",
-                    arguments.len()
-                ),
-                "Invalid argument count",
-            ));
+        run_imprint(arguments, alias, system, false, "imprint!")
+    }
+}
+
+/// `imprint_replace!()` — like `imprint!()` but each clashing target object is
+/// dropped and recreated (explicit, destructive rebuild) rather than refused.
+pub struct ImprintReplacePredicate;
+
+impl BinEntity for ImprintReplacePredicate {
+    fn name(&self) -> &str {
+        "imprint_replace!"
+    }
+
+    fn entity_type(&self) -> EntityType {
+        EntityType::BinPseudoPredicate
+    }
+
+    fn signature(&self) -> EntitySignature {
+        EntitySignature {
+            parameters: vec![
+                Parameter {
+                    name: "source_ns".to_string(),
+                    data_type: "String".to_string(),
+                    _is_optional: false,
+                },
+                Parameter {
+                    name: "target_ns".to_string(),
+                    data_type: "String".to_string(),
+                    _is_optional: false,
+                },
+            ],
+            output_schema: OutputSchema::Relation(vec![
+                ("entity".to_string(), "String".to_string()),
+                ("status".to_string(), "String".to_string()),
+            ]),
         }
+    }
 
-        let source_ns = extract_string_literal(&arguments[0], "source_ns")?;
-        let target_ns = extract_string_literal(&arguments[1], "target_ns")?;
+    fn has_side_effects(&self) -> bool {
+        true
+    }
 
-        if source_ns.is_empty() || target_ns.is_empty() {
-            return Err(DelightQLError::database_error(
-                "imprint!() arguments cannot be empty",
-                "Empty argument",
-            ));
-        }
+    fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
+        Some(self)
+    }
+}
 
-        let results = system.imprint_namespace(&source_ns, &target_ns)?;
+impl EffectExecutable for ImprintReplacePredicate {
+    fn execute(
+        &self,
+        arguments: &[DomainExpression],
+        alias: Option<String>,
+        system: &mut crate::system::DelightQLSystem,
+    ) -> Result<EntityResult> {
+        run_imprint(arguments, alias, system, true, "imprint_replace!")
+    }
+}
 
+/// Shared runner for `imprint!` / `imprint_replace!` (differ only in `replace`).
+fn run_imprint(
+    arguments: &[DomainExpression],
+    alias: Option<String>,
+    system: &mut crate::system::DelightQLSystem,
+    replace: bool,
+    verb: &str,
+) -> Result<EntityResult> {
+    if arguments.len() != 2 {
+        return Err(DelightQLError::database_error(
+            format!(
+                "{}() expects 2 arguments (source_ns, target_ns), got {}",
+                verb,
+                arguments.len()
+            ),
+            "Invalid argument count",
+        ));
+    }
+
+    let source_ns = extract_string_literal(&arguments[0], "source_ns")?;
+    let target_ns = extract_string_literal(&arguments[1], "target_ns")?;
+
+    if source_ns.is_empty() || target_ns.is_empty() {
+        return Err(DelightQLError::database_error(
+            format!("{}() arguments cannot be empty", verb),
+            "Empty argument",
+        ));
+    }
+
+    let results = system.imprint_namespace(&source_ns, &target_ns, replace)?;
+
+    {
         // Build multi-row result: (entity, status) for each materialized entity
         let headers = vec![
             DomainExpression::lvar_builder("entity".to_string()).build(),

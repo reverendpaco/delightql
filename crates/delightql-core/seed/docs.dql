@@ -1,0 +1,17 @@
+_(target, doc ----
+  "sys::entities.entity",                      "A catalog entity: a table, view, function, or other named relation known to the engine." ;
+  "sys::entities.entity_attribute",            "A column belonging to an entity, with its declared type and ordinal position." ;
+  "sys::entities.entity_clause",               "One clause of an entity's definition; multi-clause entities (disjunctive functions, facts) have several." ;
+  "sys::entities.er_rule",                      "An entity-relationship rule linking entities for join inference." ;
+  "sys::entities::ho.ho_param",                 "A parameter of a higher-order entity (a parameterized table or function)." ;
+  "sys::entities::interior.interior_entity",    "An interior relation nested within a parent entity — a tree-group column, e.g. from `~> {...}`." ;
+  "sys::ns.namespace",                          "A namespace: a named scope that groups activated entities under a fully-qualified path." ;
+  "sys::ns.activated_entity",                   "The activation of an entity within a namespace, making it referenceable by name." ;
+  "sys::ns.grounding",                          "A borrow of one namespace's data/lib namespaces by another; enforces ownership (a borrowed namespace can't be destroyed)." ;
+  "sys::connections.connection",                "A registered database connection with its resource, mechanism, and identity." ;
+  "sys::connections.connection_type_enum",      "The enumeration of connection types (in-process, fatboy, and other transports)." ;
+  "sys::targeting.dialect_render",              "A leaf-spelling rule: how a form renders into a specific SQL dialect's surface syntax." ;
+  "sys::targeting.dialect_form_rule",           "A form-selection rule: which DelightQL form a target chooses for a given construct." ;
+  "sys::targeting.dialect_capability",          "A capability flag describing whether a target supports a given feature." ;
+  "sys::execution.compilation",                 "A compilation record: one DQL-to-SQL transpilation, retained for inspection."
+) |> doc!(target, doc)

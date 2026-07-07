@@ -251,6 +251,13 @@ pub fn open(
     #[cfg(target_arch = "wasm32")]
     let _ = help_surface;
 
+    // Run embedded seed programs for their effects (e.g. seed/docs.dql
+    // self-documents the sys:: tables via doc!). Idempotent — safe on every
+    // startup. Same post-construction point as seed_help_surface: the system
+    // is fully built, so there is no init reentrancy.
+    #[cfg(not(target_arch = "wasm32"))]
+    system.run_seed_programs().map_err(|e| format!("{}", e))?;
+
     Ok(Box::new(DqlHandleImpl {
         system: Box::new(system),
         handler_factory: created.handler_factory,

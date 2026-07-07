@@ -265,6 +265,7 @@ impl DelightQLSystem {
         &mut self,
         _source_ns: &str,
         _target_ns: &str,
+        _replace: bool,
     ) -> Result<Vec<(String, String, String)>> {
         Err(DelightQLError::validation_error(
             "imprint!() not supported in WASM",

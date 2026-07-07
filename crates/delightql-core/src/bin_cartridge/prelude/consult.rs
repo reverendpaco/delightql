@@ -460,12 +460,14 @@ const KNOWN_PSEUDO_PREDICATES: &[&str] = &[
     "consult_tree",
     "ground",
     "imprint",
+    "imprint_replace",
     "alias",
     "unmount",
     "unconsult",
     "refresh",
     "reconsult",
     "expose",
+    "doc",
 ];
 
 const RENAMED_PSEUDO_PREDICATES: &[(&str, &str)] = &[
@@ -500,6 +502,44 @@ pub(crate) fn extract_embedded_directives(
     }
 
     Ok((cleaned_lines.join("\n"), directives))
+}
+
+/// Shared DDL-source front end for the loaders that do NOT execute embedded
+/// directives — autoload (`ensure_stdlib_loaded`), `sys::meta`, and inline
+/// `(~~ddl ~~)` blocks (DDL-LOADING-PATHS.md Tier 1). Routing all three
+/// through this makes a `.dql` parse identically however it is loaded:
+/// same whitespace handling as `consult!` (the trailing-newline diff goes
+/// away), and embedded directives become a LOUD error instead of a silent
+/// misparse. `context` names the caller for the error message.
+///
+/// Tier 2 will let these paths actually execute directives; until then,
+/// refusing them here converges the behavior and closes the silent trap.
+pub(crate) fn parse_ddl_source_no_directives(
+    source: &str,
+    context: &str,
+) -> Result<crate::pipeline::parser::DDLFile> {
+    let (cleaned_source, directives) = extract_embedded_directives(source)?;
+    if !directives.is_empty() {
+        let names = directives
+            .iter()
+            .map(|d| format!("{}!", d.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DelightQLError::database_error(
+            format!(
+                "embedded directives ({names}) are not supported in {context} — only \
+                 consult!()/reconsult!() files execute them today \
+                 (DDL-LOADING-PATHS.md Tier 2)"
+            ),
+            "Unsupported directive",
+        ));
+    }
+    parse_ddl_file(&cleaned_source).map_err(|e| {
+        DelightQLError::database_error(
+            format!("{context}: failed to parse DDL: {e}"),
+            "Parse error",
+        )
+    })
 }
 
 /// Try to parse a `name!("arg1", "arg2", ...)` directive from a trimmed line.
@@ -570,5 +610,33 @@ pub(super) fn extract_string_literal(expr: &DomainExpression, arg_name: &str) ->
             format!("consult!() {} must be a string literal", arg_name),
             "Invalid argument type",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tier1_tests {
+    use super::*;
+
+    #[test]
+    fn shared_front_end_parses_clean_source_and_normalizes_whitespace() {
+        // Trailing newline (the raw-vs-clean byte diff) must not matter, and
+        // both definitions must survive — the shape that started this thread.
+        let src = "sm:(v) :- _:(v @ \"a\" -> \"X\"; _ -> \"Y\")\n\
+                   myview(*) :- _(z @ 1) |> (z)\n";
+        let ddl = parse_ddl_source_no_directives(src, "test")
+            .expect("clean DDL source should parse");
+        assert_eq!(ddl.definitions.len(), 2);
+    }
+
+    #[test]
+    fn shared_front_end_refuses_embedded_directives_loudly() {
+        // A directive in a non-executing context is a LOUD error now, not a
+        // silent misparse (DDL-LOADING-PATHS.md Tier 1). Tier 2 will execute.
+        let src = "consult!(\"other.dql\", \"lib::x\")\nmyview(*) :- _(z @ 1) |> (z)";
+        let err = parse_ddl_source_no_directives(src, "autoload module 'sys::demo'")
+            .expect_err("embedded directive must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("embedded directives"), "{msg}");
+        assert!(msg.contains("sys::demo"), "context should name the caller: {msg}");
     }
 }

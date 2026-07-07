@@ -547,6 +547,24 @@ pub(super) fn resolve_ground(
                             name: entity.name.clone(),
                             body_source: entity.definition.clone(),
                         }
+                    } else if matches!(
+                        entity.entity_type,
+                        BootstrapEntityType::DqlFunctionExpression
+                            | BootstrapEntityType::DqlContextAwareFunctionExpression
+                    ) {
+                        // The name IS defined — as a function, not a relation. A bare
+                        // `fn(*)` in relation position (e.g. a named case function's
+                        // deferred relation face `style_of(*)`) would otherwise surface
+                        // the misleading "Table not found". Point at the call form.
+                        return Err(DelightQLError::validation_error(
+                            format!(
+                                "'{name}' is a function, not a relation — call it as \
+                                 `{name}:(args)`. (A case/scalar function has no relation \
+                                 face `{name}(*)`.)",
+                                name = entity.name,
+                            ),
+                            format!("'{}' resolved to a function entity", entity.name),
+                        ));
                     } else {
                         ResolutionResult::Unknown(
                             identifier.namespace_path.with_table(&identifier.name),

@@ -674,6 +674,10 @@ pub(crate) fn parse_expression(
             features.mark(QueryFeature::PseudoPredicates);
             RelationalExpression::Relation(parse_pseudo_predicate_call(base_child, features)?)
         }
+        "inline_directive_table" => {
+            // doc!("a","b")(*) — desugars to _("a","b") |> doc!(*)
+            operators::parse_inline_directive_table(base_child, features)?
+        }
         "predicate" => {
             // This shouldn't happen anymore - predicates are handled in handle_continuation
             return Err(DelightQLError::parse_error(
