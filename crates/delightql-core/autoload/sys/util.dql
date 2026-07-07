@@ -1,0 +1,46 @@
+tables_as_d2(*) :-
+  (~~docs
+    The live entity catalog rendered as a d2 diagram source document
+    (https://d2lang.com). One namespace becomes one d2 container, one
+    entity one sql_table shape, one output column one row. The diagram's
+    CONTENT is a projection of the catalog, so it cannot drift from the
+    schema it documents; layout is left to the d2 renderer (or a
+    hand-tuning pass on the emitted SVG).
+
+    Structural characters are emitted via char:() because d2's braces
+    collide with citation interpolation:
+      char:(123) = "{"   char:(125) = "}"
+      char:(10)  = newline   char:(34) = double-quote
+
+    Usage:
+      dql query -f raw "sys::util.tables_as_d2(*)" > schema.d2
+      d2 schema.d2 schema.svg
+  ~~)
+
+  sys::ns.namespace(*) as n, n.fq_name != "_"
+  , sys::ns.activated_entity(*) as ae, ae.namespace_id = n.id
+  , sys::entities.entity(*) as e, e.id = ae.entity_id
+  , sys::entities.entity_type_enum(*) as t, e.type = t.id
+  , sys::entities.entity_attribute(*) as a, a.entity_id = e.id,
+    a.attribute_type = "output_column"
+  |> (n.fq_name as ns, e.name as tname, a.position as pos, t.variant as variant,
+      :"  {a.attribute_name}: {a.data_type}" as colline)
+  : base
+
+  base(*),  variant in ("DBPermanentTable"; "DBPermanentView")
+   |> #(ns, tname, pos)
+   |> %(ns, tname ~> group_concat:(colline, char:(10)) as cols)
+   |> (ns, tname,
+       :"{tname}: {char:(123)}{char:(10)}  shape: sql_table{char:(10)}{cols}{char:(10)}{char:(125)}"
+         as block)
+  : tbls
+
+  tbls(*)
+   |> #(ns, tname)
+   |> %(ns ~> group_concat:(block, char:(10)) as blocks)
+   |> (:"{char:(34)}{ns}{char:(34)}: {char:(123)}{char:(10)}{blocks}{char:(10)}{char:(125)}"
+         as container)
+  : nss
+
+  nss(*)
+   |> %(~> group_concat:(container, char:(10)) as d2)

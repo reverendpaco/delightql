@@ -16,6 +16,7 @@ pub enum UriKind {
     Error,
     Danger,
     Config,
+    Diagnostic,
 }
 
 impl UriKind {
@@ -24,6 +25,7 @@ impl UriKind {
             UriKind::Error => "delightql-error://",
             UriKind::Danger => "delightql-danger://",
             UriKind::Config => "delightql-config://",
+            UriKind::Diagnostic => "delightql-diagnostic://",
         }
     }
 
@@ -32,11 +34,17 @@ impl UriKind {
             UriKind::Error => "error",
             UriKind::Danger => "danger",
             UriKind::Config => "config",
+            UriKind::Diagnostic => "diagnostic",
         }
     }
 
     pub fn all() -> &'static [UriKind] {
-        &[UriKind::Error, UriKind::Danger, UriKind::Config]
+        &[
+            UriKind::Error,
+            UriKind::Danger,
+            UriKind::Config,
+            UriKind::Diagnostic,
+        ]
     }
 }
 
@@ -118,6 +126,18 @@ pub const ERROR_TOP_SEGMENTS: &[&str] = &[
     // bugs get their own top segment, distinct from runtime/ (the
     // query failed) — internal/ means DQL failed.
     "internal",
+];
+
+/// The mintable top segments of the diagnostic kind — one per provider
+/// (DIAGNOSTIC-URI-RFP.md). Only `autoload` emits today; the rest are
+/// reserved by the provider inventory so the taxonomy is stable before the
+/// providers land. The soundness test keeps diagnostic rows inside this set.
+pub const DIAGNOSTIC_TOP_SEGMENTS: &[&str] = &[
+    "autoload",
+    "adapter",
+    "identity",
+    "catalog",
+    "connectivity",
 ];
 
 /// Subcategory constants (STRING-FLOOR.md Tier 2a). Error sites reference
@@ -234,7 +254,10 @@ mod tests {
                     "identifier row documents unknown config {}",
                     hierarchy
                 ),
-                UriKind::Error => {}
+                // No separate runtime registry to reconcile against — the
+                // diagnostic providers are the source. Soundness is the
+                // top-segment test below.
+                UriKind::Error | UriKind::Diagnostic => {}
             }
         }
     }
@@ -249,6 +272,23 @@ mod tests {
                 assert!(
                     ERROR_TOP_SEGMENTS.contains(&top),
                     "error identifier row '{}' is outside the mintable top segments",
+                    hierarchy
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_entries_stay_inside_the_provider_top_segments() {
+        // Every diagnostic row's top segment is a known provider
+        // (DIAGNOSTIC-URI-RFP.md) — a row outside them documents a check no
+        // provider emits.
+        for (kind, hierarchy, _, _) in burned_rows() {
+            if kind == UriKind::Diagnostic {
+                let top = hierarchy.split('/').next().unwrap();
+                assert!(
+                    DIAGNOSTIC_TOP_SEGMENTS.contains(&top),
+                    "diagnostic identifier row '{}' is outside the provider top segments",
                     hierarchy
                 );
             }

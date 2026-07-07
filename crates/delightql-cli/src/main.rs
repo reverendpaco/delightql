@@ -174,6 +174,7 @@ fn run() -> Result<()> {
             Command::Man { .. } => ("man", false, false, false),
             Command::Help { .. } => ("help", false, false, false),
             Command::Completions { .. } => ("completions", false, false, false),
+            Command::Selftest { .. } => ("selftest", false, false, false),
         };
         // --make-new-db-if-missing is --db's companion knob, but only
         // query creates databases (server's --db must already exist).
@@ -262,6 +263,9 @@ fn run() -> Result<()> {
                 let mut cmd = <CliArgs as clap::CommandFactory>::command();
                 clap_complete::generate(*shell, &mut cmd, "dql", &mut std::io::stdout());
                 Ok(())
+            }
+            Command::Selftest { json, strict } => {
+                delightql_cli::commands::selftest::handle_selftest(*json, *strict)
             }
             Command::Target { action } => match action {
                 delightql_cli::args::TargetCommand::List => {

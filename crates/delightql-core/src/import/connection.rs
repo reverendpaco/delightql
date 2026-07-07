@@ -10,6 +10,36 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
+/// True if a `resource_uri` embeds credentials — a password in the URL
+/// userinfo (`scheme://user:pass@host`).
+///
+/// Credentials must never enter the connection catalog: `resource_uri` is
+/// stored, deduped on, and DQL-exposed via `sys::connections.connection(*)`,
+/// so a URL-embedded password would persist into session metadata and every
+/// dedup query — the worst possible residency. Credentials are sourced from
+/// the environment instead (e.g. `PGPASSWORD`), never typed into the URI.
+///
+/// This is the CORE-side chokepoint for that invariant: every host (CLI,
+/// wasm, cabi, adapters) funnels connection registration through
+/// [`register_connection`], so the guarantee holds by construction, not by
+/// each frontend remembering to check. Non-URL resource_uris (`session:primary`,
+/// `:memory:`, file paths, `catalog://sys::meta`) have no authority/userinfo
+/// and are never rejected. Username-only (`scheme://user@host`, no password)
+/// is allowed — a username is not a secret.
+fn resource_uri_embeds_credentials(uri: &str) -> bool {
+    // Only URL-form (has an authority component) can carry userinfo.
+    let Some((_scheme, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    // Authority is up to the first '/', '?', or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Userinfo is everything before the first '@'; a ':' in it is a password.
+    match authority.split_once('@') {
+        Some((userinfo, _host)) => userinfo.contains(':'),
+        None => false,
+    }
+}
+
 /// Register a new connection in the bootstrap database
 ///
 /// This is a reusable method following the pattern of install_cartridge(),
@@ -53,6 +83,19 @@ pub fn register_connection(
     connection_type: i32,
     description: &str,
 ) -> Result<i32> {
+    // Structural guarantee (SYS-NAMESPACE-TAXONOMY.md credential-sourcing
+    // policy): credentials never enter the connection catalog. Enforced here,
+    // at the single core sink, so every host inherits it — not at a frontend
+    // that a new host could bypass. The message deliberately does NOT echo the
+    // offending URI (that would re-leak the password into logs/errors).
+    if resource_uri_embeds_credentials(resource_uri) {
+        anyhow::bail!(
+            "connection resource_uri must not embed credentials — a password in \
+             the URL would persist into the connection catalog and every dedup \
+             query. Source it from the environment (e.g. PGPASSWORD) instead."
+        );
+    }
+
     // Dedupe keys on IDENTITY when the resource asserted one — two
     // spellings of the same server (postgres://localhost:5433/db vs
     // postgres:///db), or two paths to the same file (the symlink trap),
@@ -89,6 +132,43 @@ pub fn register_connection(
 mod tests {
     use super::*;
     use crate::bootstrap;
+
+    #[test]
+    fn credential_detection_rejects_only_passwords() {
+        // Rejected: a password in the userinfo.
+        assert!(resource_uri_embeds_credentials("postgres://alice:hunter2@host/db"));
+        assert!(resource_uri_embeds_credentials("postgres://:secret@host:5432/db"));
+        assert!(resource_uri_embeds_credentials("mysql://u:p@h/d?x=1"));
+        // Allowed: username-only (not a secret), port colons, and every
+        // non-URL resource_uri form that legitimately flows in.
+        assert!(!resource_uri_embeds_credentials("postgres://alice@host/db"));
+        assert!(!resource_uri_embeds_credentials("postgres://host:5432/db"));
+        assert!(!resource_uri_embeds_credentials("postgres:///db"));
+        assert!(!resource_uri_embeds_credentials("session:primary"));
+        assert!(!resource_uri_embeds_credentials(":memory:"));
+        assert!(!resource_uri_embeds_credentials("data/users.db"));
+        assert!(!resource_uri_embeds_credentials("catalog://sys::meta"));
+        assert!(!resource_uri_embeds_credentials("realpath:/abs/db.db"));
+    }
+
+    #[test]
+    fn register_connection_refuses_embedded_credentials() {
+        // The guard fires before any DB access, so no schema is needed.
+        let conn = Connection::open_in_memory().unwrap();
+        let err = register_connection(
+            &conn,
+            "postgres://alice:hunter2@host/db",
+            "fatboy",
+            None,
+            2,
+            "leaky",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not embed credentials"), "{msg}");
+        // And it does NOT echo the password back into the error.
+        assert!(!msg.contains("hunter2"), "error re-leaked the password: {msg}");
+    }
 
     #[test]
     fn test_register_connection() {

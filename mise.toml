@@ -36,7 +36,12 @@ rm -rf /tmp/dql-repl
 [tasks.build-rust-bins-debug]
 description = "Build the binaries: dql, dql-test-ball-runner and dql-fmt"
 run = """
+set -e
 cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="bundled-parser"
+# Gate the build on self-diagnostics: a broken autoload (or other provider
+# failure) fails the build here rather than surfacing later as a misleading
+# `Table not found`. See DIAGNOSTICS-DESIGN.md.
+./target/debug/dql selftest
 """
 
 [tasks.build-rust-bins-release-tiny]

@@ -141,8 +141,17 @@ pub fn activate_entities_from_cartridge(
 /// Organizes bootstrap entities into:
 /// - sys::cartridges: cartridge, language, source_type_enum
 /// - sys::entities: entity, referenced_entity, entity_attribute, entity_resolution,
-///                  entity_type_enum, GroundedEntity, ExternalNamespaces
-/// - sys::ns: namespace, activated_entity, enlisted_entity, enlisted_namespace
+///                  entity_type_enum, GroundedEntity, ExternalNamespaces,
+///                  entity_clause, er_rule
+/// - sys::entities::ho: ho_param, ho_param_column, ho_param_ground_value
+/// - sys::entities::interior: interior_entity, interior_entity_attribute
+/// - sys::ns: namespace, activated_entity, enlisted_entity, enlisted_namespace,
+///            namespace_alias, namespace_local_alias, namespace_local_enlist,
+///            exposed_namespace, grounding
+/// - sys::execution: compilation, stack
+/// - sys::targeting: dialect_render, dialect_form_rule, dialect_capability
+/// - sys::connections: connection_type_enum (the curated `connection` entity is
+///                     registered separately in system.rs, safe columns only)
 ///
 /// # Arguments
 /// * `conn` - Connection to _bootstrap database
@@ -173,6 +182,33 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         // sys::execution (namespace_id = 10)
         ("compilation", 10),
         ("stack", 10),
+        // sys::targeting (namespace_id = 12) — the data-driven multi-target
+        // rule tables. Introspection already registers them as cartridge-1
+        // entities; this is the missing activation that gives them a DQL
+        // address (ALL-SQL-TARGETING-PLAN.md §1 Track B).
+        ("dialect_render", 12),
+        ("dialect_form_rule", 12),
+        ("dialect_capability", 12),
+        // sys::entities (namespace_id = 4) — entity-detail that isn't ho/interior
+        ("entity_clause", 4),
+        ("er_rule", 4),
+        // sys::entities::ho (namespace_id = 15)
+        ("ho_param", 15),
+        ("ho_param_column", 15),
+        ("ho_param_ground_value", 15),
+        // sys::entities::interior (namespace_id = 16)
+        ("interior_entity", 16),
+        ("interior_entity_attribute", 16),
+        // sys::ns (namespace_id = 5) — namespace wiring
+        ("namespace_alias", 5),
+        ("namespace_local_alias", 5),
+        ("namespace_local_enlist", 5),
+        ("exposed_namespace", 5),
+        ("grounding", 5),
+        // sys::connections (namespace_id = 13) — reference enum (safe raw).
+        // The `connection` table itself carries secret columns; its curated
+        // safe-subset entity is registered separately in system.rs.
+        ("connection_type_enum", 13),
     ];
 
     activate_entities_by_name(conn, cartridge_id, &mappings)

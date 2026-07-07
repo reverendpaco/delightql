@@ -195,6 +195,17 @@ pub enum Command {
         shell: clap_complete::Shell,
     },
 
+    /// Run self-diagnostics (checks dql's own health; see DIAGNOSTICS-DESIGN.md)
+    Selftest {
+        /// Emit findings as a JSON array (machine-readable, for CI)
+        #[arg(long)]
+        json: bool,
+
+        /// Treat warnings as failures (exit nonzero on any WARN)
+        #[arg(long)]
+        strict: bool,
+    },
+
     /// Explain a DelightQL identifier (error, danger gate, or config)
     Explain {
         /// The identifier to explain

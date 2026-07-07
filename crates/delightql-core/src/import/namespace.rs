@@ -250,6 +250,49 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             source_path: None,
             writable: false,
         },
+        NamespaceSpec {
+            id: 12,
+            name: "targeting".into(),
+            pid: Some(2),
+            fq_name: "sys::targeting".into(),
+            kind: "system".into(),
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: false,
+        },
+        NamespaceSpec {
+            id: 13,
+            name: "connections".into(),
+            pid: Some(2),
+            fq_name: "sys::connections".into(),
+            kind: "system".into(),
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: false,
+        },
+        // id 14 is intentionally skipped: reserved for `sys::session`
+        // (assertions/danger/errors), deferred as Part 1b — see
+        // SYS-NAMESPACE-TAXONOMY.md. Those tables stay bare in `sys` for now.
+        NamespaceSpec {
+            id: 15,
+            name: "ho".into(),
+            pid: Some(4),
+            fq_name: "sys::entities::ho".into(),
+            kind: "system".into(),
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: false,
+        },
+        NamespaceSpec {
+            id: 16,
+            name: "interior".into(),
+            pid: Some(4),
+            fq_name: "sys::entities::interior".into(),
+            kind: "system".into(),
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: false,
+        },
     ];
 
     create_namespace_hierarchy(conn, &specs)

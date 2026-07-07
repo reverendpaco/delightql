@@ -159,6 +159,12 @@ fn print_kind_facts(entry: &IdentifierEntry) {
                 entry.hierarchy
             );
         }
+        UriKind::Diagnostic => {
+            println!();
+            println!("Surfaced by: dql selftest (provider '{}')", {
+                entry.hierarchy.split('/').next().unwrap_or(&entry.hierarchy)
+            });
+        }
     }
 }
 

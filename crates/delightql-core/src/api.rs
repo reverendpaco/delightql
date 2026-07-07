@@ -32,6 +32,13 @@ pub trait DqlHandle: Send {
 
     /// Create a relay for raw protocol handling (server use).
     fn create_relay(&mut self) -> Result<Box<dyn ServerRelay + '_>, String>;
+
+    /// Run self-diagnostics against this handle's system (see
+    /// DIAGNOSTICS-DESIGN.md). Default: no findings, for hosts that do not
+    /// implement diagnostics.
+    fn selftest(&self) -> Vec<crate::diagnostics::DiagnosticFinding> {
+        Vec::new()
+    }
 }
 
 /// A DQL session for query/fetch/close operations.

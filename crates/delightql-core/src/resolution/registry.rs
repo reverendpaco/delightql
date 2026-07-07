@@ -218,6 +218,50 @@ impl<'a> DatabaseRegistry<'a> {
             "lookup_table_with_namespace: connection_id={:?}, backend_schema={:?}, table={}",
             connection_id, backend_schema_opt, table_name
         );
+
+        // Curated safe-subset guard: for bootstrap system tables (connection_id
+        // == 1), star-expansion below reads the raw physical schema via PRAGMA.
+        // When the entity is activated in this namespace with an explicit
+        // registered column set, honor that instead. Bootstrap tables normally
+        // register every physical column (so this is behavior-preserving),
+        // except where a curated entity deliberately omits secret columns —
+        // sys::connections.connection never registers resource_uri/identity, so
+        // they stay structurally unprojectable (SYS-NAMESPACE-TAXONOMY.md).
+        if connection_id == Some(1) {
+            let fq_name: String = namespace_path
+                .items()
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join("::");
+            if let Some(cols) = self.schema.get_table_columns(Some(&fq_name), &canonical_name) {
+                if !cols.is_empty() {
+                    let column_metadata = cols
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, col)| {
+                            ColumnMetadata::new(
+                                ColumnProvenance::from_table_column(
+                                    col.name.clone(),
+                                    TableName::Named(canonical_name.clone()),
+                                    crate::pipeline::asts::core::QualificationSource::None,
+                                ),
+                                TableName::Named(canonical_name.clone()),
+                                Some(idx + 1),
+                            )
+                            .with_declared_type(col.declared_type.clone())
+                        })
+                        .collect();
+                    return Ok(Some((
+                        CprSchema::Resolved(column_metadata),
+                        1,
+                        canonical_name.clone(),
+                        backend_schema_opt.clone(),
+                    )));
+                }
+            }
+        }
+
         let columns = if let Some(conn_id) = connection_id {
             if conn_id == 1 {
                 // Bootstrap connection introspection

@@ -15,4 +15,5 @@ pub mod format;
 pub mod jstruct;
 pub mod man;
 pub mod query;
+pub mod selftest;
 pub mod target;

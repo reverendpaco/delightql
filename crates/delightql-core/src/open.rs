@@ -189,6 +189,10 @@ impl api::DqlHandle for DqlHandleImpl {
         let relay = RelayParty::new(&mut self.system, backend_session);
         Ok(Box::new(relay))
     }
+
+    fn selftest(&self) -> Vec<crate::diagnostics::DiagnosticFinding> {
+        crate::diagnostics::run_selftest(self.system())
+    }
 }
 
 impl DqlHandleImpl {

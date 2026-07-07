@@ -2,6 +2,7 @@
 // Copyright 2026 Daniel Eklund
 pub mod uri_registry;
 pub mod api;
+pub mod diagnostics;
 pub(crate) mod bin_cartridge;
 pub(crate) mod ddl;
 #[cfg(not(target_arch = "wasm32"))]

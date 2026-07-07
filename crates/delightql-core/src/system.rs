@@ -278,6 +278,125 @@ fn register_sys_help_tables(bootstrap_conn: &Connection, bootstrap_conn_id: i64)
     Ok(())
 }
 
+/// Register the CURATED `connection` entity in sys::connections.
+///
+/// Register the `connection` entity in sys::connections as an explicit column
+/// ALLOWLIST. Under the credential-sourcing policy (credentials come from the
+/// environment, never embedded in a URI — SYS-NAMESPACE-TAXONOMY.md) no column
+/// of `connection` carries a secret: `resource_uri` is guaranteed
+/// credential-free, and `identity` is a resource fingerprint (what the
+/// resource asserts about itself, for idempotent-mount / conflict detection),
+/// not a credential. So every column is exposed and answers "what am I
+/// connected to?".
+///
+/// It stays a curated, explicitly-enumerated entity (not the raw introspected
+/// twin) so the exposure is DEFAULT-DENY: a column added to the physical table
+/// later is NOT surfaced unless deliberately added here — the structural belt
+/// to the policy's suspenders. The resolver guard in registry.rs makes these
+/// registered attributes authoritative for bootstrap (connection_id==1)
+/// tables. The raw introspected `connection` entity (cartridge 1) is left
+/// orphaned; the `catalog` diagnostic dedups by name, so this activation
+/// clears its warning. Own cartridge so no bulk activation sweeps it into bare
+/// `sys`.
+fn register_sys_connection_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64) -> Result<()> {
+    bootstrap_conn
+        .execute(
+            "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+             VALUES (?1, ?2, 'sys://connections', NULL, 1, ?3, 0)",
+            rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to create sys::connections cartridge: {}", e),
+                e.to_string(),
+            )
+        })?;
+    let conn_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
+
+    let conn_ns_id: i32 = bootstrap_conn
+        .query_row(
+            "SELECT id FROM namespace WHERE fq_name = 'sys::connections'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to query sys::connections namespace: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO entity (name, type, cartridge_id) VALUES ('connection', 10, ?1)",
+            rusqlite::params![conn_cartridge_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to insert sys::connections.connection entity: {}", e),
+                e.to_string(),
+            )
+        })?;
+    let entity_id = bootstrap_conn.last_insert_rowid() as i32;
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO entity_clause (entity_id, ordinal, definition)
+             VALUES (?1, 1, '-- sys::connections curated safe-subset (SYS-NAMESPACE-TAXONOMY.md)')",
+            rusqlite::params![entity_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to insert sys::connections.connection clause: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    // Explicit allowlist of all current columns (none is a secret under the
+    // credential-sourcing policy). Enumerated, not raw, so a future column is
+    // default-deny. Order + nullability mirror the physical `connection` table.
+    let connection_columns = [
+        ("id", "INTEGER", 1, false),
+        ("resource_uri", "TEXT", 2, false),
+        ("mechanism", "TEXT", 3, false),
+        ("identity", "TEXT", 4, true),
+        ("connection_type", "INTEGER", 5, false),
+        ("description", "TEXT", 6, true),
+    ];
+    for (col_name, data_type, position, nullable) in &connection_columns {
+        bootstrap_conn
+            .execute(
+                "INSERT INTO entity_attribute
+                 (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
+                 VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
+                rusqlite::params![entity_id, col_name, data_type, position, nullable],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!(
+                        "Failed to insert sys::connections.connection column '{}': {}",
+                        col_name, e
+                    ),
+                    e.to_string(),
+                )
+            })?;
+    }
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![entity_id, conn_ns_id, conn_cartridge_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to activate sys::connections.connection: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    Ok(())
+}
+
 fn register_catalog_wrapper(
     conn: &Connection,
     ns_fq: &str,
@@ -858,6 +977,11 @@ impl DelightQLSystem {
         // as sys::help.identifier. Its own cartridge so the bulk
         // activation above cannot leak it into bare `sys`.
         register_sys_help_tables(&bootstrap_conn, bootstrap_conn_id)?;
+
+        // sys::connections: the curated safe-subset `connection` entity
+        // (non-secret columns only). Own cartridge so the bulk activation
+        // above cannot leak it into bare `sys`.
+        register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
 
         // Initialize connection routing map
         let mut connection_map: HashMap<i64, Arc<Mutex<dyn DatabaseConnection>>> = HashMap::new();
@@ -1622,6 +1746,10 @@ impl DelightQLSystem {
             )
         })?;
 
+        // sys::connections: curated safe-subset `connection` entity, own
+        // cartridge (mirrors the primary bootstrap path).
+        register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
+
         // 9. Swap bootstrap connection
         *self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
@@ -1666,21 +1794,29 @@ impl DelightQLSystem {
         }
     }
 
-    /// Returns true if the module was just loaded (caller should retry lookup).
-    pub fn ensure_stdlib_loaded(&self, namespace_fq: &str) -> bool {
+    /// Lazily load an embedded stdlib/autoload module for `namespace_fq`.
+    ///
+    /// Returns a [`StdlibLoad`] rather than a bool: the old boolean crushed
+    /// "not a stdlib namespace", "already loaded", and "failed to load" into
+    /// one `false`, so a broken autoload was indistinguishable from an
+    /// absent one and surfaced only as a misleading `Table not found`. The
+    /// `Failed` variant carries the parse/consult cause so callers can
+    /// surface it. A newly-loaded module is [`StdlibLoad::Loaded`] (caller
+    /// should retry the lookup).
+    pub fn ensure_stdlib_loaded(&self, namespace_fq: &str) -> StdlibLoad {
         // Find matching embedded module (covers std::*, sys::*, etc.)
         let module = crate::stdlib_manifest::STDLIB_MODULES
             .iter()
             .find(|(ns, _)| *ns == namespace_fq);
 
         let Some((_namespace, source)) = module else {
-            return false;
+            return StdlibLoad::NotAModule;
         };
 
         // Check if already loaded (namespace row exists in bootstrap DB)
         let bootstrap_conn = match self.bootstrap_connection.lock() {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(_) => return StdlibLoad::NotAModule,
         };
 
         let source_uri = format!("embedded://{}", namespace_fq);
@@ -1693,15 +1829,18 @@ impl DelightQLSystem {
             .unwrap_or(false);
 
         if already_loaded {
-            return false;
+            return StdlibLoad::AlreadyLoaded;
         }
 
         // Consult the module
         let ddl = match crate::pipeline::parser::parse_ddl_file(source) {
             Ok(d) => d,
             Err(e) => {
-                log::warn!("Failed to parse stdlib '{}': {}", namespace_fq, e);
-                return false;
+                report_stdlib_load_failure(namespace_fq, &e);
+                return StdlibLoad::Failed {
+                    phase: LoadPhase::Parse,
+                    error: e,
+                };
             }
         };
 
@@ -1730,12 +1869,15 @@ impl DelightQLSystem {
                         );
                     }
                 }
-                true
+                StdlibLoad::Loaded
             }
             Err(e) => {
-                log::warn!("Failed to consult stdlib '{}': {}", namespace_fq, e);
                 let _ = bootstrap_conn.execute_batch("ROLLBACK");
-                false
+                report_stdlib_load_failure(namespace_fq, &e);
+                StdlibLoad::Failed {
+                    phase: LoadPhase::Consult,
+                    error: e,
+                }
             }
         }
     }
@@ -7171,4 +7313,78 @@ fn register_curly_members(
     }
 
     Ok(())
+}
+
+/// Outcome of a lazy autoload (stdlib) module load — a union replacing a
+/// bool that could not distinguish "not a module" from "module, but broken"
+/// (an information hole: three states in two values). See
+/// [`DelightQLSystem::ensure_stdlib_loaded`].
+/// Which phase of a load failed. Distinguished because their remediations
+/// differ (a parse failure is a syntax fix; a consult failure is a missing
+/// reference), which the diagnostics `autoloads` provider maps to distinct
+/// `delightql-diagnostic://autoload/{parse,consult}_failed` identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPhase {
+    Parse,
+    Consult,
+}
+
+#[derive(Debug)]
+pub enum StdlibLoad {
+    /// `namespace_fq` is not an embedded stdlib module (resolver falls through).
+    NotAModule,
+    /// The module was already loaded on a previous call.
+    AlreadyLoaded,
+    /// The module was parsed and consulted on this call.
+    Loaded,
+    /// The namespace IS an embedded module but failed; carries which phase
+    /// and the cause, so callers can surface a phase-specific remediation
+    /// instead of a bare `Table not found`.
+    Failed { phase: LoadPhase, error: DelightQLError },
+}
+
+impl StdlibLoad {
+    /// True only when a module was newly loaded this call (caller should
+    /// retry the lookup that triggered the load).
+    pub fn just_loaded(&self) -> bool {
+        matches!(self, StdlibLoad::Loaded)
+    }
+}
+
+/// Report an autoload module load failure. Always logs at warn; on dev
+/// builds it also prints to stderr, because otherwise a broken autoload
+/// surfaces only as a misleading `Table not found` with the real cause
+/// hidden behind `RUST_LOG=warn`. The build-time `every_stdlib_module_parses`
+/// test keeps this path unreachable for shipped modules.
+fn report_stdlib_load_failure(namespace_fq: &str, err: &DelightQLError) {
+    log::warn!("Failed to load stdlib '{}': {}", namespace_fq, err);
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "delightql: autoload module '{}' failed to load and was skipped:\n  {}",
+            namespace_fq, err
+        );
+    }
+}
+
+#[cfg(test)]
+mod stdlib_load_tests {
+    //! Autoload modules are static `include_str!` content: a shipped binary
+    //! must never carry an unparseable one. The lazy loader
+    //! (`ensure_stdlib_loaded`) only fires for namespaces a session
+    //! references, so a per-session run can miss a broken module — this
+    //! test parses every one, unconditionally, at `cargo test` time.
+    //!
+    //! Regression guard for the silent-autoload-failure class: a syntax
+    //! error in any `autoload/**/*.dql` fails here with the module name and
+    //! the parse error, instead of surfacing later as a misleading
+    //! `Table not found`.
+
+    #[test]
+    fn every_stdlib_module_parses() {
+        for (ns, src) in crate::stdlib_manifest::STDLIB_MODULES {
+            if let Err(e) = crate::pipeline::parser::parse_ddl_file(src) {
+                panic!("autoload module '{ns}' failed to parse: {e}");
+            }
+        }
+    }
 }
