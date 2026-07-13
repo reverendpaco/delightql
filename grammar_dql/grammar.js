@@ -2067,6 +2067,13 @@ module.exports = grammar({
     // Inline directive table-value: doc!("a","b")(*), doc!("a","b"; "c","d")(*)
     // First paren = positional ho_argument_list (the table value, ;-rows).
     // Second paren = output spec (column_spec|continuation, mirrors DML alts).
+    // GENERALITY (INTENTIONAL): `field('name', $.identifier)` matches ANY
+    // directive name, not just doc!. `mount!(...)( * )`, `enlist!(...)( * )`,
+    // etc. all parse through this same rule and desugar identically — doc! is
+    // simply the only directive whose semantics make the inline-table form
+    // useful today. This is by design, not a doc!-specific special case;
+    // pinned by the CST test `inline_directive_table_is_directive_agnostic`
+    // (parser tests) which exercises a NON-doc! directive through this path.
     // Desugars in the builder to _(rows) |> name!(output) — same AST as the
     // piped form, so the runtime is unchanged. Reachable standalone via
     // base_expression (NOT via bang_pipe_operation): the piped context reaches

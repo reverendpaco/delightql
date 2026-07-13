@@ -139,6 +139,12 @@ pub(crate) fn execute_consult(
     namespace: &str,
     _consulting_ns: Option<&str>,
 ) -> Result<usize> {
+    // System name guard (catechism Deviation #3): a USER-TYPED consult target
+    // may not land on a reserved system name. Applied to the already-resolved
+    // namespace, so surface `consult!`, embedded `consult!` directives, and
+    // `consult_tree!`'s per-file namespaces all pass through here.
+    crate::system::validate_user_namespace_target(namespace)?;
+
     // Resolve relative path against session CWD (for test isolation).
     let resolved_path = crate::session_cwd::resolve_path(file_path);
     let file_path = resolved_path.display().to_string();

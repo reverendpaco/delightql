@@ -157,7 +157,12 @@ fn run_imprint(
         ));
     }
 
-    let results = system.imprint_namespace(&source_ns, &target_ns, replace)?;
+    let mode = if replace {
+        crate::system::ImprintMode::Replace
+    } else {
+        crate::system::ImprintMode::Strict
+    };
+    let results = system.imprint_namespace(&source_ns, &target_ns, mode)?;
 
     {
         // Build multi-row result: (entity, status) for each materialized entity

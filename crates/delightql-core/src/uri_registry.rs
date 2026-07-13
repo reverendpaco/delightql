@@ -126,6 +126,17 @@ pub const ERROR_TOP_SEGMENTS: &[&str] = &[
     // bugs get their own top segment, distinct from runtime/ (the
     // query failed) — internal/ means DQL failed.
     "internal",
+    // Added 2026-07-07 with blueprint-inertness enforcement (Change 3):
+    // imprint!'s linear lifecycle refusals (imprint/blueprint/inert — an
+    // archived blueprint namespace is visible but inert). Its own top
+    // segment: not a query semantic error, a lifecycle-policy refusal.
+    "imprint",
+    // Added 2026-07-08 with the system name guard (namespace work step 3a,
+    // catechism Deviation #3): USER-facing namespace creation refuses the
+    // reserved system name pool (exact sys/std/home, sys*/std* prefixes, `_`
+    // machinery segments, the sys::/std:: subtree). Its own top segment: a
+    // creation-policy refusal, not a query semantic error.
+    "namespace",
 ];
 
 /// The mintable top segments of the diagnostic kind — one per provider

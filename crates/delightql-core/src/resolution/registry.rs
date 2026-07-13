@@ -867,19 +867,75 @@ impl ConsultRegistry {
             )
             .ok()?;
 
-        let result = stmt
-            .query_row(rusqlite::params![name, namespace_fq], |row| {
-                Ok((
-                    row.get::<_, i32>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i32>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .ok()?;
+        let map_row = |row: &rusqlite::Row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        };
+
+        let result = match stmt.query_row(rusqlite::params![name, namespace_fq], map_row) {
+            Ok(r) => r,
+            Err(_) => {
+                // §IV MIDDLE ACCESS RUNG (plain qualifier): the exact
+                // (name, namespace_fq) pair missed. Consult the enlist set for
+                // an enlisted-parent namespace whose DIRECT child bears this
+                // plain qualifier (home first), then retry ONCE with the
+                // expanded fq. Fires only on this miss, so no lookup that
+                // resolves today is affected (§IV precedence rule 1). The
+                // returned entity carries the RESOLVED (expanded) namespace, so
+                // the blueprint safety net below and every downstream body
+                // resolution see the real fq. A plain-qualifier AMBIGUITY
+                // (multiple non-home parents) is loud on the relation door
+                // (`resolve_namespace_path`); here — a bare Option return — it
+                // degrades to a miss, and the caller surfaces "not found".
+                let expanded = crate::system::expand_plain_namespace(&conn, namespace_fq)
+                    .ok()
+                    .flatten()?;
+                stmt.query_row(rusqlite::params![name, expanded], map_row)
+                    .ok()?
+            }
+        };
 
         let (entity_id, entity_name, entity_type, definition, namespace) = result;
+
+        // §IV plain-qualifier SHADOW (ratified softening): if this was an EXACT
+        // hit on a top-level namespace (`namespace == namespace_fq`, so no
+        // expansion happened) and an enlisted `home::{namespace_fq}` child sits
+        // shadowed behind it, warn that the full path is needed to reach it.
+        // The `== namespace_fq` guard is load-bearing: it excludes the normal
+        // expanded case (where `namespace` is the `home::…` fq), which must NOT
+        // warn.
+        if namespace == namespace_fq && crate::system::home_child_shadows(&conn, namespace_fq) {
+            log::warn!(
+                "plain qualifier '{n}' resolved to the top-level namespace '{n}'; an \
+                 enlisted scratch child 'home::{n}' is shadowed behind it — spell \
+                 'home::{n}' to reach it (namespace-catechism §IV, ratified \
+                 top-level-wins softening of home-first)",
+                n = namespace_fq
+            );
+        }
+
+        // Blueprint inertness SAFETY NET (M2; companion_linear--70/--74): if
+        // the RESOLVED namespace is an archived blueprint (or nested under
+        // one), treat the lookup as a miss. This is the quiet deep layer —
+        // every consulted-lookup route (relations, function inlining, CFE
+        // precompile, HO/curried) funnels through lookup_entity, so no
+        // present-or-future route can silently execute archived rules. The
+        // LOUD badged refusals live at the front doors (resolve_namespace_path,
+        // refuse_if_blueprint_fq below, enlist!, ground!). A failed scan
+        // degrades to a miss too — the loud doors re-scan and surface it.
+        if crate::system::blueprint_shadowing(&conn, &namespace)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return None;
+        }
+
         let definition = definition.unwrap_or_default();
         // Unknown entity_type in the catalog = treat as lookup miss (the
         // catalog is compiler-owned; this is unreachable short of corruption).
@@ -912,6 +968,33 @@ impl ConsultRegistry {
     #[cfg(target_arch = "wasm32")]
     pub fn lookup_entity(&self, _name: &str, _namespace_fq: &str) -> Option<ConsultedEntity> {
         None
+    }
+
+    /// Loud front door for the FUNCTION-inlining route (companion_linear--74):
+    /// refuse a namespace-qualified consulted lookup whose path is an archived
+    /// blueprint, with the badged `imprint/blueprint/inert` error. The relation
+    /// route gets the same refusal from `resolve_namespace_path`; this covers
+    /// `grounding.rs`'s qualified colon-functor entries, which do not pass
+    /// through it. (The quiet safety net in `lookup_entity` backstops every
+    /// other route with a plain miss.)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn refuse_if_blueprint_fq(&self, fq: &str) -> crate::error::Result<()> {
+        let Some(system) = self.system else {
+            return Ok(());
+        };
+        // SAFETY: System pointer is valid for the lifetime of the resolver
+        let system_ref = unsafe { &*system };
+        let bootstrap = system_ref.get_bootstrap_connection();
+        let Ok(conn) = bootstrap.lock() else {
+            return Ok(());
+        };
+        crate::system::refuse_if_blueprint(&conn, fq)
+    }
+
+    /// WASM stub: no consults, nothing to refuse.
+    #[cfg(target_arch = "wasm32")]
+    pub fn refuse_if_blueprint_fq(&self, _fq: &str) -> crate::error::Result<()> {
+        Ok(())
     }
 
     /// Look up a consulted function by name across all namespaces enlisted into "main".

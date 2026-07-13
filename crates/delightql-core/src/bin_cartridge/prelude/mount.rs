@@ -91,10 +91,13 @@ impl EffectExecutable for MountPredicate {
             ));
         }
 
-        // Execute the side effect - delegate to system
-        system.mount_database(&db_path, &namespace).map_err(|e| {
-            DelightQLError::database_error(format!("mount!() failed: {}", e), "Mount failed")
-        })?;
+        // Execute the side effect - delegate to system. Propagate UNWRAPPED:
+        // mount_database's own errors already carry the "mount!() failed:"
+        // prefix where it applies, and re-wrapping erased typed badges (e.g.
+        // the namespace/name/reserved guard) into a generic runtime error —
+        // the same badge-erasing defect enlist.rs had (fixed in the
+        // blueprint-inertness change).
+        system.mount_database(&db_path, &namespace)?;
 
         Ok(EntityResult::Relation(super::directive_result(
             &namespace, alias,

@@ -540,8 +540,23 @@ impl<'a> Pipeline<'a> {
         // (skipped in sequential mode — sequential handles DDL upfront for cross-query visibility)
         if !self.skip_ddl_processing {
             for ddl in std::mem::take(&mut self.ddl_blocks) {
-                let suffix = ddl.namespace.as_deref().unwrap_or("user");
-                let namespace = format!("main::{}", suffix);
+                // Scratch routes to `home` (catechism §IV). Named blocks become
+                // ordinary lib-kind children `home::<name>`; the unnamed block lands
+                // its entities DIRECTLY in `home` — bare because home is enlisted, not
+                // because of any special rule for unnamed blocks.
+                let namespace = match ddl.namespace.as_deref() {
+                    Some(suffix) => {
+                        // System name guard (catechism Deviation #3): the
+                        // user-typed scratch name is a creation target under
+                        // home. Guard it as `home::<suffix>` so prong (c) (the
+                        // `_` reservation) fires while prong (b) relaxes —
+                        // `home::sysinfo` legal, `home::_x` refused.
+                        let fq = format!("home::{}", suffix);
+                        crate::system::validate_user_namespace_target(&fq)?;
+                        fq
+                    }
+                    None => "home".to_string(),
+                };
                 sequential::process_inline_ddl_block(&ddl.body, &namespace, self.system).map_err(
                     |e| {
                         crate::error::DelightQLError::database_error(

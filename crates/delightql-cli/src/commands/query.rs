@@ -78,8 +78,6 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         sql_optimize,
         sequential,
         #[cfg(feature = "repl")]
-            interactive: _,
-        #[cfg(feature = "repl")]
         quiet,
         #[cfg(feature = "repl")]
         highlights,

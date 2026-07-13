@@ -320,10 +320,10 @@ pub fn process_inline_ddl_block(
         process_inline_ddl_block(&block.body, &child_ns, system)?;
     }
 
-    // Auto-enlist default namespace ("main::user") so definitions are immediately usable
-    if namespace == "main::user" {
-        let _ = system.enlist_namespace("main::user");
-    }
+    // No special enlist here: unnamed scratch lands directly in `home`, which is
+    // enlisted at session start (catechism §IV). Named scratch (`home::<name>`) is
+    // session-scoped and reached FQ or via `enlist!("home::<name>")` — deliberately
+    // not auto-enlisted.
 
     Ok(result.replaced_entities)
 }

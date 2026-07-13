@@ -818,6 +818,7 @@ mod tests {
         let help = String::from_utf8_lossy(&out.stdout);
         assert!(help.contains("query and server; others refuse"));
         assert!(help.contains("(query only)"));
+        assert!(help.contains("(query, tools, server)"));
 
         // #4: a --to compile failure emits the SAME record shape as
         // normal execution — URI and full prose, no withholding.
@@ -840,10 +841,11 @@ mod tests {
 
     /// ALPHA-CLI-UX-WORRIES.md #3: numeric values in anonymous tables,
     /// aggregates, and computed columns must emit as JSON numbers.
-    /// sqlite declares no decl_type for expression columns, so the
-    /// relay falls back to the engine's own storage class (peeked from
-    /// the first row) — a declaration by the engine, not a parsing
-    /// heuristic; the round-trip guard still demotes mismatched cells.
+    /// sqlite declares no decl_type for expression columns, so the relay
+    /// elects the engine's own storage class from the column's FIRST
+    /// NON-NULL value (bounded peek, Change 6 / M8) — a declaration by the
+    /// engine, not a parsing heuristic; the round-trip guard still demotes
+    /// mismatched cells per-value.
     #[test]
     fn test_alpha_ux_worry_3_expression_typing() {
         let cli_path = get_cli_path();
@@ -869,6 +871,32 @@ mod tests {
         // declaration: TEXT storage class → string.
         let v = json("_(pad @ \"007\")");
         assert_eq!(v[0]["pad"], serde_json::json!("007"));
+
+        // M8 (Change 6): a NULL-leading column no longer types off row 0.
+        // It elects INTEGER from its first non-NULL value; the leading NULL
+        // stays null, the 5 emits as a number. Under the old first-row peek
+        // this whole column was stringly and `5` rendered as "5".
+        let v = json("_(x @ null; 5)");
+        assert_eq!(v[0]["x"], serde_json::Value::Null);
+        assert_eq!(v[1]["x"], serde_json::json!(5), "null-leading elects INTEGER");
+
+        // Row-order independence: reversing the rows yields identical JSON
+        // types (only the values swap). `5; null` and `null; 5` were the
+        // M8 asymmetry — same data, reversed rows, different JSON types.
+        let v = json("_(x @ 5; null)");
+        assert_eq!(v[0]["x"], serde_json::json!(5));
+        assert_eq!(v[1]["x"], serde_json::Value::Null);
+
+        // Genuinely mixed column: election happens from row 0 (INTEGER 1),
+        // so the numeric cells (1, 2) emit as numbers and the interloping
+        // "abc" — which does not round-trip against INTEGER — is demoted to
+        // a string per-value by the round-trip guard. Mixed-type columns
+        // remain order-dependent by design (declare or cast if a consumer
+        // depends on it); this pins what the ruled mechanism yields.
+        let v = json("_(x @ 1; \"abc\"; 2)");
+        assert_eq!(v[0]["x"], serde_json::json!(1));
+        assert_eq!(v[1]["x"], serde_json::json!("abc"));
+        assert_eq!(v[2]["x"], serde_json::json!(2));
     }
 
     /// Bare `dql` is sugar for `dql query` with no arguments — one

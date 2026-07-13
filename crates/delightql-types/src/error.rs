@@ -342,6 +342,13 @@ impl DelightQLError {
             } => match subcategory {
                 Some(sub) if sub.starts_with("dml/") => format!("{S}{}", sub),
                 Some(sub) if sub.starts_with("operational/") => format!("{S}{}", sub),
+                // imprint! lifecycle refusals (blueprint inertness) are their
+                // own top segment, not a query-semantic error.
+                Some(sub) if sub.starts_with("imprint/") => format!("{S}{}", sub),
+                // namespace-creation name-guard refusals (system name pool,
+                // Deviation #3) are their own top segment — a lifecycle-policy
+                // refusal, not a query semantic error.
+                Some(sub) if sub.starts_with("namespace/") => format!("{S}{}", sub),
                 Some(sub) => format!("{S}semantic/{}", sub),
                 None => format!("{S}semantic/{}", Self::semantic_subcategory(message)),
             },

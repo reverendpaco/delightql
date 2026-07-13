@@ -425,6 +425,17 @@ impl ColumnProvenance {
         self.identity_stack.first().map(|id| &id.table_qualifier)
     }
 
+    /// The qualifier of the original source table — the bottom-most
+    /// `OriginalTable` identity, before any CTE/view scope transitions renamed
+    /// it. Diagnostics-only (e.g. naming the true source relation of a column
+    /// that has since been re-qualified by an enclosing CTE).
+    pub fn original_table_qualifier(&self) -> Option<&TableName> {
+        self.identity_stack.iter().rev().find_map(|id| {
+            matches!(id.context, IdentityContext::OriginalTable { .. })
+                .then_some(&id.table_qualifier)
+        })
+    }
+
     // ========================================================================
     // New stack query methods (Epoch 1)
     // ========================================================================
@@ -578,5 +589,50 @@ impl ToLispy for ColumnProvenance {
         }
 
         format!("(column_spec {})", parts.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod original_qualifier_tests {
+    use super::*;
+    use delightql_types::SqlIdentifier;
+
+    /// `original_table_qualifier()` returns the source table even after an
+    /// enclosing CTE/view scope re-qualifies the column. This is what lets the
+    /// HO param/column-collision error (semantic/ho/param_shadows_column) name
+    /// the true body relation (`users`) rather than the wrapping view CTE.
+    #[test]
+    fn original_qualifier_survives_cte_rescope() {
+        let named = |s: &str| TableName::Named(SqlIdentifier::new(s));
+        let mut prov = ColumnProvenance::from_table_column(
+            SqlIdentifier::new("age"),
+            named("users"),
+            QualificationSource::None,
+        );
+        // Simulate the view's CTE re-qualifying the column to `g`.
+        prov = prov.with_identity(ColumnIdentity {
+            name: SqlIdentifier::new("age"),
+            context: IdentityContext::CteRegistration {
+                cte_name: "g".to_string(),
+                origin: CteOrigin::CompilerGenerated,
+            },
+            phase: TransformationPhase::Resolved,
+            table_qualifier: named("g"),
+        });
+
+        assert_eq!(prov.current_table_qualifier(), Some(&named("g")));
+        assert_eq!(prov.original_table_qualifier(), Some(&named("users")));
+    }
+
+    /// With no scope transitions the original qualifier is just the source.
+    #[test]
+    fn original_qualifier_without_rescope() {
+        let named = |s: &str| TableName::Named(SqlIdentifier::new(s));
+        let prov = ColumnProvenance::from_table_column(
+            SqlIdentifier::new("age"),
+            named("users"),
+            QualificationSource::None,
+        );
+        assert_eq!(prov.original_table_qualifier(), Some(&named("users")));
     }
 }

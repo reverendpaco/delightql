@@ -28,6 +28,15 @@ mod tests;
 
 const BATCH_SIZE: usize = 1024;
 
+/// Undeclared-column descriptor election window. An undeclared column
+/// (expression, aggregate, CTE result — sqlite reports no decl_type) elects
+/// its storage class from its FIRST NON-NULL value; we buffer/scan at most
+/// this many leading rows looking for one. A column with no non-NULL value
+/// inside the window declares nothing (stays strings downstream). Bounding
+/// the peek is what preserves streaming — a full scan (Change 6 option (c))
+/// was rejected for exactly that reason.
+const DESCRIPTOR_PEEK_ROWS: usize = 64;
+
 // --- StreamBatch ---
 
 enum StreamBatch {
@@ -154,52 +163,74 @@ impl SqlParty {
             // decl_type only exists for real table columns; expressions,
             // aggregates, and anonymous tables (SELECT 1 AS x) report
             // none, which downstream renders as stringly JSON. For those
-            // columns, peek the first row BEFORE the column handshake and
-            // let the engine's own storage class be the declaration —
-            // sqlite typed the value; this is not a parsing heuristic. A
-            // mixed column can make the first row unrepresentative, which
-            // is safe: the CLI's round-trip guard demotes any cell that
-            // does not match its descriptor back to a string.
-            let mut pending: Option<Vec<Cell>> = match rows.next() {
-                Ok(Some(row)) => {
-                    let ncols = row.as_ref().column_count();
-                    let mut cells: Vec<Cell> = Vec::with_capacity(ncols);
-                    for i in 0..ncols {
-                        let val: rusqlite::types::Value = row.get_unwrap(i);
-                        let (cell, storage_class) = value_to_cell(val);
-                        if declared_types[i].is_empty() && !storage_class.is_empty() {
-                            declared_types[i] = storage_class.to_string();
+            // columns each elects its descriptor from its FIRST NON-NULL
+            // value — the engine's own storage class for that value, not a
+            // parsing heuristic. NULL declares nothing, so a NULL-leading
+            // column no longer inherits "" from row 0 (the row-order M8 bug:
+            // `_(x @ 5; null)` and `_(x @ null; 5)` used to type differently).
+            //
+            // Election is bounded: buffer at most DESCRIPTOR_PEEK_ROWS rows
+            // looking for each undeclared column's first non-NULL; a column
+            // with none in that window declares nothing (stays strings).
+            // Per-column-independent — column A may elect on row 1 while B
+            // elects on row 7 — and we stop the moment the last undeclared
+            // column elects (early exit: the all-non-NULL common case buffers
+            // exactly one row, as before). Streaming is preserved: after the
+            // window closes the buffered rows flush and the rest flows through.
+            // A genuinely mixed column stays order-dependent; the CLI's
+            // round-trip guard still demotes any per-value mismatch to a string.
+            let mut needs_election: Vec<bool> =
+                declared_types.iter().map(|d| d.is_empty()).collect();
+            let mut unelected = needs_election.iter().filter(|&&b| b).count();
+
+            let mut buffer: VecDeque<Vec<Cell>> = VecDeque::new();
+            let mut stream_done = false;
+            while unelected > 0 && buffer.len() < DESCRIPTOR_PEEK_ROWS {
+                match rows.next() {
+                    Ok(Some(row)) => {
+                        let ncols = row.as_ref().column_count();
+                        let mut cells: Vec<Cell> = Vec::with_capacity(ncols);
+                        for i in 0..ncols {
+                            let val: rusqlite::types::Value = row.get_unwrap(i);
+                            let (cell, storage_class) = value_to_cell(val);
+                            if needs_election[i] && !storage_class.is_empty() {
+                                declared_types[i] = storage_class.to_string();
+                                needs_election[i] = false;
+                                unelected -= 1;
+                            }
+                            cells.push(cell);
                         }
-                        cells.push(cell);
+                        buffer.push_back(cells);
                     }
-                    Some(cells)
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    // First-step failure: headers go out, then the error —
-                    // same shape a mid-stream step failure has always had.
-                    if col_tx.send(Ok((columns, declared_types))).is_err() {
+                    Ok(None) => {
+                        stream_done = true;
+                        break;
+                    }
+                    Err(e) => {
+                        // First-step failure: headers go out, then the error —
+                        // same shape a mid-stream step failure has always had.
+                        if col_tx.send(Ok((columns, declared_types))).is_err() {
+                            return;
+                        }
+                        let _ = tx.send(StreamBatch::Error(format!("{}", e)));
                         return;
                     }
-                    let _ = tx.send(StreamBatch::Error(format!("{}", e)));
-                    return;
                 }
-            };
+            }
             if col_tx.send(Ok((columns, declared_types))).is_err() {
                 return; // receiver dropped
-            }
-            if pending.is_none() {
-                let _ = tx.send(StreamBatch::Done);
-                return;
             }
 
             loop {
                 let mut batch = Vec::with_capacity(BATCH_SIZE);
-                if let Some(first) = pending.take() {
-                    batch.push(first);
+                // Flush buffered peek rows first, then pull fresh ones.
+                while batch.len() < BATCH_SIZE {
+                    match buffer.pop_front() {
+                        Some(row) => batch.push(row),
+                        None => break,
+                    }
                 }
-
-                loop {
+                while !stream_done && batch.len() < BATCH_SIZE {
                     match rows.next() {
                         Ok(Some(row)) => {
                             let ncols = row.as_ref().column_count();
@@ -209,11 +240,8 @@ impl SqlParty {
                                 cells.push(value_to_cell(val).0);
                             }
                             batch.push(cells);
-                            if batch.len() >= BATCH_SIZE {
-                                break;
-                            }
                         }
-                        Ok(None) => break,
+                        Ok(None) => stream_done = true,
                         Err(e) => {
                             let _ = tx.send(StreamBatch::Error(format!("{}", e)));
                             return;
@@ -226,7 +254,7 @@ impl SqlParty {
                     return;
                 }
 
-                let is_last = batch.len() < BATCH_SIZE;
+                let is_last = stream_done && buffer.is_empty();
                 if tx.send(StreamBatch::Rows(batch)).is_err() {
                     return; // receiver dropped (Close)
                 }

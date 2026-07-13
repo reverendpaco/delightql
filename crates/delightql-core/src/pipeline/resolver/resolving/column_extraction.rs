@@ -427,6 +427,21 @@ fn try_derive_info(
     Some(info)
 }
 
+/// Unwrap pure-notation paren layers: a `Parenthesized` that carries no alias
+/// of its own is notation, not a rename site, so we see through it (mirrors
+/// `collect_source_lvars`/`derived_via_label`). A paren WITH an alias is a
+/// naming site and stops the unwrap. Lets `((id)) as x` reach the bare `id`.
+fn strip_notation_parens(
+    expr: &ast_resolved::DomainExpression,
+) -> &ast_resolved::DomainExpression {
+    match expr {
+        ast_resolved::DomainExpression::Parenthesized { inner, alias: None } => {
+            strip_notation_parens(inner)
+        }
+        _ => expr,
+    }
+}
+
 /// Extract the column that a domain expression provides (if any).
 /// This is the inductive solution - handles all domain expression types uniformly.
 ///
@@ -764,12 +779,45 @@ pub(in crate::pipeline::resolver) fn extract_provided_column_from_domain_expr(
             // Parenthesized expression - check if inner expression provides a column
             // If it has an alias, use that; otherwise use the inner expression's column
             if let Some(alias_name) = alias {
-                // Cast-lineage: a parenthesized single-source expression continues
-                // the source column's stack. Parens are notation, so the derived
-                // `via` unwraps to the inner expression's kind (derived_via_label).
-                let info = try_derive_info(inner, input_columns, alias_name).unwrap_or_else(|| {
-                    ast_resolved::ColumnProvenance::from_column(alias_name.clone())
-                });
+                // Parens are pure notation (cast-lineage ruling). Split by inner:
+                //
+                //   (id) as x  — a paren-wrapped BARE column reference is a RENAME,
+                //   identical to bare `id as x` (the Lvar arm): the source column's
+                //   provenance gains a UserAlias, NOT a Derived push, because the
+                //   underlying column is still usable as-is. Multi-layer `((id)) as
+                //   x` unwraps through alias-less paren layers to the same bare Lvar.
+                //
+                //   (a + 1) as x — a value-transforming inner is a DERIVATION; it
+                //   keeps Derived semantics via try_derive_info.
+                //
+                // NOTE (honest scope): only the identity STACK is mirrored to bare
+                // rename; the outer ColumnMetadata.table stays Fresh as this arm
+                // always built it (the bare-rename difference is a separate field,
+                // not the identity treatment the ruling distinguishes).
+                let info = match strip_notation_parens(inner) {
+                    ast_resolved::DomainExpression::Lvar {
+                        name,
+                        qualifier,
+                        alias: None,
+                        ..
+                    } => match find_source_column(name, qualifier.as_ref(), input_columns) {
+                        Some(src) => {
+                            let mut prov = src.info.clone();
+                            if qualifier.is_some() {
+                                prov = prov.with_updated_qualification(
+                                    crate::pipeline::asts::core::QualificationSource::Resolver,
+                                );
+                            }
+                            prov.with_alias(alias_name.clone())
+                        }
+                        // Bare name absent from input (passthrough / new column):
+                        // honest Fresh named by the alias — matches the Lvar arm.
+                        None => ast_resolved::ColumnProvenance::from_column(alias_name.clone()),
+                    },
+                    _ => try_derive_info(inner, input_columns, alias_name).unwrap_or_else(|| {
+                        ast_resolved::ColumnProvenance::from_column(alias_name.clone())
+                    }),
+                };
                 Some(ast_resolved::ColumnMetadata::new_with_name_flag(
                     info,
                     ast_resolved::TableName::Fresh,
@@ -839,12 +887,61 @@ mod cast_lineage_tests {
         }
     }
 
+    /// A bare `name as alias` rename — an Lvar carrying its own alias.
+    fn lvar_aliased(name: &str, alias: &str) -> ast_resolved::DomainExpression {
+        ast_resolved::DomainExpression::Lvar {
+            name: name.into(),
+            qualifier: None,
+            namespace_path: ast_resolved::NamespacePath::empty(),
+            alias: Some(alias.into()),
+            provenance: ast_resolved::PhaseBox::phantom(),
+        }
+    }
+
+    /// `(inner) as alias` — an aliased parenthesized wrapper.
+    fn paren(inner: ast_resolved::DomainExpression, alias: &str) -> ast_resolved::DomainExpression {
+        ast_resolved::DomainExpression::Parenthesized {
+            inner: Box::new(inner),
+            alias: Some(alias.into()),
+        }
+    }
+
+    /// `(inner)` — a bare, alias-less parenthesized wrapper (pure notation).
+    fn paren_noalias(inner: ast_resolved::DomainExpression) -> ast_resolved::DomainExpression {
+        ast_resolved::DomainExpression::Parenthesized {
+            inner: Box::new(inner),
+            alias: None,
+        }
+    }
+
+    /// `func:(args)` — a Regular function WITHOUT its own alias (for paren inners).
+    fn regular_noalias(
+        name: &str,
+        args: Vec<ast_resolved::DomainExpression>,
+    ) -> ast_resolved::DomainExpression {
+        ast_resolved::DomainExpression::Function(ast_resolved::FunctionExpression::Regular {
+            name: name.into(),
+            namespace: None,
+            arguments: args,
+            alias: None,
+            conditioned_on: None,
+        })
+    }
+
     /// The top identity's Derived context, if the output inherited a stack.
     fn top_derived(col: &ast_resolved::ColumnMetadata) -> Option<(String, String)> {
         match col.info.identity_stack().first().map(|id| &id.context) {
             Some(IdentityContext::Derived { previous_name, via }) => {
                 Some((previous_name.clone(), via.clone()))
             }
+            _ => None,
+        }
+    }
+
+    /// The top identity's UserAlias `previous_name` (a RENAME), if that is the top.
+    fn top_user_alias(col: &ast_resolved::ColumnMetadata) -> Option<String> {
+        match col.info.identity_stack().first().map(|id| &id.context) {
+            Some(IdentityContext::UserAlias { previous_name }) => Some(previous_name.clone()),
             _ => None,
         }
     }
@@ -910,5 +1007,75 @@ mod cast_lineage_tests {
         assert!(top_derived(&out).is_some(), "provenance inherited");
         // ...but declared_type keeps the fresh-path value (None), not "INTEGER".
         assert_eq!(out.declared_type, None, "declared_type must not be inherited");
+    }
+
+    #[test]
+    fn paren_rename_is_rename_not_derived() {
+        // `(id) as x` — a paren-wrapped BARE column reference. Parens are pure
+        // notation (cast-lineage ruling), so this is a RENAME, identical to bare
+        // `id as x`: the identity stack gains a UserAlias, NOT a Derived push.
+        // Today's code routes it through try_derive_info → Derived{via:"derived"}
+        // — this pins the fix.
+        let cols = vec![src_col("id", "users", None)];
+        let expr = paren(lvar("id"), "x");
+        let out = extract_provided_column_from_domain_expr(&expr, &cols, 0)
+            .expect("paren provides a column");
+        assert!(top_derived(&out).is_none(), "(id) as x must NOT be Derived");
+        assert_eq!(
+            top_user_alias(&out).as_deref(),
+            Some("id"),
+            "(id) as x top must be a UserAlias rename of `id`"
+        );
+        // Stack CONTINUED: UserAlias over the source's OriginalTable (same shape
+        // as bare `id as x`).
+        assert!(
+            out.info.identity_stack().len() > 1,
+            "stack should be continued from the source"
+        );
+        assert_eq!(out.name(), "x");
+    }
+
+    #[test]
+    fn paren_rename_matches_bare_rename_identity() {
+        // The identity treatment of `(id) as x` must equal that of bare `id as x`.
+        let cols = vec![src_col("id", "users", None)];
+        let bare = extract_provided_column_from_domain_expr(&lvar_aliased("id", "x"), &cols, 0)
+            .expect("bare rename provides a column");
+        let parened = extract_provided_column_from_domain_expr(&paren(lvar("id"), "x"), &cols, 0)
+            .expect("paren rename provides a column");
+        assert_eq!(
+            bare.info.identity_stack(),
+            parened.info.identity_stack(),
+            "paren-rename identity stack must mirror bare-rename's"
+        );
+    }
+
+    #[test]
+    fn double_paren_rename_is_rename() {
+        // `((id)) as x` — multi-layer parens are still pure notation, still a
+        // rename. strip_notation_parens unwraps alias-less layers to the bare Lvar.
+        let cols = vec![src_col("id", "users", None)];
+        let expr = paren(paren_noalias(lvar("id")), "x");
+        let out = extract_provided_column_from_domain_expr(&expr, &cols, 0)
+            .expect("double-paren provides a column");
+        assert!(top_derived(&out).is_none(), "((id)) as x must NOT be Derived");
+        assert_eq!(top_user_alias(&out).as_deref(), Some("id"), "still a rename");
+    }
+
+    #[test]
+    fn paren_of_expression_keeps_derived() {
+        // `(add:(id, 1)) as x` — a value-transforming inner is NOT a bare rename;
+        // it must KEEP Derived semantics (only the bare-Lvar-in-parens case flips).
+        let cols = vec![src_col("id", "users", None)];
+        let expr = paren(regular_noalias("add", vec![lvar("id"), literal_str("1")]), "x");
+        let out = extract_provided_column_from_domain_expr(&expr, &cols, 0)
+            .expect("paren of expr provides a column");
+        assert!(
+            top_user_alias(&out).is_none(),
+            "value-transforming inner must NOT be a rename"
+        );
+        let (previous_name, via) = top_derived(&out).expect("top is Derived");
+        assert_eq!(previous_name, "id");
+        assert_eq!(via, "add");
     }
 }

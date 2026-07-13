@@ -272,6 +272,7 @@ fn execute_effects_in_relation(
                         }
                     };
                     let alias_str = alias.as_ref().map(|s| s.to_string());
+                    system.note_effect_executed();
                     let result = executable.execute(&arguments, alias_str, system)?;
                     let crate::bin_cartridge::EntityResult::Relation(r) = result;
                     return Ok(r);
@@ -307,6 +308,7 @@ fn execute_effects_in_relation(
                         })
                         .collect();
                     let alias_str = alias.as_ref().map(|s| s.to_string());
+                    system.note_effect_executed();
                     let result = executable.execute(&dom_args, alias_str, system)?;
                     let crate::bin_cartridge::EntityResult::Relation(r) = result;
                     return Ok(r);
@@ -401,6 +403,7 @@ fn execute_bin_entity_pipe(
     let mut result_headers: Option<Vec<DomainExpression>> = None;
 
     for row_values in &rows {
+        system.note_effect_executed();
         let result = executable.execute(row_values, None, system)?;
         match result {
             crate::bin_cartridge::EntityResult::Relation(Relation::Anonymous {
@@ -649,6 +652,7 @@ fn execute_pseudo_predicate(
     })?;
 
     // Now we can execute with a mutable borrow of system
+    system.note_effect_executed();
     let result = executable.execute(arguments, alias, system)?;
 
     // Convert EntityResult to Relation

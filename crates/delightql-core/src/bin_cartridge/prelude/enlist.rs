@@ -80,10 +80,12 @@ impl EffectExecutable for EnlistPredicate {
             ));
         }
 
-        // Execute the side effect - delegate to system
-        system.enlist_namespace(&namespace).map_err(|e| {
-            DelightQLError::database_error(format!("enlist!() failed: {}", e), "Enlist failed")
-        })?;
+        // Execute the side effect - delegate to system. Propagate the original
+        // error unchanged (as ground!() does) so its badge survives — e.g. the
+        // imprint/blueprint/inert refusal when enlisting an archived blueprint
+        // (M2). Re-wrapping as a generic runtime error would erase the URI the
+        // whole error family exists to carry.
+        system.enlist_namespace(&namespace)?;
 
         Ok(EntityResult::Relation(super::directive_result(
             &namespace, _alias,

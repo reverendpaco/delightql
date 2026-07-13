@@ -539,7 +539,13 @@ pub(super) fn resolve_ground(
                         ResolutionResult::ConsultedView {
                             name: entity.name.clone(),
                             body_source: entity.definition.clone(),
-                            namespace: fq.clone(),
+                            // Use the entity's RESOLVED namespace, not the typed
+                            // qualifier: a §IV plain-qualifier miss expands
+                            // `chz` → `home::chz` inside lookup_entity, and the
+                            // view body must resolve against the real fq. In the
+                            // non-expanded case entity.namespace == fq, so this
+                            // is behaviour-preserving.
+                            namespace: entity.namespace.clone(),
                         }
                     } else if entity.entity_type == BootstrapEntityType::DqlFactExpression
                     {
@@ -573,7 +579,7 @@ pub(super) fn resolve_ground(
                 } else if let Some(grounding) = grounding {
                     // Fallback: entity not in patched namespace, search grounded namespaces.
                     // Handles inline DDL views referencing sibling entities: DataNsPatcher
-                    // rewrites sample(*) → main::sample(*), but fact lives in "main::user".
+                    // rewrites sample(*) → main::sample(*), but fact lives in scratch ("home").
                     let mut fallback_result = None;
                     for ns in &grounding.grounded_ns {
                         let gfq = super::grounding::namespace_path_to_fq(ns);
@@ -2691,6 +2697,69 @@ pub(super) fn expand_ho_view(
     // Convert to ConsultedView relation
     let (resolved_expr, bubbled) =
         ho_view_query_to_relational(resolved_query, bubbled, function, user_alias, config)?;
+
+    // Hygienic binders (clause-head-catechism item 14a): a plain scalar param
+    // (PureUnbound — a `Scalar` in every clause, injected as no column of its
+    // own) whose name collides with a column the body would otherwise resolve
+    // to silently CAPTURES it. `g(age)(*) :- users(*), age > 40` with a
+    // users.age column: the substitution turns `age > 40` into the tautology
+    // `50 > 40` AND the scalar-column hygiene pass consumes users.age from the
+    // glob output — both silent. Refuse loudly instead. Checked here at
+    // expansion (call) time, where body relations carry real schemas: this
+    // catches both concretely-named bodies (users) and glob-param bodies (T(*))
+    // once the call supplies a concrete table. GroundScalar/MixedGround
+    // positions are exempt — their same-named column is a synthetic
+    // discriminator injected by inject_scalar_columns, not a captured body
+    // column (e.g. tagged("young", T(*))(*)).
+    {
+        use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
+        let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr)?;
+        let body_cols: &[ast_resolved::ColumnMetadata] = match &body_schema {
+            ast_resolved::CprSchema::Resolved(cols)
+            | ast_resolved::CprSchema::Unresolved(cols) => cols,
+            ast_resolved::CprSchema::Failed {
+                resolved_columns, ..
+            } => resolved_columns,
+            ast_resolved::CprSchema::Unknown => &[],
+        };
+        for pos in &positions {
+            if !matches!(pos.column_kind, HoColumnKind::Scalar)
+                || pos.ground_mode != HoGroundMode::PureUnbound
+            {
+                continue;
+            }
+            let Some(param_name) = pos.column_name.as_deref() else {
+                continue;
+            };
+            if let Some(col) = body_cols.iter().find(|c| c.name() == param_name) {
+                // Prefer the original source table (before the view's own CTE
+                // re-qualified the column) so the message names `users`, not the
+                // enclosing view CTE.
+                let source_qualifier = col
+                    .info
+                    .original_table_qualifier()
+                    .or_else(|| Some(col.qualifier()));
+                let relation = match source_qualifier {
+                    Some(crate::pipeline::asts::core::TableName::Named(id)) => id.to_string(),
+                    _ => format!("the body of HO view '{}'", function),
+                };
+                return Err(crate::error::DelightQLError::validation_error_categorized(
+                    "ho/param_shadows_column",
+                    format!(
+                        "Scalar parameter '{param}' of higher-order view '{func}' collides with \
+                         column '{param}' of relation '{rel}' in the view body. The parameter would \
+                         silently capture the column: body constraints on '{param}' tautologize and \
+                         the column drops from the output. Rename the parameter (e.g. '{param}_arg') \
+                         so it no longer shadows the column.",
+                        param = param_name,
+                        func = function,
+                        rel = relation,
+                    ),
+                    "HO parameter validation",
+                ));
+            }
+        }
+    }
 
     // Apply PatternResolver to first-parens (scalar positions) via combined DomainSpec.
     //

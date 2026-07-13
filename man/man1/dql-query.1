@@ -50,9 +50,6 @@ the REPL.
 .TP
 .BI \-\-attach " ATTACH"
 Attach an external database.
-.TP
-.B \-i, \-\-interactive
-Interactive mode \(em allow dot commands.
 .SS Compilation
 .TP
 .BI \-\-to " STAGE"
@@ -78,7 +75,9 @@ prints a column-name-independent data hash;
 .B totalhash
 includes column names;
 .B bhash
-is the byte-level, type-preserving, platform-independent hash;
+is the byte-level, platform-independent hash of the rendered values
+(an INTEGER 5 and a TEXT '5' hash identically \(em it fingerprints data
+content, not column types);
 .B fingerprint
 prints result-fingerprint JSON for semantic comparison.
 .IP
@@ -133,9 +132,21 @@ emits one object per row (streams; composes with jq). Both are typed:
 a column DECLARED numeric whose text round-trips emits an unquoted
 number, SQL NULL emits
 .BR null ,
-everything else is a string \(em a TEXT '007' stays "007", and
-undeclared columns (expressions, CTE results) stay strings. Keys keep
-the relation's column order.
+and a TEXT '007' stays "007" \(em a value that does not round-trip is
+demoted to a string, never emitted as a corrupted number. An undeclared
+column (an expression, a CTE result) takes the storage class of its
+.I "first non-NULL"
+value within the first 64 rows: a column whose first non-NULL value is
+numeric emits numbers, and a column that shows no non-NULL value in that
+window declares nothing and stays strings. A leading NULL no longer
+decides the column's type, so
+.B "5 ; null"
+and
+.B "null ; 5"
+type identically. A genuinely mixed column remains order-dependent
+(election picks one class; off-class values demote per-value) \(em
+declare the column (or cast) when a consumer depends on it. Keys keep the
+relation's column order.
 .B table
 and
 .B box

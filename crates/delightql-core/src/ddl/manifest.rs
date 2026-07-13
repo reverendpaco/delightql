@@ -16,11 +16,95 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{DelightQLError, Result};
 
+/// How an imprinted entity is stored. Parsed at manifest-read from the
+/// `imprinting()` `materialization` column; unknown spellings are rejected
+/// loudly (`imprint/manifest/materialization`) instead of the old silent
+/// fallback where `"veiw"` materialized a table. Pinned by
+/// companion_linear--75 and `manifest::tests::materialization_rejects_typo`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Materialization {
+    Table,
+    View,
+}
+
+impl Materialization {
+    /// Parse the manifest `materialization` string, rejecting unknown values.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "table" => Ok(Materialization::Table),
+            "view" => Ok(Materialization::View),
+            other => Err(DelightQLError::validation_error_categorized(
+                "imprint/manifest/materialization",
+                format!(
+                    "imprinting() materialization '{}' is not recognized — \
+                     valid values are \"table\" or \"view\"",
+                    other
+                ),
+                "invalid materialization",
+            )),
+        }
+    }
+}
+
+/// Whether an imprinted entity persists (`permanent`) or is a session-scoped
+/// `temporary` object. Parsed at manifest-read; unknown spellings are rejected
+/// loudly (`imprint/manifest/extent`) instead of the old silent fallback where
+/// `"temp"` meant permanent. Pinned by companion_linear--76 and
+/// `manifest::tests::extent_rejects_typo`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Extent {
+    Permanent,
+    Temporary,
+}
+
+impl Extent {
+    /// Parse the manifest `extent` string, rejecting unknown values.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "permanent" => Ok(Extent::Permanent),
+            "temporary" => Ok(Extent::Temporary),
+            other => Err(DelightQLError::validation_error_categorized(
+                "imprint/manifest/extent",
+                format!(
+                    "imprinting() extent '{}' is not recognized — \
+                     valid values are \"permanent\" or \"temporary\"",
+                    other
+                ),
+                "invalid extent",
+            )),
+        }
+    }
+}
+
+/// Reject a manifest entity name that carries a `"`. The imprint DDL path
+/// interpolates entity names into quoted identifiers; the declared-table
+/// branch routes through the DDL generator (`ddl_pipeline::generator`, out of
+/// this module), whose `write_quoted` does NOT double internal quotes, so an
+/// embedded `"` would emit malformed/injected DDL there — `quote_ident` in the
+/// imprint path cannot reach it. Rather than escape theater, we forbid the
+/// character at the source (a triple-quoted DQL literal `"""a"b"""` is the only
+/// way one reaches here). Pinned by
+/// `manifest::tests::entity_name_rejects_embedded_quote`.
+fn validate_entity_name(name: &str) -> Result<()> {
+    if name.contains('"') {
+        return Err(DelightQLError::validation_error_categorized(
+            "imprint/manifest/entity_name",
+            format!(
+                "imprint entity name '{}' contains a '\"' — entity names may not \
+                 contain double quotes",
+                name
+            ),
+            "invalid entity name",
+        ));
+    }
+    Ok(())
+}
+
 /// Row from `imprinting()`: (entity_name, materialization, extent)
 pub struct ImprintingRow {
     pub entity: String,
-    pub materialization: String,
-    pub extent: String,
+    pub materialization: Materialization,
+    pub extent: Extent,
 }
 
 /// Row from `schema()`: (column_name, column_type)
@@ -107,19 +191,28 @@ pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<Imp
                 let entity: String = row.get(0)?;
                 let materialization: String = row.get(1)?;
                 let extent: String = row.get(2)?;
-                Ok(ImprintingRow {
-                    entity: strip_dql_quotes(&entity).to_string(),
-                    materialization: strip_dql_quotes(&materialization).to_string(),
-                    extent: strip_dql_quotes(&extent).to_string(),
-                })
+                Ok((
+                    strip_dql_quotes(&entity).to_string(),
+                    strip_dql_quotes(&materialization).to_string(),
+                    strip_dql_quotes(&extent).to_string(),
+                ))
             })
             .map_err(|e| {
                 DelightQLError::database_error("Failed to execute imprinting query", e.to_string())
             })?;
+        // Parse enums / validate names OUTSIDE the rusqlite closure so the loud
+        // manifest-validation errors (imprint/manifest/*) propagate as
+        // DelightQLError, not swallowed into a rusqlite row error.
         for r in result_rows {
-            rows.push(r.map_err(|e| {
+            let (entity, materialization, extent) = r.map_err(|e| {
                 DelightQLError::database_error("Failed to read imprinting row", e.to_string())
-            })?);
+            })?;
+            validate_entity_name(&entity)?;
+            rows.push(ImprintingRow {
+                entity,
+                materialization: Materialization::parse(&materialization)?,
+                extent: Extent::parse(&extent)?,
+            });
         }
     }
 
@@ -296,11 +389,16 @@ pub fn discover_schema_entities(conn: &Connection, internal_ns_id: i32) -> Resul
             DelightQLError::database_error("Failed to read schema entity names", e.to_string())
         })?;
 
-    // Strip DQL string literal quotes from ground values
-    Ok(names
+    // Strip DQL string literal quotes from ground values, then validate: an
+    // embedded `"` reaches the DDL generator unescaped (see validate_entity_name).
+    names
         .into_iter()
-        .map(|s| strip_dql_quotes(&s).to_string())
-        .collect())
+        .map(|s| {
+            let name = strip_dql_quotes(&s).to_string();
+            validate_entity_name(&name)?;
+            Ok(name)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -454,4 +552,53 @@ fn extract_body(full_source: &str) -> String {
 /// Compile an anonymous table body to SQL via the DQL pipeline.
 fn compile_body(body: &str) -> Result<String> {
     crate::pipeline::compile_source_to_sql(body, &EmptySchema)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Manifest-read validation (review finding 9 / M5). The imprinting()
+    //! materialization/extent columns and entity names are validated the moment
+    //! they leave the bootstrap DB, so a typo can never silently pick the wrong
+    //! materialization/extent or inject an unescaped identifier downstream.
+    use super::*;
+
+    #[test]
+    fn materialization_parses_known() {
+        assert_eq!(Materialization::parse("table").unwrap(), Materialization::Table);
+        assert_eq!(Materialization::parse("view").unwrap(), Materialization::View);
+    }
+
+    #[test]
+    fn materialization_rejects_typo() {
+        // Pre-fix: "veiw" != "view" silently fell through to a table.
+        let err = Materialization::parse("veiw").unwrap_err();
+        assert_eq!(err.error_uri(), "delightql-error://imprint/manifest/materialization");
+        assert!(err.to_string().contains("veiw"), "{}", err);
+    }
+
+    #[test]
+    fn extent_parses_known() {
+        assert_eq!(Extent::parse("permanent").unwrap(), Extent::Permanent);
+        assert_eq!(Extent::parse("temporary").unwrap(), Extent::Temporary);
+    }
+
+    #[test]
+    fn extent_rejects_typo() {
+        // Pre-fix: extent == "temporary" only, so "temp" silently meant permanent.
+        let err = Extent::parse("temp").unwrap_err();
+        assert_eq!(err.error_uri(), "delightql-error://imprint/manifest/extent");
+        assert!(err.to_string().contains("temp"), "{}", err);
+    }
+
+    #[test]
+    fn entity_name_accepts_plain() {
+        assert!(validate_entity_name("seniors").is_ok());
+    }
+
+    #[test]
+    fn entity_name_rejects_embedded_quote() {
+        // Reachable via a triple-quoted DQL literal `"""a"b"""` → strip → a"b.
+        let err = validate_entity_name("a\"b").unwrap_err();
+        assert_eq!(err.error_uri(), "delightql-error://imprint/manifest/entity_name");
+    }
 }

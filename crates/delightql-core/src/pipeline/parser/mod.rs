@@ -1233,6 +1233,48 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// The two-paren inline-directive-table form (`name!(rows)(out)`) is
+    /// directive-agnostic by grammar design (grammar.js `inline_directive_table`
+    /// rule, change rnyuwvzv): `field('name', $.identifier)` matches ANY
+    /// directive name, not just doc!. Only doc! is exercised elsewhere, so this
+    /// pins a NON-doc! directive (mount!) through the same parse path to keep
+    /// the generality from silently regressing to doc!-only. Parse/CST-level
+    /// only — no execution (mount! would need a real DB); the point is that the
+    /// grammar routes it through `inline_directive_table`, same as doc!.
+    #[test]
+    fn inline_directive_table_is_directive_agnostic() {
+        fn contains_kind(node: tree_sitter::Node, kind: &str) -> bool {
+            if node.kind() == kind {
+                return true;
+            }
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            children.into_iter().any(|c| contains_kind(c, kind))
+        }
+
+        // Sanity: doc! takes this path (the only directive tested today).
+        let doc_tree = parse(r#"doc!("main.users", "x")(*)"#).expect("doc! two-paren parses");
+        assert!(
+            contains_kind(doc_tree.root_node(), "inline_directive_table"),
+            "doc! should route through inline_directive_table: {}",
+            doc_tree.root_node().to_sexp()
+        );
+
+        // The generality: a NON-doc! directive parses through the SAME rule.
+        let source = r#"mount!("db.sqlite", "main")(*)"#;
+        let tree = parse(source).expect("non-doc! two-paren directive form should parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "non-doc! two-paren form parsed with errors: {}",
+            tree.root_node().to_sexp()
+        );
+        assert!(
+            contains_kind(tree.root_node(), "inline_directive_table"),
+            "a non-doc! directive must route through inline_directive_table too; got: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
     // ========================================================================
     // DDL Parsing Tests
     // ========================================================================

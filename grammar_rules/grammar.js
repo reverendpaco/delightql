@@ -299,8 +299,18 @@ module.exports = grammar(dqlGrammar, {
       field('body', $.query),
     ),
 
-    // View head item: free variable (identifier) or ground term (literal)
+    // View head item: free variable (identifier) or ground term (literal),
+    // optionally labeled with `as name` (defining-head naming/conformance).
+    // In a DEFINING head, `as` means "left side supplies, right side labels":
+    //   `nation as country` — plumb the lvar, offer `country` as the position's name
+    //   `"VIP" as tag`      — supply the constant, offer `tag` as the position's name
+    // See book/design/clause-head-catechism.md §II (remedy 2).
     view_head_item: $ => choice(
+      seq(
+        field('supply', choice($.identifier, $.string_literal, $.number_literal)),
+        $._as,
+        field('label', $.identifier),
+      ),
       $.identifier,
       $.string_literal,
       $.number_literal,

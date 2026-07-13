@@ -177,7 +177,9 @@ pub struct OptionSpec {
 pub struct InlineDdlSpec {
     /// The raw DDL body text (view definitions, rules, etc.)
     pub body: String,
-    /// Optional namespace suffix for the definitions (default: "user", resolved to "main::user")
+    /// Optional namespace name for the definitions. `Some("chz")` routes to the
+    /// scratch child `home::chz`; `None` (unnamed block) lands the entities directly
+    /// in `home` (catechism §IV).
     pub namespace: Option<String>,
 }
 

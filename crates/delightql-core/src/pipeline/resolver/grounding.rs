@@ -88,6 +88,10 @@ fn lookup_borrowed_function(
 ) -> Result<Option<crate::resolution::registry::ConsultedEntity>> {
     if let Some(ns) = namespace {
         let fq = namespace_path_to_fq(ns);
+        // Blueprint inertness, loud door for the function route (M2,
+        // companion_linear--74): a qualified call into an archived blueprint
+        // gets the badged refusal, not a confusing "no such function".
+        consult.refuse_if_blueprint_fq(&fq)?;
         Ok(consult
             .lookup_entity(name, &fq)
             .filter(|e| e.entity_type == EntityType::DqlFunctionExpression))
@@ -104,6 +108,8 @@ fn lookup_borrowed_context_aware_function(
 ) -> Result<Option<crate::resolution::registry::ConsultedEntity>> {
     if let Some(ns) = namespace {
         let fq = namespace_path_to_fq(ns);
+        // Blueprint inertness, loud door (M2, --74) — see lookup_borrowed_function.
+        consult.refuse_if_blueprint_fq(&fq)?;
         Ok(consult
             .lookup_entity(name, &fq)
             .filter(|e| e.entity_type == EntityType::DqlContextAwareFunctionExpression))
@@ -1106,10 +1112,78 @@ pub(super) fn expand_multi_clause_view(
 // how we apply it to the body.
 // ============================================================================
 
+/// Ground-Position Naming Rule (clause-head-catechism.md §II, ruled 2026-07-08,
+/// activated 2026-07-08 now that head-`as` parses).
+///
+/// A relational rule-head POSITION that every clause supplies with GROUND terms —
+/// i.e. zero naming offers across all clauses (per `offered_name()` all-None: no
+/// lvar, no `as`-label) — REFUSES loudly. This eliminates the unnamed `_colN` state
+/// for rule heads, and with it the springing-rename evolution trap: an unnamed
+/// position is the only state from which a public name can appear without a contest,
+/// so a later lvar clause would silently name (rename) it. With the rule the position
+/// must already carry a standing name, which the later lvar CONTESTS (name_conflict)
+/// instead of silently displacing.
+///
+/// Applies to single-clause heads too (one clause supplying ground = every clause
+/// abstaining). Does NOT apply to facts (a separate `DdlHead::Fact` path that never
+/// reaches this desugar), HO param positions, or HO output heads (distinct machinery).
+fn validate_ground_position_naming(
+    view_name: &str,
+    heads: &[&Vec<ViewHeadItem>],
+) -> Result<()> {
+    if heads.is_empty() {
+        return Ok(());
+    }
+    let arity = heads[0].len();
+    for pos in 0..arity {
+        let all_abstain = heads
+            .iter()
+            .all(|items| matches!(items.get(pos), Some(it) if it.offered_name().is_none()));
+        if all_abstain {
+            let n = heads.len();
+            let literal = heads[0][pos].supply();
+            return Err(DelightQLError::validation_error_categorized(
+                "ddl/head/unnamed_ground_position",
+                format!(
+                    "Entity '{}': head position {} is supplied only by ground terms — \
+                     every one of its {} {} abstains from naming it (no lvar, no \
+                     `as`-label). A position supplied only by ground terms must carry a \
+                     name — every clause abstained (the Ground-Position Naming Rule, \
+                     clause-head-catechism.md §II). Name it in the head, e.g. `{} as tag`: \
+                     the literal still supplies, the label only names the position. Why \
+                     loud: an unnamed position is the only state from which a public name \
+                     can silently spring into existence — a later lvar clause would rename \
+                     it with no warning; naming it now makes that a caught contest instead \
+                     of a 3am surprise in someone's jq pipeline.",
+                    view_name,
+                    pos + 1,
+                    n,
+                    if n == 1 { "clause" } else { "clauses" },
+                    literal,
+                ),
+                "Unnamed ground position",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Compute canonical column names from argumentative view head items across clauses.
 ///
-/// For each position, find the free-variable name from any clause.
-/// If all clauses are ground at a position, generate synthetic name `_col{pos+1}`.
+/// For each position, the canonical name is the position's naming OFFER (see the
+/// naming algebra in clause-head-catechism.md §II): an `as`-label, or an unlabeled
+/// lvar's own name. Ground literals without a label ABSTAIN.
+///
+/// The all-abstain case (every clause a bare ground literal at a position) can no
+/// longer reach this function for rule heads: `validate_ground_position_naming`
+/// refuses it upstream (the Ground-Position Naming Rule). The `_col{pos+1}` fallback
+/// below is therefore defensive/dead for the production desugar path; it survives
+/// only as the pure name-computer's total definition (and is exercised directly by
+/// unit tests). `_colN` is dead as an interface name for rule heads.
+///
+/// Contested offers (two differing names) are rejected earlier by
+/// `desugar_argumentative_defs`; by the time we get here a position's offers are
+/// unanimous, so taking the first offer is safe.
 fn compute_canonical_column_names(heads: &[&Vec<ViewHeadItem>]) -> Vec<String> {
     if heads.is_empty() {
         return vec![];
@@ -1117,13 +1191,13 @@ fn compute_canonical_column_names(heads: &[&Vec<ViewHeadItem>]) -> Vec<String> {
     let arity = heads[0].len();
     (0..arity)
         .map(|pos| {
-            // Find first free variable at this position across all clauses
+            // Find the first naming offer at this position across all clauses
             for items in heads {
-                if let Some(ViewHeadItem::Free(name)) = items.get(pos) {
-                    return name.clone();
+                if let Some(name) = items.get(pos).and_then(|it| it.offered_name()) {
+                    return name.to_string();
                 }
             }
-            // All ground at this position — synthetic name
+            // All abstain at this position — synthetic name
             format!("_col{}", pos + 1)
         })
         .collect()
@@ -1151,20 +1225,21 @@ fn desugar_single_clause(
     canonical_names: &[String],
     body_text: &str,
 ) -> String {
+    // Each clause aliases its SUPPLY (plumbed column or literal) to the position's
+    // canonical name. The `as`-label never appears here directly — it did its work in
+    // `compute_canonical_column_names` by supplying the offer that became `canon_name`.
+    // So `nation as country` (Free { nation, country }) at a `country`-canonical
+    // position projects `nation as country`, exactly like the body cover
+    // `|> *(nation as country)`; and `"VIP" as tag` projects `"VIP" as tag`.
     let proj_items: Vec<String> = items
         .iter()
         .zip(canonical_names.iter())
-        .map(|(item, canon_name)| match item {
-            ViewHeadItem::Free(col_name) => {
-                if col_name == canon_name {
-                    col_name.clone()
-                } else {
-                    // Free variable name differs from canonical — use alias
-                    format!("{} as {}", col_name, canon_name)
-                }
-            }
-            ViewHeadItem::Ground(literal) => {
-                format!("{} as {}", literal, canon_name)
+        .map(|(item, canon_name)| {
+            let supply = item.supply();
+            if supply == canon_name {
+                supply.to_string()
+            } else {
+                format!("{} as {}", supply, canon_name)
             }
         })
         .collect();
@@ -1248,33 +1323,49 @@ pub(super) fn desugar_argumentative_defs(defs: Vec<DdlDefinition>) -> Result<Vec
 
         let arity = first_items.len();
         for pos in 0..arity {
-            let mut free_name: Option<&str> = None;
+            // A position's public name is the unanimous OFFER of its clauses. Offers are
+            // `as`-labels and unlabeled lvar names; unlabeled ground literals abstain.
+            // Two DIFFERING offers refuse loudly: this is an interface-naming obligation
+            // (a public name must be singular), not a position-identity/unification claim.
+            let mut first_offer: Option<(&str, usize)> = None; // (name, clause_idx)
             for (clause_idx, items) in arg_heads.iter().enumerate() {
-                if let ViewHeadItem::Free(name) = &items[pos] {
-                    if let Some(existing) = free_name {
-                        if existing != name.as_str() {
+                if let Some(name) = items[pos].offered_name() {
+                    if let Some((existing, existing_idx)) = first_offer {
+                        if existing != name {
                             return Err(DelightQLError::validation_error_categorized(
                                 "ddl/head/name_conflict",
                                 format!(
-                                    "Entity '{}': position {} is named '{}' in clause {} \
-                                     but '{}' in an earlier clause. \
-                                     Free variables at each position must agree.",
+                                    "Entity '{}': position {} carries conflicting name offers \
+                                     '{}' (clause {}) and '{}' (clause {}). A position's public \
+                                     name must be singular, deterministic, and independent of \
+                                     clause order. Conform the differing clause in its head with \
+                                     `{} as {}`, or with a body rename-cover `|> *({} as {})`.",
                                     view_name,
                                     pos + 1,
+                                    existing,
+                                    existing_idx + 1,
                                     name,
                                     clause_idx + 1,
-                                    existing
+                                    name,
+                                    existing,
+                                    name,
+                                    existing,
                                 ),
                                 "Head name conflict",
                             ));
                         }
                     } else {
-                        free_name = Some(name.as_str());
+                        first_offer = Some((name, clause_idx));
                     }
                 }
             }
         }
     }
+
+    // Ground-Position Naming Rule (catechism §II): refuse any position every clause
+    // supplies with ground terms (all offers absent). Runs for single- AND multi-clause
+    // heads, after the arity check above (so `arg_heads[0]` sets the shared arity).
+    validate_ground_position_naming(&view_name, &arg_heads)?;
 
     let canonical_names = compute_canonical_column_names(&arg_heads);
 
@@ -1501,13 +1592,19 @@ pub(super) fn inject_scalar_columns(
         // Then: output head items
         if let Some(items) = output_head {
             for item in items {
+                // NOTE: HO output-head positions do NOT yet honor `as`-labels. The
+                // label parses (view_head_item is shared with rule heads) and is carried
+                // in the AST, but is ignored here — this is the HO output machinery, out
+                // of scope for the head-`as` change. Head-`as` on HO output positions is
+                // future work (clause-head-catechism Deviations item 13). Behavior here is
+                // deliberately byte-identical to before head-`as`.
                 match item {
-                    ViewHeadItem::Free(name) => {
+                    ViewHeadItem::Free { name, .. } => {
                         embed_exprs.push(
                             ast_unresolved::DomainExpression::lvar_builder(name.clone()).build(),
                         );
                     }
-                    ViewHeadItem::Ground(literal) => {
+                    ViewHeadItem::Ground { literal, .. } => {
                         let val = parse_literal_value(literal);
                         embed_exprs.push(ast_unresolved::DomainExpression::Literal {
                             value: val,
@@ -2926,4 +3023,149 @@ fn patch_data_ns_in_domain_expr(
     DataNsPatcher { data_ns }
         .transform_domain(expr)
         .expect("namespace patching is infallible")
+}
+
+#[cfg(test)]
+mod head_as_naming_tests {
+    //! Unit tests for the defining-head `as` naming algebra
+    //! (clause-head-catechism.md §II). An `as`-label is an OFFER: it contests
+    //! other offers, beats abstention, and agrees with a matching sibling.
+    use super::{compute_canonical_column_names, validate_ground_position_naming};
+    use crate::pipeline::asts::ddl::ViewHeadItem;
+
+    fn free(name: &str) -> ViewHeadItem {
+        ViewHeadItem::Free {
+            name: name.into(),
+            label: None,
+        }
+    }
+    fn free_as(name: &str, label: &str) -> ViewHeadItem {
+        ViewHeadItem::Free {
+            name: name.into(),
+            label: Some(label.into()),
+        }
+    }
+    fn ground(lit: &str) -> ViewHeadItem {
+        ViewHeadItem::Ground {
+            literal: lit.into(),
+            label: None,
+        }
+    }
+    fn ground_as(lit: &str, label: &str) -> ViewHeadItem {
+        ViewHeadItem::Ground {
+            literal: lit.into(),
+            label: Some(label.into()),
+        }
+    }
+
+    #[test]
+    fn offered_name_and_supply() {
+        // Free without label: offers its own name (plumbing), supplies the column.
+        assert_eq!(free("country").offered_name(), Some("country"));
+        assert_eq!(free("country").supply(), "country");
+        // Free with label: LABEL is the offer; lvar becomes pure plumbing (supply).
+        assert_eq!(free_as("nation", "country").offered_name(), Some("country"));
+        assert_eq!(free_as("nation", "country").supply(), "nation");
+        // Ground without label: ABSTAINS; supplies the literal.
+        assert_eq!(ground("\"VIP\"").offered_name(), None);
+        assert_eq!(ground("\"VIP\"").supply(), "\"VIP\"");
+        // Ground with label: label is the offer; supplies the literal.
+        assert_eq!(ground_as("\"VIP\"", "tag").offered_name(), Some("tag"));
+        assert_eq!(ground_as("\"VIP\"", "tag").supply(), "\"VIP\"");
+    }
+
+    #[test]
+    fn canonical_lvar_offer_beats_literal_abstention() {
+        // Position 0: literal abstains (clause 1), lvar offers `status` (clause 2).
+        let c1 = vec![ground("\"active\""), free("first_name")];
+        let c2 = vec![free("status"), free("first_name")];
+        let names = compute_canonical_column_names(&[&c1, &c2]);
+        assert_eq!(names, vec!["status".to_string(), "first_name".to_string()]);
+    }
+
+    #[test]
+    fn canonical_label_offer_beats_abstention() {
+        // Position 0: `"x" as tag` offers `tag` (clause 1), bare `"y"` abstains (clause 2).
+        let c1 = vec![ground_as("\"x\"", "tag"), free("last_name")];
+        let c2 = vec![ground("\"y\""), free("last_name")];
+        let names = compute_canonical_column_names(&[&c1, &c2]);
+        assert_eq!(names, vec!["tag".to_string(), "last_name".to_string()]);
+    }
+
+    #[test]
+    fn canonical_label_overrides_lvar_own_name() {
+        // A single-clause `nation as country`: the offer is the LABEL, not `nation`.
+        let c1 = vec![free_as("nation", "country"), free("last_name")];
+        let names = compute_canonical_column_names(&[&c1]);
+        assert_eq!(names, vec!["country".to_string(), "last_name".to_string()]);
+    }
+
+    #[test]
+    fn canonical_label_lvar_agreement() {
+        // Clause 1 lvar `country`; clause 2 `"x" as country`. Unanimous offer `country`.
+        let c1 = vec![free("country"), free("last_name")];
+        let c2 = vec![ground_as("\"x\"", "country"), free("last_name")];
+        let names = compute_canonical_column_names(&[&c1, &c2]);
+        assert_eq!(names, vec!["country".to_string(), "last_name".to_string()]);
+    }
+
+    #[test]
+    fn canonical_all_abstain_pure_computer_still_yields_col_n() {
+        // The PURE name-computer remains total: with no offers it falls back to
+        // `_col1`. Production never calls it in this state for rule heads — the
+        // Ground-Position Naming Rule (`validate_ground_position_naming`) refuses
+        // first (see `ground_position_rule_refuses_*` below). This test pins that
+        // enforcement lives in the validator, not in the name-computer.
+        let c1 = vec![ground("\"a\""), free("first_name")];
+        let c2 = vec![ground("\"b\""), free("first_name")];
+        let names = compute_canonical_column_names(&[&c1, &c2]);
+        assert_eq!(names, vec!["_col1".to_string(), "first_name".to_string()]);
+    }
+
+    // ---- Ground-Position Naming Rule (catechism §II) --------------------------
+
+    #[test]
+    fn ground_position_rule_refuses_multiclause_all_abstain() {
+        // Position 0: both clauses a bare literal -> every clause abstains -> REFUSE.
+        let c1 = vec![ground("\"a\""), free("first_name")];
+        let c2 = vec![ground("\"b\""), free("first_name")];
+        let err = validate_ground_position_naming("label_only", &[&c1, &c2])
+            .expect_err("all-abstain position must refuse");
+        assert!(
+            err.error_uri().contains("ddl/head/unnamed_ground_position"),
+            "category: {}",
+            err.error_uri()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("position 1"), "names position: {msg}");
+        assert!(msg.contains("as tag"), "gives remedy: {msg}");
+    }
+
+    #[test]
+    fn ground_position_rule_refuses_single_clause_all_ground() {
+        // Single-clause head, sole clause a bare literal -> REFUSE
+        // (one clause supplying ground = every clause abstaining).
+        let c1 = vec![ground("\"employee\""), free("first_name"), free("age")];
+        let err = validate_ground_position_naming("labeled_users", &[&c1])
+            .expect_err("single all-ground position must refuse");
+        assert!(err
+            .error_uri()
+            .contains("ddl/head/unnamed_ground_position"));
+    }
+
+    #[test]
+    fn ground_position_rule_ok_when_one_clause_offers() {
+        // Position 0 rescued by a single lvar offer (the seed-program shape):
+        // an offer exists, so the position is named -> no refusal.
+        let c1 = vec![ground("\"France\""), free("last_name")];
+        let c2 = vec![free("country"), free("last_name")];
+        assert!(validate_ground_position_naming("bracket", &[&c1, &c2]).is_ok());
+    }
+
+    #[test]
+    fn ground_position_rule_ok_when_labeled() {
+        // `"VIP" as tag` turns the abstention into an offer -> named -> ok.
+        let c1 = vec![ground_as("\"VIP\"", "tag"), free("first_name")];
+        assert!(validate_ground_position_naming("tagged", &[&c1]).is_ok());
+    }
 }

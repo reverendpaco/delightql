@@ -69,6 +69,18 @@ Print build identity; machine-readable with
 See
 .BR dql-version (1).
 .TP
+.B selftest
+Run self-diagnostics: every diagnostic provider (autoload health,
+catalog orphans) reports findings as
+.B delightql-diagnostic://
+badged records, each explainable via
+.BR "dql explain" .
+.B \-\-json
+emits the findings as a JSON array for CI;
+.B \-\-strict
+treats warnings as failures (exit nonzero on any WARN). Exit status is
+nonzero on any FAIL.
+.TP
 .B man
 Show one of these manual pages, rendered from the copies embedded in
 the binary (a projection of

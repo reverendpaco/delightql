@@ -102,6 +102,149 @@ pub fn desugar_named_case(node: &CstNode, source: &str) -> Result<DesugaredNamed
     })
 }
 
+/// Rewrite a `fact_definition` source into equivalent argumentative-view clause
+/// source(s), for the fact-as-clause union feature
+/// (DDL-CLAUSE-ALGEBRA-ANALYSIS.md ruling 4 / §4-DESIGN).
+///
+/// Facts already compile as UNION ALL views (`DqlFactExpression` is the
+/// expression family). This reshapes a fact clause into a view clause so that a
+/// name mixing fact and view clauses can run the UNCHANGED view pipeline (naming
+/// algebra, arity, union desugar, Ground-Position rule). The rewritten source is
+/// INDISTINGUISHABLE from a hand-written view clause — the property that makes
+/// downstream correctness free (the head-`as`/named-case desugar precedent).
+///
+/// - **Stacked fact** (has column headers) → ONE Free-headed clause plumbing the
+///   named anonymous table; the headers become naming OFFERS:
+///     `b(tag, x --- "foo","X"; "bar","Y")`
+///        → `b(tag, x) :- _(tag, x --- "foo","X"; "bar","Y")`
+///   Sparse (`?`) headers keep their marker in the BODY anon table (sparseness is
+///   a body concern) but drop it in the head (head items only name positions).
+/// - **Standard fact** (no headers) → ONE Ground-headed clause PER DATA ROW over a
+///   unit body; the ground items SUPPLY the literals and ABSTAIN from naming (so
+///   rule-clause lvars name the positions, or the Ground-Position rule fires):
+///     `b("foo","X"; "bar","Y")` → [`b("foo","X") :- _(1)`, `b("bar","Y") :- _(1)`]
+///   One row per arm preserves bag semantics: a duplicate identical row is a
+///   duplicate arm is two proofs (clause-head-catechism.md §I).
+pub fn fact_clause_to_view_sources(fact_source: &str) -> Result<Vec<String>> {
+    let tree = parse_ddl(fact_source)?;
+    let root = CstNode::new(tree.root_node(), fact_source);
+
+    // Locate the `fact_definition` node (possibly wrapped in a `definition`).
+    let fact_node = root
+        .children()
+        .find_map(|child| match child.kind() {
+            "fact_definition" => Some(child),
+            "definition" => child
+                .child(0)
+                .filter(|inner| inner.kind() == "fact_definition"),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            DelightQLError::parse_error(format!(
+                "fact_clause_to_view_sources: no fact_definition in '{}'",
+                fact_source
+            ))
+        })?;
+
+    let name = fact_node
+        .field("name")
+        .ok_or_else(|| DelightQLError::parse_error("fact definition missing name"))?
+        .text()
+        .to_string();
+
+    // The inner-parens content, reused verbatim as the anon-table body text.
+    // (First `(` and last `)` bracket the data; inner parens in data are safe.)
+    let full_text = fact_node.text();
+    let open = full_text
+        .find('(')
+        .ok_or_else(|| DelightQLError::parse_error("fact definition missing '('"))?;
+    let close = full_text
+        .rfind(')')
+        .ok_or_else(|| DelightQLError::parse_error("fact definition missing ')'"))?;
+    let data_content = full_text[open + 1..close].trim();
+
+    if let Some(headers) = fact_node.find_child("column_headers") {
+        // Stacked fact: headers → Free head items (offers); the body is the full
+        // anon table (headers + rows) so its columns carry the header names, which
+        // the Free head items plumb. Header names drop any `?` sparse marker.
+        let header_items: Vec<CstNode> = headers
+            .children()
+            .filter(|c| c.kind() == "column_header_item")
+            .collect();
+        let header_names: Vec<String> = header_items
+            .iter()
+            .filter_map(|c| c.children().next().map(|id| id.text().to_string()))
+            .collect();
+        if header_names.is_empty() {
+            return Err(DelightQLError::parse_error(
+                "stacked fact has empty column headers",
+            ));
+        }
+
+        // SINGLE-ROW workaround (review catch): a single-row stacked anon
+        // table as a clause body in a MULTI-CLAUSE definition trips a
+        // pre-existing disjunctive-path parse bug ("Guard expression … did
+        // not produce a filter"; hand-written equivalents fail identically —
+        // bugs/single-row-stacked-disjunctive/). A single non-sparse row is
+        // semantically identical to an `as`-labeled ground clause —
+        //   b(tag, x --- "m","r")  ≡  b("m" as tag, "r" as x) :- _(1)
+        // — same supply, same naming OFFERS, none of the fragile body shape.
+        // Sparse single-row facts keep the anon-table shape (their `_(col @
+        // val)` fills live in the body) and inherit the filed bug until it
+        // is fixed at the root.
+        let has_sparse = header_items
+            .iter()
+            .any(|c| c.text().contains('?'));
+        if !has_sparse {
+            if let Some(data_rows) = fact_node.find_child("data_rows") {
+                let row_nodes: Vec<CstNode> = data_rows
+                    .children()
+                    .filter(|c| c.kind() == "data_row")
+                    .collect();
+                if row_nodes.len() == 1 {
+                    let values: Vec<String> = row_nodes[0]
+                        .children()
+                        .map(|v| v.text().trim().to_string())
+                        .filter(|t| !t.is_empty() && t != ",")
+                        .collect();
+                    if values.len() == header_names.len() {
+                        let pairs: Vec<String> = values
+                            .iter()
+                            .zip(header_names.iter())
+                            .map(|(v, h)| format!("{} as {}", v, h))
+                            .collect();
+                        return Ok(vec![format!("{}({}) :- _(1)", name, pairs.join(", "))]);
+                    }
+                }
+            }
+        }
+
+        Ok(vec![format!(
+            "{}({}) :- _({})",
+            name,
+            header_names.join(", "),
+            data_content
+        )])
+    } else {
+        // Standard fact: one Ground-headed clause per row over a unit body `_(1)`.
+        let data_rows = fact_node
+            .find_child("data_rows")
+            .ok_or_else(|| DelightQLError::parse_error("standard fact missing data_rows"))?;
+        let rows: Vec<String> = data_rows
+            .children()
+            .filter(|c| c.kind() == "data_row")
+            .map(|r| r.text().trim().to_string())
+            .collect();
+        if rows.is_empty() {
+            return Err(DelightQLError::parse_error("standard fact has no data rows"));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| format!("{}({}) :- _(1)", name, row))
+            .collect())
+    }
+}
+
 /// Extract just the name and head from a definition CST node.
 ///
 /// Parses the head structure (params, HO params, etc.) without touching the body.
@@ -241,6 +384,32 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                     .filter(|n| n.kind() == "view_head_item")
                     .map(|n| extract_single_view_head_item(n))
                     .collect();
+                // Head-`as` labels are NOT yet wired through the HO output
+                // machinery (`inject_scalar_columns` would silently ignore
+                // them — the `_ground` naming path, clause-head-catechism
+                // item 13). Accepted-but-ignored is the silent-wrong class:
+                // refuse loudly until the label actually lands.
+                if let Some(labeled) = items.iter().find_map(|i| match i {
+                    ViewHeadItem::Free {
+                        label: Some(l), ..
+                    }
+                    | ViewHeadItem::Ground {
+                        label: Some(l), ..
+                    } => Some(l.clone()),
+                    _ => None,
+                }) {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "ddl/head/ho_label_unsupported",
+                        format!(
+                            "`as {}` in a higher-order view's output head is not \
+                             yet supported — the label would be silently ignored. \
+                             Name the column in the body instead (e.g. a rename- \
+                             cover `|> *(col as {})`)",
+                            labeled, labeled
+                        ),
+                        "head-as label on HO output position",
+                    ));
+                }
                 if items.is_empty() {
                     None
                 } else {
@@ -296,7 +465,10 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                 .map(|ch| {
                     ch.children()
                         .filter(|c| c.kind() == "column_header_item")
-                        .map(|c| ViewHeadItem::Free(c.text().to_string()))
+                        .map(|c| ViewHeadItem::Free {
+                            name: c.text().to_string(),
+                            label: None,
+                        })
                         .collect::<Vec<_>>()
                 })
                 .filter(|items| !items.is_empty());
@@ -689,12 +861,24 @@ fn extract_view_head_items(node: &CstNode) -> Vec<ViewHeadItem> {
 }
 
 /// Extract a single `ViewHeadItem` from a `view_head_item` CST node.
+///
+/// Handles both the bare form (`identifier` / literal) and the `as`-labeled form
+/// (`supply as label`): the `label` field, when present, is the position's naming
+/// offer per the defining-head `as` rule (clause-head-catechism §II).
 fn extract_single_view_head_item(node: &CstNode) -> ViewHeadItem {
-    let child = node.child(0).unwrap_or(*node);
-    match child.kind() {
-        "identifier" => ViewHeadItem::Free(child.text().to_string()),
-        "string_literal" | "number_literal" => ViewHeadItem::Ground(child.text().to_string()),
-        _ => ViewHeadItem::Free(child.text().to_string()),
+    // `as`-labeled form carries a `label` field; the supply is under `supply`.
+    let label = node.field("label").map(|n| n.text().to_string());
+    let supply = node.field("supply").unwrap_or_else(|| node.child(0).unwrap_or(*node));
+    match supply.kind() {
+        "string_literal" | "number_literal" => ViewHeadItem::Ground {
+            literal: supply.text().to_string(),
+            label,
+        },
+        // identifier (or any other) → free variable
+        _ => ViewHeadItem::Free {
+            name: supply.text().to_string(),
+            label,
+        },
     }
 }
 
@@ -722,6 +906,24 @@ fn extract_ddl_neck(neck_node: &CstNode) -> Result<DdlNeck> {
 mod tests {
     use super::*;
     use crate::pipeline::asts::core::{DomainExpression, FunctionExpression};
+
+    /// Head-`as` labels on an HO view's OUTPUT positions refuse loudly
+    /// (the HO output machinery would silently ignore them — the
+    /// accepted-but-ignored class; clause-head-catechism item 13).
+    /// Flips to a positive test when the label is actually wired through.
+    #[test]
+    fn ho_output_head_as_label_refuses_loudly() {
+        let source = r#"labeled(T(*))("vip" as tag, last_name) :- T(*), age > 40"#;
+        let err = build_ddl_file(source).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not yet supported") && msg.contains("tag"),
+            "expected loud ho_label_unsupported refusal, got: {msg}"
+        );
+        // Control: the same head WITHOUT a label builds fine.
+        let ok = r#"labeled(T(*))(tag, last_name) :- T(*), age > 40"#;
+        assert!(build_ddl_file(ok).is_ok());
+    }
 
     #[test]
     fn test_build_function_definition() {
@@ -1020,6 +1222,94 @@ mod tests {
         assert_eq!(def.name, "employee");
         assert!(matches!(def.head, DdlHead::Fact));
         assert!(matches!(def.body, DdlBody::Relational(_)));
+    }
+
+    #[test]
+    fn test_fact_union_standard_single_row_becomes_ground_head_view() {
+        // Standard fact (no headers) → ONE Ground-headed clause over a unit body.
+        // The rewrite is indistinguishable from a hand-written view clause, and
+        // rebuilds as an ArgumentativeView (type 4), not a Fact (type 16).
+        let out = fact_clause_to_view_sources(r#"b("foo", "X")"#).unwrap();
+        assert_eq!(out, vec![r#"b("foo", "X") :- _(1)"#.to_string()]);
+        let rebuilt = build_ddl_file(&out[0]).unwrap();
+        assert_eq!(rebuilt.len(), 1);
+        assert!(matches!(
+            rebuilt[0].head,
+            DdlHead::ArgumentativeView { .. }
+        ));
+        assert_eq!(rebuilt[0].head.entity_type_id(), 4);
+    }
+
+    #[test]
+    fn test_fact_union_standard_multi_row_splits_per_row() {
+        // A multi-row no-header fact splits into one Ground-headed arm per row —
+        // bag semantics (each row = one arm = one proof).
+        let out = fact_clause_to_view_sources(r#"b("foo","X"; "bar","Y")"#).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                r#"b("foo","X") :- _(1)"#.to_string(),
+                r#"b("bar","Y") :- _(1)"#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fact_union_stacked_becomes_free_head_over_named_anon_table() {
+        // Stacked fact (headers) → ONE Free-headed clause plumbing the named
+        // anonymous table; the headers become naming OFFERS. Rebuilds as an
+        // ArgumentativeView whose head items carry the header names.
+        let out =
+            fact_clause_to_view_sources(r#"b(tag, x --- "foo","X"; "bar","Y")"#).unwrap();
+        assert_eq!(
+            out,
+            vec![r#"b(tag, x) :- _(tag, x --- "foo","X"; "bar","Y")"#.to_string()]
+        );
+        let rebuilt = build_ddl_file(&out[0]).unwrap();
+        match &rebuilt[0].head {
+            DdlHead::ArgumentativeView { items } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].offered_name(), Some("tag"));
+                assert_eq!(items[1].offered_name(), Some("x"));
+            }
+            other => panic!("expected ArgumentativeView, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fact_union_stacked_single_row_becomes_as_labeled_ground() {
+        // SINGLE-ROW stacked fact → `as`-labeled ground clause over a unit
+        // body, NOT the single-row stacked anon-table body: that body shape
+        // trips a pre-existing multi-clause parse bug
+        // (bugs/single-row-stacked-disjunctive/). Semantically identical:
+        // same supply, same naming OFFERS. Pinned end-to-end by
+        // ddl/376_fact_union--09.
+        let out = fact_clause_to_view_sources(r#"b(tag, x --- "manual", "row")"#).unwrap();
+        assert_eq!(
+            out,
+            vec![r#"b("manual" as tag, "row" as x) :- _(1)"#.to_string()]
+        );
+        let rebuilt = build_ddl_file(&out[0]).unwrap();
+        match &rebuilt[0].head {
+            DdlHead::ArgumentativeView { items } => {
+                assert_eq!(items[0].offered_name(), Some("tag"));
+                assert_eq!(items[1].offered_name(), Some("x"));
+                assert_eq!(items[0].supply(), "\"manual\"");
+            }
+            other => panic!("expected ArgumentativeView, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fact_union_stacked_strips_sparse_marker_from_head() {
+        // A sparse (`?`) header keeps its marker in the BODY anon table
+        // (sparseness is a body concern) but drops it in the head (head items
+        // only name positions).
+        let out = fact_clause_to_view_sources(r#"b(tag, x? --- "foo","X")"#).unwrap();
+        assert_eq!(
+            out,
+            vec![r#"b(tag, x) :- _(tag, x? --- "foo","X")"#.to_string()]
+        );
     }
 
     #[test]

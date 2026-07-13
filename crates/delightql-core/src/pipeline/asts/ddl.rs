@@ -41,14 +41,55 @@ pub enum DdlNeck {
     TemporaryTable,
 }
 
-/// An item in an argumentative view head: either a free variable or a ground literal.
+/// An item in an argumentative view head: either a free variable or a ground literal,
+/// each optionally carrying an `as`-label (defining-head naming/conformance).
+///
+/// In a defining head, `as` means "left side supplies, right side labels" (the one
+/// uniform rule of book/design/clause-head-catechism.md §II):
+/// - `Free { name: "nation", label: Some("country") }` — plumb `nation`, name the
+///   position `country` (the cross-clause name-conflict conformance remedy).
+/// - `Ground { literal: "\"VIP\"", label: Some("tag") }` — supply the constant `"VIP"`,
+///   name the position `tag`.
+///
+/// In the naming algebra a `label` is an OFFER: it contests other offers (lvar names,
+/// sibling labels), beats abstention (an unlabeled `Ground`), and agrees with a matching
+/// sibling offer. When a `Free` carries a label, the LABEL is the offer — the lvar's own
+/// name stops being offered (it becomes pure plumbing).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewHeadItem {
-    /// Free variable (column name): projected from the body
-    Free(String),
+    /// Free variable (column name): projected from the body. Optional `as`-label.
+    Free {
+        name: String,
+        label: Option<String>,
+    },
     /// Ground term (literal value): constant injected into every row.
-    /// String includes quotes for string literals (e.g., `"old"`).
-    Ground(String),
+    /// String includes quotes for string literals (e.g., `"old"`). Optional `as`-label.
+    Ground {
+        literal: String,
+        label: Option<String>,
+    },
+}
+
+impl ViewHeadItem {
+    /// The naming OFFER this item makes for its position, if any.
+    /// - `Free` with a label offers the label; without, offers its own name (plumbing).
+    /// - `Ground` with a label offers the label; without, abstains (`None`).
+    pub fn offered_name(&self) -> Option<&str> {
+        match self {
+            ViewHeadItem::Free { name, label } => Some(label.as_deref().unwrap_or(name)),
+            ViewHeadItem::Ground { label, .. } => label.as_deref(),
+        }
+    }
+
+    /// The value this item SUPPLIES to its output position: the plumbed column name
+    /// (for `Free`) or the literal text (for `Ground`). The `as`-label never changes
+    /// what is supplied — only how the position is named.
+    pub fn supply(&self) -> &str {
+        match self {
+            ViewHeadItem::Free { name, .. } => name,
+            ViewHeadItem::Ground { literal, .. } => literal,
+        }
+    }
 }
 
 /// Definition head — the structural form of the definition.

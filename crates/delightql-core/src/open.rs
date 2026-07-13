@@ -255,6 +255,17 @@ pub fn open(
     // self-documents the sys:: tables via doc!). Idempotent — safe on every
     // startup. Same post-construction point as seed_help_surface: the system
     // is fully built, so there is no init reentrancy.
+    //
+    // wasm gate (load-bearing, NOT cargo-culted from seed_help_surface): the
+    // wasm `DelightQLSystem` is the rusqlite-free minimal struct with NO
+    // bootstrap catalog (see wasm_system.rs — `run_seed_programs` isn't even
+    // defined there, and `reinit_bootstrap` returns "not supported"). Seeds'
+    // doc! writes into the bootstrap sys:: tables, which do not exist on
+    // wasm, so there is nothing for a seed to write to. open() and
+    // reinit_bootstrap therefore AGREE on wasm (neither runs seeds); the
+    // asymmetry only exists on native, where both run them. Running seeds on
+    // wasm would require porting the whole bootstrap catalog, not dropping
+    // this gate.
     #[cfg(not(target_arch = "wasm32"))]
     system.run_seed_programs().map_err(|e| format!("{}", e))?;
 

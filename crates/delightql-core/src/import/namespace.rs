@@ -131,6 +131,7 @@ pub fn create_namespace_hierarchy(conn: &Connection, specs: &[NamespaceSpec]) ->
 /// - main (user default)
 /// - std (standard library)
 ///   - std::predicates
+/// - home (user scratch container)
 ///
 /// # Arguments
 /// * `conn` - Connection to _bootstrap database
@@ -293,6 +294,23 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             source_path: None,
             writable: false,
         },
+        // `home` — the user's scratch container (catechism §II/§IV, Deviation #2).
+        // Parented to the root `_` (id=1), like `main`/`sys`/`std`. It is the
+        // enlisted destination for in-session authored definitions. Ships typed
+        // as `lib` from day one (the source text you just typed is its truth),
+        // and is the only writable bootstrap namespace: scratch DDL lands here.
+        // id 14 is reserved for a future `sys::session`, so home takes 17 (the
+        // next genuinely free id); dynamic namespaces autoincrement above it.
+        NamespaceSpec {
+            id: 17,
+            name: "home".into(),
+            pid: Some(1),
+            fq_name: "home".into(),
+            kind: "lib".into(),
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: true,
+        },
     ];
 
     create_namespace_hierarchy(conn, &specs)
@@ -438,4 +456,86 @@ pub fn create_namespace_from_path(conn: &Connection, namespace_path: &str) -> Re
     // Return the ID of the final namespace
     let final_id = specs.last().unwrap().id;
     Ok(final_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootstrap::initialize_bootstrap_db;
+
+    /// The root row `_` is the tree's root: id=1, pid=NULL, kind=system.
+    /// home parents to it (catechism §II).
+    #[test]
+    fn test_root_row_is_id_1() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_bootstrap_db(&conn).unwrap();
+        create_bootstrap_namespaces(&conn).unwrap();
+
+        let (id, pid, kind): (i32, Option<i32>, String) = conn
+            .query_row(
+                "SELECT id, pid, kind FROM namespace WHERE fq_name = '_'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(id, 1, "root `_` must be id=1");
+        assert_eq!(pid, None, "root `_` must have NULL parent");
+        assert_eq!(kind, "system", "root `_` must be system-kind");
+    }
+
+    /// `home` ships as a real bootstrap namespace: parented to root, lib-kind,
+    /// writable, bootstrap-provenance (catechism §II/§IV, Deviation #2).
+    #[test]
+    fn test_home_bootstrap_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_bootstrap_db(&conn).unwrap();
+        create_bootstrap_namespaces(&conn).unwrap();
+
+        // Root's id, to assert home is parented to it (not by hardcoded 1).
+        let root_id: i32 = conn
+            .query_row("SELECT id FROM namespace WHERE fq_name = '_'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let (id, name, pid, fq_name, kind, provenance, writable): (
+            i32,
+            String,
+            Option<i32>,
+            String,
+            String,
+            Option<String>,
+            i32,
+        ) = conn
+            .query_row(
+                "SELECT id, name, pid, fq_name, kind, provenance, writable
+                 FROM namespace WHERE fq_name = 'home'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("home bootstrap row must exist");
+
+        assert_eq!(name, "home");
+        assert_eq!(fq_name, "home");
+        assert_eq!(pid, Some(root_id), "home parents to root `_`");
+        assert_eq!(kind, "lib", "home ships typed as lib (scratch container)");
+        assert_eq!(
+            provenance.as_deref(),
+            Some("bootstrap"),
+            "home is a bootstrap namespace"
+        );
+        assert_eq!(writable, 1, "home is user territory — writable");
+        // id 14 is reserved for sys::session; home takes the next free id.
+        assert_eq!(id, 17, "home takes id 17 (14 reserved for sys::session)");
+    }
 }

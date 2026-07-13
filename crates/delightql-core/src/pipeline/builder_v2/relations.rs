@@ -44,10 +44,25 @@ pub(super) fn parse_column_spec(
                     super::expressions::parse_expression(paren, &mut FeatureCollector::new())?
                 } else if let Some(id) = item.find_child("identifier") {
                     // Simple identifier - must be last since identifiers appear in other constructs
-                    DomainExpression::lvar_builder(crate::pipeline::cst::unstrop_identifier(
-                        id.text(),
-                    ))
-                    .build()
+                    let ident = crate::pipeline::cst::unstrop_identifier(id.text());
+                    // HO scalar param substitution in a body relation's argument/column
+                    // position. `by_key(k)(*) :- lookup(k, label)` binds `k` to a call-site
+                    // literal; the identifier `k` here must splice the bound expression so the
+                    // post-substitution AST is indistinguishable from the directly-written
+                    // `lookup("k1", label)` — a Literal in argument position that downstream
+                    // argumentative grounding turns into a WHERE constraint. Without this, `k`
+                    // stayed an lvar (`SELECT id AS k`), the grounding was missed, and the
+                    // scalar-column hygiene pass consumed the underlying column
+                    // (clause-head-catechism item 14 b2).
+                    if let Some(ref bindings) = features.ho_bindings {
+                        if let Some(bound_expr) = bindings.scalar_params.get(ident.as_str()) {
+                            bound_expr.clone()
+                        } else {
+                            DomainExpression::lvar_builder(ident).build()
+                        }
+                    } else {
+                        DomainExpression::lvar_builder(ident).build()
+                    }
                 } else {
                     continue;
                 };
@@ -1341,5 +1356,72 @@ mod column_spec_tests {
             }
             other => panic!("expected Lvar, got {other:?}"),
         }
+    }
+
+    /// Parse `source`'s column_spec with the given HO bindings active.
+    fn column_spec_with_bindings(
+        source: &str,
+        bindings: crate::pipeline::query_features::HoParamBindings,
+    ) -> DomainSpec {
+        let tree = crate::pipeline::parser::parse(source).expect("parse failed");
+        let cst = CstTree::new(&tree, source);
+        let spec_node =
+            find_kind(cst.root(), "column_spec").expect("no column_spec node in source");
+        let mut features = crate::pipeline::query_features::FeatureCollector::new();
+        features.ho_bindings = Some(bindings);
+        parse_column_spec(spec_node, &mut features).expect("parse_column_spec failed")
+    }
+
+    /// Bug B (clause-head-catechism item 14 b2): a scalar-param identifier in a
+    /// body relation's argument/column position must be spliced with its bound
+    /// expression, so `lookup(k, label)` with k→"k1" becomes a Literal in
+    /// position 0 — indistinguishable from the directly-written
+    /// `lookup("k1", label)` — which downstream grounds to a WHERE constraint.
+    #[test]
+    fn scalar_param_in_column_position_is_substituted() {
+        use crate::pipeline::asts::core::LiteralValue;
+        let mut bindings = crate::pipeline::query_features::HoParamBindings::default();
+        bindings.scalar_params.insert(
+            "k".to_string(),
+            DomainExpression::Literal {
+                value: LiteralValue::String("k1".to_string()),
+                alias: None,
+            },
+        );
+        let DomainSpec::Positional(columns) = column_spec_with_bindings("lookup(k, label)", bindings)
+        else {
+            panic!("expected Positional spec");
+        };
+        // Position 0 (`k`) must become the bound literal, not an lvar.
+        match &columns[0] {
+            DomainExpression::Literal {
+                value: LiteralValue::String(s),
+                ..
+            } => assert_eq!(s, "k1"),
+            other => panic!("expected substituted Literal at position 0, got {other:?}"),
+        }
+        // Position 1 (`label`) is not a param — stays an lvar.
+        assert!(matches!(&columns[1], DomainExpression::Lvar { .. }));
+    }
+
+    /// A non-colliding identifier (not a scalar param) is left as an lvar even
+    /// when bindings are active — substitution is name-matched, not blanket.
+    #[test]
+    fn non_param_column_survives_when_bindings_active() {
+        use crate::pipeline::asts::core::LiteralValue;
+        let mut bindings = crate::pipeline::query_features::HoParamBindings::default();
+        bindings.scalar_params.insert(
+            "k".to_string(),
+            DomainExpression::Literal {
+                value: LiteralValue::String("k1".to_string()),
+                alias: None,
+            },
+        );
+        let DomainSpec::Positional(columns) = column_spec_with_bindings("lookup(id, label)", bindings)
+        else {
+            panic!("expected Positional spec");
+        };
+        assert!(matches!(&columns[0], DomainExpression::Lvar { .. }));
+        assert!(matches!(&columns[1], DomainExpression::Lvar { .. }));
     }
 }

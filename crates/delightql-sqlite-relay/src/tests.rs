@@ -528,3 +528,153 @@ fn expression_descriptors_fall_back_to_storage_class() {
     }
     session.close(handle).unwrap();
 }
+
+// --- Tests 11–16: first-non-NULL descriptor election (Change 6, M8) ---
+//
+// An undeclared column (expression / CTE result) elects its storage class
+// from its FIRST NON-NULL value within the first DESCRIPTOR_PEEK_ROWS (64)
+// rows, not from row 0 blindly. This kills the null-first asymmetry
+// (`_(x @ 5; null)` vs `_(x @ null; 5)` were reversed rows, identical data,
+// different JSON types) while preserving streaming (bounded peek). Election
+// is per-column-independent and bounded; the CLI's round-trip demote guard
+// still governs per-value rendering downstream (unchanged).
+
+/// Run SQL over a fresh single-column session and return the descriptor of
+/// the last (only) column plus every fetched cell for that column, in order.
+fn probe(sql: &str) -> (String, Vec<Option<Vec<u8>>>) {
+    let mut session = make_sql_session();
+    let rows = session.agreed_orientation(Orientation::Rows).unwrap();
+    let resp = session.query(b(sql)).unwrap();
+    let (handle, descriptor) = match resp {
+        QueryResponse::Header {
+            handle, dimensions, ..
+        } => {
+            let last = dimensions.last().unwrap();
+            (
+                handle,
+                String::from_utf8_lossy(&last.descriptor).to_string(),
+            )
+        }
+        QueryResponse::Error { message, .. } => {
+            panic!("expected Header, got Error: {}", String::from_utf8_lossy(&message))
+        }
+    };
+    let mut collected = Vec::new();
+    loop {
+        match session.fetch(&handle, Projection::All, 10000, rows).unwrap() {
+            FetchResponse::Data { cells } => {
+                for row in cells {
+                    collected.push(row.last().unwrap().clone());
+                }
+            }
+            FetchResponse::End => break,
+            FetchResponse::Error { message, .. } => {
+                panic!("fetch error: {}", String::from_utf8_lossy(&message))
+            }
+        }
+    }
+    session.close(handle).unwrap();
+    (descriptor, collected)
+}
+
+// (a) A NULL-leading undeclared column elects INTEGER from its first
+// non-NULL value (row 2). Under the old first-row-only peek this was ""
+// (NULL declares nothing) — RED before the fix.
+#[test]
+fn descriptor_elects_from_first_non_null_not_row_zero() {
+    let (desc, cells) =
+        probe("SELECT column2 AS x FROM (VALUES (1, NULL), (2, 5)) ORDER BY column1");
+    assert_eq!(desc, "INTEGER", "null-then-5 must elect INTEGER");
+    // The buffered NULL row must still arrive as data — peeking must not eat it.
+    assert_eq!(cells.len(), 2);
+    assert_eq!(cells[0], null_cell());
+    assert_eq!(cell_text(&cells[1]), "5");
+}
+
+// (b) Reversed-row pairs — identical data, opposite order — must produce
+// IDENTICAL descriptors. Under the old peek `5;null` gave INTEGER and
+// `null;5` gave "" — RED.
+#[test]
+fn descriptor_is_row_order_independent() {
+    let (fwd, _) =
+        probe("SELECT column2 AS x FROM (VALUES (1, 5), (2, NULL)) ORDER BY column1");
+    let (rev, _) =
+        probe("SELECT column2 AS x FROM (VALUES (1, NULL), (2, 5)) ORDER BY column1");
+    assert_eq!(fwd, "INTEGER");
+    assert_eq!(rev, "INTEGER");
+    assert_eq!(fwd, rev, "reversed rows, identical data → identical descriptor");
+}
+
+// (c) An all-NULL undeclared column has no non-NULL value to elect from and
+// stays undeclared ("") — the current NULL behavior, preserved.
+#[test]
+fn descriptor_all_null_column_stays_undeclared() {
+    let (desc, cells) =
+        probe("SELECT column2 AS x FROM (VALUES (1, NULL), (2, NULL)) ORDER BY column1");
+    assert_eq!(desc, "", "no non-NULL in window → declares nothing");
+    assert_eq!(cells.len(), 2);
+}
+
+// (d) Bounds pin. The peek window is DESCRIPTOR_PEEK_ROWS = 64 rows,
+// inclusive: a first non-NULL AT row 64 elects; a first non-NULL at row 65
+// (beyond the window) does NOT — stays "". This pins the bound so it can't
+// silently drift to a full scan (which would break streaming).
+#[test]
+fn descriptor_election_is_bounded_to_the_peek_window() {
+    // First non-NULL at row 64 → within window → elects.
+    let (in_window, _) = probe(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 64) \
+         SELECT CASE WHEN n = 64 THEN 5 END AS x FROM seq ORDER BY n",
+    );
+    assert_eq!(in_window, "INTEGER", "non-NULL at row 64 is inside the window");
+
+    // First non-NULL at row 65 → beyond the window → does NOT elect.
+    let (out_window, cells) = probe(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 65) \
+         SELECT CASE WHEN n = 65 THEN 5 END AS x FROM seq ORDER BY n",
+    );
+    assert_eq!(out_window, "", "non-NULL at row 65 is beyond the 64-row window");
+    assert_eq!(cells.len(), 65, "all rows still stream through");
+    assert_eq!(cell_text(&cells[64]), "5", "the row-65 value still arrives as data");
+}
+
+// (e) Election is not INTEGER-only: a TEXT-leading undeclared column elects
+// TEXT (numeric-looking '007' stays TEXT storage class → the CLI's per-value
+// round-trip guard then keeps it a string; that guard is unchanged).
+#[test]
+fn descriptor_elects_text_storage_class() {
+    let (desc, _) =
+        probe("SELECT column2 AS x FROM (VALUES (1, NULL), (2, '007')) ORDER BY column1");
+    assert_eq!(desc, "TEXT", "first non-NULL is TEXT → TEXT descriptor");
+}
+
+// Per-column independence: column A may elect from row 1 while column B
+// elects from a later row. Column a is non-NULL at row 1; column b is NULL
+// until row 2. Both elect INTEGER; the buffer scans until the last-electing
+// column is satisfied, then closes.
+#[test]
+fn descriptor_election_is_per_column_independent() {
+    let mut session = make_sql_session();
+    let rows = session.agreed_orientation(Orientation::Rows).unwrap();
+    let resp = session
+        .query(b(
+            "SELECT column2 AS a, column3 AS b \
+             FROM (VALUES (1, 10, NULL), (2, 20, 30)) ORDER BY column1",
+        ))
+        .unwrap();
+    let (handle, descs) = match resp {
+        QueryResponse::Header { handle, dimensions, .. } => (
+            handle,
+            dimensions
+                .iter()
+                .map(|d| String::from_utf8_lossy(&d.descriptor).to_string())
+                .collect::<Vec<_>>(),
+        ),
+        QueryResponse::Error { message, .. } => {
+            panic!("error: {}", String::from_utf8_lossy(&message))
+        }
+    };
+    assert_eq!(descs[0], "INTEGER", "column a elects from row 1");
+    assert_eq!(descs[1], "INTEGER", "column b elects from row 2");
+    session.close(handle).unwrap();
+}

@@ -109,11 +109,6 @@ pub enum Command {
         #[arg(long = "attach")]
         attach: Vec<String>,
 
-        /// Interactive mode - allow dot commands
-        #[cfg(feature = "repl")]
-        #[arg(long, short = 'i')]
-        interactive: bool,
-
         /// Path to highlights.scm file
         #[cfg(feature = "repl")]
         #[arg(long)]
