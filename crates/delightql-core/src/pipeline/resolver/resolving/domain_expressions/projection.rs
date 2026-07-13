@@ -372,6 +372,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                 resolved.push(super::simple::resolve_simple_expr(
                     lvar_expr,
                     &available_clone,
+                    &fold.qualifier_scope,
                     fold.in_correlation,
                 )?);
             }

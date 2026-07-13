@@ -83,6 +83,14 @@ inherits = "release"
 opt-level = 3
 lto = "fat"
 
+
+[profile.release-ship]
+inherits    = "release"
+opt-level   = 3          # fast — keep it
+lto         = "fat"      # faster AND smaller, costs only build time
+strip       = "symbols"  # ~8 MB gone, no runtime cost
+# panic stays "unwind"   # safe for server + cabi + wasm
+
 # Custom profile: optimize for minimum size
 [profile.release-size]
 inherits = "release"

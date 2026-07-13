@@ -162,8 +162,14 @@ fn strip_limit(expr: RelationalExpression) -> Result<(RelationalExpression, i64)
                     found,
                 )
             }
-            // Limits live in the linear chain above the join/relation/setop;
-            // we don't descend into joins or set-ops here.
+            // STOP at the WHOLE node: limits live in the linear Filter/Pipe chain
+            // above the Join/Relation/SetOperation/IntersectCorresponding/ER, so
+            // those are returned WHOLESALE — we deliberately do NOT descend a Join
+            // arm or a SetOperation operand. Returning the whole node drops no
+            // recursive field (the node IS the boundary), so this catch-all is
+            // R-I3-safe; the boundary is stated by this comment. (The Filter arm
+            // above preserves `condition` wholesale — it peels the limit off the
+            // spine without recursing into the condition, the base-spine contract.)
             other => (other, None),
         }
     }

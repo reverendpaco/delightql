@@ -59,6 +59,8 @@ pub mod resolver; // Phase 2: AST(unresolved) → AST(resolved) // Phase 3: AST(
                   // transformer_v3 shelved — code preserved in transformer_v3BAK/ for reference.
                   // Use `./dqlOLD` binary for TV3 comparison.
 pub mod ast_transform; // Unified AST walk infrastructure (JEDI Epoch 0 — replaced ast_fold)
+pub mod ast_visit; // Non-consuming whole-tree inspection/collection sibling of ast_transform
+pub mod spine; // The two earned source-spine helpers (R-I2): base/source spine + ending/tail spine
 pub mod cfe_substitution; // CFE parameter substitution (shared between transformers)
 pub mod precedence; // Operator precedence helpers for infix expressions
 pub mod sql_optimizer;
@@ -89,7 +91,7 @@ pub mod verdict; // Verdict types for assertion and error hook outcomes // Per-f
 
 // Re-export key types and functions
 
-use crate::error::Result;
+use crate::error::{DelightQLError, Result};
 use crate::lispy::ToLispy;
 use crate::sexp_formatter;
 use crate::system::DelightQLSystem;
@@ -830,6 +832,21 @@ impl<'a> Pipeline<'a> {
             };
 
             for spec in &specs {
+                let body_demands_directive =
+                    !asts::effects::collect_directive_invocations(&spec.body).is_empty();
+                let right_demands_directive = spec.right_operand.as_ref().is_some_and(|right| {
+                    !asts::effects::collect_directive_invocations(right).is_empty()
+                });
+                if body_demands_directive || right_demands_directive {
+                    let error = DelightQLError::validation_error_categorized(
+                        "assertion/directive/not_permitted",
+                        "directives are not permitted in assertions",
+                        "assertions are read-only checks",
+                    );
+                    self.record_delightql_error(&error);
+                    return Err(error);
+                }
+
                 // Wrap the assertion body in a Query, including outer CTEs and CFEs
                 // so CTE references and CFE definitions resolve correctly inside assertions.
                 let mut assertion_query = ast_unresolved::Query::Relational(spec.body.clone());
@@ -1091,27 +1108,18 @@ impl<'a> Pipeline<'a> {
 /// real table's connection.
 #[stacksafe::stacksafe]
 fn query_has_meta_ize(query: &ast_resolved::Query) -> bool {
+    // Rides Helper A `source_spine`: a MetaIze buried in a join arm still needs
+    // the real table's connection, so the spine STOPS at composites (returns
+    // false) — byte-equivalent to the old `Pipe→(op?/source), Filter→source,
+    // _ => false` walk. Pinned by `source_spine_descends_filter_pipe_to_terminal`.
     fn expr_has_meta_ize(expr: &ast_resolved::RelationalExpression) -> bool {
-        match expr {
-            ast_resolved::RelationalExpression::Pipe(pipe) => {
-                matches!(
-                    pipe.operator,
-                    ast_resolved::UnaryRelationalOperator::MetaIze { .. }
-                ) || expr_has_meta_ize(&pipe.source)
-            }
-            ast_resolved::RelationalExpression::Filter { source, .. } => expr_has_meta_ize(source),
-            ast_resolved::RelationalExpression::Relation(_)
-            | ast_resolved::RelationalExpression::Join { .. }
-            | ast_resolved::RelationalExpression::SetOperation { .. } => false,
-            // ER chains consumed before meta-ize check
-            ast_resolved::RelationalExpression::ErJoinChain { .. }
-            | ast_resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-                unreachable!("ER chains consumed before meta-ize check")
-            }
-            ast_resolved::RelationalExpression::IntersectCorresponding { .. } => {
-                unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-            }
-        }
+        use crate::pipeline::spine::{source_spine, SpineStep};
+        source_spine(expr).any(|step| {
+            matches!(
+                step,
+                SpineStep::Pipe(ast_resolved::UnaryRelationalOperator::MetaIze { .. })
+            )
+        })
     }
 
     match query {

@@ -9,8 +9,14 @@ use crate::pipeline::asts::resolved;
 use crate::pipeline::refiner::flattener::{FlatPredicate, FlatSegment};
 use std::collections::HashSet;
 
-/// Extract table references from a DomainExpression (recursively)
-pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec<String> {
+/// Extract table references from a DomainExpression (recursively).
+///
+/// SCOPE-LOCAL (INVENTORY L6): collects table refs from a predicate within the
+/// current scope; the boolean sub-walker
+/// (`extract_table_references_from_boolean`) does NOT descend nested subquery
+/// scopes. The `_in_scope` name marks that stop boundary (and disambiguates it
+/// from the whole-tree `cte_validation::extract_table_references`).
+pub(super) fn extract_table_references_in_scope(expr: &resolved::DomainExpression) -> Vec<String> {
     let mut tables = Vec::new();
 
     match expr {
@@ -32,7 +38,7 @@ pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec
                 | resolved::FunctionExpression::Curried { arguments, .. }
                 | resolved::FunctionExpression::Bracket { arguments, .. } => {
                     for arg in arguments {
-                        tables.extend(extract_table_references(arg));
+                        tables.extend(extract_table_references_in_scope(arg));
                     }
                 }
                 resolved::FunctionExpression::HigherOrder {
@@ -41,18 +47,18 @@ pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec
                     ..
                 } => {
                     for arg in curried_arguments {
-                        tables.extend(extract_table_references(arg));
+                        tables.extend(extract_table_references_in_scope(arg));
                     }
                     for arg in regular_arguments {
-                        tables.extend(extract_table_references(arg));
+                        tables.extend(extract_table_references_in_scope(arg));
                     }
                 }
                 resolved::FunctionExpression::Infix { left, right, .. } => {
-                    tables.extend(extract_table_references(left));
-                    tables.extend(extract_table_references(right));
+                    tables.extend(extract_table_references_in_scope(left));
+                    tables.extend(extract_table_references_in_scope(right));
                 }
                 resolved::FunctionExpression::Lambda { body, .. } => {
-                    tables.extend(extract_table_references(body));
+                    tables.extend(extract_table_references_in_scope(body));
                 }
                 resolved::FunctionExpression::StringTemplate { .. } => {
                     // StringTemplate should have been expanded to concat by resolver
@@ -65,19 +71,19 @@ pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec
                             resolved::CaseArm::Simple {
                                 test_expr, result, ..
                             } => {
-                                tables.extend(extract_table_references(test_expr));
-                                tables.extend(extract_table_references(result));
+                                tables.extend(extract_table_references_in_scope(test_expr));
+                                tables.extend(extract_table_references_in_scope(result));
                             }
                             resolved::CaseArm::CurriedSimple { result, .. } => {
                                 // Curried simple has no test_expr (it uses @)
-                                tables.extend(extract_table_references(result));
+                                tables.extend(extract_table_references_in_scope(result));
                             }
                             resolved::CaseArm::Searched { condition, result } => {
                                 tables.extend(extract_table_references_from_boolean(condition));
-                                tables.extend(extract_table_references(result));
+                                tables.extend(extract_table_references_in_scope(result));
                             }
                             resolved::CaseArm::Default { result } => {
-                                tables.extend(extract_table_references(result));
+                                tables.extend(extract_table_references_in_scope(result));
                             }
                         }
                     }
@@ -96,16 +102,24 @@ pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec
                 } => {
                     // Extract from window function arguments, partition, and order clauses
                     for arg in arguments {
-                        tables.extend(extract_table_references(arg));
+                        tables.extend(extract_table_references_in_scope(arg));
                     }
                     for arg in partition_by {
-                        tables.extend(extract_table_references(arg));
+                        tables.extend(extract_table_references_in_scope(arg));
                     }
                     for spec in order_by {
-                        tables.extend(extract_table_references(&spec.column));
+                        tables.extend(extract_table_references_in_scope(&spec.column));
                     }
                 }
-                _ => unimplemented!("JsonPath not yet implemented in this phase"),
+                // Spelled per R-I3 (was a bare `_ =>`): JsonPath.source/path and
+                // Array.members carry recursive domain expressions this scope-local
+                // walker does not yet extract from. Kept as the SAME `unimplemented!`
+                // (byte-identical) so a newly-added function variant forces a
+                // decision here instead of being swallowed.
+                resolved::FunctionExpression::JsonPath { .. }
+                | resolved::FunctionExpression::Array { .. } => {
+                    unimplemented!("JsonPath not yet implemented in this phase")
+                }
             }
         }
         resolved::DomainExpression::Predicate { expr, .. } => {
@@ -115,22 +129,22 @@ pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec
         resolved::DomainExpression::PipedExpression {
             value, transforms, ..
         } => {
-            tables.extend(extract_table_references(value));
+            tables.extend(extract_table_references_in_scope(value));
             for (_, transform) in transforms {
                 if let resolved::FunctionExpression::Regular { arguments, .. } = transform {
                     for arg in arguments {
-                        tables.extend(extract_table_references(arg));
+                        tables.extend(extract_table_references_in_scope(arg));
                     }
                 }
             }
         }
         resolved::DomainExpression::Parenthesized { inner, .. } => {
-            tables.extend(extract_table_references(inner));
+            tables.extend(extract_table_references_in_scope(inner));
         }
         // Tuple: recurse into elements
         resolved::DomainExpression::Tuple { elements, .. } => {
             for elem in elements {
-                tables.extend(extract_table_references(elem));
+                tables.extend(extract_table_references_in_scope(elem));
             }
         }
         // ScalarSubquery: the subquery relation references tables, but that's handled
@@ -142,8 +156,8 @@ pub(super) fn extract_table_references(expr: &resolved::DomainExpression) -> Vec
             pivot_key,
             ..
         } => {
-            tables.extend(extract_table_references(value_column));
-            tables.extend(extract_table_references(pivot_key));
+            tables.extend(extract_table_references_in_scope(value_column));
+            tables.extend(extract_table_references_in_scope(pivot_key));
         }
         // Leaf types: no table references
         resolved::DomainExpression::Literal { .. }
@@ -165,8 +179,8 @@ pub(super) fn extract_table_references_from_boolean(
 
     match expr {
         resolved::BooleanExpression::Comparison { left, right, .. } => {
-            tables.extend(extract_table_references(left));
-            tables.extend(extract_table_references(right));
+            tables.extend(extract_table_references_in_scope(left));
+            tables.extend(extract_table_references_in_scope(right));
         }
         resolved::BooleanExpression::And { left, right } => {
             tables.extend(extract_table_references_from_boolean(left));
@@ -187,7 +201,21 @@ pub(super) fn extract_table_references_from_boolean(
             tables.push(left.to_string());
             tables.push(right.to_string());
         }
-        other => panic!("catch-all hit in analyzer/reference_extraction.rs extract_table_references_from_boolean: {:?}", other),
+        // SCOPE-LOCAL contract, spelled per R-I3 (was a bare `other =>`). This
+        // predicate-reference walker runs over already-flattened current-scope
+        // conjunctions of comparisons; the subquery-bearing variants
+        // (InnerExists.subquery, InRelational.value/subquery, In.value/set,
+        // Sigma.condition) do NOT reach it in practice — they are handled at the
+        // relational level, before/around flattening — so encountering one is an
+        // internal invariant violation, kept as the SAME LOUD panic (byte-identical
+        // behavior). Spelling the variants means a newly-added boolean variant now
+        // forces a decision here instead of being silently swallowed.
+        other @ (resolved::BooleanExpression::InnerExists { .. }
+        | resolved::BooleanExpression::InRelational { .. }
+        | resolved::BooleanExpression::In { .. }
+        | resolved::BooleanExpression::Sigma { .. }
+        | resolved::BooleanExpression::Using { .. }
+        | resolved::BooleanExpression::BooleanLiteral { .. }) => panic!("catch-all hit in analyzer/reference_extraction.rs extract_table_references_from_boolean: {:?}", other),
     }
 
     tables

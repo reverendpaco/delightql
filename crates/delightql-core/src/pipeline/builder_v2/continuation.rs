@@ -1090,6 +1090,13 @@ fn negate_terminal_filters_for_forall(
 /// Strip all terminal Predicate-type Filter nodes from the top of an expression.
 /// Returns the collected boolean conditions (outer-to-inner order) and the
 /// remaining inner expression.
+///
+/// KEPT LOCAL (INVENTORY §4, marginal terminal-filter-peel S9–S11): peels
+/// `Filter` ONLY (and only the Predicate-typed ones), never a Pipe — so it is
+/// NOT subsumed by Helper A's `Filter`+`Pipe` base spine. Its per-walker payload
+/// (collect predicates here / count in `count_terminal_pred_filters` / drop-one
+/// in `cdt_wj_rewriter::strip_limit`) diverges enough that a named local peel is
+/// clearer than a shared one.
 fn strip_terminal_pred_filters(
     mut expr: RelationalExpression,
 ) -> (Vec<BooleanExpression>, RelationalExpression) {
@@ -1104,6 +1111,11 @@ fn strip_terminal_pred_filters(
                 conditions.push(bool_expr);
                 expr = *source;
             }
+            // STOP: any non-Predicate Filter, Pipe, Join, SetOperation, Relation,
+            // IntersectCorresponding, ER — returned WHOLESALE as the remaining
+            // inner expression. Returning the whole node drops no recursive field
+            // (the node IS the boundary of this outer-Predicate-filter peel), so a
+            // catch-all is R-I3-safe here; the boundary is stated by this comment.
             other => return (conditions, other),
         }
     }
@@ -1117,6 +1129,11 @@ fn count_terminal_pred_filters(expr: &RelationalExpression) -> usize {
             condition: SigmaCondition::Predicate(_),
             ..
         } => 1 + count_terminal_pred_filters(source),
+        // STOP at the WHOLE node: any non-Predicate Filter, Pipe, Join,
+        // SetOperation, Relation, IntersectCorresponding, ER — the count ends
+        // here. Stopping at the whole node hides no recursive field (the node IS
+        // the boundary of the outer-Predicate-filter peel), so a catch-all is
+        // R-I3-safe; the boundary is stated by this comment.
         _other => 0,
     }
 }

@@ -9,6 +9,7 @@ use crate::pipeline::asts::core::{ProjectionExpr, SubstitutionExpr};
 pub(in crate::pipeline::resolver) fn resolve_simple_expr(
     expr: ast_unresolved::DomainExpression,
     available: &[ast_resolved::ColumnMetadata],
+    qualifier_scope: &[ast_resolved::ColumnMetadata],
     in_correlation: bool,
 ) -> Result<ast_resolved::DomainExpression> {
     match expr {
@@ -24,6 +25,7 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
             namespace_path,
             alias.map(|s| s.to_string()),
             available,
+            qualifier_scope,
             in_correlation,
         ),
 
@@ -197,6 +199,7 @@ fn resolve_lvar(
     namespace_path: crate::pipeline::asts::unresolved::NamespacePath,
     alias: Option<String>,
     available: &[ast_resolved::ColumnMetadata],
+    qualifier_scope: &[ast_resolved::ColumnMetadata],
     in_correlation: bool,
 ) -> Result<ast_resolved::DomainExpression> {
     // Validate column references based on context:
@@ -214,9 +217,37 @@ fn resolve_lvar(
         in_correlation,
         available.len()
     );
-    let should_validate = if available.is_empty() {
+    // A qualifier which is present in the current relational scope is a real
+    // binding, not merely a disambiguation hint. Keep this fact separate from
+    // whether validation must be deferred for an unknown/correlated scope: if
+    // `p` is known, `p.c` must be checked against p's columns specifically.
+    let qualifier_is_bound = qualifier.as_ref().is_some_and(|qual| {
+        qualifier_scope.iter().any(|col| match col.qualifier() {
+            ast_resolved::TableName::Named(table) => table == qual,
+            ast_resolved::TableName::Fresh => qual == "_",
+        })
+    });
+    if !in_correlation
+        && (!available.is_empty() || !qualifier_scope.is_empty())
+        && qualifier.is_some()
+        && !qualifier_is_bound
+    {
+        let qual = qualifier.as_ref().expect("checked is_some");
+        return Err(DelightQLError::ColumnNotFoundError {
+            column: format!("{}.{}", qual, name),
+            context: format!(
+                "Qualifier '{}' is not bound in the current relational scope",
+                qual
+            ),
+        });
+    }
+
+    let should_validate = if available.is_empty() && !qualifier_is_bound {
         // No columns available — source has unknown schema (TVFs, passthrough).
-        // Skip validation; the backend validates at runtime.
+        // Skip unqualified and genuinely unknown-qualified validation; the
+        // backend validates those at runtime. A known qualifier can still be
+        // checked against its lexical binding even when the flattened output
+        // schema is unavailable.
         // Real tables always have at least one column, so empty available
         // can only come from CprSchema::Unknown. See memory/semantic-onion.md.
         log::debug!("  -> should_validate=false (unknown schema, no available columns)");
@@ -232,17 +263,13 @@ fn resolve_lvar(
     } else {
         // In correlation, qualified - validate only if qualifier is in available
         let qual_name = qualifier.as_ref().unwrap();
-        let qualifier_known = available.iter().any(|col| match col.qualifier() {
-            ast_resolved::TableName::Named(t) => t == qual_name,
-            ast_resolved::TableName::Fresh => false,
-        });
-        if !qualifier_known {
+        if !qualifier_is_bound {
             // Qualifier doesn't match any table in scope. Check if the column
             // name exists unqualified under a *Named* table — if so, the
             // qualifier is definitely bogus. If the column only exists under
             // Fresh tables, the qualifier might be the original table name that
             // the resolver doesn't track; let it through for SQL-level resolution.
-            let col_under_named = available.iter().any(|col| {
+            let col_under_named = qualifier_scope.iter().chain(available.iter()).any(|col| {
                 col.info.original_name() == Some(&name)
                     && matches!(col.qualifier(), ast_resolved::TableName::Named(_))
             });
@@ -257,7 +284,7 @@ fn resolve_lvar(
                 });
             }
         }
-        qualifier_known
+        qualifier_is_bound
     };
 
     if should_validate {
@@ -345,16 +372,23 @@ fn resolve_lvar(
             }
         }
 
-        // Non-pipe context or unqualified: validate column name exists,
-        // stripping qualifier (existing lenient behavior).
+        // A live qualifier is part of the lookup key. In a deferred
+        // correlation context, an as-yet-unbound qualifier retains the
+        // historical name-only fallback until the sibling/outer scope is
+        // available.
         {
             let col_ref = ColumnReference::Named {
                 name: name.clone(),
-                qualifier: None,
+                qualifier: qualifier_is_bound.then(|| qualifier.clone()).flatten(),
                 schema,
             };
 
-            let results = unify_columns(vec![col_ref], available);
+            let lookup_columns = if qualifier_is_bound {
+                qualifier_scope
+            } else {
+                available
+            };
+            let results = unify_columns(vec![col_ref], lookup_columns);
 
             for result in results {
                 match result {

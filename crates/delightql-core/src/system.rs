@@ -10482,142 +10482,67 @@ fn register_interior_schemas_from_query(
     entity_id: i32,
     query: &crate::pipeline::asts::core::Query<crate::pipeline::asts::core::Unresolved>,
 ) -> Result<()> {
-    use crate::pipeline::asts::core::Query;
+    use crate::pipeline::ast_visit::walk_visit_query;
 
-    match query {
-        Query::Relational(rel_expr) => {
-            walk_relational_for_tree_groups(conn, entity_id, rel_expr)?;
-        }
-        Query::WithCtes {
-            ctes,
-            query: main_expr,
-        } => {
-            walk_relational_for_tree_groups(conn, entity_id, main_expr)?;
-            for cte in ctes {
-                walk_relational_for_tree_groups(conn, entity_id, &cte.expression)?;
-            }
-        }
-        // WithCfes: recurse into inner query
-        Query::WithCfes { query: inner, .. } => {
-            register_interior_schemas_from_query(conn, entity_id, inner)?;
-        }
-        // WithPrecompiledCfes: recurse into inner query
-        Query::WithPrecompiledCfes { query: inner, .. } => {
-            register_interior_schemas_from_query(conn, entity_id, inner)?;
-        }
-        // ReplTempTable/ReplTempView: recurse into inner query
-        Query::ReplTempTable { query: inner, .. } | Query::ReplTempView { query: inner, .. } => {
-            register_interior_schemas_from_query(conn, entity_id, inner)?;
-        }
-        // WithErContext: consumed before registration — shouldn't appear
-        Query::WithErContext { query: inner, .. } => {
-            register_interior_schemas_from_query(conn, entity_id, inner)?;
-        }
-    }
-
+    let mut registrar = InteriorSchemaRegistrar { conn, entity_id };
+    walk_visit_query(&mut registrar, query)?;
     Ok(())
 }
 
-#[stacksafe::stacksafe]
-fn walk_relational_for_tree_groups(
-    conn: &Connection,
+struct InteriorSchemaRegistrar<'a> {
+    conn: &'a Connection,
     entity_id: i32,
-    expr: &crate::pipeline::asts::core::RelationalExpression<
-        crate::pipeline::asts::core::Unresolved,
-    >,
-) -> Result<()> {
-    use crate::pipeline::asts::core::specs::ModuloSpec;
-    use crate::pipeline::asts::core::{RelationalExpression, UnaryRelationalOperator};
-
-    match expr {
-        RelationalExpression::Pipe(pipe) => {
-            // Walk source
-            walk_relational_for_tree_groups(conn, entity_id, &pipe.source)?;
-            // Check operator for tree groups
-            match &pipe.operator {
-                UnaryRelationalOperator::Modulo { spec, .. } => {
-                    if let ModuloSpec::GroupBy { reducing_on, .. } = spec {
-                        for ode in reducing_on {
-                            register_tree_group_from_domain_expr(conn, entity_id, &ode.expr)?;
-                        }
-                    }
-                }
-                // All non-Modulo operators: no tree groups to register
-                // (General, ProjectOut, Embed, MapCover, RenameCover, Transform, etc.)
-                _ => {}
-            }
-        }
-        RelationalExpression::SetOperation { operands, .. } => {
-            for operand in operands {
-                walk_relational_for_tree_groups(conn, entity_id, operand)?;
-            }
-        }
-        // Relation: leaf — no tree groups
-        RelationalExpression::Relation(_) => {}
-        // Filter: recurse into source
-        RelationalExpression::Filter { source, .. } => {
-            walk_relational_for_tree_groups(conn, entity_id, source)?;
-        }
-        // Join: recurse both sides
-        RelationalExpression::Join { left, right, .. } => {
-            walk_relational_for_tree_groups(conn, entity_id, left)?;
-            walk_relational_for_tree_groups(conn, entity_id, right)?;
-        }
-        // ER chains: walk the contained relations for tree groups
-        RelationalExpression::ErJoinChain { relations, .. } => {
-            for rel in relations {
-                walk_relational_for_tree_groups(
-                    conn,
-                    entity_id,
-                    &RelationalExpression::Relation(rel.clone()),
-                )?;
-            }
-        }
-        RelationalExpression::ErTransitiveJoin { left, right, .. } => {
-            walk_relational_for_tree_groups(conn, entity_id, left)?;
-            walk_relational_for_tree_groups(conn, entity_id, right)?;
-        }
-        RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    }
-
-    Ok(())
 }
 
-/// If a domain expression is a Curly (tree group) with an alias, register it
-/// as an interior_entity with its members as interior_entity_attribute rows.
-fn register_tree_group_from_domain_expr(
+impl crate::pipeline::ast_visit::AstVisit<crate::pipeline::asts::core::Unresolved>
+    for InteriorSchemaRegistrar<'_>
+{
+    fn enter_function(
+        &mut self,
+        function: &crate::pipeline::asts::core::FunctionExpression<
+            crate::pipeline::asts::core::Unresolved,
+        >,
+    ) -> Result<crate::pipeline::ast_visit::Descent> {
+        use crate::pipeline::ast_visit::Descent;
+        use crate::pipeline::asts::core::FunctionExpression;
+
+        if let FunctionExpression::Curly {
+            members,
+            alias: Some(alias),
+            ..
+        } = function
+        {
+            register_tree_group(self.conn, self.entity_id, members, alias.as_str())?;
+            // register_curly_members owns the nested tree-group recursion for
+            // this schema. Do not register a nested Curly a second time as if
+            // it were another top-level result column.
+            return Ok(Descent::SkipSubtree);
+        }
+        Ok(Descent::Continue)
+    }
+}
+
+/// Register one aliased Curly discovered anywhere in the unresolved query.
+fn register_tree_group(
     conn: &Connection,
     entity_id: i32,
-    expr: &crate::pipeline::asts::core::DomainExpression<crate::pipeline::asts::core::Unresolved>,
+    members: &[crate::pipeline::asts::core::CurlyMember<crate::pipeline::asts::core::Unresolved>],
+    alias: &str,
 ) -> Result<()> {
-    use crate::pipeline::asts::core::{DomainExpression, FunctionExpression};
-
-    if let DomainExpression::Function(FunctionExpression::Curly {
-        members,
-        alias: Some(alias),
-        ..
-    }) = expr
-    {
-        let alias_str = alias.as_str();
-        // Insert interior_entity
-        conn.execute(
-            "INSERT INTO interior_entity (parent_entity_id, column_name) VALUES (?1, ?2)",
-            rusqlite::params![entity_id, alias_str],
+    conn.execute(
+        "INSERT INTO interior_entity (parent_entity_id, column_name) VALUES (?1, ?2)",
+        rusqlite::params![entity_id, alias],
+    )
+    .map_err(|e| {
+        DelightQLError::database_error_with_source(
+            "Failed to insert interior_entity",
+            e.to_string(),
+            Box::new(e),
         )
-        .map_err(|e| {
-            DelightQLError::database_error_with_source(
-                "Failed to insert interior_entity",
-                e.to_string(),
-                Box::new(e),
-            )
-        })?;
-        let interior_entity_id = conn.last_insert_rowid() as i32;
+    })?;
+    let interior_entity_id = conn.last_insert_rowid() as i32;
 
-        // Insert members as interior_entity_attribute rows
-        register_curly_members(conn, interior_entity_id, entity_id, members)?;
-    }
+    register_curly_members(conn, interior_entity_id, entity_id, members)?;
 
     Ok(())
 }
@@ -11118,5 +11043,99 @@ mod function_clause_discipline_tests {
         // Function — the helper is a no-op, clauses OR together elsewhere.
         discipline("empty(column) :- null = column\nempty(column) :- trim:(column) = \"\"")
             .expect("multi-clause sigma predicate must NOT be touched by this check");
+    }
+}
+
+// =============================================================================
+// RED-5 (F5): the live W9 tree-group registration walker is structurally
+// incomplete (review pnxwskxr::nzpzwxqx [P2]; system.rs `walk_relational_for_
+// tree_groups`). It inspects ONLY `Modulo::GroupBy.reducing_on`, so a tree group
+// (a `Curly {alias: Some(_)}`) in `reducing_by` — a legal, surface-constructible
+// position (`%({region, "kids": ~> {order_id}} as grp ~> count:(*))`,
+// TreeGroupLocation::InReducingBy) — is never registered, leaving absent
+// interior_entity metadata and later drill-down failures.
+//
+// Evidence-driven (Q-I2): the reducing_by tree group IS constructible (verified
+// against the parser), so this is a real hole, not a fabricated shape. RED
+// today — the walker skips reducing_by.
+// =============================================================================
+#[cfg(test)]
+mod red5_w9_tree_group_tests {
+    use rusqlite::Connection;
+
+    /// A minimal bootstrap: just the two interior-schema tables the W9 walker
+    /// writes into (FKs are unenforced by default, so no `entity` row needed).
+    fn interior_schema_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory conn");
+        conn.execute_batch(
+            "CREATE TABLE interior_entity (
+                 id INTEGER PRIMARY KEY,
+                 parent_entity_id INTEGER NOT NULL,
+                 column_name TEXT NOT NULL
+             );
+             CREATE TABLE interior_entity_attribute (
+                 id INTEGER PRIMARY KEY,
+                 interior_entity_id INTEGER NOT NULL,
+                 attribute_name TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 child_interior_entity_id INTEGER
+             );",
+        )
+        .expect("create interior tables");
+        conn
+    }
+
+    fn parse_one(dql: &str) -> crate::pipeline::asts::core::Query<crate::pipeline::asts::core::Unresolved> {
+        let tree = crate::pipeline::parser::parse(dql).expect("parse");
+        let (mut queries, _f, _a, _e, _d, _o, _ddl) =
+            crate::pipeline::builder_v2::parse_queries(&tree, dql).expect("build");
+        assert_eq!(queries.len(), 1, "one statement expected");
+        queries.pop().unwrap()
+    }
+
+    fn interior_column_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT column_name FROM interior_entity ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect()
+    }
+
+    /// Control: a tree group in `reducing_on` DOES register today — proves the
+    /// harness (parse → register → interior_entity read) works end to end.
+    #[test]
+    fn reducing_on_tree_group_registers_control() {
+        let conn = interior_schema_conn();
+        let query = parse_one("orders(*) |> %(region ~> {order_id} as kids)");
+        super::register_interior_schemas_from_query(&conn, 1, &query)
+            .expect("registration walk");
+        assert!(
+            interior_column_names(&conn).iter().any(|c| c == "kids"),
+            "reducing_on tree group must register (control): {:?}",
+            interior_column_names(&conn)
+        );
+    }
+
+    /// RED-5: a tree group in `reducing_by` must ALSO register its interior
+    /// schema — the W9 walker skips it today (it only descends reducing_on), so
+    /// its drill-down metadata is silently lost. RED until W9 is migrated onto
+    /// the shared `AstVisit` walk or its input boundary enforced.
+    #[test]
+    fn reducing_by_tree_group_registers_interior_schema() {
+        let conn = interior_schema_conn();
+        let query =
+            parse_one("orders(*) |> %({region, \"kids\": ~> {order_id}} as grp ~> count:(*) as c)");
+        super::register_interior_schemas_from_query(&conn, 1, &query)
+            .expect("registration walk");
+        let names = interior_column_names(&conn);
+        assert!(
+            names.iter().any(|c| c == "grp"),
+            "reducing_by tree group `grp` was NOT registered — W9 \
+             (walk_relational_for_tree_groups) inspects only reducing_on, dropping \
+             reducing_by tree groups and their interior_entity metadata; reached: {:?}",
+            names
+        );
     }
 }

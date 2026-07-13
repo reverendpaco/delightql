@@ -2,6 +2,9 @@
 // Copyright 2026 Daniel Eklund
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_unresolved;
+use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
+use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
+use crate::pipeline::asts::core::{Relation, Unresolved};
 use std::collections::{HashMap, HashSet};
 
 /// Validates grouped CTE definitions (after merging duplicates)
@@ -131,122 +134,75 @@ fn has_cycle_dfs(
     Ok(false)
 }
 
-/// Extract table references from a relational expression
-/// This is a simple implementation that extracts Ground relation identifiers
+/// Extract table references from a relational expression — every Ground table
+/// name and InnerRelation base name reachable ANYWHERE in the body, including
+/// inside predicate subqueries (`Filter.condition`), pipe-operator arguments,
+/// consulted-view bodies, and nested CTE bodies.
+///
+/// Rides the shared whole-tree closure `AstVisit<Unresolved>` (INDUCTIVE-
+/// TRAVERSAL-PLAN R-I1/R-I3): the former hand-rolled walker matched
+/// `Filter { source, .. }` and dropped the recursive `condition` field (a
+/// third instance of the P1/P2 pattern, INDUCTIVE-INVENTORY §2a W6). The
+/// default `walk_visit_*` descent names every recursive edge once, so a table
+/// reference hidden in a predicate subquery can no longer be silently ignored.
+///
+/// Behavior-preserving in expectation: this graph is validation-only (forward-
+/// reference + cycle checks; it never reorders emission). Collecting a
+/// reference to an EARLIER CTE is harmless (backward references trigger
+/// neither check); a reference to a LATER CTE is illegal under left-to-right
+/// scoping and is rejected regardless — closing the hole can only sharpen the
+/// diagnostic on an already-rejected query, never flip accept/reject
+/// (epic1/REPORT-INDUCTIVE-D-RISK-CANDIDATES.md, W6).
 fn extract_table_references(expr: &ast_unresolved::RelationalExpression) -> Vec<String> {
-    let mut refs = Vec::new();
-    extract_table_references_recursive(expr, &mut refs);
-    refs
+    let mut collector = TableRefCollector { refs: Vec::new() };
+    walk_visit_relational(&mut collector, expr)
+        .expect("CTE table-reference collection is infallible (hooks never return Err)");
+    collector.refs
 }
 
-#[stacksafe::stacksafe]
-fn extract_table_references_recursive(
-    expr: &ast_unresolved::RelationalExpression,
-    refs: &mut Vec<String>,
-) {
-    match expr {
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier,
-            ..
-        }) => {
-            refs.push(identifier.name.to_string());
-        }
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Anonymous {
-            ..
-        }) => {
-            // Anonymous relations don't reference tables
-        }
-        ast_unresolved::RelationalExpression::Join { left, right, .. } => {
-            extract_table_references_recursive(left, refs);
-            extract_table_references_recursive(right, refs);
-        }
-        ast_unresolved::RelationalExpression::Filter { source, .. } => {
-            extract_table_references_recursive(source, refs);
-        }
-        ast_unresolved::RelationalExpression::Pipe(pipe) => {
-            extract_table_references_recursive(&pipe.source, refs);
-        }
-        ast_unresolved::RelationalExpression::SetOperation { operands, .. } => {
-            // SetOperation can appear from |;| syntax or will be created during CTE merging
-            for operand in operands {
-                extract_table_references_recursive(operand, refs);
-            }
-        }
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::TVF {
-            ..
-        }) => {
-            // TVFs don't reference tables, skip
-        }
-        ast_unresolved::RelationalExpression::Relation(
-            ast_unresolved::Relation::InnerRelation { pattern, .. },
-        ) => {
-            // InnerRelation references both the base table and any tables in the subquery
-            match pattern {
-                ast_unresolved::InnerRelationPattern::Indeterminate {
-                    identifier,
-                    subquery,
-                    ..
-                }
-                | ast_unresolved::InnerRelationPattern::UncorrelatedDerivedTable {
-                    identifier,
-                    subquery,
-                    ..
-                }
-                | ast_unresolved::InnerRelationPattern::CorrelatedScalarJoin {
-                    identifier,
-                    subquery,
-                    ..
-                }
-                | ast_unresolved::InnerRelationPattern::CorrelatedGroupJoin {
-                    identifier,
-                    subquery,
-                    ..
-                } => {
-                    refs.push(identifier.name.to_string());
-                    extract_table_references_recursive(subquery, refs);
-                }
-            }
-        }
+/// Collects Ground table names and InnerRelation base names into `refs`. The
+/// `AstVisit` default walk supplies the complete structural descent; this only
+/// names the leaf positions that contribute a reference.
+struct TableRefCollector {
+    refs: Vec<String>,
+}
 
-        ast_unresolved::RelationalExpression::Relation(
-            ast_unresolved::Relation::ConsultedView { body, .. },
-        ) => {
-            // Recursively validate CTE references in the consulted view body
-            match body.as_ref() {
-                ast_unresolved::Query::Relational(expr) => {
-                    extract_table_references_recursive(expr, refs);
-                }
-                ast_unresolved::Query::WithCtes { ctes, query: main } => {
-                    for cte in ctes {
-                        extract_table_references_recursive(&cte.expression, refs);
-                    }
-                    extract_table_references_recursive(main, refs);
-                }
-                other => panic!("catch-all hit in cte_validation.rs extract_table_references_recursive (Query variant): {:?}", other),
+impl AstVisit<Unresolved> for TableRefCollector {
+    fn enter_relation(&mut self, rel: &Relation<Unresolved>) -> Result<Descent> {
+        match rel {
+            Relation::Ground { identifier, .. } => {
+                self.refs.push(identifier.name.to_string());
             }
-        }
-
-        ast_unresolved::RelationalExpression::Relation(
-            ast_unresolved::Relation::PseudoPredicate { .. },
-        ) => {
-            panic!(
+            // A pseudo-predicate must have been executed and replaced during
+            // Phase 1.X before resolution reaches CTE validation; its presence
+            // here is an internal invariant violation (loud, as before).
+            Relation::PseudoPredicate { .. } => panic!(
                 "INTERNAL ERROR: PseudoPredicate should not exist in this phase. \
                  Pseudo-predicates are executed and replaced during Phase 1.X (Effect Executor)."
-            )
+            ),
+            // Anonymous / TVF / ConsultedView contribute no ref of their own;
+            // their recursive children (TVF table args, consulted-view bodies)
+            // are reached by the default walk.
+            Relation::Anonymous { .. }
+            | Relation::TVF { .. }
+            | Relation::ConsultedView { .. } => {}
+            // InnerRelation's base identifier is contributed in enter_inner_relation.
+            Relation::InnerRelation { .. } => {}
         }
-        ast_unresolved::RelationalExpression::ErJoinChain { relations } => {
-            for rel in relations {
-                if let ast_unresolved::Relation::Ground { identifier, .. } = rel {
-                    refs.push(identifier.name.to_string());
-                }
+        Ok(Descent::Continue)
+    }
+
+    fn enter_inner_relation(&mut self, pattern: &InnerRelationPattern<Unresolved>) -> Result<Descent> {
+        // The InnerRelation's base table name is itself a reference (matching
+        // the former walker); its subquery is descended by the default walk.
+        match pattern {
+            InnerRelationPattern::Indeterminate { identifier, .. }
+            | InnerRelationPattern::UncorrelatedDerivedTable { identifier, .. }
+            | InnerRelationPattern::CorrelatedScalarJoin { identifier, .. }
+            | InnerRelationPattern::CorrelatedGroupJoin { identifier, .. } => {
+                self.refs.push(identifier.name.to_string());
             }
         }
-        ast_unresolved::RelationalExpression::ErTransitiveJoin { left, right } => {
-            extract_table_references_recursive(left, refs);
-            extract_table_references_recursive(right, refs);
-        }
-        ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
+        Ok(Descent::Continue)
     }
 }

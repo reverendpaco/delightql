@@ -75,8 +75,9 @@ impl<'a> CfeRefiner<'a> {
         &self,
         subquery: Box<resolved::RelationalExpression>,
     ) -> Result<Box<refined::RelationalExpression>> {
-        let mut refined = refiner::refine(*subquery)?;
-        populate_provenance_in_relational(&mut refined, self.curried, self.regular, self.context);
+        let refined = refiner::refine(*subquery)?;
+        let refined =
+            populate_provenance_in_relational(refined, self.curried, self.regular, self.context)?;
         Ok(Box::new(refined))
     }
 

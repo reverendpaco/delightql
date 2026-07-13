@@ -1317,11 +1317,14 @@ fn try_collapse_to_domain_spec(subquery: &RelationalExpression) -> Option<Domain
     }
 }
 
-/// Apply an alias to a `RelationalExpression` by setting the alias field
-/// on the innermost `Relation` variant.
-#[stacksafe::stacksafe]
+/// Apply an alias to a `RelationalExpression` by setting the alias field on the
+/// innermost `Relation` variant. Rides Helper A
+/// [`source_spine_terminal_mut`](crate::pipeline::spine::source_spine_terminal_mut)
+/// to descend the `Filter→source, Pipe→source` chain; the alias-setting payload
+/// stays here. Byte-equivalent to the old hand-rolled recursion. Pinned by
+/// `source_spine_terminal_mut_reaches_innermost_relation`.
 fn apply_alias_to_relational_expr(expr: &mut RelationalExpression, alias: String) {
-    match expr {
+    match crate::pipeline::spine::source_spine_terminal_mut(expr) {
         RelationalExpression::Relation(rel) => match rel {
             Relation::Ground {
                 alias: ref mut a, ..
@@ -1344,16 +1347,13 @@ fn apply_alias_to_relational_expr(expr: &mut RelationalExpression, alias: String
                 unreachable!("ConsultedView/PseudoPredicate not present in builder phase")
             }
         },
-        // Pipe/Filter: recurse to innermost relation
-        RelationalExpression::Pipe(pipe) => {
-            apply_alias_to_relational_expr(&mut pipe.source, alias);
-        }
-        RelationalExpression::Filter { source, .. } => {
-            apply_alias_to_relational_expr(source, alias);
-        }
         // Join/SetOperation: can't meaningfully alias composite expressions
         RelationalExpression::Join { .. } | RelationalExpression::SetOperation { .. } => {
             log::warn!("Cannot apply alias to composite RelationalExpression");
+        }
+        // Filter/Pipe are peeled by the spine — never a terminal.
+        RelationalExpression::Filter { .. } | RelationalExpression::Pipe(_) => {
+            unreachable!("source-spine terminal is never Filter/Pipe")
         }
         // ER chains consumed before builder
         RelationalExpression::ErJoinChain { .. }

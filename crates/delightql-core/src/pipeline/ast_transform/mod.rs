@@ -17,7 +17,7 @@ use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
 use crate::pipeline::asts::core::operators::{ColumnSelector, FrameBound, WindowFrame};
 use crate::pipeline::asts::core::{
     ArrayMember, BooleanExpression, CteBinding, CurlyMember, DomainExpression, DomainSpec,
-    FunctionExpression, ModuloSpec, OrderingSpec, OutputDomainExpression, PhaseBox, PipeExpression,
+    FunctionExpression, ModuloSpec, OrderingSpec, OutputDomainExpression, PipeExpression,
     Query, Relation, RelationalExpression, RenameSpec, RepositionSpec, Row, SigmaCondition,
     UnaryRelationalOperator, DelegateSpec,
 };
@@ -1267,7 +1267,7 @@ pub fn walk_transform_relational<P, Q, F: AstTransform<P, Q> + ?Sized>(
         RelationalExpression::SetOperation {
             operator,
             operands,
-            correlation: _, // PhaseBox<Option<BooleanExpression<P>>, P> — inner type is phase-parameterized, must use phantom
+            correlation,
             cpr_schema,
         } => Ok(RelationalExpression::SetOperation {
             operator,
@@ -1275,7 +1275,9 @@ pub fn walk_transform_relational<P, Q, F: AstTransform<P, Q> + ?Sized>(
                 .into_iter()
                 .map(|e| Ok(t.transform_relational_action(e)?.into_inner()))
                 .collect::<Result<Vec<_>>>()?,
-            correlation: PhaseBox::phantom(),
+            // Correlation is a recursive boolean edge, not phase metadata.
+            // Transform its payload just like every other boolean child.
+            correlation: correlation.try_map_correlation(|c| t.transform_boolean(c))?,
             cpr_schema: cpr_schema.rephase(),
         }),
         RelationalExpression::ErJoinChain { relations } => Ok(RelationalExpression::ErJoinChain {
@@ -1385,7 +1387,6 @@ fn transform_cte_requirements<P, Q, F: AstTransform<P, Q> + ?Sized>(
             .collect::<Result<Vec<_>>>()?,
         location: reqs.location,
         nested_members_info: reqs.nested_members_info,
-        cte_name: reqs.cte_name.rephase(),
     })
 }
 
@@ -1416,5 +1417,108 @@ fn transform_projection<P, Q>(
             root_is_array,
             alias,
         }),
+    }
+}
+
+// =============================================================================
+// RED-1 (F1): same-phase transforms must PRESERVE refined SetOperation.correlation
+// =============================================================================
+
+#[cfg(test)]
+mod correlation_preservation_tests {
+    use super::*;
+    use crate::pipeline::asts::core::expressions::helpers::QualifiedName;
+    use crate::pipeline::asts::core::expressions::metadata_types::SetOperator;
+    use crate::pipeline::asts::core::metadata::NamespacePath;
+    use crate::pipeline::asts::core::{
+        BooleanExpression, PhaseBox, Refined, Relation, RelationalExpression,
+    };
+
+    fn qn(name: &str) -> QualifiedName {
+        QualifiedName {
+            namespace_path: NamespacePath::empty(),
+            name: name.into(),
+            grounding: None,
+        }
+    }
+
+    /// A recognizable relation sentinel (a `PseudoPredicate` whose `name` is a
+    /// tag), so a surviving correlation can be identified by the tag it carries.
+    fn sentinel(tag: &str) -> RelationalExpression<Refined> {
+        RelationalExpression::Relation(Relation::PseudoPredicate {
+            name: tag.to_string(),
+            arguments: vec![],
+            alias: None,
+            cpr_schema: PhaseBox::phantom(),
+        })
+    }
+
+    /// The recognizable correlation: an `EXISTS` whose subquery is a tagged
+    /// sentinel, mirroring `process_mixed_setop`'s populated correlation shape.
+    fn recognizable_correlation() -> BooleanExpression<Refined> {
+        BooleanExpression::<Refined>::InnerExists {
+            exists: true,
+            identifier: qn("q"),
+            subquery: Box::new(sentinel("setop_correlation")),
+            alias: None,
+            using_columns: vec![],
+        }
+    }
+
+    fn correlated_setop() -> RelationalExpression<Refined> {
+        RelationalExpression::<Refined>::SetOperation {
+            operator: SetOperator::SmartUnionAll,
+            operands: vec![sentinel("setop_operand_a"), sentinel("setop_operand_b")],
+            correlation: <PhaseBox<Option<BooleanExpression<Refined>>, Refined>>::with_correlation(
+                Some(recognizable_correlation()),
+            ),
+            cpr_schema: PhaseBox::phantom(),
+        }
+    }
+
+    /// A minimal SAME-PHASE identity transform: it overrides nothing, so every
+    /// node rides the default `walk_transform_*` — exactly the exposure the
+    /// review flags for EVERY `AstTransform<Refined, Refined>` pass. `P == Q`
+    /// here, so `correlation`'s inner `BooleanExpression<Refined>` CAN be
+    /// preserved, yet `walk_transform_relational` (mod.rs:1267) phantoms it away
+    /// unconditionally.
+    struct IdentityRefined;
+    impl AstTransform<Refined, Refined> for IdentityRefined {}
+
+    /// RED-1 (F1, ★ the critical one): a same-phase transform must PRESERVE a
+    /// populated `SetOperation.correlation`. RED today — the default
+    /// `walk_transform_relational` (ast_transform/mod.rs:1267) discards
+    /// `correlation` and substitutes `PhaseBox::phantom()`, silently erasing a
+    /// correlation predicate and changing query semantics.
+    #[test]
+    fn same_phase_transform_preserves_setoperation_correlation() {
+        let out = IdentityRefined
+            .transform_relational(correlated_setop())
+            .expect("same-phase identity transform must succeed");
+
+        let RelationalExpression::SetOperation { correlation, .. } = out else {
+            panic!("transform must return a SetOperation");
+        };
+
+        assert!(
+            correlation.correlation().is_some(),
+            "same-phase AstTransform<Refined,Refined> ERASED SetOperation.correlation \
+             (phantomed unconditionally at ast_transform/mod.rs:1267); the populated \
+             correlation predicate must survive a same-phase rewrite"
+        );
+
+        // And it is the SAME predicate, not a fresh phantom: the tagged sentinel
+        // beneath the EXISTS must still be reachable.
+        let Some(BooleanExpression::InnerExists { subquery, .. }) = correlation.correlation() else {
+            panic!("correlation must be the preserved InnerExists predicate");
+        };
+        assert!(
+            matches!(
+                subquery.as_ref(),
+                RelationalExpression::Relation(Relation::PseudoPredicate { name, .. })
+                    if name == "setop_correlation"
+            ),
+            "the preserved correlation must carry its original recognizable subquery"
+        );
     }
 }

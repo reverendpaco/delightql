@@ -99,6 +99,40 @@ impl<T, P> PhaseBox<T, P> {
             _phase: PhantomData,
         }
     }
+
+}
+
+/// Payload-specific read-only borrow of a set-operation correlation predicate.
+///
+/// The non-consuming `AstVisit` walk borrows `SetOperation.correlation` here;
+/// the consuming `AstTransform` walk uses `try_map_correlation` below. Both
+/// therefore reach this recursive edge
+/// (INDUCTIVE-INVENTORY §5 finding 9; pinned by
+/// `ast_visit::tests::visit_reaches_setoperation_correlation`).
+///
+/// This is deliberately NOT a phase-generic `as_inner()` on `PhaseBox<T, P>`: a
+/// generic borrow would let `PhaseBox<CprSchema, Unresolved>` be read, defeating
+/// the phase-typestate whose whole point is that a schema read in an unresolved
+/// phase is impossible at compile time (ruled 2026-07-12).
+impl<P> PhaseBox<Option<BooleanExpression<P>>, P> {
+    pub fn correlation(&self) -> Option<&BooleanExpression<P>> {
+        self.data.as_ref()
+    }
+
+    /// Consume and transform a set-operation correlation while changing its
+    /// phase. The callback owns conversion of the boolean payload; this method
+    /// only preserves the typestate wrapper.
+    pub(crate) fn try_map_correlation<Q, E>(
+        self,
+        transform: impl FnOnce(
+            BooleanExpression<P>,
+        ) -> std::result::Result<BooleanExpression<Q>, E>,
+    ) -> std::result::Result<PhaseBox<Option<BooleanExpression<Q>>, Q>, E> {
+        Ok(PhaseBox {
+            data: self.data.map(transform).transpose()?,
+            _phase: PhantomData,
+        })
+    }
 }
 
 // Generic new method that delegates to the trait
@@ -559,15 +593,8 @@ impl From<PhaseBox<Option<delightql_types::SqlIdentifier>, Resolved>>
 // PhaseBox for Option<String>
 // =============================================================================
 
-// Addressed Phase: Can create and read (used by CteRequirements.cte_name)
+// Addressed Phase: Can read the optional backend-schema name.
 impl PhaseBox<Option<String>, Addressed> {
-    pub fn from_cte_name(name: Option<String>) -> Self {
-        PhaseBox {
-            data: name,
-            _phase: PhantomData,
-        }
-    }
-
     pub fn get(&self) -> &Option<String> {
         &self.data
     }

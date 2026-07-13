@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use crate::error::Result;
-use crate::pipeline::asts::core::phase_box::{PhaseBox, PhaseBoxable};
+use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
+use crate::pipeline::asts::core::phase_box::PhaseBoxable;
+use crate::pipeline::asts::core::Refined;
 use crate::pipeline::{ast_addressed, ast_refined};
 use delightql_types::SqlIdentifier;
 
 pub fn address_query(query: ast_refined::Query) -> Result<ast_addressed::Query> {
-    let mut addressed = address_query_inner(query)?;
-    assign_tree_group_cte_names(&mut addressed);
-    Ok(addressed)
+    address_query_inner(query)
 }
 
 fn address_query_inner(query: ast_refined::Query) -> Result<ast_addressed::Query> {
@@ -51,7 +51,6 @@ fn address_query_inner(query: ast_refined::Query) -> Result<ast_addressed::Query
             })
         }
         // Plain relational query — no CTEs, just convert phase.
-        // Tree group CTE names are assigned by the caller (assign_tree_group_cte_names).
         ast_refined::Query::Relational(expr) => Ok(ast_addressed::Query::Relational(expr.into())),
         // These are consumed before the refined phase and should never reach the addresser.
         ast_refined::Query::WithCfes { .. } | ast_refined::Query::WithErContext { .. } => {
@@ -61,351 +60,68 @@ fn address_query_inner(query: ast_refined::Query) -> Result<ast_addressed::Query
 }
 
 // ---------------------------------------------------------------------------
-// DQL AST walk: does an expression reference a name via Ground relations?
-// ---------------------------------------------------------------------------
-
-#[stacksafe::stacksafe]
+// Recursive-CTE detection: does a CTE body reference its own name via a Ground
+// relation ANYWHERE — including inside a predicate subquery (`Filter.condition`,
+// IN/EXISTS/scalar), a pipe-operator argument, a consulted-view body, or a
+// nested CTE — not only along the source spine?
+//
+// Rides the shared whole-tree closure `AstVisit<Refined>` (INDUCTIVE-TRAVERSAL-
+// PLAN R-I1/R-I3), with an early `Break` on the first hit. The former
+// hand-rolled walker matched `Filter { source, .. }` and dropped the recursive
+// `condition` field (INDUCTIVE-INVENTORY §2a W7); the default `walk_visit_*`
+// descent names every recursive edge once, so a self-reference in a subquery
+// can no longer be silently ignored.
+//
+// The `is_recursive` flag produced here is ADVISORY: the SQL rewriter's
+// `mark_recursive_ctes` (sql_rewriter/recursive_cte.rs) is the authoritative
+// detector — it re-marks recursion structurally at the SQL level (descending
+// into subqueries) and only ever ADDS the keyword, never removes it, then
+// `validate_recursive_members` refuses a subquery-buried self-reference with
+// N4 (`semantic/recursion/self_subquery`). So closing this hole cannot change
+// the outcome of any legal query: a subquery-only self-reference is N4-illegal
+// regardless, and the SQL-level marker already detects everything this walk now
+// detects. Pinned by the recursion_contract ball staying 16/16
+// (epic1/REPORT-INDUCTIVE-D-RISK-CANDIDATES.md, W7).
 fn expression_references_name(expr: &ast_refined::RelationalExpression, name: &str) -> bool {
-    match expr {
-        ast_refined::RelationalExpression::Relation(rel) => relation_references_name(rel, name),
-        ast_refined::RelationalExpression::Join { left, right, .. } => {
-            expression_references_name(left, name) || expression_references_name(right, name)
-        }
-        ast_refined::RelationalExpression::Filter { source, .. } => {
-            expression_references_name(source, name)
-        }
-        ast_refined::RelationalExpression::Pipe(pipe) => {
-            expression_references_name(&pipe.source, name)
-        }
-        ast_refined::RelationalExpression::SetOperation { operands, .. } => operands
-            .iter()
-            .any(|op| expression_references_name(op, name)),
-        ast_refined::RelationalExpression::ErJoinChain { .. }
-        | ast_refined::RelationalExpression::ErTransitiveJoin { .. } => false,
-        ast_refined::RelationalExpression::IntersectCorresponding { operands, .. } => operands
-            .iter()
-            .any(|op| expression_references_name(op, name)),
-    }
+    let mut finder = NameReferenceFinder {
+        name: SqlIdentifier::new(name),
+        found: false,
+    };
+    walk_visit_relational(&mut finder, expr)
+        .expect("recursive-CTE self-reference detection is infallible (hooks never return Err)");
+    finder.found
 }
 
-fn relation_references_name(rel: &ast_refined::Relation, name: &str) -> bool {
-    match rel {
-        ast_refined::Relation::Ground { identifier, .. } => {
-            identifier.name == SqlIdentifier::new(name)
-        }
-        ast_refined::Relation::ConsultedView { body, .. } => query_references_name(body, name),
-        ast_refined::Relation::InnerRelation { pattern, .. } => {
-            inner_pattern_references_name(pattern, name)
-        }
-        ast_refined::Relation::Anonymous { .. }
-        | ast_refined::Relation::TVF { .. }
-        | ast_refined::Relation::PseudoPredicate { .. } => false,
-    }
+/// Finds any `Ground` relation whose identifier equals `name`, anywhere in the
+/// tree. The `AstVisit` default walk supplies the complete structural descent
+/// (consulted-view bodies, inner-relation subqueries, predicate subqueries,
+/// operator arguments); this only inspects the Ground leaf and stops early.
+struct NameReferenceFinder {
+    name: SqlIdentifier,
+    found: bool,
 }
 
-fn query_references_name(query: &ast_refined::Query, name: &str) -> bool {
-    match query {
-        ast_refined::Query::Relational(expr) => expression_references_name(expr, name),
-        ast_refined::Query::WithCtes { ctes, query } => {
-            ctes.iter()
-                .any(|cte| expression_references_name(&cte.expression, name))
-                || expression_references_name(query, name)
+impl AstVisit<Refined> for NameReferenceFinder {
+    fn enter_relation(&mut self, rel: &ast_refined::Relation) -> Result<Descent> {
+        if let ast_refined::Relation::Ground { identifier, .. } = rel {
+            if identifier.name == self.name {
+                self.found = true;
+                return Ok(Descent::Break);
+            }
         }
-        ast_refined::Query::WithPrecompiledCfes { query, .. } => query_references_name(query, name),
-        ast_refined::Query::WithCfes { query, .. } => query_references_name(query, name),
-        ast_refined::Query::ReplTempTable { query, .. } => query_references_name(query, name),
-        ast_refined::Query::ReplTempView { query, .. } => query_references_name(query, name),
-        ast_refined::Query::WithErContext { query, .. } => query_references_name(query, name),
-    }
-}
-
-fn inner_pattern_references_name(pattern: &ast_refined::InnerRelationPattern, name: &str) -> bool {
-    match pattern {
-        ast_refined::InnerRelationPattern::Indeterminate { subquery, .. }
-        | ast_refined::InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. }
-        | ast_refined::InnerRelationPattern::CorrelatedScalarJoin { subquery, .. }
-        | ast_refined::InnerRelationPattern::CorrelatedGroupJoin { subquery, .. } => {
-            expression_references_name(subquery, name)
-        }
+        Ok(Descent::Continue)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Mutable walk: assign CTE names to tree groups (depth-first)
+// NOTE: the `_tg_N` tree-group CTE-naming walk (formerly `walk_*_for_tree_groups`
+// here, INVENTORY §2a W8) was DELETED in Phase E. Its sole output,
+// `CteRequirements.cte_name`, had no reader anywhere in transformer_v4 /
+// generator_v3 (the transformer derives the tree-group column name from the
+// resolver's `cpr_schema`, `transformer_v4/tree_group.rs`), and `_tg_` never
+// appeared in a generated-SQL baseline — the assignment was vestigial. Deleting
+// it is behavior-preserving (proven by the corpus being outcome-identical).
+// Details: epic1/REPORT-INDUCTIVE-D-RISK-CANDIDATES.md (W8) and the Phase E
+// report. NB: `system.rs::walk_relational_for_tree_groups` shares only the NAME
+// — it registers `interior_entity` schemas (a live consumer) and is unrelated.
 // ---------------------------------------------------------------------------
-
-fn assign_tree_group_cte_names(query: &mut ast_addressed::Query) {
-    let mut counter = 0;
-    walk_query_for_tree_groups(query, &mut counter);
-}
-
-fn walk_query_for_tree_groups(query: &mut ast_addressed::Query, counter: &mut usize) {
-    match query {
-        ast_addressed::Query::Relational(expr) => {
-            walk_relational_for_tree_groups(expr, counter);
-        }
-        ast_addressed::Query::WithCtes { ctes, query } => {
-            for cte in ctes.iter_mut() {
-                walk_relational_for_tree_groups(&mut cte.expression, counter);
-            }
-            walk_relational_for_tree_groups(query, counter);
-        }
-        ast_addressed::Query::WithPrecompiledCfes { query, .. } => {
-            walk_query_for_tree_groups(query, counter);
-        }
-        ast_addressed::Query::WithCfes { query, .. } => {
-            walk_query_for_tree_groups(query, counter);
-        }
-        ast_addressed::Query::ReplTempTable { query, .. } => {
-            walk_query_for_tree_groups(query, counter);
-        }
-        ast_addressed::Query::ReplTempView { query, .. } => {
-            walk_query_for_tree_groups(query, counter);
-        }
-        ast_addressed::Query::WithErContext { query, .. } => {
-            walk_query_for_tree_groups(query, counter);
-        }
-    }
-}
-
-#[stacksafe::stacksafe]
-fn walk_relational_for_tree_groups(
-    expr: &mut ast_addressed::RelationalExpression,
-    counter: &mut usize,
-) {
-    match expr {
-        ast_addressed::RelationalExpression::Relation(_) => {
-            // ConsultedView bodies bypass the addresser (known gap from chunk 1).
-            // The Option<String> fallback in the transformer handles this.
-        }
-        ast_addressed::RelationalExpression::Join { left, right, .. } => {
-            walk_relational_for_tree_groups(left, counter);
-            walk_relational_for_tree_groups(right, counter);
-        }
-        ast_addressed::RelationalExpression::Filter { source, .. } => {
-            walk_relational_for_tree_groups(source, counter);
-        }
-        ast_addressed::RelationalExpression::Pipe(_) => {
-            // Linearize: walk the pipe chain iteratively instead of recursing
-            let mut current = expr;
-            while let ast_addressed::RelationalExpression::Pipe(pipe) = current {
-                walk_operator_for_tree_groups(&mut pipe.operator, counter);
-                current = &mut pipe.source;
-            }
-            walk_relational_for_tree_groups(current, counter);
-        }
-        ast_addressed::RelationalExpression::SetOperation { operands, .. } => {
-            for operand in operands.iter_mut() {
-                walk_relational_for_tree_groups(operand, counter);
-            }
-        }
-        ast_addressed::RelationalExpression::ErJoinChain { .. }
-        | ast_addressed::RelationalExpression::ErTransitiveJoin { .. } => {}
-        ast_addressed::RelationalExpression::IntersectCorresponding { operands, .. } => {
-            for operand in operands.iter_mut() {
-                walk_relational_for_tree_groups(operand, counter);
-            }
-        }
-    }
-}
-
-fn walk_operator_for_tree_groups(
-    op: &mut ast_addressed::UnaryRelationalOperator,
-    counter: &mut usize,
-) {
-    match op {
-        ast_addressed::UnaryRelationalOperator::Modulo { spec, .. } => {
-            if let ast_addressed::ModuloSpec::GroupBy {
-                reducing_by,
-                reducing_on,
-                ..
-            } = spec
-            {
-                for ode in reducing_by.iter_mut() {
-                    walk_domain_for_tree_groups(&mut ode.expr, counter);
-                }
-                for ode in reducing_on.iter_mut() {
-                    walk_domain_for_tree_groups(&mut ode.expr, counter);
-                }
-            }
-        }
-        ast_addressed::UnaryRelationalOperator::General { expressions, .. } => {
-            for expr in expressions.iter_mut() {
-                walk_domain_for_tree_groups(expr, counter);
-            }
-        }
-        ast_addressed::UnaryRelationalOperator::AggregatePipe { aggregations } => {
-            for expr in aggregations.iter_mut() {
-                walk_domain_for_tree_groups(expr, counter);
-            }
-        }
-        // Operators with expressions but no tree groups in practice:
-        // MapCover/EmbedMapCover: function is a regular fn (trim:(), etc), not a curly tree group
-        // ProjectOut: column names to exclude — no expressions that could hold tree groups
-        // RenameCover: old→new rename specs — no complex expressions
-        // TupleOrdering: column refs for ORDER BY
-        // Reposition: positional specs
-        // Transform: expressions that could theoretically hold tree groups, but
-        //   transform covers ($$) use simple column→expression mappings
-        ast_addressed::UnaryRelationalOperator::MapCover { .. }
-        | ast_addressed::UnaryRelationalOperator::EmbedMapCover { .. }
-        | ast_addressed::UnaryRelationalOperator::ProjectOut { .. }
-        | ast_addressed::UnaryRelationalOperator::RenameCover { .. }
-        | ast_addressed::UnaryRelationalOperator::TupleOrdering { .. }
-        | ast_addressed::UnaryRelationalOperator::Reposition { .. }
-        | ast_addressed::UnaryRelationalOperator::Transform { .. } => {}
-        // Operators with no user expressions at all:
-        ast_addressed::UnaryRelationalOperator::MetaIze { .. }
-        | ast_addressed::UnaryRelationalOperator::Witness { .. }
-        | ast_addressed::UnaryRelationalOperator::SignedWitness
-        | ast_addressed::UnaryRelationalOperator::Qualify
-        | ast_addressed::UnaryRelationalOperator::Using { .. }
-        | ast_addressed::UnaryRelationalOperator::UsingAll
-        | ast_addressed::UnaryRelationalOperator::DmlTerminal { .. }
-        | ast_addressed::UnaryRelationalOperator::InteriorDrillDown { .. }
-        | ast_addressed::UnaryRelationalOperator::NarrowingDestructure { .. } => {}
-        // Consumed before refined phase:
-        ast_addressed::UnaryRelationalOperator::HoViewApplication { .. }
-        | ast_addressed::UnaryRelationalOperator::DirectiveTerminal { .. } => {
-            unreachable!("HoViewApplication/DirectiveTerminal consumed before addressing")
-        }
-        // Refused by the resolver (resolver/resolving/operators/mod.rs) —
-        // cannot reach addressing:
-        ast_addressed::UnaryRelationalOperator::DirectivePipeInvocation { .. } => {
-            unreachable!("DirectivePipeInvocation refused by the resolver")
-        }
-    }
-}
-
-fn walk_domain_for_tree_groups(expr: &mut ast_addressed::DomainExpression, counter: &mut usize) {
-    match expr {
-        ast_addressed::DomainExpression::Function(func) => {
-            walk_function_for_tree_groups(func, counter);
-        }
-        ast_addressed::DomainExpression::PipedExpression { transforms, .. } => {
-            for (_, transform) in transforms.iter_mut() {
-                walk_function_for_tree_groups(transform, counter);
-            }
-        }
-        ast_addressed::DomainExpression::Parenthesized { inner, .. } => {
-            walk_domain_for_tree_groups(inner, counter);
-        }
-        // Leaf domain expressions: no nested function expressions, no tree groups possible.
-        ast_addressed::DomainExpression::Lvar { .. }
-        | ast_addressed::DomainExpression::Literal { .. }
-        | ast_addressed::DomainExpression::Projection(_)
-        | ast_addressed::DomainExpression::NonUnifiyingUnderscore
-        | ast_addressed::DomainExpression::ValuePlaceholder { .. }
-        | ast_addressed::DomainExpression::Substitution(_)
-        | ast_addressed::DomainExpression::ColumnOrdinal(_)
-        | ast_addressed::DomainExpression::PivotOf { .. } => {}
-        // Predicate: contains BooleanExpression. Tree groups in boolean context are
-        // not a supported pattern, so no walk needed.
-        ast_addressed::DomainExpression::Predicate { .. } => {}
-        // Tuple: contains sub-expressions, but tuple elements are simple values
-        // (used for multi-column IN). No tree groups.
-        ast_addressed::DomainExpression::Tuple { .. } => {}
-        // ScalarSubquery: contains a RelationalExpression that CAN contain tree groups.
-        // e.g., orders:(, user_id = id ~> {total, date}) — the {total, date} is a tree group.
-        // A scalar subquery returning a JSON object via tree group is valid DQL.
-        ast_addressed::DomainExpression::ScalarSubquery { subquery, .. } => {
-            walk_relational_for_tree_groups(subquery, counter);
-        }
-    }
-}
-
-fn walk_function_for_tree_groups(
-    func: &mut ast_addressed::FunctionExpression,
-    counter: &mut usize,
-) {
-    match func {
-        ast_addressed::FunctionExpression::Curly {
-            members,
-            cte_requirements,
-            ..
-        } => {
-            // Depth-first: walk nested members (inner tree groups) FIRST
-            for member in members.iter_mut() {
-                if let ast_addressed::CurlyMember::KeyValue { value, .. } = member {
-                    walk_domain_for_tree_groups(value, counter);
-                }
-            }
-            // Then assign name to THIS level (if it has cte_requirements)
-            if let Some(req) = cte_requirements {
-                let name = format!("_tg_{}", counter);
-                *counter += 1;
-                req.cte_name = PhaseBox::from_cte_name(Some(name));
-            }
-        }
-        ast_addressed::FunctionExpression::MetadataTreeGroup {
-            constructor,
-            cte_requirements,
-            ..
-        } => {
-            // Depth-first: walk the constructor chain FIRST
-            walk_function_for_tree_groups(constructor, counter);
-            // Then assign name to THIS level
-            if let Some(req) = cte_requirements {
-                let name = format!("_tg_{}", counter);
-                *counter += 1;
-                req.cte_name = PhaseBox::from_cte_name(Some(name));
-            }
-        }
-        ast_addressed::FunctionExpression::Regular { arguments, .. } => {
-            for arg in arguments.iter_mut() {
-                walk_domain_for_tree_groups(arg, counter);
-            }
-        }
-        ast_addressed::FunctionExpression::Bracket { arguments, .. } => {
-            for arg in arguments.iter_mut() {
-                walk_domain_for_tree_groups(arg, counter);
-            }
-        }
-        // Function variants whose arguments could contain tree groups:
-        ast_addressed::FunctionExpression::Curried { arguments, .. } => {
-            for arg in arguments.iter_mut() {
-                walk_domain_for_tree_groups(arg, counter);
-            }
-        }
-        ast_addressed::FunctionExpression::HigherOrder {
-            curried_arguments,
-            regular_arguments,
-            ..
-        } => {
-            for arg in curried_arguments.iter_mut() {
-                walk_domain_for_tree_groups(arg, counter);
-            }
-            for arg in regular_arguments.iter_mut() {
-                walk_domain_for_tree_groups(arg, counter);
-            }
-        }
-        ast_addressed::FunctionExpression::Window { arguments, .. } => {
-            for arg in arguments.iter_mut() {
-                walk_domain_for_tree_groups(arg, counter);
-            }
-        }
-        ast_addressed::FunctionExpression::CaseExpression { arms, .. } => {
-            for arm in arms.iter_mut() {
-                match arm {
-                    ast_addressed::CaseArm::Simple { result, .. }
-                    | ast_addressed::CaseArm::CurriedSimple { result, .. }
-                    | ast_addressed::CaseArm::Searched { result, .. }
-                    | ast_addressed::CaseArm::Default { result } => {
-                        walk_domain_for_tree_groups(result, counter);
-                    }
-                }
-            }
-        }
-        ast_addressed::FunctionExpression::Lambda { body, .. } => {
-            walk_domain_for_tree_groups(body, counter);
-        }
-        ast_addressed::FunctionExpression::Infix { left, right, .. } => {
-            walk_domain_for_tree_groups(left, counter);
-            walk_domain_for_tree_groups(right, counter);
-        }
-        // Leaf-like: no sub-expressions that could hold tree groups
-        ast_addressed::FunctionExpression::StringTemplate { .. }
-        | ast_addressed::FunctionExpression::Array { .. }
-        | ast_addressed::FunctionExpression::JsonPath { .. } => {}
-    }
-}

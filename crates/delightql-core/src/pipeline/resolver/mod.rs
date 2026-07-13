@@ -193,8 +193,16 @@ use resolver_fold::ResolverFold;
 
 #[derive(Debug, Clone)]
 pub struct BubbledState {
+    /// Columns produced by this relational expression. Unqualified references
+    /// resolve against this schema.
     pub i_provide: Vec<ast_resolved::ColumnMetadata>,
     pub i_need: Vec<ColumnReference>,
+    /// Columns grouped under the lexical qualifiers which remain visible while
+    /// resolving a condition attached to this expression. This deliberately
+    /// differs from `i_provide`: a set operation produces one merged output
+    /// schema while its correlation condition can still name its operand
+    /// aliases. A pipe result, conversely, is Fresh and carries no old aliases.
+    pub qualifier_scope: Vec<ast_resolved::ColumnMetadata>,
 }
 
 impl BubbledState {
@@ -204,6 +212,7 @@ impl BubbledState {
 
     pub fn resolved(columns: Vec<ast_resolved::ColumnMetadata>) -> Self {
         Self {
+            qualifier_scope: columns.clone(),
             i_provide: columns,
             i_need: Vec::new(),
         }
@@ -216,6 +225,7 @@ impl BubbledState {
         Self {
             i_provide: columns,
             i_need: unresolved,
+            qualifier_scope: Vec::new(),
         }
     }
 
@@ -226,9 +236,13 @@ impl BubbledState {
         let mut combined_need = left.i_need;
         combined_need.extend(right.i_need);
 
+        let mut combined_scope = left.qualifier_scope;
+        combined_scope.extend(right.qualifier_scope);
+
         Self {
             i_provide: combined_provide,
             i_need: combined_need,
+            qualifier_scope: combined_scope,
         }
     }
 }
@@ -861,7 +875,11 @@ fn wrap_with_pipe_cfes(
 /// interdependent EXISTS subqueries so that cross-EXISTS column references
 /// (e.g., `order_items.product_id` inside an EXISTS for `products`, where
 /// `order_items` is a sibling EXISTS) can be validated.
-fn collect_exists_table_columns(
+///
+/// SCOPE-LOCAL (INVENTORY L2): walks the current scope's Filter/spine and reaches
+/// each EXISTS's own innermost source, but does NOT recurse whole-tree into
+/// arbitrary nested subquery scopes. The `_in_scope` name marks that boundary.
+fn collect_exists_table_columns_in_scope(
     expr: &ast_unresolved::RelationalExpression,
     registry: &mut crate::resolution::EntityRegistry,
     context: &mut Vec<ast_resolved::ColumnMetadata>,
@@ -871,7 +889,7 @@ fn collect_exists_table_columns(
             source, condition, ..
         } => {
             // Recurse into the source to find deeper EXISTS
-            collect_exists_table_columns(source, registry, context)?;
+            collect_exists_table_columns_in_scope(source, registry, context)?;
 
             // If this filter's condition is an EXISTS, resolve the EXISTS
             // table source to get its columns and add them to context.
@@ -900,17 +918,17 @@ fn collect_exists_table_columns(
         }
         // Pipe: recurse into source for nested Filters with EXISTS.
         ast_unresolved::RelationalExpression::Pipe(pipe) => {
-            collect_exists_table_columns(&pipe.source, registry, context)
+            collect_exists_table_columns_in_scope(&pipe.source, registry, context)
         }
         // Join: EXISTS could be in Filter nodes inside either branch.
         ast_unresolved::RelationalExpression::Join { left, right, .. } => {
-            collect_exists_table_columns(left, registry, context)?;
-            collect_exists_table_columns(right, registry, context)
+            collect_exists_table_columns_in_scope(left, registry, context)?;
+            collect_exists_table_columns_in_scope(right, registry, context)
         }
         // SetOperation: recurse into operands.
         ast_unresolved::RelationalExpression::SetOperation { operands, .. } => {
             for operand in operands {
-                collect_exists_table_columns(operand, registry, context)?;
+                collect_exists_table_columns_in_scope(operand, registry, context)?;
             }
             Ok(())
         }
@@ -929,15 +947,38 @@ fn collect_exists_table_columns(
 
 /// Extract the innermost source from a relational expression.
 /// Traverses through Filter nodes to find the bottom source (usually a Relation).
+///
+/// KEPT LOCAL (not routed through Helper A `source_spine`): this peels `Filter`
+/// ONLY and STOPS at a Pipe (`_ => Some(self)`) — it belongs with the
+/// terminal-filter-peel family (S9–S11), NOT the base/source spine, which
+/// descends `Filter` AND `Pipe`. Routing it through `source_spine_terminal`
+/// would descend past a Pipe and return a different node (INVENTORY §4 grouped
+/// it with Helper A, but its Pipe boundary diverges — a named local accessor is
+/// correct here).
 fn extract_innermost_source(
     expr: &ast_unresolved::RelationalExpression,
 ) -> Option<&ast_unresolved::RelationalExpression> {
     match expr {
-        ast_unresolved::RelationalExpression::Filter { source, .. } => {
-            extract_innermost_source(source)
-        }
-        ast_unresolved::RelationalExpression::Relation(_) => Some(expr),
-        _ => Some(expr),
+        // Peel Filter → source ONLY. `condition` is a recursive field this peel
+        // DELIBERATELY does not follow (spelled `_` per R-I3); origin/cpr_schema
+        // are non-recursive metadata under `..`.
+        ast_unresolved::RelationalExpression::Filter {
+            source,
+            condition: _,
+            ..
+        } => extract_innermost_source(source),
+        // STOP at the WHOLE node: Pipe (this peel stops at a Pipe, unlike the
+        // base spine), Relation, Join, SetOperation, IntersectCorresponding, ER.
+        // Returning the whole node hides no recursive field — the node IS the
+        // boundary. Variants spelled per R-I3 so a new relational variant forces a
+        // decision instead of a silent `_ => Some(self)`.
+        ast_unresolved::RelationalExpression::Relation(_)
+        | ast_unresolved::RelationalExpression::Pipe(_)
+        | ast_unresolved::RelationalExpression::Join { .. }
+        | ast_unresolved::RelationalExpression::SetOperation { .. }
+        | ast_unresolved::RelationalExpression::IntersectCorresponding { .. }
+        | ast_unresolved::RelationalExpression::ErJoinChain { .. }
+        | ast_unresolved::RelationalExpression::ErTransitiveJoin { .. } => Some(expr),
     }
 }
 
@@ -1909,13 +1950,28 @@ fn rename_schema(
     }
 }
 
-/// Rename table references in the bubbled state's `i_provide` columns.
+/// Rename table references in both halves of the bubbled lexical state.
 fn rename_bubbled_columns(
     bubbled: &mut BubbledState,
     old_name: &str,
     new_name: &delightql_types::SqlIdentifier,
 ) {
     for col in &mut bubbled.i_provide {
+        if let ast_resolved::TableName::Named(tn) = col.qualifier() {
+            if tn == old_name {
+                let prev = tn.to_string();
+                col.push_scope(
+                    ast_resolved::TableName::Named(new_name.clone()),
+                    ast_resolved::IdentityContext::SubqueryAlias {
+                        alias: new_name.to_string(),
+                        previous_context: prev,
+                        resolver_id: None,
+                    },
+                );
+            }
+        }
+    }
+    for col in &mut bubbled.qualifier_scope {
         if let ast_resolved::TableName::Named(tn) = col.qualifier() {
             if tn == old_name {
                 let prev = tn.to_string();
@@ -2077,9 +2133,15 @@ fn extract_grounding_from_source(
                 None
             }
         }
-        ast_unresolved::RelationalExpression::Filter { source, .. } => {
-            extract_grounding_from_source(source)
-        }
+        // Source-spine descent: follow `source` only. `condition` is a recursive
+        // field the base-spine contract DELIBERATELY ignores — grounding comes
+        // from the base relation, not a predicate subquery (spelled `_` per R-I3;
+        // origin/cpr_schema are non-recursive metadata under `..`).
+        ast_unresolved::RelationalExpression::Filter {
+            source,
+            condition: _,
+            ..
+        } => extract_grounding_from_source(source),
         ast_unresolved::RelationalExpression::Pipe(pipe) => {
             extract_grounding_from_source(&pipe.source)
         }
@@ -2099,12 +2161,16 @@ fn extract_in_predicate_values(
     source: &ast_unresolved::RelationalExpression,
 ) -> HashMap<String, Vec<String>> {
     let mut result = HashMap::new();
-    scan_for_in_predicates(source, &mut result);
+    scan_for_in_predicates_in_scope(source, &mut result);
     result
 }
 
+/// SCOPE-LOCAL (INVENTORY L1): collects IN-predicate values for pivot within the
+/// CURRENT query scope — reads `Filter.condition` and recurses the relational
+/// spine, but deliberately does NOT enter nested subquery scopes (those are
+/// scanned at their own level). The `_in_scope` name marks that stop boundary.
 #[stacksafe::stacksafe]
-fn scan_for_in_predicates(
+fn scan_for_in_predicates_in_scope(
     expr: &ast_unresolved::RelationalExpression,
     result: &mut HashMap<String, Vec<String>>,
 ) {
@@ -2115,18 +2181,18 @@ fn scan_for_in_predicates(
             if let ast_unresolved::SigmaCondition::Predicate(bool_expr) = condition {
                 extract_in_from_boolean(bool_expr, result);
             }
-            scan_for_in_predicates(source, result);
+            scan_for_in_predicates_in_scope(source, result);
         }
         ast_unresolved::RelationalExpression::Pipe(pipe) => {
-            scan_for_in_predicates(&pipe.source, result);
+            scan_for_in_predicates_in_scope(&pipe.source, result);
         }
         ast_unresolved::RelationalExpression::Join { left, right, .. } => {
-            scan_for_in_predicates(left, result);
-            scan_for_in_predicates(right, result);
+            scan_for_in_predicates_in_scope(left, result);
+            scan_for_in_predicates_in_scope(right, result);
         }
         ast_unresolved::RelationalExpression::SetOperation { operands, .. } => {
             for operand in operands {
-                scan_for_in_predicates(operand, result);
+                scan_for_in_predicates_in_scope(operand, result);
             }
         }
         // Base cases: leaf relations have no predicates to scan.

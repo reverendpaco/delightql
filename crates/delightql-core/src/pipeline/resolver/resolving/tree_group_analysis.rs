@@ -9,7 +9,6 @@
 //! for each tree group with nested reductions.
 
 use crate::error::Result;
-use crate::pipeline::asts::core::phase_box::PhaseBox;
 use crate::pipeline::asts::resolved::{
     self as ast, CteRequirements, FunctionExpression, NestedMemberCteInfo, TreeGroupLocation,
 };
@@ -262,7 +261,6 @@ fn populate_nested_metadata_cte_requirements(
             join_keys: accumulated_keys.iter().map(|(_, e)| e.clone()).collect(), // JOIN on parent's keys (just expressions)
             location,
             nested_members_info,
-            cte_name: PhaseBox::phantom(),
         });
 
         // Recursively process the constructor if it's another MetadataTreeGroup
@@ -346,7 +344,6 @@ fn compute_cte_requirements(
         join_keys,
         location,
         nested_members_info,
-        cte_name: PhaseBox::phantom(),
     })
 }
 

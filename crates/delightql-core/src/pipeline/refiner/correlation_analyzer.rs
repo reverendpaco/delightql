@@ -15,10 +15,16 @@ use std::collections::HashSet;
 use crate::error::Result;
 use crate::pipeline::asts::resolved;
 
-/// Detect (but don't remove!) correlation filters in the subquery
-/// Returns them for metadata purposes only - they stay in the AST
+/// Detect (but don't remove!) correlation filters in the subquery.
+/// Returns them for metadata purposes only - they stay in the AST.
+///
+/// SCOPE-LOCAL (INVENTORY L4, the canonical scope-local proof): finds correlation
+/// filters in the CURRENT scope only. It deliberately does NOT recurse into
+/// nested INNER-RELATIONs — their correlation filters belong to their own level
+/// and "would be hoisted to the wrong level" (see the `Relation` arm). The
+/// `_in_scope` name marks that load-bearing stop boundary.
 #[stacksafe::stacksafe]
-pub fn detect_correlation_filters(
+pub fn detect_correlation_filters_in_scope(
     expr: &resolved::RelationalExpression,
 ) -> Result<Vec<resolved::BooleanExpression>> {
     let mut filters = Vec::new();
@@ -38,16 +44,16 @@ pub fn detect_correlation_filters(
                 }
             }
             // Recursively check source
-            filters.extend(detect_correlation_filters(source)?);
+            filters.extend(detect_correlation_filters_in_scope(source)?);
         }
         resolved::RelationalExpression::Pipe(pipe_expr) => {
             // Check source
-            filters.extend(detect_correlation_filters(&pipe_expr.source)?);
+            filters.extend(detect_correlation_filters_in_scope(&pipe_expr.source)?);
         }
         resolved::RelationalExpression::Join { left, right, .. } => {
             // Check both sides of the join
-            filters.extend(detect_correlation_filters(left)?);
-            filters.extend(detect_correlation_filters(right)?);
+            filters.extend(detect_correlation_filters_in_scope(left)?);
+            filters.extend(detect_correlation_filters_in_scope(right)?);
         }
         resolved::RelationalExpression::Relation(_rel) => {
             // DO NOT recursively check nested INNER-RELATIONs!
@@ -65,7 +71,7 @@ pub fn detect_correlation_filters(
         }
         resolved::RelationalExpression::SetOperation { operands, .. } => {
             for operand in operands {
-                filters.extend(detect_correlation_filters(operand)?);
+                filters.extend(detect_correlation_filters_in_scope(operand)?);
             }
         }
         resolved::RelationalExpression::ErJoinChain { .. }
@@ -151,9 +157,20 @@ fn collect_qualifiers_and_unqualified(
                 collect_domain_qualifiers_and_unqualified(elem, out, has_unqualified);
             }
         }
-        // InnerExists, InRelational, Using, BooleanLiteral, Sigma, Glob/OrdinalGlob:
-        // Either self-contained subqueries or no qualifiers to collect
-        _ => {}
+        // Scope-local STOP, spelled per R-I3 (was a bare `_ => {}`): the
+        // subquery-bearing variants (InnerExists.subquery, InRelational.subquery,
+        // Sigma.condition) are self-contained nested scopes this correlation-
+        // qualifier collector DELIBERATELY does not descend (the load-bearing
+        // stop-at-subquery boundary, L4); the rest carry no qualifiers to collect
+        // (Using / BooleanLiteral / Glob correlations). Kept no-op (byte-identical);
+        // a newly-added boolean variant now forces a decision here.
+        resolved::BooleanExpression::InnerExists { .. }
+        | resolved::BooleanExpression::InRelational { .. }
+        | resolved::BooleanExpression::Sigma { .. }
+        | resolved::BooleanExpression::Using { .. }
+        | resolved::BooleanExpression::BooleanLiteral { .. }
+        | resolved::BooleanExpression::GlobCorrelation { .. }
+        | resolved::BooleanExpression::OrdinalGlobCorrelation { .. } => {}
     }
 }
 
@@ -194,7 +211,20 @@ fn collect_domain_qualifiers_and_unqualified(
                     collect_case_arm_qualifiers(arm, out);
                 }
             }
-            _ => {}
+            // Spelled per R-I3 (was a bare `_ => {}`): these function variants DO
+            // carry recursive domain expressions (HigherOrder/Window args,
+            // Lambda.body, JsonPath.source, Curly/Array/MetadataTreeGroup members),
+            // but this correlation-qualifier collector deliberately does not descend
+            // them (kept no-op, byte-identical). A new function variant now forces a
+            // decision here.
+            resolved::FunctionExpression::HigherOrder { .. }
+            | resolved::FunctionExpression::Lambda { .. }
+            | resolved::FunctionExpression::StringTemplate { .. }
+            | resolved::FunctionExpression::Window { .. }
+            | resolved::FunctionExpression::Curly { .. }
+            | resolved::FunctionExpression::Array { .. }
+            | resolved::FunctionExpression::MetadataTreeGroup { .. }
+            | resolved::FunctionExpression::JsonPath { .. } => {}
         },
         resolved::DomainExpression::Parenthesized { inner, .. } => {
             collect_domain_qualifiers_and_unqualified(inner, out, has_unqualified);
@@ -202,8 +232,24 @@ fn collect_domain_qualifiers_and_unqualified(
         resolved::DomainExpression::Predicate { expr, .. } => {
             collect_qualifiers_and_unqualified(expr, out, has_unqualified);
         }
-        // Leaf types (literals, etc.): no qualifiers
-        _ => {}
+        // Spelled per R-I3 (was a bare `_ => {}`). The recursive-field-bearing
+        // variants here (PipedExpression.value/transforms, Tuple.elements,
+        // PivotOf.value_column/pivot_key, ScalarSubquery.subquery) are DELIBERATELY
+        // not descended by this correlation-qualifier collector — ScalarSubquery is
+        // a self-contained nested scope (scope-local stop), the others carry no
+        // correlation qualifiers at this level. Kept no-op (byte-identical); the
+        // true leaf variants (Literal/Projection/Substitution/…) carry nothing. A
+        // newly-added domain variant now forces a decision here.
+        resolved::DomainExpression::PipedExpression { .. }
+        | resolved::DomainExpression::Tuple { .. }
+        | resolved::DomainExpression::PivotOf { .. }
+        | resolved::DomainExpression::ScalarSubquery { .. }
+        | resolved::DomainExpression::Literal { .. }
+        | resolved::DomainExpression::Projection(_)
+        | resolved::DomainExpression::NonUnifiyingUnderscore
+        | resolved::DomainExpression::ValuePlaceholder { .. }
+        | resolved::DomainExpression::Substitution(_)
+        | resolved::DomainExpression::ColumnOrdinal(_) => {}
     }
 }
 

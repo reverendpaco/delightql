@@ -258,7 +258,23 @@ pub(super) fn extract_from_domain(
                             extract_from_domain(arg, qualified, unqualified);
                         }
                     }
-                    _ => {} // Other function types in pipe transforms are rare
+                    // Spelled per R-I3 (was a bare `_ => {}`): these transform
+                    // function variants DO carry recursive domain expressions
+                    // (Infix.left/right, Lambda.body, CaseExpression.arms,
+                    // HigherOrder/Window args, JsonPath.source, …), but this
+                    // scope-local ref-extractor deliberately does NOT descend them
+                    // in pipe-transform position (kept a no-op, byte-identical). A
+                    // newly-added function variant now forces a decision here.
+                    resolved::FunctionExpression::Infix { .. }
+                    | resolved::FunctionExpression::Lambda { .. }
+                    | resolved::FunctionExpression::HigherOrder { .. }
+                    | resolved::FunctionExpression::CaseExpression { .. }
+                    | resolved::FunctionExpression::Window { .. }
+                    | resolved::FunctionExpression::StringTemplate { .. }
+                    | resolved::FunctionExpression::Curly { .. }
+                    | resolved::FunctionExpression::Array { .. }
+                    | resolved::FunctionExpression::MetadataTreeGroup { .. }
+                    | resolved::FunctionExpression::JsonPath { .. } => {}
                 }
             }
         }
@@ -274,9 +290,14 @@ pub(super) fn extract_from_domain(
     }
 }
 
-/// Extract references from a RelationalExpression (for InnerExists)
+/// Extract references from a RelationalExpression (for InnerExists).
+///
+/// SCOPE-LOCAL (INVENTORY L3): collects column/table refs for the flattener
+/// within the current scope only — `InRelational` value / `InnerExists` are NOT
+/// descended ("subquery references are internal"). The `_in_scope` name marks
+/// that deliberate stop at nested subquery scopes.
 #[stacksafe::stacksafe]
-pub(super) fn extract_refs_from_relational(
+pub(super) fn extract_refs_from_relational_in_scope(
     expr: &resolved::RelationalExpression,
     qualified: &mut HashSet<String>,
     unqualified: &mut HashSet<String>,
@@ -290,7 +311,7 @@ pub(super) fn extract_refs_from_relational(
                 qualified.extend(q);
                 unqualified.extend(u);
             }
-            extract_refs_from_relational(source, qualified, unqualified);
+            extract_refs_from_relational_in_scope(source, qualified, unqualified);
         }
         resolved::RelationalExpression::Join {
             left,
@@ -303,14 +324,14 @@ pub(super) fn extract_refs_from_relational(
                 qualified.extend(q);
                 unqualified.extend(u);
             }
-            extract_refs_from_relational(left, qualified, unqualified);
-            extract_refs_from_relational(right, qualified, unqualified);
+            extract_refs_from_relational_in_scope(left, qualified, unqualified);
+            extract_refs_from_relational_in_scope(right, qualified, unqualified);
         }
         // Leaf and compound nodes without boolean predicates at this level.
         resolved::RelationalExpression::Relation(_)
         | resolved::RelationalExpression::SetOperation { .. } => {}
         resolved::RelationalExpression::Pipe(pipe) => {
-            extract_refs_from_relational(&pipe.source, qualified, unqualified);
+            extract_refs_from_relational_in_scope(&pipe.source, qualified, unqualified);
         }
         resolved::RelationalExpression::ErJoinChain { .. }
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {

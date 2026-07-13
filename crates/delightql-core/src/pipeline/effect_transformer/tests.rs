@@ -676,8 +676,15 @@ fn self_referential_dml_materializes_view_source() {
         "the DELETE reads the snapshot, not the view over its own target: {}",
         delete_sql
     );
+    // `AS valid` is a legal preservation of the logical binding after the
+    // physical source becomes `__snap_valid`; only a FROM/JOIN of the live
+    // view would violate §5.4.
+    let without_snapshot_name = delete_sql.replace("__snap_valid", "");
     assert!(
-        !delete_sql.replace("__snap_valid", "").contains("valid"),
+        !without_snapshot_name.contains("FROM valid")
+            && !without_snapshot_name.contains("JOIN valid")
+            && !without_snapshot_name.contains("FROM \"valid\"")
+            && !without_snapshot_name.contains("JOIN \"valid\""),
         "the hazardous view is no longer read by the mutation: {}",
         delete_sql
     );
@@ -2276,4 +2283,299 @@ fn anon_source_plan_with_siso_mount_elsewhere_still_compiles() {
     retype_connection_as_siso(&system, conn_id);
     compile_query_plan(&system, &adhoc_query("_(x @ 1) |> temp_table!(t)"), None)
         .expect("anon-source plans with a siso mount elsewhere keep hub convergence");
+}
+
+// ============================================================================
+// P1 closure matrix (INDUCTIVE-TRAVERSAL-PLAN R-I4 / R-I6)
+// ============================================================================
+//
+// The two private walkers this phase removed (collect_ground_names_into detect
+// + rename_ground_reads rewrite) shared a bug precisely because NOTHING forced
+// their closures to coincide: detection could see a hole the rewrite missed
+// (or vice versa). R-I6 replaces that with two CENTRALIZED recursion schemes
+// (AstVisit for detect, AstTransform<P,P> for rewrite) whose equivalence is
+// ENFORCED here — the SAME representative fixture, a bare Ground read beneath
+// EVERY query-bearing edge, run through BOTH. If either scheme drops an edge,
+// this test fails on that edge's name.
+//
+// PRECISION LIMIT (other-code-review.md [P3]): this fixture is built at
+// Unresolved, where `SetOperation.correlation` is always empty — so this matrix
+// does NOT exercise the one edge where the two schemes genuinely differ
+// (AstVisit reaches correlation via `PhaseBox::correlation`; the cross-phase
+// AstTransform phantoms it). That divergence is harmless for GroundReadRenamer,
+// which runs strictly before correlation is populated (Refined). The
+// "coincide" claim is therefore scoped to the pre-correlation phases these
+// tenants run in — NOT a general same-phase guarantee. A future same-phase
+// transform that must preserve populated correlation needs its own mechanism
+// (INVENTORY §5 finding 9); do not read this matrix as proving that case.
+
+mod p1_closure_matrix {
+    use super::*;
+    use crate::pipeline::asts::core::expressions::metadata_types::{FilterOrigin, SetOperator};
+    use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
+    use crate::pipeline::asts::core::{
+        BooleanExpression, DomainExpression, SigmaCondition,
+    };
+
+    fn qn(name: &str) -> QualifiedName {
+        QualifiedName {
+            namespace_path: crate::pipeline::ast_unresolved::NamespacePath::empty(),
+            name: name.into(),
+            grounding: None,
+        }
+    }
+
+    fn join(
+        left: RelationalExpression,
+        right: RelationalExpression,
+        cond: Option<BooleanExpression>,
+    ) -> RelationalExpression {
+        RelationalExpression::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_condition: cond,
+            join_type: None,
+            cpr_schema: PhaseBox::phantom(),
+        }
+    }
+
+    /// One bare Ground read beneath every query-bearing edge, each uniquely
+    /// named after the edge it sits under. The union of these names is the
+    /// closure both schemes must reach.
+    fn every_edge_fixture() -> (RelationalExpression, Vec<&'static str>) {
+        // Filter.source + Filter.condition (via InRelational subquery) — the
+        // P1 headline hole.
+        let filter = RelationalExpression::Filter {
+            source: Box::new(ground_read("g_filter_source")),
+            condition: SigmaCondition::Predicate(BooleanExpression::InRelational {
+                value: Box::new(DomainExpression::NonUnifiyingUnderscore),
+                subquery: Box::new(ground_read("g_filter_condition")),
+                identifier: qn("f"),
+                negated: false,
+            }),
+            origin: FilterOrigin::UserWritten,
+            cpr_schema: PhaseBox::phantom(),
+        };
+
+        // Join.left / Join.right / Join.join_condition (via InnerExists).
+        let join_with_cond = join(
+            ground_read("g_join_left"),
+            ground_read("g_join_right"),
+            Some(BooleanExpression::InnerExists {
+                exists: true,
+                identifier: qn("j"),
+                subquery: Box::new(ground_read("g_join_condition")),
+                alias: None,
+                using_columns: vec![],
+            }),
+        );
+
+        // Pipe.source + a pipe-OPERATOR argument subquery (Transform → scalar
+        // subquery): the edge missed by ALL relational-entry walkers today.
+        let pipe = make_pipe(
+            ground_read("g_pipe_source"),
+            UnaryRelationalOperator::Transform {
+                transformations: vec![(
+                    DomainExpression::ScalarSubquery {
+                        identifier: qn("s"),
+                        subquery: Box::new(ground_read("g_operator_arg")),
+                        alias: None,
+                    },
+                    "a".to_string(),
+                    None,
+                )],
+                conditioned_on: None,
+            },
+        );
+
+        // SetOperation operand + an InnerRelation subquery.
+        let setop = RelationalExpression::SetOperation {
+            operator: SetOperator::SmartUnionAll,
+            operands: vec![
+                ground_read("g_setop_operand"),
+                RelationalExpression::Relation(Relation::InnerRelation {
+                    pattern: InnerRelationPattern::Indeterminate {
+                        identifier: qn("i"),
+                        subquery: Box::new(ground_read("g_inner_relation")),
+                    },
+                    alias: None,
+                    outer: false,
+                    cpr_schema: PhaseBox::phantom(),
+                }),
+            ],
+            correlation: PhaseBox::phantom(),
+            cpr_schema: PhaseBox::phantom(),
+        };
+
+        let fixture = join(filter, join(join_with_cond, join(pipe, setop, None), None), None);
+        let names = vec![
+            "g_filter_source",
+            "g_filter_condition",
+            "g_join_left",
+            "g_join_right",
+            "g_join_condition",
+            "g_pipe_source",
+            "g_operator_arg",
+            "g_setop_operand",
+            "g_inner_relation",
+        ];
+        (fixture, names)
+    }
+
+    #[test]
+    fn p1_closure_matrix_detection_and_rewrite_agree() {
+        let (fixture, names) = every_edge_fixture();
+
+        // --- Detection (AstVisit) reaches every edge. ---
+        let detected = collect_ground_names(&fixture);
+        for n in &names {
+            assert!(
+                detected.contains(*n),
+                "P1 DETECTION (collect_ground_names) dropped edge `{n}`; saw: {:?}",
+                detected
+            );
+        }
+
+        // --- Rewrite (AstTransform<P,P>) reaches every edge, and detection
+        // agrees. For each edge's read, renaming it must (a) make the old name
+        // vanish and (b) introduce the snapshot name — proving the rewrite
+        // reached that exact edge and the detector sees the substitution. That
+        // the SAME name set drives both halves is the R-I6 coincidence. ---
+        for n in &names {
+            let snap = format!("{n}__snap");
+            let rewritten = rename_ground_reads(fixture.clone(), n, &snap);
+            let after = collect_ground_names(&rewritten);
+            assert!(
+                !after.contains(*n),
+                "P1 REWRITE (rename_ground_reads) failed to reach edge `{n}` \
+                 (old name survived); after: {:?}",
+                after
+            );
+            assert!(
+                after.contains(&snap),
+                "P1 REWRITE did not introduce the snapshot name at edge `{n}`; \
+                 after: {:?}",
+                after
+            );
+        }
+    }
+}
+
+// ============================================================================
+// RED-6 (F6): the C-completion lowering guards (Ground/DML domain-spec) refuse
+// a predicate-position directive AT THE LOWERING PATH — the AST-level pin the
+// two wrong comments (effect_transformer/mod.rs:792/1053, citing the
+// never-created effecthead--90/91 balls) should have named.
+//
+// These shapes are surface-inconstructible (the builder routes non-column
+// access expressions to WHERE filters), so they are pinned here at the level
+// they ARE constructible: a hand-built directive-bearing DomainSpec fed
+// straight into `walk_relation` (Ground) / `handle_dml` (DML). GREEN today (the
+// guards exist); RED-VERIFIABLE — deleting either guard drops the refusal and
+// lets the directive reach SQL unprocessed. Complements the existing detection
+// pin `effects::tests::domain_spec_demands_directive_reaches_positional_scalar_subquery`.
+// ============================================================================
+
+/// A `QualifiedName` for the RED-6 fixtures.
+fn qn_red6(name: &str) -> QualifiedName {
+    QualifiedName {
+        namespace_path: crate::pipeline::asts::core::metadata::NamespacePath::empty(),
+        name: name.into(),
+        grounding: None,
+    }
+}
+
+/// A positional access spec that hides a directive (`insert!`) in a scalar
+/// subquery — the exact shape `domain_spec_demands_directive` detects.
+fn directive_bearing_domain_spec() -> DomainSpec {
+    DomainSpec::Positional(vec![DomainExpression::ScalarSubquery {
+        identifier: qn_red6("s"),
+        subquery: Box::new(RelationalExpression::Relation(Relation::PseudoPredicate {
+            name: "insert!".to_string(),
+            arguments: vec![],
+            alias: None,
+            cpr_schema: PhaseBox::phantom(),
+        })),
+        alias: None,
+    }])
+}
+
+fn top_walk_ctx() -> WalkCtx {
+    WalkCtx {
+        guards: Vec::new(),
+        label_hint: None,
+        sink: None,
+        ctes: Vec::new(),
+        bindings: HashMap::new(),
+    }
+}
+
+/// RED-6 (Ground): `walk_relation` on a `Ground` read whose access spec demands
+/// a directive must refuse with the honest not-yet-lowerable diagnostic — never
+/// return the directive unprocessed. Pins the guard at mod.rs:792.
+#[test]
+fn ground_access_spec_directive_refuses_at_lowering() {
+    let system = world_system();
+    let mut builder = PlanBuilder::new(&system, Some("fx"));
+    let ground = Relation::Ground {
+        identifier: qn_red6("orders"),
+        canonical_name: PhaseBox::phantom(),
+        backend_schema: PhaseBox::phantom(),
+        domain_spec: directive_bearing_domain_spec(),
+        alias: None,
+        outer: false,
+        mutation_target: false,
+        passthrough: false,
+        cpr_schema: PhaseBox::phantom(),
+        hygienic_injections: Vec::new(),
+    };
+
+    let err = builder
+        .walk_relation(ground, &top_walk_ctx())
+        .expect_err("a directive in a Ground access spec must refuse, not lower unprocessed");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("predicate-position lowering is not yet supported"),
+        "Ground lowering guard must emit the effect/predicate/unsupported refusal \
+         (RED-verifiable — deleting the mod.rs:792 guard drops it): {msg}"
+    );
+}
+
+/// RED-6 (DML): `handle_dml` on a DML terminal whose access spec demands a
+/// directive must refuse before any statement is compiled — never lower the
+/// directive unprocessed. Pins the guard at mod.rs:1053.
+#[test]
+fn dml_access_spec_directive_refuses_at_lowering() {
+    let system = world_system();
+    let mut builder = PlanBuilder::new(&system, Some("fx"));
+    // The walked source is immaterial: the guard fires before it is touched.
+    let walked_source = RelationalExpression::Relation(Relation::Ground {
+        identifier: qn_red6("source_rows"),
+        canonical_name: PhaseBox::phantom(),
+        backend_schema: PhaseBox::phantom(),
+        domain_spec: DomainSpec::Glob,
+        alias: None,
+        outer: false,
+        mutation_target: false,
+        passthrough: false,
+        cpr_schema: PhaseBox::phantom(),
+        hygienic_injections: Vec::new(),
+    });
+
+    let err = builder
+        .handle_dml(
+            walked_source,
+            DmlKind::Insert,
+            "orders_eu".to_string(),
+            Some("warehouse".to_string()),
+            directive_bearing_domain_spec(),
+            &top_walk_ctx(),
+        )
+        .expect_err("a directive in a DML access spec must refuse, not lower unprocessed");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("predicate-position lowering is not yet supported"),
+        "DML lowering guard must emit the effect/predicate/unsupported refusal \
+         (RED-verifiable — deleting the mod.rs:1053 guard drops it): {msg}"
+    );
 }

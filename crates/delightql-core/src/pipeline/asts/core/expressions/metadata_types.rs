@@ -3,7 +3,6 @@
 //! Metadata types for expressions
 //! FilterOrigin, SetOperator, TreeGroupLocation, CteRequirements
 
-use super::super::phase_box::PhaseBox;
 use super::super::{Addressed, Refined, Resolved, Unresolved};
 use super::domain::DomainExpression;
 use crate::{lispy::ToLispy, PhaseConvert, ToLispy};
@@ -100,10 +99,4 @@ pub struct CteRequirements<Phase = Unresolved> {
     /// Metadata for each nested member (for CTE column reference)
     /// Maps nested reduction keys to their CTE column names
     pub nested_members_info: Vec<NestedMemberCteInfo>,
-
-    /// Pre-assigned CTE name from the addresser (Phase A+)
-    /// None during builder/resolver/refiner, Some("_tg_0") after addresser walk.
-    /// The transformer uses this instead of next_alias() when present.
-    #[phase_convert(phantom)]
-    pub cte_name: PhaseBox<Option<String>, Phase>,
 }

@@ -115,12 +115,15 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved::{ColumnMetadata, ColumnProvenance, CprSchema, TableName};
+use crate::pipeline::ast_transform::{walk_transform_relation, AstTransform};
+use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
 use crate::pipeline::ast_unresolved::{
     Query, Relation, RelationalExpression, UnaryRelationalOperator,
 };
 use crate::pipeline::asts::core::operators::DmlKind;
 use crate::pipeline::asts::core::{
     DomainExpression, DomainSpec, PhaseBox, ProjectionExpr, QualificationSource, QualifiedName,
+    Unresolved,
 };
 use crate::pipeline::asts::ddl::HoParamKind;
 use crate::pipeline::asts::effects::{self, DirectiveCategory, EffectCteDef, EffectRule};
@@ -685,6 +688,14 @@ impl<'a> PlanBuilder<'a> {
                 join_type,
                 cpr_schema,
             } => {
+                // W4 / P2 (close the recursive type): a join condition carries
+                // the same boolean subquery edges as a filter predicate. A
+                // directive demanded there is not lowered on the spine.
+                if let Some(jc) = &join_condition {
+                    if effects::boolean_demands_directive(jc) {
+                        return Err(effect_head_predicate_unsupported("a join condition"));
+                    }
+                }
                 let walked_left = self.walk_value(*left, &ctx.without_sink())?;
                 // Emission 3: a left conjunct gates directives demanded to
                 // its right (E1: an empty step ends the chain). Only gate
@@ -711,6 +722,15 @@ impl<'a> PlanBuilder<'a> {
                 origin,
                 cpr_schema,
             } => {
+                // W4 / P2: the predicate is NOT on the lowered source spine. A
+                // directive demanded through an IN/EXISTS/scalar subquery here
+                // reaches SQL unprocessed under the old walker; instead refuse
+                // it with the honest not-yet-lowerable diagnostic (Q-I1(b)).
+                if effects::condition_demands_directive(&condition) {
+                    return Err(effect_head_predicate_unsupported(
+                        "a predicate subquery (IN / EXISTS / scalar)",
+                    ));
+                }
                 let walked = self.walk_value(*source, &ctx.without_sink())?;
                 Ok(RelationalExpression::Filter {
                     source: Box::new(walked),
@@ -765,6 +785,19 @@ impl<'a> PlanBuilder<'a> {
             } => self.walk_directive_call(&name, &arguments, ctx),
 
             Relation::Ground { ref identifier, ref domain_spec, .. } => {
+                // W4 / P2 (other-code-review.md [P1], close the recursive type):
+                // a Ground read's access spec can hide a directive in a scalar
+                // subquery — NOT on the lowered spine, so refuse it honestly
+                // (Q-I1(b)) rather than return it unprocessed. Pinned at the
+                // constructible AST boundary by
+                // `ground_access_spec_directive_refuses_at_lowering` and the
+                // collector test
+                // `domain_spec_demands_directive_reaches_positional_scalar_subquery`.
+                if effects::domain_spec_demands_directive(domain_spec) {
+                    return Err(effect_head_predicate_unsupported(
+                        "a relation's access specification",
+                    ));
+                }
                 // A bare capitalized name may be a bound HO parameter: the
                 // rule body's `Bad(*)` reads the invocation's piped input.
                 if identifier.namespace_path.is_empty() {
@@ -982,8 +1015,16 @@ impl<'a> PlanBuilder<'a> {
                 self.walk_value(*argument, ctx)
             }
 
-            // Every other operator is pure: pass through.
+            // Every other operator is pure: pass through. But a pure operator's
+            // argument domain expressions can still hide a directive in a scalar
+            // subquery (W4 / P2, close the recursive type) — that is not lowered
+            // on the spine, so refuse it honestly (Q-I1(b)).
             other => {
+                if effects::operator_demands_directive(&other) {
+                    return Err(effect_head_predicate_unsupported(
+                        "a pipe operator argument",
+                    ));
+                }
                 let walked_source = self.walk_value(source, &ctx.without_sink())?;
                 Ok(make_pipe(walked_source, other))
             }
@@ -1009,6 +1050,17 @@ impl<'a> PlanBuilder<'a> {
         domain_spec: DomainSpec,
         ctx: &WalkCtx,
     ) -> Result<RelationalExpression> {
+        // W4 / P2 (other-code-review.md [P1], close the recursive type): the DML
+        // terminal's access spec is not on the lowered spine; a directive hidden
+        // in a scalar subquery there would reach SQL unprocessed. Refuse it
+        // honestly (Q-I1(b)). Pinned at the constructible AST boundary by
+        // `dml_access_spec_directive_refuses_at_lowering` and the collector test
+        // `domain_spec_demands_directive_reaches_positional_scalar_subquery`.
+        if effects::domain_spec_demands_directive(&domain_spec) {
+            return Err(effect_head_predicate_unsupported(
+                "a DML terminal's access specification",
+            ));
+        }
         // Invariant §5.4 / D2: a self-referential mutation whose source
         // reads the target THROUGH a plan-created view materializes the
         // derived relation first (pinned by
@@ -2661,6 +2713,34 @@ fn unsupported(message: String) -> DelightQLError {
     )
 }
 
+/// Q-I1(b): a directive demanded inside a predicate subquery under an EFFECT
+/// head is LEGAL IN PRINCIPLE (EFFECT-ALGEBRA E1a corollary — a directive is a
+/// relation and composes wherever a relational expression occurs). Its
+/// predicate-position lowering is simply not built yet. Refuse it with an honest
+/// limitation diagnostic — deliberately NOT an R1 purity refusal: R1 governs
+/// PURE heads, but the transformer only ever runs on registered EFFECT rules, so
+/// R1 does not apply here (that is exactly why detection under a pure head is
+/// closed separately, at consult, by the W1 demand walker). The correlated case
+/// is likewise refused pending Q-I3; both surface this message. Pinned by the
+/// effects ball's rules--85/86/87_effecthead_predicate_{in,exists,scalar}.
+fn effect_head_predicate_unsupported(position: &str) -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "effect/predicate/unsupported",
+        format!(
+            "a directive is demanded inside {position} under an effect head. A \
+             directive composes wherever a relational expression occurs \
+             (EFFECT-ALGEBRA E1a corollary), so this is legal in principle — but \
+             its predicate-position lowering is not yet supported in v0.1. Demand \
+             the directive in a top-level pipeline position instead — an arm, or \
+             an effect-CTE ': name!' demanded on the main pipeline — not inside a \
+             predicate or argument subquery. (Referencing an effect-CTE as \
+             'name!(*)' from within the predicate does NOT help: the reference is \
+             itself the demand, E2.)"
+        ),
+        "effect-head predicate directive not yet lowerable",
+    )
+}
+
 fn internal(message: impl std::fmt::Display) -> DelightQLError {
     DelightQLError::validation_error(
         format!("effect transformer internal error: {}", message),
@@ -2932,6 +3012,13 @@ fn precount_query(
 
 /// Does this pure value expression carry a signed witness that
 /// `lower_witness_union` must lower (top-level, or as a union arm)?
+///
+/// KEPT LOCAL (not routed through Helper B `fold_tail`): by contract this is a
+/// TOP-LEVEL check — a Pipe operator or a SetOperation arm only. Unlike the
+/// tail spine it does NOT descend a Join's right (`_ => false`), so routing it
+/// through `fold_tail` would over-recurse and change results. INVENTORY §2b/§6
+/// flag the `_ => false` catch-all as a Phase-E decision point (is a signed
+/// witness under a filter/join reachable/legal?), not a bug today.
 #[stacksafe::stacksafe]
 fn value_contains_witness(expr: &RelationalExpression) -> bool {
     match expr {
@@ -2941,7 +3028,18 @@ fn value_contains_witness(expr: &RelationalExpression) -> bool {
         RelationalExpression::SetOperation { operands, .. } => {
             operands.iter().any(value_contains_witness)
         }
-        _ => false,
+        // Top-level-by-contract STOP: the remaining variants carry recursive
+        // fields (Filter.source/condition, Join arms/join_condition,
+        // IntersectCorresponding operands/correlation, ER arms) that this check
+        // DELIBERATELY does NOT descend — a signed witness is recognized only at
+        // the top level (Pipe operator / union arm). Spelled per R-I3 so a new
+        // relational variant forces a decision instead of a silent `_ => false`.
+        RelationalExpression::Relation(_)
+        | RelationalExpression::Filter { .. }
+        | RelationalExpression::Join { .. }
+        | RelationalExpression::IntersectCorresponding { .. }
+        | RelationalExpression::ErJoinChain { .. }
+        | RelationalExpression::ErTransitiveJoin { .. } => false,
     }
 }
 
@@ -2950,8 +3048,35 @@ fn value_contains_witness(expr: &RelationalExpression) -> bool {
 /// DML/DDL terminal (the sinkable case, R5). Mirrors
 /// `effects::ends_in_directive`'s notion of "end": the last pipe operator,
 /// the rightmost conjunct, every union arm.
-#[stacksafe::stacksafe]
 fn ending_receipt_columns(expr: &RelationalExpression) -> Option<Vec<String>> {
+    // Rides Helper B `fold_tail` (the ending/tail spine): Join→right, and a
+    // union's echo shape is the name-preserving merge of its arms' shapes (an
+    // arm with no sinkable ending collapses the whole union to `None`). Only the
+    // Join→right / SetOp→arms RECURSION is shared; the per-node echo columns are
+    // `ending_receipt_leaf`. Byte-equivalent to the old hand-rolled walk. Pinned
+    // by `fold_tail_descends_join_right_and_all_setop_arms` and the effects ball
+    // `rules--49_multiclause_table_sinkable`.
+    crate::pipeline::spine::fold_tail(
+        expr,
+        &ending_receipt_leaf,
+        &|arms: Vec<Option<Vec<String>>>| {
+            let shapes: Vec<Vec<String>> = arms.into_iter().collect::<Option<_>>()?;
+            let mut merged: Vec<String> = Vec::new();
+            for shape in shapes {
+                for c in shape {
+                    if !merged.contains(&c) {
+                        merged.push(c);
+                    }
+                }
+            }
+            Some(merged)
+        },
+    )
+}
+
+/// The tail-LEAF half of `ending_receipt_columns`: the echo columns of THIS tail
+/// node when it is a sinkable DML/DDL terminal (R5), else `None`.
+fn ending_receipt_leaf(expr: &RelationalExpression) -> Option<Vec<String>> {
     match expr {
         RelationalExpression::Pipe(pipe) => match &pipe.operator {
             UnaryRelationalOperator::DmlTerminal { .. } => Some(vec![
@@ -2974,109 +3099,91 @@ fn ending_receipt_columns(expr: &RelationalExpression) -> Option<Vec<String>> {
                     "name".to_string(),
                 ])
             }
+            // Operator-KIND classification: any other tail operator is not a
+            // sinkable DML/DDL terminal, so there are no ending receipt columns —
+            // regardless of subqueries in its own argument expressions, which the
+            // tail contract does NOT recurse. A new sinkable terminal operator
+            // must be added to the arms above.
             _ => None,
         },
-        RelationalExpression::Join { right, .. } => ending_receipt_columns(right),
-        RelationalExpression::SetOperation { operands, .. } => {
-            let shapes: Vec<Vec<String>> = operands
-                .iter()
-                .map(ending_receipt_columns)
-                .collect::<Option<_>>()?;
-            let mut merged: Vec<String> = Vec::new();
-            for shape in shapes {
-                for c in shape {
-                    if !merged.contains(&c) {
-                        merged.push(c);
-                    }
-                }
-            }
-            Some(merged)
-        }
-        _ => None,
+        // Tail-leaf STOP, spelled per R-I3 (was a bare `_ => None`): a tail
+        // Relation, Filter, ER chain, or IntersectCorresponding is not a sinkable
+        // terminal — its recursive fields are DELIBERATELY not descended (tail
+        // contract). Join/SetOperation never reach the leaf (fold_tail recurses
+        // them) but are spelled to keep this exhaustive without a bare `_`.
+        RelationalExpression::Relation(_)
+        | RelationalExpression::Filter { .. }
+        | RelationalExpression::ErJoinChain { .. }
+        | RelationalExpression::ErTransitiveJoin { .. }
+        | RelationalExpression::IntersectCorresponding { .. }
+        | RelationalExpression::Join { .. }
+        | RelationalExpression::SetOperation { .. } => None,
     }
 }
 
 /// All bare Ground relation names an expression reads (the §5.4 hazard
 /// detector's input).
+///
+/// Rides the shared whole-tree closure `AstVisit` (INDUCTIVE-TRAVERSAL-PLAN §5
+/// W2, R-I6). Where the former private walker descended only `Filter.source`
+/// and `pipe.source`, the closure reaches EVERY query-bearing edge —
+/// `Filter.condition`, `join_condition`, pipe-OPERATOR argument subqueries, and
+/// so on — so a hazardous plan-created view read only inside an IN/EXISTS/scalar
+/// predicate is now in the candidate set (review llswlspw::zmxlwkky P1). Its
+/// closure COINCIDES with the paired rewrite `rename_ground_reads` (both centralized,
+/// both proven complete by `p1_closure_matrix_detection_and_rewrite_agree` — over
+/// the pre-correlation edges these tenants run in; see that test's PRECISION LIMIT
+/// note re SetOperation.correlation, other-code-review.md [P3]).
 fn collect_ground_names(expr: &RelationalExpression) -> HashSet<String> {
-    let mut out = HashSet::new();
-    collect_ground_names_into(expr, &mut out);
-    out
+    let mut c = GroundNameCollector::default();
+    // The collector's hook never fails, so the walk is infallible.
+    let _ = walk_visit_relational(&mut c, expr);
+    c.out
 }
 
-#[stacksafe::stacksafe]
-fn collect_ground_names_into(expr: &RelationalExpression, out: &mut HashSet<String>) {
-    match expr {
-        RelationalExpression::Relation(rel) => match rel {
-            Relation::Ground { identifier, .. } => {
-                out.insert(identifier.name.to_string());
-            }
-            Relation::InnerRelation { pattern, .. } => {
-                use crate::pipeline::asts::core::expressions::InnerRelationPattern as P;
-                match pattern {
-                    P::Indeterminate { subquery, .. }
-                    | P::UncorrelatedDerivedTable { subquery, .. }
-                    | P::CorrelatedScalarJoin { subquery, .. }
-                    | P::CorrelatedGroupJoin { subquery, .. } => {
-                        collect_ground_names_into(subquery, out)
-                    }
-                }
-            }
-            Relation::Anonymous { .. }
-            | Relation::TVF { .. }
-            | Relation::ConsultedView { .. }
-            | Relation::PseudoPredicate { .. } => {}
-        },
-        RelationalExpression::Join { left, right, .. } => {
-            collect_ground_names_into(left, out);
-            collect_ground_names_into(right, out);
+/// The `AstVisit` tenant for §5.4 ground-read detection (P1 detect half).
+#[derive(Default)]
+struct GroundNameCollector {
+    out: HashSet<String>,
+}
+
+impl AstVisit<Unresolved> for GroundNameCollector {
+    fn enter_relation(&mut self, r: &Relation) -> Result<Descent> {
+        if let Relation::Ground { identifier, .. } = r {
+            self.out.insert(identifier.name.to_string());
         }
-        RelationalExpression::Filter { source, .. } => collect_ground_names_into(source, out),
-        RelationalExpression::Pipe(pipe) => collect_ground_names_into(&pipe.source, out),
-        RelationalExpression::SetOperation { operands, .. } => {
-            for op in operands {
-                collect_ground_names_into(op, out);
-            }
-        }
-        RelationalExpression::ErJoinChain { .. }
-        | RelationalExpression::ErTransitiveJoin { .. }
-        | RelationalExpression::IntersectCorresponding { .. } => {}
+        Ok(Descent::Continue)
     }
 }
 
 /// Rewrite bare Ground reads of `from` into reads of `to` (the §5.4
 /// snapshot substitution).
-#[stacksafe::stacksafe]
-fn rename_ground_reads(
-    expr: RelationalExpression,
-    from: &str,
-    to: &str,
-) -> RelationalExpression {
-    match expr {
-        RelationalExpression::Relation(Relation::Ground {
-            identifier,
-            canonical_name,
-            backend_schema,
-            domain_spec,
-            alias,
-            outer,
-            mutation_target,
-            passthrough,
-            cpr_schema,
-            hygienic_injections,
-        }) => {
-            let identifier = if identifier.namespace_path.is_empty()
-                && identifier.name.as_str() == from
-            {
-                QualifiedName {
-                    namespace_path: identifier.namespace_path,
-                    name: to.into(),
-                    grounding: identifier.grounding,
-                }
-            } else {
-                identifier
-            };
-            RelationalExpression::Relation(Relation::Ground {
+///
+/// Rides the shared cross-phase spine `AstTransform<Unresolved, Unresolved>`
+/// (INDUCTIVE-TRAVERSAL-PLAN §5 W3, R-I5/R-I6). The default same-phase walk
+/// already descends the WHOLE tree — `Filter.condition`, `join_condition`, pipe
+/// operator arguments, InnerRelation subqueries — so the snapshot name is
+/// substituted at EVERY read, not only on the source spine (review
+/// llswlspw::zmxlwkky P1). Its closure COINCIDES with the paired detection
+/// `collect_ground_names` (both centralized recursion schemes, both proven
+/// complete by `p1_closure_matrix_detection_and_rewrite_agree` — this is the
+/// R-I6 guarantee the two private walkers lacked).
+fn rename_ground_reads(expr: RelationalExpression, from: &str, to: &str) -> RelationalExpression {
+    let mut r = GroundReadRenamer { from, to };
+    // A same-phase Ground-identifier rewrite never fails.
+    r.transform_relational(expr)
+        .expect("ground-read rename is infallible")
+}
+
+struct GroundReadRenamer<'a> {
+    from: &'a str,
+    to: &'a str,
+}
+
+impl AstTransform<Unresolved, Unresolved> for GroundReadRenamer<'_> {
+    fn transform_relation(&mut self, r: Relation) -> Result<Relation> {
+        match r {
+            Relation::Ground {
                 identifier,
                 canonical_name,
                 backend_schema,
@@ -3087,57 +3194,48 @@ fn rename_ground_reads(
                 passthrough,
                 cpr_schema,
                 hygienic_injections,
-            })
+            } => {
+                let is_rewritten =
+                    identifier.namespace_path.is_empty() && identifier.name.as_str() == self.from;
+                let identifier = if is_rewritten {
+                    QualifiedName {
+                        namespace_path: identifier.namespace_path,
+                        name: self.to.into(),
+                        grounding: identifier.grounding,
+                    }
+                } else {
+                    identifier
+                };
+                // The snapshot replaces the physical relation, not its lexical
+                // binding. Preserve the original name as an implicit alias so
+                // qualified references throughout the rewritten subtree keep
+                // resolving against the same logical relation. An explicit
+                // user alias already provides that stable binding.
+                let alias = if is_rewritten && alias.is_none() {
+                    Some(self.from.to_string().into())
+                } else {
+                    alias
+                };
+                // Descend the (possibly renamed) Ground so nested reads inside
+                // its domain_spec's scalar subqueries are renamed too.
+                walk_transform_relation(
+                    self,
+                    Relation::Ground {
+                        identifier,
+                        canonical_name,
+                        backend_schema,
+                        domain_spec,
+                        alias,
+                        outer,
+                        mutation_target,
+                        passthrough,
+                        cpr_schema,
+                        hygienic_injections,
+                    },
+                )
+            }
+            other => walk_transform_relation(self, other),
         }
-        RelationalExpression::Relation(other) => RelationalExpression::Relation(other),
-        RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            join_type,
-            cpr_schema,
-        } => RelationalExpression::Join {
-            left: Box::new(rename_ground_reads(*left, from, to)),
-            right: Box::new(rename_ground_reads(*right, from, to)),
-            join_condition,
-            join_type,
-            cpr_schema,
-        },
-        RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema,
-        } => RelationalExpression::Filter {
-            source: Box::new(rename_ground_reads(*source, from, to)),
-            condition,
-            origin,
-            cpr_schema,
-        },
-        RelationalExpression::Pipe(pipe) => {
-            let inner = (*pipe).into_inner();
-            make_pipe(
-                rename_ground_reads(inner.source, from, to),
-                inner.operator,
-            )
-        }
-        RelationalExpression::SetOperation {
-            operator,
-            operands,
-            correlation,
-            cpr_schema,
-        } => RelationalExpression::SetOperation {
-            operator,
-            operands: operands
-                .into_iter()
-                .map(|o| rename_ground_reads(o, from, to))
-                .collect(),
-            correlation,
-            cpr_schema,
-        },
-        other @ (RelationalExpression::ErJoinChain { .. }
-        | RelationalExpression::ErTransitiveJoin { .. }
-        | RelationalExpression::IntersectCorresponding { .. }) => other,
     }
 }
 

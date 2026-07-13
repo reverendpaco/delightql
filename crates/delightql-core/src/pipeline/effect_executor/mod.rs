@@ -38,7 +38,13 @@
 
 use crate::bin_cartridge::EffectExecutable;
 use crate::error::{DelightQLError, Result};
+use crate::pipeline::ast_visit::{
+    walk_visit_boolean, walk_visit_domain, walk_visit_operator, walk_visit_query,
+    walk_visit_relation, walk_visit_relational, walk_visit_sigma, AstVisit, Descent,
+};
+use crate::pipeline::asts::effects::{directive_category, DirectiveCategory};
 use crate::pipeline::asts::core::literals::LiteralValue;
+use crate::pipeline::asts::core::Unresolved;
 use crate::pipeline::asts::unresolved::*;
 use crate::pipeline::Pipeline;
 use crate::system::DelightQLSystem;
@@ -58,6 +64,12 @@ pub fn execute_effects(query: Query, system: &mut DelightQLSystem) -> Result<Que
             Ok(Query::Relational(rewritten_expression))
         }
         Query::WithCtes { ctes, query } => {
+            // A CTE definition is a data position, not the REPL/CLI top level.
+            // Walk the complete definition before resolution so an R9-illegal
+            // session directive cannot survive as a pseudo-predicate panic.
+            for cte in &ctes {
+                refuse_nested_session_directives_in_relational(&cte.expression)?;
+            }
             // Rewrite the main query expression, passing CTE bindings for resolution
             let rewritten_query = execute_effects_in_expression(query, &ctes, system)?;
             Ok(Query::WithCtes {
@@ -66,6 +78,9 @@ pub fn execute_effects(query: Query, system: &mut DelightQLSystem) -> Result<Que
             })
         }
         Query::WithCfes { cfes, query } => {
+            for cfe in &cfes {
+                refuse_nested_session_directives_in_domain(&cfe.body)?;
+            }
             // Rewrite the inner query recursively
             let rewritten_query = Box::new(execute_effects(*query, system)?);
             Ok(Query::WithCfes {
@@ -81,8 +96,23 @@ pub fn execute_effects(query: Query, system: &mut DelightQLSystem) -> Result<Que
                 query: rewritten_query,
             })
         }
-        // REPL commands don't have pseudo-predicates
-        _ => Ok(query),
+        Query::ReplTempTable { query, table_name } => {
+            refuse_nested_session_directives_in_query(&query)?;
+            Ok(Query::ReplTempTable {
+                query,
+                table_name,
+            })
+        }
+        Query::WithErContext { context, query } => {
+            Ok(Query::WithErContext { context, query })
+        }
+        Query::ReplTempView { query, view_name } => {
+            refuse_nested_session_directives_in_query(&query)?;
+            Ok(Query::ReplTempView {
+                query,
+                view_name,
+            })
+        }
     }
 }
 
@@ -95,7 +125,7 @@ fn execute_effects_in_expression(
 ) -> Result<RelationalExpression> {
     match expression {
         RelationalExpression::Relation(relation) => {
-            let rewritten_relation = execute_effects_in_relation(relation, system)?;
+            let rewritten_relation = execute_effects_in_relation(relation, ctes, system)?;
             Ok(RelationalExpression::Relation(rewritten_relation))
         }
         RelationalExpression::SetOperation {
@@ -121,6 +151,7 @@ fn execute_effects_in_expression(
             } = (*pipe).into_inner();
 
             if let UnaryRelationalOperator::DirectiveTerminal { name, arguments } = operator {
+                refuse_nested_session_directives_in_operator_arguments(&arguments)?;
                 execute_directive_pipe(source, &name, &arguments, ctes, system)
             } else if let UnaryRelationalOperator::HoViewApplication {
                 ref function,
@@ -128,6 +159,7 @@ fn execute_effects_in_expression(
                 ..
             } = operator
             {
+                refuse_nested_session_directives_in_operator(&operator)?;
                 // Check bin registry for namespace-qualified piped invocation
                 let ns_strs: Vec<&str> = ns.iter().map(|item| item.name.as_str()).collect();
                 if let Some(entity) = system
@@ -148,6 +180,7 @@ fn execute_effects_in_expression(
                     }),
                 )))
             } else {
+                refuse_nested_session_directives_in_operator(&operator)?;
                 // Regular pipe — recurse into source, preserve operator
                 let executed_source = execute_effects_in_expression(source, ctes, system)?;
                 Ok(RelationalExpression::Pipe(Box::new(
@@ -169,6 +202,9 @@ fn execute_effects_in_expression(
         } => {
             let left = Box::new(execute_effects_in_expression(*left, ctes, system)?);
             let right = Box::new(execute_effects_in_expression(*right, ctes, system)?);
+            if let Some(condition) = &join_condition {
+                refuse_nested_session_directives_in_boolean(condition)?;
+            }
             Ok(RelationalExpression::Join {
                 left,
                 right,
@@ -184,6 +220,10 @@ fn execute_effects_in_expression(
             cpr_schema,
         } => {
             let source = Box::new(execute_effects_in_expression(*source, ctes, system)?);
+            // Predicate subqueries are data positions. R9 makes session
+            // directives illegal here; the complete visitor turns every such
+            // occurrence into a clean refusal before the resolver.
+            refuse_nested_session_directives_in_sigma(&condition)?;
             Ok(RelationalExpression::Filter {
                 source,
                 condition,
@@ -191,16 +231,138 @@ fn execute_effects_in_expression(
                 cpr_schema,
             })
         }
-        // ErJoinChain and ErTransitiveJoin don't contain pseudo-predicates
-        _ => Ok(expression),
+        RelationalExpression::ErJoinChain { relations } => Ok(
+            RelationalExpression::ErJoinChain {
+                relations: relations
+                    .into_iter()
+                    .map(|r| execute_effects_in_relation(r, ctes, system))
+                    .collect::<Result<Vec<_>>>()?,
+            },
+        ),
+        RelationalExpression::ErTransitiveJoin { left, right } => Ok(
+            RelationalExpression::ErTransitiveJoin {
+                left: Box::new(execute_effects_in_expression(*left, ctes, system)?),
+                right: Box::new(execute_effects_in_expression(*right, ctes, system)?),
+            },
+        ),
+        RelationalExpression::IntersectCorresponding { .. } => {
+            unreachable!("IntersectCorresponding does not exist in the unresolved phase")
+        }
     }
+}
+
+const NESTED_SESSION_DIRECTIVE_MESSAGE: &str =
+    "session directives are legal only at the REPL/CLI top level or the liminal space — not nested in a query";
+
+fn nested_session_directive_error(name: &str) -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "effect/session/position",
+        format!("{name}: {NESTED_SESSION_DIRECTIVE_MESSAGE}"),
+        "EFFECT-ALGEBRA R9",
+    )
+}
+
+/// A tenant on the shared whole-tree visitor. It names only the semantic
+/// boundary; the visitor owns the complete recursion over every carrier.
+struct NestedSessionDirectiveGuard {
+    skip_root_relation: bool,
+    skip_root_operator: bool,
+}
+
+impl AstVisit<Unresolved> for NestedSessionDirectiveGuard {
+    fn enter_relation(&mut self, relation: &Relation) -> Result<Descent> {
+        if std::mem::take(&mut self.skip_root_relation) {
+            return Ok(Descent::Continue);
+        }
+        if let Relation::PseudoPredicate { name, .. } = relation {
+            if directive_category(name) == DirectiveCategory::Session {
+                return Err(nested_session_directive_error(name));
+            }
+        }
+        Ok(Descent::Continue)
+    }
+
+    fn enter_operator(&mut self, operator: &UnaryRelationalOperator) -> Result<Descent> {
+        if std::mem::take(&mut self.skip_root_operator) {
+            return Ok(Descent::Continue);
+        }
+        let name = if let UnaryRelationalOperator::DirectiveTerminal { name, .. }
+        | UnaryRelationalOperator::DirectivePipeInvocation { name, .. } = operator
+        {
+            Some(name)
+        } else {
+            None
+        };
+        if let Some(name) = name {
+            if directive_category(name) == DirectiveCategory::Session {
+                return Err(nested_session_directive_error(name));
+            }
+        }
+        Ok(Descent::Continue)
+    }
+}
+
+fn nested_session_guard() -> NestedSessionDirectiveGuard {
+    NestedSessionDirectiveGuard {
+        skip_root_relation: false,
+        skip_root_operator: false,
+    }
+}
+
+fn refuse_nested_session_directives_in_relational(expr: &RelationalExpression) -> Result<()> {
+    walk_visit_relational(&mut nested_session_guard(), expr)?;
+    Ok(())
+}
+
+fn refuse_nested_session_directives_in_query(query: &Query) -> Result<()> {
+    walk_visit_query(&mut nested_session_guard(), query)?;
+    Ok(())
+}
+
+fn refuse_nested_session_directives_in_domain(expression: &DomainExpression) -> Result<()> {
+    walk_visit_domain(&mut nested_session_guard(), expression)?;
+    Ok(())
+}
+
+fn refuse_nested_session_directives_in_sigma(condition: &SigmaCondition) -> Result<()> {
+    walk_visit_sigma(&mut nested_session_guard(), condition)?;
+    Ok(())
+}
+
+fn refuse_nested_session_directives_in_boolean(condition: &BooleanExpression) -> Result<()> {
+    walk_visit_boolean(&mut nested_session_guard(), condition)?;
+    Ok(())
+}
+
+fn refuse_nested_session_directives_in_operator(operator: &UnaryRelationalOperator) -> Result<()> {
+    let mut guard = nested_session_guard();
+    guard.skip_root_operator = true;
+    walk_visit_operator(&mut guard, operator)?;
+    Ok(())
+}
+
+fn refuse_nested_session_directives_in_operator_arguments(
+    arguments: &[DomainExpression],
+) -> Result<()> {
+    let operator = UnaryRelationalOperator::DirectiveTerminal {
+        name: "__root__".to_string(),
+        arguments: arguments.to_vec(),
+    };
+    refuse_nested_session_directives_in_operator(&operator)
 }
 
 /// Execute pseudo-predicates in a relation
 fn execute_effects_in_relation(
     relation: Relation,
+    ctes: &[CteBinding],
     system: &mut DelightQLSystem,
 ) -> Result<Relation> {
+    // The relation itself is on the executable source spine; all fields below
+    // it are data positions. Skip only that root and inspect every child edge.
+    let mut guard = nested_session_guard();
+    guard.skip_root_relation = true;
+    walk_visit_relation(&mut guard, &relation)?;
+
     match relation {
         // This is the key case: execute the pseudo-predicate!
         Relation::PseudoPredicate {
@@ -223,7 +385,7 @@ fn execute_effects_in_relation(
                     subquery,
                 } => {
                     let rewritten_subquery =
-                        Box::new(execute_effects_in_expression(*subquery, &[], system)?);
+                        Box::new(execute_effects_in_expression(*subquery, ctes, system)?);
                     InnerRelationPattern::Indeterminate {
                         identifier,
                         subquery: rewritten_subquery,

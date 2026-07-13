@@ -5,6 +5,9 @@
 // These laws govern predicate classification and association
 
 use super::types::*;
+use crate::error::Result;
+use crate::pipeline::ast_visit::{walk_visit_boolean, AstVisit, Descent};
+use crate::pipeline::asts::core::Resolved;
 use crate::pipeline::asts::resolved;
 use std::collections::HashSet;
 
@@ -152,39 +155,55 @@ pub fn check_law6(
 
 // Helper functions
 
+/// Law 1: does `pred` qualify-reference `table` anywhere — including inside a
+/// nested `EXISTS`/`IN`/scalar subquery's own predicates?
+///
+/// Formerly a hand-rolled boolean/domain/relational match trio that matched only
+/// `Comparison`/`InnerExists`/`And`/`Or` and PANICKED on `In`/`InRelational`/
+/// `Not`/`Sigma` and on any non-`Lvar` operand (INDUCTIVE-TRAVERSAL-PLAN §5 W11).
+/// Re-expressed as an `AstVisit<Resolved>` finder: the shared closure descends
+/// EVERY query-bearing edge, so the boolean type is closed by construction — a
+/// qualified `Lvar` `table.col` in any position is found, and no variant panics.
+/// (Pinned: refiner::laws::tests::references_table_finds_qualifier_in_in_predicate.)
 fn references_table(pred: &resolved::BooleanExpression, table: &str) -> bool {
-    match pred {
-        resolved::BooleanExpression::Comparison { left, right, .. } => {
-            references_table_in_domain(left, table) || references_table_in_domain(right, table)
-        }
-        resolved::BooleanExpression::InnerExists { subquery, .. } => {
-            // Check if the subquery references the table
-            references_table_in_relational(subquery, table)
-        }
-        resolved::BooleanExpression::And { left, right }
-        | resolved::BooleanExpression::Or { left, right } => {
-            references_table(left, table) || references_table(right, table)
-        }
-        other => panic!("catch-all hit in laws.rs references_table: {:?}", other),
-    }
+    let mut finder = QualifierRefFinder {
+        table,
+        found: false,
+    };
+    // The finder never returns Err; the walk is infallible.
+    let _ = walk_visit_boolean(&mut finder, pred);
+    finder.found
 }
 
-fn references_table_in_domain(expr: &resolved::DomainExpression, table: &str) -> bool {
-    match expr {
-        resolved::DomainExpression::Lvar { qualifier, .. } => {
-            qualifier.as_ref().is_some_and(|q| q == table)
+/// Finds a qualified column reference `table.col` anywhere in a resolved boolean
+/// subtree (mirrors the old semantics: reference is via a qualified `Lvar`).
+struct QualifierRefFinder<'a> {
+    table: &'a str,
+    found: bool,
+}
+
+impl AstVisit<Resolved> for QualifierRefFinder<'_> {
+    fn enter_domain(&mut self, e: &resolved::DomainExpression) -> Result<Descent> {
+        if let resolved::DomainExpression::Lvar { qualifier, .. } = e {
+            if qualifier.as_ref().is_some_and(|q| q == self.table) {
+                self.found = true;
+                return Ok(Descent::Break);
+            }
         }
-        other => panic!(
-            "catch-all hit in laws.rs references_table_in_domain: {:?}",
-            other
-        ),
+        Ok(Descent::Continue)
     }
 }
 
 fn is_unqualified(expr: &resolved::DomainExpression) -> bool {
     match expr {
         resolved::DomainExpression::Lvar { qualifier, .. } => qualifier.is_none(),
-        other => panic!("catch-all hit in laws.rs is_unqualified: {:?}", other),
+        // Law 3 forbids a correlation whose BOTH sides are bare, unqualified
+        // column references (ambiguous across the intersect operands). Anything
+        // that is not a bare `Lvar` — a function, literal, tuple, subquery, … —
+        // is not an unqualified bare column, so it does not trip the ambiguity
+        // (pinned: refiner::laws::tests::is_unqualified_non_lvar_is_false and
+        // correctness_bugs ball law3_intersect_function_operand).
+        _ => false,
     }
 }
 
@@ -226,38 +245,64 @@ fn extract_lvars_from_domain(expr: &resolved::DomainExpression, lvars: &mut Hash
     }
 }
 
-fn references_table_in_relational(expr: &resolved::RelationalExpression, table: &str) -> bool {
-    match expr {
-        resolved::RelationalExpression::Filter {
-            source, condition, ..
-        } => {
-            // Check filter condition
-            let cond_refs = if let resolved::SigmaCondition::Predicate(pred) = condition {
-                references_table(pred, table)
-            } else {
-                false
-            };
-            cond_refs || references_table_in_relational(source, table)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::asts::resolved::NamespacePath;
+
+    fn qualified_lvar(qual: &str, name: &str) -> resolved::DomainExpression {
+        resolved::DomainExpression::Lvar {
+            name: name.into(),
+            qualifier: Some(qual.into()),
+            namespace_path: NamespacePath::empty(),
+            alias: None,
+            provenance: resolved::PhaseBox::phantom(),
         }
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            ..
-        } => {
-            // Check join condition
-            let cond_refs = if let Some(cond) = join_condition {
-                references_table(cond, table)
-            } else {
-                false
-            };
-            cond_refs
-                || references_table_in_relational(left, table)
-                || references_table_in_relational(right, table)
+    }
+
+    fn unqualified_lvar(name: &str) -> resolved::DomainExpression {
+        resolved::DomainExpression::Lvar {
+            name: name.into(),
+            qualifier: None,
+            namespace_path: NamespacePath::empty(),
+            alias: None,
+            provenance: resolved::PhaseBox::phantom(),
         }
-        other => panic!(
-            "catch-all hit in laws.rs references_table_in_relational: {:?}",
-            other
-        ),
+    }
+
+    fn call_fn(name: &str, arg: resolved::DomainExpression) -> resolved::DomainExpression {
+        resolved::DomainExpression::Function(resolved::FunctionExpression::Regular {
+            name: name.into(),
+            namespace: None,
+            arguments: vec![arg],
+            alias: None,
+            conditioned_on: None,
+        })
+    }
+
+    // W11 (INDUCTIVE-TRAVERSAL-PLAN §5): `is_unqualified` formerly PANICKED
+    // ("catch-all hit") on any non-`Lvar` operand. A function/literal is not a
+    // bare unqualified column, so it must classify as NOT-unqualified (false).
+    #[test]
+    fn is_unqualified_non_lvar_is_false() {
+        assert!(!is_unqualified(&call_fn("upper", qualified_lvar("x", "v"))));
+        assert!(is_unqualified(&unqualified_lvar("v")));
+        assert!(!is_unqualified(&qualified_lvar("x", "v")));
+    }
+
+    // W11: `references_table` formerly PANICKED on the `In`/`InRelational`/`Not`/
+    // `Sigma` variants. Re-expressed as an `AstVisit<Resolved>` finder, it reaches
+    // the qualified `Lvar` inside `In.value` (and every other query-bearing edge)
+    // without a catch-all panic — the boolean type is closed by construction.
+    #[test]
+    fn references_table_finds_qualifier_in_in_predicate() {
+        let pred = resolved::BooleanExpression::In {
+            value: Box::new(qualified_lvar("x", "id")),
+            set: vec![unqualified_lvar("a")],
+            negated: false,
+        };
+        assert!(references_table(&pred, "x"));
+        assert!(!references_table(&pred, "z"));
     }
 }

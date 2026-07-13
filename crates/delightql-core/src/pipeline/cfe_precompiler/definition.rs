@@ -3,7 +3,7 @@
 // CFE definition precompilation - query-level and single CFE processing
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_transform::{self, AstTransform};
+use crate::pipeline::ast_visit::{self, AstVisit, Descent};
 use crate::pipeline::asts::core::{FunctionExpression, Unresolved};
 use crate::pipeline::asts::unresolved::{self as ast_unresolved};
 use crate::pipeline::asts::{resolved, unresolved};
@@ -271,7 +271,7 @@ pub(crate) fn precompile_cfe_definition(
 }
 
 /// Walk all CFE bodies to discover consulted function references and add them
-/// as additional CfeDefinitions. Uses AstTransform to walk the full AST.
+/// as additional CfeDefinitions. Uses AstVisit to walk the full AST.
 fn discover_nested_consulted_functions(
     cfes: &mut Vec<unresolved::CfeDefinition>,
     consult: &ConsultRegistry,
@@ -314,20 +314,23 @@ fn discover_nested_consulted_functions(
     Ok(())
 }
 
-/// Collect all function name references from a domain expression using AstTransform.
+/// Collect all function name references from a domain expression using AstVisit.
 /// Walks the full AST (including scalar subqueries, pipes, operators, etc.).
+///
+/// Migrated from `AstTransform<Unresolved, Unresolved>` (clone + consume) to the
+/// non-consuming `AstVisit` (INDUCTIVE-TRAVERSAL-PLAN Phase B; INVENTORY W12).
+/// Behavior-preserving by construction — both schemes centralize the identical
+/// whole-tree closure, so the collected ref set is unchanged. Pinned by
+/// `tests::collect_function_refs_reaches_nested_scopes`.
 fn collect_function_refs(
     body: &unresolved::DomainExpression,
 ) -> Vec<(String, Option<ast_unresolved::NamespacePath>)> {
     struct Collector {
         refs: Vec<(String, Option<ast_unresolved::NamespacePath>)>,
     }
-    impl AstTransform<Unresolved, Unresolved> for Collector {
-        fn transform_function(
-            &mut self,
-            f: FunctionExpression<Unresolved>,
-        ) -> Result<FunctionExpression<Unresolved>> {
-            match &f {
+    impl AstVisit<Unresolved> for Collector {
+        fn enter_function(&mut self, f: &FunctionExpression<Unresolved>) -> Result<Descent> {
+            match f {
                 FunctionExpression::Regular {
                     name, namespace, ..
                 }
@@ -341,11 +344,73 @@ fn collect_function_refs(
                 }
                 _ => {}
             }
-            ast_transform::walk_transform_function(self, f)
+            Ok(Descent::Continue)
         }
     }
     let mut collector = Collector { refs: Vec::new() };
-    // Clone body since AstTransform is consuming; CFE bodies are small.
-    let _ = collector.transform_domain(body.clone());
+    // Non-consuming: no clone needed. Errors are impossible here (the hook never
+    // fails), so the walk result is discarded.
+    let _ = ast_visit::walk_visit_domain(&mut collector, body);
     collector.refs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::asts::core::expressions::functions::FunctionExpression as CoreFn;
+    use crate::pipeline::asts::core::{PhaseBox, UnaryRelationalOperator};
+
+    fn regular(name: &str, arguments: Vec<unresolved::DomainExpression>) -> unresolved::DomainExpression {
+        unresolved::DomainExpression::Function(CoreFn::Regular {
+            name: name.into(),
+            namespace: None,
+            arguments,
+            alias: None,
+            conditioned_on: None,
+        })
+    }
+
+    /// Characterization pin (W12 migration onto `AstVisit`): `collect_function_refs`
+    /// reaches function references BENEATH a nested query scope — a scalar
+    /// subquery inside a pipe Transform — exactly as the former
+    /// `AstTransform`-based walker did. This is the whole-tree closure the
+    /// inventory certifies W12 already had; the migration preserves it.
+    #[test]
+    fn collect_function_refs_reaches_nested_scopes() {
+        // top(  scalar-subquery{ src(|> ~> nested() ) }  )
+        let src = unresolved::RelationalExpression::Relation(unresolved::Relation::PseudoPredicate {
+            name: "src".to_string(),
+            arguments: vec![],
+            alias: None,
+            cpr_schema: PhaseBox::phantom(),
+        });
+        let pipe = unresolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
+            unresolved::PipeExpression {
+                source: src,
+                operator: UnaryRelationalOperator::Transform {
+                    transformations: vec![(regular("nested", vec![]), "a".to_string(), None)],
+                    conditioned_on: None,
+                },
+                cpr_schema: PhaseBox::phantom(),
+            },
+        )));
+        let scalar = unresolved::DomainExpression::ScalarSubquery {
+            identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
+                namespace_path: ast_unresolved::NamespacePath::empty(),
+                name: "q".into(),
+                grounding: None,
+            },
+            subquery: Box::new(pipe),
+            alias: None,
+        };
+        let body = regular("top", vec![scalar]);
+
+        let refs = collect_function_refs(&body);
+        let names: Vec<&str> = refs.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"top"), "missing top-level ref: {names:?}");
+        assert!(
+            names.contains(&"nested"),
+            "whole-tree closure broke: nested-scope ref not reached: {names:?}"
+        );
+    }
 }

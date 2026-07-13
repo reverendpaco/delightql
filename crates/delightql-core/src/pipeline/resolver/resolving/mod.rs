@@ -30,6 +30,7 @@ pub(crate) fn resolve_domain_expr_via_registry(
     let config = super::ResolutionConfig::default();
     let mut fold = super::resolver_fold::ResolverFold::new(registry, config, None, None);
     fold.available = available.to_vec();
+    fold.qualifier_scope = available.to_vec();
     fold.in_correlation = in_correlation;
     fold.transform_domain(expr)
 }

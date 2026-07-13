@@ -141,7 +141,7 @@ fn infer_table_alias(
     allow_short_alias: bool,
 ) -> Option<String> {
     let mut qualifiers = Vec::new();
-    extract_qualifiers_from_relational(subquery, &mut qualifiers);
+    extract_qualifiers_from_relational_in_scope(subquery, &mut qualifiers);
 
     log::debug!(
         "infer_table_alias for table '{}': found qualifiers: {:?}, allow_short_alias: {}",
@@ -183,9 +183,15 @@ fn infer_table_alias(
     None
 }
 
-/// Extract the base relation name from a relational expression (walking through filters/pipes).
+/// Extract the base relation name from a relational expression (walking through
+/// filters/pipes). Rides Helper A
+/// [`source_spine_terminal`](crate::pipeline::spine::source_spine_terminal) to
+/// peel the `Filter→source, Pipe→source` chain; the terminal's payload logic
+/// stays here, and a Join re-roots the spine at its LEFT — byte-equivalent to
+/// the old hand-rolled walk. Pinned by
+/// `source_spine_descends_filter_pipe_to_terminal`.
 fn extract_base_relation_name(expr: &resolved::RelationalExpression) -> Option<String> {
-    match expr {
+    match crate::pipeline::spine::source_spine_terminal(expr) {
         resolved::RelationalExpression::Relation(rel) => match rel {
             resolved::Relation::Ground { identifier, .. } => Some(identifier.name.to_string()),
             resolved::Relation::ConsultedView { identifier, .. } => {
@@ -204,10 +210,20 @@ fn extract_base_relation_name(expr: &resolved::RelationalExpression) -> Option<S
                 }
             },
         },
-        resolved::RelationalExpression::Filter { source, .. } => extract_base_relation_name(source),
-        resolved::RelationalExpression::Pipe(pipe) => extract_base_relation_name(&pipe.source),
-        resolved::RelationalExpression::Join { left, .. } => extract_base_relation_name(left),
+        // Base-spine contract: the base relation is the LEFT arm's. `right` and
+        // `join_condition` are recursive fields DELIBERATELY ignored here (spelled
+        // `_` per R-I3; join_type/cpr_schema are non-recursive metadata under `..`).
+        resolved::RelationalExpression::Join {
+            left,
+            right: _,
+            join_condition: _,
+            ..
+        } => extract_base_relation_name(left),
         resolved::RelationalExpression::SetOperation { .. } => None,
+        // Filter/Pipe are peeled by the spine — never a terminal.
+        resolved::RelationalExpression::Filter { .. } | resolved::RelationalExpression::Pipe(_) => {
+            unreachable!("source-spine terminal is never Filter/Pipe")
+        }
         // ER chains consumed by resolver before this pass
         resolved::RelationalExpression::ErJoinChain { .. }
         | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
@@ -333,9 +349,14 @@ fn apply_alias_to_base_relation(
     }
 }
 
-/// Extract all qualifiers from a relational expression
+/// Extract all qualifiers from a relational expression.
+///
+/// SCOPE-LOCAL (INVENTORY L5): walks the current scope's relational spine,
+/// `Filter.condition`, `join_condition`, and operator args for alias-fixing; the
+/// boolean sub-walker stops at nested subqueries. The `_in_scope` name marks
+/// that stop boundary.
 #[stacksafe::stacksafe]
-fn extract_qualifiers_from_relational(
+fn extract_qualifiers_from_relational_in_scope(
     expr: &resolved::RelationalExpression,
     qualifiers: &mut Vec<String>,
 ) {
@@ -344,7 +365,7 @@ fn extract_qualifiers_from_relational(
         resolved::RelationalExpression::Filter {
             source, condition, ..
         } => {
-            extract_qualifiers_from_relational(source, qualifiers);
+            extract_qualifiers_from_relational_in_scope(source, qualifiers);
             if let resolved::SigmaCondition::Predicate(pred) = condition {
                 extract_qualifiers_from_boolean(pred, qualifiers);
             }
@@ -355,19 +376,19 @@ fn extract_qualifiers_from_relational(
             join_condition,
             ..
         } => {
-            extract_qualifiers_from_relational(left, qualifiers);
-            extract_qualifiers_from_relational(right, qualifiers);
+            extract_qualifiers_from_relational_in_scope(left, qualifiers);
+            extract_qualifiers_from_relational_in_scope(right, qualifiers);
             if let Some(cond) = join_condition {
                 extract_qualifiers_from_boolean(cond, qualifiers);
             }
         }
         resolved::RelationalExpression::Pipe(pipe) => {
-            extract_qualifiers_from_relational(&pipe.source, qualifiers);
+            extract_qualifiers_from_relational_in_scope(&pipe.source, qualifiers);
             extract_qualifiers_from_operator(&pipe.operator, qualifiers);
         }
         resolved::RelationalExpression::SetOperation { operands, .. } => {
             for operand in operands {
-                extract_qualifiers_from_relational(operand, qualifiers);
+                extract_qualifiers_from_relational_in_scope(operand, qualifiers);
             }
         }
         resolved::RelationalExpression::ErJoinChain { .. }
@@ -492,7 +513,7 @@ fn extract_qualifiers_from_domain(expr: &resolved::DomainExpression, qualifiers:
             extract_qualifiers_from_domain(inner, qualifiers);
         }
         resolved::DomainExpression::ScalarSubquery { subquery, .. } => {
-            extract_qualifiers_from_relational(subquery, qualifiers);
+            extract_qualifiers_from_relational_in_scope(subquery, qualifiers);
         }
         // Leaf domain expressions — no qualifiers to extract (unqualified Lvar included)
         resolved::DomainExpression::Lvar { .. }
@@ -607,7 +628,7 @@ fn extract_qualifiers_from_boolean(
             extract_qualifiers_from_boolean(expr, qualifiers);
         }
         resolved::BooleanExpression::InnerExists { subquery, .. } => {
-            extract_qualifiers_from_relational(subquery, qualifiers);
+            extract_qualifiers_from_relational_in_scope(subquery, qualifiers);
         }
         resolved::BooleanExpression::In { value, set, .. } => {
             extract_qualifiers_from_domain(value, qualifiers);
@@ -619,7 +640,7 @@ fn extract_qualifiers_from_boolean(
             value, subquery, ..
         } => {
             extract_qualifiers_from_domain(value, qualifiers);
-            extract_qualifiers_from_relational(subquery, qualifiers);
+            extract_qualifiers_from_relational_in_scope(subquery, qualifiers);
         }
         // Leaf-like boolean expressions — no qualifiers to extract
         resolved::BooleanExpression::Using { .. }

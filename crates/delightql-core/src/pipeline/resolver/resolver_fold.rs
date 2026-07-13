@@ -44,6 +44,11 @@ pub(super) struct ResolverFold<'reg, 'db> {
     /// Available columns for expression-level resolution. Set before calling
     /// transform_sigma / transform_operator / transform_domain / transform_boolean.
     pub(super) available: Vec<ast_resolved::ColumnMetadata>,
+    /// Lexically visible qualified bindings for expression-level resolution.
+    /// Kept separate from `available` because relational output identity and
+    /// qualifier scope have different lifetime laws (notably set operations
+    /// and pipe barriers).
+    pub(super) qualifier_scope: Vec<ast_resolved::ColumnMetadata>,
     /// Whether we're in a correlation context (for deferred validation).
     pub(super) in_correlation: bool,
     /// Pivot IN values for operator resolution.
@@ -77,6 +82,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             }],
             last_bubbled: None,
             available: vec![],
+            qualifier_scope: vec![],
             in_correlation: false,
             pivot_in_values: std::collections::HashMap::new(),
             last_operator_output: None,
@@ -357,10 +363,17 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         // Pass through correlation (resolver doesn't set it, refiner will)
         let resolved_correlation = unresolved_corr.into();
 
-        let bubbled = match &final_schema {
+        let mut bubbled = match &final_schema {
             ast_resolved::CprSchema::Resolved(cols) => BubbledState::resolved(cols.clone()),
             _ => BubbledState::empty(),
         };
+        // A set operation has a merged output schema, but its immediately
+        // attached correlation predicate is resolved in the lexical scope of
+        // the operands. Preserve those bindings independently of i_provide.
+        bubbled.qualifier_scope = bubbled_states
+            .iter()
+            .flat_map(|state| state.qualifier_scope.iter().cloned())
+            .collect();
         Ok((
             ast_resolved::RelationalExpression::SetOperation {
                 operator,
@@ -396,7 +409,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     // Resolve the EXISTS subquery with current context for correlation
                     let combined_context = if let Some(outer) = outer_context {
                         // Combine outer context with current source columns
-                        let (resolved_source_temp, _source_bubbled_temp) =
+                        let (resolved_source_temp, source_bubbled_temp) =
                             self.resolve_relational(source.clone())?;
                         let source_schema_temp = super::extract_cpr_schema(&resolved_source_temp)?;
                         let source_columns_temp = match &source_schema_temp {
@@ -404,15 +417,25 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             other => panic!("catch-all hit in mod.rs resolve_relational_expression (EXISTS outer+source schema): {:?}", other),
                         };
                         let mut combined = outer.to_vec();
-                        combined.extend(source_columns_temp);
+                        if source_bubbled_temp.qualifier_scope.is_empty() {
+                            combined.extend(source_columns_temp);
+                        } else {
+                            combined.extend(source_bubbled_temp.qualifier_scope);
+                        }
                         Some(combined)
                     } else {
                         // Just use source columns for context
-                        let (resolved_source_temp, _) =
+                        let (resolved_source_temp, source_bubbled_temp) =
                             self.resolve_child(source.clone(), None, grounding.cloned())?;
                         let source_schema_temp = super::extract_cpr_schema(&resolved_source_temp)?;
                         match &source_schema_temp {
-                            ast_resolved::CprSchema::Resolved(cols) => Some(cols.clone()),
+                            ast_resolved::CprSchema::Resolved(cols) => {
+                                if source_bubbled_temp.qualifier_scope.is_empty() {
+                                    Some(cols.clone())
+                                } else {
+                                    Some(source_bubbled_temp.qualifier_scope)
+                                }
+                            }
                             other => panic!("catch-all hit in mod.rs resolve_relational_expression (EXISTS source schema): {:?}", other),
                         }
                     };
@@ -424,7 +447,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     // context with columns from all EXISTS tables found in the
                     // source expression so that cross-EXISTS references validate.
                     let mut enriched_context = combined_context.unwrap_or_default();
-                    super::collect_exists_table_columns(
+                    super::collect_exists_table_columns_in_scope(
                         &source,
                         self.registry,
                         &mut enriched_context,
@@ -534,6 +557,10 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         // the full column set is known and validation is safe)
         self.in_correlation = outer_context.is_some() && !self.config.validate_in_correlation;
         self.available = available_columns;
+        self.qualifier_scope = source_bubbled.qualifier_scope.clone();
+        if let Some(outer) = outer_context {
+            self.qualifier_scope.extend_from_slice(outer);
+        }
         let resolved_condition = self.transform_sigma(condition)?;
 
         // If this is a destructuring filter, add the destructured columns to the schema
@@ -1061,6 +1088,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             BubbledState {
                 i_provide: filtered_i_provide,
                 i_need: right_bubbled.i_need,
+                qualifier_scope: right_bubbled.qualifier_scope,
             }
         } else {
             right_bubbled
@@ -1689,6 +1717,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
 
             // Resolve the operator at the pipe boundary with the source schema
             self.available = available_columns.clone();
+            self.qualifier_scope = source_bubbled.qualifier_scope.clone();
             self.pivot_in_values = pivot_in_values.clone();
             let resolved_operator = self.transform_operator(unresolved_operator)?;
             let mut output_columns = self
@@ -1871,9 +1900,11 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
             | ast_unresolved::DomainExpression::Substitution(_)
             | ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
                 let available = self.available.clone();
+                let qualifier_scope = self.qualifier_scope.clone();
                 super::resolving::domain_expressions::simple::resolve_simple_expr(
                     expr,
                     &available,
+                    &qualifier_scope,
                     self.in_correlation,
                 )
             }
@@ -2159,8 +2190,16 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                                         } else {
                                             "implicit (auto-discovered)"
                                         };
-                                        return Err(DelightQLError::ParseError {
-                                            message: format!(
+                                        // S0b: the syntax is valid; binding
+                                        // failed because a declared context
+                                        // column is absent — a resolution/column
+                                        // error, not parse/general (the badge
+                                        // agrees with the taxonomy; message
+                                        // unchanged). Pinned by
+                                        // sef_functions/ccafe_explicit_context--025.
+                                        return Err(DelightQLError::validation_error_categorized(
+                                            "resolution/column",
+                                            format!(
                                                 "CFE '{}' requires context columns that don't exist in current scope.\n\
                                                  \n\
                                                  Missing columns: {}\n\
@@ -2174,9 +2213,8 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                                                 context_mode,
                                                 cfe_def.context_params.join(", ")
                                             ),
-                                            source: None,
-                                            subcategory: None,
-                                        });
+                                            "CFE explicit context binding",
+                                        ));
                                     }
                                 }
                             }

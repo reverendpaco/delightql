@@ -4,7 +4,7 @@
 //
 // This module handles constraint extraction from positional patterns and anonymous table processing
 
-use super::reference_extraction::extract_table_references;
+use super::reference_extraction::extract_table_references_in_scope;
 use crate::pipeline::asts::resolved;
 use crate::pipeline::asts::unresolved::NamespacePath;
 use crate::pipeline::refiner::flattener::{FlatOperator, FlatOperatorKind, FlatSegment, FlatTable};
@@ -116,7 +116,7 @@ pub(super) fn create_anonymous_table_join_predicates(
 
                         // Determine classification based on expression type
                         // Check if expression references other tables (for join vs filter classification)
-                        let referenced_tables = extract_table_references(header);
+                        let referenced_tables = extract_table_references_in_scope(header);
 
                         let class = if !referenced_tables.is_empty() {
                             // Expression references other tables - create FJC (join condition)
@@ -239,7 +239,14 @@ pub(super) fn process_using_operators(
     operators
 }
 
-/// Recursively search a pipe expression for a Using operator and extract its columns
+/// Recursively search a pipe expression for a Using operator and extract its columns.
+///
+/// KEPT LOCAL (not routed through Helper A `source_spine`): this descends `Pipe`
+/// ONLY and STOPS at a Filter (`Filter => None`) — a `.(cols)` Using separated
+/// from the outer chain by a filter is deliberately NOT found. Helper A descends
+/// `Filter` AND `Pipe`, so routing this through it would look past a Filter and
+/// change results (INVENTORY §4 grouped it with Helper A, but its Filter
+/// boundary diverges — a named local accessor is correct here).
 #[stacksafe::stacksafe]
 fn extract_using_columns_from_pipe(expr: &resolved::RelationalExpression) -> Option<Vec<String>> {
     match expr {
@@ -251,7 +258,11 @@ fn extract_using_columns_from_pipe(expr: &resolved::RelationalExpression) -> Opt
             // Recursively check the source
             extract_using_columns_from_pipe(&pipe.source)
         }
-        // Leaf and branching nodes: no Using operator in these
+        // STOP at the WHOLE node: Filter (this peel stops at a Filter, unlike the
+        // base spine), Relation, Join, SetOperation. Stopping at the whole node
+        // hides no recursive field (Filter.source/condition, Join arms, SetOp
+        // operands) — the node IS the boundary. Every variant is spelled (no bare
+        // `_`) so a new relational variant forces a decision (R-I3).
         resolved::RelationalExpression::Relation(_)
         | resolved::RelationalExpression::Filter { .. }
         | resolved::RelationalExpression::Join { .. }

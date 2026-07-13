@@ -82,7 +82,7 @@ pub fn classify_inner_relation_pattern(
 ) -> Result<InnerRelationPattern<Resolved>> {
     // Step 1: Detect (but don't extract!) correlation filters from the subquery
     // The filters stay IN the subquery - we just use them for pattern detection
-    let correlation_filters = correlation_analyzer::detect_correlation_filters(&subquery)?;
+    let correlation_filters = correlation_analyzer::detect_correlation_filters_in_scope(&subquery)?;
 
     // Step 2: Check if uncorrelated
     if correlation_filters.is_empty() {
@@ -147,29 +147,23 @@ pub fn classify_inner_relation_pattern(
 // Helper Functions - Aggregation Detection
 // ============================================================================
 
+/// Does the top-level (source-spine) pipeline hold an aggregation operator?
+/// Rides Helper A [`source_spine`](crate::pipeline::spine::source_spine): an
+/// aggregation buried in a Join arm / SetOperation operand / subquery is NOT
+/// top-level, so the spine STOPS at those composites (returns `false`) — the
+/// byte-equivalent of the old `Filter→source, Pipe→(op? / source), _ => false`
+/// walk. Pinned by `source_spine_descends_filter_pipe_to_terminal`.
 fn has_aggregation(expr: &resolved::RelationalExpression) -> bool {
-    match expr {
-        resolved::RelationalExpression::Pipe(pipe_expr) => {
-            // Check if operator is aggregation (AggregatePipe for ~> and %(...))
-            matches!(
-                pipe_expr.operator,
+    use crate::pipeline::spine::{source_spine, SpineStep};
+    source_spine(expr).any(|step| {
+        matches!(
+            step,
+            SpineStep::Pipe(
                 resolved::UnaryRelationalOperator::AggregatePipe { .. }
                     | resolved::UnaryRelationalOperator::Modulo { .. }
-            ) || has_aggregation(&pipe_expr.source)
-        }
-        resolved::RelationalExpression::Filter { source, .. } => has_aggregation(source),
-        // Relation, Join, SetOperation: no aggregation operator
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::Join { .. }
-        | resolved::RelationalExpression::SetOperation { .. } => false,
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before pattern classification")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    }
+            )
+        )
+    })
 }
 
 fn extract_aggregations(
@@ -183,34 +177,27 @@ fn extract_aggregations(
 // Helper Functions - Limit/Order By Detection
 // ============================================================================
 
+/// Does the top-level (source-spine) pipeline hold a `#<N` limit filter?
+/// Rides Helper A [`source_spine`](crate::pipeline::spine::source_spine): each
+/// spine Filter's condition is inspected for a `TupleOrdinal LessThan`; a limit
+/// under a Join arm / SetOperation operand / subquery is not top-level, so the
+/// spine STOPS there. Byte-equivalent of the old `Filter→(cond? / source),
+/// Pipe→source, _ => false` walk. Pinned by
+/// `source_spine_descends_filter_pipe_to_terminal`.
 fn has_limit(expr: &resolved::RelationalExpression) -> bool {
-    match expr {
-        resolved::RelationalExpression::Filter {
-            source, condition, ..
-        } => {
-            // Check if this is a TupleOrdinal LIMIT filter (#<N)
-            matches!(
-                condition,
-                resolved::SigmaCondition::TupleOrdinal(resolved::TupleOrdinalClause {
+    use crate::pipeline::spine::{source_spine, SpineStep};
+    source_spine(expr).any(|step| {
+        matches!(
+            step,
+            SpineStep::Filter(resolved::SigmaCondition::TupleOrdinal(
+                resolved::TupleOrdinalClause {
                     operator: resolved::TupleOrdinalOperator::LessThan,
                     value: _,
                     offset: _,
-                })
-            ) || has_limit(source)
-        }
-        resolved::RelationalExpression::Pipe(pipe_expr) => has_limit(&pipe_expr.source),
-        // Relation (leaf), Join, SetOperation: no limit
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::Join { .. }
-        | resolved::RelationalExpression::SetOperation { .. } => false,
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before pattern classification")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    }
+                }
+            ))
+        )
+    })
 }
 
 // ============================================================================

@@ -213,7 +213,16 @@ pub(super) fn apply_pattern_resolver(
                 // The JOIN resolver should check for stored join conditions when processing JOINs
             }
 
-            Ok((final_expr, BubbledState::resolved(output_columns)))
+            let mut state = BubbledState::resolved(output_columns);
+            // A relation pattern controls what the relation contributes to
+            // the result, but its source columns remain addressable while the
+            // surrounding relational expression is being formed. This is
+            // what permits `materials(*.(id))` to use `materials.id` in an
+            // attached join predicate without leaking `id` into the output.
+            // A following pipe remains the scope barrier and discards these
+            // source qualifiers.
+            state.qualifier_scope = base_cols.to_vec();
+            Ok((final_expr, state))
         }
         Err(e) => {
             // If PatternResolver fails, fall back to original behavior
@@ -1591,11 +1600,14 @@ pub(super) fn resolve_anonymous(
                         _ => {
                             // Use outer_context to resolve column references from joined tables
                             let saved_available = std::mem::take(&mut fold.available);
+                            let saved_qualifier_scope = std::mem::take(&mut fold.qualifier_scope);
                             let saved_in_correlation = fold.in_correlation;
                             fold.available = outer_context.unwrap_or(&[]).to_vec();
+                            fold.qualifier_scope = outer_context.unwrap_or(&[]).to_vec();
                             fold.in_correlation = false;
                             let result = fold.transform_domain(val);
                             fold.available = saved_available;
+                            fold.qualifier_scope = saved_qualifier_scope;
                             fold.in_correlation = saved_in_correlation;
                             result
                         }
@@ -2695,8 +2707,13 @@ pub(super) fn expand_ho_view(
     };
 
     // Convert to ConsultedView relation
-    let (resolved_expr, bubbled) =
-        ho_view_query_to_relational(resolved_query, bubbled, function, user_alias, config)?;
+    let (resolved_expr, bubbled) = ho_view_query_to_relational(
+        resolved_query,
+        bubbled,
+        function,
+        user_alias.clone(),
+        config,
+    )?;
 
     // Hygienic binders (clause-head-catechism item 14a): a plain scalar param
     // (PureUnbound — a `Scalar` in every clause, injected as no column of its
@@ -2914,11 +2931,17 @@ pub(super) fn expand_ho_view(
         };
     }
 
-    Ok((
-        expr,
-        BubbledState::resolved(output_columns),
-        absorbed_join_input,
-    ))
+    let final_bubbled = BubbledState::resolved(output_columns);
+    // The transparent (no-CTE) HO path carries a call-site alias only in the
+    // bubbled lexical state; rebuilding that state after applying scalar
+    // arguments must not silently discard the alias.
+    let final_bubbled = if let Some(alias) = user_alias {
+        relabel_bubbled_with_alias(final_bubbled, &alias)
+    } else {
+        final_bubbled
+    };
+
+    Ok((expr, final_bubbled, absorbed_join_input))
 }
 
 /// Inject a correlation filter into a resolved squished query to correlate
