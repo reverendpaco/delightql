@@ -28,6 +28,17 @@ pub struct ConnectionComponents {
     /// `pg-system-id:<cluster id>`, `realpath:<canonical path>`. None when
     /// the resource asserts nothing reachable (`:memory:`, siso pipes).
     pub identity: Option<String>,
+    /// The engine SCHEMA this mount binds — the per-mount recorded fact
+    /// behind durable placement and cross-schema queries
+    /// (EFFECTS-ON-TARGETS-PLAN §4.1, schema-mount Phase A). `None` means
+    /// "the engine's own default" (postgres `public`, duckdb `main`),
+    /// resolved DOWNSTREAM at the lookup — never spelled at record time, so
+    /// a bare `mount!` keeps its unqualified reads (behavior-identical to
+    /// the pre-Phase-A derivation). A specific schema (Phase B's `#schema`
+    /// fragment / Phase C's `mount_tree!`) travels here → the cartridge's
+    /// `source_ns` → the namespace-keyed schema lookup. SQLite mounts leave
+    /// it `None` (no schema concept, R-S5).
+    pub mounted_schema: Option<String>,
 }
 
 /// Factory that creates database connections from URIs.
@@ -39,4 +50,23 @@ pub trait ConnectionFactory: Send + Sync {
         &self,
         uri: &str,
     ) -> std::result::Result<ConnectionComponents, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Enumerate the target's PERSISTENT schemas (EFFECTS-ON-TARGETS-PLAN
+    /// §4.3 / R-S2) and produce one `ConnectionComponents` per schema, ALL
+    /// backed by ONE underlying connection (one child / one relay) so that
+    /// `mount_tree!`'s sub-namespaces share a connection_id (R-S1: a
+    /// cross-schema `run!` is one bracket). Each pair is
+    /// `(schema_name, components)` with `components.mounted_schema =
+    /// Some(schema)` and a matching resource identity (so the bootstrap
+    /// `connection` dedup folds them onto one row). The default REFUSES —
+    /// only a schema-bearing target factory (the CLI's fatboy path)
+    /// implements it; SQLite/siso targets refuse (R-S5).
+    fn create_tree(
+        &self,
+        uri: &str,
+    ) -> std::result::Result<Vec<(String, ConnectionComponents)>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let _ = uri;
+        Err("mount_tree! is not supported by this connection factory".into())
+    }
 }

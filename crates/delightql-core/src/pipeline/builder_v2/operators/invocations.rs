@@ -110,6 +110,12 @@ pub(in crate::pipeline::builder_v2) fn parse_bang_pipe_operation(
             for child in args_node.children() {
                 if child.kind() == "domain_expression" {
                     arguments.push(parse_expression(child, features)?);
+                } else if child.kind() == "namespace_path" {
+                    // Bare ::-qualified argument (REPORT-1.5 F2): carried as
+                    // an Lvar with the :: text intact.
+                    arguments.push(
+                        DomainExpression::lvar_builder(child.text().to_string()).build(),
+                    );
                 }
             }
         }
@@ -143,10 +149,43 @@ fn parse_dml_pipe_target(
         "update" => DmlKind::Update,
         "delete" => DmlKind::Delete,
         "insert" => DmlKind::Insert,
-        "keep" => DmlKind::Keep,
+        // Piped two-paren form of a NON-DML directive:
+        //   source |> name!(Rel(*))(spec)
+        // returning! and stdout! have exactly ONE higher-order parameter:
+        // with the pipe supplying it, an explicit relational argument leaves
+        // the pipe nowhere to land — refuse (EFFECT-ALGEBRA §5/R8; pinned
+        // red-first by the effects ball, rules--29_r8_landing).
+        "returning" | "stdout" => {
+            return Err(DelightQLError::validation_error_categorized(
+                "effect/pipe/landing",
+                format!(
+                    "{operation}! has exactly one higher-order parameter and the pipe \
+                     already fills it — the argument leaves the pipe nowhere to land \
+                     (EFFECT-ALGEBRA R8). Write `|> {operation}!(*)`, or use \
+                     `|> returning_other!(rel(*))(*)` to return the OTHER relation."
+                ),
+                "pipe has nowhere to land",
+            ));
+        }
+        // Known non-DML BUILT-IN directives build the two-paren pipe
+        // invocation (returning_other!, run_namespace!, exit!, run! — the
+        // TORTURE-TEST tail's `|> returning_other!(final_summary(*))(*)`);
+        // their lowering is Epic-3 work. Constructed here so nothing is
+        // silently dropped (REPORT-2.1 note 2); pinned by
+        // `piped_two_paren_directive_builds_as_pipe_invocation`.
+        //
+        // UNKNOWN names stay a parse error: keep! is retired as an unknown
+        // DML name with NO curated message (DECISION-MEMO-1.0 Q1 /
+        // REPORT-1.5b; pinned by dml/dml_should_fail--37_keep_removed's
+        // error://parse/general annotation). The piped two-paren form of a
+        // USER effect rule lands with the effect transformer (Epic 3), which
+        // can then migrate this refusal deliberately.
+        "returning_other" | "run_namespace" | "exit" | "run" => {
+            return parse_directive_pipe_invocation(node, input, features)
+        }
         _ => {
             return Err(DelightQLError::parse_error(format!(
-                "Unknown DML operation: {}!. Expected update!, delete!, insert!, or keep!",
+                "Unknown DML operation: {}!. Expected update!, delete!, or insert!",
                 operation
             )))
         }
@@ -182,6 +221,53 @@ fn parse_dml_pipe_target(
                 kind,
                 target,
                 target_namespace,
+                domain_spec,
+            },
+            cpr_schema: PhaseBox::phantom(),
+        }),
+    )))
+}
+
+/// Parse a piped two-paren directive invocation: `source |> name!(Rel(*))(spec)`
+/// (EFFECT-ALGEBRA §1: first parens = parameters, trailing parens = access).
+/// Reached through the DML-shaped bang_pipe alternative for non-DML names —
+/// e.g. `… |> returning_other!(final_summary(*))(*)` (TORTURE-TEST tail).
+/// Produces `UnaryRelationalOperator::DirectivePipeInvocation`; consumed by
+/// the effect transformer (Epic 3).
+fn parse_directive_pipe_invocation(
+    node: CstNode,
+    input: RelationalExpression,
+    features: &mut FeatureCollector,
+) -> Result<RelationalExpression> {
+    features.mark(crate::pipeline::query_features::QueryFeature::PseudoPredicates);
+
+    let operation = node
+        .field_text("operation")
+        .ok_or_else(|| DelightQLError::parse_error("No operation in directive pipe invocation"))?;
+    let full_name = format!("{}!", operation);
+
+    let argument = if let Some(target_node) = node.field("target") {
+        relations::parse_table_access(target_node, features)?
+    } else if let Some(anon_node) = node.field("anon_target") {
+        RelationalExpression::Relation(relations::parse_anonymous_table(anon_node, features)?)
+    } else {
+        return Err(DelightQLError::parse_error(
+            "No argument in directive pipe invocation",
+        ));
+    };
+
+    let domain_spec = if let Some(columns_node) = node.field("columns") {
+        relations::parse_column_spec(columns_node, features)?
+    } else {
+        DomainSpec::Glob
+    };
+
+    Ok(RelationalExpression::Pipe(Box::new(
+        stacksafe::StackSafe::new(PipeExpression {
+            source: input,
+            operator: UnaryRelationalOperator::DirectivePipeInvocation {
+                name: full_name,
+                argument: Box::new(argument),
                 domain_spec,
             },
             cpr_schema: PhaseBox::phantom(),

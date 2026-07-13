@@ -146,6 +146,13 @@ fn make_backend_session(backend: Box<dyn Handler + Send>) -> Result<BackendSessi
 
 impl api::DqlHandle for DqlHandleImpl {
     fn session(&mut self) -> Result<Box<dyn api::DqlSession + '_>, String> {
+        self.session_with_hooks(api::SessionHooks::default())
+    }
+
+    fn session_with_hooks(
+        &mut self,
+        hooks: api::SessionHooks,
+    ) -> Result<Box<dyn api::DqlSession + '_>, String> {
         // Take the stored backend, or recreate from the SAME connection.
         // Using handler_factory (not factory.create) ensures the handler wraps
         // the same connection where mount! did ATTACH.
@@ -156,7 +163,13 @@ impl api::DqlHandle for DqlHandleImpl {
 
         let backend_session = make_backend_session(backend)?;
 
-        let relay = RelayParty::new(&mut self.system, backend_session);
+        let mut relay = RelayParty::new(&mut self.system, backend_session);
+        if hooks.on_ship.is_some() {
+            relay.set_hooks(crate::relay::RelayHooks {
+                on_ship: hooks.on_ship,
+                ..Default::default()
+            });
+        }
         let transport = DirectTransport::new(relay);
         let client = Client::new(transport);
 

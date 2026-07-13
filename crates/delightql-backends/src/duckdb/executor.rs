@@ -379,14 +379,17 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
             .query_map([], |row| {
                 let name: String = row.get(1)?;
                 let data_type: String = row.get(2)?;
-                let not_null: i32 = row.get(3)?;
-                let pk: i32 = row.get(5)?;
+                // DuckDB's PRAGMA table_info returns notnull/pk as BOOLEAN
+                // (unlike SQLite's integers); reading them as i32 errors.
+                // Pinned by duckdb::executor::tests::test_table_schema.
+                let not_null: bool = row.get(3)?;
+                let pk: bool = row.get(5)?;
 
                 Ok(ColumnInfo {
                     name,
                     data_type,
-                    nullable: not_null == 0,
-                    primary_key: pk > 0,
+                    nullable: !not_null,
+                    primary_key: pk,
                 })
             })
             .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
@@ -406,7 +409,7 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite::connection::DuckDBConnectionManager;
+    use crate::duckdb::connection::DuckDBConnectionManager;
 
     #[test]
     fn test_query_execution() {
@@ -443,7 +446,7 @@ mod tests {
             let conn = executor.connection.lock().unwrap();
             conn.execute(
                 "CREATE TABLE test_schema (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
                     age INTEGER,
                     score REAL
@@ -465,9 +468,9 @@ mod tests {
         assert!(id_col.primary_key);
         assert_eq!(id_col.data_type, "INTEGER");
 
-        // Check NOT NULL column
+        // Check NOT NULL column (DuckDB canonicalizes TEXT to VARCHAR)
         let name_col = schema.columns.iter().find(|c| c.name == "name").unwrap();
         assert!(!name_col.nullable);
-        assert_eq!(name_col.data_type, "TEXT");
+        assert_eq!(name_col.data_type, "VARCHAR");
     }
 }

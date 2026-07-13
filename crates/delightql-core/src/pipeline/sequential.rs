@@ -303,7 +303,9 @@ pub fn process_inline_ddl_block(
     let nested_blocks = std::mem::take(&mut ddl.inline_ddl_blocks);
 
     let result = system
-        .consult_file("(inline)", namespace, ddl)
+        // Inline DDL blocks have no liminal space — the scratch namespace's
+        // liminal is empty (EFFECT-ALGEBRA §8: created by other means).
+        .consult_file("(inline)", namespace, ddl, &[])
         .map_err(|e| {
             DelightQLError::database_error(
                 format!("Inline DDL registration failed: {}", e),

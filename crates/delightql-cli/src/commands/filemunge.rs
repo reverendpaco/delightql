@@ -206,10 +206,9 @@ pub fn handle_filemunge_command(
     }
 
     let db_path_str = temp_path.to_string_lossy().to_string();
-    let conn = connection::ConnectionManager::new_memory()?;
     let output_format = format.unwrap_or(OutputFormat::Table);
 
-    let mut handle = conn.open_handle()?;
+    let mut handle = connection::open_handle()?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
 
     crate::exec_ng::run_dql_query(
@@ -222,7 +221,6 @@ pub fn handle_filemunge_command(
 
     drop(session);
     drop(handle);
-    drop(conn);
     let _ = std::fs::remove_file(&temp_path);
 
     result.map(|_| ())

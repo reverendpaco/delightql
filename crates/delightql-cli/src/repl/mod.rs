@@ -887,10 +887,10 @@ pub fn process_piped_input(
             no_headers,
         )
     } else {
-        let conn = connection
+        let _conn = connection
             .ok_or_else(|| anyhow::anyhow!("No database connection available for piped input"))?;
 
-        let mut handle = conn.open_handle()?;
+        let mut handle = crate::connection::open_handle()?;
 
         let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
 

@@ -599,9 +599,16 @@ fn parse_cte_binding(cte_node: CstNode, features: &mut FeatureCollector) -> Resu
     let expression = parse_expression(rel_expr_node, features)?;
     let name = name_node.text().to_string();
 
+    // Effect-CTE label (EFFECT-ALGEBRA R4): `expression : name!` — the CST's
+    // effect_marker field. REPORT-2.1 note 1: the builder used to DROP this
+    // silently, building an effect CTE as a plain CTE. Pinned by
+    // `effect_cte_marker_is_read_by_builder` (builder_v2 tests).
+    let effect_label = cte_node.field("effect_marker").is_some();
+
     Ok(CteBinding {
         expression,
         name,
+        effect_label,
         is_recursive: PhaseBox::phantom(),
     })
 }
@@ -672,7 +679,7 @@ pub(crate) fn parse_expression(
         }
         "pseudo_predicate_call" => {
             features.mark(QueryFeature::PseudoPredicates);
-            RelationalExpression::Relation(parse_pseudo_predicate_call(base_child, features)?)
+            parse_pseudo_predicate_call(base_child, features)?
         }
         "inline_directive_table" => {
             // doc!("a","b")(*) — desugars to _("a","b") |> doc!(*)
@@ -842,4 +849,269 @@ fn walk_for_error_hook(
         walk_for_error_hook(child, source, found)?;
     }
     Ok(())
+}
+
+// ============================================================================
+// Effect-construct builder tests (IMPLEMENTATION-PLAN §2.2)
+// ============================================================================
+
+#[cfg(test)]
+mod effect_builder_tests {
+    //! Pins for the effect-algebra constructs the builder must CONSTRUCT
+    //! (REPORT-2.1 notes 1–2: the effect marker used to be silently dropped;
+    //! the new CST nodes used to die as "Unknown …" builder errors).
+
+    use super::*;
+    use crate::pipeline::parser::parse;
+
+    fn build(source: &str) -> Query {
+        let tree = parse(source).expect("source parses");
+        let (query, _f, _a, _e, _d, _o, _b) =
+            parse_query(&tree, source).expect("builder constructs the query");
+        query
+    }
+
+    /// REPORT-2.1 note 1: the builder silently DROPPED the effect_marker,
+    /// building an effect CTE as a plain CTE. RED before 2.2: no
+    /// `effect_label` field existed at all.
+    #[test]
+    fn effect_cte_marker_is_read_by_builder() {
+        let marked = build("_(x @ 1) |> temp_table!(t) : s!\ns!(*)");
+        let Query::WithCtes { ctes, .. } = marked else {
+            panic!("expected WithCtes");
+        };
+        assert_eq!(ctes.len(), 1);
+        assert!(ctes[0].effect_label, "`: s!` must set effect_label");
+
+        let plain = build("_(x @ 1) : s\ns(*)");
+        let Query::WithCtes { ctes, .. } = plain else {
+            panic!("expected WithCtes");
+        };
+        assert!(!ctes[0].effect_label, "`: s` must NOT set effect_label");
+    }
+
+    /// The `+-` postfix builds as SignedWitness (EFFECT-ALGEBRA §3), not as
+    /// witness-then-minus. RED before 2.2: "Unknown base"/materialize
+    /// fallback silently misbuilt the token.
+    #[test]
+    #[stacksafe::stacksafe]
+    fn signed_witness_builds_as_signed_witness_operator() {
+        let query = build("_(x @ 1) +-");
+        let Query::Relational(RelationalExpression::Pipe(pipe)) = query else {
+            panic!("expected a pipe");
+        };
+        assert!(
+            matches!(pipe.operator, UnaryRelationalOperator::SignedWitness),
+            "expected SignedWitness, got {:?}",
+            pipe.operator
+        );
+    }
+
+    /// Directive in conjunction position (EFFECT-ALGEBRA E1; grammar item 3
+    /// of REPORT-2.1) joins like any relation. RED before 2.2:
+    /// "Unexpected expression after comma: 'pseudo_predicate_call'".
+    #[test]
+    fn directive_in_conjunction_builds_as_join() {
+        let query = build(r#"users(*), region = "EU", exit!(*)"#);
+        let Query::Relational(RelationalExpression::Join { right, .. }) = query else {
+            panic!("expected a join");
+        };
+        let RelationalExpression::Relation(Relation::PseudoPredicate { name, .. }) = *right
+        else {
+            panic!("expected the right operand to be the directive");
+        };
+        assert_eq!(name, "exit!");
+    }
+
+    /// F2 (REPORT-1.5): bare ::-qualified arguments in pseudo-predicate
+    /// calls must be constructed, not silently skipped. RED before 2.2: the
+    /// namespace_path child was filtered out (zero arguments built).
+    #[test]
+    fn namespace_path_argument_is_constructed() {
+        let query = build("run_namespace!(lib::etl)");
+        let Query::Relational(RelationalExpression::Relation(Relation::PseudoPredicate {
+            name,
+            arguments,
+            ..
+        })) = query
+        else {
+            panic!("expected a pseudo-predicate call");
+        };
+        assert_eq!(name, "run_namespace!");
+        assert_eq!(arguments.len(), 1, "the lib::etl argument must be built");
+        let DomainExpression::Lvar { name: arg, .. } = &arguments[0] else {
+            panic!("expected the namespace path as an Lvar, got {:?}", arguments[0]);
+        };
+        assert_eq!(arg.as_str(), "lib::etl");
+    }
+
+    /// The piped two-paren directive form builds as DirectivePipeInvocation
+    /// (EFFECT-ALGEBRA §1 access form; TORTURE-TEST tail). RED before 2.2:
+    /// "Unknown DML operation: returning_other!".
+    #[test]
+    #[stacksafe::stacksafe]
+    fn piped_two_paren_directive_builds_as_pipe_invocation() {
+        let query = build("users(*) |> returning_other!(customers(*))(*)");
+        let Query::Relational(RelationalExpression::Pipe(pipe)) = query else {
+            panic!("expected a pipe");
+        };
+        let UnaryRelationalOperator::DirectivePipeInvocation { ref name, .. } = pipe.operator
+        else {
+            panic!("expected DirectivePipeInvocation, got {:?}", pipe.operator);
+        };
+        assert_eq!(name, "returning_other!");
+    }
+
+    // ------------------------------------------------------------------
+    // Interior continuations on directive calls (task 3.1b, THE RULING
+    // 2026-07-11): a continuation inside the access parens scopes to that
+    // relation, exactly like a functor interior. RED before 3.1b: the CST
+    // forms were parse errors (`s!(+-)`), and the builder ignored a
+    // continuation field entirely (sabotage-verified: disabling the
+    // continuation branch silently builds a bare `s!()`).
+    // ------------------------------------------------------------------
+
+    /// `s!(*)` — under functor-paren uniformity the `*` parses as a qualify
+    /// CONTINUATION; the builder must collapse it back to the glob-argument
+    /// AST, byte-identical to the pre-3.1b build (require_glob_args in the
+    /// effect transformer and every AST consumer see the same shape).
+    #[test]
+    #[stacksafe::stacksafe]
+    fn glob_pseudo_predicate_call_builds_as_glob_argument() {
+        let query = build("s!(*)");
+        let Query::Relational(RelationalExpression::Relation(Relation::PseudoPredicate {
+            name,
+            arguments,
+            alias,
+            ..
+        })) = query
+        else {
+            panic!("expected a pseudo-predicate relation");
+        };
+        assert_eq!(name, "s!");
+        assert_eq!(arguments.len(), 1, "the glob must be an argument");
+        assert!(
+            matches!(
+                arguments[0],
+                DomainExpression::Projection(crate::pipeline::asts::unresolved::ProjectionExpr::Glob { .. })
+            ),
+            "expected a glob argument, got {:?}",
+            arguments[0]
+        );
+        assert!(alias.is_none());
+
+        // The alias survives the collapse.
+        let aliased = build("s!(*) as t");
+        let Query::Relational(RelationalExpression::Relation(Relation::PseudoPredicate {
+            alias, ..
+        })) = aliased
+        else {
+            panic!("expected a pseudo-predicate relation");
+        };
+        assert_eq!(alias.as_deref(), Some("t"));
+    }
+
+    /// `s!(+-)` — the per-arm total-ledger spelling (EFFECT-ALGEBRA §3,
+    /// witness.md "Dictates") builds as the ordinary continuation applied to
+    /// the pseudo-predicate relation: SignedWitness over the bare call, the
+    /// same AST one arm of the exterior `s!(*) +-` carries.
+    #[test]
+    #[stacksafe::stacksafe]
+    fn interior_continuation_on_directive_builds_like_functor_interior() {
+        let query = build("s!(+-)");
+        let Query::Relational(RelationalExpression::Pipe(pipe)) = query else {
+            panic!("expected a pipe");
+        };
+        assert!(
+            matches!(pipe.operator, UnaryRelationalOperator::SignedWitness),
+            "expected SignedWitness, got {:?}",
+            pipe.operator
+        );
+        let RelationalExpression::Relation(Relation::PseudoPredicate {
+            ref name,
+            ref arguments,
+            ..
+        }) = pipe.source
+        else {
+            panic!("expected the witness source to be the directive call");
+        };
+        assert_eq!(name, "s!");
+        assert!(arguments.is_empty(), "the glob is optional interiorly");
+
+        // Plain witness: s!(+) — the same scoping for the collapsed witness.
+        let plus = build("s!(+)");
+        let Query::Relational(RelationalExpression::Pipe(pipe)) = plus else {
+            panic!("expected a pipe");
+        };
+        assert!(
+            matches!(pipe.operator, UnaryRelationalOperator::Witness { exists: true }),
+            "expected the exists witness, got {:?}",
+            pipe.operator
+        );
+    }
+
+    /// The interior ledger `s!(+-) ; k!(+-)` builds as a union whose EVERY
+    /// arm is a SignedWitness scoped to its own receipt — contrast the
+    /// exterior `s!(*) +- ; k!(*) +-` where the trailing `+-` extends the
+    /// accumulated union (THE RULING: no special postfix binding).
+    #[test]
+    #[stacksafe::stacksafe]
+    fn interior_ledger_arms_scope_per_arm() {
+        let query = build("s!(+-) ; k!(+-)");
+        let Query::Relational(RelationalExpression::SetOperation { operands, .. }) = query
+        else {
+            panic!("expected a union");
+        };
+        assert_eq!(operands.len(), 2);
+        for (i, arm) in operands.iter().enumerate() {
+            let RelationalExpression::Pipe(pipe) = arm else {
+                panic!("arm {i} must be a witness pipe, got {arm:?}");
+            };
+            assert!(
+                matches!(pipe.operator, UnaryRelationalOperator::SignedWitness),
+                "arm {i}: expected SignedWitness, got {:?}",
+                pipe.operator
+            );
+            assert!(
+                matches!(
+                    pipe.source,
+                    RelationalExpression::Relation(Relation::PseudoPredicate { .. })
+                ),
+                "arm {i}: the witness must scope to its own directive call"
+            );
+        }
+    }
+
+    /// Fuller interiority (uniformity — directives are relations): filter,
+    /// projection-pipe, and aggregation continuations apply to the call.
+    #[test]
+    #[stacksafe::stacksafe]
+    fn interior_general_continuations_build_on_directive_calls() {
+        // Conjunction: s!(, region = "EU") — a predicate conjunct is a
+        // Filter over the call.
+        let filtered = build(r#"s!(, region = "EU")"#);
+        let Query::Relational(RelationalExpression::Filter { ref source, .. }) = filtered else {
+            panic!("expected the filter shape, got {filtered:?}");
+        };
+        assert!(
+            matches!(
+                **source,
+                RelationalExpression::Relation(Relation::PseudoPredicate { .. })
+            ),
+            "the filter must scope to the directive call"
+        );
+
+        // Aggregation: s!(~> count:(*) as n) — reduce over the call.
+        let agg = build("s!(~> count:(*) as n)");
+        let Query::Relational(RelationalExpression::Pipe(pipe)) = agg else {
+            panic!("expected an aggregate pipe, got {agg:?}");
+        };
+        assert!(
+            matches!(
+                pipe.source,
+                RelationalExpression::Relation(Relation::PseudoPredicate { .. })
+            ),
+            "the aggregation must scope to the directive call"
+        );
+    }
 }

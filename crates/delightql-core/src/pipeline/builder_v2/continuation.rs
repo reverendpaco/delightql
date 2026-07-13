@@ -8,7 +8,8 @@ use super::predicates::{
     is_destructuring_predicate, parse_destructuring_sigma, parse_predicate_as_boolean,
 };
 use super::relations::{
-    parse_anonymous_table, parse_catalog_functor, parse_table_access, parse_tvf_call,
+    parse_anonymous_table, parse_catalog_functor, parse_pseudo_predicate_call, parse_table_access,
+    parse_tvf_call,
 };
 use super::{parse_expression, parse_limit_offset};
 use crate::error::{DelightQLError, Result};
@@ -247,8 +248,14 @@ fn apply_comma(
             Some("table_access")
             | Some("anonymous_table")
             | Some("tvf_call")
-            | Some("catalog_functor") => {
-                // Parse just the table itself
+            | Some("catalog_functor")
+            | Some("pseudo_predicate_call")
+            | Some("inline_directive_table") => {
+                // Parse just the table itself.
+                // pseudo_predicate_call / inline_directive_table: directives in
+                // conjunction position (EFFECT-ALGEBRA E1 — grammar item 3 of
+                // REPORT-2.1). A directive's return table joins like any
+                // relation. Pinned by `directive_in_conjunction_builds_as_join`.
                 let base_node = base.expect("Matched Some(...) above, base must exist");
                 let mut table_expr = match base_node.kind() {
                     "table_access" => parse_table_access(base_node, features)?,
@@ -258,6 +265,13 @@ fn apply_comma(
                     }
                     "tvf_call" => {
                         RelationalExpression::Relation(parse_tvf_call(base_node, features)?)
+                    }
+                    "pseudo_predicate_call" => {
+                        features.mark(QueryFeature::PseudoPredicates);
+                        parse_pseudo_predicate_call(base_node, features)?
+                    }
+                    "inline_directive_table" => {
+                        super::operators::parse_inline_directive_table(base_node, features)?
                     }
                     _ => unreachable!(),
                 };
@@ -419,6 +433,18 @@ fn apply_comma_to_node(
             let table = RelationalExpression::Relation(parse_tvf_call(node, features)?);
             Ok(RelationalExpression::join_builder(cpr, table).build())
         }
+        "pseudo_predicate_call" => {
+            // Directive in conjunction position (EFFECT-ALGEBRA E1): its
+            // return table joins like any relation.
+            features.mark(QueryFeature::PseudoPredicates);
+            let table = parse_pseudo_predicate_call(node, features)?;
+            Ok(RelationalExpression::join_builder(cpr, table).build())
+        }
+        "inline_directive_table" => {
+            // Two-paren directive access in conjunction position: a!(x)(*).
+            let table = super::operators::parse_inline_directive_table(node, features)?;
+            Ok(RelationalExpression::join_builder(cpr, table).build())
+        }
         "predicate" => {
             // Always create filter - refiner will detect if it's correlation
             // Check if it's destructuring or regular predicate
@@ -530,6 +556,15 @@ pub(super) fn parse_right_side(
                     RelationalExpression::Relation(parse_anonymous_table(base, features)?)
                 }
                 "tvf_call" => RelationalExpression::Relation(parse_tvf_call(base, features)?),
+                // Directive as a union/operator operand (EFFECT-ALGEBRA E1:
+                // disjunction of receipts — the ledger shape).
+                "pseudo_predicate_call" => {
+                    features.mark(QueryFeature::PseudoPredicates);
+                    parse_pseudo_predicate_call(base, features)?
+                }
+                "inline_directive_table" => {
+                    super::operators::parse_inline_directive_table(base, features)?
+                }
                 "relational_expression" => parse_expression(base, features)?,
                 _ => {
                     return Err(DelightQLError::parse_error(format!(
@@ -561,6 +596,16 @@ pub(super) fn parse_right_side(
                     RelationalExpression::Relation(parse_anonymous_table(child, features)?)
                 }
                 "tvf_call" => RelationalExpression::Relation(parse_tvf_call(child, features)?),
+                // Directive as a union/operator operand (EFFECT-ALGEBRA E1:
+                // a ledger arm `a!(*) ; b!(*)` — pinned by the effects ball,
+                // rules--28_r6_recursion, whose body is exactly this shape).
+                "pseudo_predicate_call" => {
+                    features.mark(QueryFeature::PseudoPredicates);
+                    parse_pseudo_predicate_call(child, features)?
+                }
+                "inline_directive_table" => {
+                    super::operators::parse_inline_directive_table(child, features)?
+                }
                 "relational_expression" => parse_expression(child, features)?,
                 _ => {
                     return Err(DelightQLError::parse_error(format!(

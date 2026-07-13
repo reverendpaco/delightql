@@ -22,6 +22,7 @@ fn address_query_inner(query: ast_refined::Query) -> Result<ast_addressed::Query
                     ast_addressed::CteBinding {
                         expression: addressed_expr,
                         name: cte.name,
+                        effect_label: cte.effect_label,
                         is_recursive: is_recursive.new(),
                     }
                 })
@@ -256,6 +257,7 @@ fn walk_operator_for_tree_groups(
         // Operators with no user expressions at all:
         ast_addressed::UnaryRelationalOperator::MetaIze { .. }
         | ast_addressed::UnaryRelationalOperator::Witness { .. }
+        | ast_addressed::UnaryRelationalOperator::SignedWitness
         | ast_addressed::UnaryRelationalOperator::Qualify
         | ast_addressed::UnaryRelationalOperator::Using { .. }
         | ast_addressed::UnaryRelationalOperator::UsingAll
@@ -266,6 +268,11 @@ fn walk_operator_for_tree_groups(
         ast_addressed::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_addressed::UnaryRelationalOperator::DirectiveTerminal { .. } => {
             unreachable!("HoViewApplication/DirectiveTerminal consumed before addressing")
+        }
+        // Refused by the resolver (resolver/resolving/operators/mod.rs) —
+        // cannot reach addressing:
+        ast_addressed::UnaryRelationalOperator::DirectivePipeInvocation { .. } => {
+            unreachable!("DirectivePipeInvocation refused by the resolver")
         }
     }
 }

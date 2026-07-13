@@ -69,6 +69,12 @@ pub mod transformer_v4; // Phase 4: AST → SQL AST (PRODUCTION)
                         // pub mod generator;     // Phase 5: SQL AST → SQL String (OLD - v1 - REMOVED)
                         // pub mod generator_v2;  // Phase 5: SQL AST v2 → SQL String (OLD - for transformer_v2 - REMOVED)
 pub mod compiled_query; // Compiled query output bundle (primary SQL + assertions + emits)
+// The effect transformer: consulted effect bodies → CompiledPlan (Epic 3.1).
+// dead_code allowed outside tests: its entry points get their production
+// callers with run!/run_namespace! (Epic 3.3); the module's own test suite
+// exercises everything today and still surfaces real dead code.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod effect_transformer;
 pub mod danger_gates; // Danger gate system (named safety boundaries, OFF by default)
 pub mod dialect_pack; // Per-compile image of the dialect_* targeting tables (ALL-SQL-TARGETING-DESIGN.md)
 pub mod generator_v3; // Phase 5: SQL AST v3 → SQL String (PRODUCTION)
@@ -348,6 +354,18 @@ impl<'a> Pipeline<'a> {
             emit_streams: self.emit_sqls.clone(),
             connection_id: self.connection_id,
         })
+    }
+
+    /// Compile to the generalized plan form (effect algebra, plan §2.3).
+    ///
+    /// A plain query yields the degenerate plan: its assertions, emits, and
+    /// primary statement as ordered entries in the relay's execution order
+    /// (see `From<CompiledQuery> for CompiledPlan`; order pinned by
+    /// `compiled_query::tests::degenerate_entry_order_mirrors_relay`).
+    /// Multi-entry plans arrive with the effect transformer (Epic 3).
+    #[allow(dead_code)] // Epic-3 entry point; degenerate mapping pinned by compiled_query tests
+    pub fn compile_plan(&mut self) -> Result<compiled_query::CompiledPlan> {
+        Ok(self.compile()?.into())
     }
 
     /// Render the pipeline output at a named stage as a pretty-printed string.

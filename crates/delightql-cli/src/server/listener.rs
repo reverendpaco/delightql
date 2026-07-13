@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::connection::ConnectionManager;
 use crate::server::handler;
 
 fn now_secs() -> u64 {
@@ -189,18 +188,10 @@ fn worker_loop(
     active_connections: Arc<AtomicU32>,
     disconnected_since: Arc<AtomicU64>,
 ) {
-    let conn_manager = match ConnectionManager::new_memory() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "worker-{}: failed to create connection manager: {}",
-                worker_id, e
-            );
-            return;
-        }
-    };
-
-    let mut handle = match conn_manager.open_handle() {
+    // The session's backend is created by the mount! below (if any); the
+    // handle itself comes straight from the factories, no pre-opened manager
+    // (bugs/duplicate-fatboy-spawn-one-shot).
+    let mut handle = match crate::connection::open_handle() {
         Ok(h) => h,
         Err(e) => {
             eprintln!("worker-{}: failed to init system: {}", worker_id, e);

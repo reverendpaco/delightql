@@ -1630,6 +1630,8 @@ pub(super) fn r_lower_pipe(
 
             UnaryRelationalOperator::Witness { exists } => r_lower_witness(current, exists, ctx)?,
 
+            UnaryRelationalOperator::SignedWitness => r_lower_signed_witness(current, ctx)?,
+
             UnaryRelationalOperator::NarrowingDestructure { column, fields } => {
                 r_lower_narrowing_destructure(current, column, fields, &cpr_schema, ctx)?
             }
@@ -1668,7 +1670,7 @@ pub(super) fn r_lower_pipe(
                 // the old unreachable!() panic (bugs/dml-multiterminal-panic).
                 return Err(DelightQLError::validation_error_categorized(
                     "dml/shape/multi_terminal",
-                    "a DML terminal (insert!/update!/delete!/keep!) must be the \
+                    "a DML terminal (insert!/update!/delete!) must be the \
                      final operation of a statement; multi-step DML via `,` \
                      (dataflow) or `;` (sequential) is not yet supported",
                     "run each mutation as a separate statement",
@@ -3403,6 +3405,136 @@ pub(super) fn r_lower_witness(
         scope_name.clone(),
         Some(0),
     )];
+
+    Ok(Builder::from_query(query, scope_name, columns, names_fork))
+}
+
+/// Lower the signed witness: postfix `+-`.
+///
+/// The one-row-unit LEFT-JOIN wrap (book/reference/dql/witness.md
+/// "Lowering") — source rows widened with `met = 1`, or one all-NULL
+/// proxy row with `met = 0` when the source is empty:
+///
+///   SELECT r.c1 AS c1, ..., COALESCE(r.__p, 0) AS met
+///   FROM (SELECT 1 AS __dee) AS dee
+///   LEFT JOIN (SELECT 1 AS __p, a.* FROM (<source>) AS a) AS r ON 1 = 1
+///
+/// Mirrors the effect transformer's `witness_wrap` (the value-position
+/// lowering, effect_transformer/mod.rs), including the `met_2` collision
+/// convention — the same convention `resolve_signed_witness` applies, so
+/// the resolver's schema and the emitted SQL agree. Pinned by the effects
+/// ball's compose--70…76 (witness citizenship) and compose--74 (plain
+/// ad-hoc `+-`).
+pub(super) fn r_lower_signed_witness(
+    builder: Builder<Unprojected>,
+    _ctx: &TransformCtx,
+) -> Result<Builder<Projected>> {
+    use crate::pipeline::asts::core::literals::LiteralValue;
+    use crate::pipeline::asts::core::provenance::ColumnProvenance;
+    use crate::pipeline::sql_ast_v3::{
+        ColumnQualifier, DomainExpression as SqlDomainExpr, JoinCondition, JoinType,
+        QueryExpression, SelectItem, SelectStatement,
+    };
+
+    let err = |e: String| DelightQLError::ParseError {
+        message: format!("SignedWitness: {}", e),
+        source: None,
+        subcategory: None,
+    };
+
+    // Finalize the source into a query expression, keeping its output
+    // column names (the disambiguated SQL-level aliases).
+    let names_fork = builder.names().fork();
+    let projected = builder.project_all()?;
+    let source_names: Vec<String> = projected
+        .columns()
+        .iter()
+        .map(|c| col_name(c).to_string())
+        .collect();
+    let source_query = projected.to_sql()?;
+
+    let one = || SqlDomainExpr::literal(LiteralValue::Number("1".to_string()));
+
+    let dee = SelectStatement::builder()
+        .select(SelectItem::expression_with_alias(one(), "__dee"))
+        .build()
+        .map_err(err)?;
+
+    let sentinel = SelectStatement::builder()
+        .select(SelectItem::expression_with_alias(one(), "__p"))
+        .select(SelectItem::QualifiedStar {
+            qualifier: ColumnQualifier::table("a"),
+        })
+        .from_tables(vec![TableExpression::subquery(source_query, "a")])
+        .build()
+        .map_err(err)?;
+
+    let join = TableExpression::Join {
+        left: Box::new(TableExpression::subquery(
+            QueryExpression::Select(Box::new(dee)),
+            "dee",
+        )),
+        right: Box::new(TableExpression::subquery(
+            QueryExpression::Select(Box::new(sentinel)),
+            "r",
+        )),
+        join_type: JoinType::Left,
+        join_condition: JoinCondition::On(SqlDomainExpr::eq(one(), one())),
+    };
+
+    // `met` collides when witnesses stack: `_2`-suffix per the language's
+    // existing collision convention (same computation as
+    // `resolve_signed_witness`).
+    let met_name = {
+        let mut candidate = "met".to_string();
+        let mut n = 2;
+        while source_names.contains(&candidate) {
+            candidate = format!("met_{}", n);
+            n += 1;
+        }
+        candidate
+    };
+
+    let mut items: Vec<SelectItem> = Vec::with_capacity(source_names.len() + 1);
+    for col in &source_names {
+        items.push(SelectItem::expression_with_alias(
+            SqlDomainExpr::with_qualifier(ColumnQualifier::table("r"), col.as_str()),
+            col.clone(),
+        ));
+    }
+    items.push(SelectItem::expression_with_alias(
+        SqlDomainExpr::function(
+            "coalesce",
+            vec![
+                SqlDomainExpr::with_qualifier(ColumnQualifier::table("r"), "__p"),
+                SqlDomainExpr::literal(LiteralValue::Number("0".to_string())),
+            ],
+        ),
+        met_name.clone(),
+    ));
+
+    let select = SelectStatement::builder()
+        .select_all(items)
+        .from_tables(vec![join])
+        .build()
+        .map_err(err)?;
+
+    let query = QueryExpression::Select(Box::new(select));
+    let scope_name = TableName::Named(SqlIdentifier::from("_witness"));
+    // Honest Fresh: the carried names are re-scoped under the wrap; "met"
+    // is the compiler-generated presence flag, not a source column.
+    let columns: Vec<ColumnMetadata> = source_names
+        .iter()
+        .chain(std::iter::once(&met_name))
+        .enumerate()
+        .map(|(i, name)| {
+            ColumnMetadata::new(
+                ColumnProvenance::from_column(name.clone()),
+                scope_name.clone(),
+                Some(i),
+            )
+        })
+        .collect();
 
     Ok(Builder::from_query(query, scope_name, columns, names_fork))
 }

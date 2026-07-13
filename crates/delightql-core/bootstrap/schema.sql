@@ -310,6 +310,28 @@ CREATE TABLE namespace_alias (
     FOREIGN KEY (target_namespace_id) REFERENCES namespace(id)
 );
 
+-- Liminal Receipt: THE LIMINAL RELATION's storage (EFFECT-ALGEBRA §8).
+-- One row per executed liminal directive of the namespace's OWN file, in
+-- file-appearance order — rowid IS the insertion order (the engine-courtesy
+-- ordering contract; the presented ledger carries no sequence column).
+-- `receipt` is the receipt row as a JSON object (success, operation, then
+-- the directive's echo columns); `echoes` is the ordered JSON array of this
+-- receipt's echo column names, from which the ledger's corresponding-union
+-- presentation schema is computed at drill time.
+-- Session-scoped catalog state: rows are written inside the consult
+-- transaction (abort rolls the ledger away with the namespace), die with the
+-- namespace (destroy_namespace) and are replaced whole on reconsult
+-- (clear_namespace_contents). Pinned by effects/liminal--43, --45 and the
+-- liminal_ledger_* tests in bin_cartridge/prelude/consult.rs.
+CREATE TABLE liminal_receipt (
+    id INTEGER PRIMARY KEY,
+    namespace_id INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    echoes TEXT NOT NULL,
+    receipt TEXT NOT NULL,
+    FOREIGN KEY (namespace_id) REFERENCES namespace(id)
+);
+
 -- Grounding: Tracks which namespaces borrow from which data/lib namespaces.
 -- Used for ownership enforcement: a namespace cannot be destroyed while borrowed.
 CREATE TABLE grounding (
@@ -568,6 +590,22 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
     ('duckdb',   'type.real', 'template', 'DOUBLE');
 
 -- ----------------------------------------------------------------------------
+-- Seed row: effect-plan scratch qualification (`scratch.schema`) — R-T2's
+-- layer-1 dialect slot (EFFECTS-ON-TARGETS-PLAN.md §1, ratified 2026-07-11).
+-- The session-temp schema qualifier every plan-scratch REFERENCE takes
+-- (receipt shells/reads, the __exit peek and wrap-guards, replace/trailing
+-- drops). Canonical (SQLite) is `temp.` in code; DuckDB accepts the SQLite
+-- spelling verbatim (REPORT-T-P3 §B) so it carries no row; PG spells
+-- `pg_temp.` — never `pg_temp_N` (REPORT-T-P1 §B: the alias always names
+-- the session's own schema, and full qualification is immune to user
+-- search_path exotica). Consumed by the effect transformer's
+-- `scratch_schema` (pipeline/effect_transformer); pinned by
+-- pg_shells_move_in_bracket_with_on_commit_drop_and_pg_temp_spelling.
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'scratch.schema', 'template', 'pg_temp');
+
+-- ----------------------------------------------------------------------------
 -- sys::help ring 2 — the identifier registry as burned rows
 -- (SYS-HELP-DESIGN.md phase 1). AUTHORED-AS-DATA: these rows are the
 -- SOURCE of truth for `dql explain` and every future projection (the
@@ -594,7 +632,7 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('error', 'parse/ddl', 'A definition (DDL) source failed to parse.', 'The text of a definition — a consulted rules file, a view/rule body, or inline DDL — contains syntax the DDL grammar rejects. The message carries the offending line and tree-sitter''s recovery note. Common causes: operator ambiguity needing spaces (`x / 2`, not `x/2`), unbalanced delimiters, or query-mode clause syntax (`… : name`) used in a rules file where definition syntax (`name(*) :- …`) is required.'),
     ('error', 'parse/sigil', 'A sigil expression contains syntax errors.', 'A sigil-introduced expression (the compact operator forms) parsed as structurally invalid. Check the sigil''s expected operand shape and delimiter balance near the reported position.'),
     ('error', 'semantic', 'The structure is valid but the meaning is wrong.', 'Semantic errors mean the query parsed, but a name failed to resolve, an arity was wrong, or a constraint was violated during compilation. The subhierarchy names what went wrong: resolution/ (name binding), constraint/, arity, limitation/ (known gaps).'),
-    ('error', 'dml', 'A data-modification query violated DML shape rules.', 'DML errors cover insert!/update!/delete!/keep! shape and marker rules: marker/ (the !! mutation marker — missing, multiple, forbidden, mismatch), shape/ (required or meaningless clauses), source/ (what may feed a mutation).'),
+    ('error', 'dml', 'A data-modification query violated DML shape rules.', 'DML errors cover insert!/update!/delete! shape and marker rules: marker/ (the !! mutation marker — missing, multiple, forbidden, mismatch), shape/ (required or meaningless clauses), source/ (what may feed a mutation).'),
     ('error', 'operational', 'The query is valid but this session refuses to run it.', 'Operational errors are policy, not meaning: the query compiled, but session configuration forbids executing it (e.g. federation-prohibited: a query may touch only one connection).'),
     ('error', 'runtime', 'Compilation succeeded; execution failed.', 'Runtime errors happen after SQL generation: the database rejected the SQL, an assertion failed, a connection dropped, or I/O failed. Subhierarchy: assertion, connection, io, bug (internal), relay/transport (protocol channel).'),
     ('error', 'target', 'The foreign engine rejected or failed the query.', 'Target errors originate in the mounted engine, not in DelightQL: target/<engine>/<class>/<code> embeds the world''s taxonomy as the leaf (Postgres: SQLSTATE, e.g. target/postgres/undefined-object/42883). Hook family: (~~error://target/postgres ~~) matches any Postgres-side failure. Lifecycle members: connect, orientation, unimplemented.'),

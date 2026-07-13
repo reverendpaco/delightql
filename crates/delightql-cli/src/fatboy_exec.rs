@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use delightql_protocol::stdio::StdioTransport;
 use delightql_protocol::{
@@ -41,7 +41,53 @@ fn default_schema(profile: &str) -> &'static str {
     }
 }
 
-fn introspect_sql(profile: &str) -> String {
+/// The schema a mount introspects: the RECORDED per-mount schema when one
+/// was bound (schema-mount Phase B/C), else the engine default for the
+/// profile (a bare mount, Phase A). Keeping the fallback here means the
+/// recorded `source_ns` and the introspected schema always name the same
+/// thing (system.rs::default_engine_schema_for_type is the read-side twin).
+fn effective_schema<'a>(mounted_schema: &'a Option<String>, profile: &str) -> &'a str {
+    match mounted_schema.as_deref() {
+        Some(s) => s,
+        None => default_schema(profile),
+    }
+}
+
+/// The per-engine enumeration of PERSISTENT schemas (EFFECTS-ON-TARGETS
+/// §4.3, R-S2). PG keeps public + user + information_schema + pg_catalog
+/// and excludes the transient `pg_temp_%` / `pg_toast*` prefixes; DuckDB
+/// dedups and excludes `temp`/`system`. Shared by Phase B's existence
+/// refusal and Phase C's `mount_tree!` enumeration.
+fn schema_enumeration_sql(profile: &str) -> &'static str {
+    match profile {
+        "duckdb" => {
+            "SELECT DISTINCT schema_name FROM information_schema.schemata \
+             WHERE schema_name NOT IN ('temp', 'system') \
+             ORDER BY schema_name"
+        }
+        _ => {
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name NOT LIKE 'pg_temp_%' \
+               AND schema_name NOT LIKE 'pg_toast%' \
+             ORDER BY schema_name"
+        }
+    }
+}
+
+/// Enumerate the target's persistent schemas over the fatboy relay.
+fn enumerate_persistent_schemas(
+    mgr: &std::sync::Arc<FatboyManager>,
+) -> Result<Vec<String>, String> {
+    let sql = schema_enumeration_sql(&mgr.profile);
+    let (_cols, rows) = mgr.relay()?.query_nullable(sql)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect())
+}
+
+fn introspect_sql(schema: &str) -> String {
+    let schema_lit = schema.replace('\'', "''");
     format!(
         "SELECT t.table_name, t.table_type, \
          c.ordinal_position - 1 AS cid, c.column_name, c.data_type, \
@@ -53,7 +99,7 @@ fn introspect_sql(profile: &str) -> String {
           AND t.table_name = c.table_name \
          WHERE t.table_schema = '{}' \
          ORDER BY t.table_name, c.ordinal_position",
-        default_schema(profile)
+        schema_lit
     )
 }
 
@@ -267,7 +313,19 @@ pub struct FatboyManager {
     pub db: String,
     /// How to (re)spawn children for this connection.
     spawn: SpawnSpec,
-    relay: FatboyRelay,
+    /// The handshaken relay session, spawned LAZILY on first `relay()`.
+    /// Constructing a FatboyManager does NOT spawn a child: the CLI's
+    /// `--db` entry (query.rs make_connection) builds one purely to carry
+    /// route metadata (profile/db) and hands it to the REPL, where the
+    /// only live fatboy operations refuse before touching the backend;
+    /// the child that actually runs queries is spawned once by the mount!
+    /// factory. Deferring the spawn is what collapses a one-shot fatboy
+    /// `--db` query from two backend children to one.
+    /// Pinned by tests/fatboy_spawn_count.rs.
+    relay: OnceLock<FatboyRelay>,
+    /// Serializes the lazy spawn so a concurrent first-use cannot mint two
+    /// children (get_or_try_init is unstable; this is its stand-in).
+    init: Mutex<()>,
 }
 
 /// The spawn contract for a fatboy child.
@@ -301,18 +359,38 @@ impl FatboyManager {
     }
 
     fn connect_spec(profile: &str, db: String, spawn: SpawnSpec) -> Result<Self, String> {
-        let child = spawn_fatboy_stdio(profile, &spawn)?;
-        let relay = FatboyRelay::from_child(child)?;
+        // Lazy: record the route and how to spawn, but do NOT spawn the
+        // child here. The first `relay()` call materializes it. (See the
+        // `relay` field's note — this is the one-spawn collapse.)
         Ok(Self {
             profile: profile.to_string(),
             db,
             spawn,
-            relay,
+            relay: OnceLock::new(),
+            init: Mutex::new(()),
         })
     }
 
-    pub fn relay(&self) -> &FatboyRelay {
-        &self.relay
+    /// The handshaken relay session, spawning the fatboy child on the FIRST
+    /// call (lazy — see the `relay` field). Later calls reuse it. Fallible:
+    /// the spawn/handshake can fail, and that failure now surfaces here
+    /// rather than at construction.
+    pub fn relay(&self) -> Result<&FatboyRelay, String> {
+        if let Some(r) = self.relay.get() {
+            return Ok(r);
+        }
+        let _guard = self
+            .init
+            .lock()
+            .map_err(|_| "fatboy init lock poisoned".to_string())?;
+        // Re-check under the lock (another thread may have won the race).
+        if let Some(r) = self.relay.get() {
+            return Ok(r);
+        }
+        let child = spawn_fatboy_stdio(&self.profile, &self.spawn)?;
+        let relay = FatboyRelay::from_child(child)?;
+        let _ = self.relay.set(relay);
+        Ok(self.relay.get().expect("relay just set under init lock"))
     }
 
     /// A fresh protocol handler = a fresh fatboy child = a fresh
@@ -425,7 +503,7 @@ impl FatboyConnection {
     fn run(&self, sql: &str) -> delightql_types::Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
         self.relay
             .relay()
-            .query_nullable(sql)
+            .and_then(|r| r.query_nullable(sql))
             .map_err(|e| fatboy_db_error("Fatboy query failed", e))
     }
 }
@@ -484,20 +562,35 @@ impl DatabaseConnection for FatboyConnection {
 
 pub struct FatboyIntrospector {
     relay: std::sync::Arc<FatboyManager>,
+    /// The mount's bound schema (schema-mount Phase A); `None` = the
+    /// profile default. Feeds `introspect_sql` so a mount discovers the
+    /// entities of the schema it actually bound, not always the default.
+    mounted_schema: Option<String>,
 }
 
 impl FatboyIntrospector {
     pub fn new(relay: std::sync::Arc<FatboyManager>) -> Self {
-        Self { relay }
+        Self::with_schema(relay, None)
+    }
+
+    pub fn with_schema(
+        relay: std::sync::Arc<FatboyManager>,
+        mounted_schema: Option<String>,
+    ) -> Self {
+        Self {
+            relay,
+            mounted_schema,
+        }
     }
 }
 
 impl DatabaseIntrospector for FatboyIntrospector {
     fn introspect_entities(&self) -> delightql_types::Result<Vec<DiscoveredEntity>> {
+        let schema = effective_schema(&self.mounted_schema, &self.relay.profile);
         let (_cols, rows) = self
             .relay
             .relay()
-            .query_nullable(&introspect_sql(&self.relay.profile))
+            .and_then(|r| r.query_nullable(&introspect_sql(schema)))
             .map_err(|e| fatboy_db_error("Fatboy introspection failed", e))?;
 
         // Rows ordered by (table_name, ordinal): fold into entities.
@@ -540,29 +633,70 @@ impl DatabaseIntrospector for FatboyIntrospector {
 
 pub struct FatboySchema {
     relay: std::sync::Arc<FatboyManager>,
+    /// The mount's bound schema (schema-mount Phase A); `None` = the
+    /// profile default. Scopes the column lookup to the schema the mount
+    /// actually bound.
+    mounted_schema: Option<String>,
 }
 
 impl FatboySchema {
     pub fn new(relay: std::sync::Arc<FatboyManager>) -> Self {
-        Self { relay }
+        Self::with_schema(relay, None)
+    }
+
+    pub fn with_schema(
+        relay: std::sync::Arc<FatboyManager>,
+        mounted_schema: Option<String>,
+    ) -> Self {
+        Self {
+            relay,
+            mounted_schema,
+        }
     }
 }
 
 impl DatabaseSchema for FatboySchema {
     fn get_table_columns(&self, _schema: Option<&str>, table_name: &str) -> Option<Vec<ColumnInfo>> {
         let escaped = table_name.replace('\'', "''");
+        // Schema scoping, per profile (E-T5): on Postgres the lookup
+        // prefers the SESSION'S OWN temp schema when the name is temp-held,
+        // else the mounted schema — the same COALESCE scoping E-T4 ruled
+        // for the registration read-back (`created_object_readback_sql`),
+        // and PG's own resolution order (temp shadows public for
+        // unqualified names, P1 §B). Without it a plan-created temp table
+        // (`|> temp_table!(staged)`) is invisible to the NEXT statement's
+        // column lookup — the read-back registers it, then live resolution
+        // scoped to 'public' answers None ("Table not found"). DuckDB never
+        // had the hole: its temp objects live in schema `main` (catalog
+        // `temp`), the same schema name this query scopes to (P3 §B).
+        // Pinned live by
+        // `pg_temp_readback_round_trip_and_table_bang_lands_in_public`
+        // (crates/delightql-cli/tests/effects_on_targets.rs).
+        let mounted = effective_schema(&self.mounted_schema, &self.relay.profile);
+        let mounted_lit = mounted.replace('\'', "''");
+        let schema_scope = if self.relay.profile == "postgres" {
+            format!(
+                "COALESCE((SELECT tn.nspname FROM pg_class t \
+                  JOIN pg_namespace tn ON tn.oid = t.relnamespace \
+                  WHERE t.relname = '{}' \
+                    AND t.relnamespace = pg_my_temp_schema()), '{}')",
+                escaped, mounted_lit
+            )
+        } else {
+            format!("'{}'", mounted_lit)
+        };
         let sql = format!(
             "SELECT c.column_name AS name, \
              CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS notnull, \
              c.ordinal_position - 1 AS cid, \
              c.data_type AS data_type \
              FROM information_schema.columns c \
-             WHERE c.table_schema = '{}' AND c.table_name = '{}' \
+             WHERE c.table_schema = {} AND c.table_name = '{}' \
              ORDER BY c.ordinal_position",
-            default_schema(&self.relay.profile),
+            schema_scope,
             escaped
         );
-        let (_cols, rows) = self.relay.relay().query_nullable(&sql).ok()?;
+        let (_cols, rows) = self.relay.relay().ok()?.query_nullable(&sql).ok()?;
         if rows.is_empty() {
             return None;
         }
@@ -595,15 +729,74 @@ impl DatabaseSchema for FatboySchema {
 
 pub fn create_fatboy_system_components(
     mgr: &std::sync::Arc<FatboyManager>,
+    mounted_schema: Option<String>,
 ) -> anyhow::Result<delightql_types::ConnectionComponents> {
+    // R-S4: refuse (loudly) when the resolved schema does not exist on the
+    // target rather than bind an empty namespace. The resolved schema is the
+    // spelled `#schema` (Phase B) or the engine default (public/main) for a
+    // bare mount; both must be a persistent schema of the target. Checked
+    // against the SAME enumeration Phase C mounts (build once, share).
+    let resolved = effective_schema(&mounted_schema, &mgr.profile).to_string();
+    let schemas = enumerate_persistent_schemas(mgr)
+        .map_err(|e| anyhow::anyhow!("could not enumerate schemas on {}: {}", mgr.db, e))?;
+    if !schemas.iter().any(|s| s == &resolved) {
+        anyhow::bail!(
+            "schema '{}' does not exist on {} database '{}' (available: {})",
+            resolved,
+            mgr.profile,
+            mgr.db,
+            schemas.join(", ")
+        );
+    }
     Ok(delightql_types::ConnectionComponents {
-        schema: Box::new(FatboySchema::new(mgr.clone())),
+        schema: Box::new(FatboySchema::with_schema(mgr.clone(), mounted_schema.clone())),
         connection: std::sync::Arc::new(Mutex::new(FatboyConnection::new(mgr.clone()))),
-        introspector: Box::new(FatboyIntrospector::new(mgr.clone())),
+        introspector: Box::new(FatboyIntrospector::with_schema(
+            mgr.clone(),
+            mounted_schema.clone(),
+        )),
         db_type: mgr.profile.clone(),
         mechanism: "fatboy".to_string(),
         identity: fatboy_resource_identity(mgr),
+        // A bare mount records `None` (the engine default, resolved
+        // downstream — behavior-identical to Phase A). A spelled `#schema`
+        // travels here → the cartridge's `source_ns` → read qualification
+        // and durable placement (Phase A flag 3).
+        mounted_schema,
     })
+}
+
+/// Phase C: one components per PERSISTENT schema, ALL sharing this ONE
+/// FatboyManager (one child / one relay). Each components carries
+/// `mounted_schema = Some(schema)` and the SAME resource identity, so the
+/// bootstrap `connection` dedup (by identity) folds every sub-namespace
+/// onto ONE connection_id — the load-bearing R-S1 property that makes a
+/// cross-schema `run!` a single-connection, one-bracket plan.
+pub fn create_fatboy_tree_components(
+    mgr: &std::sync::Arc<FatboyManager>,
+) -> anyhow::Result<Vec<(String, delightql_types::ConnectionComponents)>> {
+    let schemas = enumerate_persistent_schemas(mgr)
+        .map_err(|e| anyhow::anyhow!("could not enumerate schemas on {}: {}", mgr.db, e))?;
+    let identity = fatboy_resource_identity(mgr);
+    let mut out = Vec::with_capacity(schemas.len());
+    for schema in schemas {
+        out.push((
+            schema.clone(),
+            delightql_types::ConnectionComponents {
+                schema: Box::new(FatboySchema::with_schema(mgr.clone(), Some(schema.clone()))),
+                connection: std::sync::Arc::new(Mutex::new(FatboyConnection::new(mgr.clone()))),
+                introspector: Box::new(FatboyIntrospector::with_schema(
+                    mgr.clone(),
+                    Some(schema.clone()),
+                )),
+                db_type: mgr.profile.clone(),
+                mechanism: "fatboy".to_string(),
+                identity: identity.clone(),
+                mounted_schema: Some(schema),
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// Resource-asserted identity, obtained at connect (URI-DESIGN.md §4):
@@ -615,8 +808,11 @@ fn fatboy_resource_identity(mgr: &std::sync::Arc<FatboyManager>) -> Option<Strin
     match mgr.profile.as_str() {
         "postgres" => mgr
             .relay()
-            .query_nullable("SELECT system_identifier FROM pg_control_system()")
             .ok()
+            .and_then(|r| {
+                r.query_nullable("SELECT system_identifier FROM pg_control_system()")
+                    .ok()
+            })
             .and_then(|(_cols, rows)| rows.into_iter().next())
             .and_then(|row| row.into_iter().next().flatten())
             .map(|id| format!("pg-system-id:{id}")),
@@ -633,12 +829,15 @@ pub(crate) fn execute_sql_with_fatboy(
     sql: &str,
     mgr: &std::sync::Arc<FatboyManager>,
 ) -> std::result::Result<delightql_backends::QueryResults, delightql_core::error::DelightQLError> {
-    let (columns, rows) = mgr.relay().query_nullable(sql).map_err(|e| {
-        delightql_core::error::DelightQLError::database_error(
-            format!("Fatboy query failed: {}", e),
-            e,
-        )
-    })?;
+    let (columns, rows) = mgr
+        .relay()
+        .and_then(|r| r.query_nullable(sql))
+        .map_err(|e| {
+            delightql_core::error::DelightQLError::database_error(
+                format!("Fatboy query failed: {}", e),
+                e,
+            )
+        })?;
     let string_rows: Vec<Vec<String>> = rows
         .into_iter()
         .map(|row| row.into_iter().map(|v| v.unwrap_or_default()).collect())

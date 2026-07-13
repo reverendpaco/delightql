@@ -202,12 +202,7 @@ fn create_ddl_error(tree: &Tree, source: &str) -> DelightQLError {
     // Find definitions with errors — the most actionable info for the user
     for child in root.children() {
         if child.has_error() {
-            let text = child.text();
-            let display = if text.len() > 80 {
-                format!("{}...", &text[..80])
-            } else {
-                text.to_string()
-            };
+            let display = truncate_for_display(child.text(), 80);
 
             let pos = child.raw_node().start_position();
             return DelightQLError::ParseError {
@@ -451,12 +446,42 @@ fn find_missing_node_info(node: CstNode, _source: &str) -> Option<MissingNodeInf
     None
 }
 
+/// Clamp `index` to the nearest char boundary at or below it.
+///
+/// std's `str::floor_char_boundary` is still unstable; same contract.
+/// Error positions are byte offsets, and arbitrary byte arithmetic on them
+/// (context windows, display truncation) can land inside a multi-byte
+/// character — slicing there panics (bugs/run-non-ascii-panic). Pinned by
+/// `parse_error_context_is_char_boundary_safe` and
+/// `get_context_around_error_clamps_both_edges`.
+pub(crate) fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Truncate `text` to at most `max_bytes` bytes for display, appending
+/// "..." when truncated, never splitting a multi-byte character.
+/// Pinned by `ddl_error_display_truncation_is_char_boundary_safe`.
+pub(crate) fn truncate_for_display(text: &str, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        format!("{}...", &text[..floor_char_boundary(text, max_bytes)])
+    } else {
+        text.to_string()
+    }
+}
+
 /// Get context around an error position for better error messages
 fn get_context_around_error(source: &str, position: usize) -> String {
     const CONTEXT_SIZE: usize = 20;
 
-    let start = position.saturating_sub(CONTEXT_SIZE);
-    let end = (position + CONTEXT_SIZE).min(source.len());
+    let start = floor_char_boundary(source, position.saturating_sub(CONTEXT_SIZE));
+    let end = floor_char_boundary(source, (position + CONTEXT_SIZE).min(source.len()));
 
     let context = &source[start..end];
 
@@ -645,6 +670,9 @@ pub enum DefinitionType {
     Fact,
     /// ER-context rule: left&right(*) within context neck body
     ErRule,
+    /// Effect rule: name!(*) neck body or name!(ho_params)(output) neck body
+    /// (EFFECT-ALGEBRA §1). The stored `Definition.name` carries the `!`.
+    EffectRule,
 }
 
 /// Definition neck (determines persistence and type)
@@ -700,12 +728,7 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
         // has_error=true containing a garbled body). Silent acceptance of such
         // nodes is the "mortal sin" that produced the disjunctive_function bug.
         if child.has_error() {
-            let text = child.text();
-            let display = if text.len() > 80 {
-                format!("{}...", &text[..80])
-            } else {
-                text.to_string()
-            };
+            let display = truncate_for_display(child.text(), 80);
             let pos = child.raw_node().start_position();
             return Err(DelightQLError::ParseError {
                 message: format!(
@@ -735,8 +758,28 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
             | "ho_view_definition"
             | "sigma_definition"
             | "fact_definition"
-            | "named_case_definition" => {
+            | "named_case_definition"
+            | "effect_rule_definition" => {
                 definitions.push(extract_definition(&child, source)?);
+            }
+            "liminal_directive" => {
+                // A bare directive call at the file's top level that the
+                // textual extraction did NOT lift out. Under the 2.2
+                // narrowing, extraction lifts exactly the session directives
+                // (the liminal space) — so a liminal_directive node reaching
+                // the parser names a non-session directive, and only session
+                // directives are liminal-eligible (EFFECT-ALGEBRA §8).
+                // Pinned red-first by the effects ball
+                // (liminal--41_dml_not_eligible, liminal--42_run_not_eligible).
+                let name = child
+                    .find_child("pseudo_predicate_call")
+                    .and_then(|c| c.field_text("name"))
+                    .unwrap_or_else(|| child.text().to_string());
+                return Err(DelightQLError::validation_error_categorized(
+                    crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
+                    crate::pipeline::asts::effects::liminal_not_eligible_message(&name),
+                    "not liminal-eligible",
+                ));
             }
             "query_statement" => {
                 query_statements.push(extract_query_statement(&child, source)?);
@@ -803,6 +846,15 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
         } else {
             format!("{}&{}", right, left)
         }
+    } else if cst_node_type == "effect_rule_definition" {
+        // Effect rules carry the `!` in their stored name (the invocation
+        // spelling and the BinPseudoPredicate convention: "consult!").
+        format!(
+            "{}!",
+            node.field("name")
+                .ok_or_else(|| DelightQLError::parse_error("Definition missing name field"))?
+                .text()
+        )
     } else {
         // Get the name (fields are direct children of definition node)
         node.field("name")
@@ -963,6 +1015,22 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
         "er_rule_definition" => {
             // ER-rule: no params (left/right table names already in entity name)
             (DefinitionType::ErRule, Vec::new())
+        }
+        "effect_rule_definition" => {
+            // Effect rule (EFFECT-ALGEBRA §1): glob head name!(*) has no
+            // params; the HO head name!(ho_params)(output) reuses the HO
+            // machinery.
+            let params_nodes = node.children_by_field("ho_params");
+            let params = params_nodes
+                .iter()
+                .filter(|p| p.kind() == "ho_param" || p.kind() == "identifier")
+                .map(|p| {
+                    p.field("param_name")
+                        .map(|n| crate::pipeline::cst::unstrop(n.text()))
+                        .unwrap_or_else(|| crate::pipeline::cst::unstrop(p.text()))
+                })
+                .collect();
+            (DefinitionType::EffectRule, params)
         }
         _ => {
             return Err(DelightQLError::parse_error(format!(
@@ -1217,6 +1285,50 @@ mod tests {
         }
     }
 
+    /// Pins bugs/run-non-ascii-panic: parse-error context extraction sliced
+    /// the source at `position ± CONTEXT_SIZE` without clamping to char
+    /// boundaries, so a parse error near multi-byte characters panicked
+    /// ("byte index N is not a char boundary") instead of reporting the error.
+    #[test]
+    fn parse_error_context_is_char_boundary_safe() {
+        // Error node starts at byte 9; position + CONTEXT_SIZE = 29 lands
+        // inside the 3-byte '─' at bytes 27..30 — panicked before the fix.
+        let source = "users(*) |> where(xy = \"──────────\") ???";
+        let err = parse(source).expect_err("source has a parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Syntax error"),
+            "expected a normal parse error, got: {msg}"
+        );
+    }
+
+    /// Pins bugs/run-non-ascii-panic (helper level): both context-window
+    /// edges must clamp to char boundaries, including the start side.
+    #[test]
+    fn get_context_around_error_clamps_both_edges() {
+        // 30 box-drawing chars, 3 bytes each. position 24 is char-aligned;
+        // 24 - 20 = 4 and 24 + 20 = 44 are both mid-char.
+        let source = "─".repeat(30);
+        let ctx = get_context_around_error(&source, 24);
+        assert!(!ctx.is_empty());
+        assert!(ctx.chars().all(|c| c == '─'), "got: {ctx}");
+    }
+
+    /// Pins bugs/run-non-ascii-panic sibling: `create_ddl_error` truncated
+    /// the errored definition text at byte 80 without a char-boundary check.
+    #[test]
+    fn ddl_error_display_truncation_is_char_boundary_safe() {
+        // Unterminated string: 16 ASCII bytes then 30 3-byte chars; byte 80
+        // is mid-char (80 - 16 = 64, 64 % 3 == 1).
+        let source = format!("bad:(x) :- x + \"{}", "─".repeat(30));
+        let err = parse_ddl(&source).expect_err("source has a DDL parse error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parse error") || msg.contains("Parse error"),
+            "expected a normal DDL parse error, got: {msg}"
+        );
+    }
+
     #[test]
     fn test_parse_empty_string() {
         let source = "";
@@ -1468,5 +1580,356 @@ high_value_users(*) :- users(*), balance > 500
             "full_source should parse: {:?}",
             parse_result2.err()
         );
+    }
+
+    // ========================================================================
+    // Effect-algebra grammar pins (task 2.1) — parse/CST level only.
+    // The builder does not construct these nodes yet (task 2.2); these tests
+    // pin that the GRAMMAR produces the right CST shapes.
+    // ========================================================================
+
+    /// Walk helper shared by the effect-grammar pins.
+    fn cst_contains_kind(node: tree_sitter::Node, kind: &str) -> bool {
+        if node.kind() == kind {
+            return true;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        children.into_iter().any(|c| cst_contains_kind(c, kind))
+    }
+
+    /// Item 4 regression (IMPLEMENTATION-PLAN 2.1): introducing the one-token
+    /// signed witness `+-` in relational postfix position must not change how
+    /// the exact string `a + -b` lexes in scalar position. Before the change,
+    /// `(a + -b)` was a parse error (unary minus on an identifier is not a
+    /// thing) and `(a + -1)` / `(a +-1)` parsed as add-with-negative-literal;
+    /// both facts must survive, and no signed_witness_operator may appear in
+    /// scalar position.
+    #[test]
+    fn scalar_plus_minus_is_unaffected_by_signed_witness_token() {
+        // The exact string from the task: `a + -b` in scalar position.
+        // It did not parse before the signed-witness token and must not
+        // start parsing (or lexing +- as one token) because of it.
+        let err = parse("users(*) |> (a + -b)");
+        assert!(
+            err.is_err(),
+            "`a + -b` in scalar position was a parse error before +- landed and must stay one"
+        );
+
+        // Adjacent `+-` before a NUMBER in scalar position: still add + (-1),
+        // never the signed-witness token.
+        for src in ["users(*) |> (a + -1)", "users(*) |> (a +-1)"] {
+            let tree = parse(src).unwrap_or_else(|e| panic!("{src} must parse: {e}"));
+            assert!(!tree.root_node().has_error(), "{src} parsed with errors");
+            assert!(
+                !cst_contains_kind(tree.root_node(), "signed_witness_operator"),
+                "{src}: +- must not lex as signed witness in scalar position: {}",
+                tree.root_node().to_sexp()
+            );
+            assert!(
+                cst_contains_kind(tree.root_node(), "add"),
+                "{src}: expected binary add: {}",
+                tree.root_node().to_sexp()
+            );
+        }
+    }
+
+    /// Item 4 (EFFECT-ALGEBRA §3): postfix `+-` in relational position is ONE
+    /// token, signed_witness_operator; the spaced form `+ -` keeps its old
+    /// reading (witness `+` then minus_corresponding `-`).
+    #[test]
+    fn signed_witness_is_one_token_in_relational_postfix() {
+        let tree = parse("s!(*) +- ; k!(*) +-").expect("total-ledger union must parse");
+        assert!(!tree.root_node().has_error());
+        assert!(
+            cst_contains_kind(tree.root_node(), "signed_witness_operator"),
+            "expected signed_witness_operator: {}",
+            tree.root_node().to_sexp()
+        );
+
+        // Spaced form is untouched: witness then minus-corresponding.
+        let spaced = parse("t(*) + - u(*)").expect("spaced witness-minus must still parse");
+        assert!(!spaced.root_node().has_error());
+        assert!(
+            cst_contains_kind(spaced.root_node(), "witness_operator")
+                && cst_contains_kind(spaced.root_node(), "minus_corresponding")
+                && !cst_contains_kind(spaced.root_node(), "signed_witness_operator"),
+            "spaced `+ -` must stay witness + minus_corresponding: {}",
+            spaced.root_node().to_sexp()
+        );
+    }
+
+    /// Item 2 (EFFECT-ALGEBRA R4): `: name!` — the effect-CTE label. The `!`
+    /// must be immediate and shows up as an effect_marker on cte_inline.
+    #[test]
+    fn effect_cte_label_parses_with_effect_marker() {
+        let tree = parse("users(*) |> temp_table!(staged) : s!\nstaged(*)")
+            .expect("effect-CTE label must parse");
+        assert!(!tree.root_node().has_error());
+        assert!(
+            cst_contains_kind(tree.root_node(), "effect_marker"),
+            "expected effect_marker on the CTE label: {}",
+            tree.root_node().to_sexp()
+        );
+
+        // Plain labels keep parsing without a marker.
+        let plain = parse("users(*), age > 30 : adults\nadults(*)").expect("plain CTE label");
+        assert!(!plain.root_node().has_error());
+        assert!(!cst_contains_kind(plain.root_node(), "effect_marker"));
+    }
+
+    /// Item 3 (EFFECT-ALGEBRA E1): a directive is reachable in conjunction
+    /// position — `staged(*) ~> count:(*) as n, n = 0, exit!(*)`.
+    #[test]
+    fn directive_parses_in_conjunction_position() {
+        let tree = parse("staged(*) ~> count:(*) as n, n = 0, exit!(*)")
+            .expect("directive after comma must parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "conjunction directive parsed with errors: {}",
+            tree.root_node().to_sexp()
+        );
+        assert!(cst_contains_kind(tree.root_node(), "pseudo_predicate_call"));
+
+        // Receipt-gated chain: two directives joined by comma.
+        let chain = parse("route!(*), mark_processed!(*)").expect("receipt chain must parse");
+        assert!(!chain.root_node().has_error());
+    }
+
+    /// REPORT-1.5 F2: `::`-qualified bare arguments inside pseudo-predicate
+    /// calls — `run_namespace!(lib::etl)(*)` (access form, through
+    /// inline_directive_table) and `run_namespace!(lib::etl)` (call form).
+    #[test]
+    fn namespace_qualified_arg_in_pseudo_predicate_call() {
+        let access = parse("run_namespace!(lib::etl)(*)").expect("F2 access form must parse");
+        assert!(!access.root_node().has_error());
+        assert!(
+            cst_contains_kind(access.root_node(), "inline_directive_table")
+                && cst_contains_kind(access.root_node(), "namespace_path"),
+            "F2 access form CST: {}",
+            access.root_node().to_sexp()
+        );
+
+        let call = parse("run_namespace!(lib::etl)").expect("F2 call form must parse");
+        assert!(!call.root_node().has_error());
+        assert!(cst_contains_kind(call.root_node(), "namespace_path"));
+    }
+
+    // ========================================================================
+    // Interior continuations for pseudo-predicate calls (task 3.1b).
+    // THE RULING (2026-07-11): a postfix operator extends the complete query
+    // to its left; per-arm scoping is spelled with INTERIORITY, and the glob
+    // is optional — `s!(+-)` is the total-ledger arm spelling
+    // (EFFECT-ALGEBRA §3, book/reference/dql/witness.md "Dictates").
+    // ========================================================================
+
+    /// Find the first node of `kind` and return its sexp, if any.
+    fn cst_find_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        children.into_iter().find_map(|c| cst_find_kind(c, kind))
+    }
+
+    /// 3.1b: pseudo-predicate access parens accept interior continuations —
+    /// the postfix witness family first (`+`, `\+`, `+-`). The continuation
+    /// lands in the call's `continuation` field, scoped to that relation.
+    #[test]
+    fn interior_witness_continuations_parse_in_pseudo_predicate_call() {
+        for (src, kind) in [
+            ("s!(+-)", "signed_witness_operator"),
+            ("s!(+)", "witness_operator"),
+            ("s!(\\+)", "witness_operator"),
+        ] {
+            let tree = parse(src).unwrap_or_else(|e| panic!("{src} must parse: {e}"));
+            assert!(
+                !tree.root_node().has_error(),
+                "{src} parsed with errors: {}",
+                tree.root_node().to_sexp()
+            );
+            let call = cst_find_kind(tree.root_node(), "pseudo_predicate_call")
+                .unwrap_or_else(|| panic!("{src}: no pseudo_predicate_call: {}", tree.root_node().to_sexp()));
+            let cont = call
+                .child_by_field_name("continuation")
+                .unwrap_or_else(|| panic!("{src}: no continuation field: {}", call.to_sexp()));
+            assert!(
+                cst_contains_kind(cont, kind),
+                "{src}: continuation must contain {kind}: {}",
+                cont.to_sexp()
+            );
+        }
+    }
+
+    /// 3.1b: the total-ledger tail spelling — every arm interior-witnessed,
+    /// six arms union-corresponding (TORTURE-TEST.dql [T]).
+    #[test]
+    fn interior_ledger_spelling_parses() {
+        let tree = parse("s!(+-) ; x!(+-) ; v!(+-) ; q!(+-) ; rm!(+-) ; k!(+-)")
+            .expect("interior total ledger must parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "interior ledger parsed with errors: {}",
+            tree.root_node().to_sexp()
+        );
+        let sexp = tree.root_node().to_sexp();
+        assert_eq!(
+            sexp.matches("(signed_witness_operator").count(),
+            6,
+            "expected six interior signed witnesses: {sexp}"
+        );
+        assert_eq!(
+            sexp.matches("(pseudo_predicate_call").count(),
+            6,
+            "expected six pseudo_predicate_calls: {sexp}"
+        );
+    }
+
+    /// 3.1b uniformity: directives are relations, so the fork zone's cheap
+    /// fuller interiority also parses — conjunction (`, cond`), pipe
+    /// (`|> (cols)`), and aggregation (`~> count:(*) as n`) continuations.
+    #[test]
+    fn interior_general_continuations_parse_in_pseudo_predicate_call() {
+        for src in [
+            "s!(, region = \"EU\")",
+            "s!(|> (a, b))",
+            "s!(~> count:(*) as n)",
+        ] {
+            let tree = parse(src).unwrap_or_else(|e| panic!("{src} must parse: {e}"));
+            assert!(
+                !tree.root_node().has_error(),
+                "{src} parsed with errors: {}",
+                tree.root_node().to_sexp()
+            );
+            let call = cst_find_kind(tree.root_node(), "pseudo_predicate_call")
+                .unwrap_or_else(|| panic!("{src}: no pseudo_predicate_call: {}", tree.root_node().to_sexp()));
+            assert!(
+                call.child_by_field_name("continuation").is_some(),
+                "{src}: continuation must be interior to the call: {}",
+                call.to_sexp()
+            );
+        }
+    }
+
+    /// 3.1b pins: literal/namespace argument call forms keep their exact CST
+    /// shapes (byte-identity across the grammar change verified by the
+    /// task's before/after sexp diff), the HO two-paren form stays
+    /// inline_directive_table, and `s!(*)` takes the UNIFORM functor-paren
+    /// shape: a qualify CONTINUATION, exactly like `users(*)` — the builder
+    /// collapses it back to the glob-argument AST (pinned by
+    /// `glob_pseudo_predicate_call_builds_as_glob_argument`).
+    #[test]
+    fn pseudo_predicate_argument_forms_are_unchanged_by_interiority() {
+        // Glob form: `s!(*)` — under functor-paren uniformity the `*` is the
+        // qualify continuation (same CST shape as `users(*)`).
+        let glob = parse("s!(*)").expect("glob call must parse");
+        assert!(!glob.root_node().has_error());
+        let call = cst_find_kind(glob.root_node(), "pseudo_predicate_call").unwrap();
+        let cont = call
+            .child_by_field_name("continuation")
+            .expect("s!(*): expected the uniform qualify-continuation shape");
+        assert!(
+            cst_contains_kind(cont, "qualify_operator"),
+            "s!(*): continuation must be the qualify operator: {}",
+            call.to_sexp()
+        );
+
+        // Literal arguments: mount!("nba.db", "nba").
+        let lit = parse("mount!(\"nba.db\", \"nba\")").expect("literal-arg call must parse");
+        assert!(!lit.root_node().has_error());
+        let call = cst_find_kind(lit.root_node(), "pseudo_predicate_call").unwrap();
+        assert!(call.child_by_field_name("arguments").is_some());
+
+        // Namespace argument: run_namespace!(lib::etl).
+        let ns = parse("run_namespace!(lib::etl)").expect("namespace-arg call must parse");
+        assert!(!ns.root_node().has_error());
+        let call = cst_find_kind(ns.root_node(), "pseudo_predicate_call").unwrap();
+        assert!(
+            call.child_by_field_name("arguments").is_some()
+                && cst_contains_kind(call, "namespace_path"),
+            "run_namespace!(lib::etl) must keep its namespace_path argument: {}",
+            call.to_sexp()
+        );
+
+        // HO two-paren form: quarantine!(Bad(*))(*) stays inline_directive_table.
+        let ho = parse("quarantine!(Bad(*))(*)").expect("HO form must parse");
+        assert!(!ho.root_node().has_error());
+        assert!(
+            cst_contains_kind(ho.root_node(), "inline_directive_table"),
+            "quarantine!(Bad(*))(*) must stay the two-paren inline_directive_table: {}",
+            ho.root_node().to_sexp()
+        );
+    }
+
+    /// Item 1 (EFFECT-ALGEBRA §1, R5): effect-rule heads in the definition
+    /// grammar — glob head `route!(*) :- …` (multi-clause), HO head
+    /// `quarantine!(Bad(*))(*) :- …`, and a liminal directive line above them.
+    /// parse_ddl-level only; extraction/registration is task 2.2.
+    #[test]
+    fn effect_rule_heads_parse_in_rules_grammar() {
+        let source = r#"doc!("main", "pin")
+
+recent(*) :- orders(*), amount > 0
+
+quarantine!(Bad(*))(*) :-
+    Bad(*) |> insert!(quarantine_t(*))(*)
+
+route!(*) :- recent(*), region = "EU" |> insert!(eu_orders(*))(*)
+route!(*) :- recent(*), region = "US" |> insert!(us_orders(*))(*)
+
+main!(*) :-
+    recent(*) |> temp_table!(staged) : s!
+    s!(*) +- |> stdout!(*)
+"#;
+        let tree = parse_ddl(source).expect("effect-rule file must parse at CST level");
+        assert!(
+            !tree.root_node().has_error(),
+            "effect-rule file parsed with errors: {}",
+            tree.root_node().to_sexp()
+        );
+        let sexp = tree.root_node().to_sexp();
+        let clause_count = sexp.matches("(effect_rule_definition").count();
+        assert_eq!(
+            clause_count, 4,
+            "expected 4 effect-rule clauses (quarantine!, route! x2, main!): {sexp}"
+        );
+        assert!(
+            sexp.contains("(liminal_directive"),
+            "top-level doc! must parse as liminal_directive: {sexp}"
+        );
+        assert!(
+            sexp.contains("(view_definition"),
+            "plain view definition must still parse alongside effect rules: {sexp}"
+        );
+    }
+
+    /// IMPLEMENTATION-PLAN §3.0 (ruled 2026-07-11): the `:=` neck is stricken
+    /// for effect rules — `name!(*) := body` must refuse AT THE GRAMMAR
+    /// (effect_rule_definition takes `:-` only; hard removal, no curated
+    /// message). The `:-` neck keeps parsing, and `:=` stays valid for the
+    /// necks that legitimately own it (table definitions).
+    #[test]
+    fn effect_rule_walrus_neck_refuses_at_grammar() {
+        let walrus = parse_ddl("stage!(*) := customers(*) |> insert!(orders_eu(*))(*)");
+        match walrus {
+            Ok(tree) => panic!(
+                "effect rule with `:=` neck must be a parse error (§3.0 strike): {}",
+                tree.root_node().to_sexp()
+            ),
+            Err(e) => assert!(
+                e.to_string().contains("DDL parse error"),
+                "`:=` neck must die as a plain parse refusal, got: {e}"
+            ),
+        }
+
+        let session = parse_ddl("stage!(*) :- customers(*) |> insert!(orders_eu(*))(*)")
+            .expect("`:-`-necked effect rule must parse");
+        assert!(
+            !session.root_node().has_error(),
+            "`:-`-necked effect rule must keep parsing: {}",
+            session.root_node().to_sexp()
+        );
+        assert!(cst_contains_kind(session.root_node(), "effect_rule_definition"));
     }
 }

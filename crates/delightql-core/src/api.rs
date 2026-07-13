@@ -30,6 +30,16 @@ pub trait DqlHandle: Send {
     /// Create a session for query execution.
     fn session(&mut self) -> Result<Box<dyn DqlSession + '_>, String>;
 
+    /// Create a session with side-channel hooks installed (Epic 3.3):
+    /// mid-run `stdout!` result sets deliver through `hooks.on_ship` as
+    /// they execute (the run's return value never passes through it).
+    /// The CLI wires a console sink here; hosts that don't care call
+    /// `session()`.
+    fn session_with_hooks(
+        &mut self,
+        hooks: SessionHooks,
+    ) -> Result<Box<dyn DqlSession + '_>, String>;
+
     /// Create a relay for raw protocol handling (server use).
     fn create_relay(&mut self) -> Result<Box<dyn ServerRelay + '_>, String>;
 
@@ -62,6 +72,21 @@ pub trait DqlSession {
 pub trait ServerRelay: Handler {
     /// Close all open handles and reinitialize the system.
     fn handle_reset(&mut self) -> Result<(), String>;
+}
+
+// --- Session hooks (the Epic-3.3 side channel, plain data across the boundary) ---
+
+/// Hooks a host installs on a session (`DqlHandle::session_with_hooks`).
+/// Deliberately a struct of plain callbacks — not a re-export of the
+/// relay's internal hook type — per this module's boundary doctrine.
+#[derive(Default)]
+pub struct SessionHooks {
+    /// Called for each NON-FINAL shipped result set (`stdout!`), in
+    /// execution order, as it executes. Args: (columns, rows). The FINAL
+    /// shipped set is the run's one wire response and never passes
+    /// through here (Epic-3 protocol ruling). Unset = executed and
+    /// discarded.
+    pub on_ship: Option<Box<dyn FnMut(&[String], &[Vec<String>])>>,
 }
 
 // --- Return structs (not protocol types) ---

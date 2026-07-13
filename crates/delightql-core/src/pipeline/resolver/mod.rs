@@ -12,6 +12,38 @@ pub use pattern_resolver::{JoinContext, PatternResolver};
 
 mod string_templates;
 
+/// Epic 3.0b probe tests: plan-note schema injection via the query-local
+/// registry (test code only — see the module header for the guarantee).
+#[cfg(test)]
+mod plan_note_injection_tests;
+
+/// SQL-shape pins for argumentative semi/anti-join correlation
+/// (bugs/correlated-semijoin-lost-correlation): the `+rel(col)` guard must
+/// compare the OUTER column to the fact column, never `_fact` to itself.
+#[cfg(test)]
+mod semijoin_correlation_tests;
+
+/// Classification pins for bare guards on enlisted tables / consulted rules
+/// (bugs/enlisted-guard-predicate-rewrite, the torture--99 blocker): a
+/// guard functor resolvable through enlistment or the Some(ns) resolution
+/// scope must classify as table-as-sigma, never fall to PredicateRewrite.
+#[cfg(test)]
+mod enlisted_guard_classification_tests;
+
+/// Scope pins for sigma-predicate rule guards
+/// (bugs/sigma-rule-guard-under-consulted-scope, IMPLEMENTATION-PLAN §4.2):
+/// a sigma rule visible in the Some(ns) consulted scope must expand to its
+/// boolean body — scope first, enlisted-into-main as fallback.
+#[cfg(test)]
+mod sigma_guard_scope_tests;
+
+/// F2 shadowing pins (COMMENTS-ON-EFFECT-IMPLEMENTATION.md RULINGS item 2,
+/// materialize-pipe §6): temp shadows main for UNQUALIFIED names only;
+/// qualified reads reach the physical entity; the shadow is a resolution
+/// preference, never a catalog delete.
+#[cfg(test)]
+mod session_shadow_tests;
+
 /// Per-resolution alias counter. Shared across clones so that all
 /// resolution phases within a single query use the same sequence.
 #[derive(Debug, Clone)]
@@ -339,6 +371,7 @@ fn resolve_cte_bindings(
                 .into_iter()
                 .next()
                 .expect("Group has len==1, must have element - invariant");
+            let effect_label = cte.effect_label;
             let (resolved_expr, pipe_cfes) = resolver.resolve_cte_expression(cte.expression)?;
             all_pipe_cfes.extend(pipe_cfes);
             let mut cte_schema = extract_cpr_schema(&resolved_expr)?;
@@ -348,6 +381,7 @@ fn resolve_cte_bindings(
             resolved_ctes.push(ast_resolved::CteBinding {
                 expression: resolved_expr,
                 name: name.clone(),
+                effect_label,
                 is_recursive: ast_resolved::PhaseBox::phantom(),
             });
         } else {
@@ -405,6 +439,7 @@ fn resolve_cte_bindings(
             resolved_ctes.push(ast_resolved::CteBinding {
                 expression: union_expr,
                 name: name.clone(),
+                effect_label: group.iter().any(|c| c.effect_label),
                 is_recursive: ast_resolved::PhaseBox::phantom(),
             });
         }
@@ -621,6 +656,24 @@ pub fn resolve_query(
         query: resolved_query,
         connection_id,
     })
+}
+
+/// Output column names of a resolved query, for callers outside the
+/// resolver (the effect transformer builds plan notes and witness-union
+/// alignment from them — IMPLEMENTATION-PLAN §3.1). Thin wrapper over the
+/// resolver-internal `extract_cpr_schema_from_query`. `None` when the
+/// schema did not resolve to named columns.
+pub(crate) fn resolved_output_columns(query: &ast_resolved::Query) -> Option<Vec<String>> {
+    let schema = extract_cpr_schema_from_query(query).ok()?;
+    match schema {
+        ast_resolved::CprSchema::Resolved(cols) => {
+            Some(cols.iter().map(|c| c.name().to_string()).collect())
+        }
+        ast_resolved::CprSchema::Unresolved(cols) => {
+            Some(cols.iter().map(|c| c.name().to_string()).collect())
+        }
+        ast_resolved::CprSchema::Failed { .. } | ast_resolved::CprSchema::Unknown => None,
+    }
 }
 
 /// Resolve a Query using an existing registry context.
@@ -2410,6 +2463,8 @@ fn classify_single_dml_op(op: &ast_unresolved::UnaryRelationalOperator) -> DmlPi
         | ast_unresolved::UnaryRelationalOperator::InteriorDrillDown { .. }
         | ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { .. }
         | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. }
+        | ast_unresolved::UnaryRelationalOperator::SignedWitness
+        | ast_unresolved::UnaryRelationalOperator::DirectivePipeInvocation { .. }
         | ast_unresolved::UnaryRelationalOperator::DmlTerminal { .. } => DmlPipeKind::General,
     }
 }

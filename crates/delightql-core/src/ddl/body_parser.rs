@@ -755,6 +755,8 @@ fn remap_operator_qualifiers(
         }
         UnaryRelationalOperator::HoViewApplication { .. }
         | UnaryRelationalOperator::DirectiveTerminal { .. }
+        | UnaryRelationalOperator::SignedWitness
+        | UnaryRelationalOperator::DirectivePipeInvocation { .. }
         | UnaryRelationalOperator::MetaIze { .. }
         | UnaryRelationalOperator::Witness { .. }
         | UnaryRelationalOperator::Qualify

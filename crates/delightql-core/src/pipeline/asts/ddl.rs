@@ -112,6 +112,15 @@ pub enum DdlHead {
     },
     /// Sigma predicate: `name(params)` — boolean-valued, used with +/\+ prefix
     SigmaPredicate { params: Vec<String> },
+    /// Effect rule: `name!(*)` or `name!(ho_params)(output)` — a user
+    /// directive definition (EFFECT-ALGEBRA §1). Parameters use the HO
+    /// machinery; the stored `DdlDefinition.name` carries the `!` suffix
+    /// (matching the pseudo-predicate naming convention, `consult!` etc.).
+    EffectRule {
+        params: Vec<HoParam>,
+        /// Output head of the HO form (`None` = glob `(*)`).
+        output_head: Option<Vec<ViewHeadItem>>,
+    },
     /// Fact: `name(values)` — inline data literal, no parameters
     Fact,
     /// ER-context rule: `left&right(*) within context :- body`
@@ -213,6 +222,7 @@ impl DdlHead {
         match self {
             DdlHead::Function { params, .. } => params.len(),
             DdlHead::HoView { params, .. } => params.len(),
+            DdlHead::EffectRule { params, .. } => params.len(),
             DdlHead::SigmaPredicate { params } => params.len(),
             DdlHead::View
             | DdlHead::ArgumentativeView { .. }
@@ -224,6 +234,16 @@ impl DdlHead {
     pub fn param_names(&self) -> Vec<&str> {
         match self {
             DdlHead::Function { params, .. } => params.iter().map(|p| p.name.as_str()).collect(),
+            DdlHead::EffectRule { params, .. } => params
+                .iter()
+                .filter_map(|p| {
+                    if matches!(p.kind, HoParamKind::GroundScalar(_)) {
+                        None
+                    } else {
+                        Some(p.name.as_str())
+                    }
+                })
+                .collect(),
             DdlHead::HoView { params, .. } => params
                 .iter()
                 .filter_map(|p| {
@@ -246,6 +266,16 @@ impl DdlHead {
     pub fn ho_param_names(&self) -> Vec<&str> {
         match self {
             DdlHead::HoView { params, .. } => params
+                .iter()
+                .filter_map(|p| {
+                    if matches!(p.kind, HoParamKind::GroundScalar(_)) {
+                        None
+                    } else {
+                        Some(p.name.as_str())
+                    }
+                })
+                .collect(),
+            DdlHead::EffectRule { params, .. } => params
                 .iter()
                 .filter_map(|p| {
                     if matches!(p.kind, HoParamKind::GroundScalar(_)) {
@@ -285,6 +315,9 @@ impl DdlHead {
             DdlHead::SigmaPredicate { .. } => 9,
             DdlHead::Fact => 16,
             DdlHead::ErRule { .. } => 17,
+            // 20 = DqlEffectRule (enums.rs) — effect rules are a new entity
+            // type (IMPLEMENTATION-PLAN §2.2 "entity registration").
+            DdlHead::EffectRule { .. } => 20,
         }
     }
 }

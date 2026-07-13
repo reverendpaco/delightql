@@ -20,6 +20,19 @@ module.exports = grammar(dqlGrammar, {
   conflicts: ($, previous) => previous.concat([
     // DDL definition rules create new ambiguities with inherited DQL rules
 
+    // Effect-rule heads (EFFECT-ALGEBRA §1): name!(*) — the * after name!( could
+    // be the effect head's glob or a glob argument of a pseudo_predicate_call
+    // (liminal directive / query expression). GLR forks; the token after ')'
+    // resolves (neck ':-' => effect rule, anything else => call).
+    [$.glob, $.effect_rule_definition],
+
+    // 3.1b interiority: pseudo_predicate_call parens now also accept a
+    // relational_continuation, so `name!( * • )` forks three ways — effect
+    // head glob (`name!(*) :-`), glob ARGUMENT (call form), or qualify
+    // continuation. GLR forks; the token after ')' resolves (':-' => effect
+    // rule) and the arguments branch's prec(2) keeps `s!(*)` an argument.
+    [$.qualify_operator, $.glob, $.effect_rule_definition],
+
     // HO view: name(params)(*) conflicts with column_spec_item and tvf_argument
     [$.ho_view_definition, $.column_spec_item, $.tvf_argument],
 
@@ -164,11 +177,20 @@ module.exports = grammar(dqlGrammar, {
     // The Rust extraction code (extract_ddl_file) iterates root.children()
     // matching on "definition", "function_definition", "query_statement", etc.
     // — all preserved by this rule.
-    source_file: $ => repeat1(choice($.definition, $.query_statement, $.ddl_annotation)),
+    source_file: $ => repeat1(choice($.definition, $.query_statement, $.ddl_annotation, $.liminal_directive)),
+
+    // Liminal directive: a bare session-directive call at the top of the file
+    // (EFFECT-ALGEBRA §8). The consult pipeline strips these lines textually
+    // (extract_embedded_directives) before this grammar ever sees them, so this
+    // rule exists so that raw .dql files (e.g. TORTURE-TEST.dql) parse without
+    // ERROR nodes under the tree-sitter CLI. Reuses the inherited DQL
+    // pseudo_predicate_call shape: name!(args).
+    liminal_directive: $ => $.pseudo_predicate_call,
 
     // === DDL-specific rules (the only reason this grammar exists) ===
 
     definition: $ => choice(
+      $.effect_rule_definition, // name!(*) :- body — the ! disambiguates; first for priority
       $.function_definition,
       $.constant_definition,  // nl :- char:(10) — zero-arity function without parens
       $.named_case_definition, // name(in -> out ---- arms) — before fact; the `->` head disambiguates
@@ -326,6 +348,46 @@ module.exports = grammar(dqlGrammar, {
       optional(field('doc', $.annotation_body)),
       field('body', $.domain_expression),
     ),
+
+    // Effect-rule definition (EFFECT-ALGEBRA §1): a rule defining a user
+    // directive. The head name carries a `!` (token.immediate — no space).
+    // Forms:
+    //   glob head:  do_something!(*) :- body      (route!, main!, ...)
+    //   HO head:    quarantine!(Bad(*))(*) :- body (params via HO machinery, §1/F4)
+    // Multi-clause rules (R5) are simply repeated effect_rule_definitions with
+    // the same head name; the grammar does not group clauses.
+    // prec.dynamic(2) so that when a GLR fork survives against a top-level
+    // liminal_directive reading (`name!(*)` is also a valid pseudo-predicate
+    // call until the neck token appears), the definition reading wins.
+    // NECK: `:-` ONLY — the shared definition_neck's `:=` is STRICKEN for
+    // effect rules (IMPLEMENTATION-PLAN §3.0, ruled 2026-07-11): a directive
+    // rule is a session definition, never a temporary table. Hard removal,
+    // no curated message — `name!(*) := body` is a plain parse error. Pinned
+    // by effect_rule_walrus_neck_refuses_at_grammar (parser/mod.rs) and
+    // effects-ball rules--46_walrus_neck_refused.
+    effect_rule_definition: $ => prec.dynamic(2, seq(
+      field('name', $.identifier),
+      token.immediate('!'),
+      choice(
+        // Glob head: name!(*)
+        seq('(', '*', ')'),
+        // HO head: name!(ho_params)(* | output items)
+        seq(
+          '(',
+          field('ho_params', sep1($._comma, $.ho_param)),
+          ')',
+          '(',
+          choice(
+            '*',
+            field('output_head', sep1($._comma, $.view_head_item)),
+          ),
+          ')',
+        ),
+      ),
+      field('neck', alias(token(':-'), $.session_neck)),
+      optional(field('doc', $.annotation_body)),
+      field('body', $.query),
+    )),
 
     // View definition: name(*) neck [docs] query
     view_definition: $ => seq(

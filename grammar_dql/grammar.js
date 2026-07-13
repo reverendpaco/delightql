@@ -89,6 +89,11 @@ module.exports = grammar({
     // argument) or tvf_argument (inline_directive_table's ho_argument_list value).
     // GLR forks; the token after ')' (another '(' => inline, else directive) disambiguates.
     [$.glob, $.tvf_argument],
+    // Bare ::-qualified directive arg (REPORT-1.5 F2): name!(lib::etl) — the
+    // namespace_path could be a pseudo_predicate_call argument (one-paren call)
+    // or a tvf_argument (inline_directive_table's first parens). GLR forks;
+    // the token after ')' (another '(' => inline table, else call) disambiguates.
+    [$.tvf_argument, $.pseudo_predicate_argument_list],
     // Catalog functor: identifier could start catalog_functor (main::) or table_access (main. or main/) or CTE
     [$.catalog_functor, $.table_access],
     [$.catalog_functor, $.table_access, $.cte_definition],
@@ -164,10 +169,16 @@ module.exports = grammar({
     
     // CTE inline-style: expression : name
     // Example: users(*), age > 30 : adults
+    // Effect-CTE label (EFFECT-ALGEBRA R4): expression : name!
+    // The '!' marks a CTE whose expression demands a directive. It must
+    // follow the label identifier immediately (token.immediate) — the
+    // ':'+identifier decision point resolves one token after the identifier
+    // (no valid continuation begins with a bare '!', so LR needs no fork).
     cte_inline: $ => prec.dynamic(1, seq(
       $.relational_expression,
       ':',
-      field('name', $.identifier)
+      field('name', $.identifier),
+      optional(field('effect_marker', alias(token.immediate('!'), $.effect_marker)))
     )),
 
     // CTE definition-style: name(columns): expression
@@ -495,6 +506,8 @@ module.exports = grammar({
     continuation_base: $ => choice(
       $.ordering,                 // ORDER BY: #(...) - must come before limit_offset
       $.limit_offset,             // Check limit/offset (starts with #)
+      $.inline_directive_table,   // EFFECT-ALGEBRA E1: two-paren directive access in conjunction: a!(x)(*)
+      $.pseudo_predicate_call,    // EFFECT-ALGEBRA E1: directive in conjunction: staged(*), n = 0, exit!(*)
       $.table_access,             // Check tables (have specific syntax, passthrough via / separator)
       $.tvf_call,                 // TVFs can appear after comma
       $.anonymous_table,          // Anonymous tables start with _
@@ -509,6 +522,7 @@ module.exports = grammar({
       seq($.aggregate_pipe_operator, $.aggregate_function, optional($.relational_continuation)),  // Allow continuation for CPR
       seq($.materialize_pipe_operator, optional($.relational_continuation)),
       prec.right(1, seq($.meta_ize_operator, optional($.relational_continuation))),  // ^ or ^^ for schema reification
+      prec.right(1, seq($.signed_witness_operator, optional($.relational_continuation))),  // +- signed witness (must precede witness_operator: one token, not + then -)
       prec.right(1, seq($.witness_operator, optional($.relational_continuation))),  // + or \+ for existence witness (postfix/functor)
       prec.right(1, seq($.qualify_operator, optional($.relational_continuation))),  // * for qualification (no pipe needed)
       prec.right(1, seq($.using_operator, optional($.relational_continuation))),    // .(cols) for USING semantics
@@ -524,6 +538,16 @@ module.exports = grammar({
     // + returns ExistsWitness, \+ returns DoesNotExistWitness
     // Reuses exists_marker tokens (+ and \+) in postfix/functor position
     witness_operator: $ => $.exists_marker,
+
+    // Signed witness (EFFECT-ALGEBRA §3, book/reference/dql/witness.md):
+    // postfix +- keeps the relation's schema and adds met = 1/0 — a total-
+    // ledger arm contributes a full-schema row fired or not. ONE token: in
+    // the relational-postfix slot, adjacent `+-` lexes as signed witness
+    // (longest match beats witness `+`); the spaced form `+ -` remains
+    // witness-then-minus-corresponding. Scalar `a + -b` / `a +-1` are
+    // unaffected: the token is only valid in this postfix parse state,
+    // never in domain-expression states (contextual lexing).
+    signed_witness_operator: $ => token('+-'),
 
     // Qualify: marks columns as qualified (table-prefixed)
     // Unqualified names from () unify; qualified names from * don't
@@ -1700,6 +1724,7 @@ module.exports = grammar({
       $.string_literal,
       $.number_literal,          // Numeric arguments (e.g., HO view: above_balance(1000)(*))
       $.table_access,            // Functor args: users(*), ns.table(*)
+      $.namespace_path,          // Bare namespace args: run_namespace!(lib::etl)(*) (REPORT-1.5 F2)
       $.identifier,              // Scalar args: bare name, literal value
       $.qualified_column,        // Support table.column references
       $.column_ordinal,          // Ordinal addressing: |1|, |-1|, T|2|
@@ -1732,19 +1757,34 @@ module.exports = grammar({
     //   engage!("std::string") as str
     // Strategy: Use seq with token.immediate to ensure ! follows identifier without space
     // The prec.dynamic gives it priority when there's ambiguity with table_access
+    // INTERIORITY (task 3.1b, THE RULING 2026-07-11): the access parens also
+    // accept a relational_continuation, exactly like table_access — a
+    // continuation inside the parens scopes to this relation (`s!(+-)` is the
+    // per-arm total-ledger spelling; `s!(*) +- ` written OUTSIDE extends the
+    // whole query to its left). The arguments branch carries prec.dynamic(1)
+    // so at the `*` fork (glob argument vs qualify continuation) GLR keeps
+    // `s!(*)` a glob ARGUMENT — the pre-change CST, byte-identical. Pinned by
+    // parser tests `interior_witness_continuations_parse_in_pseudo_predicate_call`
+    // and `pseudo_predicate_argument_forms_are_unchanged_by_interiority`.
     pseudo_predicate_call: $ => prec.dynamic(10, seq(
       field('name', $.identifier),
       token.immediate('!'),  // ! must follow immediately (no whitespace)
       '(',
-      optional(field('arguments', $.pseudo_predicate_argument_list)),
+      optional(choice(
+        prec.dynamic(1, field('arguments', $.pseudo_predicate_argument_list)),
+        field('continuation', $.relational_continuation)
+      )),
       ')',
       optional($.table_alias)
     )),
 
     // Argument list for pseudo-predicates
+    // namespace_path alternative: bare ::-qualified args like
+    // run_namespace!(lib::etl) (REPORT-1.5 F2). domain_expression cannot
+    // reach namespace_path (lvar stops at identifier/qualified_column).
     pseudo_predicate_argument_list: $ => seq(
-      $.domain_expression,
-      repeat(seq(',', $.domain_expression))
+      choice($.domain_expression, $.namespace_path),
+      repeat(seq(',', choice($.domain_expression, $.namespace_path)))
     ),
 
     anonymous_table_separator: $ => choice('@', /---+/),  // @ or multiple dashes

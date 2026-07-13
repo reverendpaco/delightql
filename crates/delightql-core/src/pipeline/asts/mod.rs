@@ -10,6 +10,7 @@
 pub mod addressed;
 pub mod core; // Public - needed for SQL AST provenance
 pub mod ddl;
+pub mod effects;
 pub mod refined;
 pub mod resolved;
 pub mod unresolved;

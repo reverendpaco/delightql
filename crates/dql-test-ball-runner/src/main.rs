@@ -1095,6 +1095,16 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                                     .map_err(|e| format!("create init db: {}", e))?;
                                 init_conn.execute_batch(sql)
                                     .map_err(|e| format!("init sql {}: {}", init_name, e))?;
+                                // bugs/nullmount Phase 1: mount! is now
+                                // attach-only and rejects empty/headerless
+                                // files. A schema-less init (e.g. a
+                                // comment-only main.sql, as the companion
+                                // imprint/define tests use) leaves a 0-byte
+                                // db; force the SQLite header page out so the
+                                // worker's mount! succeeds. Pinned by the
+                                // companion ball.
+                                init_conn.execute_batch("PRAGMA user_version = 0;")
+                                    .map_err(|e| format!("init header {}: {}", init_name, e))?;
                             }
                             if inits.len() == 1 {
                                 mount_db = format!("{}.sqlite", inits[0].0);

@@ -158,10 +158,55 @@ impl<'a> DatabaseRegistry<'a> {
         }
     }
 
+    /// Namespace lookup for an UNQUALIFIED reference (the resolver reached
+    /// this namespace by searching, not because the user spelled it). When
+    /// a session-materialized temp shadows a same-name physical entity,
+    /// this path answers the TEMP (bare spelling; the engine's temp-first
+    /// resolution and `BootstrapBackedSchema`'s session-first preference
+    /// agree) — materialize-pipe §6's ruled shadowing.
     pub fn lookup_table_with_namespace(
         &self,
         namespace_path: &NamespacePath,
         table_name: &str,
+    ) -> crate::error::Result<
+        Option<(
+            CprSchema,
+            i64,
+            delightql_types::SqlIdentifier,
+            Option<String>,
+        )>,
+    > {
+        self.lookup_table_with_namespace_impl(namespace_path, table_name, false)
+    }
+
+    /// Namespace lookup for a QUALIFIED reference (`main.staged(*)`) — the
+    /// user spelled the namespace, so a session-materialized shadow must
+    /// NOT win: materialize-pipe §6 scopes the temp shadow to unqualified
+    /// names only. On a shadow collision this returns the competitor
+    /// (physical) entity's columns with an explicit backend schema, so the
+    /// generated SQL spells `main.<table>` and bypasses the engine's own
+    /// temp-first resolution. Pinned by session_shadow_tests::
+    /// qualified_read_reaches_physical_after_same_name_temp.
+    pub fn lookup_table_with_namespace_qualified(
+        &self,
+        namespace_path: &NamespacePath,
+        table_name: &str,
+    ) -> crate::error::Result<
+        Option<(
+            CprSchema,
+            i64,
+            delightql_types::SqlIdentifier,
+            Option<String>,
+        )>,
+    > {
+        self.lookup_table_with_namespace_impl(namespace_path, table_name, true)
+    }
+
+    fn lookup_table_with_namespace_impl(
+        &self,
+        namespace_path: &NamespacePath,
+        table_name: &str,
+        qualified: bool,
     ) -> crate::error::Result<
         Option<(
             CprSchema,
@@ -218,6 +263,64 @@ impl<'a> DatabaseRegistry<'a> {
             "lookup_table_with_namespace: connection_id={:?}, backend_schema={:?}, table={}",
             connection_id, backend_schema_opt, table_name
         );
+
+        // F2 shadow punch-through, QUALIFIED references only (materialize-pipe
+        // §6, RULED 2026-07-11: temp shadows main for unqualified names; a
+        // qualified read must reach the physical entity). When a
+        // session-materialized entity and a competitor share this name in the
+        // namespace, answer the COMPETITOR's registered columns with an
+        // explicit backend schema — the ATTACH alias where the namespace's
+        // physical tables live (PRAGMA database_list recovery, the
+        // imprint_namespace precedent) — so the generated SQL spells
+        // `<alias>.<table>`, bypassing the engine's temp-first resolution.
+        // `session_shadow_split` is gated on the session having materialized
+        // anything, so plain sessions never reach bootstrap here. Pinned by
+        // session_shadow_tests::qualified_read_reaches_physical_after_same_name_temp;
+        // the bare counterpart (no punch-through) by
+        // session_shadow_tests::bare_read_prefers_session_materialized_temp.
+        if qualified && backend_schema_opt.is_none() && connection_id != Some(1) {
+            if let Some(system) = self.system {
+                let fq: String = namespace_path
+                    .items()
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                if let Some((_session_id, competitor_id)) =
+                    system.session_shadow_split(&fq, table_name)?
+                {
+                    let physical_alias = system
+                        .physical_schema_alias_for_namespace(&fq, connection_id.unwrap_or(2))?;
+                    if let Some(alias) = physical_alias {
+                        let cols = system.output_columns_for_entity(competitor_id)?;
+                        if !cols.is_empty() {
+                            let column_metadata = cols
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, col)| {
+                                    ColumnMetadata::new(
+                                        ColumnProvenance::from_table_column(
+                                            col.name.clone(),
+                                            TableName::Named(canonical_name.clone()),
+                                            crate::pipeline::asts::core::QualificationSource::None,
+                                        ),
+                                        TableName::Named(canonical_name.clone()),
+                                        Some(idx + 1),
+                                    )
+                                    .with_declared_type(col.declared_type.clone())
+                                })
+                                .collect();
+                            return Ok(Some((
+                                CprSchema::Resolved(column_metadata),
+                                connection_id.unwrap_or(2),
+                                canonical_name.clone(),
+                                Some(alias),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
 
         // Curated safe-subset guard: for bootstrap system tables (connection_id
         // == 1), star-expansion below reads the raw physical schema via PRAGMA.
@@ -1341,6 +1444,144 @@ impl ConsultRegistry {
     pub fn lookup_enlisted_sigma(
         &self,
         _name: &str,
+    ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
+        Ok(None)
+    }
+
+    /// Look up a consulted sigma predicate (entity_type = 9) by unqualified
+    /// name within a CONSULTED SCOPE: the namespace itself, namespaces
+    /// enlisted into it, and their transitive exposures — the same reachable
+    /// set the relation path uses for unqualified entities
+    /// (`DelightQLSystem::resolve_unqualified_entity`). Companion to
+    /// `lookup_enlisted_sigma` (which sees only namespaces enlisted into
+    /// MAIN and therefore missed a same-file sigma rule while its own
+    /// file's body compiled under `resolution_namespace = Some(ns)`).
+    /// Pinned by sigma_guard_scope_tests
+    /// (bugs/sigma-rule-guard-under-consulted-scope).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn lookup_sigma_in_scope(
+        &self,
+        name: &str,
+        namespace_fq: &str,
+    ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
+        let Some(system) = self.system else {
+            return Ok(None);
+        };
+        let system_ref = unsafe { &*system };
+
+        let bootstrap = system_ref.get_bootstrap_connection();
+        let conn = bootstrap.lock().map_err(|e| {
+            DelightQLError::database_error(
+                "Failed to acquire bootstrap lock for scoped sigma lookup",
+                format!("{}", e),
+            )
+        })?;
+
+        let mut stmt = conn
+            .prepare(
+                "WITH RECURSIVE direct(ns_id) AS (
+                    SELECT scope_ns.id
+                    FROM namespace scope_ns
+                    WHERE scope_ns.fq_name = ?3
+                    UNION
+                    SELECT en.from_namespace_id
+                    FROM enlisted_namespace en
+                    JOIN namespace scope_ns ON scope_ns.id = en.to_namespace_id
+                       AND scope_ns.fq_name = ?3
+                 ),
+                 reachable(ns_id) AS (
+                    SELECT ns_id FROM direct
+                    UNION
+                    SELECT exp.exposed_namespace_id
+                    FROM exposed_namespace exp
+                    JOIN reachable r ON r.ns_id = exp.exposing_namespace_id
+                 )
+                 SELECT e.id, e.name, e.type,
+                        (SELECT GROUP_CONCAT(ec.definition, char(10))
+                         FROM (SELECT definition FROM entity_clause WHERE entity_id = e.id ORDER BY ordinal) ec
+                        ) as definition,
+                        n.fq_name
+                 FROM entity e
+                 JOIN activated_entity ae ON ae.entity_id = e.id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 JOIN reachable r ON r.ns_id = n.id
+                 WHERE e.name = ?1 COLLATE NOCASE AND e.type = ?2",
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to prepare scoped sigma lookup",
+                    e.to_string(),
+                )
+            })?;
+
+        let rows: Vec<(i32, String, i32, Option<String>, String)> = stmt
+            .query_map(
+                rusqlite::params![
+                    name,
+                    EntityType::DqlTemporarySigmaRule.as_i32(),
+                    namespace_fq
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to query scoped sigma predicates",
+                    e.to_string(),
+                )
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        match rows.len() {
+            0 => Ok(None),
+            1 => {
+                let (entity_id, entity_name, entity_type, definition, namespace) =
+                    rows.into_iter().next().unwrap();
+                let definition = definition.unwrap_or_default();
+                let entity_type = EntityType::from_i32(entity_type).map_err(|e| {
+                    DelightQLError::database_error("corrupt catalog: unknown entity_type", e.to_string())
+                })?;
+                let params = Self::query_params(&conn, entity_id, entity_type);
+                Ok(Some(ConsultedEntity {
+                    name: entity_name.into(),
+                    entity_type,
+                    definition,
+                    params,
+                    positions: Vec::new(),
+                    namespace,
+                }))
+            }
+            _ => {
+                let namespaces: Vec<String> =
+                    rows.iter().map(|(_, _, _, _, ns)| ns.clone()).collect();
+                Err(DelightQLError::validation_error(
+                    format!(
+                        "Ambiguous unqualified sigma predicate '{}': found in multiple namespaces reachable from '{}' [{}]. \
+                         Use qualified syntax to disambiguate.",
+                        name,
+                        namespace_fq,
+                        namespaces.join(", "),
+                    ),
+                    "Ambiguous scoped sigma predicate",
+                ))
+            }
+        }
+    }
+
+    /// WASM stub
+    #[cfg(target_arch = "wasm32")]
+    pub fn lookup_sigma_in_scope(
+        &self,
+        _name: &str,
+        _namespace_fq: &str,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         Ok(None)
     }

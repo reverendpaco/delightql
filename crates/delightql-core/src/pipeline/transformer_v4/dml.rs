@@ -110,12 +110,6 @@ fn transform_dml_pipe(
             target_namespace,
             dml_schema.get(),
         ),
-        DmlKind::Keep => build_keep(
-            projected.to_sql()?,
-            target,
-            target_namespace,
-            dml_schema.get(),
-        ),
         DmlKind::Update => build_update(projected.to_sql()?, target, target_namespace),
     }
 }
@@ -149,24 +143,7 @@ fn build_delete(
     schema: &CprSchema,
 ) -> Result<SqlStatement> {
     let columns = columns_from_schema(schema);
-    let where_clause = build_exists_match(&target, &columns, source, false)?;
-    Ok(SqlStatement::Delete {
-        target_table: target,
-        target_namespace,
-        with_clause: None,
-        where_clause,
-    })
-}
-
-/// DELETE FROM target WHERE NOT EXISTS (SELECT 1 FROM (<source>) AS _keep WHERE ...)
-fn build_keep(
-    source: QueryExpression,
-    target: String,
-    target_namespace: Option<String>,
-    schema: &CprSchema,
-) -> Result<SqlStatement> {
-    let columns = columns_from_schema(schema);
-    let where_clause = build_exists_match(&target, &columns, source, true)?;
+    let where_clause = build_exists_match(&target, &columns, source)?;
     Ok(SqlStatement::Delete {
         target_table: target,
         target_namespace,
@@ -236,16 +213,15 @@ fn build_update(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build EXISTS / NOT EXISTS subquery matching rows between target and source.
+/// Build EXISTS subquery matching rows between target and source.
 ///
 /// Generates:
-///   [NOT] EXISTS (SELECT 1 FROM (<source>) AS _del
-///                 WHERE target.c1 IS NOT DISTINCT FROM _del.c1 AND ...)
+///   EXISTS (SELECT 1 FROM (<source>) AS _del
+///           WHERE target.c1 IS NOT DISTINCT FROM _del.c1 AND ...)
 fn build_exists_match(
     target_table: &str,
     columns: &[String],
     source_query: QueryExpression,
-    negate: bool,
 ) -> Result<Option<DomainExpression>> {
     if columns.is_empty() {
         return Ok(None);
@@ -286,13 +262,7 @@ fn build_exists_match(
 
     let inner_query = QueryExpression::Select(Box::new(inner_select));
 
-    let exists_expr = if negate {
-        DomainExpression::not_exists(inner_query)
-    } else {
-        DomainExpression::exists(inner_query)
-    };
-
-    Ok(Some(exists_expr))
+    Ok(Some(DomainExpression::exists(inner_query)))
 }
 
 /// Extract column names from a resolved CprSchema.

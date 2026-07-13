@@ -1046,7 +1046,8 @@ pub(super) fn expand_multi_clause_view(
                 all_ctes.push(ast_unresolved::CteBinding {
                     name: view_name.clone(),
                     expression: expr,
-                    is_recursive: ast_unresolved::PhaseBox::phantom(),
+                    effect_label: false,
+            is_recursive: ast_unresolved::PhaseBox::phantom(),
                 });
             }
             ast_unresolved::Query::WithCtes {
@@ -1061,7 +1062,8 @@ pub(super) fn expand_multi_clause_view(
                 all_ctes.push(ast_unresolved::CteBinding {
                     name: view_name.clone(),
                     expression: main_expr,
-                    is_recursive: ast_unresolved::PhaseBox::phantom(),
+                    effect_label: false,
+            is_recursive: ast_unresolved::PhaseBox::phantom(),
                 });
             }
             other => {
@@ -2316,7 +2318,8 @@ fn extract_clause_ctes(
             all_ctes.push(ast_unresolved::CteBinding {
                 name: function.to_string(),
                 expression: expr,
-                is_recursive: ast_unresolved::PhaseBox::phantom(),
+                effect_label: false,
+            is_recursive: ast_unresolved::PhaseBox::phantom(),
             });
         }
         ast_unresolved::Query::WithCtes {
@@ -2329,7 +2332,8 @@ fn extract_clause_ctes(
             all_ctes.push(ast_unresolved::CteBinding {
                 name: function.to_string(),
                 expression: main_expr,
-                is_recursive: ast_unresolved::PhaseBox::phantom(),
+                effect_label: false,
+            is_recursive: ast_unresolved::PhaseBox::phantom(),
             });
         }
         ast_unresolved::Query::WithCfes { cfes, query: inner } => {
@@ -2447,6 +2451,7 @@ pub(super) fn build_squished_relation(
         all_ctes.push(ast_unresolved::CteBinding {
             expression: source_expr,
             name: cte_name,
+            effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
         });
     }
@@ -2462,6 +2467,7 @@ pub(super) fn build_squished_relation(
         all_ctes.push(ast_unresolved::CteBinding {
             expression: patched_expr,
             name: cte_name.clone(),
+            effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
         });
     }
@@ -2473,6 +2479,7 @@ pub(super) fn build_squished_relation(
         all_ctes.push(ast_unresolved::CteBinding {
             expression: source_expr,
             name: cte_name,
+            effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
         });
         Some(name)

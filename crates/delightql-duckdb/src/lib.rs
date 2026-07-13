@@ -11,11 +11,20 @@
 //!   `--db file.duckdb` uses, so fatboy hashes equal in-proc hashes by
 //!   construction (no NULL-fidelity distinction either — exactly like
 //!   in-proc; the fingerprint conflates NULL and '' anyway).
-//! - **No server**: DuckDB is a file database. `connect` opens the file
-//!   fail-closed (`new_file_existing` — a DuckParty whose database
-//!   doesn't exist never exists). One party = one connection = the
-//!   file's single writer; per-relay-connection parties serialize on
-//!   DuckDB's own locking.
+//! - **No server**: DuckDB is a file database. `connect` is fail-closed
+//!   (a DuckParty whose database doesn't exist never exists) but LAZY:
+//!   the file is not opened until the first Query. dql spawns two
+//!   children per session on the same file (the idle spare from
+//!   make_connection plus the mount's worker — REPORT-T-P2 §C), and a
+//!   writable open takes DuckDB's exclusive lock (P3 §C: it excludes
+//!   ALL other opens, even read-only) — an eager open would deadlock
+//!   the pair. Lazy, only the party that actually speaks takes the
+//!   lock; pinned by `connect_does_not_take_the_file_lock`.
+//! - **Writable by default** (E-T3b, RULED 2026-07-11: DuckDB goes
+//!   writable; EFFECTS-ON-TARGETS-PLAN §1 finding 2). `connect_readonly`
+//!   preserves the old posture — concurrent read-only opens across
+//!   processes, every write refused by the engine; the binary's
+//!   `--readonly` flag reaches it (pinned by tests/readonly_flag.rs).
 //! - **Descriptors are empty** (v1): the backends executor abstracts
 //!   the statement away. Foreign descriptors were postgres's question
 //!   to answer; here they're a noted gap, not a goal.
@@ -26,6 +35,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
+use delightql_backends::duckdb::executor::QueryResult;
 use delightql_backends::{DuckDBConnectionManager, DuckDBExecutor, DuckDBExecutorImpl};
 use delightql_protocol::{
     resolve_projection, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem,
@@ -41,27 +51,75 @@ struct ResultState {
     exec_ms: u64,
 }
 
+/// The database behind the party: verified at connect, opened at first
+/// use. Lazy because dql runs TWO fatboy children on one file per
+/// session (the idle spare + the mount's worker, REPORT-T-P2 §C) and a
+/// writable open takes DuckDB's exclusive lock — eager opens would make
+/// the spare starve the worker. Pinned by
+/// `connect_does_not_take_the_file_lock`.
+enum DbState {
+    Closed { path: String, readonly: bool },
+    Open(DuckDBConnectionManager),
+}
+
 pub struct DuckParty {
-    manager: DuckDBConnectionManager,
+    db: DbState,
     handles: HashMap<Handle, ResultState>,
     next_handle_id: u64,
 }
 
 impl DuckParty {
-    /// Open the database file, fail-closed (must already exist).
+    /// Connect WRITABLE (the default since the 2026-07-11 ruling),
+    /// fail-closed (the file must already exist) and lazy (the file —
+    /// and DuckDB's exclusive write lock — is not taken until the
+    /// first Query).
     pub fn connect(db_path: &str) -> Result<Self, String> {
-        // Read-only: lets multiple fatboy children share one file across
-        // processes (the stdio model). Query-only fatboy, so no loss.
-        let manager = if db_path == ":memory:" {
-            DuckDBConnectionManager::new_memory().map_err(|e| e.to_string())?
-        } else {
-            DuckDBConnectionManager::new_file_readonly(db_path).map_err(|e| e.to_string())?
-        };
+        Self::connect_mode(db_path, false)
+    }
+
+    /// Connect READ-ONLY: the pre-write-mode posture, kept as an
+    /// explicit opt-in. Read-only opens can share one file across
+    /// processes (all openers must be read-only — P3 §C); the engine
+    /// refuses every write. Pinned by
+    /// `connect_readonly_still_refuses_writes`.
+    pub fn connect_readonly(db_path: &str) -> Result<Self, String> {
+        Self::connect_mode(db_path, true)
+    }
+
+    fn connect_mode(db_path: &str, readonly: bool) -> Result<Self, String> {
+        // Fail-closed at connect, WITHOUT opening: a DuckParty whose
+        // database doesn't exist never exists, but taking the lock
+        // waits for the first Query (see DbState).
+        if db_path != ":memory:" && !std::path::Path::new(db_path).exists() {
+            return Err(format!("Database file '{}' does not exist.", db_path));
+        }
         Ok(Self {
-            manager,
+            db: DbState::Closed { path: db_path.to_string(), readonly },
             handles: HashMap::new(),
             next_handle_id: 1,
         })
+    }
+
+    /// The open connection, opening it (and taking the lock, when
+    /// writable) on first use. A lock conflict or late corruption
+    /// surfaces here as a Query-time error rather than at connect —
+    /// the price of laziness, and the error still travels the protocol.
+    fn manager(&mut self) -> Result<&DuckDBConnectionManager, String> {
+        if let DbState::Closed { path, readonly } = &self.db {
+            let manager = if path == ":memory:" {
+                DuckDBConnectionManager::new_memory()
+            } else if *readonly {
+                DuckDBConnectionManager::new_file_readonly(path)
+            } else {
+                DuckDBConnectionManager::new_file_existing(path)
+            }
+            .map_err(|e| e.to_string())?;
+            self.db = DbState::Open(manager);
+        }
+        match &self.db {
+            DbState::Open(m) => Ok(m),
+            DbState::Closed { .. } => unreachable!("just opened above"),
+        }
     }
 
     fn handle_query(&mut self, text: Vec<u8>) -> ServerTerm {
@@ -73,7 +131,11 @@ impl DuckParty {
         };
 
         let started = Instant::now();
-        let mut executor = DuckDBExecutorImpl::new(&self.manager);
+        let manager = match self.manager() {
+            Ok(m) => m,
+            Err(e) => return error(ErrorKind::Connection, IDENT_DUCK_ERROR, e.into_bytes()),
+        };
+        let mut executor = DuckDBExecutorImpl::new(manager);
         let result = match executor.execute_query(&sql) {
             Ok(r) => r,
             Err(e) => {
@@ -83,11 +145,9 @@ impl DuckParty {
         let exec_ms = started.elapsed().as_millis() as u64;
 
         // DML/DDL with no result columns: the spec-appendix relation.
-        let (columns, rows): (Vec<String>, Vec<Vec<String>>) = if result.columns.is_empty() {
-            let n = result.affected_rows.unwrap_or(0);
-            (vec!["affected_rows".to_string()], vec![vec![n.to_string()]])
-        } else {
-            (result.columns, result.rows)
+        let (columns, rows) = match shape_result(result) {
+            Ok(cr) => cr,
+            Err(msg) => return error(ErrorKind::Connection, IDENT_DUCK_ERROR, msg.into_bytes()),
         };
 
         let handle_id = self.next_handle_id;
@@ -165,6 +225,32 @@ impl DuckParty {
         } else {
             unknown_handle()
         }
+    }
+}
+
+/// Shape an executor result into the relay's (columns, rows) relation.
+///
+/// A result WITH columns passes through unchanged. A result with NO
+/// columns is a DML/DDL outcome and becomes the spec-appendix
+/// `affected_rows` relation — from the executor's count. Note that
+/// today's DuckDB `execute_query` surfaces DML counts as a `Count`
+/// column (so DML takes the pass-through arm) and NEVER populates
+/// `affected_rows`; if the no-columns arm is reached without a count,
+/// that is a LOUD error — fabricating 0 would let the receipts
+/// feature read a YES as a NO and silently skip downstream work.
+/// Pinned by `missing_affected_count_is_a_loud_error`.
+fn shape_result(result: QueryResult) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    if result.columns.is_empty() {
+        match result.affected_rows {
+            Some(n) => Ok((vec!["affected_rows".to_string()], vec![vec![n.to_string()]])),
+            None => Err(
+                "executor returned no result columns and no affected-rows count; \
+                 refusing to fabricate affected_rows = 0"
+                    .to_string(),
+            ),
+        }
+    } else {
+        Ok((result.columns, result.rows))
     }
 }
 
@@ -299,9 +385,176 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Task 1.7: the executor's `affected_rows` is an Option defaulted
+    /// None and `execute_query` never populates it. A no-columns result
+    /// without a count must be a LOUD error — never a fabricated
+    /// `affected_rows = 0`, which the receipts feature would read as a
+    /// NO and silently skip downstream work.
+    #[test]
+    fn missing_affected_count_is_a_loud_error() {
+        let missing = QueryResult::new(vec![], vec![]);
+        match shape_result(missing) {
+            Err(msg) => {
+                assert!(
+                    msg.contains("affected"),
+                    "error should name the missing count, got: {}",
+                    msg
+                );
+            }
+            Ok((columns, rows)) => panic!(
+                "missing count must not shape into a relation, got columns={:?} rows={:?}",
+                columns, rows
+            ),
+        }
+    }
+
+    /// Companion pin: a count the executor DID supply still becomes the
+    /// spec-appendix `affected_rows` relation.
+    #[test]
+    fn populated_affected_count_becomes_the_relation() {
+        let populated = QueryResult::new(vec![], vec![]).with_affected_rows(3);
+        let (columns, rows) = shape_result(populated).expect("populated count must shape");
+        assert_eq!(columns, vec!["affected_rows".to_string()]);
+        assert_eq!(rows, vec![vec!["3".to_string()]]);
+    }
+
+    /// DuckDB surfaces DML counts as a `Count` column through
+    /// `execute_query` (verified empirically, task 1.7); the relay must
+    /// pass that relation through, not error on it.
+    #[test]
+    fn dml_count_relation_passes_through() {
+        let mgr = DuckDBConnectionManager::new_memory().unwrap();
+        let mut ex = DuckDBExecutorImpl::new(&mgr);
+        ex.execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        let result = ex
+            .execute_query("INSERT INTO t VALUES (3, 'gamma')")
+            .unwrap();
+        assert_eq!(
+            result.affected_rows, None,
+            "executor does not populate the Option (task 1.7 finding)"
+        );
+        let (columns, rows) = shape_result(result).expect("Count relation passes through");
+        assert_eq!(columns, vec!["Count".to_string()]);
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
+    }
+
     #[test]
     fn connect_is_fail_closed() {
         assert!(DuckParty::connect("/nonexistent/nope.duckdb").is_err());
+    }
+
+    /// Drive one SQL statement through a fresh relay session over the
+    /// given party; Ok(handle columns) on Header, Err(message) on Error.
+    fn run_sql(party: DuckParty, sql: &str) -> Result<Vec<String>, String> {
+        let client = RelayClient::new(DirectTransport::new(party));
+        let VersionResult::Accepted(mut session) = client
+            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .unwrap()
+        else {
+            panic!("handshake should succeed")
+        };
+        match session.query(b(sql)).unwrap() {
+            QueryResponse::Header { dimensions, .. } => Ok(dimensions
+                .iter()
+                .map(|d| String::from_utf8_lossy(&d.name).into_owned())
+                .collect()),
+            QueryResponse::Error { message, .. } => {
+                Err(String::from_utf8_lossy(&message).into_owned())
+            }
+        }
+    }
+
+    /// Read one scalar back from the file via a fresh read-only manager
+    /// (a separate open — proves the write PERSISTED, not that it merely
+    /// succeeded in a session).
+    fn reopen_and_read(path: &std::path::Path, sql: &str) -> String {
+        let mgr = DuckDBConnectionManager::new_file_readonly(path.to_str().unwrap()).unwrap();
+        let mut ex = DuckDBExecutorImpl::new(&mgr);
+        let result = ex.execute_query(sql).unwrap();
+        result.rows[0][0].clone()
+    }
+
+    /// E-T3b RED: DuckDB is ruled WRITABLE (EFFECTS-ON-TARGETS-PLAN §1
+    /// finding 2). A plain INSERT through the party against a FILE
+    /// connection must succeed and persist across a reopen.
+    #[test]
+    fn file_insert_persists_across_reopen() {
+        let path = temp_db();
+        let party = DuckParty::connect(path.to_str().unwrap()).unwrap();
+        run_sql(party, "INSERT INTO t VALUES (3, 'gamma')")
+            .expect("INSERT through the party must succeed (writable ruling)");
+        // Party dropped: lock released. Reopen the FILE and read back.
+        assert_eq!(reopen_and_read(&path, "SELECT count(*) FROM t"), "3");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// E-T3b RED companion: CREATE TABLE (durable DDL) through the party
+    /// persists across a reopen.
+    #[test]
+    fn file_create_table_persists_across_reopen() {
+        let path = temp_db();
+        {
+            let party = DuckParty::connect(path.to_str().unwrap()).unwrap();
+            let client = RelayClient::new(DirectTransport::new(party));
+            let VersionResult::Accepted(mut session) = client
+                .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+                .unwrap()
+            else {
+                panic!("handshake should succeed")
+            };
+            for sql in ["CREATE TABLE made (x INTEGER)", "INSERT INTO made VALUES (7)"] {
+                match session.query(b(sql)).unwrap() {
+                    QueryResponse::Header { .. } => {}
+                    QueryResponse::Error { message, .. } => panic!(
+                        "{} must succeed (writable ruling), got: {}",
+                        sql,
+                        String::from_utf8_lossy(&message)
+                    ),
+                }
+            }
+        }
+        assert_eq!(reopen_and_read(&path, "SELECT x FROM made"), "7");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// E-T3b: the explicit read-only opt-in keeps the old posture —
+    /// the engine refuses the write; reads still work.
+    #[test]
+    fn connect_readonly_still_refuses_writes() {
+        let path = temp_db();
+        let party = DuckParty::connect_readonly(path.to_str().unwrap()).unwrap();
+        let err = run_sql(party, "INSERT INTO t VALUES (9, 'nope')")
+            .expect_err("read-only opt-in must refuse the INSERT");
+        assert!(
+            err.contains("read-only"),
+            "refusal should name read-only mode, got: {}",
+            err
+        );
+        let party = DuckParty::connect_readonly(path.to_str().unwrap()).unwrap();
+        run_sql(party, "SELECT * FROM t").expect("read-only still reads");
+        assert_eq!(reopen_and_read(&path, "SELECT count(*) FROM t"), "2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// E-T3b, the double-spawn constraint: one dql session spawns TWO
+    /// fatboy children on the same file (the idle spare from
+    /// make_connection plus the mount's worker — REPORT-T-P2 §C), and a
+    /// writable open takes DuckDB's EXCLUSIVE lock (P3 §C). So `connect`
+    /// must NOT open the file; the first Query does. Pin: two live
+    /// parties on one file, and the one that actually speaks can write.
+    #[test]
+    fn connect_does_not_take_the_file_lock() {
+        let path = temp_db();
+        let idle_spare = DuckParty::connect(path.to_str().unwrap())
+            .expect("first connect (the idle spare)");
+        let worker = DuckParty::connect(path.to_str().unwrap())
+            .expect("second connect must succeed while the spare is alive");
+        run_sql(worker, "INSERT INTO t VALUES (4, 'delta')")
+            .expect("the worker (second-connected) party must hold the write lock");
+        drop(idle_spare);
+        assert_eq!(reopen_and_read(&path, "SELECT count(*) FROM t"), "3");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

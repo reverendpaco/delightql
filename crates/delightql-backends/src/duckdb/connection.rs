@@ -200,7 +200,7 @@ impl DuckDBConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::tempdir;
 
     #[test]
     fn test_memory_connection() {
@@ -219,8 +219,11 @@ mod tests {
 
     #[test]
     fn test_file_connection() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let temp_path = temp_file.path().to_str().unwrap();
+        // DuckDB refuses to open a pre-existing empty file (unlike SQLite),
+        // so hand it a path that does not exist yet inside a temp directory.
+        let temp_dir = tempdir().unwrap();
+        let temp_path_buf = temp_dir.path().join("test_connection.duckdb");
+        let temp_path = temp_path_buf.to_str().unwrap();
         let manager =
             DuckDBConnectionManager::new_file(temp_path).expect("Failed to create file connection");
 

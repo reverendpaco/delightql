@@ -1018,6 +1018,16 @@ pub fn walk_transform_operator<P, Q, F: AstTransform<P, Q> + ?Sized>(
                     .collect::<Result<Vec<_>>>()?,
             })
         }
+        UnaryRelationalOperator::SignedWitness => Ok(UnaryRelationalOperator::SignedWitness),
+        UnaryRelationalOperator::DirectivePipeInvocation {
+            name,
+            argument,
+            domain_spec,
+        } => Ok(UnaryRelationalOperator::DirectivePipeInvocation {
+            name,
+            argument: Box::new(t.transform_relational_action(*argument)?.into_inner()),
+            domain_spec: t.transform_domain_spec(domain_spec)?,
+        }),
     }
 }
 
@@ -1308,6 +1318,7 @@ pub fn walk_transform_cte_binding<P, Q, F: AstTransform<P, Q> + ?Sized>(
     Ok(CteBinding {
         expression: t.transform_relational_action(cte.expression)?.into_inner(),
         name: cte.name,
+        effect_label: cte.effect_label,
         is_recursive: cte.is_recursive.rephase(),
     })
 }

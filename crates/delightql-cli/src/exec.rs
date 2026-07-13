@@ -6,7 +6,6 @@ use std::fs;
 use std::path::Path;
 
 use crate::args::Stage;
-use crate::connection::ConnectionManager;
 use crate::exec_ng::ResultMetadata;
 use crate::output_format::OutputFormat;
 
@@ -51,13 +50,10 @@ pub fn execute_query(
     target_stage: Option<Stage>,
     no_headers: bool,
 ) -> Result<Option<ResultMetadata>> {
-    let conn = if let Some(ref path) = db_path {
-        ConnectionManager::new_file(path)?
-    } else {
-        ConnectionManager::new_memory()?
-    };
-
-    let mut handle = conn.open_handle()?;
+    // The session's one backend is created by the mount! below, not by a
+    // pre-opened manager — so build the handle straight from the factories
+    // (bugs/duplicate-fatboy-spawn-one-shot).
+    let mut handle = crate::connection::open_handle()?;
 
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
 

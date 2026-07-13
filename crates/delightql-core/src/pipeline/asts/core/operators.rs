@@ -20,8 +20,6 @@ pub enum DmlKind {
     Delete,
     #[lispy("dml_kind:insert")]
     Insert,
-    #[lispy("dml_kind:keep")]
-    Keep,
 }
 
 /// A single &-separated parameter group in an HO call.
@@ -268,6 +266,18 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
         /// True for `+` (ExistsWitness), false for `\+` (DoesNotExistWitness)
         exists: bool,
     },
+    /// Signed witness: postfix `+-` (EFFECT-ALGEBRA §3;
+    /// book/reference/dql/witness.md). Keeps the relation's schema and adds
+    /// `met` = 1/0 — a total-ledger arm contributes a full-schema row fired
+    /// or not (a NO arm contributes one all-NULL proxy row with met = 0).
+    ///
+    /// A plain-pipeline citizen: resolved by `resolve_signed_witness`
+    /// (schema = source + `met` appended LAST), lowered as the one-row-unit
+    /// LEFT-JOIN wrap by `r_lower_signed_witness` (transformer_v4) and, in
+    /// effect-body value position, by `witness_wrap` (effect_transformer).
+    /// Pinned by the effects ball's compose--65/70…76.
+    #[lispy("unary_relational_operator:signed_witness")]
+    SignedWitness,
     /// Qualify: * - marks all columns as qualified (table-prefixed)
     ///
     /// Qualified columns don't unify implicitly with same-named columns from other tables.
@@ -288,7 +298,7 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
     /// After resolution, expanded into explicit GlobWithUsing/Using.
     #[lispy("unary_relational_operator:using_all")]
     UsingAll,
-    /// DML terminal: update!(table)(*), delete!(table)(*), insert!(table)(*), keep!(table)(*)
+    /// DML terminal: update!(table)(*), delete!(table)(*), insert!(table)(*)
     ///
     /// The final pipe operator in a DML pipeline. Converts the upstream query
     /// into a SQL DML statement (DELETE, UPDATE, INSERT INTO ... SELECT).
@@ -333,6 +343,27 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
         name: String,
         /// Arguments from the call site. A glob (*) means "bind all upstream columns."
         arguments: Vec<DomainExpression<Phase>>,
+    },
+    /// Two-paren directive invocation in pipe-terminal position with a
+    /// relational higher-order argument: `source |> name!(Rel(*))(spec)`
+    /// (EFFECT-ALGEBRA §1: first parens = parameters, trailing parens =
+    /// access/reshape of the return table). Distinct from `DmlTerminal`
+    /// (insert!/update!/delete! keep their dedicated machinery) and from
+    /// `DirectiveTerminal` (the one-paren pipe form).
+    ///
+    /// Unresolved-only: the effect transformer (Epic 3) consumes it; until
+    /// then the resolver refuses it with a clean not-yet-implemented error
+    /// (pinned by the effects ball, util--40_returning_other, red until
+    /// Epic 3).
+    #[lispy("unary_relational_operator:directive_pipe_invocation")]
+    #[phase_convert(unreachable)]
+    DirectivePipeInvocation {
+        /// Directive name (includes `!` suffix, e.g., "returning_other!")
+        name: String,
+        /// The relational HO argument written in the first parens.
+        argument: Box<super::RelationalExpression<Phase>>,
+        /// The trailing access-parens spec over the return table.
+        domain_spec: DomainSpec<Phase>,
     },
 }
 

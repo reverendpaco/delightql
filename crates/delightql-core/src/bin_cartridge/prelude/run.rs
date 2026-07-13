@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! `run!()` pseudo-predicate implementation
+//! `run!()` pseudo-predicate registration.
 //!
-//! Syntax: `run!(file_path)`
+//! Syntax: `run!(file_path)` — REPL/CLI top level ONLY (EFFECT-ALGEBRA R9).
 //!
-//! Example: `run!("scripts/setup.dql")`
+//! ## Behavior (Epic 3.3, EFFECT-ALGEBRA F2)
 //!
-//! ## Behavior
+//! `run!("file.dql")` = consult the file, then demand its `main!` — the
+//! run's value is `main!`'s return table. The LIVE implementation is the
+//! relay entry point (`relay/entry.rs`): a whole-statement `run!` is
+//! classified there and never reaches this entity. The old implementation
+//! here parsed the file with the QUERY grammar (REPORT-2.1: it could never
+//! accept `:-` rule definitions) and executed free statements; that
+//! semantics is RETIRED (effects ball main--21_run_file pins the
+//! consult-then-demand behavior).
 //!
-//! 1. Read file at specified path
-//! 2. Parse as sequential query statements (using multi-query parser)
-//! 3. Execute each query sequentially with current system
-//! 4. Return summary table (queries executed, rows affected)
+//! This registration remains so `run!` demanded from any NON-whole-statement
+//! position (a conjunct, a subquery) refuses with a directed message rather
+//! than "Unknown pseudo-predicate".
 
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
@@ -19,7 +25,6 @@ use crate::bin_cartridge::{
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
-use crate::pipeline::{builder_v2, parser};
 
 /// run!() pseudo-predicate entity
 pub struct RunPredicate;
@@ -41,9 +46,8 @@ impl BinEntity for RunPredicate {
                 _is_optional: false,
             }],
             output_schema: OutputSchema::Relation(vec![
-                ("status".to_string(), "String".to_string()),
-                ("file_path".to_string(), "String".to_string()),
-                ("queries_executed".to_string(), "Int".to_string()),
+                ("success".to_string(), "Int".to_string()),
+                ("operation".to_string(), "String".to_string()),
             ]),
         }
     }
@@ -60,153 +64,74 @@ impl BinEntity for RunPredicate {
 impl EffectExecutable for RunPredicate {
     fn execute(
         &self,
-        arguments: &[DomainExpression],
+        _arguments: &[DomainExpression],
         _alias: Option<String>,
-        system: &mut crate::system::DelightQLSystem,
+        _system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
-        // Validate argument count
-        if arguments.len() != 1 {
-            return Err(DelightQLError::database_error(
-                format!(
-                    "run!() expects 1 argument (file_path), got {}",
-                    arguments.len()
-                ),
-                "Invalid argument count",
-            ));
-        }
-
-        // Extract file_path from first argument (must be string literal)
-        let file_path = extract_string_literal(&arguments[0], "file_path")?;
-
-        // Validate file path
-        if file_path.is_empty() {
-            return Err(DelightQLError::database_error(
-                "run!() file_path cannot be empty",
-                "Empty file path",
-            ));
-        }
-
-        // Resolve relative path against session CWD (for test isolation).
-        let resolved_path = crate::session_cwd::resolve_path(&file_path);
-        let file_path = resolved_path.display().to_string();
-        let file_path = file_path.as_str();
-
-        // Read file contents
-        let source_code = std::fs::read_to_string(file_path).map_err(|e| {
-            DelightQLError::database_error(
-                format!("run!() failed to read file '{}': {}", file_path, e),
-                "File read error",
-            )
-        })?;
-
-        // Parse file as queries
-        let tree = parser::parse(&source_code).map_err(|e| {
-            DelightQLError::database_error(
-                format!("run!() failed to parse file '{}': {}", file_path, e),
-                "Parse error",
-            )
-        })?;
-
-        let (queries, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
-            builder_v2::parse_queries(&tree, &source_code).map_err(|e| {
-                DelightQLError::database_error(
-                    format!("run!() failed to build AST for file '{}': {}", file_path, e),
-                    "Build error",
-                )
-            })?;
-
-        if queries.is_empty() {
-            return Err(DelightQLError::database_error(
-                format!("run!() file '{}' contains no queries", file_path),
-                "No queries found",
-            ));
-        }
-
-        let query_count = queries.len();
-
-        // Execute each query sequentially with the current system
-        for (i, query) in queries.into_iter().enumerate() {
-            log::debug!(
-                "run!(): Executing query {}/{} from '{}'",
-                i + 1,
-                query_count,
-                file_path
-            );
-
-            // Execute query by recursively calling effect executor
-            // This allows nested pseudo-predicates in the file
-            let _rewritten_query =
-                crate::pipeline::effect_executor::execute_effects(query, system)?;
-
-            // Note: We execute for side effects, don't collect results
-            // This is intentional - run!() is for executing scripts, not collecting data
-        }
-
-        log::debug!(
-            "run!(): Successfully executed {} queries from '{}'",
-            query_count,
-            file_path
-        );
-
-        // Return success result table
-        let result_table = create_success_table(&file_path, query_count, _alias);
-        Ok(EntityResult::Relation(result_table))
+        // An execution directive starts a run; it cannot be a sub-expression
+        // of another statement (EFFECT-ALGEBRA §9/R9). Whole-statement run!
+        // never reaches here — the relay entry point owns it.
+        Err(DelightQLError::validation_error_categorized(
+            "effect/run/position",
+            "run! starts a run (consult the file, then demand its main! — \
+             EFFECT-ALGEBRA F2) and must be the entire statement at the \
+             REPL/CLI top level",
+            "run! must be the whole statement",
+        ))
     }
 }
 
-/// Extract a string literal from a domain expression
-fn extract_string_literal(expr: &DomainExpression, param_name: &str) -> Result<String> {
-    match expr {
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Ok(s.clone()),
-        _ => Err(DelightQLError::database_error(
-            format!(
-                "run!() expects '{}' to be a string literal, got: {:?}",
-                param_name, expr
-            ),
-            "Invalid argument type (expected string literal)",
-        )),
+/// run_namespace!() pseudo-predicate entity — registered for the same
+/// reason as `RunPredicate`: the live implementation is the relay entry
+/// point; this registration turns a NON-whole-statement demand into a
+/// directed refusal instead of "Unknown pseudo-predicate".
+pub struct RunNamespacePredicate;
+
+impl BinEntity for RunNamespacePredicate {
+    fn name(&self) -> &str {
+        "run_namespace!"
+    }
+
+    fn entity_type(&self) -> EntityType {
+        EntityType::BinPseudoPredicate
+    }
+
+    fn signature(&self) -> EntitySignature {
+        EntitySignature {
+            parameters: vec![Parameter {
+                name: "namespace".to_string(),
+                data_type: "String".to_string(),
+                _is_optional: false,
+            }],
+            output_schema: OutputSchema::Relation(vec![
+                ("success".to_string(), "Int".to_string()),
+                ("operation".to_string(), "String".to_string()),
+            ]),
+        }
+    }
+
+    fn has_side_effects(&self) -> bool {
+        true
+    }
+
+    fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
+        Some(self)
     }
 }
 
-/// Create a success result table for run!()
-///
-/// Returns: _("success", file_path, queries_executed @ "status", "file_path", "queries_executed")
-fn create_success_table(file_path: &str, query_count: usize, alias: Option<String>) -> Relation {
-    // Create column headers
-    let headers = vec![
-        DomainExpression::lvar_builder("status".to_string()).build(),
-        DomainExpression::lvar_builder("file_path".to_string()).build(),
-        DomainExpression::lvar_builder("queries_executed".to_string()).build(),
-    ];
-
-    // Create data row
-    let row = Row {
-        values: vec![
-            DomainExpression::Literal {
-                value: LiteralValue::String("success".to_string()),
-                alias: None,
-            },
-            DomainExpression::Literal {
-                value: LiteralValue::String(file_path.to_string()),
-                alias: None,
-            },
-            DomainExpression::Literal {
-                value: LiteralValue::Number(query_count.to_string()),
-                alias: None,
-            },
-        ],
-    };
-
-    Relation::Anonymous {
-        column_headers: Some(headers),
-        rows: vec![row],
-        alias: alias.map(|s| s.into()),
-        outer: false,
-        exists_mode: false,
-        qua_target: None,
-        cpr_schema: PhaseBox::phantom(),
+impl EffectExecutable for RunNamespacePredicate {
+    fn execute(
+        &self,
+        _arguments: &[DomainExpression],
+        _alias: Option<String>,
+        _system: &mut crate::system::DelightQLSystem,
+    ) -> Result<EntityResult> {
+        Err(DelightQLError::validation_error_categorized(
+            "effect/run/position",
+            "run_namespace! demands a consulted namespace's main! \
+             (EFFECT-ALGEBRA F3) and must be the entire statement at the \
+             REPL/CLI top level, or a demand inside an effect-rule body",
+            "run_namespace! must be the whole statement",
+        ))
     }
 }

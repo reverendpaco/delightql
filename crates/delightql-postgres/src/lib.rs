@@ -30,6 +30,22 @@
 //! multi-statement input), descriptors degrade to empty and
 //! `simple_query` remains the single authoritative source of errors.
 //!
+//! **Inside an open transaction block the prepare is SKIPPED entirely**
+//! (E-T3a; EFFECTS-ON-TARGETS-PLAN.md §3). A failed extended-protocol
+//! Parse inside a block ABORTS the block, so preparing mid-transaction
+//! (a) killed the caller's bracket one statement early and (b) masked
+//! every real error as 25P02 ("current transaction is aborted") when
+//! the authoritative `simple_query` ran into the wreckage. Descriptors
+//! degrade to empty mid-transaction — the multi-statement fallback the
+//! engine already handles — and recover at COMMIT/ROLLBACK. Pinned by
+//! `mid_transaction_prepare_neither_masks_errors_nor_aborts_bracket`;
+//! the outside-a-block path is unchanged, pinned by
+//! `descriptors_survive_errors_outside_transactions`. Block state is
+//! tracked by classifying the leading keywords of the statements this
+//! party itself executes (it owns the session exclusively), erring
+//! toward `Unknown`, which a deterministic SAVEPOINT probe resolves
+//! before the next descriptor decision.
+//!
 //! Eager materialization (SqlParty's cursor-streaming worker is the
 //! later perf upgrade, not a correctness need).
 //!
@@ -75,6 +91,125 @@ struct LoadState {
     rows: Vec<Vec<Cell>>,
 }
 
+/// Transaction-block state of the party's one PG session (E-T3a).
+///
+/// Tracked so the descriptor-harvest prepare runs ONLY outside a
+/// transaction block: a failed Parse inside a block aborts it, killing
+/// the caller's bracket early and masking the next real error as 25P02.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TxnState {
+    /// No block open: prepare is safe (a failed Parse aborts only its
+    /// own implicit transaction).
+    Idle,
+    /// Inside a block (healthy or already aborted): skip the prepare;
+    /// `simple_query` stays the single authoritative error source.
+    InTxn,
+    /// A statement that may have changed block state ended ambiguously
+    /// (transaction-control text that errored, or multi-statement text
+    /// containing transaction-control fragments). Resolved by
+    /// `resync_txn_state` before the next descriptor decision.
+    Unknown,
+}
+
+/// What a statement text does to the transaction-block state, judged
+/// conservatively from leading keywords (see `txn_effect`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TxnEffect {
+    /// Cannot change block state (includes erroring: a statement error
+    /// aborts a block but never opens or closes one).
+    None,
+    /// BEGIN / START TRANSACTION.
+    Opens,
+    /// COMMIT / END / ROLLBACK / ABORT / PREPARE TRANSACTION.
+    Closes,
+    /// Multi-statement text with transaction-control fragments: the
+    /// outcome is not knowable from the text — force a probe.
+    Murky,
+}
+
+/// First two keywords of a statement fragment, uppercased ("" when
+/// absent), skipping whitespace, `--` line comments, and nested
+/// `/* */` block comments. Stops at the first non-word lead character
+/// (a fragment starting with `(`, a digit, a quote, … has no keyword).
+fn first_two_keywords(fragment: &str) -> (String, String) {
+    let bytes = fragment.as_bytes();
+    let mut i = 0;
+    let mut words: Vec<String> = Vec::new();
+    while i < bytes.len() && words.len() < 2 {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut depth = 1;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            words.push(fragment[start..i].to_ascii_uppercase());
+        } else {
+            break; // non-keyword lead: no (further) keyword here
+        }
+    }
+    let mut it = words.into_iter();
+    (it.next().unwrap_or_default(), it.next().unwrap_or_default())
+}
+
+/// Classify one fragment's effect on the block state from its first
+/// two keywords ("" = no keyword at all: empty or non-statement text).
+fn fragment_effect(kw1: &str, kw2: &str) -> TxnEffect {
+    match kw1 {
+        "BEGIN" | "START" => TxnEffect::Opens,
+        // COMMIT/ROLLBACK PREPARED act on two-phase transactions, not
+        // the block; ROLLBACK TO SAVEPOINT stays inside the block.
+        "COMMIT" | "END" | "ABORT" if kw2 != "PREPARED" => TxnEffect::Closes,
+        "ROLLBACK" if kw2 != "TO" && kw2 != "PREPARED" => TxnEffect::Closes,
+        "PREPARE" if kw2 == "TRANSACTION" => TxnEffect::Closes,
+        _ => TxnEffect::None,
+    }
+}
+
+/// Conservative text classification. The split on `;` is deliberately
+/// naive (a `;` inside a string literal splits too): false extra
+/// fragments can only ADD transaction-control readings, driving the
+/// answer toward `Murky` — a wasted probe, never a wrong state. Every
+/// REAL statement starts a fragment (real statements are separated by
+/// real `;`), so transaction control is never missed.
+fn txn_effect(sql: &str) -> TxnEffect {
+    let mut effects: Vec<TxnEffect> = Vec::new();
+    for fragment in sql.split(';') {
+        let (kw1, kw2) = first_two_keywords(fragment);
+        if kw1.is_empty() {
+            continue; // trailing `;`, comment-only or empty fragment
+        }
+        effects.push(fragment_effect(&kw1, &kw2));
+    }
+    match effects.as_slice() {
+        [] => TxnEffect::None,
+        [single] => *single,
+        many if many.iter().all(|e| *e == TxnEffect::None) => TxnEffect::None,
+        _ => TxnEffect::Murky,
+    }
+}
+
 pub struct PgParty {
     /// Connected on construction; fail-closed — a PgParty that cannot
     /// reach its database never exists.
@@ -82,6 +217,10 @@ pub struct PgParty {
     handles: HashMap<Handle, ResultState>,
     loads: HashMap<Handle, LoadState>,
     next_handle_id: u64,
+    /// E-T3a: transaction-block state of the one session, so the
+    /// descriptor prepare never runs (and never aborts) inside a block.
+    /// A fresh connection is always idle.
+    txn_state: TxnState,
 }
 
 impl PgParty {
@@ -95,6 +234,7 @@ impl PgParty {
             handles: HashMap::new(),
             loads: HashMap::new(),
             next_handle_id: 1,
+            txn_state: TxnState::Idle,
         })
     }
 
@@ -107,7 +247,27 @@ impl PgParty {
             handles: HashMap::new(),
             loads: HashMap::new(),
             next_handle_id: 1,
+            txn_state: TxnState::Idle,
         })
+    }
+
+    /// Resolve an `Unknown` transaction state with a deterministic
+    /// probe: `SAVEPOINT` is legal ONLY inside a transaction block.
+    /// Ok → healthy block (the savepoint is released immediately — and
+    /// SAVEPOINT stacks, so a same-named user savepoint is untouched);
+    /// 25P01 → idle; 25P02 (aborted block) or anything else → treat as
+    /// in-txn, the direction that can only degrade descriptors, never
+    /// abort anyone's bracket.
+    fn resync_txn_state(&mut self) {
+        self.txn_state = match self.client.simple_query(
+            "SAVEPOINT __pgparty_txn_probe; RELEASE SAVEPOINT __pgparty_txn_probe",
+        ) {
+            Ok(_) => TxnState::InTxn,
+            Err(e) => match e.code().map(|c| c.code()) {
+                Some("25P01") => TxnState::Idle,
+                _ => TxnState::InTxn,
+            },
+        };
     }
 
     fn handle_query(&mut self, text: Vec<u8>) -> ServerTerm {
@@ -121,20 +281,42 @@ impl PgParty {
         // Descriptor harvest: prepare parses and plans, executes nothing.
         // On ANY prepare failure, fall through descriptor-less and let
         // simple_query be the single authoritative error source.
-        let prepared: Option<Vec<(String, String)>> = self
-            .client
-            .prepare(&sql)
-            .ok()
-            .map(|stmt| {
+        //
+        // E-T3a: ONLY outside a transaction block. Inside one, a failed
+        // Parse aborts the block — the caller's bracket would die one
+        // statement early and every later error would surface as the
+        // 25P02 mask instead of the true error. Mid-transaction,
+        // descriptors degrade (the multi-statement fallback) and
+        // recover at COMMIT/ROLLBACK.
+        if self.txn_state == TxnState::Unknown {
+            self.resync_txn_state();
+        }
+        let prepared: Option<Vec<(String, String)>> = if self.txn_state == TxnState::Idle {
+            self.client.prepare(&sql).ok().map(|stmt| {
                 stmt.columns()
                     .iter()
                     .map(|c| (c.name().to_string(), c.type_().name().to_string()))
                     .collect()
-            });
+            })
+        } else {
+            None
+        };
 
         // Execute via the simple-query protocol: PG renders all text.
+        let effect = txn_effect(&sql);
         let started = Instant::now();
-        let messages = match self.client.simple_query(&sql) {
+        let result = self.client.simple_query(&sql);
+        // Track the block state off what this session just executed
+        // (statement errors abort a block but never open or close one;
+        // transaction control that ERRORS — e.g. a failed COMMIT is a
+        // rollback — resolves via the probe on the next query).
+        self.txn_state = match (effect, result.is_ok()) {
+            (TxnEffect::None, _) => self.txn_state,
+            (TxnEffect::Opens, true) => TxnState::InTxn,
+            (TxnEffect::Closes, true) => TxnState::Idle,
+            (_, _) => TxnState::Unknown,
+        };
+        let messages = match result {
             Ok(m) => m,
             Err(e) => return pg_error(&e),
         };
@@ -493,11 +675,14 @@ mod tests {
     /// The sweep container's loopback (new_test_suite/sweep.py). Tests
     /// SKIP (loudly) when it isn't running — runnable-by-default without
     /// demanding infrastructure.
-    fn test_party() -> Option<PgParty> {
-        let conninfo = std::env::var("DQL_TEST_PG_CONNINFO").unwrap_or_else(|_| {
+    fn base_conninfo() -> String {
+        std::env::var("DQL_TEST_PG_CONNINFO").unwrap_or_else(|_| {
             "host=127.0.0.1 port=5433 user=postgres dbname=dql_core".to_string()
-        });
-        match PgParty::connect(&conninfo) {
+        })
+    }
+
+    fn party_on(conninfo: &str) -> Option<PgParty> {
+        match PgParty::connect(conninfo) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!(
@@ -509,8 +694,14 @@ mod tests {
         }
     }
 
-    fn session() -> Option<(Session<DirectTransport<PgParty>>, AgreedOrientation)> {
-        let party = test_party()?;
+    fn test_party() -> Option<PgParty> {
+        party_on(&base_conninfo())
+    }
+
+    fn session_on(
+        conninfo: &str,
+    ) -> Option<(Session<DirectTransport<PgParty>>, AgreedOrientation)> {
+        let party = party_on(conninfo)?;
         let client = RelayClient::new(DirectTransport::new(party));
         let VersionResult::Accepted(session) = client
             .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
@@ -520,6 +711,10 @@ mod tests {
         };
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
         Some((session, rows))
+    }
+
+    fn session() -> Option<(Session<DirectTransport<PgParty>>, AgreedOrientation)> {
+        session_on(&base_conninfo())
     }
 
     fn b(s: &str) -> Vec<u8> {
@@ -837,6 +1032,308 @@ mod tests {
             }
             other => panic!("expected Error, got {:?}", other),
         }
+    }
+
+    // ── E-T3a: the descriptor-prepare must not poison open transactions ──
+    //
+    // P2 §D finding (EFFECTS-ON-TARGETS-PLAN.md §1 item 3): PgParty
+    // prepared EVERY query before simple_query. Inside an open
+    // transaction, a statement whose PREPARE failed aborted the PG
+    // transaction one statement early; the authoritative simple_query
+    // then reported 25P02, masking the real error (observed live: a
+    // receipt insert's true 3F000 surfaced as 25P02).
+    //
+    // These tests use a scratch database (created here, dropped here,
+    // WITH (FORCE)) so nothing in the container's shared fixtures is
+    // touched — including on panic, via the ScratchDb drop guard.
+
+    /// Rewrite the base conninfo (key=value or URI form) to point at
+    /// `dbname`, so the scratch tests follow DQL_TEST_PG_CONNINFO too.
+    fn conninfo_for_db(dbname: &str) -> String {
+        let base = base_conninfo();
+        if let Some(scheme_end) = base.find("://") {
+            // URI form: replace any path (and drop query params).
+            let authority_start = scheme_end + 3;
+            let rest = &base[authority_start..];
+            let authority_end = rest
+                .find(['/', '?'])
+                .map(|i| authority_start + i)
+                .unwrap_or(base.len());
+            format!("{}/{}", &base[..authority_end], dbname)
+        } else {
+            // key=value form: later dbname would be ambiguous — filter.
+            let mut parts: Vec<&str> = base
+                .split_whitespace()
+                .filter(|kv| !kv.starts_with("dbname="))
+                .collect();
+            let db_kv = format!("dbname={}", dbname);
+            parts.push(&db_kv);
+            parts.join(" ")
+        }
+    }
+
+    /// Creates the scratch database on construction, drops it (WITH
+    /// FORCE) on Drop — panic-safe cleanup, nothing else touched.
+    struct ScratchDb {
+        name: &'static str,
+    }
+
+    impl ScratchDb {
+        fn create(name: &'static str) -> Option<Self> {
+            let (mut admin, _) = session_on(&base_conninfo())?;
+            // A previous red/panicked run may have left the db behind.
+            let drop_sql = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", name);
+            match admin.query(b(&drop_sql)).unwrap() {
+                QueryResponse::Header { .. } => {}
+                QueryResponse::Error { message, .. } => panic!(
+                    "scratch pre-drop failed: {}",
+                    String::from_utf8_lossy(&message)
+                ),
+            }
+            match admin.query(b(&format!("CREATE DATABASE {}", name))).unwrap() {
+                QueryResponse::Header { .. } => {}
+                QueryResponse::Error { message, .. } => panic!(
+                    "scratch create failed: {}",
+                    String::from_utf8_lossy(&message)
+                ),
+            }
+            Some(ScratchDb { name })
+        }
+    }
+
+    impl Drop for ScratchDb {
+        fn drop(&mut self) {
+            if let Some((mut admin, _)) = session_on(&base_conninfo()) {
+                let sql = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
+                let _ = admin.query(b(&sql));
+            }
+        }
+    }
+
+    fn expect_header(
+        session: &mut Session<DirectTransport<PgParty>>,
+        sql: &str,
+    ) -> (delightql_protocol::QueryHandle, Vec<Dimension>) {
+        match session.query(b(sql)).unwrap() {
+            QueryResponse::Header { handle, dimensions } => (handle, dimensions),
+            QueryResponse::Error { message, .. } => panic!(
+                "expected Header for {:?}, got Error: {}",
+                sql,
+                String::from_utf8_lossy(&message)
+            ),
+        }
+    }
+
+    fn expect_error(session: &mut Session<DirectTransport<PgParty>>, sql: &str) -> String {
+        match session.query(b(sql)).unwrap() {
+            QueryResponse::Error { message, .. } => {
+                String::from_utf8_lossy(&message).to_string()
+            }
+            QueryResponse::Header { .. } => {
+                panic!("expected Error for {:?}, got Header", sql)
+            }
+        }
+    }
+
+    /// Run `sql`, fetch the single cell of the single row, close.
+    fn one_cell(
+        session: &mut Session<DirectTransport<PgParty>>,
+        rows_o: AgreedOrientation,
+        sql: &str,
+    ) -> String {
+        let (handle, _) = expect_header(session, sql);
+        let cells = match session.fetch(&handle, Projection::All, 10, rows_o).unwrap() {
+            FetchResponse::Data { cells } => cells,
+            other => panic!("expected Data for {:?}, got {:?}", sql, other),
+        };
+        assert_eq!(cells.len(), 1, "expected one row from {:?}", sql);
+        assert_eq!(cells[0].len(), 1, "expected one column from {:?}", sql);
+        let value = String::from_utf8_lossy(cells[0][0].as_deref().unwrap()).to_string();
+        session.close(handle).unwrap();
+        value
+    }
+
+    /// (a) A mid-transaction statement's TRUE error must surface: the
+    /// receipt-insert shape from P2 §D — a statement referencing the
+    /// (nonexistent on PG) `temp` schema inside an open transaction —
+    /// must report 3F000 / `schema "temp" does not exist`, never the
+    /// 25P02 aborted-transaction mask.
+    ///
+    /// (b) The descriptor-prepare must never abort an open transaction
+    /// one statement early. The distinguishing probe: a MULTI-STATEMENT
+    /// text mid-transaction. Its prepare fails by construction ("cannot
+    /// insert multiple commands into a prepared statement") while its
+    /// execution is perfectly valid — so if the bracket dies, only the
+    /// prepare can have killed it. It must execute, the transaction must
+    /// stay healthy, and COMMIT must persist the rows.
+    ///
+    /// Also pins the agreed degradations/recoveries: descriptors are
+    /// degraded (empty) inside the bracket, and return (int4) after it.
+    #[test]
+    fn mid_transaction_prepare_neither_masks_errors_nor_aborts_bracket() {
+        // Gate on the live container first (skip, don't fail).
+        if session_on(&base_conninfo()).is_none() {
+            return;
+        }
+        let Some(scratch) = ScratchDb::create("probe_e3a_pgparty") else {
+            return;
+        };
+        let scratch_uri = conninfo_for_db(scratch.name);
+        let (mut s, rows_o) =
+            session_on(&scratch_uri).expect("scratch db just created must be connectable");
+
+        // ── (a) the masking reproduction ────────────────────────────
+        // The charter's receipt-insert shape. Live PG's TRUE error for
+        // DML into a missing schema is 42P01 "relation … does not
+        // exist" (3F000 is the CREATE spelling, next bracket): what
+        // matters is that the statement's OWN error surfaces, never the
+        // 25P02 aborted-transaction mask.
+        expect_header(&mut s, "CREATE TABLE receipts_probe (id int, note text)");
+        expect_header(&mut s, "BEGIN");
+        expect_header(&mut s, "INSERT INTO receipts_probe VALUES (1, 'ok')");
+        let msg = expect_error(&mut s, "INSERT INTO temp.__r_x VALUES (1)");
+        assert!(
+            !msg.contains("25P02"),
+            "the true error must not be masked as 25P02 (aborted transaction).\ngot: {msg}"
+        );
+        assert!(
+            msg.contains("42P01") && msg.contains("relation \"temp.__r_x\" does not exist"),
+            "the TRUE error (42P01, the DML's own) must surface.\ngot: {msg}"
+        );
+        expect_header(&mut s, "ROLLBACK");
+
+        // The receipt-SHELL shape (P2 §A's first hard refusal), whose
+        // true error IS 3F000 `schema "temp" does not exist`.
+        expect_header(&mut s, "BEGIN");
+        expect_header(&mut s, "INSERT INTO receipts_probe VALUES (2, 'ok')");
+        let msg = expect_error(&mut s, "CREATE TEMP TABLE temp.__r_x (x int)");
+        assert!(
+            !msg.contains("25P02"),
+            "the true error must not be masked as 25P02 (aborted transaction).\ngot: {msg}"
+        );
+        assert!(
+            msg.contains("3F000") && msg.contains("schema \"temp\" does not exist"),
+            "the TRUE error (3F000, missing schema) must surface.\ngot: {msg}"
+        );
+        expect_header(&mut s, "ROLLBACK");
+
+        // ── (b) prepare-only failure must not abort the bracket ─────
+        expect_header(&mut s, "BEGIN");
+        expect_header(&mut s, "CREATE TABLE bracket_probe (x int)");
+        // Valid to EXECUTE, impossible to PREPARE: multi-statement text.
+        expect_header(
+            &mut s,
+            "INSERT INTO bracket_probe VALUES (1); INSERT INTO bracket_probe VALUES (2)",
+        );
+        // The transaction is still healthy and sees both rows…
+        let (h, dims) = expect_header(&mut s, "SELECT count(*) AS n FROM bracket_probe");
+        // …with descriptors DEGRADED inside the bracket (the agreed
+        // multi-statement-fallback behavior, now also the mid-txn one).
+        assert_eq!(
+            dims[0].descriptor,
+            b(""),
+            "mid-transaction descriptors are degraded (no prepare inside the bracket)"
+        );
+        match s.fetch(&h, Projection::All, 10, rows_o).unwrap() {
+            FetchResponse::Data { cells } => assert_eq!(cells, vec![vec![cell("2")]]),
+            other => panic!("expected Data, got {:?}", other),
+        }
+        s.close(h).unwrap();
+        expect_header(&mut s, "COMMIT");
+        assert_eq!(
+            one_cell(&mut s, rows_o, "SELECT count(*) AS n FROM bracket_probe"),
+            "2",
+            "the bracket must have committed both rows"
+        );
+
+        // ── descriptors recover outside the transaction ─────────────
+        let (h, dims) = expect_header(&mut s, "SELECT 1 AS x");
+        assert_eq!(
+            dims[0].descriptor,
+            b("int4"),
+            "descriptor harvest must be back in force outside the transaction"
+        );
+        s.close(h).unwrap();
+
+        // Disconnect the scratch session before the guard drops the db.
+        drop(s);
+        drop(scratch);
+
+        // The scratch database is gone; nothing else was touched.
+        let (mut admin, admin_rows) = session_on(&base_conninfo()).unwrap();
+        assert_eq!(
+            one_cell(
+                &mut admin,
+                admin_rows,
+                "SELECT count(*) FROM pg_database WHERE datname = 'probe_e3a_pgparty'"
+            ),
+            "0",
+            "the scratch database must be dropped"
+        );
+    }
+
+    /// The classifier's contract (no container needed): every real
+    /// transaction-control statement is recognized; ambiguity always
+    /// lands on Murky (a probe), never on a wrong Opens/Closes/None.
+    #[test]
+    fn txn_effect_classification() {
+        use TxnEffect::*;
+        // The pump's literal bracket statements.
+        assert_eq!(txn_effect("BEGIN"), Opens);
+        assert_eq!(txn_effect("COMMIT"), Closes);
+        assert_eq!(txn_effect("ROLLBACK"), Closes);
+        // Spelling variants.
+        assert_eq!(txn_effect("  begin;"), Opens);
+        assert_eq!(txn_effect("START TRANSACTION ISOLATION LEVEL SERIALIZABLE"), Opens);
+        assert_eq!(txn_effect("BEGIN TRANSACTION READ WRITE"), Opens);
+        assert_eq!(txn_effect("END"), Closes);
+        assert_eq!(txn_effect("abort"), Closes);
+        assert_eq!(txn_effect("/* plan */ COMMIT"), Closes);
+        assert_eq!(txn_effect("-- note\nROLLBACK;"), Closes);
+        // Block-preserving / two-phase forms are NOT Closes.
+        assert_eq!(txn_effect("ROLLBACK TO SAVEPOINT s1"), None);
+        assert_eq!(txn_effect("COMMIT PREPARED 'gid'"), None);
+        assert_eq!(txn_effect("ROLLBACK PREPARED 'gid'"), None);
+        assert_eq!(txn_effect("PREPARE q AS SELECT 1"), None);
+        assert_eq!(txn_effect("PREPARE TRANSACTION 'gid'"), Closes);
+        assert_eq!(txn_effect("SAVEPOINT s1"), None);
+        // Ordinary statements — including CASE…END, which must NOT
+        // read as transaction control.
+        assert_eq!(txn_effect("SELECT CASE WHEN x THEN 1 ELSE 2 END FROM t"), None);
+        assert_eq!(txn_effect("INSERT INTO t VALUES (1)"), None);
+        assert_eq!(txn_effect("SELECT 'BEGIN' FROM t"), None);
+        // Multi-statement with transaction control: Murky (probe).
+        assert_eq!(txn_effect("BEGIN; INSERT INTO t VALUES (1); COMMIT"), Murky);
+        // Multi-statement without: None.
+        assert_eq!(
+            txn_effect("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)"),
+            None
+        );
+        // The naive split's failure mode is CONSERVATIVE: a `;COMMIT`
+        // inside a literal reads as Murky (wasted probe), never Idle.
+        assert_eq!(txn_effect("INSERT INTO t VALUES ('a;COMMIT;b')"), Murky);
+        // …while a plain `;` inside a literal stays None.
+        assert_eq!(txn_effect("INSERT INTO t VALUES ('a;b')"), None);
+    }
+
+    /// An erroring statement OUTSIDE any transaction must not degrade
+    /// descriptor harvest for the statements after it (the pure-query
+    /// path keeps working exactly as today). Uses only the shared
+    /// fixture read-only + errors: no objects created anywhere.
+    #[test]
+    fn descriptors_survive_errors_outside_transactions() {
+        let Some((mut s, _)) = session() else { return };
+        // (SELECT from a missing schema is 42P01 "relation does not
+        // exist" — 3F000 is the CREATE/INSERT spelling; P1 §H1.)
+        let msg = expect_error(&mut s, "SELECT * FROM temp.__r_x");
+        assert!(msg.contains("42P01"), "expected 42P01, got: {msg}");
+        let (h, dims) = expect_header(&mut s, "SELECT 1 AS x");
+        assert_eq!(
+            dims[0].descriptor,
+            b("int4"),
+            "a standalone error must not cost the next statement its descriptors"
+        );
+        s.close(h).unwrap();
     }
 
     #[test]

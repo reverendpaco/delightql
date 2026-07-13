@@ -44,15 +44,34 @@ impl DatabaseSchema for BootstrapBackedSchema {
         // We try namespace fq_name first, then fall back to cartridge source_ns.
         let qualifier = schema.unwrap_or("main");
 
-        // Primary path: look up by namespace fq_name
+        // Primary path: look up by namespace fq_name.
+        //
+        // ONE entity's columns, never a merge: when several same-name
+        // entities are activated in the namespace, the inner SELECT picks a
+        // single entity, PREFERRING the session-materialized one — this is
+        // the ruled bare-name shadowing (materialize-pipe §6: temp shadows
+        // main for unqualified names; a name-keyed schema question is
+        // unqualified-shaped). A `temp_table!(staged)` over a physical
+        // `staged` leaves BOTH registered (the F2 retirement is scoped to
+        // the session cartridge), so without this preference the old join
+        // would interleave two column sets. Qualified reads punch through
+        // via `DelightQLSystem::session_shadow_split` instead of this path.
+        // Pinned by session_shadow_tests::bare_read_prefers_session_materialized_temp.
         let sql_by_namespace = r#"
             SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
             FROM entity_attribute ea
-            JOIN entity e ON e.id = ea.entity_id
-            JOIN activated_entity ae ON ae.entity_id = e.id
-            JOIN namespace n ON n.id = ae.namespace_id
-            WHERE n.fq_name = ?1
-              AND e.name = ?2
+            WHERE ea.entity_id = (
+                SELECT e.id
+                FROM entity e
+                JOIN activated_entity ae ON ae.entity_id = e.id
+                JOIN namespace n ON n.id = ae.namespace_id
+                JOIN cartridge c ON c.id = e.cartridge_id
+                WHERE n.fq_name = ?1
+                  AND e.name = ?2
+                ORDER BY (c.source_uri = 'session://materialized') DESC,
+                         e.id DESC
+                LIMIT 1
+            )
               AND ea.attribute_type = 'output_column'
             ORDER BY ea.position
         "#;

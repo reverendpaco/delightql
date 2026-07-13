@@ -375,6 +375,11 @@ pub(super) fn bubble_unary_operator(
             ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields },
             BubbledState::empty(),
         )),
+        // No expressions to bubble; pass through unchanged.
+        op @ ast_unresolved::UnaryRelationalOperator::SignedWitness
+        | op @ ast_unresolved::UnaryRelationalOperator::DirectivePipeInvocation { .. } => {
+            Ok((op, BubbledState::empty()))
+        }
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. } => unreachable!(),

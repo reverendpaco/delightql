@@ -152,6 +152,24 @@ pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
             schema_ops::resolve_narrowing_destructure(column, fields, available)
         }
 
+        ast_unresolved::UnaryRelationalOperator::SignedWitness => {
+            schema_ops::resolve_signed_witness(available)
+        }
+
+        // Constructed by builder 2.2 (IMPLEMENTATION-PLAN §2.2); its
+        // lowering is the effect transformer. Clean refusal, not a panic:
+        // an `x |> f!(r(*))(*)` outside an effect plan reaches here.
+        ast_unresolved::UnaryRelationalOperator::DirectivePipeInvocation { name, .. } => {
+            Err(crate::error::DelightQLError::transformation_error(
+                format!(
+                    "the piped directive invocation '|> {}(…)(…)' is not implemented \
+                     yet: directive invocations compile through the effect transformer \
+                     (EFFECT-ALGEBRA §1; IMPLEMENTATION-PLAN Epic 3)",
+                    name
+                ),
+                "directive pipe invocation not yet implemented",
+            ))
+        }
         // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
         ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
         | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. } => {

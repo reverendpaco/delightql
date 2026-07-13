@@ -244,6 +244,13 @@ pub enum EntityType {
     /// System-namespace relations backed by Rust code
     /// Examples: sys::execution.compile
     BinRelation = 19,
+
+    /// DelightQL effect rule — a user directive definition (EFFECT-ALGEBRA §1):
+    /// `name!(*) :- body`. Registered at consult time (IMPLEMENTATION-PLAN
+    /// §2.2 "effect rules as a new entity type"); demanded through the effect
+    /// transformer (Epic 3). The stored entity name carries the `!` suffix,
+    /// matching the BinPseudoPredicate naming convention.
+    DqlEffectRule = 20,
 }
 
 impl EntityType {
@@ -268,6 +275,7 @@ impl EntityType {
         Self::DqlErContextRule,
         Self::DqlCompanionDefinition,
         Self::BinRelation,
+        Self::DqlEffectRule,
     ];
 
     /// Convert to integer for database storage
@@ -297,6 +305,7 @@ impl EntityType {
             Self::DqlErContextRule => "DQLErContextRule",
             Self::DqlCompanionDefinition => "DQLCompanionDefinition",
             Self::BinRelation => "BinRelation",
+            Self::DqlEffectRule => "DQLEffectRule",
         }
     }
 
@@ -340,6 +349,7 @@ impl EntityType {
             17 => Ok(Self::DqlErContextRule),
             18 => Ok(Self::DqlCompanionDefinition),
             19 => Ok(Self::BinRelation),
+            20 => Ok(Self::DqlEffectRule),
             _ => Err(anyhow!("Invalid entity_type_enum value: {}", value)),
         }
     }

@@ -271,6 +271,14 @@ pub struct CteBinding<Phase = Unresolved> {
     /// The name to bind this expression to
     #[lispy("name")]
     pub name: String,
+    /// True when the label carries the `!` effect marker (`expression : name!`,
+    /// EFFECT-ALGEBRA R4): the CTE's expression demands a directive. Read
+    /// from the CST's `effect_marker` field by the builder (REPORT-2.1 note 1
+    /// — previously silently dropped; pinned by
+    /// `effect_cte_marker_is_read_by_builder`).
+    #[serde(default)]
+    #[lispy("effect_label")]
+    pub effect_label: bool,
     /// Whether this CTE references itself (recursive CTE).
     /// Populated by the addresser; phantom in earlier phases.
     #[lispy("is_recursive")]

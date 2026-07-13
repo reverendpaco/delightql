@@ -459,7 +459,9 @@ fn extract_qualifiers_from_operator(
         | resolved::UnaryRelationalOperator::Transform { .. }
         | resolved::UnaryRelationalOperator::EmbedMapCover { .. }
         | resolved::UnaryRelationalOperator::HoViewApplication { .. }
-        | resolved::UnaryRelationalOperator::DirectiveTerminal { .. } => {}
+        | resolved::UnaryRelationalOperator::DirectiveTerminal { .. }
+        | resolved::UnaryRelationalOperator::SignedWitness
+        | resolved::UnaryRelationalOperator::DirectivePipeInvocation { .. } => {}
     }
 }
 

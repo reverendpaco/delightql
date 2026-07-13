@@ -19,6 +19,25 @@ pub fn looks_like_uri(path: &str) -> bool {
     }
 }
 
+/// Split a trailing `#schema` FRAGMENT off a URI-shaped mount target,
+/// CLIENT-SIDE (EFFECTS-ON-TARGETS-PLAN §4.2): a fragment is a locator
+/// WITHIN the resource and is never sent to the server — libpq / the
+/// DuckDB adapter receive only the base. `postgres:///db#production`
+/// → (`postgres:///db`, Some("production")); no fragment → (input, None).
+/// Only URI-shaped inputs are split; a bare file path keeps any `#`
+/// verbatim (a legit filename character), so the fragment surface is a
+/// deliberate URI feature. `?schema=` is NOT a fragment and is never
+/// consulted here (it was rejected as fake conninfo, §4.9).
+pub fn split_schema_fragment(input: &str) -> (String, Option<String>) {
+    if !looks_like_uri(input) {
+        return (input.to_string(), None);
+    }
+    match input.split_once('#') {
+        Some((base, frag)) if !frag.is_empty() => (base.to_string(), Some(frag.to_string())),
+        _ => (input.to_string(), None),
+    }
+}
+
 /// One classified route for a `--db` / `mount!()` input — THE single
 /// scheme-dispatch point (URI-DESIGN.md §4: users speak in resources,
 /// DelightQL chooses mechanisms). An unknown scheme teaches; it can never
@@ -217,7 +236,8 @@ impl ConnectionManager {
                 let _conn = mgr.connect().map_err(|e| anyhow::anyhow!("{}", e))?;
                 Ok(())
             }
-            // Connected eagerly at construction (fail-closed).
+            // Fatboy children connect lazily (fatboy_exec FatboyManager::relay);
+            // there is no eager connection to test here.
             ConnectionManager::Fatboy(_) => Ok(()),
         }
     }
@@ -396,65 +416,8 @@ impl ConnectionManager {
             // NULL fidelity is native here: relay Cells are Option already.
             ConnectionManager::Fatboy(mgr) => mgr
                 .relay()
-                .query_nullable(sql)
+                .and_then(|r| r.query_nullable(sql))
                 .map_err(|e| anyhow::anyhow!("{}", e)),
-        }
-    }
-
-    /// Execute a DML statement with NULL fidelity preserved.
-    ///
-    /// Returns (columns, rows) where affected_rows is the first column.
-    pub fn execute_dml_typed(
-        &self,
-        sql: &str,
-        _db_label: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
-        match self {
-            ConnectionManager::SQLite(conn) => {
-                use delightql_backends::SqliteExecutor;
-                let mut executor = delightql_backends::SqliteExecutorImpl::new(conn);
-                let affected = executor
-                    .execute_statement(sql)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                Ok((
-                    vec!["affected_rows".to_string()],
-                    vec![vec![Some(affected.to_string())]],
-                ))
-            }
-            ConnectionManager::Pipe(_) => {
-                anyhow::bail!("DML not supported on pipe connections")
-            }
-            ConnectionManager::Fatboy(_) => {
-                anyhow::bail!("DML not yet supported on fatboy connections")
-            }
-        }
-    }
-
-    /// Execute a DML statement (DELETE, UPDATE, INSERT) and return affected row count.
-    pub fn execute_dml(
-        &self,
-        sql: &str,
-        _db_label: &str,
-    ) -> Result<delightql_backends::QueryResults> {
-        match self {
-            ConnectionManager::SQLite(conn) => {
-                use delightql_backends::SqliteExecutor;
-                let mut executor = delightql_backends::SqliteExecutorImpl::new(conn);
-                let affected = executor
-                    .execute_statement(sql)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                Ok(delightql_backends::QueryResults {
-                    columns: vec!["affected_rows".to_string()],
-                    rows: vec![vec![affected.to_string()]],
-                    row_count: 1,
-                })
-            }
-            ConnectionManager::Pipe(_) => {
-                anyhow::bail!("DML not supported on pipe connections")
-            }
-            ConnectionManager::Fatboy(_) => {
-                anyhow::bail!("DML not yet supported on fatboy connections")
-            }
         }
     }
 
@@ -462,9 +425,23 @@ impl ConnectionManager {
     ///
     /// The CLI never touches the individual components — it passes the
     /// opaque struct straight to `delightql_core::api::open()`.
-    pub fn create_system_components(&self) -> Result<delightql_types::ConnectionComponents> {
+    ///
+    /// `mounted_schema` is the client-parsed `#schema` fragment (Phase B):
+    /// it threads to the recorded `source_ns` AND the introspector/schema
+    /// scope (so the recorded fact and the introspected schema agree). A
+    /// fragment on a SQLite target REFUSES (R-S5): SQLite has no schemas.
+    pub fn create_system_components(
+        &self,
+        mounted_schema: Option<String>,
+    ) -> Result<delightql_types::ConnectionComponents> {
         match self {
             ConnectionManager::SQLite(sqlite_conn) => {
+                if mounted_schema.is_some() {
+                    anyhow::bail!(
+                        "SQLite has no schemas; a #schema fragment is only meaningful \
+                         on a Postgres or DuckDB target (use mount! without a fragment)"
+                    );
+                }
                 let raw_conn_arc = sqlite_conn.get_connection_arc();
                 let schema = Box::new(delightql_backends::DynamicSqliteSchema::new(
                     raw_conn_arc.clone(),
@@ -489,32 +466,45 @@ impl ConnectionManager {
                     db_type: "sqlite".to_string(),
                     mechanism: "in-process".to_string(),
                     identity,
+                    // SQLite has no schema concept (R-S5); leave unset.
+                    mounted_schema: None,
                 })
             }
+            // siso (pipe) is a fallback mechanism outside the schema-mount
+            // scope (R-S5: fatboy PG+DuckDB); a fragment on it is ignored.
             ConnectionManager::Pipe(mgr) => crate::pipe_exec::create_pipe_system_components(mgr),
             ConnectionManager::Fatboy(mgr) => {
-                crate::fatboy_exec::create_fatboy_system_components(mgr)
+                crate::fatboy_exec::create_fatboy_system_components(mgr, mounted_schema)
             }
         }
     }
 
-    /// Open a DqlHandle using the factory-only API.
-    ///
-    /// Returns `Box<dyn DqlHandle>` — the compiler-enforced API boundary.
-    /// The handle starts with an empty "main" namespace. The CLI must send
-    /// `mount!("path", "main")` to populate it.
-    pub fn open_handle(&self) -> Result<Box<dyn delightql_core::api::DqlHandle>> {
-        let factory = Box::new(crate::connection_factory::CliConnectionFactory);
-        // Second factory (types-level) powers mount!/import! of URI-scheme
-        // databases (pipe://, etc.). Same unit struct, both trait impls.
-        let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
-        delightql_core::api::open(
-            factory,
-            Some(mount_factory),
-            Some(crate::help_surface::build()),
-        )
-            .map_err(|e| anyhow::anyhow!("{}", e))
-    }
+}
+
+/// Open a DqlHandle using the factory-only API.
+///
+/// Returns `Box<dyn DqlHandle>` — the compiler-enforced API boundary.
+/// The handle starts with an empty "main" namespace. The CLI must send
+/// `mount!("path", "main")` to populate it.
+///
+/// This is a FREE function, not a method on `ConnectionManager`, because it
+/// builds the session purely from the factories and never consulted a
+/// manager's own backend — the session's one backend is created by the
+/// `mount!` first-query, not by any pre-opened `ConnectionManager`. Keeping
+/// it self-less makes that separation explicit (it used to be a `&self`
+/// method that ignored `self`, which read as if a manager fed the handle;
+/// bugs/duplicate-fatboy-spawn-one-shot).
+pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
+    let factory = Box::new(crate::connection_factory::CliConnectionFactory);
+    // Second factory (types-level) powers mount!/import! of URI-scheme
+    // databases (pipe://, etc.). Same unit struct, both trait impls.
+    let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
+    delightql_core::api::open(
+        factory,
+        Some(mount_factory),
+        Some(crate::help_surface::build()),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 #[cfg(test)]

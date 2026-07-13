@@ -28,6 +28,54 @@ pub(crate) struct ConsultResult {
     pub replaced_entities: Vec<String>,
 }
 
+/// One liminal-directive receipt row, headed for the consulted namespace's
+/// ledger (EFFECT-ALGEBRA §8, THE LIMINAL RELATION). Collected by the liminal
+/// executor (bin_cartridge/prelude/consult.rs) in file-appearance order and
+/// persisted by `consult_file_inner` inside the consult transaction. The row
+/// schema is `success` (always 1 — session directives never answer NO),
+/// `operation` (the directive's name as written, with `!`), then the named
+/// echoes per the §8 table; echo VALUES are the arguments as written in the
+/// file (receipts echo parameters — compile-time constants, §3).
+#[derive(Debug, Clone)]
+pub(crate) struct LiminalReceipt {
+    /// Directive name as written, with the `!` (e.g. `"enlist!"`).
+    pub operation: String,
+    /// Echo columns in receipt order: (column name per the §8 table, value
+    /// as written — `None` renders as SQL NULL, e.g. `enlist!`'s plain-form
+    /// `into` or `reconsult!` re-reading the same file).
+    pub echoes: Vec<(String, Option<String>)>,
+}
+
+impl LiminalReceipt {
+    /// The ordered echo-column names as a JSON array (drives the ledger's
+    /// corresponding-union presentation schema at drill time).
+    pub fn echoes_json(&self) -> String {
+        let names: Vec<&str> = self.echoes.iter().map(|(k, _)| k.as_str()).collect();
+        serde_json::to_string(&names).expect("echo names serialize")
+    }
+
+    /// The receipt row as a JSON object: success, operation, then echoes.
+    pub fn receipt_json(&self) -> String {
+        let mut obj = String::from("{\"success\":1,\"operation\":");
+        obj.push_str(
+            &serde_json::to_string(&self.operation).expect("operation serializes"),
+        );
+        for (name, value) in &self.echoes {
+            obj.push(',');
+            obj.push_str(&serde_json::to_string(name).expect("echo name serializes"));
+            obj.push(':');
+            match value {
+                Some(v) => {
+                    obj.push_str(&serde_json::to_string(v).expect("echo value serializes"))
+                }
+                None => obj.push_str("null"),
+            }
+        }
+        obj.push('}');
+        obj
+    }
+}
+
 /// DelightQL system state with user database and internal metadata store
 ///
 /// This struct manages:
@@ -95,6 +143,13 @@ pub(crate) struct DelightQLSystem {
     /// discarded — the review's "quiet path"). Pinned by the RED unit test
     /// `seed_no_effect_statement_is_refused`.
     effects_executed: Cell<u64>,
+
+    /// True once `register_run_created_object` has registered anything on a
+    /// `session://materialized` cartridge. Gates the shadow-split probe in
+    /// qualified resolution (`session_shadow_split`) so sessions that never
+    /// ran a DDL directive pay zero extra bootstrap queries. Never reset:
+    /// a stale `true` only costs the probe query, never correctness.
+    session_materialized_names: Cell<bool>,
 }
 
 /// Embedded DQL source for the sys::meta generator HO view.
@@ -760,6 +815,79 @@ pub(crate) fn imprint_clash_probe_sql(master: &str, name_lit: &str) -> String {
     )
 }
 
+/// The engine's OWN default schema for a fatboy `connection_type` — the
+/// downstream resolution of a NULL (bare-mount) `source_ns` (schema-mount
+/// Phase A; the read side of `fatboy_exec.rs::default_schema`, which is the
+/// write side the introspector uses). 3 = postgres → `public`, 4 = duckdb →
+/// `main`; every other type (SQLite primary, siso, unknown) has no derivable
+/// engine schema and answers `None`. Pinned by
+/// `schema_mount_recording_tests::bare_mount_falls_back_to_the_engine_default`.
+pub(crate) fn default_engine_schema_for_type(connection_type: Option<i64>) -> Option<String> {
+    match connection_type {
+        Some(3) => Some("public".to_string()),
+        Some(4) => Some("main".to_string()),
+        _ => None,
+    }
+}
+
+/// The introspection SQL `register_run_created_object` routes to a created
+/// object's OWN connection, selected by that connection's dialect (E-T4;
+/// P2 "what breaks first" item 7). Answers `(sql, name_col, type_col)` —
+/// the 0-based row positions of the column name and its engine type.
+///
+/// - **SQLite** (and every dialect without a specific arm): `PRAGMA
+///   table_info` verbatim — the pre-E-T4 spelling, byte-identical.
+/// - **DuckDB**: PRAGMA table_info is KEPT, deliberately: it works there
+///   (REPORT-T-P3 §H wrinkle 7), its boolean-shaped `notnull`/`pk` columns
+///   sit at positions this parse never reads (name = 1, type = 2), and the
+///   information_schema alternative would need CATALOG scoping (temp
+///   objects live in catalog `temp`, durable in the file's basename
+///   catalog — P3 §B/§E) for zero gain. Pinned by
+///   `duckdb_readback_keeps_pragma_and_tolerates_the_boolean_shape`.
+/// - **Postgres**: the information_schema form, mirroring the fatboy
+///   mount's own working introspection (fatboy_exec.rs `introspect_sql` —
+///   the proven pattern over the relay), scoped to ONE schema: the
+///   session's temp schema when the name is temp-held (the shadow
+///   preference resolution itself applies — materialize-pipe §6, P1 §B),
+///   else the MOUNTED schema. `None` when the mounted schema is not
+///   derivable — the caller abstains (registers nothing) rather than
+///   guess. Pinned by
+///   `pg_readback_routes_information_schema_sql_to_the_objects_connection`
+///   and `system::readback_sql_tests`. E-T5's live lane must confirm
+///   information_schema.columns lists the session's own temp tables on PG
+///   (compile-only here — effects on fatboys are struck).
+pub(crate) fn created_object_readback_sql(
+    dialect: crate::pipeline::generator_v3::SqlDialect,
+    name: &str,
+    mounted_schema: Option<&str>,
+) -> Option<(String, usize, usize)> {
+    match dialect {
+        crate::pipeline::generator_v3::SqlDialect::PostgreSQL => {
+            let schema_lit = mounted_schema?.replace('\'', "''");
+            let name_lit = name.replace('\'', "''");
+            Some((
+                format!(
+                    "SELECT c.column_name, c.data_type \
+                     FROM information_schema.columns c \
+                     WHERE c.table_name = '{n}' \
+                       AND c.table_schema = COALESCE(\
+                           (SELECT tn.nspname FROM pg_class t \
+                             JOIN pg_namespace tn ON tn.oid = t.relnamespace \
+                            WHERE t.relname = '{n}' \
+                              AND t.relnamespace = pg_my_temp_schema()), \
+                           '{s}') \
+                     ORDER BY c.ordinal_position",
+                    n = name_lit,
+                    s = schema_lit
+                ),
+                0,
+                1,
+            ))
+        }
+        _ => Some((format!("PRAGMA table_info({})", quote_ident(name)), 1, 2)),
+    }
+}
+
 /// The loud half of `blueprint_shadowing`: badged `imprint/blueprint/inert`.
 pub(crate) fn refuse_if_blueprint(conn: &Connection, fq_name: &str) -> Result<()> {
     if let Some(bp) = blueprint_shadowing(conn, fq_name)? {
@@ -1386,6 +1514,192 @@ mod imprint_helper_tests {
     }
 }
 
+#[cfg(test)]
+mod readback_sql_tests {
+    //! E-T4: the registration read-back's per-dialect SQL SELECTION
+    //! (EFFECTS-ON-TARGETS-PLAN §3; P2 "what breaks first" item 7).
+    //! Compile-only — routing and shape tolerance are pinned in
+    //! effect_transformer/tests.rs; live behavior is E-T5's lane.
+    use super::created_object_readback_sql;
+    use crate::pipeline::generator_v3::SqlDialect;
+
+    #[test]
+    fn readback_sql_is_pragma_table_info_on_sqlite_and_duckdb() {
+        for dialect in [SqlDialect::SQLite, SqlDialect::DuckDB] {
+            let (sql, name_col, type_col) =
+                created_object_readback_sql(dialect, "staged", None)
+                    .expect("sqlite/duckdb read-back never abstains");
+            assert_eq!(sql, "PRAGMA table_info(\"staged\")");
+            // name at 1, type at 2 — DuckDB's boolean-shaped notnull/pk
+            // (positions 3/5, P3 H7) are never read.
+            assert_eq!((name_col, type_col), (1, 2));
+        }
+    }
+
+    #[test]
+    fn readback_sql_on_postgres_scopes_the_mounted_schema_and_prefers_temp() {
+        let (sql, name_col, type_col) =
+            created_object_readback_sql(SqlDialect::PostgreSQL, "dur", Some("public"))
+                .expect("a known mounted schema yields the information_schema form");
+        assert!(sql.contains("information_schema.columns"), "{sql}");
+        assert!(sql.contains("c.table_name = 'dur'"), "{sql}");
+        // ONE schema: the session temp schema when the name is temp-held
+        // (resolution's shadow preference), else the mounted schema.
+        assert!(sql.contains("pg_my_temp_schema()"), "{sql}");
+        assert!(sql.contains("'public'"), "{sql}");
+        assert!(sql.contains("ORDER BY c.ordinal_position"), "{sql}");
+        assert_eq!((name_col, type_col), (0, 1));
+        // Literal escaping is real: a quote in the name cannot break out.
+        let (evil, _, _) =
+            created_object_readback_sql(SqlDialect::PostgreSQL, "a'b", Some("public")).unwrap();
+        assert!(evil.contains("'a''b'"), "{evil}");
+        assert!(!evil.contains("= 'a'b'"), "{evil}");
+    }
+
+    #[test]
+    fn readback_abstains_on_postgres_without_a_mounted_schema() {
+        assert!(
+            created_object_readback_sql(SqlDialect::PostgreSQL, "dur", None).is_none(),
+            "an unknowable mounted schema abstains (never a guessed schema)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_mount_recording_tests {
+    //! schema-mount Phase A (EFFECTS-ON-TARGETS-PLAN §4.1): the mounted
+    //! engine schema is a RECORDED per-mount fact — the cartridge's
+    //! `source_ns`, fed by `ConnectionComponents.mounted_schema` — not a
+    //! connection-type derivation. A mount given a specific schema records
+    //! THAT schema (and introspects it); a bare mount records NULL and the
+    //! namespace-keyed lookup resolves the engine default downstream, so it
+    //! is behavior-identical to the pre-Phase-A derivation.
+    use super::DelightQLSystem;
+    use delightql_types::factory::ConnectionComponents;
+    use delightql_types::introspect::{
+        DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity,
+    };
+    use delightql_types::test_utils::{MockDatabaseConnection, MockSchemaProvider};
+    use delightql_types::Result;
+    use std::sync::{Arc, Mutex};
+
+    /// Discovers ONE entity named after the schema it was built for — the
+    /// mock analog of `FatboyIntrospector` introspecting its own bound
+    /// schema. Proves the schema flows to INTROSPECTION, not merely to the
+    /// recorded fact.
+    struct SchemaEchoIntrospector {
+        schema: Option<String>,
+    }
+    impl DatabaseIntrospector for SchemaEchoIntrospector {
+        fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
+            let s = self.schema.as_deref().unwrap_or("public");
+            Ok(vec![DiscoveredEntity {
+                name: format!("in_{s}").into(),
+                entity_type_id: 10,
+                attributes: vec![DiscoveredAttribute {
+                    name: "id".into(),
+                    data_type: "INTEGER".to_string(),
+                    position: 0,
+                    is_nullable: true,
+                }],
+            }])
+        }
+        fn introspect_entities_in_schema(&self, _schema: &str) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+    }
+
+    fn fresh_system() -> DelightQLSystem {
+        let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        DelightQLSystem::new(
+            conn,
+            Box::new(SchemaEchoIntrospector { schema: None }),
+            "sqlite",
+        )
+        .expect("fresh in-memory system should build")
+    }
+
+    /// A postgres-typed mock mount whose `ConnectionComponents.mounted_schema`
+    /// and introspector schema AGREE (the wiring `create_fatboy_system_components`
+    /// builds).
+    fn pg_components(mounted_schema: Option<&str>) -> ConnectionComponents {
+        ConnectionComponents {
+            connection: Arc::new(Mutex::new(MockDatabaseConnection::new())),
+            schema: Box::new(MockSchemaProvider::new()),
+            introspector: Box::new(SchemaEchoIntrospector {
+                schema: mounted_schema.map(str::to_string),
+            }),
+            db_type: "postgresql".to_string(),
+            mechanism: "fatboy".to_string(),
+            identity: None,
+            mounted_schema: mounted_schema.map(str::to_string),
+        }
+    }
+
+    /// A mount given a SPECIFIC schema records it as `source_ns`; the
+    /// namespace-keyed lookup reads that recorded fact VERBATIM (type 3 would
+    /// have DERIVED `public`); and the mount introspected THAT schema's
+    /// entity. Red before Phase A: `mounted_engine_schema_for_connection`
+    /// derived `public` from connection_type, ignoring the recorded schema.
+    #[test]
+    fn mount_records_the_schema_as_source_ns_and_the_lookup_reads_it() {
+        let mut system = fresh_system();
+        let (conn_id, count) = system
+            .register_external_connection(pg_components(Some("reporting")), "rep", "mock://rep")
+            .expect("register the reporting-schema mount");
+        assert_eq!(count, 1, "the schema's one entity is introspected");
+        // The recorded fact, read back namespace-keyed — verbatim, NOT derived.
+        assert_eq!(
+            system.mounted_engine_schema_for_namespace("rep").unwrap(),
+            Some("reporting".to_string()),
+            "the lookup reads the RECORDED schema, not the connection-type default"
+        );
+        // The connection-keyed shim agrees via the namespace route.
+        assert_eq!(
+            system.mounted_engine_schema_for_connection(conn_id).unwrap(),
+            Some("reporting".to_string()),
+        );
+        // Introspection followed the schema: the discovered entity is named
+        // for 'reporting' and is registered in the namespace.
+        assert!(
+            system
+                .get_canonical_entity_name("rep", "in_reporting")
+                .unwrap()
+                .is_some(),
+            "the mount introspected the 'reporting' schema's entity"
+        );
+    }
+
+    /// A BARE mount (mounted_schema None) records a NULL `source_ns`; the
+    /// lookup falls back to the engine default for the connection type
+    /// (postgres → `public`, duckdb → `main`) — byte-identical to the
+    /// pre-Phase-A derivation, keeping reads unqualified.
+    #[test]
+    fn bare_mount_falls_back_to_the_engine_default() {
+        let mut system = fresh_system();
+        let (conn_id, _count) = system
+            .register_external_connection(pg_components(None), "plain", "mock://plain")
+            .expect("register the bare mount");
+        assert_eq!(
+            system.mounted_engine_schema_for_namespace("plain").unwrap(),
+            Some("public".to_string()),
+            "a NULL source_ns resolves the engine default downstream"
+        );
+        assert_eq!(
+            system.mounted_engine_schema_for_connection(conn_id).unwrap(),
+            Some("public".to_string()),
+            "the connection shim agrees with the namespace lookup"
+        );
+        // The default introspection discovered the default schema's entity.
+        assert!(
+            system
+                .get_canonical_entity_name("plain", "in_public")
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
 /// Validate value-function clause discipline for a multi-clause definition —
 /// the FUNCTIONAL half of "The Two Algebras" (clause-head-catechism.md §II;
 /// DDL-CLAUSE-ALGEBRA-ANALYSIS.md RULE 2).
@@ -1503,6 +1817,223 @@ fn validate_function_clause_discipline(
     Ok(())
 }
 
+/// Validate effect-algebra discipline for one name-group at consult time —
+/// the sibling of `validate_function_clause_discipline` (the RULE 2
+/// precedent; IMPLEMENTATION-PLAN §2.2). Covers the per-definition
+/// structural rules of EFFECT-ALGEBRA.md:
+///
+/// - **R1 (purity)**: a rule whose head lacks `!` must not contain a
+///   directive. Pinned by the effects ball (rules--25_r1_purity:
+///   "its head lacks '!' but its body demands").
+/// - **R2 (ending rule)**: an effect body must end in a directive.
+///   Pinned by rules--26_r2_ending ("must end in a directive").
+/// - **R3 (body grammar)**: enforced structurally by
+///   `EffectBody::from_query` (single expression + CTEs).
+/// - **R4 (effect labels), refusal half**: a CTE whose expression demands a
+///   directive must carry a `!`-marked label. Pinned by rules--27_r4_label
+///   ("its label must be '!'-marked"). The WARN half (a `!` label on a pure
+///   CTE) is DEFERRED — the runner has no warning channel (plan §2.2 F4).
+/// - **R9 (session directives are liminal-only)**: session directives and
+///   `run!` refuse in effect bodies (`doc!` and `run_namespace!` exempt).
+///   Pinned by rules--30_r9_session_in_body ("legal only in the liminal
+///   space") and rules--31_r9_run_in_body ("never changes the world it was
+///   compiled against").
+/// - **F2 (main! single clause)**: pinned by main--23_main_second_clause
+///   ("may only be single-claused").
+///
+/// R7 (vacuity WARN) is deferred with R4's WARN half. R6 (no recursion) is
+/// a file-level check — see `validate_effect_rule_recursion`.
+///
+/// Returns `Some((rule_name, demanded_names))` when the group is an effect
+/// rule (the R6 DAG edges), `None` for pure groups.
+fn validate_effect_algebra_discipline(
+    defs: &[crate::pipeline::asts::ddl::DdlDefinition],
+) -> Result<Option<(String, Vec<String>)>> {
+    use crate::pipeline::asts::ddl::{DdlBody, DdlHead};
+    use crate::pipeline::asts::effects;
+
+    let Some(first) = defs.first() else {
+        return Ok(None);
+    };
+
+    // --- Pure heads: R1 (purity). ---
+    if !matches!(first.head, DdlHead::EffectRule { .. }) {
+        for def in defs {
+            // Only relational bodies can demand directives today (scalar
+            // function bodies have no relational directive positions).
+            if let DdlBody::Relational(ref query) = def.body {
+                let invocations = effects::collect_directive_invocations_in_query(query);
+                if let Some(inv) = invocations.first() {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "effect/rule/purity",
+                        format!(
+                            "definition '{}': its head lacks '!' but its body demands \
+                             the directive '{}' — a rule without the effect marker must \
+                             not contain a directive (EFFECT-ALGEBRA R1). Declare the \
+                             effect in the head: '{}!(*) :- …'.",
+                            def.name, inv.name, def.name
+                        ),
+                        "directive in a pure rule body",
+                    ));
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    // --- Effect-rule heads. ---
+
+    // F2: main! may only be single-claused.
+    if first.name == "main!" && defs.len() > 1 {
+        return Err(DelightQLError::validation_error_categorized(
+            "effect/main/multi_clause",
+            format!(
+                "effect rule 'main!' may only be single-claused (EFFECT-ALGEBRA F2): \
+                 found {} clauses. Split the arms into named effect rules and demand \
+                 them from the single main! body.",
+                defs.len()
+            ),
+            "main! may only be single-claused",
+        ));
+    }
+
+    let rule = effects::EffectRule::from_ddl_definitions(&first.name, defs)?;
+    let mut demanded: Vec<String> = Vec::new();
+
+    for clause in &rule.clauses {
+        // R2: the body expression must end in a directive.
+        if !effects::ends_in_directive(&clause.body.expression) {
+            return Err(DelightQLError::validation_error_categorized(
+                "effect/rule/ending",
+                format!(
+                    "effect rule '{}': its body must end in a directive \
+                     (EFFECT-ALGEBRA R2). To return an ordinary table, pipe it \
+                     through the post-pipe returning! directive: '… |> returning!(*)'.",
+                    rule.name
+                ),
+                "effect body must end in a directive",
+            ));
+        }
+
+        // R4 (refusal half): an effect-demanding CTE must wear a ! label.
+        for cte in &clause.body.ctes {
+            if cte.demands_directive && !cte.effect_marked {
+                return Err(DelightQLError::validation_error_categorized(
+                    "effect/cte/label",
+                    format!(
+                        "effect rule '{}': the CTE '{}' demands a directive, so \
+                         its label must be '!'-marked — write ': {}!' \
+                         (EFFECT-ALGEBRA R4).",
+                        rule.name, cte.name, cte.name
+                    ),
+                    "effect CTE without ! label",
+                ));
+            }
+        }
+
+        // R9: session directives (doc! exempt) and run! refuse in bodies.
+        for inv in effects::demanded_directive_names(&clause.body) {
+            match inv.category {
+                effects::DirectiveCategory::Session if inv.name != "doc!" => {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "effect/body/session_directive",
+                        format!(
+                            "effect rule '{}': its body demands the session directive \
+                             '{}'. Session directives alter what the compiler resolves \
+                             against — rules, connections, names — and are legal only in \
+                             the liminal space and at the REPL/CLI top level \
+                             (EFFECT-ALGEBRA R9): mount and consult before the run, not \
+                             during it. Shape the session in the file's liminal space \
+                             (above the rules) and let the body demand the work. \
+                             (Exempt, because they cannot change resolution: doc! — \
+                             annotation only — and run_namespace! — its target's rules \
+                             already exist when the body is compiled.)",
+                            rule.name, inv.name
+                        ),
+                        "session directive in effect body",
+                    ));
+                }
+                effects::DirectiveCategory::Execution if inv.name == "run!" => {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "effect/body/run",
+                        format!(
+                            "effect rule '{}': its body demands run!. run! consults its \
+                             file, which would extend the set of rules the run was \
+                             compiled against while the run is executing (EFFECT-ALGEBRA \
+                             R9) — a run never changes the world it was compiled against. \
+                             consult! the file in the liminal space and demand \
+                             run_namespace!(ns) from the body instead: its target's rules \
+                             already exist at compile time.",
+                            rule.name
+                        ),
+                        "run! in effect body",
+                    ));
+                }
+                _ => {}
+            }
+            demanded.push(inv.name);
+        }
+    }
+
+    Ok(Some((rule.name, demanded)))
+}
+
+/// R6 (no recursion): an effect rule must not invoke itself, directly or
+/// transitively — every effect rule expands to a finite static DAG
+/// (EFFECT-ALGEBRA R6). Checked over the effect rules of one consulted file
+/// (cross-file cycles are impossible: an already-registered rule was
+/// validated against the rules that existed at ITS registration, which
+/// cannot include this file's). Pinned by the effects ball
+/// (rules--28_r6_recursion: "must not recurse").
+fn validate_effect_rule_recursion(edges: &[(String, Vec<String>)]) -> Result<()> {
+    use std::collections::HashMap;
+    let graph: HashMap<&str, &Vec<String>> =
+        edges.iter().map(|(n, d)| (n.as_str(), d)).collect();
+
+    fn visit<'a>(
+        node: &'a str,
+        graph: &HashMap<&'a str, &'a Vec<String>>,
+        path: &mut Vec<&'a str>,
+    ) -> Option<Vec<String>> {
+        if let Some(pos) = path.iter().position(|n| *n == node) {
+            let mut cycle: Vec<String> = path[pos..].iter().map(|s| s.to_string()).collect();
+            cycle.push(node.to_string());
+            return Some(cycle);
+        }
+        let Some(demands) = graph.get(node) else {
+            return None;
+        };
+        path.push(node);
+        for next in demands.iter() {
+            if graph.contains_key(next.as_str()) {
+                if let Some(cycle) = visit(next, graph, path) {
+                    return Some(cycle);
+                }
+            }
+        }
+        path.pop();
+        None
+    }
+
+    for (name, _) in edges {
+        let mut path = Vec::new();
+        if let Some(cycle) = visit(name, &graph, &mut path) {
+            return Err(DelightQLError::validation_error_categorized(
+                "effect/rule/recursion",
+                format!(
+                    "effect rule '{}' must not recurse, directly or transitively \
+                     (EFFECT-ALGEBRA R6: every effect rule expands to a finite \
+                     static DAG). Cycle: {}.",
+                    name,
+                    cycle.join(" -> ")
+                ),
+                "recursive effect rule",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Register catalog views in sys::meta at bootstrap time.
 ///
 /// 1. Loads the generator HO view from embedded sys/meta.dql
@@ -1525,6 +2056,9 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
         ddl,
         count,
         None,
+        // Embedded system modules have no liminal space (§8: created by
+        // other means — empty liminal).
+        &[],
     )?;
 
     // Create a separate cartridge for the catalog wrapper entities
@@ -2074,6 +2608,7 @@ impl DelightQLSystem {
             catalog_cartridge_id: Cell::new(None),
             db_type: db_type.to_string(),
             effects_executed: Cell::new(0),
+            session_materialized_names: Cell::new(false),
         };
 
         // Eagerly load stdlib DQL overlays for universal (auto-enlisted) namespaces
@@ -2169,6 +2704,66 @@ impl DelightQLSystem {
                 .unwrap_or(SqlDialect::SQLite),
             _ => SqlDialect::SQLite,
         }
+    }
+
+    /// E-T1 plan-to-connection attribution (EFFECTS-ON-TARGETS-PLAN §3):
+    /// the connection id of the session's `main` mount, when that mount is
+    /// a FATBOY-backed engine (connection_type 3 = postgres, 4 = duckdb;
+    /// namespace.source_path ↔ connection.resource_uri, both written by
+    /// `register_external_connection`).
+    /// This is the None-plan settling road: an effect plan whose walk
+    /// resolved NO connection executes wherever the user pointed dql — the
+    /// main mount — per R-T1 ("one plan, one engine"), instead of silently
+    /// converging on the in-memory SQLite hub. Deliberately scoped to the
+    /// fatboy types: SQLite ATTACH mains live ON the hub (convergence is
+    /// correct there), and pipe/siso mains keep today's hub convergence
+    /// untouched (T0's scope — cross_test lanes unaffected).
+    ///
+    /// NOTE: this helper is ATTRIBUTION — it survived E-T5's deletion of
+    /// the T0 strike (and of `fatboy_engine_for_effect_plan`) because it
+    /// answers WHERE a None-plan executes, not whether it may. Pinned by
+    /// `anon_source_plan_with_fatboy_main_stamps_the_main_connection`
+    /// (pipeline/effect_transformer/tests.rs).
+    pub fn fatboy_main_connection_for_effect_plan(&self) -> Option<i64> {
+        let conn = self.bootstrap_connection.lock().ok()?;
+        conn.query_row(
+            "SELECT co.id FROM connection co
+             WHERE co.resource_uri =
+                   (SELECT source_path FROM namespace WHERE fq_name = 'main')
+               AND co.connection_type IN (3, 4)
+             LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    /// E-T5 siso refusal support (EFFECTS-ON-TARGETS-PLAN §3 E-T5, RULED
+    /// 2026-07-11, PERMANENT): is this connection a siso/pipe mount
+    /// (connection_type 6)? Effect plans that settle on one refuse at
+    /// compile — the siso transport is error-blind, so R-T3's
+    /// failure-aborts bracket discipline cannot be honored over it. A
+    /// `None` connection is never siso: anon-source plans settle only on
+    /// fatboy mains (`fatboy_main_connection_for_effect_plan`, types 3/4)
+    /// or stay on the hub. Used only by the effect transformer's
+    /// `refuse_siso_connection`. Pinned by
+    /// `effect_plan_on_siso_connection_refuses` /
+    /// `anon_source_plan_with_siso_mount_elsewhere_still_compiles`
+    /// (pipeline/effect_transformer/tests.rs).
+    pub fn siso_connection_for_effect_plan(&self, connection_id: Option<i64>) -> bool {
+        let Some(id) = connection_id else {
+            return false;
+        };
+        let Ok(conn) = self.bootstrap_connection.lock() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT connection_type FROM connection WHERE id = ?1",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|t| t == 6)
+        .unwrap_or(false)
     }
 
     /// Get the schema map for imported connections
@@ -2338,16 +2933,24 @@ impl DelightQLSystem {
             )
         })?;
 
-        // Install as a cartridge (no source_ns since it's a separate connection)
+        // Install as a cartridge, RECORDING the mounted engine schema as
+        // this cartridge's `source_ns` (schema-mount Phase A,
+        // EFFECTS-ON-TARGETS-PLAN §4.1). `None` — a bare mount — stays NULL,
+        // meaning "the engine's own default", resolved downstream by
+        // `mounted_engine_schema_for_namespace`; reads therefore stay
+        // unqualified, behavior-identical to the pre-Phase-A NULL. A specific
+        // schema (Phase B `#schema` / Phase C `mount_tree!`) is spelled here
+        // and flows to both durable placement and read qualification.
         let cartridge_id = {
             bootstrap_conn
                 .execute(
                     "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
-                     VALUES (?1, ?2, ?3, NULL, 1, ?4, 0)",
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, 0)",
                     rusqlite::params![
                         connection_type,
                         crate::bootstrap::SourceType::Db.as_i32(),
                         connection_uri,
+                        components.mounted_schema.as_deref(),
                         connection_id,
                     ],
                 )
@@ -2929,7 +3532,10 @@ impl DelightQLSystem {
 
         bootstrap_conn.execute_batch("BEGIN").ok();
 
-        match Self::consult_file_inner(&bootstrap_conn, &path, namespace_fq, ddl, count, None) {
+        // Autoload modules have no liminal space (§8: created by other
+        // means — empty liminal), hence the empty receipts.
+        match Self::consult_file_inner(&bootstrap_conn, &path, namespace_fq, ddl, count, None, &[])
+        {
             Ok(_) => {
                 let _ = bootstrap_conn.execute_batch("COMMIT");
                 // Register catalog wrapper for the newly-loaded stdlib namespace
@@ -3185,6 +3791,61 @@ impl DelightQLSystem {
     /// system.mount_database("./data.db", "mydata")?;
     /// // Now can query: mydata::users(*)
     /// ```
+    /// `mount_tree!()`'s system half (EFFECTS-ON-TARGETS §4.3, Phase C):
+    /// enumerate the target's PERSISTENT schemas and bind one sub-namespace
+    /// per schema (`namespace::<schema>`), ALL on ONE connection.
+    ///
+    /// The factory's `create_tree` opens a single connection (one fatboy
+    /// child) and hands back one `ConnectionComponents` per schema, every
+    /// one carrying the SAME resource identity. `register_external_connection`
+    /// deduplicates the bootstrap `connection` row by identity, so every
+    /// sub-namespace lands on ONE `connection_id` (R-S1: a cross-schema
+    /// `run!` is a single-connection, one-bracket plan). Returns the created
+    /// sub-namespaces in enumeration order (for the receipt's JSON array,
+    /// R-S3). SQLite/siso targets refuse inside `create_tree` (R-S5).
+    pub fn mount_database_tree(&mut self, uri: &str, namespace: &str) -> Result<Vec<String>> {
+        // System name guard: the USER-TYPED root may not take over a reserved
+        // system name (the sub-namespaces derive from it).
+        validate_user_namespace_target(namespace)?;
+
+        // Enumerate + build per-schema components (all sharing one child).
+        // The factory borrow ends here (NLL), freeing `&mut self` for the
+        // registration loop below (mount_database's own pattern).
+        let per_schema = {
+            let factory = self.connection_factory.as_ref().ok_or_else(|| {
+                DelightQLError::validation_error(
+                    format!(
+                        "Cannot mount_tree! '{}': URI schemes require a connection factory \
+                         (not available in this context)",
+                        uri
+                    ),
+                    "No connection factory configured",
+                )
+            })?;
+            factory.create_tree(uri).map_err(|e| {
+                DelightQLError::database_error(
+                    format!("mount_tree!() failed for '{}': {}", uri, e),
+                    e.to_string(),
+                )
+            })?
+        };
+
+        if per_schema.is_empty() {
+            return Err(DelightQLError::database_error(
+                format!("mount_tree!() found no persistent schemas on '{}'", uri),
+                "Empty schema tree",
+            ));
+        }
+
+        let mut created = Vec::with_capacity(per_schema.len());
+        for (schema, components) in per_schema {
+            let sub_ns = format!("{}::{}", namespace, schema);
+            self.register_external_connection(components, &sub_ns, uri)?;
+            created.push(sub_ns);
+        }
+        Ok(created)
+    }
+
     pub fn mount_database(&mut self, db_path: &str, namespace: &str) -> Result<()> {
         // System name guard (catechism Deviation #3): a USER-TYPED mount target
         // may not take over or nest under a reserved system name. mount_database
@@ -3274,9 +3935,13 @@ impl DelightQLSystem {
                     "No connection factory",
                 ));
             }
-            // Allow empty files (0 bytes) — SQLite creates the database on ATTACH.
-            // Only reject non-empty files that don't have a valid SQLite header.
-            if bytes_read > 0 && (bytes_read < 16 || &header != b"SQLite format 3\0") {
+            // mount! is attach-only (bugs/nullmount Phase 1; EFFECT-ALGEBRA
+            // §6). An empty (0-byte, e.g. /dev/null) or short file is not a
+            // valid SQLite database and is rejected here — create intent
+            // belongs to mount_new!, which materializes a valid header first.
+            // Pinned by new_test_suite/balls/ddl_bugs/bug_nullmount--02 and
+            // crates/delightql-cli/tests/mount_validation.rs.
+            if bytes_read < 16 || &header != b"SQLite format 3\0" {
                 return Err(DelightQLError::database_error(
                     format!(
                         "mount!() failed: '{}' is not a valid SQLite database",
@@ -3604,6 +4269,104 @@ impl DelightQLSystem {
         Ok(())
     }
 
+    /// Provision a fresh, valid, empty SQLite database at `db_path` and bind it
+    /// as namespace `namespace` (EFFECT-ALGEBRA §6, the `mount_new!`
+    /// paragraph). The create-intent counterpart of `mount_database`: where
+    /// `mount!` ATTACHES an existing database and rejects a missing/empty/
+    /// invalid path, `mount_new!` MATERIALIZES the database first, then binds
+    /// it exactly as `mount!` would.
+    ///
+    /// CLOBBER POLICY (§6, the `table!`/`table_replace!` refuse-over-clobber
+    /// posture): refuse when the path already holds content — a real database
+    /// OR any other non-empty bytes; only a MISSING or 0-byte path is
+    /// materialized. On refusal the existing file is left untouched.
+    ///
+    /// v1 SCOPE (ruled): SQLite files only. A URI scheme (`postgres://`, …) or
+    /// a DuckDB target refuses cleanly — extending to other engines is a
+    /// future increment.
+    ///
+    /// MATERIALIZE: `rusqlite::Connection::open(path)` + `PRAGMA user_version =
+    /// 0` forces the SQLite header page out (a valid 4096-byte empty db — the
+    /// mechanism proven in bugs/nullmount/ANALYSIS.md; a 0-byte file or a bare
+    /// read-only open does NOT). Then delegate to `mount_database`, so the
+    /// resulting mount — reserved-name refusal, namespace registration,
+    /// catalog wrapper — is identical to `mount!` of a valid empty database.
+    ///
+    /// Pinned by `mount_new_database_tests` (below) and the CLI
+    /// `mount_new_roundtrip` integration test (mount_new! then mount!).
+    pub fn mount_new_database(&mut self, db_path: &str, namespace: &str) -> Result<()> {
+        // Reserved-name refusal is inherited from mount_database; run it up
+        // front so we never materialize a file for a target we will refuse
+        // anyway. (mount_database re-runs it harmlessly on delegation.)
+        validate_user_namespace_target(namespace)?;
+
+        // v1 SCOPE: SQLite files only. A URI scheme refuses cleanly — the same
+        // `://` classification mount_database itself uses to route URIs.
+        if db_path.contains("://") {
+            let engine = db_path.split("://").next().unwrap_or("that engine");
+            return Err(DelightQLError::database_error(
+                format!(
+                    "mount_new!() creates a new SQLite database; to create on {}, \
+                     use its native tooling then mount!()",
+                    engine
+                ),
+                "Unsupported create target",
+            ));
+        }
+
+        // Resolve against session CWD exactly as mount_database will, so the
+        // file we materialize is the file it attaches.
+        let resolved = crate::session_cwd::resolve_path(db_path);
+        let path = resolved.as_path();
+
+        // CLOBBER POLICY: refuse a path already holding content. Only a MISSING
+        // or 0-byte path is ours to create. (A non-empty DuckDB file lands here
+        // too — refused as a clobber; attach it with mount!.)
+        if path.exists() {
+            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if len > 0 {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "mount_new!() failed: '{}' already exists; use mount!() to attach it",
+                        resolved.display()
+                    ),
+                    "Refuse to clobber",
+                ));
+            }
+        }
+
+        // MATERIALIZE a valid empty SQLite database (a header-bearing 4096-byte
+        // file). `PRAGMA user_version = 0` forces the header page out — a bare
+        // open would leave a 0-byte file that mount!'s attach-only guard
+        // rejects (bugs/nullmount/ANALYSIS.md).
+        {
+            let conn = rusqlite::Connection::open(path).map_err(|e| {
+                DelightQLError::database_error(
+                    format!(
+                        "mount_new!() failed: cannot create database at '{}': {}",
+                        resolved.display(),
+                        e
+                    ),
+                    e.to_string(),
+                )
+            })?;
+            conn.execute_batch("PRAGMA user_version = 0;").map_err(|e| {
+                DelightQLError::database_error(
+                    format!(
+                        "mount_new!() failed: cannot initialize database at '{}': {}",
+                        resolved.display(),
+                        e
+                    ),
+                    e.to_string(),
+                )
+            })?;
+        }
+
+        // Delegate to the ordinary mount path: the resulting mount is identical
+        // to mount!() of a valid empty database.
+        self.mount_database(db_path, namespace)
+    }
+
     /// Consult a DQL file containing definitions (functions and views)
     ///
     /// Load definitions from a parsed DDL file into the bootstrap metadata system.
@@ -3615,6 +4378,12 @@ impl DelightQLSystem {
     /// * `path` - Path to the DQL file (for cartridge source_uri)
     /// * `namespace` - Namespace to register under (e.g., "lib::math")
     /// * `ddl` - Pre-parsed DDL file (consumed)
+    /// * `liminal_receipts` - the file's liminal-space directive receipts, in
+    ///   file-appearance order (EFFECT-ALGEBRA §8). Written into
+    ///   `liminal_receipt` INSIDE the consult transaction, so an aborted load
+    ///   rolls the ledger away with the namespace (pinned by
+    ///   `liminal_ledger_abort_leaves_no_ledger`). Empty for inline DDL and
+    ///   for namespaces created by other means (their liminal is empty).
     ///
     /// # Returns
     /// ConsultResult with definitions loaded count and any replaced entity names
@@ -3623,6 +4392,7 @@ impl DelightQLSystem {
         path: &str,
         namespace: &str,
         ddl: DDLFile,
+        liminal_receipts: &[LiminalReceipt],
     ) -> Result<ConsultResult> {
         let count = ddl.definitions.len();
         debug!(
@@ -3663,6 +4433,7 @@ impl DelightQLSystem {
             ddl,
             count,
             ambient_data_ns.as_deref(),
+            liminal_receipts,
         );
 
         if result.is_ok() {
@@ -3721,6 +4492,7 @@ impl DelightQLSystem {
         ddl: DDLFile,
         count: usize,
         default_data_ns: Option<&str>,
+        liminal_receipts: &[LiminalReceipt],
     ) -> Result<ConsultResult> {
         // Embedded stdlib modules use their path directly as the URI;
         // filesystem consults get a file:// prefix.
@@ -3847,6 +4619,38 @@ impl DelightQLSystem {
             }
         };
 
+        // THE LIMINAL RELATION (EFFECT-ALGEBRA §8): persist the file's
+        // liminal-space receipts, one row per directive, in file-appearance
+        // order (rowid = insertion order — the engine-courtesy contract, no
+        // sequence column). This runs INSIDE the consult transaction, so an
+        // abort rolls the ledger away with the namespace (pinned by
+        // `liminal_ledger_abort_leaves_no_ledger`). A deferred liminal doc!
+        // keeps its FILE position here — the receipts vec was collected in a
+        // single pass over the file, before deferral (pinned by
+        // `liminal_ledger_doc_keeps_file_position`). A repeat consult into an
+        // existing namespace APPENDS (the namespace's liminal is the union of
+        // its files' liminal spaces); reconsult REPLACES whole via
+        // clear_namespace_contents.
+        for receipt in liminal_receipts {
+            bootstrap_conn
+                .execute(
+                    "INSERT INTO liminal_receipt (namespace_id, operation, echoes, receipt)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        namespace_id,
+                        &receipt.operation,
+                        receipt.echoes_json(),
+                        receipt.receipt_json()
+                    ],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        "Failed to record liminal receipt",
+                        e.to_string(),
+                    )
+                })?;
+        }
+
         // For inline DDL: drop-and-replace conflicting entities by name.
         // Only entities whose names match a definition in the new DDL block are
         // removed; other entities from earlier inline blocks are preserved.
@@ -3970,6 +4774,11 @@ impl DelightQLSystem {
         for def in &ddl.definitions {
             groups.entry(def.name.clone()).or_default().push(def);
         }
+
+        // R6 DAG edges collected per effect-rule group; cycle-checked after
+        // the loop (the whole consult is one transaction — a refusal rolls
+        // back every registration). See validate_effect_rule_recursion.
+        let mut effect_rule_edges: Vec<(String, Vec<String>)> = Vec::new();
 
         for (_name, defs) in &groups {
             // For multi-clause groups, concatenate source texts
@@ -4116,6 +4925,75 @@ impl DelightQLSystem {
             } else {
                 ddl_defs
             };
+
+            // foo/foo! name collision (IMPLEMENTATION-PLAN §3.0, ruled
+            // 2026-07-11): a namespace may not hold both a functor `foo` and
+            // an effect rule `foo!`. Enforced at registration time in BOTH
+            // directions, before either insert branch below (normal and
+            // deferred-HO alike). Same-file collisions are caught too:
+            // earlier groups of this consult are already inserted and
+            // activated on this connection when later groups arrive. This is
+            // the prerequisite for making doc! targets explicit — the `!`
+            // fallback in consult_body (REPORT-2.2 decision 3) stays sound
+            // only while the two names cannot coexist. Pinned by effects-ball
+            // rules--47_name_collision_effect_second and
+            // rules--48_name_collision_entity_second.
+            {
+                let group_name = first_def.name.as_str();
+                if let Some(base) = group_name.strip_suffix('!') {
+                    // The effect rule arrives second: refuse if ANY entity
+                    // named `foo` (view/table/function/fact/…) is active in
+                    // this namespace — the whole functor namespace collides.
+                    let base_exists: bool = bootstrap_conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM entity e
+                             JOIN activated_entity ae ON ae.entity_id = e.id
+                             WHERE e.name = ?1 AND ae.namespace_id = ?2)",
+                            rusqlite::params![base, namespace_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(false);
+                    if base_exists {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "effect/rule/name_collision",
+                            format!(
+                                "cannot register effect rule '{}': namespace '{}' \
+                                 already holds an entity named '{}' — a namespace \
+                                 may not hold both '{}' and '{}'.",
+                                group_name, namespace, base, base, group_name
+                            ),
+                            "effect-rule name collision",
+                        ));
+                    }
+                } else {
+                    // The plain entity arrives second: refuse if an EFFECT
+                    // RULE named `foo!` (entity type 20) is active in this
+                    // namespace. Restricted to type 20 so `!`-named built-in
+                    // pseudo-predicates can never block a plain name.
+                    let banged = format!("{}!", group_name);
+                    let effect_rule_exists: bool = bootstrap_conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM entity e
+                             JOIN activated_entity ae ON ae.entity_id = e.id
+                             WHERE e.name = ?1 AND e.type = 20 AND ae.namespace_id = ?2)",
+                            rusqlite::params![&banged, namespace_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(false);
+                    if effect_rule_exists {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "effect/rule/name_collision",
+                            format!(
+                                "cannot register '{}': namespace '{}' already \
+                                 holds an effect rule '{}' — a namespace may not \
+                                 hold both '{}' and '{}'.",
+                                group_name, namespace, banged, group_name, banged
+                            ),
+                            "effect-rule name collision",
+                        ));
+                    }
+                }
+            }
 
             // When ddl_defs is empty (HO view body deferred), derive
             // entity metadata from the parser-level Definition instead.
@@ -4311,6 +5189,7 @@ impl DelightQLSystem {
                         DdlHead::SigmaPredicate { .. } => "sigma predicate",
                         DdlHead::Fact => "fact",
                         DdlHead::ErRule { .. } => "er-context rule",
+                        DdlHead::EffectRule { .. } => "effect rule",
                     }
                 }
 
@@ -4367,6 +5246,38 @@ impl DelightQLSystem {
                 // the helper, so sigma predicates (the relational OR path) are
                 // untouched. See validate_function_clause_discipline.
                 validate_function_clause_discipline(&ddl_defs)?;
+            }
+
+            // Effect-algebra discipline (EFFECT-ALGEBRA R1/R2/R3/R4/R9 + F2)
+            // — every group, single- or multi-clause; the effect sibling of
+            // validate_function_clause_discipline above.
+            if let Some(edges) = validate_effect_algebra_discipline(&ddl_defs)? {
+                effect_rule_edges.push(edges);
+            }
+
+            // F2: at most one main! per namespace. A second file consulted
+            // into the same namespace must not smuggle in another main!.
+            if first_ddl.name == "main!" {
+                let already_has_main: bool = bootstrap_conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM entity e
+                         JOIN activated_entity ae ON ae.entity_id = e.id
+                         WHERE e.name = 'main!' AND ae.namespace_id = ?1)",
+                        [namespace_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                if already_has_main {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "effect/main/duplicate",
+                        format!(
+                            "namespace '{}' already has a main! — at most one main! \
+                             per namespace (EFFECT-ALGEBRA F2).",
+                            namespace
+                        ),
+                        "duplicate main! in namespace",
+                    ));
+                }
             }
 
             debug!(
@@ -4546,6 +5457,12 @@ impl DelightQLSystem {
                     )
                 })?;
         }
+
+        // R6 (no recursion): the file's effect rules must form a DAG.
+        // Checked after all groups are known (forward references between
+        // rules in one file are legal); a refusal rolls the whole consult
+        // transaction back.
+        validate_effect_rule_recursion(&effect_rule_edges)?;
 
         debug!(
             "consult_file: Successfully loaded {} definitions into '{}'",
@@ -5275,6 +6192,18 @@ impl DelightQLSystem {
             )
             .map_err(|e| {
                 DelightQLError::database_error("Failed to delete namespace_alias", e.to_string())
+            })?;
+
+        // The liminal ledger dies with its namespace (EFFECT-ALGEBRA §8:
+        // catalog state, session-scoped; pinned by
+        // `liminal_ledger_dies_with_namespace`).
+        bootstrap_conn
+            .execute(
+                "DELETE FROM liminal_receipt WHERE namespace_id = ?1",
+                [namespace_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to delete liminal_receipt", e.to_string())
             })?;
 
         // 2. Grounding table
@@ -6260,6 +7189,22 @@ impl DelightQLSystem {
             .map_err(|e| {
                 DelightQLError::database_error(
                     "Failed to delete activated_entity orphans",
+                    e.to_string(),
+                )
+            })?;
+
+        // Reconsulting replaces the liminal ledger WHOLE (EFFECT-ALGEBRA §8:
+        // the record describes THE load, not the history of loads; pinned by
+        // `liminal_ledger_reconsult_replaces_whole`). The new file's receipts
+        // are re-inserted by consult_file_inner in the same transaction.
+        bootstrap_conn
+            .execute(
+                "DELETE FROM liminal_receipt WHERE namespace_id = ?1",
+                [namespace_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to clear liminal_receipt",
                     e.to_string(),
                 )
             })?;
@@ -8222,6 +9167,566 @@ impl DelightQLSystem {
         }
     }
 
+    /// Register an object a run's DDL directive created
+    /// (`temp_table!`/`table!`/`temp_view!` — materialize-pipe.md §1:
+    /// "catalog-registered … its name resolves like any table's") so
+    /// post-run statements resolve it bare. Called by the Epic-3.3 entry
+    /// point (relay/entry.rs) after a successful run; pinned by the
+    /// effects ball's ddl_receipt--12/--13/--14 and util--36 post-state
+    /// reads.
+    ///
+    /// The recipe is `imprint_namespace`'s registration tail: read the
+    /// engine-typed columns back via CONNECTION-APPROPRIATE introspection
+    /// SQL (`created_object_readback_sql` — PRAGMA table_info on
+    /// SQLite/DuckDB, information_schema on postgres; E-T4, P2 "what
+    /// breaks first" item 7: PRAGMA on a PG connection silently registered
+    /// nothing), retire the run's own stale registration (fresh scratch
+    /// per run), then write entity + output_column attributes +
+    /// activation, on a per-connection `session://materialized` cartridge
+    /// with NO schema alias — the generator then spells reads unqualified,
+    /// which is exactly how SQLite finds temp-schema objects
+    /// (materialize-pipe §3).
+    ///
+    /// The retirement is SCOPED to the session cartridge (F2, RULED
+    /// 2026-07-11): a same-name mount-introspected physical entity keeps
+    /// its registration — the temp SHADOWS it for unqualified resolution
+    /// (materialize-pipe §6, a preference, not a catalog edit), and a
+    /// qualified read still reaches it. Pinned by session_shadow_tests::
+    /// {physical_registration_survives_temp_registration,
+    /// reregistration_retires_prior_session_entry_only} and the effects
+    /// ball's scratch--52_qualified_read_reaches_physical.
+    ///
+    /// Returns Ok(false) when there is nothing to register: the object
+    /// does not exist (an exit-flagged run skipped its CREATE) or the
+    /// namespace 'main' is absent. materialize-pipe's full nominal
+    /// placement (`<conn-ns>::temp` mirror + scoped enlistment edges) is
+    /// that spec's own later work; this is the session-catalog slice the
+    /// entry points need.
+    pub fn register_run_created_object(
+        &mut self,
+        name: &str,
+        is_view: bool,
+        connection_id: i64,
+    ) -> Result<bool> {
+        // 1. Read the columns back from the object's own connection, with
+        // the connection's own introspection SQL (E-T4: the read-back is
+        // dialect-selected; a PG mount whose mounted schema is unknowable
+        // ABSTAINS — the F7/abstain doctrine, never a guessed schema).
+        let dialect = self.dialect_for_connection(Some(connection_id));
+        let mounted_schema = if matches!(
+            dialect,
+            crate::pipeline::generator_v3::SqlDialect::PostgreSQL
+        ) {
+            self.mounted_engine_schema_for_connection(connection_id)?
+        } else {
+            None
+        };
+        let Some((readback_sql, name_col, type_col)) =
+            created_object_readback_sql(dialect, name, mounted_schema.as_deref())
+        else {
+            return Ok(false); // PG with no derivable mounted schema: abstain
+        };
+        let conn_arc = if connection_id == 2 {
+            self.connection.clone()
+        } else {
+            self.get_connection(connection_id)?
+        };
+        let attr_cols: Vec<(String, String)> = {
+            let guard = conn_arc.lock().map_err(|e| {
+                DelightQLError::connection_poison_error(
+                    "Failed to acquire connection lock for created-object read-back",
+                    format!("Connection was poisoned: {}", e),
+                )
+            })?;
+            match guard.query_all_string_rows(&readback_sql, &[]) {
+                Ok((_cols, rows)) => rows
+                    .iter()
+                    .filter_map(|r| Some((r.get(name_col)?.clone(), r.get(type_col)?.clone())))
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        if attr_cols.is_empty() {
+            return Ok(false); // not created (e.g. skipped past the exit flag)
+        }
+
+        // 2. Target namespace: the object's OWN connection's namespace —
+        // `main` for the primary, the mounted namespace for an external
+        // connection (REPORT-3.3 discovery 5's revisit: registering
+        // cross-connection creations into `main` put them in a namespace
+        // their connection cannot serve). Falls back to `main` when the
+        // connection has no resolvable namespace.
+        let ns_fq = self
+            .connection_namespace_fq(connection_id)?
+            .unwrap_or_else(|| "main".to_string());
+
+        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for created-object registration",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+
+        let ns_id: i64 = match bootstrap_conn
+            .query_row(
+                "SELECT id FROM namespace WHERE fq_name = ?1",
+                [ns_fq.as_str()],
+                |row| row.get(0),
+            )
+            .ok()
+        {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        // 3. The per-connection session cartridge (created on first use).
+        let cartridge_id: i64 = match bootstrap_conn
+            .query_row(
+                "SELECT id FROM cartridge
+                 WHERE source_uri = 'session://materialized' AND connection_id = ?1",
+                [connection_id],
+                |row| row.get(0),
+            )
+            .ok()
+        {
+            Some(id) => id,
+            None => {
+                bootstrap_conn
+                    .execute(
+                        "INSERT INTO cartridge (language, source_type_enum, source_uri, \
+                         source_ns, connected, connection_id, is_universal)
+                         VALUES (?1, ?2, 'session://materialized', NULL, 1, ?3, 0)",
+                        rusqlite::params![
+                            3, // SQLite language ID
+                            SourceType::Db.as_i32(),
+                            connection_id,
+                        ],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            "Failed to create session-materialization cartridge",
+                            e.to_string(),
+                        )
+                    })?;
+                bootstrap_conn.last_insert_rowid()
+            }
+        };
+
+        // 4. Retire the run's own stale registration (a re-run re-creates).
+        // SCOPED to the session cartridge: a same-name entity from any other
+        // cartridge (e.g. the mount-introspected physical table) keeps its
+        // registration — the shadow is a resolution preference, not a
+        // catalog edit (F2 ruling; materialize-pipe §6). Pinned by
+        // session_shadow_tests::physical_registration_survives_temp_registration.
+        let stale_ids: Vec<i64> = {
+            let mut stmt = bootstrap_conn
+                .prepare(
+                    "SELECT e.id FROM entity e
+                     JOIN activated_entity ae ON ae.entity_id = e.id
+                     WHERE ae.namespace_id = ?1 AND e.name = ?2
+                       AND e.cartridge_id = ?3",
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error("query stale created entity", e.to_string())
+                })?;
+            let rows = stmt
+                .query_map(rusqlite::params![ns_id, name, cartridge_id], |r| r.get(0))
+                .map_err(|e| {
+                    DelightQLError::database_error("query stale created entity", e.to_string())
+                })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for eid in stale_ids {
+            let _ = bootstrap_conn
+                .execute("DELETE FROM activated_entity WHERE entity_id = ?1", [eid]);
+            let _ = bootstrap_conn
+                .execute("DELETE FROM entity_attribute WHERE entity_id = ?1", [eid]);
+            let _ =
+                bootstrap_conn.execute("DELETE FROM entity_clause WHERE entity_id = ?1", [eid]);
+            let _ = bootstrap_conn.execute("DELETE FROM entity WHERE id = ?1", [eid]);
+        }
+
+        // 5. Entity + attributes + activation (entity type: 1 table, 2 view).
+        bootstrap_conn
+            .execute(
+                "INSERT INTO entity (name, type, cartridge_id, doc) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    name,
+                    if is_view { 2 } else { 1 },
+                    cartridge_id,
+                    "Session-materialized by a DDL directive",
+                ],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to register created object '{}'", name),
+                    e.to_string(),
+                )
+            })?;
+        let entity_id = bootstrap_conn.last_insert_rowid();
+        for (position, (col_name, col_type)) in attr_cols.iter().enumerate() {
+            bootstrap_conn
+                .execute(
+                    "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, \
+                     data_type, position, is_nullable, default_value)
+                     VALUES (?1, ?2, 'output_column', ?3, ?4, 1, NULL)",
+                    rusqlite::params![entity_id, col_name, col_type, position as i64 + 1],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!("Failed to register attribute '{}' for '{}'", col_name, name),
+                        e.to_string(),
+                    )
+                })?;
+        }
+        bootstrap_conn
+            .execute(
+                "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![entity_id, ns_id, cartridge_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to activate created object '{}'", name),
+                    e.to_string(),
+                )
+            })?;
+
+        // Arm the shadow-split probe (see `session_materialized_names`).
+        self.session_materialized_names.set(true);
+
+        Ok(true)
+    }
+
+    /// The F2 shadow split: when BOTH a session-materialized entity
+    /// (`register_run_created_object`'s cartridge) and an entity from any
+    /// other cartridge (e.g. a mount-introspected physical table) hold
+    /// `entity_name` activated in `namespace_fq`, return their entity ids
+    /// as `(session, competitor)`. `None` when there is no such collision.
+    ///
+    /// This is the seam qualified resolution uses to punch through the
+    /// temp shadow (materialize-pipe §6: the shadow covers UNQUALIFIED
+    /// names only). Gated by `session_materialized_names`, so sessions
+    /// that never materialized anything answer without touching bootstrap.
+    /// Pinned by session_shadow_tests::
+    /// qualified_read_reaches_physical_after_same_name_temp.
+    pub fn session_shadow_split(
+        &self,
+        namespace_fq: &str,
+        entity_name: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        if !self.session_materialized_names.get() {
+            return Ok(None);
+        }
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for shadow-split probe",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let (session_id, competitor_id): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT
+                     MAX(CASE WHEN c.source_uri = 'session://materialized'
+                              THEN e.id END),
+                     MAX(CASE WHEN c.source_uri <> 'session://materialized'
+                              THEN e.id END)
+                 FROM activated_entity ae
+                 JOIN entity e ON e.id = ae.entity_id
+                 JOIN cartridge c ON c.id = e.cartridge_id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 WHERE e.name = ?1 COLLATE NOCASE AND n.fq_name = ?2",
+                rusqlite::params![entity_name, namespace_fq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("shadow-split probe", e.to_string())
+            })?;
+        Ok(match (session_id, competitor_id) {
+            (Some(s), Some(c)) => Some((s, c)),
+            _ => None,
+        })
+    }
+
+    /// The engine schema (ATTACH alias) where a mounted namespace's
+    /// PHYSICAL tables live, recovered from the connection itself via
+    /// PRAGMA database_list — the `imprint_namespace` precedent (its step
+    /// 4b): a mounted "main" deliberately carries no alias in its
+    /// cartridge (reads resolve unqualified via SQLite's cross-schema
+    /// search), so an operation that must BYPASS the temp schema — here
+    /// the F2 qualified-read punch-through — matches the namespace's
+    /// source file against the attached databases. `None` when the
+    /// namespace has no source file or no attached schema matches (the
+    /// caller then has no physical schema to punch through to).
+    pub fn physical_schema_alias_for_namespace(
+        &self,
+        namespace_fq: &str,
+        connection_id: i64,
+    ) -> Result<Option<String>> {
+        let source_path: Option<String> = {
+            let conn = self.bootstrap_connection.lock().map_err(|e| {
+                DelightQLError::connection_poison_error(
+                    "Failed to acquire bootstrap lock for schema-alias recovery",
+                    format!("Connection was poisoned: {}", e),
+                )
+            })?;
+            conn.query_row(
+                "SELECT source_path FROM namespace
+                 WHERE fq_name = ?1 AND source_path IS NOT NULL",
+                [namespace_fq],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+        let Some(path) = source_path else {
+            return Ok(None);
+        };
+        let Ok(want) = std::fs::canonicalize(&path) else {
+            return Ok(None);
+        };
+        let target_conn = self
+            .connection_map
+            .get(&connection_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.connection));
+        let guard = target_conn.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire connection lock for schema-alias recovery",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let Ok((_cols, rows)) = guard.query_all_string_rows("PRAGMA database_list", &[]) else {
+            return Ok(None);
+        };
+        Ok(rows.iter().find_map(|row| {
+            let alias = row.get(1)?;
+            let file = row.get(2)?;
+            if file.is_empty() {
+                return None; // temp / :memory: — never a punch-through target
+            }
+            (std::fs::canonicalize(file).ok()? == want).then(|| alias.clone())
+        }))
+    }
+
+    /// The registered `output_column` attributes of one entity, in position
+    /// order — the per-entity form of what `BootstrapBackedSchema` answers
+    /// by name. Used by the qualified-resolution shadow punch-through to
+    /// read the COMPETITOR's columns when a session-materialized entity
+    /// shares its name (name-keyed lookups would answer the session entity).
+    pub fn output_columns_for_entity(
+        &self,
+        entity_id: i64,
+    ) -> Result<Vec<delightql_types::schema::ColumnInfo>> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for entity columns",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT attribute_name, position, is_nullable, data_type
+                 FROM entity_attribute
+                 WHERE entity_id = ?1 AND attribute_type = 'output_column'
+                 ORDER BY position",
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("entity column query", e.to_string())
+            })?;
+        let cols = stmt
+            .query_map([entity_id], |row| {
+                let name: String = row.get(0)?;
+                let position: i32 = row.get(1)?;
+                let is_nullable: Option<i32> = row.get(2)?;
+                let data_type: Option<String> = row.get(3)?;
+                Ok(delightql_types::schema::ColumnInfo {
+                    name: name.into(),
+                    nullable: is_nullable.unwrap_or(1) != 0,
+                    position: (position + 1) as usize, // 0-based to 1-based
+                    declared_type: data_type.filter(|t| !t.is_empty()),
+                })
+            })
+            .map_err(|e| {
+                DelightQLError::database_error("entity column query", e.to_string())
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(cols)
+    }
+
+    /// The catalog namespace a connection's entities live under: `main`
+    /// for the primary user connection (id 2, the register_connection
+    /// convention entry.rs and `register_run_created_object` share), else
+    /// the namespace whose mount-introspected entities carry the
+    /// connection's cartridge. Used by Epic 4.1 to key durable placement,
+    /// the durable clash universe, and created-object registration on the
+    /// CONNECTION rather than an unconditional `main` (materialize-pipe §2
+    /// counts connections; REPORT-3.3 discovery 5). Pinned (primary case,
+    /// end-to-end) by the CLI integration test
+    /// `table_bang_persists_to_the_db_file_across_sessions`; the
+    /// non-primary lookup is exercised by the effect_transformer
+    /// two-connection refusal tests and remains end-to-end unpinned until
+    /// a real second engine is testable (PG/DuckDB ferry).
+    pub fn connection_namespace_fq(&self, connection_id: i64) -> Result<Option<String>> {
+        if connection_id == 2 {
+            return Ok(Some("main".to_string()));
+        }
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for connection-namespace lookup",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        Ok(conn
+            .query_row(
+                "SELECT n.fq_name
+                 FROM activated_entity ae
+                 JOIN entity e ON e.id = ae.entity_id
+                 JOIN cartridge c ON c.id = e.cartridge_id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 WHERE c.connection_id = ?1
+                   AND c.source_uri <> 'session://materialized'
+                 LIMIT 1",
+                [connection_id],
+                |row| row.get(0),
+            )
+            .ok())
+    }
+
+    /// The ENGINE SCHEMA a namespace's mount binds — R-T4's durable home on
+    /// targets, now a per-mount RECORDED fact (schema-mount Phase A,
+    /// EFFECTS-ON-TARGETS-PLAN §4.1, ratified 2026-07-12; it closes the
+    /// E-T4 coupling note this method's comment used to carry). The fact is
+    /// the cartridge's `source_ns`, written by `register_external_connection`
+    /// from `ConnectionComponents.mounted_schema`:
+    /// - a SPELLED schema (Phase B `#schema` / Phase C `mount_tree!`) is
+    ///   returned verbatim — the mount introspected THAT schema, so durable
+    ///   placement and read qualification agree with it;
+    /// - a NULL `source_ns` (a bare mount — "the engine's own default")
+    ///   resolves DOWNSTREAM here to the engine default by connection type
+    ///   (3 = postgres → `public`, 4 = duckdb → `main`), so a bare mount is
+    ///   byte-identical to the pre-Phase-A derivation while its reads stay
+    ///   unqualified;
+    /// - anything else — the SQLite primary (alias-recovery territory),
+    ///   siso pipes, missing rows — answers `None`, and the PG durable CTAS
+    ///   REFUSES rather than emit search_path-fragile unqualified DDL
+    ///   (REPORT-T-P1 §E).
+    ///
+    /// NAMESPACE-keyed because one connection legitimately holds MANY
+    /// schemas under `mount_tree!` (R-S1); the connection-keyed shim below
+    /// exists only for callers holding just a connection whose
+    /// namespace↔schema mapping is 1:1 today. Pinned by
+    /// `pg_table_bang_ctas_spells_the_mounted_schema_and_registers_on_the_connection`
+    /// (effect_transformer/tests.rs) and
+    /// `mount_records_the_schema_as_source_ns_and_the_lookup_reads_it`
+    /// (schema_mount_recording_tests).
+    pub fn mounted_engine_schema_for_namespace(
+        &self,
+        namespace_fq: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for mounted-schema lookup",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        // The mount cartridge (never the session-materialization cartridge,
+        // whose source_ns is deliberately NULL) carries both the recorded
+        // schema and the connection type that seeds the default.
+        let recorded: Option<(Option<String>, Option<i64>)> = conn
+            .query_row(
+                "SELECT c.source_ns, co.connection_type
+                 FROM activated_entity ae
+                 JOIN entity e ON e.id = ae.entity_id
+                 JOIN cartridge c ON c.id = e.cartridge_id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 LEFT JOIN connection co ON co.id = c.connection_id
+                 WHERE n.fq_name = ?1
+                   AND c.source_uri <> 'session://materialized'
+                 LIMIT 1",
+                [namespace_fq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        Ok(match recorded {
+            Some((Some(schema), _)) => Some(schema),
+            Some((None, ct)) => default_engine_schema_for_type(ct),
+            None => None,
+        })
+    }
+
+    /// Connection-keyed shim over `mounted_engine_schema_for_namespace`
+    /// (schema-mount Phase A): the durable-placement and read-back callers
+    /// hold the object's CONNECTION and create in that connection's
+    /// namespace, a 1:1 mapping today. Routes to the recorded fact via the
+    /// connection's namespace; a connection with no resolvable namespace
+    /// falls back to the connection-type default directly (defensive — the
+    /// SQLite-primary/siso rows that answered `None` before Phase A).
+    pub fn mounted_engine_schema_for_connection(
+        &self,
+        connection_id: i64,
+    ) -> Result<Option<String>> {
+        if let Some(ns) = self.connection_namespace_fq(connection_id)? {
+            return self.mounted_engine_schema_for_namespace(&ns);
+        }
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for mounted-schema lookup",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let connection_type: Option<i64> = conn
+            .query_row(
+                "SELECT connection_type FROM connection WHERE id = ?1",
+                [connection_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(default_engine_schema_for_type(connection_type))
+    }
+
+    /// The KIND (`is_view`) of the session-materialized object holding
+    /// `name` on `connection_id`, if the session catalog knows one — the
+    /// compile-time holder probe behind the cross-kind temp replace
+    /// (EFFECT-ALGEBRA §3, ruled 2026-07-11: replacement is by NAME, not
+    /// kind; the replace DROP must match whatever HOLDS the name). Gated
+    /// like `session_shadow_split`: sessions that never materialized
+    /// anything answer without touching bootstrap. An object minted
+    /// outside the catalog (legacy-path DDL) stays invisible here and
+    /// surfaces the engine's own error — the F7 doctrine. Pinned by the
+    /// CLI integration tests `temp_view_over_temp_table_replaces_the_table`
+    /// / `temp_table_over_temp_view_replaces_the_view`.
+    pub fn session_created_object_kind(
+        &self,
+        name: &str,
+        connection_id: i64,
+    ) -> Result<Option<bool>> {
+        if !self.session_materialized_names.get() {
+            return Ok(None);
+        }
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for holder-kind probe",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let kind: Option<i64> = conn
+            .query_row(
+                "SELECT e.type
+                 FROM entity e
+                 JOIN cartridge c ON c.id = e.cartridge_id
+                 WHERE c.source_uri = 'session://materialized'
+                   AND c.connection_id = ?1
+                   AND e.name = ?2 COLLATE NOCASE
+                 ORDER BY e.id DESC
+                 LIMIT 1",
+                rusqlite::params![connection_id, name],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(kind.map(|t| t == 2))
+    }
+
     /// Refresh a data namespace by re-introspecting its source database.
     ///
     /// Clears all entity metadata and re-discovers entities from the same
@@ -8590,7 +10095,17 @@ impl DelightQLSystem {
         let saved_aliases = self.save_alias_state()?;
 
         // Execute embedded directives (resolve .:: and :: prefixes relative to namespace)
+        // THE LIMINAL RELATION (EFFECT-ALGEBRA §8): reconsult REPLACES the
+        // ledger whole — clear_namespace_contents deletes the old rows and
+        // consult_file_inner re-inserts THIS pass's receipts, both inside the
+        // reconsult transaction (pinned by
+        // `liminal_ledger_reconsult_replaces_whole`).
+        let mut liminal_receipts: Vec<LiminalReceipt> = Vec::new();
         for directive in &directives {
+            liminal_receipts.push(crate::bin_cartridge::prelude::consult::liminal_receipt_for(
+                &directive.name,
+                &directive.args,
+            ));
             match directive.name.as_str() {
                 "consult" => {
                     if directive.args.len() == 2 {
@@ -8676,8 +10191,15 @@ impl DelightQLSystem {
 
             // 6. Insert new entities (via consult_file_inner — namespace row already exists)
             let count = ddl.definitions.len();
-            let result =
-                Self::consult_file_inner(&bootstrap_conn, &file_path, namespace, ddl, count, None);
+            let result = Self::consult_file_inner(
+                &bootstrap_conn,
+                &file_path,
+                namespace,
+                ddl,
+                count,
+                None,
+                &liminal_receipts,
+            );
             if let Err(e) = result {
                 let _ = bootstrap_conn.execute_batch("ROLLBACK");
                 return Err(e);
@@ -8790,6 +10312,124 @@ impl DelightQLSystem {
         );
 
         Ok(entity_count)
+    }
+
+    /// THE LIMINAL RELATION (EFFECT-ALGEBRA §8): the corresponding-union echo
+    /// columns of a namespace's liminal ledger, in first-appearance order
+    /// across its receipts (the union corresponding of the file's mixed
+    /// directive schemas — later columns NULL-pad, never break).
+    ///
+    /// `Ok(None)` = no such namespace (the caller falls through to the
+    /// ordinary catalog-functor resolution and its "Table not found" error).
+    /// `Ok(Some(vec![]))` = the namespace exists with an EMPTY liminal — a
+    /// namespace created by other means (mount, imprint, ground, inline DDL)
+    /// or a liminal-space-free file; the drill then presents only the bare
+    /// receipt prefix (success, operation) over zero receipt rows (pinned by
+    /// `liminal_ledger_empty_for_non_consulted`).
+    ///
+    /// Accepts an alias as well as a fq name — returns the CANONICAL fq name
+    /// alongside the columns so the caller synthesizes against the real
+    /// namespace.
+    pub fn liminal_echo_columns(&self, ns_fq: &str) -> Result<Option<(String, Vec<String>)>> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for liminal ledger",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+
+        let found: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, fq_name FROM namespace WHERE fq_name = ?1",
+                [ns_fq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to look up namespace", e.to_string())
+            })?
+            .or_else(|| {
+                conn.query_row(
+                    "SELECT n.id, n.fq_name FROM namespace_alias a
+                     JOIN namespace n ON n.id = a.target_namespace_id
+                     WHERE a.alias = ?1",
+                    [ns_fq],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            });
+
+        let Some((ns_id, canonical_fq)) = found else {
+            return Ok(None);
+        };
+
+        // Union the per-receipt echo lists in insertion (= file-appearance)
+        // order; first appearance wins the column position.
+        let mut stmt = conn
+            .prepare("SELECT echoes FROM liminal_receipt WHERE namespace_id = ?1 ORDER BY id")
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to read liminal ledger", e.to_string())
+            })?;
+        let echo_lists: Vec<String> = stmt
+            .query_map([ns_id], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to read liminal ledger", e.to_string())
+            })?
+            .flatten()
+            .collect();
+
+        let mut union: Vec<String> = Vec::new();
+        for list in echo_lists {
+            let names: Vec<String> = serde_json::from_str(&list).map_err(|e| {
+                DelightQLError::database_error(
+                    "Corrupt liminal receipt echo list",
+                    e.to_string(),
+                )
+            })?;
+            for name in names {
+                if !union.contains(&name) {
+                    union.push(name);
+                }
+            }
+        }
+        Ok(Some((canonical_fq, union)))
+    }
+
+    /// Test-inspection: the namespace's ledger `operation` column in
+    /// insertion (= file-appearance) order; None if no such namespace.
+    /// Serves the liminal_ledger_* pins in consult.rs.
+    #[cfg(test)]
+    pub(crate) fn liminal_ledger_operations(&self, ns_fq: &str) -> Result<Option<Vec<String>>> {
+        let conn = self.bootstrap_connection.lock().expect("bootstrap lock");
+        let ns_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM namespace WHERE fq_name = ?1",
+                [ns_fq],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| DelightQLError::database_error("ns lookup", e.to_string()))?;
+        let Some(ns_id) = ns_id else { return Ok(None) };
+        let mut stmt = conn
+            .prepare("SELECT operation FROM liminal_receipt WHERE namespace_id = ?1 ORDER BY id")
+            .map_err(|e| DelightQLError::database_error("ledger read", e.to_string()))?;
+        let ops = stmt
+            .query_map([ns_id], |row| row.get::<_, String>(0))
+            .map_err(|e| DelightQLError::database_error("ledger read", e.to_string()))?
+            .flatten()
+            .collect();
+        Ok(Some(ops))
+    }
+
+    /// Test-inspection: total ledger rows across ALL namespaces — proves an
+    /// aborted or unconsulted load left no orphan receipts behind.
+    #[cfg(test)]
+    pub(crate) fn liminal_receipt_row_count(&self) -> i64 {
+        let conn = self.bootstrap_connection.lock().expect("bootstrap lock");
+        conn.query_row("SELECT COUNT(*) FROM liminal_receipt", [], |row| row.get(0))
+            .unwrap_or(-1)
     }
 
     /// Get the canonical (bootstrap-stored) name for an entity in a specific namespace.
@@ -9238,6 +10878,155 @@ mod seed_program_tests {
                 .run_seed_program(source)
                 .unwrap_or_else(|e| panic!("shipped seed '{name}' tripped the guard: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_new_database_tests {
+    //! `mount_new!` (EFFECT-ALGEBRA §6): PROVISION a fresh, valid, empty SQLite
+    //! database and bind it — the create-intent counterpart of `mount!`. These
+    //! pin the three new behaviors (materialization, clobber refusal, v1
+    //! SQLite-only scope) + reserved-name inheritance. The end-to-end
+    //! round-trip (mount_new! then mount! the same file, with a real read-back)
+    //! is the CLI `mount_new_roundtrip` integration test.
+
+    use super::DelightQLSystem;
+    use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
+    use delightql_types::test_utils::MockDatabaseConnection;
+    use delightql_types::Result;
+    use std::sync::{Arc, Mutex};
+
+    struct EmptyIntrospector;
+    impl DatabaseIntrospector for EmptyIntrospector {
+        fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+        fn introspect_entities_in_schema(&self, _schema: &str) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+    }
+
+    fn fresh_system() -> DelightQLSystem {
+        let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+            .expect("fresh in-memory system should build")
+    }
+
+    /// A valid empty SQLite database has the 16-byte header magic.
+    fn is_valid_sqlite(path: &std::path::Path) -> bool {
+        use std::io::Read;
+        let mut header = [0u8; 16];
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_exact(&mut header))
+            .map(|()| &header == b"SQLite format 3\0")
+            .unwrap_or(false)
+    }
+
+    /// mount_new! on a MISSING path materializes a valid, non-zero SQLite
+    /// database (header-bearing) and the namespace resolves.
+    #[test]
+    fn mount_new_provisions_a_valid_database_and_binds_the_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fresh.db");
+        assert!(!path.exists(), "path must start missing");
+
+        let mut system = fresh_system();
+        system
+            .mount_new_database(path.to_str().unwrap(), "freshns")
+            .expect("mount_new! should provision + bind");
+
+        // File exists, non-zero, valid SQLite header.
+        assert!(path.exists(), "database file must exist after mount_new!");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert!(len > 0, "materialized db must be non-empty, got {len} bytes");
+        assert!(is_valid_sqlite(&path), "materialized db must carry the SQLite header");
+
+        // The namespace is registered and reachable: enlist_namespace requires
+        // the namespace to exist (the enlisted-guard-classification test's
+        // proof-of-registration pattern). resolve_namespace_path returns None
+        // for an EMPTY db (no activated entities), so it is not the right probe
+        // here — the CLI round-trip test proves an in-session read end-to-end.
+        system
+            .enlist_namespace("freshns")
+            .expect("mount_new!'s namespace must be registered + reachable");
+    }
+
+    /// CLOBBER: mount_new! on a path holding a REAL database refuses with the
+    /// substring, and the existing database is left untouched.
+    #[test]
+    fn mount_new_refuses_to_clobber_an_existing_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("existing.db");
+        // A real db with a table + row.
+        {
+            let conn = rusqlite::Connection::open(&path).expect("seed db");
+            conn.execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
+                .expect("seed schema");
+        }
+        let before = std::fs::read(&path).expect("read before");
+
+        let mut system = fresh_system();
+        let err = system
+            .mount_new_database(path.to_str().unwrap(), "clobberns")
+            .expect_err("mount_new! must refuse to clobber a non-empty path");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("already exists; use mount!() to attach it"),
+            "clobber message must teach mount!(): {msg}"
+        );
+
+        // The existing database is byte-for-byte untouched.
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(before, after, "existing db must be untouched on clobber refusal");
+    }
+
+    /// A 0-byte file is NOT content — mount_new! materializes over it.
+    #[test]
+    fn mount_new_materializes_over_a_zero_byte_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.db");
+        std::fs::write(&path, b"").expect("touch 0-byte file");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let mut system = fresh_system();
+        system
+            .mount_new_database(path.to_str().unwrap(), "zerons")
+            .expect("mount_new! should materialize over a 0-byte file");
+        assert!(is_valid_sqlite(&path), "0-byte file must become a valid db");
+    }
+
+    /// v1 SCOPE: a URI target (postgres://, …) refuses cleanly with the
+    /// SQLite-only substring — no file is created.
+    #[test]
+    fn mount_new_refuses_non_sqlite_targets() {
+        let mut system = fresh_system();
+        let err = system
+            .mount_new_database("postgres://localhost/db", "pgns")
+            .expect_err("mount_new! is SQLite-only in v1");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mount_new!() creates a new SQLite database"),
+            "v1-scope message must state SQLite-only: {msg}"
+        );
+    }
+
+    /// Reserved-name refusal is inherited from mount_database: a `_`-prefixed
+    /// target is refused BEFORE any file is materialized.
+    #[test]
+    fn mount_new_inherits_the_reserved_name_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reserved.db");
+
+        let mut system = fresh_system();
+        let err = system
+            .mount_new_database(path.to_str().unwrap(), "_secret")
+            .expect_err("mount_new! must refuse a reserved namespace");
+        assert!(
+            format!("{err}").contains("reserved"),
+            "reserved-name refusal must survive: {err}"
+        );
+        // No file materialized for a refused target.
+        assert!(!path.exists(), "no db must be created for a reserved-name refusal");
     }
 }
 

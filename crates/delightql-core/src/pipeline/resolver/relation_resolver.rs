@@ -484,7 +484,7 @@ pub(super) fn resolve_ground(
         let data_ns_path = identifier.namespace_path.clone();
         match registry
             .database
-            .lookup_table_with_namespace(&data_ns_path, &identifier.name)
+            .lookup_table_with_namespace_qualified(&data_ns_path, &identifier.name)
         {
             Ok(Some((table_schema, connection_id, canonical_name, bs_opt))) => {
                 // Table found in data namespace F. Grounding is NOT propagated
@@ -512,7 +512,7 @@ pub(super) fn resolve_ground(
         // Namespace-qualified table (no grounding) - use bootstrap resolution
         match registry
             .database
-            .lookup_table_with_namespace(&identifier.namespace_path, &identifier.name)
+            .lookup_table_with_namespace_qualified(&identifier.namespace_path, &identifier.name)
         {
             Ok(Some((table_schema, connection_id, canonical_name, bs_opt))) => {
                 // Found table at namespace location
@@ -717,7 +717,7 @@ pub(super) fn r_resolve_passthrough(
     let (table_schema, canonical_name, resolved_namespace, passthrough_backend_schema) =
         match registry
             .database
-            .lookup_table_with_namespace(&identifier.namespace_path, &identifier.name)
+            .lookup_table_with_namespace_qualified(&identifier.namespace_path, &identifier.name)
         {
             Ok(Some((schema, connection_id, canon, passthrough_backend_schema))) => {
                 registry.track_connection_id(connection_id);

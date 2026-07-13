@@ -22,6 +22,12 @@ impl delightql_core::api::ConnectionFactory for CliConnectionFactory {
         &self,
         uri: &str,
     ) -> std::result::Result<CreatedConnection, Box<dyn std::error::Error + Send + Sync>> {
+        // A `#schema` fragment is a client-side locator; strip it so the
+        // engine only ever sees the base resource (Phase B). This API-level
+        // door does not carry a schema (CreatedConnection has no such field);
+        // schema threading rides the types-level `create` used by mount!.
+        let (base, _schema) = crate::connection::split_schema_fragment(uri);
+        let uri = base.as_str();
         let conn_mgr = ConnectionManager::new_file(uri)?;
         let handler = make_handler(&conn_mgr)?;
         let connection = conn_mgr.get_database_connection();
@@ -70,13 +76,51 @@ impl delightql_types::ConnectionFactory for CliConnectionFactory {
         delightql_types::ConnectionComponents,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let conn_mgr = ConnectionManager::new_file(uri)?;
+        // Phase B: strip the client-side `#schema` fragment before the base
+        // reaches the engine (libpq / the DuckDB adapter never see it).
+        let (base, schema) = crate::connection::split_schema_fragment(uri);
+        let conn_mgr = ConnectionManager::new_file(&base)?;
 
         let connection = conn_mgr.get_database_connection();
-        let mut components = conn_mgr.create_system_components()?;
+        let mut components = conn_mgr.create_system_components(schema)?;
         components.connection = connection;
 
         Ok(components)
+    }
+
+    /// `mount_tree!`'s enumeration half (Phase C): open ONE connection and
+    /// return one components per persistent schema, all sharing that
+    /// connection (R-S1). Delegates to the fatboy path; SQLite/siso refuse.
+    fn create_tree(
+        &self,
+        uri: &str,
+    ) -> std::result::Result<
+        Vec<(String, delightql_types::ConnectionComponents)>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        // A fragment is meaningless here — mount_tree! mounts EVERY schema.
+        let (base, schema) = crate::connection::split_schema_fragment(uri);
+        if schema.is_some() {
+            return Err("mount_tree! mounts every schema; drop the #schema fragment \
+                        (use mount! to bind a single schema)"
+                .into());
+        }
+        let conn_mgr = ConnectionManager::new_file(&base)?;
+        match &conn_mgr {
+            ConnectionManager::Fatboy(mgr) => {
+                Ok(crate::fatboy_exec::create_fatboy_tree_components(mgr)?)
+            }
+            ConnectionManager::SQLite(_) => {
+                Err("SQLite has no schemas; use mount! (mount_tree! is for \
+                     Postgres and DuckDB targets)"
+                    .into())
+            }
+            ConnectionManager::Pipe(_) => Err(
+                "mount_tree! is not supported over a siso pipe; mount the \
+                 Postgres/DuckDB resource directly"
+                    .into(),
+            ),
+        }
     }
 }
 

@@ -310,6 +310,57 @@ impl DelightQLSystem {
         Ok(None)
     }
 
+    /// F2 shadow split - WASM returns None (no session materialization,
+    /// no bootstrap catalog; see the native impl in system.rs)
+    pub fn session_shadow_split(
+        &self,
+        _namespace_fq: &str,
+        _entity_name: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        Ok(None)
+    }
+
+    /// Physical schema alias recovery - WASM returns None (no bootstrap,
+    /// no ATTACH machinery)
+    pub fn physical_schema_alias_for_namespace(
+        &self,
+        _namespace_fq: &str,
+        _connection_id: i64,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Per-entity registered columns - WASM returns empty (no bootstrap)
+    pub fn output_columns_for_entity(
+        &self,
+        _entity_id: i64,
+    ) -> Result<Vec<delightql_types::schema::ColumnInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// Connection-namespace lookup - WASM has only the primary
+    pub fn connection_namespace_fq(&self, _connection_id: i64) -> Result<Option<String>> {
+        Ok(Some("main".to_string()))
+    }
+
+    /// Mounted-schema derivation - WASM returns None (no fatboy mounts;
+    /// the primary dialect is SQLite, so the PG durable arm never fires)
+    pub fn mounted_engine_schema_for_connection(
+        &self,
+        _connection_id: i64,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Holder-kind probe - WASM returns None (no session catalog)
+    pub fn session_created_object_kind(
+        &self,
+        _name: &str,
+        _connection_id: i64,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// Save enlisted state - WASM no-op (no bootstrap)
     pub fn save_enlisted_state(&self) -> Result<Vec<(i32, i32)>> {
         Ok(Vec::new())

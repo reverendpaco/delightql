@@ -147,7 +147,7 @@ pub fn activate_entities_from_cartridge(
 /// - sys::entities::interior: interior_entity, interior_entity_attribute
 /// - sys::ns: namespace, activated_entity, enlisted_entity, enlisted_namespace,
 ///            namespace_alias, namespace_local_alias, namespace_local_enlist,
-///            exposed_namespace, grounding
+///            exposed_namespace, grounding, liminal_receipt
 /// - sys::execution: compilation, stack
 /// - sys::targeting: dialect_render, dialect_form_rule, dialect_capability
 /// - sys::connections: connection_type_enum (the curated `connection` entity is
@@ -205,6 +205,10 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         ("namespace_local_enlist", 5),
         ("exposed_namespace", 5),
         ("grounding", 5),
+        // sys::ns — the liminal ledger storage (EFFECT-ALGEBRA §8); read by
+        // the catalog functor's synthesized `liminal` drill expansion
+        // (resolver_fold::r_resolve_pipe). Pinned by effects/liminal--43/45.
+        ("liminal_receipt", 5),
         // sys::connections (namespace_id = 13) — reference enum (safe raw).
         // The `connection` table itself carries secret columns; its curated
         // safe-subset entity is registered separately in system.rs.

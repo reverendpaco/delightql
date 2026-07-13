@@ -28,6 +28,23 @@ fn check_database_exists(db_path: &str, make_new_db_if_missing: bool) -> Result<
     Ok(())
 }
 
+/// A plain-file `--db` target is CREATE intent when `--make-new-db-if-missing`
+/// is set and the path is missing or a 0-byte stub: the primary mount then
+/// routes through `mount_new!` (which materializes a VALID empty database)
+/// rather than the now attach-only `mount!` (bugs/nullmount Phase 1 /
+/// EFFECT-ALGEBRA §6 — `mount!` rejects missing/empty/invalid files). An
+/// existing non-empty database, or any URI, keeps `mount!`.
+/// Pinned by tests/mount_validation.rs::make_new_db_if_missing_creates_and_works.
+fn wants_provision(db_path: &str, make_new_db_if_missing: bool) -> bool {
+    if !make_new_db_if_missing || connection::looks_like_uri(db_path) {
+        return false;
+    }
+    match std::fs::metadata(db_path) {
+        Ok(m) => m.len() == 0, // 0-byte stub → provision
+        Err(_) => true,        // missing → provision
+    }
+}
+
 fn make_connection(
     db_path: &Option<String>,
     make_new_db_if_missing: bool,
@@ -42,6 +59,13 @@ fn make_connection(
 }
 
 /// Execute a query string: create session via handle, call exec_ng.
+///
+/// Human-output modes (`--to results` / default) get the Epic-3.3 console
+/// sink: mid-run `stdout!` result sets print live as the run executes
+/// (EFFECT-ALGEBRA §5; the run's return value still arrives as the ordinary
+/// result). Machine modes (`--to hash`, `--to sql`, …) install NO sink so
+/// their output stays a single machine-readable value — both halves pinned
+/// by `tests/stdout_ship.rs`.
 fn run_query(
     source: &str,
     handle: &mut dyn delightql_core::api::DqlHandle,
@@ -51,7 +75,27 @@ fn run_query(
     no_sanitize: bool,
     sequential: bool,
 ) -> Result<()> {
-    let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let console_sink = matches!(to, None | Some(args::Stage::Results));
+    let hooks = if console_sink {
+        delightql_core::api::SessionHooks {
+            on_ship: Some(Box::new(move |columns: &[String], rows: &[Vec<String>]| {
+                let output = crate::output_format::format_output_with_zebra(
+                    columns,
+                    rows,
+                    output_format,
+                    None,
+                    no_headers,
+                    no_sanitize,
+                );
+                print!("{}", output);
+            })),
+        }
+    } else {
+        delightql_core::api::SessionHooks::default()
+    };
+    let mut session = handle
+        .session_with_hooks(hooks)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     exec_ng::execute_query(
         source,
         &mut *session,
@@ -104,17 +148,56 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         anyhow::bail!("--consult flag not supported. Use consult!() in DQL source instead.");
     }
 
+    // Build the connection manager. For a fatboy target this classifies the
+    // route WITHOUT spawning a child (fatboy_exec: FatboyManager is lazy);
+    // for SQLite it opens (and, with --make-new-db-if-missing, creates) the
+    // file. It also validates existence/provisioning intent. The session's
+    // one backend is created by the mount! below (one-shot) or by the REPL's
+    // own mount (interactive) — never by this manager directly.
     let conn = make_connection(
         &db_path,
         base_args.make_new_db_if_missing,
         base_args.via.as_deref(),
     )?;
-    let mut handle = conn.open_handle()?;
 
-    // mount! the user database as "main" (if specified)
+    // Interactive REPL: it builds AND mounts its own session
+    // (repl::run_interactive_with_connection → new_with_connection), so
+    // opening a handle and mounting here would create a backend only to
+    // discard it. Hand the manager over and let the REPL be the SOLE
+    // backend-opener on its path — one child, mirroring the one-shot mount!
+    // (bugs/duplicate-fatboy-spawn-one-shot; pinned indirectly by the
+    // REPL smoke path — no ball coverage).
+    if query.is_none() && file.is_none() && io::stdin().is_terminal() {
+        #[cfg(feature = "repl")]
+        {
+            return crate::repl::run_interactive_with_connection(
+                db_path,
+                output_format,
+                *quiet,
+                highlights.as_deref(),
+                Some(conn),
+            );
+        }
+        #[cfg(not(feature = "repl"))]
+        {
+            anyhow::bail!("Interactive REPL mode requires the 'repl' feature")
+        }
+    }
+
+    let mut handle = connection::open_handle()?;
+
+    // mount! the user database as "main" (if specified). Under
+    // --make-new-db-if-missing a missing/empty target is CREATE intent and
+    // routes through mount_new! (see wants_provision). This is the sole
+    // backend-creating step on the one-shot path.
     if let Some(ref path) = db_path {
         let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
-        crate::exec_ng::run_dql_query(&format!("mount!(\"{}\", \"main\")", path), &mut *session)?;
+        let directive = if wants_provision(path, base_args.make_new_db_if_missing) {
+            format!("mount_new!(\"{}\", \"main\")", path)
+        } else {
+            format!("mount!(\"{}\", \"main\")", path)
+        };
+        crate::exec_ng::run_dql_query(&directive, &mut *session)?;
     }
 
     if !attach.is_empty() {
@@ -150,7 +233,9 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
             *no_sanitize,
             *sequential,
         )
-    } else if !io::stdin().is_terminal() {
+    } else {
+        // No query, no file, and (per the interactive check above) stdin is
+        // NOT a terminal: read the piped program from stdin.
         let mut buffer = String::new();
         io::stdin().read_to_string(&mut buffer)?;
         if buffer.trim().is_empty() {
@@ -165,20 +250,5 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
             *no_sanitize,
             *sequential,
         )
-    } else {
-        #[cfg(feature = "repl")]
-        {
-            crate::repl::run_interactive_with_connection(
-                db_path,
-                output_format,
-                *quiet,
-                highlights.as_deref(),
-                Some(conn),
-            )
-        }
-        #[cfg(not(feature = "repl"))]
-        {
-            anyhow::bail!("Interactive REPL mode requires the 'repl' feature")
-        }
     }
 }

@@ -109,6 +109,30 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         self.scope.pop();
     }
 
+    /// Namespace-aware fallback for sigma classification: does a bare guard
+    /// functor name a relation? Asks the SAME resolution authority the
+    /// relation path uses (`resolve_entity_with_alias`, which honors
+    /// `config.resolution_namespace` and enlistment edges) and accepts the
+    /// relation-shaped answers: physical/mounted tables (`DatabaseEntity`),
+    /// consulted views, consulted facts. Query-local CTEs and built-in
+    /// functions are deliberately NOT accepted — guards on those keep
+    /// today's behavior. Pinned by enlisted_guard_classification_tests
+    /// (bugs/enlisted-guard-predicate-rewrite).
+    fn functor_is_relation_entity(&mut self, functor: &str) -> bool {
+        use crate::resolution::{resolve_entity_with_alias, ResolutionResult};
+        matches!(
+            resolve_entity_with_alias(
+                functor,
+                None,
+                self.registry,
+                self.config.resolution_namespace.as_deref(),
+            ),
+            ResolutionResult::DatabaseEntity(_)
+                | ResolutionResult::ConsultedView { .. }
+                | ResolutionResult::ConsultedFact { .. }
+        )
+    }
+
     /// Push scope, resolve child through self.resolve_relational(), pop scope.
     /// Use for recursive calls that need DIFFERENT context than the current scope.
     fn resolve_child(
@@ -1090,6 +1114,75 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         ))
     }
 
+    /// Detect `ns::(*).liminal(…)` — a `liminal` interior drill whose source
+    /// is a catalog functor (a Ground in sys::meta whose name ends in `::`,
+    /// the wrapper naming convention of `register_catalog_wrapper`) — and
+    /// synthesize the wrapper body that carries the namespace's liminal
+    /// ledger as a fourth tree-group column beside entities/namespaces/name
+    /// (EFFECT-ALGEBRA §8, THE LIMINAL RELATION). Returns the pieces
+    /// r_resolve_consulted_view needs; None falls through to the ordinary
+    /// path (not a liminal drill, not a catalog functor, or no such
+    /// namespace — the stock "Table not found" then reports as today).
+    fn liminal_catalog_expansion(
+        &self,
+        base: &ast_unresolved::RelationalExpression,
+        segments: &[ast_unresolved::UnaryRelationalOperator],
+    ) -> Result<
+        Option<(
+            delightql_types::SqlIdentifier,
+            String,
+            ast_unresolved::DomainSpec,
+            Option<delightql_types::SqlIdentifier>,
+            bool,
+        )>,
+    > {
+        let Some(ast_unresolved::UnaryRelationalOperator::InteriorDrillDown { column, .. }) =
+            segments.first()
+        else {
+            return Ok(None);
+        };
+        if column != "liminal" {
+            return Ok(None);
+        }
+        let ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+            identifier,
+            domain_spec,
+            alias,
+            outer,
+            ..
+        }) = base
+        else {
+            return Ok(None);
+        };
+        let ns_parts: Vec<&str> = identifier
+            .namespace_path
+            .items()
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        if ns_parts != ["sys", "meta"] {
+            return Ok(None);
+        }
+        let wrapper_name = identifier.name.as_str();
+        let Some(ns_typed) = wrapper_name.strip_suffix("::") else {
+            return Ok(None);
+        };
+        let Some(system) = self.registry.database.system else {
+            return Ok(None);
+        };
+        let Some((ns_fq, echo_columns)) = system.liminal_echo_columns(ns_typed)? else {
+            return Ok(None);
+        };
+        let body = liminal_wrapper_body(&ns_fq, &echo_columns);
+        Ok(Some((
+            identifier.name.clone(),
+            body,
+            domain_spec.clone(),
+            alias.clone(),
+            *outer,
+        )))
+    }
+
     fn r_resolve_pipe(
         &mut self,
         boxed_pipe_expr: Box<stacksafe::StackSafe<ast_unresolved::PipeExpression>>,
@@ -1237,6 +1330,22 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         let mut resolved_source;
         let mut source_bubbled;
 
+        // THE LIMINAL RELATION (EFFECT-ALGEBRA §8): `ns::(*).liminal(*)`
+        // drills into the namespace's liminal ledger beside `entities` and
+        // `namespaces`. The stored catalog-wrapper definition carries only
+        // (entities, namespaces, name) — the ledger's presented schema is the
+        // corresponding union of THAT NAMESPACE's receipts, knowable only at
+        // resolve time — so when the drill's column is `liminal` and its
+        // source is a catalog functor, the source expands from a SYNTHESIZED
+        // wrapper body (generator ⨯ ledger tree group carrying this
+        // namespace's echo columns) through the ordinary consulted-view road.
+        // Bare `ns::(*)` reads and entities/namespaces drills never enter
+        // here and keep the stored definition byte-for-byte (pinned by
+        // scratch_home--02, home_namespace--01, nesting--10). Pinned by
+        // effects/liminal--43, --45,
+        // `liminal_drill_presents_the_corresponding_union`.
+        let liminal_expansion = self.liminal_catalog_expansion(&base, &segments)?;
+
         {
             // Pre-processing extractions from the base (once, not per-pipe).
             // These functions walk through Pipes/Filters to find data at the Ground level.
@@ -1264,7 +1373,22 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
 
             // Resolve the base expression through registry.
             // If base is Pipe(HoView, ...), recursion handles the expansion.
-            let (rs, sb) = self.resolve_relational(base)?;
+            let (rs, sb) = match liminal_expansion {
+                Some((view_name, body, domain_spec, alias, outer)) => {
+                    super::relation_resolver::r_resolve_consulted_view(
+                        view_name,
+                        body,
+                        "sys::meta".to_string(),
+                        domain_spec,
+                        alias,
+                        outer,
+                        self.registry,
+                        outer_context,
+                        &self.config,
+                    )?
+                }
+                None => self.resolve_relational(base)?,
+            };
             resolved_source = rs;
             source_bubbled = sb;
 
@@ -1397,11 +1521,10 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             ));
                         }
                     }
-                    DmlKind::Update | DmlKind::Delete | DmlKind::Keep => {
+                    DmlKind::Update | DmlKind::Delete => {
                         let kind_name = match kind {
                             DmlKind::Update => "update!",
                             DmlKind::Delete => "delete!",
-                            DmlKind::Keep => "keep!",
                             _ => unreachable!(),
                         };
                         if mutation_targets.is_empty() {
@@ -1482,25 +1605,15 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             }
                         }
                     }
-                    DmlKind::Delete | DmlKind::Keep => {
-                        let kind_name = if matches!(kind, DmlKind::Delete) {
-                            "delete!"
-                        } else {
-                            "keep!"
-                        };
+                    DmlKind::Delete => {
                         let has_transform = pipe_ops
                             .iter()
                             .any(|op| matches!(op, DmlPipeKind::Transform));
                         if has_transform {
-                            let sub = if matches!(kind, DmlKind::Delete) {
-                                "dml/shape/delete_with_cover"
-                            } else {
-                                "dml/shape/keep_with_cover"
-                            };
                             return Err(DelightQLError::validation_error_categorized(
-                                sub,
-                                format!("{} discards column data — a Transform ($$) before it is wasted", kind_name),
-                                format!("Remove the Transform before {} — only filters affect which rows are deleted/kept", kind_name),
+                                "dml/shape/delete_with_cover",
+                                "delete! discards column data — a Transform ($$) before it is wasted",
+                                "Remove the Transform before delete! — only filters affect which rows are deleted",
                             ));
                         }
                         let has_shape_ops = pipe_ops.iter().any(|op| {
@@ -1512,15 +1625,10 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             )
                         });
                         if has_shape_ops {
-                            let sub = if matches!(kind, DmlKind::Delete) {
-                                "dml/shape/delete_with_cover"
-                            } else {
-                                "dml/shape/keep_with_cover"
-                            };
                             return Err(DelightQLError::validation_error_categorized(
-                                sub,
-                                format!("{} discards column data — shape-changing operators (embed, project-out, rename, projection) before it are wasted", kind_name),
-                                format!("Remove shape-changing pipes before {} — only filters affect which rows are deleted/kept", kind_name),
+                                "dml/shape/delete_with_cover",
+                                "delete! discards column data — shape-changing operators (embed, project-out, rename, projection) before it are wasted",
+                                "Remove shape-changing pipes before delete! — only filters affect which rows are deleted",
                             ));
                         }
                         let has_aggregate = pipe_ops.iter().any(|op| {
@@ -1529,7 +1637,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                         if has_aggregate {
                             return Err(DelightQLError::validation_error_categorized(
                                 "dml/source/aggregate",
-                                format!("Cannot aggregate/group data before {} — aggregation changes the row identity", kind_name),
+                                "Cannot aggregate/group data before delete! — aggregation changes the row identity",
                                 "Remove the aggregate/group-by pipe before the DML operation",
                             ));
                         }
@@ -2255,8 +2363,32 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 arguments,
                 exists,
             } => {
-                // Check if functor matches a consulted sigma predicate (entity_type = 9)
-                if let Some(entity) = self.registry.consult.lookup_enlisted_sigma(&functor)? {
+                // Check if functor matches a consulted sigma predicate
+                // (entity_type = 9). Scope first: under a consulted scope
+                // (resolution_namespace = Some(ns) — effect bodies, view
+                // bodies, HO expansions), a sigma rule reachable from ns
+                // (same file, or enlisted into it) wins over one enlisted
+                // into main — mirroring the relation path's
+                // scope-then-main-fallback (resolve_entity_with_alias).
+                // Without the scoped probe, a SAME-FILE sigma guard fell
+                // through to the bin-rewrite path and died at SQL
+                // generation ("Unknown predicate rewrite"), and a
+                // same-named enlisted sigma silently shadowed the scope's
+                // own rule. Sigma stays FIRST in the classification order
+                // (before the table probes and the bin fall-through).
+                // Pinned by sigma_guard_scope_tests
+                // (bugs/sigma-rule-guard-under-consulted-scope).
+                let consulted_sigma = match self.config.resolution_namespace.as_deref() {
+                    Some(ns) if ns != "main" => {
+                        self.registry.consult.lookup_sigma_in_scope(&functor, ns)?
+                    }
+                    _ => None,
+                };
+                let consulted_sigma = match consulted_sigma {
+                    some @ Some(_) => some,
+                    None => self.registry.consult.lookup_enlisted_sigma(&functor)?,
+                };
+                if let Some(entity) = consulted_sigma {
                     let expanded = super::resolving::predicates::expand_consulted_sigma(
                         &entity.definition,
                         &functor,
@@ -2267,13 +2399,29 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                     return Ok(ast_resolved::SigmaCondition::Predicate(resolved));
                 }
 
-                // Check if functor matches a known table or fact (used as sigma).
+                // Check if functor matches a known table, fact, or consulted
+                // view (used as sigma).
                 // Expand +table(args) → EXISTS (SELECT 1 FROM table WHERE table.col = arg)
+                //
+                // Three probes, cheapest first: the user connection's default
+                // schema, enlisted DDL facts, then the SAME namespace-aware
+                // authority the relation path uses (resolve_entity_with_alias,
+                // honoring config.resolution_namespace + enlistment edges).
+                // Without the third, a guard on a table reachable only through
+                // an ENLISTED mount — or on a consulted rule visible only in
+                // the Some(ns) scope — fell through to the bin-rewrite path
+                // and died at SQL generation ("Unknown predicate rewrite").
+                // Pinned by enlisted_guard_classification_tests
+                // (bugs/enlisted-guard-predicate-rewrite).
                 if self.registry.database.lookup_table(&functor).is_some()
                     || self.registry.consult.lookup_enlisted_table(&functor)?
+                    || self.functor_is_relation_entity(&functor)
                 {
                     let expanded = super::resolving::predicates::expand_table_as_sigma(
-                        &functor, arguments, exists,
+                        &functor,
+                        arguments,
+                        exists,
+                        &self.available,
                     )?;
                     let resolved = self.transform_boolean(expanded)?;
                     return Ok(ast_resolved::SigmaCondition::Predicate(resolved));
@@ -2354,4 +2502,95 @@ fn scalar_only_declaration<'a>(
                 })
         })
         .and_then(|c| c.scalar_only_declaration())
+}
+
+/// Synthesize the catalog-wrapper body carrying the namespace's liminal
+/// ledger (EFFECT-ALGEBRA §8, THE LIMINAL RELATION). The shape mirrors the
+/// stored wrapper (`_(*) :- sys::meta.generator("ns")(*)`,
+/// system.rs::register_catalog_wrapper) with one addition: a CTE that reads
+/// the namespace's `liminal_receipt` rows and packs them into a `liminal`
+/// tree-group column whose keys are the receipt prefix (success, operation)
+/// plus THIS namespace's corresponding-union echo columns — static in the
+/// synthesized text, per-namespace at resolve time. The tree group is what
+/// hands the interior-drill machinery its schema; everything downstream
+/// (drill resolution, json_each/json_extract emission) is the stock path
+/// that answers `.entities(*)` and `.namespaces(*)`. Receipt rows are packed
+/// in rowid = insertion = file-appearance order: the `#(lim_id)` step before
+/// the tree group pins the pack order through an ORDER BY subquery —
+/// without it, SQLite's automatic covering index on the join reorders the
+/// receipts (observed live: alias! packed before enlist!). The presented
+/// ledger still carries no sequence column: `lim_id` orders the pack and is
+/// not a tree-group key. An empty ledger packs to `[]`, which the
+/// drill's outer join presents as one all-NULL receipt row — exactly how an
+/// empty `namespaces` drill presents. Pinned by effects/liminal--43, --45,
+/// and `liminal_drill_presents_the_corresponding_union`.
+fn liminal_wrapper_body(ns_fq: &str, echo_columns: &[String]) -> String {
+    let mut cols: Vec<String> = vec!["success".to_string(), "operation".to_string()];
+    for c in echo_columns {
+        if !cols.contains(c) {
+            cols.push(c.clone());
+        }
+    }
+    let projections: Vec<String> = cols
+        .iter()
+        .map(|c| format!("lim_r.receipt:{{.{c}}} as {c}"))
+        .collect();
+    format!(
+        "_(*) :- sys::ns.namespace(*) as lim_ns, lim_ns.fq_name = \"{ns}\", \
+         sys::ns.liminal_receipt?(*) as lim_r, lim_r.namespace_id = lim_ns.id \
+         |> (lim_r.id as lim_id, {proj}) \
+         |> #(lim_id) \
+         |> %(~> {{{keys}}} as liminal) \
+         : lim_cte  \
+         sys::meta.generator(\"{ns}\")(*), lim_cte(*)",
+        ns = ns_fq,
+        proj = projections.join(", "),
+        keys = cols.join(", "),
+    )
+}
+
+#[cfg(test)]
+mod liminal_drill_tests {
+    //! Shape pins for the synthesized liminal wrapper body (EFFECT-ALGEBRA
+    //! §8). End-to-end behavior is pinned by the effects-ball liminal--43/45
+    //! baselines; these pin the synthesis contract the drill machinery
+    //! depends on.
+
+    use super::liminal_wrapper_body;
+
+    /// The tree-group keys are the receipt prefix plus the namespace's
+    /// corresponding-union echo columns, in order — the drill's presented
+    /// interior schema (NULL-padded by json_extract for rows lacking a key).
+    #[test]
+    fn liminal_drill_presents_the_corresponding_union() {
+        let body = liminal_wrapper_body(
+            "fx",
+            &["namespace".to_string(), "into".to_string(), "shorthand".to_string()],
+        );
+        assert!(
+            body.contains("{success, operation, namespace, into, shorthand}"),
+            "tree-group keys = receipt prefix + union echoes, in order: {body}"
+        );
+        assert!(
+            body.contains("|> #(lim_id)"),
+            "the pack is ordered by insertion (rowid) — SQLite's automatic \
+             covering index otherwise reorders the receipts: {body}"
+        );
+        assert!(
+            body.contains("sys::meta.generator(\"fx\")(*), lim_cte(*)"),
+            "the ledger rides beside the stored wrapper's own generator join: {body}"
+        );
+    }
+
+    /// An empty ledger (namespace created by other means) synthesizes the
+    /// bare receipt prefix — the drill then presents one all-NULL receipt
+    /// row over `[]`, exactly like an empty namespaces drill.
+    #[test]
+    fn liminal_drill_empty_ledger_presents_the_bare_prefix() {
+        let body = liminal_wrapper_body("home", &[]);
+        assert!(
+            body.contains("{success, operation}"),
+            "empty union = receipt prefix only: {body}"
+        );
+    }
 }

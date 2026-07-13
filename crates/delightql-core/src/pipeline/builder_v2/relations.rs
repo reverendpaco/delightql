@@ -232,10 +232,20 @@ pub(super) fn parse_catalog_functor(
 }
 
 /// Parse pseudo-predicate call (e.g., mount!(), enlist!())
+///
+/// INTERIORITY (task 3.1b, THE RULING 2026-07-11): the access parens accept
+/// an interior continuation, exactly like a functor's — it applies to this
+/// relation, scoped (`s!(+-)` is the per-arm total-ledger spelling;
+/// EFFECT-ALGEBRA §3, witness.md "Dictates"). The bare qualify continuation
+/// `name!(*)` collapses back to the glob-ARGUMENT AST, identical to the
+/// pre-interiority build (pinned by
+/// `glob_pseudo_predicate_call_builds_as_glob_argument`); everything else is
+/// the ordinary continuation applied to the pseudo-predicate relation
+/// (pinned by `interior_continuation_on_directive_builds_like_functor_interior`).
 pub(super) fn parse_pseudo_predicate_call(
     node: CstNode,
     features: &mut crate::pipeline::query_features::FeatureCollector,
-) -> Result<Relation> {
+) -> Result<RelationalExpression> {
     // Get the pseudo-predicate name (includes the ! suffix)
     let name = node
         .field_text("name")
@@ -244,6 +254,52 @@ pub(super) fn parse_pseudo_predicate_call(
     // Pseudo-predicate names must end with '!'
     let full_name = format!("{}!", name);
 
+    // Check for alias
+    let alias = node
+        .find_child("table_alias")
+        .and_then(|n| n.field_text("name"));
+
+    if let Some(continuation_node) = node.field("continuation") {
+        let base = RelationalExpression::Relation(Relation::PseudoPredicate {
+            name: full_name.clone(),
+            arguments: Vec::new(),
+            alias: None,
+            cpr_schema: PhaseBox::phantom(),
+        });
+        let subquery =
+            super::continuation::handle_continuation(continuation_node, base, features)?;
+
+        // Collapse `name!(*)`: a lone Qualify over the bare call is the glob
+        // argument form — the same AST this function built before parens
+        // grew interiority (the CST moved from an `arguments` glob to a
+        // qualify continuation under functor-paren uniformity).
+        if let RelationalExpression::Pipe(ref pipe) = subquery {
+            let is_bare_base = matches!(
+                pipe.source,
+                RelationalExpression::Relation(Relation::PseudoPredicate {
+                    ref arguments, ..
+                }) if arguments.is_empty()
+            );
+            if is_bare_base && matches!(pipe.operator, UnaryRelationalOperator::Qualify) {
+                return Ok(RelationalExpression::Relation(Relation::PseudoPredicate {
+                    name: full_name,
+                    arguments: vec![DomainExpression::glob_builder().build()],
+                    alias,
+                    cpr_schema: PhaseBox::phantom(),
+                }));
+            }
+        }
+
+        if alias.is_some() {
+            return Err(DelightQLError::parse_error(format!(
+                "an alias on an interior-continued directive call ('{}(…) as …') \
+                 is not supported; alias the enclosing expression instead",
+                full_name
+            )));
+        }
+        return Ok(subquery);
+    }
+
     // Parse arguments (literal expressions in MVP)
     let mut arguments = Vec::new();
     if let Some(args_list) = node.field("arguments") {
@@ -251,21 +307,24 @@ pub(super) fn parse_pseudo_predicate_call(
         for child in args_list.children() {
             if child.kind() == "domain_expression" {
                 arguments.push(parse_expression(child, features)?);
+            } else if child.kind() == "namespace_path" {
+                // Bare ::-qualified argument: run_namespace!(lib::etl)
+                // (REPORT-1.5 F2 / REPORT-2.1). A namespace path is a NAME,
+                // carried as an Lvar with the :: text intact. Pinned by
+                // `namespace_path_argument_is_constructed`.
+                arguments.push(
+                    DomainExpression::lvar_builder(child.text().to_string()).build(),
+                );
             }
         }
     }
 
-    // Check for alias
-    let alias = node
-        .find_child("table_alias")
-        .and_then(|n| n.field_text("name"));
-
-    Ok(Relation::PseudoPredicate {
+    Ok(RelationalExpression::Relation(Relation::PseudoPredicate {
         name: full_name,
         arguments,
         alias,
         cpr_schema: PhaseBox::phantom(),
-    })
+    }))
 }
 
 /// Parse TVF (Table-Valued Function) call
@@ -467,6 +526,12 @@ pub(super) fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<D
             }
             "placeholder" => {
                 return Ok(DomainExpression::NonUnifiyingUnderscore);
+            }
+            "namespace_path" => {
+                // Bare ::-qualified argument: run_namespace!(lib::etl)(*)
+                // (REPORT-1.5 F2). A namespace path is a NAME — an Lvar with
+                // the :: text intact.
+                return Ok(DomainExpression::lvar_builder(child.text().to_string()).build());
             }
             _ => {}
         }

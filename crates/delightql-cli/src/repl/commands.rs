@@ -61,7 +61,7 @@ impl ReplState {
             ConnectionManager::new_memory()?
         };
 
-        let mut handle = db_connection.open_handle()?;
+        let mut handle = crate::connection::open_handle()?;
 
         // mount! the user database as "main" if specified
         if let Some(ref path) = db_path {

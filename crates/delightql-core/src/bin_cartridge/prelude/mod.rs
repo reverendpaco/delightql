@@ -24,6 +24,8 @@ mod enlist;
 mod ground;
 mod imprint;
 mod mount;
+mod mount_new;
+mod mount_tree;
 mod reconsult;
 mod refresh;
 mod run;
@@ -40,9 +42,11 @@ pub use enlist::EnlistPredicate;
 pub use ground::GroundPredicate;
 pub use imprint::{ImprintPredicate, ImprintReplacePredicate};
 pub use mount::MountPredicate;
+pub use mount_new::MountNewPredicate;
+pub use mount_tree::MountTreePredicate;
 pub use reconsult::ReconsultPredicate;
 pub use refresh::RefreshPredicate;
-pub use run::RunPredicate;
+pub use run::{RunNamespacePredicate, RunPredicate};
 pub use unconsult::UnconsultPredicate;
 pub use unmount::UnmountPredicate;
 
@@ -53,7 +57,7 @@ use std::sync::Arc;
 
 /// Create a single-column directive result: _(namespace @ "ns")
 ///
-/// All namespace-producing directives (mount!, consult!, enlist!, delist!, ground!)
+/// All namespace-producing directives (mount!, mount_new!, consult!, enlist!, delist!, ground!)
 /// return this uniform schema for pipe composition.
 pub(crate) fn directive_result(namespace: &str, alias: Option<String>) -> Relation {
     let headers = vec![DomainExpression::lvar_builder("ns".to_string()).build()];
@@ -91,9 +95,12 @@ impl BinCartridge for PreludeCartridge {
     fn entities(&self) -> Vec<Arc<dyn BinEntity>> {
         vec![
             Arc::new(MountPredicate) as Arc<dyn BinEntity>,
+            Arc::new(MountNewPredicate) as Arc<dyn BinEntity>,
+            Arc::new(MountTreePredicate) as Arc<dyn BinEntity>,
             Arc::new(EnlistPredicate) as Arc<dyn BinEntity>,
             Arc::new(DelistPredicate) as Arc<dyn BinEntity>,
             Arc::new(RunPredicate) as Arc<dyn BinEntity>,
+            Arc::new(RunNamespacePredicate) as Arc<dyn BinEntity>,
             Arc::new(ConsultPredicate) as Arc<dyn BinEntity>,
             Arc::new(ConsultTreePredicate) as Arc<dyn BinEntity>,
             Arc::new(GroundPredicate) as Arc<dyn BinEntity>,

@@ -15,7 +15,10 @@ use crate::pipeline::asts::ddl::{
     DdlBody, DdlDefinition, DdlHead, DdlNeck, FunctionParam, HoParam, HoParamKind, ViewHeadItem,
 };
 use crate::pipeline::cst::CstNode;
-use crate::pipeline::parser::parse_ddl;
+// truncate_for_display is char-boundary safe; a local byte-index variant
+// here panicked on multi-byte text (bugs/run-non-ascii-panic, pinned by
+// no_definition_error_truncation_is_char_boundary_safe).
+use crate::pipeline::parser::{parse_ddl, truncate_for_display};
 use tree_sitter::Tree;
 
 /// A `named_case_definition` desugared to its equivalent case-bodied function.
@@ -268,6 +271,15 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
         } else {
             format!("{}&{}", right, left)
         }
+    } else if cst_node_type == "effect_rule_definition" {
+        // Effect rules carry the `!` in their stored name (EFFECT-ALGEBRA §1;
+        // matches the BinPseudoPredicate convention, e.g. "consult!").
+        format!(
+            "{}!",
+            node.field("name")
+                .ok_or_else(|| DelightQLError::parse_error("Definition missing name field"))?
+                .text()
+        )
     } else {
         node.field("name")
             .ok_or_else(|| DelightQLError::parse_error("Definition missing name field"))?
@@ -426,6 +438,48 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
             DdlHead::Function {
                 params: vec![],
                 context_mode: ContextMode::None,
+            }
+        }
+        "effect_rule_definition" => {
+            // Effect rule head (EFFECT-ALGEBRA §1): glob form name!(*) has
+            // no ho_params children; the HO form reuses ho_param extraction.
+            let params_nodes = node.children_by_field("ho_params");
+            let params = params_nodes
+                .iter()
+                .filter(|p| {
+                    p.kind() == "ho_param"
+                        || p.kind() == "identifier"
+                        || p.kind() == "stropped_identifier"
+                })
+                .map(|p| {
+                    if p.kind() == "ho_param" {
+                        extract_ho_param(p)
+                    } else {
+                        HoParam {
+                            name: crate::pipeline::cst::unstrop(p.text()),
+                            kind: HoParamKind::Scalar,
+                        }
+                    }
+                })
+                .collect();
+            let output_head_nodes = node.children_by_field("output_head");
+            let output_head = if output_head_nodes.is_empty() {
+                None
+            } else {
+                let items: Vec<ViewHeadItem> = output_head_nodes
+                    .iter()
+                    .filter(|n| n.kind() == "view_head_item")
+                    .map(|n| extract_single_view_head_item(n))
+                    .collect();
+                if items.is_empty() {
+                    None
+                } else {
+                    Some(items)
+                }
+            };
+            DdlHead::EffectRule {
+                params,
+                output_head,
             }
         }
         "er_rule_definition" => {
@@ -591,7 +645,8 @@ pub fn build_ddl_definition(node: &CstNode, source: &str) -> Result<DdlDefinitio
         "view_definition"
         | "argumentative_view_definition"
         | "ho_view_definition"
-        | "er_rule_definition" => BodyKind::Relational,
+        | "er_rule_definition"
+        | "effect_rule_definition" => BodyKind::Relational,
         _ => unreachable!("handled by extract_name_and_head"),
     };
 
@@ -663,11 +718,7 @@ pub fn build_single_definition(source: &str) -> Result<DdlDefinition> {
     defs.into_iter().next().ok_or_else(|| {
         DelightQLError::parse_error(format!(
             "No definition found in source: '{}'",
-            if source.len() > 60 {
-                &source[..60]
-            } else {
-                source
-            }
+            truncate_for_display(source, 60)
         ))
     })
 }
@@ -718,7 +769,8 @@ pub fn build_ddl_head(source: &str) -> Result<(String, DdlHead)> {
             | "sigma_definition"
             | "fact_definition"
             | "named_case_definition"
-            | "er_rule_definition" => {
+            | "er_rule_definition"
+            | "effect_rule_definition" => {
                 return extract_name_and_head(&child, source);
             }
             other => panic!("catch-all hit in ddl/ddl_builder.rs find_definition_in_source: unexpected CST node kind: {}", other),
@@ -727,11 +779,7 @@ pub fn build_ddl_head(source: &str) -> Result<(String, DdlHead)> {
 
     Err(DelightQLError::parse_error(format!(
         "No definition found in source: '{}'",
-        if source.len() > 60 {
-            &source[..60]
-        } else {
-            source
-        }
+        truncate_for_display(source, 60)
     )))
 }
 
@@ -773,8 +821,23 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
             | "sigma_definition"
             | "fact_definition"
             | "named_case_definition"
-            | "er_rule_definition" => {
+            | "er_rule_definition"
+            | "effect_rule_definition" => {
                 definitions.push(build_ddl_definition(&child, source)?);
+            }
+            // Only session directives are liminal-eligible (EFFECT-ALGEBRA
+            // §8); extraction lifts those, so a liminal_directive node here
+            // names an ineligible directive. Refuse — never panic.
+            "liminal_directive" => {
+                let name = child
+                    .find_child("pseudo_predicate_call")
+                    .and_then(|c| c.field_text("name"))
+                    .unwrap_or_else(|| child.text().to_string());
+                return Err(DelightQLError::validation_error_categorized(
+                    crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
+                    crate::pipeline::asts::effects::liminal_not_eligible_message(&name),
+                    "not liminal-eligible",
+                ));
             }
             "query_statement" => {}
 
@@ -788,13 +851,6 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
     Ok(definitions)
 }
 
-fn truncate_for_display(text: &str, max_len: usize) -> String {
-    if text.len() > max_len {
-        format!("{}...", &text[..max_len])
-    } else {
-        text.to_string()
-    }
-}
 
 /// Extract an HO parameter from a `ho_param` CST node.
 ///
@@ -923,6 +979,23 @@ mod tests {
         // Control: the same head WITHOUT a label builds fine.
         let ok = r#"labeled(T(*))(tag, last_name) :- T(*), age > 40"#;
         assert!(build_ddl_file(ok).is_ok());
+    }
+
+    /// Pins bugs/run-non-ascii-panic sibling: the "No definition found"
+    /// message truncated the source at byte 60 without a char-boundary
+    /// check, panicking on multi-byte content.
+    #[test]
+    fn no_definition_error_truncation_is_char_boundary_safe() {
+        // A `?-` query statement (skipped by build_ddl_file) with multi-byte
+        // content: 19 ASCII bytes then 20 3-byte chars; byte 60 is mid-char
+        // (60 - 19 = 41, 41 % 3 == 2).
+        let source = format!("?- users(*), nm = \"{}\"", "─".repeat(20));
+        let err = build_single_definition(&source).expect_err("no definition in source");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("No definition found"),
+            "expected the normal no-definition error, got: {msg}"
+        );
     }
 
     #[test]

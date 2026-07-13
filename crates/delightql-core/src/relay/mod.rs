@@ -34,6 +34,11 @@ struct EagerBuffer {
 #[cfg(test)]
 mod tests;
 
+mod entry;
+mod pump;
+#[cfg(test)]
+mod pump_tests;
+
 // --- Hooks ---
 
 /// Hooks for non-relational side effects during query execution.
@@ -51,6 +56,16 @@ pub struct RelayHooks {
 
     /// Called when an error hook fires (compile-time or runtime).
     pub on_error_hook: Option<Box<dyn FnMut(&verdict::Verdict)>>,
+
+    /// Called by the pump for each NON-FINAL shipped result set (`stdout!`),
+    /// in execution order, as each entry executes (Epic 3 protocol ruling:
+    /// mid-run result sets ride the hook side channel; the FINAL shipped
+    /// statement is the run's one wire response and never passes through
+    /// here). Args: (columns, rows). If unset, non-final shipped sets are
+    /// executed and discarded — the same contract as an unset `on_emit`.
+    /// Delivery order pinned by
+    /// `pump_tests::non_final_shipped_deliver_via_on_ship_in_order`.
+    pub on_ship: Option<Box<dyn FnMut(&[String], &[Vec<String>])>>,
 }
 
 impl Default for RelayHooks {
@@ -59,6 +74,7 @@ impl Default for RelayHooks {
             on_emit: None,
             on_verdict: None,
             on_error_hook: None,
+            on_ship: None,
         }
     }
 }
@@ -94,6 +110,14 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             inline_ctes: false,
             hooks: RelayHooks::default(),
         }
+    }
+
+    /// Install the side-channel hooks (emit sinks, verdicts, shipped sets).
+    /// Production caller: `open.rs::session_with_hooks` (the Epic-3.3 hook
+    /// threading — the CLI's console sink for `stdout!` rides through it);
+    /// also exercised by `relay/pump_tests.rs`.
+    pub fn set_hooks(&mut self, hooks: RelayHooks) {
+        self.hooks = hooks;
     }
 
     /// Handle a Reset control operation: close all open handles and reinit the system.
@@ -159,6 +183,16 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // Error hook path: handle both compile-time and runtime error hooks
         if let Some(expected) = error_hook {
             return self.handle_error_hook_query(&dql, expected);
+        }
+
+        // The Epic-3.3 entry points: run!/run_namespace!/query-position
+        // directives take the effect chain (transformer → pump). The
+        // classifier declines annotated statements, and DML/DDL statements
+        // under CLI danger/option overrides keep today's path (the plan
+        // compiler applies default gates only) — see relay/entry.rs.
+        let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
+        if let Some(effect_entry) = entry::classify_effect_entry(&dql, allow_adhoc) {
+            return self.handle_effect_entry(effect_entry);
         }
 
         // Normal single-query path: compile DQL → SQL via the pipeline

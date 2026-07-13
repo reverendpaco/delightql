@@ -388,6 +388,44 @@ pub(super) fn resolve_witness(
     Ok((resolved_op, output_columns))
 }
 
+/// Resolve the SignedWitness operator (+-)
+///
+/// The signed witness keeps the source schema and appends `met` LAST —
+/// the operand keeps its shape and the witness annotates it
+/// (EFFECT-ALGEBRA §3; book/reference/dql/witness.md "Lowering").
+/// A colliding `met` takes the language's `_2` suffix convention,
+/// mirroring the effect transformer's `witness_wrap`. Pinned by the
+/// effects ball's compose--74 (plain ad-hoc `+-`).
+pub(super) fn resolve_signed_witness(
+    available: &[ast_resolved::ColumnMetadata],
+) -> Result<(
+    ast_resolved::UnaryRelationalOperator,
+    Vec<ast_resolved::ColumnMetadata>,
+)> {
+    let met_name = {
+        let mut candidate = "met".to_string();
+        let mut n = 2;
+        while available.iter().any(|c| c.name() == candidate) {
+            candidate = format!("met_{}", n);
+            n += 1;
+        }
+        candidate
+    };
+
+    let mut output_columns = available.to_vec();
+    // Honest Fresh: "met" is the synthesized presence flag, not a table column.
+    output_columns.push(ast_resolved::ColumnMetadata::new(
+        ast_resolved::ColumnProvenance::from_column(met_name),
+        ast_resolved::TableName::Fresh,
+        Some(available.len() + 1),
+    ));
+
+    Ok((
+        ast_resolved::UnaryRelationalOperator::SignedWitness,
+        output_columns,
+    ))
+}
+
 /// Resolve the MetaIze operator (^ or ^^)
 ///
 /// MetaIze reifies the input relation's schema as queryable data.

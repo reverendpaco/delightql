@@ -781,16 +781,105 @@ pub(in crate::pipeline::resolver) fn expand_consulted_sigma(
     }
 }
 
+/// Stamp OUTER-scope qualifiers onto the unqualified lvars of a semi-join
+/// argument expression.
+///
+/// The arguments of an argumentative semi/anti-join (`+rel(col)`) are
+/// written in the OUTER clause: a shared lvar name correlates the outer
+/// row with the fact row (shared-name correlation, book/reference/dql/
+/// where.md). The expansion places the comparison INSIDE the EXISTS
+/// subquery, where an unqualified name legally binds to the innermost
+/// scope (`_fact`) — which turned the guard into a self-comparison
+/// (bugs/correlated-semijoin-lost-correlation). Qualifying the argument's
+/// lvars with their outer table here preserves the correlation through
+/// inner-first name binding.
+///
+/// Rules (mirroring `synthesize_using_correlation`, the USING-form twin
+/// that always did this correctly):
+/// - unqualified lvar whose name matches an outer column under a Named
+///   table → stamp that table/alias as qualifier (first match wins,
+///   same as the USING path);
+/// - matches only under Fresh (anonymous pipe-stage) scopes → left
+///   unqualified (no name to stamp; such scopes have no correlated
+///   semi-join spelling today);
+/// - no outer match, already-qualified refs, and non-lvar leaves →
+///   untouched.
+///
+/// Nested relational scopes (scalar subqueries etc.) are NOT descended
+/// into — their lvars belong to their own scope.
+///
+/// Pinned by `resolver::semijoin_correlation_tests` and the
+/// `new_test_suite/balls/correctness_bugs/*_lost_correlation.sef` data
+/// tests.
+struct OuterArgumentQualifier<'a> {
+    outer_columns: &'a [ast_resolved::ColumnMetadata],
+}
+
+impl crate::pipeline::ast_transform::AstTransform<
+        crate::pipeline::asts::core::Unresolved,
+        crate::pipeline::asts::core::Unresolved,
+    > for OuterArgumentQualifier<'_>
+{
+    fn transform_domain(
+        &mut self,
+        expr: ast_unresolved::DomainExpression,
+    ) -> Result<ast_unresolved::DomainExpression> {
+        use crate::pipeline::ast_transform::walk_transform_domain;
+        use crate::pipeline::asts::core::metadata::TableName;
+
+        match expr {
+            ast_unresolved::DomainExpression::Lvar {
+                name,
+                qualifier: None,
+                namespace_path,
+                alias,
+                provenance,
+            } => {
+                let outer_qualifier: Option<delightql_types::SqlIdentifier> = self
+                    .outer_columns
+                    .iter()
+                    .find(|cm| delightql_types::SqlIdentifier::str_eq(cm.name(), name.as_str()))
+                    .and_then(|cm| match cm.qualifier() {
+                        TableName::Named(id) => Some(id.clone()),
+                        TableName::Fresh => None,
+                    });
+                Ok(ast_unresolved::DomainExpression::Lvar {
+                    name,
+                    qualifier: outer_qualifier,
+                    namespace_path,
+                    alias,
+                    provenance,
+                })
+            }
+            other => walk_transform_domain(self, other),
+        }
+    }
+
+    fn transform_relational(
+        &mut self,
+        e: ast_unresolved::RelationalExpression,
+    ) -> Result<ast_unresolved::RelationalExpression> {
+        // Do not descend into nested relational scopes — their lvars
+        // resolve against their own columns, not the outer clause.
+        Ok(e)
+    }
+}
+
 /// Expand a table (fact) used as a sigma predicate.
 ///
 /// `+no_data(x)` expands to:
 ///   EXISTS (SELECT * FROM no_data AS _fact WHERE x IS NOT DISTINCT FROM _fact.|1|)
+///
+/// `outer_columns` is the scope of the CALLING clause; argument lvars are
+/// qualified against it (see `OuterArgumentQualifier`) so the correlation
+/// to the outer row survives resolution inside the EXISTS subquery.
 ///
 /// Constructs the AST directly without re-parsing.
 pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
     table_name: &str,
     arguments: Vec<ast_unresolved::DomainExpression>,
     exists: bool,
+    outer_columns: &[ast_resolved::ColumnMetadata],
 ) -> Result<ast_unresolved::BooleanExpression> {
     use crate::pipeline::asts::core::{FilterOrigin, NamespacePath, PhaseBox};
 
@@ -800,6 +889,16 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
             table_name
         )));
     }
+
+    // Correlation arguments are outer-clause expressions: stamp outer
+    // qualifiers before they get resolved inside the inner scope.
+    let mut qualifier = OuterArgumentQualifier { outer_columns };
+    let arguments = arguments
+        .into_iter()
+        .map(|arg| {
+            crate::pipeline::ast_transform::AstTransform::transform_domain(&mut qualifier, arg)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let table_ident = ast_unresolved::QualifiedName {
         namespace_path: NamespacePath::empty(),

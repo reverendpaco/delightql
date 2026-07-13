@@ -110,13 +110,20 @@ impl<'a> Formatter<'a> {
             self.output.write("!");
         }
 
-        // Format arguments
+        // Format arguments (or an interior continuation — since task 3.1b
+        // the access parens accept a relational_continuation like any
+        // functor's; under functor-paren uniformity `s!(*)` parses as a
+        // qualify CONTINUATION, so this branch also covers the bare-glob
+        // call form and must echo it, not drop it)
         self.output.write("(");
         if let Some(args_node) = node.child_by_field_name("arguments") {
             let args_text = self.node_text(&args_node).to_string();
             // No spaces after commas (consistent with TVF calls)
             let formatted = args_text.replace(", ", ",");
             self.output.write(&formatted);
+        } else if let Some(cont_node) = node.child_by_field_name("continuation") {
+            let cont_text = self.node_text(&cont_node).to_string();
+            self.output.write(&cont_text);
         }
         self.output.write(")");
 

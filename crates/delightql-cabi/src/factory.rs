@@ -77,6 +77,8 @@ impl delightql_types::ConnectionFactory for CabiConnectionFactory {
             db_type: "sqlite".to_string(),
             mechanism: "in-process".to_string(),
             identity,
+            // SQLite has no schema concept (R-S5); leave unset.
+            mounted_schema: None,
         })
     }
 }

@@ -276,6 +276,7 @@ impl AstTransform<Resolved, Refined> for RefinerFold {
                                 .transform_relational_action(cte.expression)?
                                 .into_inner(),
                             name: cte.name,
+                            effect_label: cte.effect_label,
                             is_recursive: refined::PhaseBox::phantom(),
                         })
                     })
@@ -438,6 +439,7 @@ fn apply_limit_placement_to_query(query: resolved::Query) -> Result<resolved::Qu
                     Ok(resolved::CteBinding {
                         expression: limit_placement::apply(cte.expression)?,
                         name: cte.name,
+                        effect_label: cte.effect_label,
                         is_recursive: cte.is_recursive,
                     })
                 })

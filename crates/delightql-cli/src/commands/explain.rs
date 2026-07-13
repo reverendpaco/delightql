@@ -20,8 +20,7 @@ use delightql_core::uri_registry::{
 /// querying the burned table — the same ~25ms a `dql query` pays, so
 /// explain's latency is unchanged (measured, SYS-HELP finding #5).
 fn load_rows() -> Result<Vec<IdentifierEntry>> {
-    let conn = crate::connection::ConnectionManager::new_memory()?;
-    let mut handle = conn.open_handle()?;
+    let mut handle = crate::connection::open_handle()?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     let results = crate::exec_ng::fetch_all(
         &mut *session,

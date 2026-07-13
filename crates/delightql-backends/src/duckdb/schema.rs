@@ -111,8 +111,10 @@ impl Schema for DuckDBSchema {
 
         let columns = stmt
             .query_map([], |row| {
-                let is_primary_key = row.get::<_, i32>(5)? != 0;
-                let notnull = row.get::<_, i32>(3)? == 1;
+                // DuckDB's PRAGMA table_info returns notnull/pk as BOOLEAN
+                // (unlike SQLite's integers); reading them as i32 errors.
+                let is_primary_key = row.get::<_, bool>(5)?;
+                let notnull = row.get::<_, bool>(3)?;
                 // In SQLite, PRIMARY KEY columns are implicitly NOT NULL
                 let nullable = !notnull && !is_primary_key;
 

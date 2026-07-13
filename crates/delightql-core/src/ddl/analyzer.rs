@@ -640,6 +640,13 @@ fn walk_unary_operator(op: &UnaryRelationalOperator, refs: &mut Vec<ExtractedRef
         UnaryRelationalOperator::NarrowingDestructure { .. } => {}
         UnaryRelationalOperator::HoViewApplication { .. }
         | UnaryRelationalOperator::DirectiveTerminal { .. } => {}
+        // Signed witness has no expressions; the two-paren pipe invocation's
+        // relational argument may reference entities (returning_other!'s
+        // other relation) — walk it.
+        UnaryRelationalOperator::SignedWitness => {}
+        UnaryRelationalOperator::DirectivePipeInvocation { argument, .. } => {
+            walk_relational(argument, refs);
+        }
     }
 }
 

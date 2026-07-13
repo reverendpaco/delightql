@@ -218,7 +218,7 @@ mod tests {
         let manager =
             SqliteConnectionManager::new_memory().expect("Failed to create memory connection");
 
-        assert!(manager.is_connected());
+        assert!(manager.connection_info().unwrap().is_connected);
         assert!(manager.test_connection().is_ok());
 
         let info = manager.connection_info().unwrap();
@@ -235,7 +235,7 @@ mod tests {
         let manager =
             SqliteConnectionManager::new_file(temp_path).expect("Failed to create file connection");
 
-        assert!(manager.is_connected());
+        assert!(manager.connection_info().unwrap().is_connected);
         assert!(manager.test_connection().is_ok());
 
         let info = manager.connection_info().unwrap();

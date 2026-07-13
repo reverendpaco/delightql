@@ -170,6 +170,16 @@ fn parse_unary_operator_core(
             }
             other => panic!("Unknown meta_ize_operator text: {}", other),
         }
+    } else if node.find_child("signed_witness_operator").is_some() {
+        // Signed witness: postfix `+-` (EFFECT-ALGEBRA §3). One token —
+        // grammar item 4 of REPORT-2.1; must be checked before
+        // witness_operator only for symmetry (the grammar already lexed the
+        // decision). Pinned by `signed_witness_builds_as_signed_witness_operator`.
+        RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
+            source: input,
+            operator: UnaryRelationalOperator::SignedWitness,
+            cpr_schema: PhaseBox::phantom(),
+        })))
     } else if let Some(witness_node) = node.find_child("witness_operator") {
         // Witness operator: + or \+ in postfix/functor position
         // Check exists_marker child for not_exists to determine + vs \+

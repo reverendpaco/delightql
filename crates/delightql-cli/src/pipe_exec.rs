@@ -79,5 +79,7 @@ pub(crate) fn create_pipe_system_components(
         // The siso channel is deliberately thin (and error-blind) — the
         // resource asserts nothing through it.
         identity: None,
+        // Siso pipes carry a SQLite-shaped backend; no schema to bind.
+        mounted_schema: None,
     })
 }
