@@ -3,6 +3,83 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The tree-sitter CLI version the generated parsers must come from, read from
+/// the Makefile rather than duplicated here. The Makefile owns the check; this
+/// only names the number in diagnostics. Two copies of a version that must
+/// agree is one copy too many — if it drifted, the hint would confidently lie.
+fn expected_tree_sitter_version(workspace_root: &std::path::Path) -> Option<String> {
+    let mk = std::fs::read_to_string(workspace_root.join("Makefile")).ok()?;
+    mk.lines()
+        // The ASSIGNMENT, not the `$(...)` references in the recipes: Make puts
+        // assignments at column 0 and recipe lines behind a tab. Matching the
+        // name anywhere would depend on assignment-before-reference ordering.
+        .find(|l| l.starts_with("TREE_SITTER_EXPECTED_VERSION"))
+        .and_then(|l| l.split_once('='))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Report a failed child process the way a stranger's first clone needs to see
+/// it: BOTH streams. A `make` recipe says what went wrong via `echo`, which is
+/// stdout — printing only stderr throws away the diagnosis and leaves the bare
+/// `Error 1`. Whatever the child said, the human gets.
+fn child_failure(what: &str, output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut s = format!(
+        "\n\n{what} failed (exit {})\n",
+        output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string())
+    );
+    if !stdout.trim().is_empty() {
+        s.push_str(&format!("\n--- {what} stdout ---\n{}\n", stdout.trim_end()));
+    }
+    if !stderr.trim().is_empty() {
+        s.push_str(&format!("\n--- {what} stderr ---\n{}\n", stderr.trim_end()));
+    }
+    s
+}
+
+/// The tree-sitter CLI actually on PATH, for diagnostics. `None` if absent.
+fn tree_sitter_version() -> Option<String> {
+    let out = Command::new("tree-sitter").arg("--version").output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.split_whitespace().nth(1).map(|v| v.to_string())
+}
+
+/// The hint every parser-generation failure should carry: the overwhelmingly
+/// common cause is a CLI version that isn't the pinned one, so say what we
+/// wanted and what we found rather than making the reader go look.
+fn tree_sitter_hint(workspace_root: &std::path::Path) -> String {
+    let found = tree_sitter_version().unwrap_or_else(|| "not found on PATH".to_string());
+    let Some(expected) = expected_tree_sitter_version(workspace_root) else {
+        return "\n\
+            Could not read TREE_SITTER_EXPECTED_VERSION from the Makefile.\n\
+            To see the raw failure yourself:\n  make generate-parser\n"
+            .to_string();
+    };
+    let mut s = format!("\ntree-sitter CLI: expected {expected}, found {found}\n");
+    if found != expected {
+        s.push_str(&format!(
+            "\n\
+            ^^^ This is almost certainly the problem. The generated parser must\n\
+            come from the pinned CLI (it has to match tree-sitter-c2rust).\n\
+            \n\
+            Fix it with either:\n\
+              mise use tree-sitter@{expected}\n\
+              cargo install tree-sitter-cli --version {expected}\n"
+        ));
+    }
+    s.push_str(
+        "\n\
+        To see the raw failure yourself:\n\
+          make generate-parser\n",
+    );
+    s
+}
+
 fn main() {
     // Use CARGO_MANIFEST_DIR to find the workspace root reliably
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -118,20 +195,10 @@ fn main() {
                 println!("cargo:warning=Successfully regenerated DQL parser via Makefile");
             }
             Ok(output) => {
-                eprintln!(
-                    "make generate-parser failed:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
                 panic!(
-                    "\n\n\
-                    Failed to generate parser!\n\
-                    \n\
-                    Run this manually to see the error:\n\
-                      make generate-parser\n\
-                    \n\
-                    Or install tree-sitter CLI:\n\
-                      make ensure-tree-sitter\n\
-                    "
+                    "{}{}",
+                    child_failure("make generate-parser", &output),
+                    tree_sitter_hint(&workspace_root)
                 );
             }
             Err(e) => {
@@ -187,11 +254,11 @@ fn main() {
                 println!("cargo:warning=Successfully regenerated rules parser");
             }
             Ok(output) => {
-                eprintln!(
-                    "tree-sitter generate (rules) failed:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
+                panic!(
+                    "{}{}",
+                    child_failure("tree-sitter generate (grammar_rules)", &output),
+                    tree_sitter_hint(&workspace_root)
                 );
-                panic!("Failed to generate rules parser! Run: cd grammar_rules && tree-sitter generate");
             }
             Err(e) => {
                 panic!("Failed to run tree-sitter for rules grammar: {}", e);
@@ -240,12 +307,10 @@ fn main() {
                 println!("cargo:warning=Successfully regenerated DDL parser");
             }
             Ok(output) => {
-                eprintln!(
-                    "tree-sitter generate (DDL) failed:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
                 panic!(
-                    "Failed to generate DDL parser! Run: cd grammar_ddl && tree-sitter generate"
+                    "{}{}",
+                    child_failure("tree-sitter generate (grammar_ddl)", &output),
+                    tree_sitter_hint(&workspace_root)
                 );
             }
             Err(e) => {

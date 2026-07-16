@@ -16,8 +16,19 @@ DUCKDB_LIB := /opt/homebrew/lib/libduckdb.dylib
 .DEFAULT_GOAL := build
 
 .PHONY: build
+# The default is the CLONER's build: fast to produce, symbols intact, panics
+# legible. `make ship` is for producing the deliverable, not for meeting the
+# project.
 build: ensure-cargo ensure-uv
 	cargo build --bin dql
+	@echo ""
+	@echo "✓ built: target/debug/dql"
+
+.PHONY: ship
+ship: ensure-cargo ensure-uv
+	cargo build --profile release-ship --bin dql
+	@echo ""
+	@echo "✓ built: target/release-ship/dql  (optimized, fat LTO, stripped)"
 
 .PHONY: ensure-cargo
 ensure-cargo:
@@ -138,9 +149,10 @@ help:
 	@echo "DelightQL Dependency Management"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make [build]           - Check cargo+uv, build the dql binary"
+	@echo "  make [build]           - Check cargo+uv, build dql -> target/debug/dql"
+	@echo "  make ship              - Optimized build (fat LTO, stripped) -> target/release-ship/dql"
 	@echo "  make setup             - Ensure all build dependencies are installed"
-	@echo "  make ensure-tree-sitter - Ensure tree-sitter CLI is installed (pinned to $(TREE_SITTER_REV))"
+	@echo "  make ensure-tree-sitter - Ensure tree-sitter CLI is installed (pinned to $(TREE_SITTER_EXPECTED_VERSION))"
 	@echo "  make generate-parser   - Generate parser.c from grammar.js"
 	@echo "  make help              - Show this help"
 	@echo ""
