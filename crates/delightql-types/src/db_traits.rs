@@ -127,6 +127,34 @@ pub trait DatabaseConnection: Send + Sync {
             .collect();
         Ok((cols, nullable_rows))
     }
+
+    /// Attach a read-only in-memory schema deserialized from a static SQLite
+    /// image (`delightql-bytes://` mounts, BYTES-SCHEME-DESIGN.md). The
+    /// default refusal IS the design's SQLite-primary-only rule: only the
+    /// native SQLite adapter overrides this; pipe, fatboy, DuckDB, and WASM
+    /// connections refuse with an actionable error.
+    fn attach_static_bytes(&self, _schema_alias: &str, _bytes: &'static [u8]) -> Result<()> {
+        Err(DelightQLError::validation_error(
+            "delightql-bytes:// mounts require a native SQLite primary connection",
+            "This connection type cannot attach a deserialized in-memory schema",
+        ))
+    }
+
+    /// The owned-buffer sibling of `attach_static_bytes`: the image is
+    /// COPIED into SQLite-owned memory (for buffers built at runtime, e.g.
+    /// the CLI's live surface database). Same attach-class semantics and
+    /// default refusal — but NOT the same write protection: unlike the
+    /// static variant, the copied schema is engine-level WRITABLE, because
+    /// `BEGIN IMMEDIATE` locks every attached database and a READONLY
+    /// member would fail all such transactions session-wide (imprint!).
+    /// Not-for-writing is the host's convention until the delightql-level
+    /// DML gate lands (MOUNT-SPINE-PLAN.md follow-up, with review R4).
+    fn attach_bytes_copied(&self, _schema_alias: &str, _bytes: &[u8]) -> Result<()> {
+        Err(DelightQLError::validation_error(
+            "delightql-bytes:// mounts require a native SQLite primary connection",
+            "This connection type cannot attach a deserialized in-memory schema",
+        ))
+    }
 }
 
 /// Extension trait for database connections with generic methods

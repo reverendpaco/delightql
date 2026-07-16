@@ -109,21 +109,10 @@ pub(in super::super) fn extract_inline_using_columns(
 /// Transform a schema's table names to use a new table name
 /// This is used for CTEs to ensure their columns reference the CTE name, not the original table
 /// Also pushes CteRegistration identity onto each column's identity stack.
-/// CTE origin is inferred: `_ho_*` names → CompilerGenerated, others → UserDefined.
+/// `origin` is the binding's TYPED construction provenance — never inferred
+/// from the name (review qmqwqlms round 3, P2: a user may legally write
+/// `_ho_*` identifiers).
 pub(in super::super) fn transform_schema_table_names(
-    schema: ast_resolved::CprSchema,
-    new_table_name: &str,
-) -> ast_resolved::CprSchema {
-    let origin = if new_table_name.starts_with("_ho_") {
-        ast_resolved::CteOrigin::CompilerGenerated
-    } else {
-        ast_resolved::CteOrigin::UserDefined
-    };
-    transform_schema_table_names_with_origin(schema, new_table_name, origin)
-}
-
-/// Transform schema table names with explicit CTE origin
-pub(in super::super) fn transform_schema_table_names_with_origin(
     schema: ast_resolved::CprSchema,
     new_table_name: &str,
     origin: ast_resolved::CteOrigin,

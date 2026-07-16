@@ -249,6 +249,13 @@ impl<'a> Pipeline<'a> {
         self.query_unresolved.as_ref()
     }
 
+    /// Whether the source carries inline `(~~ddl ~~)` blocks. Processing
+    /// them registers namespaces/entities, so a pure inspection surface
+    /// (compile purity, Phase 1B) must refuse before that happens.
+    pub(crate) fn has_inline_ddl_blocks(&self) -> bool {
+        !self.ddl_blocks.is_empty()
+    }
+
     /// Get reference to the resolved query if available
     pub fn query_resolved(&self) -> Option<&ast_resolved::Query> {
         self.query_resolved.as_ref()
@@ -1242,6 +1249,39 @@ fn generate_sql_with_ctes(
 /// Text → CST → Query → AST(resolved) → AST(refined) → SQL AST → SQL String
 ///
 /// This is the main entry point for compiling DelightQL queries with full CTE support.
+
+/// The assertion predicate → boolean-SQL wrap (one row, one column).
+/// Shared vocabulary for the ordinary pipeline's assertion compilation
+/// and the typed assertion steps (Phase 10 slice b); the two sites
+/// compile their operand SQL differently but wrap identically.
+pub(crate) fn assertion_bool_wrap(
+    predicate: &ast_unresolved::AssertionPredicate,
+    left_sql: &str,
+    right_sql: Option<&str>,
+) -> String {
+    match predicate {
+        ast_unresolved::AssertionPredicate::Exists => {
+            format!("SELECT EXISTS({}) AS bool", left_sql)
+        }
+        ast_unresolved::AssertionPredicate::NotExists
+        | ast_unresolved::AssertionPredicate::Forall => {
+            format!("SELECT NOT EXISTS({}) AS bool", left_sql)
+        }
+        ast_unresolved::AssertionPredicate::Equals => {
+            let right = right_sql.expect("Equals carries a right operand");
+            format!(
+                "SELECT (\
+                (SELECT COUNT(*) FROM ({left})) = (SELECT COUNT(*) FROM ({right})) \
+                AND NOT EXISTS(SELECT * FROM ({left}) EXCEPT SELECT * FROM ({right})) \
+                AND NOT EXISTS(SELECT * FROM ({right}) EXCEPT SELECT * FROM ({left}))\
+                ) AS bool",
+                left = left_sql,
+                right = right,
+            )
+        }
+    }
+}
+
 pub(crate) fn compile_source_to_sql(
     source: &str,
     schema: &dyn resolver::DatabaseSchema,

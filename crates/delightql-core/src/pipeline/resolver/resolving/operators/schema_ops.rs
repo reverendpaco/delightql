@@ -659,6 +659,26 @@ pub(super) fn resolve_interior_drill_down(
                 )
             })?;
 
+    // 1b. TAGGED SUM (EFFECT-ALGEBRA §3, amended 2026-07-15): a ledger
+    // column whose arms declare DIFFERENT interior headings must not be
+    // released across arms — the first arm's heading would silently drop
+    // the other arms' rows. The union stays legal; the RELEASE teaches.
+    // Pinned by directive_contract 35_mixed_payload_release_refused.
+    if drilled_col.interior_schema_conflict {
+        return Err(crate::error::DelightQLError::validation_error_categorized(
+            "effect/ledger/mixed_release",
+            format!(
+                "releasing '{}' across ledger arms whose declared interior \
+                 headings DIFFER — narrow the ledger to arms that agree \
+                 before releasing, by operation (…, operation = \"run!\" \
+                 |> .{}(*)) or by arm label when one operation contributes \
+                 several headings (EFFECT-ALGEBRA §3)",
+                column, column
+            ),
+            "mixed payload release",
+        ));
+    }
+
     // 2. Get the interior schema from the column metadata
     let schema = drilled_col.interior_schema.clone().ok_or_else(|| {
         crate::error::DelightQLError::validation_error(

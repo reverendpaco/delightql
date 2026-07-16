@@ -47,10 +47,12 @@ impl BinEntity for ImprintPredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![
-                ("entity".to_string(), "String".to_string()),
-                ("status".to_string(), "String".to_string()),
-            ]),
+            // The receipt heading is the DESCRIPTOR's declaration
+            // (Phase 6 slice 4): core + source/target namespace echoes +
+            // the `returned` tree of materialized entities.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
+                "imprint",
+            )),
         }
     }
 
@@ -101,10 +103,11 @@ impl BinEntity for ImprintReplacePredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![
-                ("entity".to_string(), "String".to_string()),
-                ("status".to_string(), "String".to_string()),
-            ]),
+            // Same declared heading as imprint! (Phase 6 slice 4); only
+            // the operation string differs.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
+                "imprint_replace",
+            )),
         }
     }
 
@@ -164,39 +167,28 @@ fn run_imprint(
     };
     let results = system.imprint_namespace(&source_ns, &target_ns, mode)?;
 
-    {
-        // Build multi-row result: (entity, status) for each materialized entity
-        let headers = vec![
-            DomainExpression::lvar_builder("entity".to_string()).build(),
-            DomainExpression::lvar_builder("status".to_string()).build(),
-        ];
-
-        let rows: Vec<Row> = results
+    // The manifest enumeration is the receipt's `returned` tree
+    // (EFFECT-ALGEBRA §3, ruled 2026-07-15 — Phase 6 slice 4): one
+    // interior row per materialized entity, cardinality back to
+    // zero-or-one. An empty manifest ships the all-NULL contributor
+    // row, which elides to `[]`.
+    let returned_rows: Vec<Vec<Option<String>>> = if results.is_empty() {
+        vec![vec![None, None]]
+    } else {
+        results
             .iter()
-            .map(|(entity_name, status, _sql)| Row {
-                values: vec![
-                    DomainExpression::Literal {
-                        value: LiteralValue::String(entity_name.clone()),
-                        alias: None,
-                    },
-                    DomainExpression::Literal {
-                        value: LiteralValue::String(status.clone()),
-                        alias: None,
-                    },
-                ],
+            .map(|(entity_name, status, _sql)| {
+                vec![Some(entity_name.clone()), Some(status.clone())]
             })
-            .collect();
-
-        Ok(EntityResult::Relation(Relation::Anonymous {
-            column_headers: Some(headers),
-            rows,
-            alias: alias.map(|s| s.into()),
-            outer: false,
-            exists_mode: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        }))
-    }
+            .collect()
+    };
+    Ok(EntityResult::Relation(super::descriptor_tree_receipt(
+        verb.trim_end_matches('!'),
+        &[Some(source_ns.clone()), Some(target_ns.clone())],
+        &["entity", "status"],
+        &returned_rows,
+        alias,
+    )))
 }
 
 /// Extract a string literal value from a DomainExpression

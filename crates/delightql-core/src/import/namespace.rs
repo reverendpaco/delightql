@@ -21,7 +21,7 @@ pub struct NamespaceSpec {
     pub pid: Option<i32>,
     /// Fully-qualified name (e.g., "sys::cartridges")
     pub fq_name: String,
-    /// Namespace kind: system, data, lib, grounded, scratch, unknown
+    /// Namespace kind: system, container, data, lib, grounded, scratch, unknown
     pub kind: String,
     /// How the namespace was created: bootstrap, file, uri, scratch, ground
     pub provenance: Option<String>,
@@ -42,7 +42,7 @@ pub struct NamespaceSpec {
 /// * `name` - Namespace segment name
 /// * `pid` - Parent namespace ID (None for root)
 /// * `fq_name` - Fully-qualified namespace path
-/// * `kind` - Namespace kind (system, data, lib, grounded, scratch, unknown)
+/// * `kind` - Namespace kind (system, container, data, lib, grounded, scratch, unknown)
 /// * `provenance` - How it was created (bootstrap, file, uri, scratch, ground)
 /// * `source_path` - Original file path or URI
 /// * `writable` - Whether the namespace can accept new definitions
@@ -243,9 +243,9 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
         },
         NamespaceSpec {
             id: 11,
-            name: "help".into(),
+            name: "identifiers".into(),
             pid: Some(2),
-            fq_name: "sys::help".into(),
+            fq_name: "sys::identifiers".into(),
             kind: "system".into(),
             provenance: Some("bootstrap".into()),
             source_path: None,

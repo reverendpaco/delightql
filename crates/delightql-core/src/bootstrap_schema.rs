@@ -38,10 +38,11 @@ impl DatabaseSchema for BootstrapBackedSchema {
 
         // The schema qualifier can be either:
         // 1. A namespace fq_name (e.g., "main", "zot") — used by direct user queries
-        // 2. An internal ATTACH alias (e.g., "_imported_8") — used by the resolver
-        //    after resolve_namespace_path returns cartridge.source_ns
+        // 2. A mount qualification (an ATTACH alias or engine schema) returned
+        //    by resolve_namespace_path from the authoritative `mount` row.
         //
-        // We try namespace fq_name first, then fall back to cartridge source_ns.
+        // We try namespace fq_name first, then mount qualification, then the
+        // source namespace of cartridges that are not mount bindings.
         let qualifier = schema.unwrap_or("main");
 
         // Primary path: look up by namespace fq_name.
@@ -83,20 +84,60 @@ impl DatabaseSchema for BootstrapBackedSchema {
             }
         }
 
-        // Fallback: look up by cartridge source_ns (ATTACH alias)
-        let sql_by_source_ns = r#"
+        // Mounted-data fallback: qualification policy belongs to `mount`, not
+        // to cartridge.source_ns. In particular an unqualified main mount may
+        // still record its physical ATTACH alias on the cartridge without
+        // making generated reads qualified.
+        let sql_by_mount_qualification = r#"
+            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
+            FROM entity_attribute ea
+            JOIN entity e ON e.id = ea.entity_id
+            JOIN activated_entity ae ON ae.entity_id = e.id
+            JOIN cartridge c ON ae.cartridge_id = c.id
+            JOIN mount m ON m.namespace_id = ae.namespace_id
+                        AND m.cartridge_id = c.id
+            WHERE CASE
+                    WHEN m.qualification = 'aliased' THEN m.attach_alias
+                    WHEN m.qualification = 'engine_schema' THEN m.engine_schema
+                    ELSE NULL
+                  END = ?1
+              AND e.name = ?2
+              AND ea.attribute_type = 'output_column'
+            ORDER BY ea.position
+        "#;
+
+        let columns = Self::query_columns(
+            &conn,
+            sql_by_mount_qualification,
+            qualifier,
+            table_name,
+        );
+        if let Some(cols) = columns {
+            if !cols.is_empty() {
+                return Some(cols);
+            }
+        }
+
+        // Non-mount cartridges (consulted libraries and other definition
+        // sources) retain source_ns as source metadata. Excluding cartridges
+        // participating in `mount` keeps that metadata from becoming a second
+        // writable copy of mount qualification policy.
+        let sql_by_non_mount_source_ns = r#"
             SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
             FROM entity_attribute ea
             JOIN entity e ON e.id = ea.entity_id
             JOIN activated_entity ae ON ae.entity_id = e.id
             JOIN cartridge c ON ae.cartridge_id = c.id
             WHERE c.source_ns = ?1
+              AND NOT EXISTS (
+                    SELECT 1 FROM mount m WHERE m.cartridge_id = c.id
+              )
               AND e.name = ?2
               AND ea.attribute_type = 'output_column'
             ORDER BY ea.position
         "#;
 
-        let columns = Self::query_columns(&conn, sql_by_source_ns, qualifier, table_name);
+        let columns = Self::query_columns(&conn, sql_by_non_mount_source_ns, qualifier, table_name);
         if let Some(cols) = columns {
             if !cols.is_empty() {
                 return Some(cols);

@@ -48,7 +48,7 @@ pub(in crate::pipeline::builder_v2) fn parse_lvar(node: CstNode) -> Result<Domai
 
 /// Strip enclosing quotes from a string literal CST node text.
 /// Handles triple-quoted (""") and double-quoted (") forms.
-pub(in crate::pipeline::builder_v2) fn strip_string_quotes(text: &str) -> &str {
+pub(crate) fn strip_string_quotes(text: &str) -> &str {
     if text.starts_with("\"\"\"") {
         &text[3..text.len() - 3]
     } else {
@@ -58,7 +58,7 @@ pub(in crate::pipeline::builder_v2) fn strip_string_quotes(text: &str) -> &str {
 
 /// Decode a string literal that may have a `b64:` prefix.
 /// Returns the decoded content for b64 strings, or stripped-quotes content for regular strings.
-pub(in crate::pipeline::builder_v2) fn decode_string_literal_text(text: &str) -> Option<String> {
+pub(crate) fn decode_string_literal_text(text: &str) -> Option<String> {
     if text.starts_with("b64:") {
         let inner = &text[4..];
         let encoded = strip_string_quotes(inner);

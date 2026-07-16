@@ -673,12 +673,14 @@ pub fn walk_transform_function<P, Q, F: AstTransform<P, Q> + ?Sized>(
         }),
         FunctionExpression::HigherOrder {
             name,
+            namespace,
             curried_arguments,
             regular_arguments,
             alias,
             conditioned_on,
         } => Ok(FunctionExpression::HigherOrder {
             name,
+            namespace,
             curried_arguments: curried_arguments
                 .into_iter()
                 .map(|e| t.transform_domain(e))
@@ -839,10 +841,12 @@ pub fn walk_transform_sigma<P, Q, F: AstTransform<P, Q> + ?Sized>(
         }),
         SigmaCondition::SigmaCall {
             functor,
+            namespace,
             arguments,
             exists,
         } => Ok(SigmaCondition::SigmaCall {
             functor,
+            namespace,
             arguments: arguments
                 .into_iter()
                 .map(|e| t.transform_domain(e))
@@ -961,6 +965,7 @@ pub fn walk_transform_operator<P, Q, F: AstTransform<P, Q> + ?Sized>(
             first_parens_spec,
             domain_spec,
             namespace,
+            grounding,
         } => Ok(UnaryRelationalOperator::HoViewApplication {
             function,
             arguments,
@@ -969,6 +974,7 @@ pub fn walk_transform_operator<P, Q, F: AstTransform<P, Q> + ?Sized>(
                 .transpose()?,
             domain_spec: t.transform_domain_spec(domain_spec)?,
             namespace,
+            grounding,
         }),
         UnaryRelationalOperator::DmlTerminal {
             kind,
@@ -1213,15 +1219,19 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
         }),
         Relation::PseudoPredicate {
             name,
+            namespace,
             arguments,
+            access,
             alias,
             cpr_schema,
         } => Ok(Relation::PseudoPredicate {
             name,
+            namespace,
             arguments: arguments
                 .into_iter()
                 .map(|e| t.transform_domain(e))
                 .collect::<Result<Vec<_>>>()?,
+            access: t.transform_domain_spec(access)?,
             alias,
             cpr_schema: cpr_schema.rephase(),
         }),
@@ -1320,6 +1330,8 @@ pub fn walk_transform_cte_binding<P, Q, F: AstTransform<P, Q> + ?Sized>(
     Ok(CteBinding {
         expression: t.transform_relational_action(cte.expression)?.into_inner(),
         name: cte.name,
+        origin: cte.origin,
+        resolution_owner: cte.resolution_owner,
         effect_label: cte.effect_label,
         is_recursive: cte.is_recursive.rephase(),
     })
@@ -1447,6 +1459,8 @@ mod correlation_preservation_tests {
     fn sentinel(tag: &str) -> RelationalExpression<Refined> {
         RelationalExpression::Relation(Relation::PseudoPredicate {
             name: tag.to_string(),
+            namespace: Vec::new(),
+            access: DomainSpec::Glob,
             arguments: vec![],
             alias: None,
             cpr_schema: PhaseBox::phantom(),

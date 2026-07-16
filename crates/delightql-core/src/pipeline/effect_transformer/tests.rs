@@ -360,13 +360,191 @@ fn receipt_mention_gates_later_directive_with_exists() {
     let update_sql = sql_at(&plan, update);
     // `temp.`-qualified per the scratch-collision invariant (review F1/F3;
     // the generator quotes the schema keyword).
+    // Receipt-era (2026-07-15): the mention's value is route!'s OUTER
+    // receipt (built over its receipt shell), so the gate is EXISTS over
+    // that derived receipt — still a 0/1 guard on __r_route's emptiness.
+    let flat_update = flat(update_sql.clone());
     assert!(
-        flat(update_sql).contains("EXISTS (SELECT 1 FROM \"temp\".__r_route)"),
+        flat_update.contains("EXISTS (SELECT") && flat_update.contains("__r_route"),
         "the chained directive is gated on the receipt's non-emptiness: {}",
         update_sql
     );
     // And route!'s DML happened first (E1: left to right).
     assert!(index_of(&plan, "orders_eu") < update);
+}
+
+// ============================================================================
+// D2 — the typed effect plan (DOGFOODING-EFFECT-EXECUTION-PLAN §5):
+// scheduled steps with occurrence identity and requirement edges; guard
+// DEFINITIONS shared by dependents; the flat entry list is the steps'
+// statement streams, concatenated.
+// ============================================================================
+
+/// The ONE typed program: the flat entry list IS the flatten projection
+/// of the typed steps — byte-for-byte, variant-for-variant (review
+/// finding 3: no cloned streams to drift, no second positional
+/// authority). Setup, Begin, effect steps, Return, Commit, and Cleanup
+/// all appear as steps.
+#[test]
+fn flat_entries_are_the_flatten_projection_of_the_typed_program() {
+    let plan = plan_for(
+        "route!(*) :- source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*)\n\
+         stage!(*) :- source.orders(*), region = \"US\" |> temp_table!(staged(*))(*)\n\
+         main!(*) :- route!(*), stage!(*)\n",
+    );
+    let typed = plan.typed.as_ref().expect("transformer plans carry the typed layer");
+    let derived = typed.flatten();
+    assert_eq!(plan.entries.len(), derived.len());
+    for (a, b) in plan.entries.iter().zip(derived.iter()) {
+        let sig = |e: &PlanEntry| match e {
+            PlanEntry::Statement(st) => format!("S:{}", st.sql),
+            PlanEntry::ShippedStatement(st) => format!("SHIP:{}", st.sql),
+            PlanEntry::BeginTransaction { .. } => "BEGIN".to_string(),
+            PlanEntry::CommitTransaction { .. } => "COMMIT".to_string(),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(sig(a), sig(b));
+    }
+    let kinds: Vec<_> = typed.steps.iter().map(|s| s.kind()).collect();
+    assert_eq!(kinds.first(), Some(&compiled_query::EffectStepKind::Setup));
+    assert!(kinds.contains(&compiled_query::EffectStepKind::Begin));
+    assert!(kinds.contains(&compiled_query::EffectStepKind::Commit));
+    assert_eq!(kinds.last(), Some(&compiled_query::EffectStepKind::Cleanup));
+    assert!(
+        typed.steps.iter().all(|s| !matches!(s.kind(), compiled_query::EffectStepKind::Dml)
+            || !s.action.statements().is_empty()),
+        "effect steps own their statement streams"
+    );
+}
+
+/// Occurrence identity and requirement edges: the guarded occurrence
+/// carries a Present edge referencing a shared guard DEFINITION (which
+/// holds a standalone one-row SELECT over the left receipt); two
+/// occurrences have distinct identities carrying their expansion paths.
+#[test]
+fn typed_steps_carry_occurrences_and_requirement_edges() {
+    let plan = plan_for(
+        "route!(*) :- source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*)\n\
+         stage!(*) :- source.orders(*), region = \"US\" |> temp_table!(staged(*))(*)\n\
+         main!(*) :- route!(*), stage!(*)\n",
+    );
+    let typed = plan.typed.as_ref().unwrap();
+    let ddl = typed
+        .steps
+        .iter()
+        .find(|s| s.kind() == compiled_query::EffectStepKind::Ddl)
+        .expect("stage!'s temp_table! is a Ddl step");
+    assert!(
+        ddl.occurrence.contains("temp_table!"),
+        "occurrence carries the expansion path: {}",
+        ddl.occurrence
+    );
+    assert_eq!(ddl.requirements.len(), 1, "one comma edge");
+    let req = &ddl.requirements[0];
+    assert_eq!(req.polarity, compiled_query::GuardPolarity::Present);
+    assert_eq!(req.reason, "comma");
+    let guard = &typed.guards[req.guard_id];
+    let g = flat(&guard.sql);
+    assert!(
+        g.starts_with("SELECT 1 WHERE") && g.contains("__r_route"),
+        "the guard definition is a standalone one-row SELECT over the left receipt: {}",
+        guard.sql
+    );
+    let dml = typed
+        .steps
+        .iter()
+        .find(|s| s.kind() == compiled_query::EffectStepKind::Dml)
+        .expect("route!'s insert! is a Dml step");
+    assert!(dml.occurrence.contains("insert!"), "{}", dml.occurrence);
+    assert_ne!(dml.occurrence, ddl.occurrence, "mention is instantiation");
+    assert!(
+        typed.steps.iter().any(|s| s.kind() == compiled_query::EffectStepKind::Return),
+        "the return step is scheduled"
+    );
+}
+
+/// A reached exit! stamps LATER data steps with an Absent edge on the
+/// latch (Q-D7: exit is an ordinary absent-polarity guard edge in the
+/// typed model; the pump's peek and the NOT EXISTS stamps are its
+/// lowering).
+#[test]
+fn typed_exit_stamps_later_steps_with_absent_edges() {
+    let plan = plan_for(
+        "halt!(*) :- source.orders(*), amount > 999999 |> exit!(*)\n\
+         mark!(*) :- source.orders!!(*), status = \"new\" |> $$(\"done\" as status) |> update!(source.orders(*))(*)\n\
+         main!(*) :- halt!(*) ; mark!(*)\n",
+    );
+    let typed = plan.typed.as_ref().unwrap();
+    let exit_step = typed
+        .steps
+        .iter()
+        .find(|s| s.kind() == compiled_query::EffectStepKind::Exit)
+        .expect("exit! is a scheduled step");
+    assert!(
+        !exit_step
+            .requirements
+            .iter()
+            .any(|r| r.reason == "exit"),
+        "exit!'s own step wears no edge on the latch it sets"
+    );
+    let dml = typed
+        .steps
+        .iter()
+        .find(|s| s.kind() == compiled_query::EffectStepKind::Dml)
+        .expect("mark!'s update! is a Dml step");
+    let absent: Vec<_> = dml
+        .requirements
+        .iter()
+        .filter(|r| r.polarity == compiled_query::GuardPolarity::Absent)
+        .collect();
+    assert_eq!(absent.len(), 1, "one absent edge on the later DML");
+    assert_eq!(absent[0].reason, "exit");
+    assert!(
+        typed.guards[absent[0].guard_id].sql.contains("__exit"),
+        "the absent edge references the exit-latch guard definition"
+    );
+}
+
+/// M0 → D3c: a conjunction-guarded DDL creation emits PLAIN statements —
+/// the per-entry GuardedStatement special case is retired, because the
+/// typed walk's requirement edges (D3a) decline the WHOLE step (drops +
+/// CREATE + receipt together) when the guard is closed. This pin holds
+/// the retirement honest: no guarded entries exist, and the Ddl step
+/// carries the Present edge that now does the suppressing. Corpus pins:
+/// the effects ball's ddl_gate--94..97 (green across M0, D3a, and this
+/// retirement).
+#[test]
+fn conjunction_guarded_ddl_relies_on_step_edges_not_guarded_entries() {
+    let plan = plan_for(
+        "route!(*) :- source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*)\n\
+         stage!(*) :- source.orders(*), region = \"US\" |> temp_table!(staged(*))(*)\n\
+         main!(*) :- route!(*), stage!(*)\n",
+    );
+    let typed = plan.typed.as_ref().unwrap();
+    let ddl = typed
+        .steps
+        .iter()
+        .find(|s| s.kind() == compiled_query::EffectStepKind::Ddl)
+        .expect("stage!'s temp_table! is a Ddl step");
+    assert_eq!(ddl.requirements.len(), 1, "the comma edge does the suppressing");
+    // The sum type says it structurally: a Ddl action is plain statements
+    // (no ship, no guard pairing possible).
+    assert!(
+        matches!(ddl.action, compiled_query::EffectAction::Ddl(_)),
+        "guarded DDL is a Ddl action: {:?}",
+        ddl.action
+    );
+    let create = ddl
+        .action
+        .statements()
+        .iter()
+        .find_map(|st| {
+            st.sql
+                .contains("CREATE TEMPORARY TABLE staged")
+                .then(|| st.sql.clone())
+        })
+        .expect("the CREATE is an ordinary statement inside the step");
+    assert!(!create.contains("[guard]"), "{create}");
 }
 
 /// R5 ruling: a multi-clause rule's clauses execute in definition order and
@@ -487,21 +665,40 @@ fn signed_witness_lowers_to_dee_left_join() {
 /// The safe half of §5.8: the ship and its consumer are ADJACENT — the
 /// pure prefix re-evaluates with no mutation in between.
 #[test]
-fn stdout_prefix_reevaluates_adjacently() {
+fn stdout_prefix_snapshots_once() {
+    // OBSERVED-PAYLOAD FUSION (txmyxvos; formerly
+    // `stdout_prefix_reevaluates_adjacently`, which pinned the payload
+    // round-trip): the released tee materializes its prefix ONCE into a
+    // typed snapshot; the ship and the consumer BOTH read the snapshot,
+    // so printed rows = staged rows by construction and the prefix is
+    // never re-evaluated.
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*), amount > 0 |> stdout!(*) |> temp_table!(staged) : s!\n\
+         \x20   source.orders(*), amount > 0 !> stdout!(*) |> temp_table!(staged) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
     );
-    let ship = index_of(&plan, "FROM"); // first statement is the shipped prefix
     let (i, ship_sql, shipped) = statement_sqls(&plan)
         .into_iter()
         .find(|(_, _, s)| *s)
         .expect("stdout! ships");
     assert!(shipped);
+    assert!(
+        ship_sql.contains("__tee_stdout"),
+        "the ship reads the snapshot (ship-once): {}",
+        ship_sql
+    );
+    let snap_ctas = statement_sqls(&plan)
+        .into_iter()
+        .map(|(_, sql, _)| sql)
+        .find(|sql| sql.contains("CREATE TEMPORARY TABLE __tee_stdout"))
+        .expect("the tee snapshot CTAS exists");
+    assert!(
+        snap_ctas.contains("FROM") && snap_ctas.contains("amount"),
+        "the prefix is evaluated exactly once, in the snapshot CTAS: {}",
+        snap_ctas
+    );
     // Between the ship and the CTAS sits only the §3 replace drop (ruled
-    // 2026-07-11: temp creations replace) — it mutates nothing the prefix
-    // reads, so the §5.8 mutation-free window holds across it.
+    // 2026-07-11: temp creations replace).
     let drop_sql = sql_at(&plan, i + 1);
     assert!(
         drop_sql.starts_with("DROP TABLE IF EXISTS temp.staged"),
@@ -515,12 +712,19 @@ fn stdout_prefix_reevaluates_adjacently() {
         ctas_sql
     );
     assert!(
-        ctas_sql.contains(ship_sql.as_str()),
-        "the consumer re-evaluates the SAME pure prefix:\nship: {}\nctas: {}",
-        ship_sql,
+        ctas_sql.contains("__tee_stdout"),
+        "the consumer reads the SAME snapshot the ship printed: {}",
         ctas_sql
     );
-    let _ = ship;
+    // The txmyxvos acceptance shape: no json packaging anywhere for the
+    // released tee.
+    for (_, sql, _) in statement_sqls(&plan) {
+        assert!(
+            !sql.contains("json_group_array") && !sql.contains("json_each"),
+            "no payload round-trip in the fused plan: {}",
+            sql
+        );
+    }
 }
 
 /// The materialize half of §5.8: an HO input bound before a mutation and
@@ -882,8 +1086,11 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     );
     let update = index_of(&plan, "UPDATE");
     let update_sql = sql_at(&plan, update);
+    // Receipt-era (2026-07-15): the gate is EXISTS over route!'s derived
+    // OUTER receipt — still a 0/1 guard on __r_route's emptiness.
+    let flat_update = flat(update_sql.clone());
     assert!(
-        flat(update_sql).contains("EXISTS (SELECT 1 FROM \"temp\".__r_route)"),
+        flat_update.contains("EXISTS (SELECT") && flat_update.contains("__r_route"),
         "mark_processed! is receipt-gated: {}",
         update_sql
     );
@@ -907,10 +1114,13 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     );
 
     // [tail] the total ledger — INTERIOR signed witness per arm
-    // (`s!(+-) ; x!(+-) ; …`, task 3.1b; THE RULING 2026-07-11) — ships
-    // wrap-guarded, ONE full-schema row per arm, corresponding-union
-    // padded, matching TORTURE-TEST-NORMAL's ledger shape; then the
-    // return value (final_summary, post-state E3) ships last.
+    // (`s!(+-) ; x!(+-) ; …`, task 3.1b; THE RULING 2026-07-11).
+    // OBSERVED-PAYLOAD FUSION (txmyxvos): the tee's `!>` releases
+    // stdout!'s payload immediately, so the union materializes ONCE into
+    // the typed snapshot (`__tee_stdout_2`) — the ship reads the
+    // snapshot (printed rows = rows passed downstream, ship-once), and
+    // NO tree-group/json packaging appears for this spelling. The
+    // signed-witness union itself now lives in the snapshot's CTAS.
     let ships: Vec<(usize, String, bool)> = statement_sqls(&plan)
         .into_iter()
         .filter(|(_, _, s)| *s)
@@ -919,10 +1129,26 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
         ships.len() >= 3,
         "stdout! #1, the ledger, and the return all ship"
     );
-    let ledger = &ships[ships.len() - 2].1;
+    let ledger_ship = &ships[ships.len() - 2].1;
+    assert!(
+        ledger_ship.contains("__tee_stdout"),
+        "the ledger ships FROM the fused snapshot (ship-once): {}",
+        ledger_ship
+    );
+    assert!(
+        !ledger_ship.contains("json_group") && !ledger_ship.contains("json_each"),
+        "no payload round-trip on the released tee (txmyxvos): {}",
+        ledger_ship
+    );
+    let ledger = statement_sqls(&plan)
+        .into_iter()
+        .map(|(_, sql, _)| sql)
+        .find(|sql| sql.contains("__tee_stdout_2") && sql.contains("CREATE"))
+        .expect("the ledger snapshot CTAS exists");
+    let ledger = &ledger;
     assert!(
         ledger.contains("LEFT JOIN") && ledger.contains("met"),
-        "the ledger is the signed-witness union: {}",
+        "the ledger is the signed-witness union (in the snapshot CTAS): {}",
         ledger
     );
     // Per-arm shape (the interior spelling): six arms = six DEE LEFT-JOIN
@@ -972,11 +1198,13 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
         "rm!'s receipt join widens the ledger with _2 columns (D3): {}",
         ledger
     );
+    // Post-fusion the WRAP-guard (§5.9) sits on the SHIP that reads the
+    // snapshot, not on the CTAS that builds it.
     assert!(
-        ledger.starts_with("SELECT * FROM (")
-            && ledger.contains("NOT EXISTS (SELECT 1 FROM temp.__exit)"),
+        ledger_ship.starts_with("SELECT * FROM (")
+            && ledger_ship.contains("NOT EXISTS (SELECT 1 FROM temp.__exit)"),
         "the ledger ship is WRAP-guarded (§5.9): {}",
-        ledger
+        ledger_ship
     );
 
     let final_ship = &ships[ships.len() - 1].1;
@@ -992,10 +1220,12 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     // four flat labeled-count arms, one per bucket — never the nested
     // count-of-accumulated-union shape of the exterior spelling.
     let final_flat = flat(final_ship);
+    // Receipt-era (2026-07-15): 4 arm counts + 1 __clause_count from
+    // main!'s outer-receipt emptiness gate (the universal boundary).
     assert_eq!(
         final_flat.matches("count(*)").count(),
-        4,
-        "one count per arm, four arms: {}",
+        5,
+        "one count per arm (four arms) plus the boundary gate: {}",
         final_ship
     );
     assert_eq!(
@@ -1530,6 +1760,56 @@ fn assert_no_sqlite_spellings(plan: &CompiledPlan) {
 
 /// R-T2 + R-T3 (PG): scratch spells `pg_temp.`, and the shells move
 /// INSIDE the bracket with ON COMMIT DROP (the RECOMMENDED PG form —
+/// The txmyxvos cross-target witness: the observed-payload fusion is
+/// UPSTREAM of dialect rendering — one semantic plan, spelling-only
+/// variance — so the released tee produces the same fused shape on the
+/// PG lane: the prefix snapshots once into a pg_temp scratch CTAS, the
+/// ship reads the snapshot, and NO json packaging appears anywhere for
+/// the released spelling. Proves the acceptance clause "relevant
+/// cross-target lanes prove this is not SQLite-only" at the plan level
+/// (live-PG value coverage rides the mount-BC harness).
+#[test]
+fn pg_released_tee_fuses_identically() {
+    let plan = plan_on_engine_remote(
+        "postgresql",
+        "pgremote",
+        "main!(*) :- pgremote.rt(*) !> stdout!(*) |> temp_table!(staged) : s!\n\
+         \x20   s!(*) |> returning!(*)\n",
+    );
+    assert_no_sqlite_spellings(&plan);
+    let (_, ship_sql, _) = statement_sqls(&plan)
+        .into_iter()
+        .find(|(_, _, s)| *s)
+        .expect("stdout! ships on the PG lane");
+    assert!(
+        ship_sql.contains("__tee_stdout"),
+        "PG ship reads the fused snapshot: {}",
+        ship_sql
+    );
+    // The snapshot rides the same in-bracket scratch convention as
+    // `__snap_*` (E-T2): a plain temp CTAS inside the bracket, dropped by
+    // the plan's Cleanup step (`alloc_scratch` registers it), NOT a
+    // pg_temp-qualified ON-COMMIT-DROP shell.
+    let (snap_idx, snap) = statement_sqls(&plan)
+        .into_iter()
+        .find(|(_, sql, _)| sql.contains("__tee_stdout") && sql.contains("CREATE"))
+        .map(|(i, sql, _)| (i, sql))
+        .expect("the tee snapshot CTAS exists on PG");
+    assert!(
+        snap_idx > begin_index(&plan) && snap_idx < commit_index(&plan),
+        "the snapshot CTAS sits inside the bracket: {}",
+        snap
+    );
+    for (_, sql, _) in statement_sqls(&plan) {
+        assert!(
+            !sql.contains("json_group_array") && !sql.contains("json_each")
+                && !sql.contains("json_agg") && !sql.contains("jsonb_array_elements"),
+            "no payload round-trip on the PG lane either (txmyxvos): {}",
+            sql
+        );
+    }
+}
+
 /// zero residue on abort AND commit, no stale-__exit latch window;
 /// P1 §A verified the shape end-to-end).
 #[test]
@@ -1799,30 +2079,7 @@ fn sqlite_representative_plan_render_pinned_byte_for_byte() {
     let plan = plan_for(
         "main!(*) :- source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*)\n",
     );
-    let expected = "\
-CREATE TEMP TABLE temp.__r_main (success INTEGER, operation TEXT, target TEXT);
-
--- [conn 2]
-BEGIN;
-
--- [conn 2]
-INSERT INTO _imported_12.orders_eu (order_id, customer_id, region, amount, order_date, status) SELECT orders.order_id AS order_id, orders.customer_id AS customer_id, orders.region AS region, orders.amount AS amount, orders.order_date AS order_date, orders.status AS status
-FROM _imported_11.orders
-WHERE orders.region IS NOT DISTINCT FROM 'EU';
-
--- [conn 2]
-INSERT INTO \"temp\".__r_main (success, operation, target) SELECT 1, 'insert!', 'warehouse.orders_eu'
-WHERE changes() > 0;
-
--- [ship] [conn 2] the return value
-SELECT __r_main.success AS success, __r_main.operation AS operation, __r_main.target AS target
-FROM \"temp\".__r_main;
-
--- [conn 2]
-COMMIT;
-
--- [conn 2] plan-scratch cleanup
-DROP TABLE IF EXISTS temp.__r_main;";
+    let expected = "-- [conn 2]\nCREATE TEMP TABLE temp.__r_main (success INTEGER, operation TEXT, target TEXT);\n\n-- [conn 2]\nBEGIN;\n\n-- [conn 2]\nINSERT INTO _imported_13.orders_eu (order_id, customer_id, region, amount, order_date, status) SELECT orders.order_id AS order_id, orders.customer_id AS customer_id, orders.region AS region, orders.amount AS amount, orders.order_date AS order_date, orders.status AS status\nFROM _imported_12.orders\nWHERE orders.region IS NOT DISTINCT FROM 'EU';\n\n-- [conn 2]\nINSERT INTO \"temp\".__r_main (success, operation, target) SELECT 1, 'insert!', 'warehouse.orders_eu'\nWHERE changes() > 0;\n\n-- [ship] [conn 2] the return value\nSELECT 1 AS success, 'main!' AS operation, t_2.returned AS returned\nFROM (\n  SELECT COALESCE(JSON('[' || GROUP_CONCAT(CASE WHEN ((__r_main.success IS NOT NULL OR __r_main.operation IS NOT NULL) OR __r_main.target IS NOT NULL) THEN JSON_OBJECT('success', __r_main.success, 'operation', __r_main.operation, 'target', __r_main.target) END, ',') || ']'), JSON('[]')) AS returned, count(*) AS __clause_count\n  FROM \"temp\".__r_main\n) AS t_2\nWHERE t_2.__clause_count > 0;\n\n-- [conn 2]\nCOMMIT;\n\n-- [conn 2] plan-scratch cleanup\nDROP TABLE IF EXISTS temp.__r_main;";
     assert_eq!(
         plan.render_sql(),
         expected,
@@ -2492,6 +2749,8 @@ fn directive_bearing_domain_spec() -> DomainSpec {
         identifier: qn_red6("s"),
         subquery: Box::new(RelationalExpression::Relation(Relation::PseudoPredicate {
             name: "insert!".to_string(),
+            namespace: Vec::new(),
+            access: DomainSpec::Glob,
             arguments: vec![],
             alias: None,
             cpr_schema: PhaseBox::phantom(),

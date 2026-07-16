@@ -361,12 +361,14 @@ impl<'a> CfeRefiner<'a> {
             }
             resolved::FunctionExpression::HigherOrder {
                 name,
+                namespace,
                 curried_arguments,
                 regular_arguments,
                 alias,
                 conditioned_on,
             } => refined::FunctionExpression::HigherOrder {
                 name,
+                namespace,
                 curried_arguments: self.rd_vec(curried_arguments)?,
                 regular_arguments: self.rd_vec(regular_arguments)?,
                 alias,

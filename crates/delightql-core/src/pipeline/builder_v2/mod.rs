@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use tree_sitter::Tree;
 
 mod continuation;
-mod expressions;
+pub(crate) mod expressions;
 mod helpers;
 mod operators;
 mod predicates;
@@ -608,6 +608,9 @@ fn parse_cte_binding(cte_node: CstNode, features: &mut FeatureCollector) -> Resu
     Ok(CteBinding {
         expression,
         name,
+        // User text: the builder is the ONE author of UserDefined CTEs.
+        origin: crate::pipeline::asts::core::provenance::CteOrigin::UserDefined,
+        resolution_owner: crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
         effect_label,
         is_recursive: PhaseBox::phantom(),
     })
@@ -869,6 +872,106 @@ mod effect_builder_tests {
         let (query, _f, _a, _e, _d, _o, _b) =
             parse_query(&tree, source).expect("builder constructs the query");
         query
+    }
+
+    fn build_error(source: &str) -> DelightQLError {
+        let tree = parse(source).expect("source parses");
+        parse_query(&tree, source).expect_err("builder must refuse the source")
+    }
+
+    /// Surface-to-AST losslessness pin: the grammar's grounded namespace is
+    /// a two-part semantic value. SigmaCall does not yet carry GroundedPath,
+    /// so accepting it would necessarily discard information.
+    #[test]
+    fn grounded_sigma_citation_refuses_instead_of_dropping_grounding() {
+        let error = build_error("_(v @ 1), +data::x^lib::y.h(v)");
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://semantic/sigma/grounding_unsupported"
+        );
+    }
+
+    /// Complete semantic-value pin for ordinary relation qualification. Both
+    /// halves of `data^library` must survive; keeping only the first namespace
+    /// produces a valid-looking AST with the wrong meaning.
+    #[test]
+    fn grounded_relation_preserves_data_and_library_namespaces() {
+        let query = build("data::warehouse^lib::reports.orders(*)");
+        let Query::Relational(RelationalExpression::Relation(Relation::Ground {
+            identifier,
+            ..
+        })) = query
+        else {
+            panic!("expected a grounded relation");
+        };
+        assert_eq!(identifier.namespace_path.fq_string(), "data::warehouse");
+        let grounding = identifier.grounding.expect("grounding must be preserved");
+        assert_eq!(grounding.data_ns.fq_string(), "data::warehouse");
+        assert_eq!(grounding.grounded_ns.len(), 1);
+        assert_eq!(grounding.grounded_ns[0].fq_string(), "lib::reports");
+    }
+
+    /// The piped HO syntax used to parse the same grounded namespace and then
+    /// discard its `GroundedPath`. It now carries the complete value to the
+    /// common HO expansion door.
+    #[test]
+    #[stacksafe::stacksafe]
+    fn grounded_piped_ho_preserves_grounding() {
+        let query = build("orders(*) |> data::warehouse^lib::reports.decorate(*)");
+        let Query::Relational(RelationalExpression::Pipe(pipe)) = query else {
+            panic!("expected a pipe");
+        };
+        let UnaryRelationalOperator::HoViewApplication {
+            ref namespace,
+            ref grounding,
+            ..
+        } = pipe.operator
+        else {
+            panic!("expected a piped HO invocation");
+        };
+        assert_eq!(
+            namespace.as_ref().expect("data namespace").fq_string(),
+            "data::warehouse"
+        );
+        let grounding = grounding.as_ref().expect("grounding must be preserved");
+        assert_eq!(grounding.data_ns.fq_string(), "data::warehouse");
+        assert_eq!(grounding.grounded_ns[0].fq_string(), "lib::reports");
+    }
+
+    /// Function ASTs do not yet model grounding. As with sigma citations, an
+    /// explicit refusal is lossless; accepting and truncating is not.
+    #[test]
+    fn grounded_scalar_function_refuses_instead_of_dropping_grounding() {
+        let error = build_error("_(x @ data::warehouse^lib::reports.f:(1))");
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://semantic/function/grounding_unsupported"
+        );
+    }
+
+    /// Higher-order scalar calls once discarded an ordinary namespace even
+    /// though regular and curried calls preserved theirs.
+    #[test]
+    fn qualified_higher_order_function_preserves_namespace() {
+        let query = build("_(x @ lib::math.apply:(upper:())(1))");
+        let Query::Relational(RelationalExpression::Relation(Relation::Anonymous {
+            rows,
+            ..
+        })) = query
+        else {
+            panic!("expected an anonymous relation");
+        };
+        let DomainExpression::Function(FunctionExpression::HigherOrder {
+            namespace,
+            ..
+        }) = &rows[0].values[0]
+        else {
+            panic!("expected a higher-order scalar call");
+        };
+        assert_eq!(
+            namespace.as_ref().expect("namespace").fq_string(),
+            "lib::math"
+        );
     }
 
     /// REPORT-2.1 note 1: the builder silently DROPPED the effect_marker,

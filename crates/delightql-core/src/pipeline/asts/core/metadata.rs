@@ -55,6 +55,12 @@ pub struct NamespacePath {
     items: SmallVec<[NamespaceItem; 2]>,
 }
 
+impl Default for NamespacePath {
+    fn default() -> Self {
+        NamespacePath::empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceItem {
     pub name: SqlIdentifier,
@@ -98,6 +104,16 @@ impl NamespacePath {
     /// Examples: `users(*)`, `id`, `count:(*)`
     pub fn empty() -> Self {
         NamespacePath { items: smallvec![] }
+    }
+
+    /// The `::`-joined fully-qualified spelling (empty string for an
+    /// empty path). The catalog's `fq_name` convention.
+    pub fn fq_string(&self) -> String {
+        self.items
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>()
+            .join("::")
     }
 
     /// Single-level path (e.g., just schema or just database)
@@ -357,6 +373,15 @@ pub struct ColumnMetadata {
     /// describes the columns of the interior relation for drill-down support.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub interior_schema: Option<Vec<crate::pipeline::asts::core::operators::InteriorColumnDef>>,
+    /// TAGGED-SUM marker (EFFECT-ALGEBRA §3, amended 2026-07-15): set when
+    /// a corresponding union merged arms whose DECLARED interior headings
+    /// for this column DIFFER. The union itself is legal (each row keeps
+    /// its own heading; `operation` is the tag); RELEASING the column is
+    /// the compile-time teaching error — narrow the ledger to arms that
+    /// agree first. The kept `interior_schema` is the first arm's, for
+    /// display only; drills must check this flag before trusting it.
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub interior_schema_conflict: bool,
     /// The column's DECLARED type from the catalog, when the column comes
     /// from a physical table (registry lookup carries it forward from
     /// ColumnInfo). None for derived/expression columns. Declarations lie
@@ -387,6 +412,7 @@ impl ColumnMetadata {
             needs_hygienic_alias: false,
             needs_sql_rename: false,
             interior_schema: None,
+            interior_schema_conflict: false,
             declared_type: None,
         }
     }
@@ -451,6 +477,7 @@ impl ColumnMetadata {
             needs_hygienic_alias: false,
             needs_sql_rename: false,
             interior_schema: None,
+            interior_schema_conflict: false,
             declared_type: None,
         }
     }

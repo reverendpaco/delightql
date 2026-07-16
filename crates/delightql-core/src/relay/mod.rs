@@ -92,6 +92,9 @@ pub struct RelayParty<'a, T: Transport> {
     is_repl: bool,
     sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel,
     inline_ctes: bool,
+    /// Whether the most recent typed-plan run took its exit! latch —
+    /// read by the F5 receipt binder (a NO run ships the empty receipt).
+    last_run_exited: bool,
     hooks: RelayHooks,
 }
 
@@ -108,6 +111,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             is_repl: false,
             sql_optimization_level: pipeline::sql_optimizer::level_from_env(),
             inline_ctes: false,
+            last_run_exited: false,
             hooks: RelayHooks::default(),
         }
     }
@@ -755,6 +759,74 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             _source_location: None,
             body_text: expected.display_uri(),
         };
+
+        // ANNOTATION TRANSPARENCY (Phase 4c): an error hook must not change
+        // how a statement EXECUTES — only how its outcome is judged. A
+        // statement the effect chain would own (a directive tail) takes the
+        // effect chain here too, so its diagnostic class is the same with
+        // and without the annotation. Its error (or unexpected success) is
+        // matched against the expected URI exactly like the pipeline path.
+        let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
+        if let Some(effect_entry) = entry::classify_effect_entry(dql, allow_adhoc) {
+            let term = self.handle_effect_entry(effect_entry);
+            return match term {
+                ServerTerm::Error {
+                    identity: err_identity,
+                    message,
+                    ..
+                } => {
+                    let actual_uri = String::from_utf8_lossy(&err_identity).to_string();
+                    let v = verdict::Verdict {
+                        outcome: if expected.matches(&actual_uri) {
+                            verdict::VerdictOutcome::Pass
+                        } else {
+                            verdict::VerdictOutcome::Fail
+                        },
+                        identity,
+                        detail: Some(format!(
+                            "{}: {}",
+                            actual_uri,
+                            String::from_utf8_lossy(&message)
+                        )),
+                        _intent: None,
+                    };
+                    if let Some(ref mut hook) = self.hooks.on_error_hook {
+                        hook(&v);
+                    }
+                    match v.outcome {
+                        verdict::VerdictOutcome::Pass => self.empty_header_response(),
+                        _ => ServerTerm::Error {
+                            kind: ErrorKind::Constraint,
+                            identity: actual_uri.into_bytes(),
+                            message: format!(
+                                "expected error {} but got: {}",
+                                expected.display_uri(),
+                                String::from_utf8_lossy(&message)
+                            )
+                            .into_bytes(),
+                        },
+                    }
+                }
+                other => {
+                    // The statement succeeded where an error was expected.
+                    let v = verdict::Verdict {
+                        outcome: verdict::VerdictOutcome::Fail,
+                        identity,
+                        detail: Some("statement succeeded; expected an error".to_string()),
+                        _intent: None,
+                    };
+                    if let Some(ref mut hook) = self.hooks.on_error_hook {
+                        hook(&v);
+                    }
+                    let _ = other;
+                    ServerTerm::Error {
+                        kind: ErrorKind::Constraint,
+                        identity: expected.display_uri().into_bytes(),
+                        message: "statement succeeded; expected an error".to_string().into_bytes(),
+                    }
+                }
+            };
+        }
 
         // Try to compile the query
         let mut pipeline = Pipeline::new_with_config(

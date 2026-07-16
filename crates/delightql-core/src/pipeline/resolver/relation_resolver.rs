@@ -310,7 +310,9 @@ pub(super) fn resolve_ground(
         let mut found_entity: Option<(String, crate::enums::EntityType, String)> = None;
         for ns in &grounding.grounded_ns {
             let fq = super::grounding::namespace_path_to_fq(ns);
-            if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &fq) {
+            if let Some(entity) = registry
+                .consult
+                .lookup_entity(&identifier.name, &fq, config.resolution_namespace.as_deref()) {
                 if entity.entity_type == BootstrapEntityType::DqlTemporaryViewExpression
                     || entity.entity_type == BootstrapEntityType::DqlFactExpression
                 {
@@ -541,7 +543,9 @@ pub(super) fn resolve_ground(
             Ok(None) => {
                 // Not a database table — check consult registry for consulted views
                 let fq = super::grounding::namespace_path_to_fq(&identifier.namespace_path);
-                if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &fq) {
+                if let Some(entity) = registry
+                .consult
+                .lookup_entity(&identifier.name, &fq, config.resolution_namespace.as_deref()) {
                     if entity.entity_type
                         == BootstrapEntityType::DqlTemporaryViewExpression
                     {
@@ -592,7 +596,9 @@ pub(super) fn resolve_ground(
                     let mut fallback_result = None;
                     for ns in &grounding.grounded_ns {
                         let gfq = super::grounding::namespace_path_to_fq(ns);
-                        if let Some(entity) = registry.consult.lookup_entity(&identifier.name, &gfq)
+                        if let Some(entity) = registry
+                    .consult
+                    .lookup_entity(&identifier.name, &gfq, config.resolution_namespace.as_deref())
                         {
                             if entity.entity_type
                                 == BootstrapEntityType::DqlTemporaryViewExpression
@@ -1220,7 +1226,8 @@ pub(super) fn r_resolve_consulted_view(
     // Without this, function calls like `double:(b)` in the view body
     // would pass through to SQL as unresolved function names.
     let (query, view_ccafe_cfes) =
-        super::grounding::inline_in_query_borrowed(query, &registry.consult, None).map_err(
+        super::grounding::inline_in_query_borrowed(query, &registry.consult, None, Some(&view_ns))
+            .map_err(
             |e| {
                 DelightQLError::database_error(
                     format!(
@@ -1263,21 +1270,14 @@ pub(super) fn r_resolve_consulted_view(
         config.clone()
     };
 
-    // Temporarily activate namespace-local enlists and aliases so the view body
-    // can resolve entities from namespaces enlisted inside its DDL.
-    let activated_enlists = registry.consult.activate_namespace_local_enlists(&view_ns);
-    let activated_aliases = registry.consult.activate_namespace_local_aliases(&view_ns);
+    // Phase 10 slice c: the alias dance is gone from the view-body path —
+    // lookup_entity's alias clause is SCOPE-AWARE (a definition's
+    // qualifier alias resolves through its OWN namespace_local_alias
+    // rows, never the caller's session set).
 
     let resolve_result =
         super::resolve_query_inline(query, registry, outer_context, &body_config, None);
 
-    // Deactivate before checking the result (cleanup on both success and error)
-    registry
-        .consult
-        .deactivate_namespace_local_aliases(&activated_aliases);
-    registry
-        .consult
-        .deactivate_namespace_local_enlists(&activated_enlists);
 
     let (resolved_query, body_bubbled) = resolve_result.map_err(|e| {
         // Preserve validation errors (e.g., the B5 expansion-cycle refusal)
@@ -1990,7 +1990,9 @@ pub(super) fn resolve_tvf(
     if let Some(ref grounding) = grounding {
         for ns in &grounding.grounded_ns {
             let fq = super::grounding::namespace_path_to_fq(ns);
-            if let Some(entity) = registry.consult.lookup_entity(&function, &fq) {
+            if let Some(entity) = registry
+                .consult
+                .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
                 if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
                     let (table_bindings, scalar_spec, _pipe_idx) =
@@ -2000,6 +2002,9 @@ pub(super) fn resolve_tvf(
                             None,
                             groups_ref,
                             &ho_arguments,
+                            &config.alias_counter,
+                            registry,
+                            config.resolution_namespace.as_deref(),
                         )?;
                     return expand_ho_view(
                         &function,
@@ -2024,7 +2029,9 @@ pub(super) fn resolve_tvf(
     if grounding.is_none() {
         if let Some(ref ns) = namespace {
             let fq = super::grounding::namespace_path_to_fq(ns);
-            if let Some(entity) = registry.consult.lookup_entity(&function, &fq) {
+            if let Some(entity) = registry
+                .consult
+                .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
                 if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
                     let ho_grounding = ast_unresolved::GroundedPath {
@@ -2032,15 +2039,6 @@ pub(super) fn resolve_tvf(
                         grounded_ns: vec![ns.clone()],
                     };
 
-                    // Scope ER-rule lookups to the HO-view's namespace
-                    let ho_config = if !fq.is_empty() && fq != "main" {
-                        ResolutionConfig {
-                            resolution_namespace: Some(fq),
-                            ..config.clone()
-                        }
-                    } else {
-                        config.clone()
-                    };
 
                     let (table_bindings, scalar_spec, _pipe_idx) =
                         super::grounding::split_ho_first_parens(
@@ -2049,6 +2047,9 @@ pub(super) fn resolve_tvf(
                             None,
                             groups_ref,
                             &ho_arguments,
+                            &config.alias_counter,
+                            registry,
+                            config.resolution_namespace.as_deref(),
                         )?;
                     return expand_ho_view(
                         &function,
@@ -2061,7 +2062,7 @@ pub(super) fn resolve_tvf(
                         &ho_grounding,
                         registry,
                         outer_context,
-                        &ho_config,
+                        config,
                         alias.clone(),
                     );
                 }
@@ -2071,7 +2072,10 @@ pub(super) fn resolve_tvf(
 
     // Fallback: unqualified HO view via engage!
     if grounding.is_none() {
-        if let Some(entity) = registry.consult.lookup_enlisted_ho_view(&function)? {
+        if let Some(entity) = registry
+            .consult
+            .lookup_enlisted_ho_view(&function, config.resolution_namespace.as_deref())?
+        {
             let ns_parts: Vec<String> = entity.namespace.split("::").map(String::from).collect();
             let entity_ns = ast_unresolved::NamespacePath::from_parts(ns_parts).map_err(|e| {
                 DelightQLError::database_error(
@@ -2090,6 +2094,9 @@ pub(super) fn resolve_tvf(
                 None,
                 groups_ref,
                 &ho_arguments,
+                &config.alias_counter,
+                registry,
+                config.resolution_namespace.as_deref(),
             )?;
             return expand_ho_view(
                 &function,
@@ -2338,7 +2345,12 @@ pub(super) fn resolve_inner_relation(
     // Relabel columns with the inner relation's effective name (alias if present, otherwise identifier)
     // This ensures qualified globs like `users.*` or `u.*` can match these columns
     let effective_name = alias.as_deref().unwrap_or(&identifier.name);
-    let schema = super::helpers::extraction::transform_schema_table_names(schema, effective_name);
+    let schema = super::helpers::extraction::transform_schema_table_names(
+        schema,
+        effective_name,
+        // The effective name is the USER's alias or identifier text.
+        ast_resolved::CteOrigin::UserDefined,
+    );
 
     // Also relabel the bubbled state's i_provide columns so the join sees the correct table names
     let relabeled_i_provide: Vec<ast_resolved::ColumnMetadata> = bubbled
@@ -2669,30 +2681,29 @@ pub(super) fn expand_ho_view(
         pipe_source_cte,
         join_input_cte,
         data_ns,
+        config.resolution_namespace.clone(),
     )?;
 
-    // Activate namespace-local enlists and aliases
-    let activated_enlists = registry
-        .consult
-        .activate_namespace_local_enlists(&entity.namespace);
-    let activated_aliases = registry
-        .consult
-        .activate_namespace_local_aliases(&entity.namespace);
-
+    // The squished body resolves under the entity's scope. Caller-authored
+    // pipe/join/argument carriers each carry their concrete authored namespace
+    // in CteResolutionOwner, so the inline resolver changes scope only for
+    // those terms. This is shared by grounded, qualified, enlisted, relation,
+    // and piped invocation forms; no alias dance or ambient caller override.
+    let entity_config = if entity.namespace.is_empty() || entity.namespace == "main" {
+        config.clone()
+    } else {
+        ResolutionConfig {
+            resolution_namespace: Some(entity.namespace.clone()),
+            ..config.clone()
+        }
+    };
     let resolve_result = super::resolve_query_inline(
         squished_query,
         registry,
         outer_context,
-        config,
+        &entity_config,
         Some(grounding),
     );
-
-    registry
-        .consult
-        .deactivate_namespace_local_aliases(&activated_aliases);
-    registry
-        .consult
-        .deactivate_namespace_local_enlists(&activated_enlists);
 
     let (resolved_query, bubbled) = resolve_result?;
 

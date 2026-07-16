@@ -124,7 +124,16 @@ pub(in crate::pipeline::builder_v2) fn parse_function_call(
 
     // Extract optional namespace qualification (e.g., lib::math.double:(age))
     let namespace = if let Some(ns_node) = node.field("namespace_path") {
-        let (ns, _grounding) = super::super::relations::parse_namespace_qualification(ns_node)?;
+        let (ns, grounding) = super::super::relations::parse_namespace_qualification(ns_node)?;
+        if grounding.is_some() {
+            return Err(DelightQLError::validation_error_categorized(
+                "function/grounding_unsupported",
+                "grounded scalar-function citations are not implemented: the grounding qualifier \
+                 changes which definition is cited, so it cannot be discarded. Use an ordinary \
+                 namespace or alias",
+                "grounded scalar-function citation",
+            ));
+        }
         Some(ns)
     } else {
         None
@@ -142,6 +151,7 @@ pub(in crate::pipeline::builder_v2) fn parse_function_call(
         return Ok(DomainExpression::Function(
             FunctionExpression::HigherOrder {
                 name: name.into(),
+                namespace,
                 curried_arguments: curried_args,
                 regular_arguments: regular_args,
                 alias: None,

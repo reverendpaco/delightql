@@ -42,14 +42,30 @@ use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry};
 use crate::pipeline::{builder_v2, effect_transformer, parser};
 
 /// A statement the effect chain owns.
+#[derive(Debug)]
 pub(super) enum EffectEntry {
     /// `run_namespace!(ns)` — demand an already-consulted namespace's main!.
-    RunNamespace { namespace: String },
+    RunNamespace {
+        namespace: String,
+        /// Non-glob receipt access: the exact-arity positional binding
+        /// list (F5 reified, Phase 6 slice 6). None = glob/bare — the
+        /// execution family's payload-transparent dump.
+        access: Option<Vec<String>>,
+    },
     /// `run!("file.dql")` — consult the file, then demand its main!.
-    RunFile { path: String },
+    RunFile {
+        path: String,
+        /// See RunNamespace::access.
+        access: Option<Vec<String>>,
+    },
     /// A top-level directive-demanding statement: compile as an ad-hoc
     /// effect body; the run's value is the directive's receipt.
-    AdhocBody { query: Box<Query> },
+    AdhocBody {
+        query: Box<Query>,
+        /// Phase 10 slice b: statement annotations ride the typed program.
+        assertions: Vec<crate::pipeline::asts::core::queries::AssertionSpec>,
+        emits: Vec<crate::pipeline::asts::core::queries::EmitSpec>,
+    },
 }
 
 /// Classify a single-statement query text. `None` = not the effect chain's
@@ -71,20 +87,32 @@ pub(super) fn classify_effect_entry(dql: &str, allow_adhoc: bool) -> Option<Effe
     let tree = parser::parse(dql).ok()?;
     let (mut queries, _features, assertions, emits, dangers, options, ddl_blocks) =
         builder_v2::parse_queries(&tree, dql).ok()?;
-    // Conservative: any annotation keeps the statement on today's path.
-    if queries.len() != 1
-        || !assertions.is_empty()
-        || !emits.is_empty()
-        || !dangers.is_empty()
-        || !options.is_empty()
-        || !ddl_blocks.is_empty()
+    // Phase 10 slice b (semantic routing): assertions and emits ride the
+    // typed program as head steps — an annotated statement chooses the
+    // SAME execution generation as its unannotated twin. Danger/option
+    // overrides and inline DDL blocks are compile-mode configuration and
+    // conservatively keep today's path.
+    if queries.len() != 1 || !dangers.is_empty() || !options.is_empty() || !ddl_blocks.is_empty()
     {
         return None;
     }
     let query = queries.pop().expect("length checked above");
     match classify_query(query) {
-        Some(EffectEntry::AdhocBody { .. }) if !allow_adhoc => None,
-        other => other,
+        Some(EffectEntry::AdhocBody { query, .. }) => {
+            if allow_adhoc {
+                Some(EffectEntry::AdhocBody {
+                    query,
+                    assertions,
+                    emits,
+                })
+            } else {
+                None
+            }
+        }
+        // The run/entry forms take no statement annotations today; an
+        // annotated run! keeps today's path rather than dropping them.
+        other if assertions.is_empty() && emits.is_empty() => other,
+        _ => None,
     }
 }
 
@@ -108,13 +136,44 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
         // v0.1 (effect-CTE labels only occur inside consulted rules).
         return None;
     };
-    match expr {
+    // Descend through PURE postfix operators (drills, narrows,
+    // projections — e.g. the `!>` normalization or an explicit
+    // `.returned(*)` release over a DML receipt): the classification is
+    // by the expression's directive TAIL, not its outermost operator.
+    // The AdhocBody wraps the FULL original query either way.
+    let mut probe: &RelationalExpression = expr;
+    loop {
+        match probe {
+            RelationalExpression::Pipe(pipe)
+                if !matches!(
+                    &pipe.operator,
+                    UnaryRelationalOperator::DirectiveTerminal { .. }
+                        | UnaryRelationalOperator::DirectivePipeInvocation { .. }
+                ) =>
+            {
+                probe = &pipe.source;
+            }
+            _ => break,
+        }
+    }
+    match probe {
         RelationalExpression::Pipe(pipe) => {
             match &pipe.operator {
-                // Query-position DML terminal → receipt lowering.
-                UnaryRelationalOperator::DmlTerminal { .. } => {
+                // Relation-target DDL (Phase 3 canonical invocation) and
+                // DML (Phase 6 slice 5 — the designator form):
+                // source |> table!(my::ns.dump_table(*))(*) → receipt
+                // lowering, same as the bare-name terminal form.
+                UnaryRelationalOperator::DirectivePipeInvocation { name, .. }
+                    if matches!(
+                        name.as_str(),
+                        "temp_table!" | "table!" | "temp_view!" | "insert!" | "update!"
+                            | "delete!"
+                    ) =>
+                {
                     Some(EffectEntry::AdhocBody {
                         query: Box::new(query),
+                        assertions: Vec::new(),
+                        emits: Vec::new(),
                     })
                 }
                 UnaryRelationalOperator::DirectiveTerminal { name, .. } => {
@@ -125,31 +184,85 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
                         "temp_table!" | "table!" | "temp_view!" => {
                             Some(EffectEntry::AdhocBody {
                                 query: Box::new(query),
+                                assertions: Vec::new(),
+                                emits: Vec::new(),
                             })
                         }
                         // Two-paren `run_namespace!(ns)(*)`: the builder
                         // spells the argument as a one-row anonymous source.
-                        "run_namespace!" => {
-                            single_anonymous_argument(&pipe.source)
-                                .map(|namespace| EffectEntry::RunNamespace { namespace })
-                        }
+                        "run_namespace!" => single_anonymous_argument(&pipe.source)
+                            .map(|namespace| EffectEntry::RunNamespace {
+                                namespace,
+                                access: None,
+                            }),
                         "run!" => single_anonymous_argument(&pipe.source)
-                            .map(|path| EffectEntry::RunFile { path }),
+                            .map(|path| EffectEntry::RunFile { path, access: None }),
                         _ => None,
                     }
                 }
                 _ => None,
             }
         }
-        // One-paren forms `run_namespace!(ns)` / `run!("file")`.
+        // Direct invocations `run_namespace!(ns)` / `run!("file")`, with or
+        // without the `(*)` receipt access (Phase 3 canonical invocation:
+        // the two-paren spelling now builds this same PseudoPredicate shape).
+        // Non-glob receipt access is not classified here — it falls through
+        // to the executor, whose run!/run_namespace! entities refuse with
+        // their whole-statement policy until receipt access lands with the
+        // Phase 4 receipt rebuild.
         RelationalExpression::Relation(Relation::PseudoPredicate {
-            name, arguments, ..
-        }) => match name.as_str() {
-            "run_namespace!" => single_argument(arguments)
-                .map(|namespace| EffectEntry::RunNamespace { namespace }),
-            "run!" => single_argument(arguments).map(|path| EffectEntry::RunFile { path }),
-            _ => None,
-        },
+            name,
+            arguments,
+            access,
+            ..
+        }) => {
+            use crate::pipeline::asts::core::DomainSpec;
+            // Glob/bare access = the payload-transparent dump (F5's
+            // execution-family exception). A positional NAME list is the
+            // exact-arity receipt binding (Phase 6 slice 6); any other
+            // spec falls through to the executor's refusal.
+            let run_access = match access {
+                DomainSpec::Glob | DomainSpec::Bare => Some(None),
+                DomainSpec::Positional(exprs) => {
+                    let glob = exprs.len() == 1
+                        && matches!(
+                            &exprs[0],
+                            crate::pipeline::asts::core::DomainExpression::Projection(
+                                crate::pipeline::asts::core::expressions::domain::ProjectionExpr::Glob { .. }
+                            )
+                        );
+                    if glob {
+                        Some(None)
+                    } else {
+                        exprs
+                            .iter()
+                            .map(|e| match e {
+                                crate::pipeline::asts::core::DomainExpression::Lvar {
+                                    name, ..
+                                } => Some(name.to_string()),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<String>>>()
+                            .map(Some)
+                    }
+                }
+                _ => None,
+            };
+            let access = run_access?;
+            match name.as_str() {
+                "run_namespace!" => single_argument(arguments).map(|namespace| {
+                    EffectEntry::RunNamespace {
+                        namespace,
+                        access: access.clone(),
+                    }
+                }),
+                "run!" => single_argument(arguments).map(|path| EffectEntry::RunFile {
+                    path,
+                    access: access.clone(),
+                }),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -222,8 +335,20 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// final shipped statement — the one wire response (protocol ruling).
     pub(super) fn handle_effect_entry(&mut self, entry: EffectEntry) -> ServerTerm {
         match entry {
-            EffectEntry::RunNamespace { namespace } => self.demand_namespace_main(&namespace),
-            EffectEntry::RunFile { path } => {
+            EffectEntry::RunNamespace { namespace, access } => {
+                let term = self.demand_namespace_main(&namespace);
+                match access {
+                    None => term,
+                    Some(names) => self.bind_run_receipt(
+                        term,
+                        "run_namespace!",
+                        "namespace",
+                        &namespace,
+                        &names,
+                    ),
+                }
+            }
+            EffectEntry::RunFile { path, access } => {
                 // F2: consult-then-demand. Liminal directives execute at
                 // load; rules register; then main! is demanded exactly as
                 // run_namespace! would.
@@ -231,15 +356,106 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     Ok(ns) => ns,
                     Err(e) => return error_term(&e),
                 };
-                self.demand_namespace_main(&namespace)
+                let term = self.demand_namespace_main(&namespace);
+                match access {
+                    None => term,
+                    Some(names) => {
+                        self.bind_run_receipt(term, "run!", "path", &path, &names)
+                    }
+                }
             }
-            EffectEntry::AdhocBody { query } => {
-                match effect_transformer::compile_query_plan(self.system, &query, None) {
+            EffectEntry::AdhocBody {
+                query,
+                assertions,
+                emits,
+            } => {
+                match effect_transformer::compile_query_plan_annotated(
+                    self.system,
+                    &query,
+                    None,
+                    &assertions,
+                    &emits,
+                ) {
                     Ok(plan) => self.play_plan(&plan),
                     Err(e) => error_term(&e),
                 }
             }
         }
+    }
+
+    /// Bind an exact-arity positional access list against the run's
+    /// REIFIED receipt (F5, Phase 6 slice 6): `(success, operation,
+    /// path|namespace, returned)`. The payload is the run's response,
+    /// packaged as the `returned` interior; a NO run (exit! latch taken)
+    /// ships the EMPTY receipt — zero rows, declared heading.
+    fn bind_run_receipt(
+        &mut self,
+        term: ServerTerm,
+        operation: &str,
+        echo_name: &str,
+        echo_value: &str,
+        names: &[String],
+    ) -> ServerTerm {
+        let ServerTerm::Header { handle, dimensions } = term else {
+            return term; // errors propagate untouched
+        };
+        let declared = ["success", "operation", echo_name, "returned"];
+        if names.len() != declared.len() {
+            let msg = format!(
+                "{operation}'s receipt heading is (success, operation, {echo_name}, \
+                 returned) — the binding list is exact-arity; glob access `(*)` \
+                 dumps the payload instead (EFFECT-ALGEBRA F5)"
+            );
+            return error_term(&DelightQLError::validation_error_categorized(
+                "effect/run/receipt_access",
+                msg,
+                "run receipt access",
+            ));
+        }
+        // The response buffer becomes the `returned` payload.
+        let payload = match self.eager_buffers.remove(&handle) {
+            Some(buf) => {
+                let cols: Vec<String> = buf
+                    .dimensions
+                    .iter()
+                    .map(|d| String::from_utf8_lossy(&d.name).into_owned())
+                    .collect();
+                let objs: Vec<serde_json::Value> = buf
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let mut m = serde_json::Map::new();
+                        for (c, cell) in cols.iter().zip(row) {
+                            m.insert(
+                                c.clone(),
+                                match cell {
+                                    Some(bytes) => serde_json::Value::String(
+                                        String::from_utf8_lossy(bytes).into_owned(),
+                                    ),
+                                    None => serde_json::Value::Null,
+                                },
+                            );
+                        }
+                        serde_json::Value::Object(m)
+                    })
+                    .collect();
+                serde_json::Value::Array(objs).to_string()
+            }
+            None => "[]".to_string(),
+        };
+        let _ = dimensions;
+        let rows: Vec<Vec<String>> = if self.last_run_exited {
+            Vec::new()
+        } else {
+            vec![vec![
+                "1".to_string(),
+                operation.to_string(),
+                echo_value.to_string(),
+                payload,
+            ]]
+        };
+        let columns: Vec<String> = names.to_vec();
+        self.eager_header(&columns, &rows)
     }
 
     fn demand_namespace_main(&mut self, namespace: &str) -> ServerTerm {
@@ -256,6 +472,13 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// the whole run). Pinned by the CLI integration test
     /// `run_twice_on_one_session_gets_fresh_scratch`.
     fn play_plan(&mut self, plan: &CompiledPlan) -> ServerTerm {
+        // D4: materialize the plan's observational projection
+        // (sys::execution.effect_plan/…) — clear-then-insert is the
+        // next-run-clears lifecycle. Best-effort: bookkeeping never
+        // outranks the run (Q-D5's discipline, applied to the plan side).
+        if let Some(typed) = &plan.typed {
+            let _ = self.system.materialize_effect_plan(typed);
+        }
         self.drop_plan_scratch(plan);
         let response = self.handle_plan(plan);
         if !matches!(response, ServerTerm::Error { .. }) {
@@ -395,7 +618,7 @@ mod tests {
     fn whole_statement_run_namespace_classifies_both_forms() {
         for dql in ["run_namespace!(fx)(*)", "run_namespace!(fx)", "run_namespace!(\"fx\")(*)"] {
             match classify_effect_entry(dql, true) {
-                Some(EffectEntry::RunNamespace { namespace }) => assert_eq!(namespace, "fx"),
+                Some(EffectEntry::RunNamespace { namespace, .. }) => assert_eq!(namespace, "fx"),
                 _ => panic!("expected RunNamespace for {:?}", dql),
             }
         }
@@ -404,7 +627,7 @@ mod tests {
     #[test]
     fn whole_statement_run_classifies_with_path() {
         match classify_effect_entry("run!(\"ddl/script.dql\")(*)", true) {
-            Some(EffectEntry::RunFile { path }) => assert_eq!(path, "ddl/script.dql"),
+            Some(EffectEntry::RunFile { path, .. }) => assert_eq!(path, "ddl/script.dql"),
             _ => panic!("expected RunFile"),
         }
     }
@@ -445,10 +668,22 @@ mod tests {
     }
 
     #[test]
-    fn annotated_statements_stay_on_todays_path() {
-        // An assertion-carrying DML keeps today's path (conservative
-        // classification — annotations are not plan entries yet).
+    fn annotated_statements_ride_the_typed_program() {
+        // Phase 10 slice b (semantic routing): an assertion-carrying DML
+        // classifies — the annotation rides the typed program as a head
+        // step, so wrapped and unwrapped demands choose the SAME
+        // execution generation (the acceptance clause). The old
+        // conservative bailout is gone.
         let dql = "orders(*) |> insert!(t(*))(*) (~~assert ~> count:(*) as c, c = 1 |> exists(*) ~~)";
+        match classify_effect_entry(dql, true) {
+            Some(EffectEntry::AdhocBody { assertions, .. }) => {
+                assert_eq!(assertions.len(), 1, "the assertion spec is threaded");
+            }
+            other => panic!("expected AdhocBody with the assertion, got {other:?}"),
+        }
+        // Danger/option overrides are compile-mode configuration and
+        // conservatively keep today's path.
+        let dql = "orders(*) |> insert!(t(*))(*) (~~danger:allow_full_scan ~~)";
         assert!(classify_effect_entry(dql, true).is_none());
     }
 

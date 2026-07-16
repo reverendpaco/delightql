@@ -2,7 +2,7 @@
 // Copyright 2026 Daniel Eklund
 //! Unary operators and pipe operations
 
-use super::metadata::NamespacePath;
+use super::metadata::{GroundedPath, NamespacePath};
 use super::{
     Addressed, BooleanExpression, ContainmentSemantic, DomainExpression, DomainSpec,
     FunctionExpression, ModuloSpec, OrderingSpec, Refined, RenameSpec, RepositionSpec, Resolved,
@@ -245,6 +245,11 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
         first_parens_spec: Option<DomainSpec<Phase>>,
         domain_spec: DomainSpec<Phase>,
         namespace: Option<NamespacePath>,
+        /// Full `data^library` qualification for a grounded invocation. It is
+        /// semantically distinct from an ordinary namespace and must survive
+        /// the surface-to-AST boundary intact.
+        #[serde(default)]
+        grounding: Option<GroundedPath>,
     },
     /// Meta-ize: ^ or ^^ - reifies relation schema as queryable data
     ///

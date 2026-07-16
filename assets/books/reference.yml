@@ -1,0 +1,57 @@
+book: reference
+title: DelightQL Language Reference
+frontmatter: |
+  ---
+  title: DelightQL Language Reference
+  ---
+spine:
+  - dql/_index.md:
+      - dql/from.md
+      - dql/order-by.md
+      - dql/limit.md
+      - dql/projection/_index.md:
+          - dql/projection/project-retain.md
+          - dql/projection/rename.md
+          - dql/projection/generalized.md
+          - dql/projection/positional-functor-access.md
+          - dql/projection/project-out.md
+          - dql/projection/map-cover.md
+          - dql/projection/basic-cover.md
+          - dql/projection/if-only.md
+          - dql/projection/regex-addressing.md
+          - dql/projection/rename-cover.md
+          - dql/projection/embedding.md
+          - dql/projection/embed-map.md
+          - dql/projection/summary.md
+      - dql/group/_index.md:
+          - dql/group/distinct.md
+          - dql/group/group-by.md
+          - dql/group/delegate-selection.md
+          - dql/group/whole-group-aggregates.md
+          - dql/group/internal-distinct.md
+          - dql/group/filter-clauses.md
+          - dql/group/having.md
+      - dql/functions/_index.md:
+          - dql/functions/case-simple.md
+          - dql/functions/case-search.md
+          - dql/functions/format.md
+          - dql/functions/window.md
+          - dql/functions/scalar-subquery.md
+          - dql/functions/context-aware.md
+          - dql/functions/sigma-as-column.md
+          - dql/functions/interior-tuples.md
+      - dql/path-addressing.md
+      - dql/index-addressing.md
+      - dql/common-expressions.md:
+        - dql/common-table-expressions.md
+        - dql/common-function-expressions.md
+        - dql/recursive-common-table-expressions.md
+      - dql/where.md
+      - dql/join.md
+      - dql/lvars.md
+      - dql/set-operators.md
+      - dql/interior-relations.md
+      - dql/higher-order.md
+      - dql/pivot.md
+      - dql/tree-groups.md
+      - dql/meta-ize.md

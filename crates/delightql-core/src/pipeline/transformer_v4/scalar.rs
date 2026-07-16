@@ -324,6 +324,7 @@ pub(super) fn s_lower_sigma(
             functor,
             arguments,
             exists,
+            ..
         } => {
             let args: Vec<SqlDomainExpr> = arguments
                 .into_iter()

@@ -18,6 +18,37 @@ pub(crate) struct ConsultResult {
     pub replaced_entities: Vec<String>,
 }
 
+/// Mirror of the native `LiminalReceipt` (system.rs) — consult! is not
+/// supported in WASM, but the shared consult module must type-check.
+#[derive(Debug, Clone)]
+pub(crate) struct LiminalReceipt {
+    pub operation: String,
+    pub echoes: Vec<(String, Option<String>)>,
+}
+
+/// Mirror of the native `ConsultPost` (system.rs).
+#[allow(dead_code)]
+pub(crate) struct ConsultPost<'a> {
+    pub deferred_exposes: Vec<Vec<String>>,
+    pub deferred_docs: Vec<(String, String)>,
+    pub new_enlists: &'a [(i32, i32)],
+    pub new_aliases: &'a [(String, i32)],
+    pub record_source: bool,
+}
+
+/// Mirror of the native `LiminalProgramKind` (system.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiminalProgramKind {
+    Consult,
+    Reconsult,
+}
+
+/// Mirror of the native free function — consult targets can't be created
+/// in WASM, but the shared guard call must resolve.
+pub(crate) fn validate_user_namespace_target(_namespace: &str) -> Result<()> {
+    Ok(())
+}
+
 /// Connection-backed database schema for WASM.
 ///
 /// Implements DatabaseSchema by routing PRAGMA and sqlite_master queries
@@ -60,6 +91,9 @@ impl DatabaseSchema for ConnectionBackedSchema {
                     name: name.into(),
                     nullable: notnull == 0,
                     position: pos,
+                    // PRAGMA table_info exposes decltype in the `type`
+                    // column; the WASM bridge path doesn't thread it yet.
+                    declared_type: None,
                 }
             })
             .collect();
@@ -187,6 +221,24 @@ impl DelightQLSystem {
         ))
     }
 
+    /// Byte bindings (`delightql-bytes://`, BYTES-SCHEME-DESIGN.md) — not
+    /// supported in WASM: it cannot attach deserialized native SQLite
+    /// schemas. The documented refusal, actually implemented.
+    pub fn bind_static_bytes(&mut self, _name: &str, _bytes: &'static [u8]) -> Result<()> {
+        Err(DelightQLError::validation_error(
+            "bind_static_bytes not supported in WASM",
+            "delightql-bytes:// mounts are only available in native builds",
+        ))
+    }
+
+    /// Owned-buffer sibling — same WASM refusal.
+    pub fn bind_owned_bytes(&mut self, _name: &str, _bytes: Vec<u8>) -> Result<()> {
+        Err(DelightQLError::validation_error(
+            "bind_owned_bytes not supported in WASM",
+            "delightql-bytes:// mounts are only available in native builds",
+        ))
+    }
+
     /// Enlist namespace - not supported in WASM
     pub fn enlist_namespace(&mut self, _namespace: &str) -> Result<()> {
         Err(DelightQLError::validation_error(
@@ -247,16 +299,78 @@ impl DelightQLSystem {
         ))
     }
 
-    /// Consult file - not supported in WASM
+    /// Consult file - not supported in WASM. Signature mirrors the native
+    /// `consult_file` (review qmqwqlms round 3, P2: the stub had drifted
+    /// to three parameters while native call sites supply five).
     pub fn consult_file(
         &mut self,
         _path: &str,
         _namespace: &str,
         _ddl: crate::pipeline::parser::DDLFile,
+        _liminal_receipts: &[LiminalReceipt],
+        _post: Option<&ConsultPost<'_>>,
     ) -> Result<ConsultResult> {
         Err(DelightQLError::validation_error(
             "consult!() not supported in WASM",
             "File consultation is only available in native builds",
+        ))
+    }
+
+    /// Liminal-program machinery (native atomic boundary): WASM has
+    /// no consultation, so there is never an active program.
+    pub(crate) fn begin_liminal_program(
+        &self,
+        _mark: i64,
+        _kind: LiminalProgramKind,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    pub(crate) fn end_liminal_program(&self, _commit: bool) -> Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn rollback_liminal_external_effects(&mut self) {}
+
+    pub(crate) fn refuse_preexisting_namespace_mutation_in_program(
+        &self,
+        _target_fq: &str,
+        _verb: &str,
+        _badge: &'static str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Namespace snapshot helpers — no namespace catalog in WASM.
+    pub fn max_namespace_id(&self) -> Result<i64> {
+        Ok(0)
+    }
+
+    pub fn namespace_exists(&self, _fq: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    pub fn namespace_kind_and_provenance(
+        &self,
+        _fq: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        Ok(None)
+    }
+
+    pub fn namespace_is_data_kind(&self, _fq: &str) -> bool {
+        false
+    }
+
+    /// Liminal ledger row count — no ledger in WASM.
+    pub(crate) fn liminal_receipt_row_count(&self) -> i64 {
+        -1
+    }
+
+    /// Entity documentation - not supported in WASM
+    pub fn set_entity_doc(&mut self, _target: &str, _doc: &str) -> Result<(String, String)> {
+        Err(DelightQLError::validation_error(
+            "doc!() not supported in WASM",
+            "Entity documentation is only available in native builds",
         ))
     }
 
@@ -381,24 +495,6 @@ impl DelightQLSystem {
         Ok(())
     }
 
-    /// Record namespace-local enlists - WASM no-op
-    pub fn record_namespace_local_enlists(
-        &mut self,
-        _namespace: &str,
-        _new_enlists: &[(i32, i32)],
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// Record namespace-local aliases - WASM no-op
-    pub fn record_namespace_local_aliases(
-        &mut self,
-        _namespace: &str,
-        _new_aliases: &[(String, i32)],
-    ) -> Result<()> {
-        Ok(())
-    }
-
     /// Ground namespace - not supported in WASM
     pub fn ground_namespace(
         &mut self,
@@ -409,14 +505,6 @@ impl DelightQLSystem {
         Err(DelightQLError::validation_error(
             "ground_namespace not supported in WASM",
             "Namespace grounding is only available in native builds",
-        ))
-    }
-
-    /// Expose namespace - not supported in WASM
-    pub fn expose_namespace(&mut self, _exposing_ns: &str, _exposed_ns: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "expose_namespace not supported in WASM",
-            "Namespace exposure is only available in native builds",
         ))
     }
 

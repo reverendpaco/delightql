@@ -92,6 +92,88 @@ impl DatabaseConnection for SqliteConnection {
         Ok(conn.last_insert_rowid())
     }
 
+    /// `delightql-bytes://` mounts (BYTES-SCHEME-DESIGN.md): attach a fresh
+    /// in-memory schema and deserialize a static SQLite image into it,
+    /// read-only, referencing the `include_bytes!` buffer in place — zero
+    /// copies, zero disk. On deserialize failure the alias is detached so
+    /// nothing is left behind (spike Q5).
+    fn attach_static_bytes(&self, schema_alias: &str, bytes: &'static [u8]) -> DelightQLResult<()> {
+        let mut conn = self.conn.lock().map_err(|e| {
+            delightql_types::DelightQLError::connection_poison_error(
+                "Connection mutex poisoned",
+                e.to_string(),
+            )
+        })?;
+
+        conn.execute(
+            &format!("ATTACH DATABASE ':memory:' AS '{}'", schema_alias),
+            [],
+        )
+        .map_err(|e| {
+            delightql_types::DelightQLError::database_error(
+                format!("Failed to attach in-memory schema '{}'", schema_alias),
+                e.to_string(),
+            )
+        })?;
+
+        if let Err(e) = conn.deserialize_bytes(schema_alias, bytes) {
+            let _ = conn.execute(&format!("DETACH DATABASE '{}'", schema_alias), []);
+            return Err(delightql_types::DelightQLError::database_error(
+                format!(
+                    "Failed to deserialize static image into schema '{}'",
+                    schema_alias
+                ),
+                e.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Owned-buffer variant: the image is copied into SQLite-allocated
+    /// memory (`deserialize_read_exact`: sqlite3_malloc + FREEONCLOSE).
+    /// For runtime-built images like the CLI surface database.
+    ///
+    /// Deliberately WRITABLE at the engine level (unlike the static
+    /// variant): `BEGIN IMMEDIATE` acquires locks on EVERY attached
+    /// database, and a READONLY deserialized member makes every such
+    /// transaction on the connection fail with SQLITE_READONLY — which
+    /// would break imprint! (and any other IMMEDIATE user) for the whole
+    /// session. The tempfile this replaces was writable at the SQLite
+    /// level too; the not-for-writing contract is the host's convention,
+    /// as it was then. (A delightql-level DML gate on bytes-mounted
+    /// namespaces is the recorded follow-up, with review R4.)
+    fn attach_bytes_copied(&self, schema_alias: &str, bytes: &[u8]) -> DelightQLResult<()> {
+        let mut conn = self.conn.lock().map_err(|e| {
+            delightql_types::DelightQLError::connection_poison_error(
+                "Connection mutex poisoned",
+                e.to_string(),
+            )
+        })?;
+
+        conn.execute(
+            &format!("ATTACH DATABASE ':memory:' AS '{}'", schema_alias),
+            [],
+        )
+        .map_err(|e| {
+            delightql_types::DelightQLError::database_error(
+                format!("Failed to attach in-memory schema '{}'", schema_alias),
+                e.to_string(),
+            )
+        })?;
+
+        if let Err(e) = conn.deserialize_read_exact(schema_alias, bytes, bytes.len(), false) {
+            let _ = conn.execute(&format!("DETACH DATABASE '{}'", schema_alias), []);
+            return Err(delightql_types::DelightQLError::database_error(
+                format!(
+                    "Failed to deserialize image into schema '{}'",
+                    schema_alias
+                ),
+                e.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn query_row_values(&self, sql: &str, params: &[DbValue]) -> DelightQLResult<Option<Vec<DbValue>>> {
         let conn = self.conn.lock().map_err(|e| {
             delightql_types::DelightQLError::connection_poison_error(

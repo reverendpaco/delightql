@@ -519,6 +519,13 @@ module.exports = grammar({
     // Unary operators (pipes) transform the relation
     unary_operator_expression: $ => choice(
       seq($.pipe_operator, $.unary_operator, optional($.relational_continuation)),
+      // Effect-unwrap pipe (DIRECTIVE-CONVERGENCE-PLAN Rule 6):
+      // Q !> S(...) is exact sugar for Q |> S(...) |> .returned(*) — apply
+      // the callee, then narrow into its conventional `returned` interior
+      // relation. One generic operator for bang and non-bang callees alike;
+      // NOT a comparison (T-SQL's `!>` means "not greater than" — DelightQL's
+      // never does; this token exists only in relational pipe position).
+      seq($.unwrap_pipe_operator, $.unary_operator, optional($.relational_continuation)),
       seq($.aggregate_pipe_operator, $.aggregate_function, optional($.relational_continuation)),  // Allow continuation for CPR
       seq($.materialize_pipe_operator, optional($.relational_continuation)),
       prec.right(1, seq($.meta_ize_operator, optional($.relational_continuation))),  // ^ or ^^ for schema reification
@@ -598,6 +605,7 @@ module.exports = grammar({
 
     // Semantic nodes for pipe operators
     pipe_operator: $ => '|>',
+    unwrap_pipe_operator: $ => '!>',
     aggregate_pipe_operator: $ => '~>',
     materialize_pipe_operator: $ => '|*>',
     
@@ -1767,6 +1775,17 @@ module.exports = grammar({
     // parser tests `interior_witness_continuations_parse_in_pseudo_predicate_call`
     // and `pseudo_predicate_argument_forms_are_unchanged_by_interiority`.
     pseudo_predicate_call: $ => prec.dynamic(10, seq(
+      // Qualified built-in access (DIRECTIVE-CONVERGENCE-PLAN Phase 2):
+      // std::prelude.enlist!("ns") — same namespace_path-dot shape as
+      // table_access, so bin identity rides ordinary namespace rules
+      // instead of a global name map.
+      optional(seq(
+        field('namespace_path', choice(
+          $.namespace_path,      // Multi-level: std::prelude
+          $.identifier           // Single-level: sys
+        )),
+        token.immediate('.')
+      )),
       field('name', $.identifier),
       token.immediate('!'),  // ! must follow immediately (no whitespace)
       '(',
@@ -2055,7 +2074,25 @@ module.exports = grammar({
       $.reposition,
       $.piped_invocation,
       $.narrowing_destructure,
+      $.narrowing_access,
       $.bang_pipe_operation,
+    ),
+
+    // Post-pipe parenthesized narrowing (DIRECTIVE-CONVERGENCE-PLAN Phase 3):
+    // |> .t(*) or |> .t(a, b) — the SAME correlated interior expansion as
+    // postfix drill-down, retaining only the interior heading. Requires a
+    // schema-known tree-group interior, exactly like the drill (external
+    // JSON refuses at resolution). Same shape as drill_operator; position
+    // (after |>) selects the context-replacing disposition.
+    narrowing_access: $ => seq(
+      '.',
+      field('column', $.identifier),
+      '(',
+      choice(
+        field('glob', $.glob_spec),
+        field('columns', $.column_spec),
+      ),
+      ')',
     ),
 
     // Bang pipe operation: unified rule for both DML and directive pipes.
@@ -2122,6 +2159,16 @@ module.exports = grammar({
     // still parses. prec.dynamic(15) wins over pseudo_predicate_call so
     // doc!("a","b")(*) is the two-paren form, not a one-paren call + trailing.
     inline_directive_table: $ => prec.dynamic(15, seq(
+      // Qualified two-paren invocation (Phase 3):
+      // std::prelude.enlist!("ns")(success) — same qualification shape as
+      // pseudo_predicate_call.
+      optional(seq(
+        field('namespace_path', choice(
+          $.namespace_path,
+          $.identifier
+        )),
+        token.immediate('.')
+      )),
       field('name', $.identifier),
       token.immediate('!'),
       '(',

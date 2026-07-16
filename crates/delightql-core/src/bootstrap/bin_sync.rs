@@ -57,9 +57,17 @@ pub fn sync_bin_cartridges_to_bootstrap(
         let namespace_id =
             crate::import::create_namespace_from_path(conn, &metadata.namespace_path)?;
 
-        // Step 3: Register each entity
+        // Step 3: Register each entity under its IDENTITY namespace — the
+        // entity's namespace_override if declared, else the cartridge's
+        // namespace (DIRECTIVE-CONVERGENCE-PLAN Phase 2: deliberate catalog
+        // identities; compile activates under sys::execution, not
+        // std::prelude).
         for entity in cartridge.entities() {
             let signature = entity.signature();
+            let entity_namespace_id = match entity.namespace_override() {
+                Some(ns_path) => crate::import::create_namespace_from_path(conn, ns_path)?,
+                None => namespace_id,
+            };
 
             // Insert entity record
             conn.execute(
@@ -68,6 +76,8 @@ pub fn sync_bin_cartridges_to_bootstrap(
                 params![entity.name(), entity.entity_type().as_i32(), cartridge_id,],
             )?;
             let entity_id = conn.last_insert_rowid() as i32;
+
+            crate::import::activate_entity(conn, entity_id, entity_namespace_id, cartridge_id)?;
 
             // Insert parameter attributes
             for (param_index, param) in signature.parameters.iter().enumerate() {
@@ -108,21 +118,21 @@ pub fn sync_bin_cartridges_to_bootstrap(
             }
         }
 
-        // Step 4: Activate all entities from this cartridge in the namespace
-        let activated_count =
-            crate::import::activate_entities_from_cartridge(conn, cartridge_id, namespace_id)?;
-
+        // Step 4: activation happened per entity above, in each entity's
+        // identity namespace.
         log::debug!(
-            "Synced bin cartridge '{}' to bootstrap: {} entities activated in namespace '{}'",
+            "Synced bin cartridge '{}' to bootstrap (namespace '{}')",
             metadata.source_uri,
-            activated_count,
             metadata.namespace_path
         );
 
-        // Step 5: Auto-enlist universal namespaces into "main"
+        // Step 5: Auto-enlist universal namespaces into `home` — the
+        // interactive session's own resolution scope (Phase 7/2H: edges
+        // are owned by the namespace whose environment they extend,
+        // never by the `main` data namespace)
         if metadata.is_universal {
             let main_ns_id: i32 = conn.query_row(
-                "SELECT id FROM namespace WHERE fq_name = 'main'",
+                "SELECT id FROM namespace WHERE fq_name = 'home'",
                 [],
                 |row| row.get(0),
             )?;
@@ -133,7 +143,7 @@ pub fn sync_bin_cartridges_to_bootstrap(
             )?;
             universal_namespaces.push(metadata.namespace_path.clone());
             log::debug!(
-                "Auto-enlisted universal namespace '{}' into 'main'",
+                "Auto-enlisted universal namespace '{}' into 'home'",
                 metadata.namespace_path
             );
         }

@@ -4,9 +4,9 @@
 //
 // The window into the compiler's identifier taxonomy (URI-DESIGN.md §3).
 // Since SYS-HELP-DESIGN.md phase 1, the registry IS a burned relation:
-// this command queries `sys::help.identifier(*)` from the in-memory
+// this command queries `sys::identifiers.identifier(*)` from the in-memory
 // bootstrap (rows authored in bootstrap/schema.sql), so `dql explain`,
-// `sys::help.identifier(*)` in a query, and every future projection
+// `sys::identifiers.identifier(*)` in a query, and every future projection
 // (website, man pages) read one source and can never disagree.
 // Spelling normalization (badge form / canonical URL / bare hierarchy)
 // stays in code: delightql_core::uri_registry.
@@ -24,7 +24,7 @@ fn load_rows() -> Result<Vec<IdentifierEntry>> {
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     let results = crate::exec_ng::fetch_all(
         &mut *session,
-        "sys::help.identifier(*) |> (kind, hierarchy, summary, explanation)",
+        "sys::identifiers.identifier(*) |> (kind, hierarchy, summary, explanation)",
     )?;
     results
         .rows

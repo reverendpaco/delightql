@@ -63,43 +63,24 @@ pub(crate) fn resolve_ns_prefix(name: &str, consulting_ns: &str) -> Result<Strin
 pub(crate) fn liminal_receipt_for(name: &str, args: &[String]) -> crate::system::LiminalReceipt {
     let arg = |i: usize| args.get(i).cloned();
     let echoes: Vec<(String, Option<String>)> = match name {
-        // mount_new! echoes the SAME row as mount! (EFFECT-ALGEBRA §6, §8
-        // table: `path, namespace`).
-        "consult" | "mount" | "mount_new" => vec![
+        // The interior-echo directives (consult!'s family): their DIRECT
+        // receipts carry `input ⟦path, namespace⟧`, but the liminal LEDGER
+        // row stays FLAT pending the ledger's interior adoption (§8 status
+        // note) — path, namespace, for both the fresh consult and the
+        // explicit concat (review otolxyzl::qmqwqlms P2: concat recorded
+        // positional arg_N before this).
+        "consult" | "consult_concat_into_ns" => vec![
             ("path".to_string(), arg(0)),
             ("namespace".to_string(), arg(1)),
         ],
-        // mount_tree! echoes its two written parameters; the JSON array of
-        // CREATED sub-namespaces (R-S3) rides the SURFACE receipt (the
-        // executor knows the enumeration result). Threading that
-        // post-execution list into the pure ledger builder is deferred —
-        // see REPORT-SCHEMA-MOUNT-BC.
-        "mount_tree" => vec![
-            ("path".to_string(), arg(0)),
-            ("namespace".to_string(), arg(1)),
+        // doc!'s direct receipt is the interior `input` echo; its ledger
+        // row stays flat (target, doc) like consult's.
+        "doc" => vec![
+            ("target".to_string(), arg(0)),
+            ("doc".to_string(), arg(1)),
         ],
-        "reconsult" => vec![
-            ("namespace".to_string(), arg(0)),
-            // NULL when re-reading the same file (§8 table note).
-            ("path".to_string(), arg(1)),
-        ],
-        "unconsult" | "unmount" | "refresh" | "delist" => {
-            vec![("namespace".to_string(), arg(0))]
-        }
-        "ground" => vec![
-            ("data_namespace".to_string(), arg(0)),
-            ("lib_namespace".to_string(), arg(1)),
-            ("namespace".to_string(), arg(2)),
-        ],
-        "enlist" => vec![
-            ("namespace".to_string(), arg(0)),
-            // NULL for the plain form (§8 table note).
-            ("into".to_string(), arg(1)),
-        ],
-        "alias" => vec![
-            ("namespace".to_string(), arg(0)),
-            ("shorthand".to_string(), arg(1)),
-        ],
+        // expose!'s variadic echoes take the glob-join convention
+        // (`namespace`, `namespace_2`, …) — genuinely runtime-shaped.
         "expose" => args
             .iter()
             .enumerate()
@@ -112,19 +93,30 @@ pub(crate) fn liminal_receipt_for(name: &str, args: &[String]) -> crate::system:
                 (col, Some(a.clone()))
             })
             .collect(),
-        "doc" => vec![
-            ("target".to_string(), arg(0)),
-            ("doc".to_string(), arg(1)),
-        ],
-        // consult_tree!'s echo columns land with its liminal arm
-        // (EFFECT-ALGEBRA §12 item 2, explicitly deferred); any other name is
-        // refused by the executor before a receipt could be recorded. Echo
-        // the raw arguments positionally so nothing is silently dropped.
-        _ => args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (format!("arg_{}", i + 1), Some(a.clone())))
-            .collect(),
+        // EVERY other session directive derives its ledger echoes from the
+        // DESCRIPTOR's declared `receipt_echoes` (review otolxyzl::qmqwqlms
+        // P2: the per-name match was a second handwritten vocabulary — a
+        // new directive now supplies its ledger representation
+        // inductively). Optional echoes absent from the call are present
+        // with NULL, per the §8 table notes. (mount_tree!'s created
+        // sub-namespace enumeration still rides only the SURFACE receipt —
+        // threading post-execution results into this pure builder stays
+        // deferred, REPORT-SCHEMA-MOUNT-BC.)
+        other => match crate::pipeline::asts::effects::descriptor(other) {
+            Some(desc) if !desc.receipt_echoes.is_empty() => desc
+                .receipt_echoes
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.name.to_string(), arg(i)))
+                .collect(),
+            // No descriptor or no declared echoes: echo the raw arguments
+            // positionally so nothing is silently dropped.
+            _ => args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (format!("arg_{}", i + 1), Some(a.clone())))
+                .collect(),
+        },
     };
     crate::system::LiminalReceipt {
         operation: format!("{}!", name),
@@ -158,7 +150,9 @@ impl BinEntity for ConsultPredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![("ns".to_string(), "String".to_string())]),
+            // The receipt heading is the DESCRIPTOR's declaration
+            // (Phase 6 slice 2): core + `input` echo + `returned` payload.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("consult")),
         }
     }
 
@@ -204,11 +198,192 @@ impl EffectExecutable for ConsultPredicate {
 
         let _count = execute_consult(system, &file_path, &namespace, None)?;
 
-        Ok(EntityResult::Relation(super::directive_result(
-            &namespace, alias,
+        // EFFECT-ALGEBRA §3 (amended 2026-07-15): (success, operation,
+        // input, returned) — input echoes the lifted argument row,
+        // returned carries the consulted namespaces.
+        Ok(EntityResult::Relation(super::interior_receipt_result(
+            "consult!",
+            &["path", "namespace"],
+            &[vec![Some(file_path.clone()), Some(namespace.clone())]],
+            &["namespace"],
+            &[vec![Some(namespace.clone())]],
+            alias,
         )))
     }
 }
+
+/// `consult_concat_into_ns!()` — the EXPLICIT opt-in to multi-source
+/// namespaces (Phase 8, DIRECTIVE-CONVERGENCE-PLAN): adds another source
+/// file to an EXISTING consulted namespace. The verbosity is deliberate:
+/// callers must choose merged source environments rather than receive
+/// them from a repeated `consult!` (which refuses). The namespace's
+/// enlist/alias environment is NAMESPACE-WIDE: both sources' liminal
+/// enlists accumulate in the namespace-owned edge tables the scoped
+/// lookups read, so each file's definitions see the other's imports.
+pub struct ConsultConcatPredicate;
+
+impl BinEntity for ConsultConcatPredicate {
+    fn name(&self) -> &str {
+        "consult_concat_into_ns!"
+    }
+
+    fn entity_type(&self) -> EntityType {
+        EntityType::BinPseudoPredicate
+    }
+
+    fn signature(&self) -> EntitySignature {
+        EntitySignature {
+            parameters: vec![
+                Parameter {
+                    name: "file_path".to_string(),
+                    data_type: "String".to_string(),
+                    _is_optional: false,
+                },
+                Parameter {
+                    name: "namespace".to_string(),
+                    data_type: "String".to_string(),
+                    _is_optional: false,
+                },
+            ],
+            // The receipt heading is the DESCRIPTOR's declaration:
+            // consult!'s shape — core + `input` echo + `returned`
+            // payload (the namespace the source joined).
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
+                "consult_concat_into_ns",
+            )),
+        }
+    }
+
+    fn has_side_effects(&self) -> bool {
+        true
+    }
+
+    fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
+        Some(self)
+    }
+}
+
+impl EffectExecutable for ConsultConcatPredicate {
+    fn execute(
+        &self,
+        arguments: &[DomainExpression],
+        alias: Option<String>,
+        system: &mut crate::system::DelightQLSystem,
+    ) -> Result<EntityResult> {
+        if arguments.len() != 2 {
+            return Err(DelightQLError::database_error(
+                format!(
+                    "consult_concat_into_ns!() expects 2 arguments (file_path, namespace), got {}",
+                    arguments.len()
+                ),
+                "Invalid argument count",
+            ));
+        }
+        let file_path = extract_string_literal(&arguments[0], "file_path")?;
+        let namespace = extract_string_literal(&arguments[1], "namespace")?;
+
+        // The destination-class invariant lives in the SHARED
+        // execute_consult_mode (review qmqwqlms round 2, P1) — every
+        // route (this entity, the embedded liminal arm, the reconsult
+        // pass) receives it inductively.
+        let _count = execute_consult_mode(
+            system,
+            &file_path,
+            &namespace,
+            None,
+            ConsultMode::Concat,
+        )?;
+
+        Ok(EntityResult::Relation(super::interior_receipt_result(
+            "consult_concat_into_ns!",
+            &["path", "namespace"],
+            &[vec![Some(file_path.clone()), Some(namespace.clone())]],
+            &["namespace"],
+            &[vec![Some(namespace.clone())]],
+            alias,
+        )))
+    }
+}
+
+/// THE ONE LIMINAL BINDER (Phase 9): execute an embedded session
+/// directive through its REGISTERED ENTITY — the same descriptor,
+/// binder, arity teachings, and execution the top level uses. The only
+/// liminal-specific policy is DECLARED, not hand-spelled: parameters of
+/// kind `Namespace` take `.::`/`::` prefix resolution relative to the
+/// consulting namespace. This deletes the per-name dispatch arms (the
+/// "second directive vocabulary"): any registered session entity works
+/// embedded automatically — a directive can no longer be accepted by
+/// the registry and forgotten by a separate liminal match.
+pub(crate) fn execute_liminal_via_entity(
+    system: &mut crate::system::DelightQLSystem,
+    name: &str,
+    args: &[String],
+    consulting_ns: &str,
+) -> Result<()> {
+    use crate::pipeline::asts::effects::{descriptor, DirectiveParamKind};
+    let desc = descriptor(name).ok_or_else(|| {
+        DelightQLError::database_error(
+            format!("no descriptor for liminal directive '{name}!'"),
+            "Unknown directive",
+        )
+    })?;
+    let required = desc.params.iter().filter(|p| !p.optional).count();
+    if args.len() < required || args.len() > desc.params.len() {
+        return Err(DelightQLError::validation_error_categorized(
+            "directive/binding/arity",
+            format!(
+                "{name}! expects {} argument(s) ({}), got {}",
+                if required == desc.params.len() {
+                    required.to_string()
+                } else {
+                    format!("{required}..{}", desc.params.len())
+                },
+                desc.params
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                args.len()
+            ),
+            "directive arity",
+        ));
+    }
+    let mut bound: Vec<DomainExpression> = Vec::with_capacity(args.len());
+    for (param, arg) in desc.params.iter().zip(args) {
+        let value = if param.kind == DirectiveParamKind::Namespace {
+            resolve_ns_prefix(arg, consulting_ns)?
+        } else {
+            arg.clone()
+        };
+        bound.push(DomainExpression::Literal {
+            value: LiteralValue::String(value),
+            alias: None,
+        });
+    }
+    let entity = system
+        .bin_registry()
+        .lookup_entity(&format!("{name}!"))
+        .ok_or_else(|| {
+            DelightQLError::database_error(
+                format!(
+                    "liminal directive '{name}!' has a descriptor but no registered \
+                     entity — a registration accident, not a policy"
+                ),
+                "Unregistered directive",
+            )
+        })?;
+    let executable = entity.as_effect_executable().ok_or_else(|| {
+        DelightQLError::database_error(
+            format!("liminal directive '{name}!' is not executable"),
+            "Not executable",
+        )
+    })?;
+    // The liminal ledger records this statement separately
+    // (liminal_receipt_for); the direct receipt has no liminal reader.
+    let _receipt = executable.execute(&bound, None, system)?;
+    Ok(())
+}
+
 
 /// Execute a consult operation: read file, process embedded directives,
 /// parse as DDL, and store definitions.
@@ -216,17 +391,281 @@ impl EffectExecutable for ConsultPredicate {
 /// `consulting_ns` is the namespace of the DDL that triggered this consult.
 /// When present, `.::` and `::` prefixes in embedded directives are resolved
 /// relative to `namespace` (the target namespace for this file).
+/// How a consultation enters an existing namespace (Phase 8, the
+/// consultation lifecycle): ordinary `consult!` REFUSES an existing
+/// destination — a second consult is never implicit concatenation or
+/// replacement; `consult_concat_into_ns!` is the explicit opt-in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsultMode {
+    Fresh,
+    Concat,
+}
+
 pub(crate) fn execute_consult(
     system: &mut crate::system::DelightQLSystem,
     file_path: &str,
     namespace: &str,
+    consulting_ns: Option<&str>,
+) -> Result<usize> {
+    execute_consult_mode(system, file_path, namespace, consulting_ns, ConsultMode::Fresh)
+}
+
+/// Caller-visible session state captured at the boundary of one liminal
+/// program. The shared runner passes it to the load body so namespace-local
+/// deltas can be computed before the runner restores the caller.
+pub(crate) struct SavedLiminalState {
+    pub enlisted: Vec<(i32, i32)>,
+    pub aliases: Vec<(String, i32)>,
+}
+
+/// The ONE program-level lifecycle for consult, concat, and reconsult.
+///
+/// It owns the outer catalog savepoint, caller-state restoration, and
+/// typed external-effect journal. Nested loads inherit the outer savepoint while
+/// still receiving their own lexical enlist/alias save-and-restore boundary.
+pub(crate) fn run_liminal_program<T>(
+    system: &mut crate::system::DelightQLSystem,
+    kind: crate::system::LiminalProgramKind,
+    body: impl FnOnce(&mut crate::system::DelightQLSystem, &SavedLiminalState) -> Result<T>,
+) -> Result<T> {
+    let saved = SavedLiminalState {
+        enlisted: system.save_enlisted_state()?,
+        aliases: system.save_alias_state()?,
+    };
+    let ns_mark = system.max_namespace_id()?;
+    let outermost = system.begin_liminal_program(ns_mark, kind)?;
+
+    let result = body(system, &saved);
+
+    let restore_enlisted = system.restore_enlisted_state(&saved.enlisted);
+    let restore_aliases = system.restore_alias_state(&saved.aliases);
+    let restore_result = match (restore_enlisted, restore_aliases) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    let commit = result.is_ok() && restore_result.is_ok();
+
+    if outermost {
+        if !commit {
+            // Catalog state needs no inverse walk: the program savepoint
+            // restores it exactly, including mutations of pre-existing
+            // namespaces. Only effects outside that connection require the
+            // typed journal — drained HERE, at the one outermost close
+            // (review zmvnywzu, P2: a nested drain would empty the OUTER
+            // program's journal too, which is only safe while every nested
+            // failure provably aborts the enclosing program; draining at
+            // the boundary needs no such invariant). This includes a body
+            // that succeeded but whose lexical state could not be restored:
+            // that is still an aborted program, never a partial commit.
+            system.rollback_liminal_external_effects();
+        }
+        let closed = system.end_liminal_program(commit);
+        if result.is_ok() {
+            restore_result?;
+            closed?;
+        } else if let Err(close_error) = closed {
+            // The abort's real error must not be masked, but a savepoint
+            // that failed to close is a session-health event — say so.
+            log::warn!(
+                "liminal program abort: closing the catalog savepoint failed ({close_error}); \
+                 the bootstrap catalog may be in an open transaction until session restart"
+            );
+        }
+    } else if result.is_ok() {
+        restore_result?;
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiminalDirectiveMode {
+    /// A newly loaded source expects nested consult! targets to be new.
+    Fresh,
+    /// A reloaded source reconsults an existing nested child and consults a
+    /// child that did not exist in the previous version.
+    Replay,
+}
+
+pub(crate) struct PreparedLiminalDirectives {
+    pub receipts: Vec<crate::system::LiminalReceipt>,
+    pub deferred_exposes: Vec<Vec<String>>,
+    pub deferred_docs: Vec<(String, String)>,
+}
+
+/// Execute one file's liminal directive sequence. This is the single
+/// interpreter shared by consult/concat and reconsult; the mode varies only
+/// the lifecycle of a nested `consult!` child.
+pub(crate) fn execute_liminal_directives(
+    system: &mut crate::system::DelightQLSystem,
+    directives: &[EmbeddedDirective],
+    namespace: &str,
+    mode: LiminalDirectiveMode,
+) -> Result<PreparedLiminalDirectives> {
+    let mut prepared = PreparedLiminalDirectives {
+        receipts: Vec::with_capacity(directives.len()),
+        deferred_exposes: Vec::new(),
+        deferred_docs: Vec::new(),
+    };
+
+    for directive in directives {
+        prepared
+            .receipts
+            .push(liminal_receipt_for(&directive.name, &directive.args));
+        match directive.name.as_str() {
+            "consult" => {
+                if directive.args.len() != 2 {
+                    return Err(DelightQLError::database_error(
+                        format!(
+                            "consult!() in DDL expects 2 arguments, got {}",
+                            directive.args.len()
+                        ),
+                        "Invalid directive",
+                    ));
+                }
+                let resolved_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
+                if mode == LiminalDirectiveMode::Replay && system.namespace_exists(&resolved_ns)? {
+                    system.reconsult_namespace(&resolved_ns, Some(&directive.args[0]))?;
+                } else {
+                    execute_consult(system, &directive.args[0], &resolved_ns, Some(namespace))?;
+                }
+            }
+            "consult_concat_into_ns" => {
+                if directive.args.len() != 2 {
+                    return Err(DelightQLError::database_error(
+                        format!(
+                            "consult_concat_into_ns!() in DDL expects 2 arguments, got {}",
+                            directive.args.len()
+                        ),
+                        "Invalid directive",
+                    ));
+                }
+                let resolved_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
+                execute_consult_mode(
+                    system,
+                    &directive.args[0],
+                    &resolved_ns,
+                    Some(namespace),
+                    ConsultMode::Concat,
+                )?;
+            }
+            "expose" => {
+                if directive.args.is_empty() {
+                    return Err(DelightQLError::database_error(
+                        "expose!() requires at least one namespace argument",
+                        "Invalid directive",
+                    ));
+                }
+                prepared.deferred_exposes.push(
+                    directive
+                        .args
+                        .iter()
+                        .map(|arg| resolve_ns_prefix(arg, namespace))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            "doc" => {
+                if directive.args.len() != 2 {
+                    return Err(DelightQLError::database_error(
+                        format!(
+                            "doc!() in a liminal space expects 2 arguments (target, doc), got {}",
+                            directive.args.len()
+                        ),
+                        "Invalid directive",
+                    ));
+                }
+                prepared
+                    .deferred_docs
+                    .push((directive.args[0].clone(), directive.args[1].clone()));
+            }
+            other => execute_liminal_via_entity(system, other, &directive.args, namespace)?,
+        }
+    }
+
+    Ok(prepared)
+}
+
+pub(crate) fn execute_consult_mode(
+    system: &mut crate::system::DelightQLSystem,
+    file_path: &str,
+    namespace: &str,
     _consulting_ns: Option<&str>,
+    mode: ConsultMode,
 ) -> Result<usize> {
     // System name guard (catechism Deviation #3): a USER-TYPED consult target
     // may not land on a reserved system name. Applied to the already-resolved
     // namespace, so surface `consult!`, embedded `consult!` directives, and
     // `consult_tree!`'s per-file namespaces all pass through here.
     crate::system::validate_user_namespace_target(namespace)?;
+
+    // THE CONCAT CLASS INVARIANT (review qmqwqlms round 2, P1: the
+    // embedded arm bypassed the entity's check — the guard lives in the
+    // SHARED implementation now, so every route receives it inductively):
+    // concat extends an EXISTING file-consulted library namespace only.
+    if mode == ConsultMode::Concat {
+        match system.namespace_kind_and_provenance(namespace)? {
+            None => {
+                return Err(DelightQLError::validation_error_categorized(
+                    "directive/consult_concat/missing",
+                    format!(
+                        "consult_concat_into_ns! ADDS a source to an existing consulted \
+                         namespace, and '{namespace}' does not exist — consult the first \
+                         source ordinarily: consult!(\"<file>\", \"{namespace}\")"
+                    ),
+                    "concat target missing",
+                ));
+            }
+            Some((kind, provenance)) => {
+                if !(kind == "lib" && provenance.as_deref() == Some("file")) {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "directive/consult_concat/not_consulted",
+                        format!(
+                            "consult_concat_into_ns! extends a CONSULTED namespace; \
+                             '{namespace}' is a {kind} namespace — it holds \
+                             {}, not consulted sources",
+                            match kind.as_str() {
+                                "data" => "your database's tables",
+                                "system" => "engine machinery",
+                                "scratch" => "in-session scratch definitions",
+                                _ => "something else",
+                            }
+                        ),
+                        "concat target class",
+                    ));
+                }
+            }
+        }
+    }
+
+    // A consulted file may concatenate sources into a namespace it is
+    // constructing, but may not imperatively extend a caller-owned namespace.
+    // The catalog savepoint makes this reversible; the refusal remains the
+    // file/session policy. Prompt-level concat keeps its ordinary purpose.
+    if mode == ConsultMode::Concat {
+        system.refuse_preexisting_namespace_mutation_in_program(
+            namespace,
+            "adding a source to",
+            "directive/consult_concat/uncompensable",
+        )?;
+    }
+
+    // THE LIFECYCLE REFUSAL (Phase 8): ordinary consult! creates ONE
+    // namespace from ONE source. An existing destination refuses with the
+    // lifecycle teaching; the caller chooses reload, deletion, or explicit
+    // concatenation — never receives a silent merge.
+    if mode == ConsultMode::Fresh && system.namespace_exists(namespace)? {
+        return Err(DelightQLError::validation_error_categorized(
+            "directive/consult/exists",
+            format!(
+                "consult! creates namespace '{namespace}' from one source, and it \
+                 already exists. Reload the same source with reconsult!(\"{namespace}\"); \
+                 remove it first with unconsult!(\"{namespace}\"); or ADD another \
+                 source explicitly with consult_concat_into_ns!(\"<file>\", \"{namespace}\") \
+                 — a second ordinary consult is never an implicit merge"
+            ),
+            "consult lifecycle",
+        ));
+    }
 
     // Resolve relative path against session CWD (for test isolation).
     let resolved_path = crate::session_cwd::resolve_path(file_path);
@@ -242,32 +681,30 @@ pub(crate) fn execute_consult(
     })?;
 
     // Pre-process: extract and execute embedded directives (consult!, mount!, enlist!, etc.)
-    let (cleaned_source, directives) = extract_embedded_directives(&source)?;
-    let saved_enlisted = system.save_enlisted_state()?;
-    let saved_aliases = system.save_alias_state()?;
-
-    // ALL exit paths must restore the caller's enlist/alias state
-    // (bugs/liminal-abort-state-leak): a directive failure mid-file used to
-    // return early past the restore, leaking partial mutations into the
-    // session while a fully successful consult scoped them. The success
-    // path records new enlists/aliases as namespace-local and restores
-    // inside `consult_body`; the failure path restores here (best-effort,
-    // so restore trouble cannot mask the abort error). Pinned by
-    // `liminal_abort_restores_enlist_and_alias_state`.
-    let result = consult_body(
+    // Parse errors here get the same consult!() wrapper (and error class) the
+    // cleaned-source parse has always used; categorized validation errors
+    // (eligibility refusals, R-rule badges) pass through unwrapped — badge
+    // hygiene, same discipline as consult_body's parse_ddl_file wrapping.
+    let (cleaned_source, directives) = extract_embedded_directives(&source).map_err(|e| match e {
+        DelightQLError::ParseError { .. } => wrap_consult_parse_error(e, file_path),
+        other => other,
+    })?;
+    run_liminal_program(
         system,
-        directives,
-        &cleaned_source,
-        file_path,
-        namespace,
-        &saved_enlisted,
-        &saved_aliases,
-    );
-    if result.is_err() {
-        let _ = system.restore_enlisted_state(&saved_enlisted);
-        let _ = system.restore_alias_state(&saved_aliases);
-    }
-    result
+        crate::system::LiminalProgramKind::Consult,
+        |system, saved| {
+            consult_body(
+                system,
+                directives,
+                &cleaned_source,
+                file_path,
+                namespace,
+                &saved.enlisted,
+                &saved.aliases,
+                mode,
+            )
+        },
+    )
 }
 
 /// The abortable middle of `execute_consult`: executes embedded directives,
@@ -282,252 +719,24 @@ fn consult_body(
     namespace: &str,
     saved_enlisted: &[(i32, i32)],
     saved_aliases: &[(String, i32)],
+    mode: ConsultMode,
 ) -> Result<usize> {
-    // Deferred expose directives: expose! must run after consult_file creates
-    // this DDL's namespace, so we validate args now but execute later.
-    let mut deferred_exposes: Vec<Vec<String>> = Vec::new();
-
-    // Deferred doc! directives: a liminal doc! (session directive, R9-exempt
-    // — EFFECT-ALGEBRA §8) documents an entity of THIS file, which exists
-    // only after consult_file registers the rules. Validate arity now,
-    // execute after registration (the expose! precedent).
-    let mut deferred_docs: Vec<(String, String)> = Vec::new();
-
-    // THE LIMINAL RELATION (EFFECT-ALGEBRA §8): collect one receipt per
-    // liminal directive, in this single file-order pass — so a deferred
-    // doc!'s receipt keeps its FILE position in the ledger, not its
-    // execution time (pinned by `liminal_ledger_doc_keeps_file_position`).
-    // Receipts are persisted by consult_file inside the consult transaction;
-    // any abort on this road (a failing directive below, a parse refusal, a
-    // registration refusal) leaves no namespace and no ledger (pinned by
-    // `liminal_ledger_abort_leaves_no_ledger`).
-    let mut liminal_receipts: Vec<crate::system::LiminalReceipt> = Vec::new();
-
-    for directive in directives {
-        liminal_receipts.push(liminal_receipt_for(&directive.name, &directive.args));
-        match directive.name.as_str() {
-            "consult" => {
-                if directive.args.len() != 2 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "consult!() in DDL expects 2 arguments, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
-                execute_consult(system, &directive.args[0], &resolved_ns, Some(namespace))?;
-            }
-            "mount" => {
-                if directive.args.len() != 2 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "mount!() in DDL expects 2 arguments, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
-                system.mount_database(&directive.args[0], &resolved_ns)?;
-            }
-            "mount_new" => {
-                if directive.args.len() != 2 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "mount_new!() in DDL expects 2 arguments, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
-                system.mount_new_database(&directive.args[0], &resolved_ns)?;
-            }
-            "mount_tree" => {
-                if directive.args.len() != 2 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "mount_tree!() in DDL expects 2 arguments, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
-                system.mount_database_tree(&directive.args[0], &resolved_ns)?;
-            }
-            "enlist" => {
-                if directive.args.len() != 1 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "enlist!() in DDL expects 1 argument, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                system.enlist_namespace(&resolved_ns)?;
-            }
-            "delist" => {
-                if directive.args.len() != 1 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "delist!() in DDL expects 1 argument, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                system.delist_namespace(&resolved_ns)?;
-            }
-            "alias" => {
-                if directive.args.len() != 2 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "alias!() in DDL expects 2 arguments (namespace, shorthand), got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                system.register_namespace_alias(&directive.args[1], &resolved_ns)?;
-            }
-            "unmount" => {
-                if directive.args.len() != 1 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "unmount!() in DDL expects 1 argument, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                system.unmount_database(&resolved_ns)?;
-            }
-            "unconsult" => {
-                if directive.args.len() != 1 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "unconsult!() in DDL expects 1 argument, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                system.unconsult_namespace(&resolved_ns)?;
-            }
-            "ground" => {
-                if directive.args.len() != 3 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "ground!() in DDL expects 3 arguments (data_ns, lib_ns, new_ns), got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let data_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                let lib_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
-                let new_ns = resolve_ns_prefix(&directive.args[2], namespace)?;
-                system.ground_namespace(&data_ns, &lib_ns, &new_ns)?;
-            }
-            "expose" => {
-                if directive.args.is_empty() {
-                    return Err(DelightQLError::database_error(
-                        "expose!() requires at least one namespace argument",
-                        "Invalid directive",
-                    ));
-                }
-                // Resolve args now but defer execution until after consult_file
-                // creates this DDL's namespace.
-                let resolved: Vec<String> = directive
-                    .args
-                    .iter()
-                    .map(|arg| resolve_ns_prefix(arg, namespace))
-                    .collect::<Result<Vec<_>>>()?;
-                deferred_exposes.push(resolved);
-            }
-            "refresh" => {
-                if directive.args.len() != 1 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "refresh!() in DDL expects 1 argument, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                system.refresh_namespace(&resolved_ns)?;
-            }
-            "reconsult" => {
-                if directive.args.is_empty() || directive.args.len() > 2 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "reconsult!() in DDL expects 1 or 2 arguments, got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                let resolved_ns = resolve_ns_prefix(&directive.args[0], namespace)?;
-                let new_file = if directive.args.len() == 2 {
-                    Some(directive.args[1].as_str())
-                } else {
-                    None
-                };
-                system.reconsult_namespace(&resolved_ns, new_file)?;
-            }
-            "doc" => {
-                if directive.args.len() != 2 {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "doc!() in a liminal space expects 2 arguments (target, doc), got {}",
-                            directive.args.len()
-                        ),
-                        "Invalid directive",
-                    ));
-                }
-                deferred_docs.push((directive.args[0].clone(), directive.args[1].clone()));
-            }
-            other => {
-                return Err(DelightQLError::database_error(
-                    format!(
-                        "pseudo-predicate {}!() is not supported in DDL files",
-                        other
-                    ),
-                    "Unsupported directive",
-                ));
-            }
-        }
-    }
+    let prepared = execute_liminal_directives(
+        system,
+        &directives,
+        namespace,
+        LiminalDirectiveMode::Fresh,
+    )?;
+    let liminal_receipts = prepared.receipts;
+    let deferred_exposes = prepared.deferred_exposes;
+    let deferred_docs = prepared.deferred_docs;
 
     // Parse the cleaned source as DDL. Categorized validation errors (the
     // effect-algebra refusals: liminal eligibility, R-rule badges) pass
     // through UNWRAPPED — badge hygiene (REPORT-2.1 note 3): a builder
     // refusal must not be re-badged as a parse error.
-    let mut ddl = parse_ddl_file(&cleaned_source).map_err(|e| {
-        if matches!(
-            e,
-            DelightQLError::ValidationError {
-                subcategory: Some(_),
-                ..
-            }
-        ) {
-            return e;
-        }
-        DelightQLError::database_error(
-            format!("consult!() failed to parse '{}': {}", file_path, e),
-            "Parse error",
-        )
-    })?;
+    let mut ddl = parse_ddl_file(&cleaned_source)
+        .map_err(|e| wrap_consult_parse_error(e, file_path))?;
 
     // Guard: reject files that are valid DQL queries misclassified as DDL.
     // The DDL grammar shares `:` with CTE syntax, so a DQL query file with
@@ -584,12 +793,61 @@ fn consult_body(
     // Extract inline DDL blocks before consuming ddl in consult_file
     let inline_ddl_blocks = std::mem::take(&mut ddl.inline_ddl_blocks);
 
-    // Store in system
-    let result = system
-        .consult_file(file_path, namespace, ddl, &liminal_receipts)
-        .map(|cr| cr.definitions_loaded);
+    // ONE ORCHESTRATION BOUNDARY (review otolxyzl::qmqwqlms P1): the
+    // enlist/alias deltas are computed BEFORE registration (the liminal
+    // directives already ran), and everything that must land atomically
+    // with registration — deferred exposes, deferred doc!s, the
+    // namespace-local edge recording, per-source provenance — is applied
+    // INSIDE consult_file's catalog transaction. A failure in any of them
+    // rolls the whole consultation back: no namespace, no concat
+    // additions, no ledger.
+    let current_enlisted = system.save_enlisted_state()?;
+    let current_aliases = system.save_alias_state()?;
+    let new_enlists: Vec<(i32, i32)> = current_enlisted
+        .iter()
+        .filter(|row| !saved_enlisted.contains(row))
+        .cloned()
+        .collect();
+    let new_aliases: Vec<(String, i32)> = current_aliases
+        .iter()
+        .filter(|row| !saved_aliases.contains(row))
+        .cloned()
+        .collect();
 
-    // Process inline DDL blocks — each creates a child namespace
+    // Concat + inline blocks remains a semantic refusal: concatenating a
+    // source must not silently invent child-module merge semantics. Atomicity
+    // itself is no longer the limitation; the outer program savepoint spans
+    // the nested block consultations.
+    if !inline_ddl_blocks.is_empty() && mode == ConsultMode::Concat {
+        return Err(DelightQLError::validation_error_categorized(
+            "directive/consult_concat/inline_ddl",
+            format!(
+                "consult_concat_into_ns! source '{file_path}' carries inline \
+                 (~~ddl~~) blocks — concat cannot yet orchestrate them \
+                 atomically. Consult them in the FIRST source, or as their \
+                 own consult!"
+            ),
+            "concat inline ddl",
+        ));
+    }
+
+    let post = crate::system::ConsultPost {
+        deferred_exposes,
+        deferred_docs,
+        new_enlists: &new_enlists,
+        new_aliases: &new_aliases,
+        record_source: true,
+    };
+    // The registration result propagates IMMEDIATELY (the review's
+    // inversion: inline blocks and exposes used to run even after a
+    // failed registration).
+    let definitions_loaded = system
+        .consult_file(file_path, namespace, ddl, &liminal_receipts, Some(&post))
+        .map(|cr| cr.definitions_loaded)?;
+
+    // Nested consultations share the outer program savepoint. There is no
+    // inverse walk here: any block failure bubbles to the one runner, which
+    // restores the complete catalog and the typed external journal.
     for block in &inline_ddl_blocks {
         let child_ns = match &block.namespace {
             Some(suffix) => format!("{}::{}", namespace, suffix),
@@ -607,82 +865,33 @@ fn consult_body(
             })?;
     }
 
-    // Execute deferred expose directives now that the namespace exists
-    for resolved_args in deferred_exposes {
-        for resolved_ns in &resolved_args {
-            system.expose_namespace(namespace, resolved_ns)?;
-        }
-    }
-
-    // Execute deferred doc! directives now that the file's entities exist.
-    // A liminal doc! target resolves relative to the file's own namespace;
-    // an unqualified rule name is tried verbatim, then with the `!` suffix
-    // (effect rules store the `!` in the entity name), then as an
-    // already-qualified path. Failure ABORTS the load (§8: session
-    // directives succeed or abort). Pinned by
-    // `liminal_doc_documents_this_files_effect_rule`.
-    // (Guarded on the registration result: when consult_file itself refused
-    // — e.g. an R-rule validation error — that error must surface, not a
-    // doc!-target miss over entities that were never registered.)
-    if result.is_ok() {
-        for (target, doc) in deferred_docs {
-            let candidates = [
-                format!("{}.{}", namespace, target),
-                format!("{}.{}!", namespace, target),
-                target.clone(),
-            ];
-            let mut last_err = None;
-            let mut done = false;
-            for candidate in &candidates {
-                match system.set_entity_doc(candidate, &doc) {
-                    Ok(_) => {
-                        done = true;
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            if !done {
-                return Err(last_err.expect("candidates is non-empty"));
-            }
-        }
-    }
-
-    // Record which namespaces were newly enlisted and which aliases were created
-    // by this DDL as namespace-local dependencies.
-    // Then restore the caller's state so DDL-internal changes don't leak.
-    let current_enlisted = system.save_enlisted_state()?;
-    let current_aliases = system.save_alias_state()?;
-    let new_enlists: Vec<(i32, i32)> = current_enlisted
-        .iter()
-        .filter(|row| !saved_enlisted.contains(row))
-        .cloned()
-        .collect();
-    let new_aliases: Vec<(String, i32)> = current_aliases
-        .iter()
-        .filter(|row| !saved_aliases.contains(row))
-        .cloned()
-        .collect();
-
-    if !new_enlists.is_empty() || !new_aliases.is_empty() {
-        if !new_enlists.is_empty() {
-            system.record_namespace_local_enlists(namespace, &new_enlists)?;
-        }
-        if !new_aliases.is_empty() {
-            system.record_namespace_local_aliases(namespace, &new_aliases)?;
-        }
-        system.restore_enlisted_state(&saved_enlisted)?;
-        system.restore_alias_state(&saved_aliases)?;
-    }
-
-    result
+    Ok(definitions_loaded)
 }
 
-const RENAMED_PSEUDO_PREDICATES: &[(&str, &str)] = &[
-    ("engage", "enlist"),
-    ("part", "delist"),
-    ("ground_into", "ground"),
-];
+pub(crate) use crate::pipeline::asts::effects::RENAMED_DIRECTIVES as RENAMED_PSEUDO_PREDICATES;
+
+/// Wrap a parse failure from a consulted file in the consult!() context
+/// (a `database_error`, so its class is `error://runtime` like every other
+/// consult refusal), while letting categorized validation errors — the
+/// effect-algebra refusals such as liminal eligibility and R-rule badges —
+/// pass through UNWRAPPED (badge hygiene, REPORT-2.1 note 3). Used by both
+/// the extraction parse (Phase 1A complete-form segmentation) and the
+/// cleaned-source parse so the two stages fail identically.
+fn wrap_consult_parse_error(e: DelightQLError, file_path: &str) -> DelightQLError {
+    if matches!(
+        e,
+        DelightQLError::ValidationError {
+            subcategory: Some(_),
+            ..
+        }
+    ) {
+        return e;
+    }
+    DelightQLError::database_error(
+        format!("consult!() failed to parse '{}': {}", file_path, e),
+        "Parse error",
+    )
+}
 
 /// A recognized liminal statement. The typed shape lives with the effect
 /// AST family (EFFECT-ALGEBRA §8): the extraction layer IS the liminal
@@ -691,25 +900,156 @@ pub(crate) use crate::pipeline::asts::effects::LiminalDirective as EmbeddedDirec
 
 /// Extract embedded pseudo-predicate directives from DDL source text.
 /// Returns (cleaned_source, directives). Errors on unknown !-suffixed names.
+///
+/// COMPLETE-FORM BOUNDARY (DIRECTIVE-CONVERGENCE-PLAN Phase 1A): the
+/// production DDL grammar segments the file into whole forms, replacing the
+/// previous physical-line scan. A rule head ending in `:-` owns its body
+/// across newlines, blank lines, and comments — a body line like
+/// `union_them!(*)` inside a multi-line `main!` clause is part of that
+/// rule's definition node and can never be reclassified as a liminal
+/// directive (pinned by effects/main--28/29/30). An incomplete head
+/// (`main!(*) :-` with no body) is a parse refusal from `parse_ddl`, never
+/// an installed empty rule. Exactly the grammar's top-level
+/// `liminal_directive` nodes are candidates; of those, session directives
+/// are lifted and every other name refuses with the §8 eligibility message.
 pub(crate) fn extract_embedded_directives(
     source: &str,
 ) -> Result<(String, Vec<EmbeddedDirective>)> {
-    let mut cleaned_lines = Vec::new();
-    let mut directives = Vec::new();
+    // Empty input has no forms to segment; preserve the old contract
+    // without invoking the grammar (repeat1 cannot parse emptiness).
+    if source.trim().is_empty() {
+        return Ok((source.to_string(), Vec::new()));
+    }
 
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") || trimmed.is_empty() {
-            cleaned_lines.push(line);
+    let tree = crate::pipeline::parser::parse_ddl(source)?;
+    let cst = crate::pipeline::cst::CstTree::new(&tree, source);
+
+    let mut directives = Vec::new();
+    let mut cleaned: Vec<u8> = source.as_bytes().to_vec();
+
+    for child in cst.root().children() {
+        if child.kind() != "liminal_directive" {
             continue;
         }
-        match parse_directive(trimmed)? {
-            Some(directive) => directives.push(directive),
-            None => cleaned_lines.push(line),
+        let relation_statement = child.find_child("liminal_relation_statement");
+        let call = child
+            .find_child("pseudo_predicate_call")
+            .or(relation_statement)
+            .ok_or_else(|| {
+                DelightQLError::parse_error(
+                    "liminal_directive node without a recognized call child",
+                )
+            })?;
+        let name = call.field_text("name").ok_or_else(|| {
+            DelightQLError::parse_error("liminal directive without a name")
+        })?;
+
+        // Check for renamed pseudo-predicates and give helpful error
+        if let Some((_, new_name)) = RENAMED_PSEUDO_PREDICATES
+            .iter()
+            .find(|(old, _)| *old == name)
+        {
+            return Err(DelightQLError::database_error(
+                format!(
+                    "{}!() has been renamed to {}!(). Please update your code.",
+                    name, new_name
+                ),
+                "Renamed directive",
+            ));
+        }
+
+        // Liminal eligibility (EFFECT-ALGEBRA §8): only session directives.
+        if !crate::pipeline::asts::effects::is_liminal_eligible(&name) {
+            return Err(DelightQLError::validation_error_categorized(
+                crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
+                crate::pipeline::asts::effects::liminal_not_eligible_message(&name),
+                "not liminal-eligible",
+            ));
+        }
+
+        // A relation-argument statement (insert!(audit_log(*))-shaped) can
+        // never execute liminally even under a session name: session
+        // directives take string/path arguments, not relations.
+        if call.kind() == "liminal_relation_statement" {
+            return Err(DelightQLError::validation_error_categorized(
+                crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
+                format!(
+                    "a liminal '{}!' statement takes string or namespace-path \
+                     arguments, not relations",
+                    name
+                ),
+                "not liminal-eligible",
+            ));
+        }
+
+        // A liminal statement is exactly `name!(args)`. The grammar also
+        // permits aliases and interior continuations on the shared
+        // pseudo_predicate_call shape; neither has liminal meaning.
+        if call.find_child("table_alias").is_some() {
+            return Err(DelightQLError::validation_error_categorized(
+                crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
+                format!(
+                    "a liminal '{}!' statement does not take an alias — \
+                     it is a session directive, not a relation",
+                    name
+                ),
+                "not liminal-eligible",
+            ));
+        }
+        if call.field("continuation").is_some() {
+            return Err(DelightQLError::validation_error_categorized(
+                crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
+                format!(
+                    "a liminal '{}!' statement does not take a relational \
+                     continuation — it is a session directive, not a relation",
+                    name
+                ),
+                "not liminal-eligible",
+            ));
+        }
+
+        // Typed argument extraction from the CST (same node vocabulary as
+        // the query builder): string literals are unquoted, bare
+        // ::-qualified namespace paths keep their text.
+        let mut args = Vec::new();
+        if let Some(args_list) = call.field("arguments") {
+            for arg in args_list.children() {
+                match arg.kind() {
+                    "domain_expression" | "namespace_path" => {
+                        // Phase 9: liminal string arguments decode through
+                        // the SAME literal decoder the query builder uses —
+                        // triple-quoted (\"\"\"…\"\"\") and b64:"…" forms
+                        // included; the old hand-unquote knew neither.
+                        let text = arg.text().trim();
+                        let value = crate::pipeline::builder_v2::expressions::literals::decode_string_literal_text(text)
+                            .unwrap_or_else(|| text.to_string());
+                        if !value.is_empty() {
+                            args.push(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        directives.push(EmbeddedDirective {
+            name: name.to_string(),
+            args,
+        });
+
+        // Blank the directive's byte range (spaces, newlines preserved) so
+        // downstream parses of the cleaned source keep their line numbers.
+        let range = child.raw_node().byte_range();
+        for b in &mut cleaned[range] {
+            if *b != b'\n' {
+                *b = b' ';
+            }
         }
     }
 
-    Ok((cleaned_lines.join("\n"), directives))
+    let cleaned = String::from_utf8(cleaned)
+        .expect("space-blanking byte ranges preserves UTF-8 validity");
+    Ok((cleaned, directives))
 }
 
 /// Shared DDL-source front end for the loaders that do NOT execute embedded
@@ -726,7 +1066,13 @@ pub(crate) fn parse_ddl_source_no_directives(
     source: &str,
     context: &str,
 ) -> Result<crate::pipeline::parser::DDLFile> {
-    let (cleaned_source, directives) = extract_embedded_directives(source)?;
+    let (cleaned_source, directives) = extract_embedded_directives(source).map_err(|e| match e {
+        DelightQLError::ParseError { .. } => DelightQLError::database_error(
+            format!("{context}: failed to parse DDL: {e}"),
+            "Parse error",
+        ),
+        other => other,
+    })?;
     if !directives.is_empty() {
         let names = directives
             .iter()
@@ -748,131 +1094,6 @@ pub(crate) fn parse_ddl_source_no_directives(
             "Parse error",
         )
     })
-}
-
-/// Strip a trailing `//` comment from a directive line, ignoring `//`
-/// inside double-quoted string arguments (paths/URLs like "http://x//y"
-/// must survive). Uses the same naive string model as the argument
-/// extractor below (quotes toggle, no escape sequences). Pinned by
-/// `directive_with_trailing_comment_is_recognized` and
-/// `double_slash_inside_string_argument_is_not_a_comment`.
-fn strip_trailing_line_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_string = false;
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'"' => in_string = !in_string,
-            b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
-                return line[..i].trim_end();
-            }
-            _ => {}
-        }
-    }
-    line
-}
-
-/// Find the byte index of the `)` matching the `(` at `open_pos`, using the
-/// extraction layer's naive string model (quotes toggle, no escapes).
-/// Returns None if the parens never balance on this line.
-fn find_matching_close_paren(line: &str, open_pos: usize) -> Option<usize> {
-    let bytes = line.as_bytes();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    for (i, &b) in bytes.iter().enumerate().skip(open_pos) {
-        match b {
-            b'"' => in_string = !in_string,
-            b'(' if !in_string => depth += 1,
-            b')' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Try to parse a `name!("arg1", "arg2", ...)` directive from a trimmed line.
-///
-/// NARROWED (IMPLEMENTATION-PLAN §2.2, ruled 2026-07-10): the textual layer
-/// owns ONLY the liminal space — lines that are, in their entirety, a single
-/// `name!(args)` statement. Effect-rule clauses (`name!(*) :- …`) and
-/// expression-position directives (trailing access parens, pipes, …) flow to
-/// the real parsers: anything after the matching close paren returns
-/// Ok(None).
-///
-/// Of the whole-line statements, exactly the SESSION directives are lifted
-/// (liminal-eligible, EFFECT-ALGEBRA §8); every other directive name — DML,
-/// DDL, execution, utility, user effect rules, and unknown names alike —
-/// refuses with the eligibility message (pinned red-first by the effects
-/// ball: liminal--41_dml_not_eligible, liminal--42_run_not_eligible).
-fn parse_directive(line: &str) -> Result<Option<EmbeddedDirective>> {
-    // A trailing `//` comment must not silently un-recognize a directive
-    // (bugs/directive-trailing-comment): strip it before the
-    // whole-line check below.
-    let line = strip_trailing_line_comment(line);
-
-    // Look for the name!( pattern
-    let Some(bang_pos) = line.find("!(") else {
-        return Ok(None);
-    };
-
-    let name = &line[..bang_pos];
-
-    // Must be a simple identifier (no spaces, operators, etc.)
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Ok(None);
-    }
-
-    // The whole line must be exactly `name!(args)`: find the close paren
-    // matching `name!(` and require nothing after it. An effect-rule clause
-    // (`touch!(*) :- …`) or an expression line (`run_namespace!(fx)(*)`)
-    // has trailing content and flows to the real parsers (2.2 narrowing;
-    // pinned by `effect_rule_clause_line_flows_to_the_parser`).
-    let Some(close_pos) = find_matching_close_paren(line, bang_pos + 1) else {
-        return Ok(None);
-    };
-    if !line[close_pos + 1..].trim().is_empty() {
-        return Ok(None);
-    }
-
-    // Check for renamed pseudo-predicates and give helpful error
-    if let Some((_, new_name)) = RENAMED_PSEUDO_PREDICATES
-        .iter()
-        .find(|(old, _)| *old == name)
-    {
-        return Err(DelightQLError::database_error(
-            format!(
-                "{}!() has been renamed to {}!(). Please update your code.",
-                name, new_name
-            ),
-            "Renamed directive",
-        ));
-    }
-
-    // Liminal eligibility (EFFECT-ALGEBRA §8): only session directives.
-    if !crate::pipeline::asts::effects::is_liminal_eligible(name) {
-        return Err(DelightQLError::validation_error_categorized(
-            crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
-            crate::pipeline::asts::effects::liminal_not_eligible_message(name),
-            "not liminal-eligible",
-        ));
-    }
-
-    // Extract the arguments between !( and the matching )
-    let inner = &line[bang_pos + 2..close_pos];
-    let args: Vec<String> = inner
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    Ok(Some(EmbeddedDirective {
-        name: name.to_string(),
-        args,
-    }))
 }
 
 /// Extract a string literal value from a DomainExpression
@@ -960,7 +1181,7 @@ mod liminal_abort_tests {
         std::fs::write(
             &path,
             "doc!(\"main\", \"documented at load\")\n\n\
-             main!(*) :- _(msg @ \"x\") |> insert!(audit_log(msg))(*)\n",
+             main!(*) :- _(msg @ \"x\") |> insert!(audit_log(*))(*)\n",
         )
         .expect("write docd.dql");
 
@@ -1066,7 +1287,7 @@ mod name_collision_tests {
         // Function first, effect rule second.
         let err = consult_source(
             "foo:(x) :- x + 1\n\n\
-             foo!(*) :- _(msg @ \"x\") |> insert!(audit_log(msg))(*)\n",
+             foo!(*) :- _(msg @ \"x\") |> insert!(audit_log(*))(*)\n",
         )
         .expect_err("effect rule 'foo!' must refuse where function 'foo' exists");
         assert!(
@@ -1081,7 +1302,7 @@ mod name_collision_tests {
 
         // Effect rule first, function second.
         let err = consult_source(
-            "foo!(*) :- _(msg @ \"x\") |> insert!(audit_log(msg))(*)\n\n\
+            "foo!(*) :- _(msg @ \"x\") |> insert!(audit_log(*))(*)\n\n\
              foo:(x) :- x + 1\n",
         )
         .expect_err("function 'foo' must refuse where effect rule 'foo!' exists");
@@ -1095,86 +1316,75 @@ mod name_collision_tests {
 
 #[cfg(test)]
 mod directive_line_tests {
-    //! bugs/directive-trailing-comment: a trailing `//` comment must not
-    //! silently un-recognize a liminal directive line, and `//` inside a
-    //! quoted string argument (a URL/path) is NOT a comment.
+    //! Extraction-boundary pins, re-expressed against the grammar-driven
+    //! complete-form extraction (DIRECTIVE-CONVERGENCE-PLAN Phase 1A). The
+    //! behaviors originally pinned against the line scanner still hold:
+    //! trailing comments, `//` inside string arguments, non-session refusal,
+    //! and clause bodies flowing to the parser — plus the new complete-form
+    //! guarantees for multi-line rules and incomplete heads.
 
     use super::*;
 
-    /// RED before the comment-strip: the ends-with-`)` check failed, the
-    /// line fell through to the DDL parser, and died as a garbled parse
-    /// error far from the real cause.
+    const VIEW: &str = "myview(*) :- _(z @ 1) |> (z)\n";
+
+    /// A trailing `//` comment must not un-recognize a liminal directive
+    /// (bugs/directive-trailing-comment): comments are grammar extras.
     #[test]
     fn directive_with_trailing_comment_is_recognized() {
-        let d = parse_directive(r#"consult!("lib.dql", "lib")   // load the library"#)
-            .expect("directive line must not error")
-            .expect("directive with trailing comment must be recognized");
-        assert_eq!(d.name, "consult");
-        assert_eq!(d.args, vec!["lib.dql", "lib"]);
+        let src = format!("consult!(\"lib.dql\", \"lib\")   // load the library\n{VIEW}");
+        let (cleaned, directives) =
+            extract_embedded_directives(&src).expect("extraction must succeed");
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].name, "consult");
+        assert_eq!(directives[0].args, vec!["lib.dql", "lib"]);
+        assert!(!cleaned.contains("consult!"), "{cleaned}");
     }
 
-    /// `//` inside a quoted string argument (e.g. a URL or path) must
-    /// survive comment stripping — with and without a real trailing comment.
+    /// `//` inside a quoted string argument (a URL/path) is NOT a comment.
     #[test]
     fn double_slash_inside_string_argument_is_not_a_comment() {
-        let d = parse_directive(r#"mount!("http://host//share/db.sqlite", "remote")"#)
-            .expect("directive line must not error")
-            .expect("directive must be recognized");
-        assert_eq!(d.name, "mount");
-        assert_eq!(d.args, vec!["http://host//share/db.sqlite", "remote"]);
-
-        let d = parse_directive(r#"mount!("http://host//share/db.sqlite", "remote") // attach"#)
-            .expect("directive line must not error")
-            .expect("directive with trailing comment must be recognized");
-        assert_eq!(d.args, vec!["http://host//share/db.sqlite", "remote"]);
+        let src = format!(
+            "mount!(\"http://host//share/db.sqlite\", \"remote\") // attach\n{VIEW}"
+        );
+        let (_, directives) =
+            extract_embedded_directives(&src).expect("extraction must succeed");
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].name, "mount");
+        assert_eq!(
+            directives[0].args,
+            vec!["http://host//share/db.sqlite", "remote"]
+        );
     }
 
-    /// A whole-line directive with a non-session name must still error
-    /// CLEARLY — including when a trailing comment follows it. Message
-    /// updated by the 2.2 extraction narrowing: eligibility is the §8
-    /// category, so unknown names and known non-session names share the
-    /// liminal-eligibility refusal (was "unknown pseudo-predicate").
+    /// A whole-statement directive with a non-session name must error with
+    /// the §8 eligibility refusal — unknown names and known non-session
+    /// names alike (pinned red-first by the effects ball:
+    /// liminal--41_dml_not_eligible, liminal--42_run_not_eligible).
     #[test]
     fn malformed_directive_line_still_errors_clearly() {
-        let err = parse_directive(r#"frobnicate!("x")"#)
+        let src = format!("frobnicate!(\"x\")\n{VIEW}");
+        let err = extract_embedded_directives(&src)
             .expect_err("non-session directive statement must error");
         assert!(
             err.to_string()
                 .contains("only session directives are liminal-eligible"),
             "{err}"
         );
-
-        let err = parse_directive(r#"frobnicate!("x") // huh"#)
-            .expect_err("non-session directive with trailing comment must error");
-        assert!(
-            err.to_string()
-                .contains("only session directives are liminal-eligible"),
-            "{err}"
-        );
     }
 
-    /// 2.2 narrowing (IMPLEMENTATION-PLAN §2.2 textual-extraction ruling):
-    /// a single-line effect-rule CLAUSE and an expression-position directive
-    /// line must flow to the real parsers — Ok(None), not extraction, not an
-    /// error. RED before the narrowing: the clause was intercepted as
-    /// `unknown pseudo-predicate touch!() in DDL file`.
+    /// An effect-rule CLAUSE flows to the parser as a definition — never
+    /// extraction, never an error (2.2 narrowing, preserved by Phase 1A).
     #[test]
     fn effect_rule_clause_line_flows_to_the_parser() {
-        let clause =
-            parse_directive(r#"touch!(*) :- _(msg @ "touched") |> insert!(audit_log(msg))(*)"#)
-                .expect("clause line must not error at extraction");
-        assert!(clause.is_none(), "effect-rule clause must flow to the parser");
-
-        let expr = parse_directive("run_namespace!(fx)(*)")
-            .expect("expression line must not error at extraction");
-        assert!(
-            expr.is_none(),
-            "expression-position directive must flow to the parser"
-        );
+        let src = "touch!(*) :- _(msg @ \"touched\") |> insert!(audit_log(*))(*)\n";
+        let (cleaned, directives) =
+            extract_embedded_directives(src).expect("clause must not error at extraction");
+        assert!(directives.is_empty(), "effect-rule clause must flow to the parser");
+        assert!(cleaned.contains("touch!"), "clause text must survive: {cleaned}");
     }
 
-    /// End-to-end through the scanner: a commented directive line is
-    /// extracted as a directive AND removed from the cleaned source.
+    /// End-to-end through the extraction: a commented directive line is
+    /// extracted as a directive AND blanked from the cleaned source.
     #[test]
     fn extract_strips_commented_directive_line_from_cleaned_source() {
         let src = "consult!(\"lib.dql\", \"lib\") // load\nmyview(*) :- _(z @ 1) |> (z)\n";
@@ -1184,7 +1394,77 @@ mod directive_line_tests {
         assert_eq!(directives[0].name, "consult");
         assert!(
             !cleaned.contains("consult!"),
-            "directive line must be removed from cleaned source: {cleaned}"
+            "directive must be removed from cleaned source: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("myview"),
+            "definitions must survive cleaning: {cleaned}"
+        );
+    }
+
+    /// Phase 1A acceptance (effects/main--28): a rule head on one physical
+    /// line with its body on the next belongs to ONE definition. The body
+    /// demand must not be reclassified as a liminal directive.
+    #[test]
+    fn multi_line_rule_body_is_not_liminal() {
+        let src = "union_them!(*) :- _(msg @ \"ran\") |> insert!(audit_log(*))(*)\n\
+                   main!(*) :-\n    union_them!(*)\n";
+        let (cleaned, directives) =
+            extract_embedded_directives(src).expect("multi-line rule must extract cleanly");
+        assert!(
+            directives.is_empty(),
+            "rule-body demand must not become a liminal directive: {directives:?}"
+        );
+        assert!(cleaned.contains("union_them!(*)"));
+    }
+
+    /// Phase 1A acceptance (effects/main--29): comments and blank lines
+    /// between head and body do not terminate the rule.
+    #[test]
+    fn comments_between_head_and_body_do_not_terminate_the_rule() {
+        let src = "union_them!(*) :- _(msg @ \"ran\") |> insert!(audit_log(*))(*)\n\
+                   main!(*) :-\n\n// the demand follows\n\n    union_them!(*)\n";
+        let (_, directives) =
+            extract_embedded_directives(src).expect("comments inside a rule must extract cleanly");
+        assert!(directives.is_empty(), "{directives:?}");
+    }
+
+    /// Phase 1A acceptance: an incomplete head is refused as a parse error,
+    /// never installed as an empty rule and never a liminal reclassification.
+    #[test]
+    fn incomplete_head_is_refused() {
+        let src = "main!(*) :-\n";
+        let err = extract_embedded_directives(src)
+            .expect_err("incomplete rule head must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("parse error") || msg.contains("Parse error"), "{msg}");
+    }
+
+    /// A directive statement may now span physical lines: the form, not the
+    /// line, is the boundary.
+    #[test]
+    fn multi_line_directive_arguments_are_extracted() {
+        let src = format!("consult!(\"lib.dql\",\n         \"lib\")\n{VIEW}");
+        let (cleaned, directives) =
+            extract_embedded_directives(&src).expect("multi-line directive must extract");
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].name, "consult");
+        assert_eq!(directives[0].args, vec!["lib.dql", "lib"]);
+        assert!(!cleaned.contains("consult!"), "{cleaned}");
+    }
+
+    /// Blanking preserves line structure so downstream parse errors keep
+    /// their positions.
+    #[test]
+    fn cleaned_source_preserves_line_numbers() {
+        let src = format!("enlist!(\"std::string\")\n{VIEW}");
+        let (cleaned, directives) =
+            extract_embedded_directives(&src).expect("extraction must succeed");
+        assert_eq!(directives.len(), 1);
+        assert_eq!(
+            cleaned.lines().count(),
+            src.lines().count(),
+            "blanking must not change the line count"
         );
     }
 }
@@ -1364,7 +1644,7 @@ mod liminal_ledger_tests {
             &dir,
             "refuse.dql",
             "enlist!(\"main\")\n\n\
-             bad(*) :- _(msg @ \"x\") |> insert!(audit_log(msg))(*)\n",
+             bad(*) :- _(msg @ \"x\") |> insert!(audit_log(*))(*)\n",
         );
         let mut system = fresh_system();
         let before = system.liminal_receipt_row_count();

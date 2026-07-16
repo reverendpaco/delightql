@@ -1,13 +1,41 @@
-# DelightQL Dependency Management
-# Idempotent targets for ensuring build dependencies are present
+# DelightQL Dependency Management + clone-and-build entry point
+#
+# `make` (or `make build`) checks the tools cargo cannot provide itself
+# and builds the dql binary. Compiling requires: rustc/cargo, make (you
+# are running it), and uv — build.rs bundles the embedded book/man
+# databases via assets/Makefile, whose bundler runs under `uv run` and
+# declares its own python dependencies (PEP 723). Everything else here
+# is the optional dependency doctor (`make setup`) for the wider
+# toolchain (wasm, duckdb, tree-sitter regeneration).
 
 # Tree-sitter CLI must match tree-sitter-c2rust version in Cargo.toml
 TREE_SITTER_EXPECTED_VERSION := 0.25.2
 LLVM_PATH := /opt/homebrew/opt/llvm/bin/clang
 DUCKDB_LIB := /opt/homebrew/lib/libduckdb.dylib
 
+.DEFAULT_GOAL := build
+
+.PHONY: build
+build: ensure-cargo ensure-uv
+	cargo build --bin dql
+
+.PHONY: ensure-cargo
+ensure-cargo:
+	@if ! command -v cargo >/dev/null 2>&1; then \
+		echo "❌ cargo not found. Install from: https://rustup.rs"; \
+		exit 1; \
+	fi
+
+.PHONY: ensure-uv
+ensure-uv:
+	@if ! command -v uv >/dev/null 2>&1; then \
+		echo "❌ uv not found (the asset bundler runs under it; see assets/Makefile)."; \
+		echo "   Install: mise install   or   https://docs.astral.sh/uv/"; \
+		exit 1; \
+	fi
+
 .PHONY: setup
-setup: ensure-rust ensure-llvm ensure-duckdb ensure-wasm-pack ensure-node ensure-tree-sitter
+setup: ensure-rust ensure-uv ensure-llvm ensure-duckdb ensure-wasm-pack ensure-node ensure-tree-sitter
 	@echo ""
 	@echo "✅ All dependencies ready"
 	@echo ""
@@ -110,6 +138,7 @@ help:
 	@echo "DelightQL Dependency Management"
 	@echo ""
 	@echo "Targets:"
+	@echo "  make [build]           - Check cargo+uv, build the dql binary"
 	@echo "  make setup             - Ensure all build dependencies are installed"
 	@echo "  make ensure-tree-sitter - Ensure tree-sitter CLI is installed (pinned to $(TREE_SITTER_REV))"
 	@echo "  make generate-parser   - Generate parser.c from grammar.js"

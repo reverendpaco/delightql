@@ -28,15 +28,8 @@ pub fn handle_selftest(json: bool, strict: bool) -> Result<()> {
 }
 
 fn run() -> Result<Vec<DiagnosticFinding>> {
-    // Fresh in-memory handle — selftest inspects dql itself, not a user db.
-    let factory = Box::new(crate::connection_factory::CliConnectionFactory);
-    let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
-    let handle = delightql_core::api::open(
-        factory,
-        Some(mount_factory),
-        Some(crate::help_surface::build()),
-    )
-    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Fresh CLI handle — selftest inspects dql itself, not a user database.
+    let handle = crate::connection::open_handle()?;
     Ok(handle.selftest())
 }
 

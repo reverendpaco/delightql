@@ -145,9 +145,11 @@ pub fn activate_entities_from_cartridge(
 ///                  entity_clause, er_rule
 /// - sys::entities::ho: ho_param, ho_param_column, ho_param_ground_value
 /// - sys::entities::interior: interior_entity, interior_entity_attribute
-/// - sys::ns: namespace, activated_entity, enlisted_entity, enlisted_namespace,
+/// - sys::ns: activated_entity, enlisted_entity, enlisted_namespace,
 ///            namespace_alias, namespace_local_alias, namespace_local_enlist,
-///            exposed_namespace, grounding, liminal_receipt
+///            exposed_namespace, grounding, liminal_receipt (the curated
+///            `namespace` entity is registered separately in system.rs,
+///            public columns only — it carries an internal mount link)
 /// - sys::execution: compilation, stack
 /// - sys::targeting: dialect_render, dialect_form_rule, dialect_capability
 /// - sys::connections: connection_type_enum (the curated `connection` entity is
@@ -174,14 +176,23 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         ("entity_type_enum", 4),
         ("GroundedEntity", 4),
         ("ExternalNamespaces", 4),
-        // sys::ns (namespace_id = 5)
-        ("namespace", 5),
+        // sys::ns (namespace_id = 5). The `namespace` table itself is NOT
+        // activated raw: its public face is the
+        // curated explicit-column entity registered separately in system.rs
+        // (register_sys_ns_namespace_table) — the sys::connections
+        // precedent: a column added to the physical table is default-deny.
         ("activated_entity", 5),
         ("enlisted_entity", 5),
         ("enlisted_namespace", 5),
         // sys::execution (namespace_id = 10)
         ("compilation", 10),
         ("stack", 10),
+        // sys::execution — the typed effect plan's observational
+        // projection (D4; engine-written, cleared at next compile).
+        ("effect_plan", 10),
+        ("effect_guard", 10),
+        ("effect_requirement", 10),
+        ("effect_run", 10),
         // sys::targeting (namespace_id = 12) — the data-driven multi-target
         // rule tables. Introspection already registers them as cartridge-1
         // entities; this is the missing activation that gives them a DQL

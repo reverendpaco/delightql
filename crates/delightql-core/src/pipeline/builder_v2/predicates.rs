@@ -904,6 +904,29 @@ pub(super) fn parse_sigma_call_as_boolean(node: CstNode) -> Result<BooleanExpres
         .ok_or_else(|| DelightQLError::parse_error("No functor in sigma_call"))?
         .to_string();
 
+    // Namespace qualifier (`+HL.h(v)`, `+a::b.h(v)`): carried as written
+    // for alias-/scope-aware resolution in the resolver's sigma arm
+    // (review qmqwqlms round 3: this used to be DROPPED silently, so a
+    // qualified sigma citation resolved as its bare functor). Grounding on
+    // sigma citations is not implemented. Refuse it here instead of keeping
+    // only tuple element `.0`: that lossy builder path silently changed
+    // `data::x^lib::y` into `data::x`.
+    let namespace = if let Some(ns_node) = node.field("namespace_path") {
+        let (namespace, grounding) = super::relations::parse_namespace_qualification(ns_node)?;
+        if grounding.is_some() {
+            return Err(DelightQLError::validation_error_categorized(
+                "sigma/grounding_unsupported",
+                "grounded sigma citations are not implemented: the grounding qualifier \
+                 would change which predicate definition is cited, so it cannot be ignored. \
+                 Cite the predicate through an ordinary namespace or alias",
+                "grounded sigma citation",
+            ));
+        }
+        namespace
+    } else {
+        crate::pipeline::asts::core::metadata::NamespacePath::empty()
+    };
+
     // Extract arguments
     let arguments = if let Some(args_node) = node.find_child("sigma_argument_list") {
         let mut args = Vec::new();
@@ -922,6 +945,7 @@ pub(super) fn parse_sigma_call_as_boolean(node: CstNode) -> Result<BooleanExpres
     Ok(BooleanExpression::Sigma {
         condition: Box::new(SigmaCondition::SigmaCall {
             functor,
+            namespace,
             arguments,
             exists,
         }),

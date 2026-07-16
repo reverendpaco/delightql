@@ -4,7 +4,7 @@
 //!
 //! Syntax (piped): `<relation of (target, doc)> |> doc!(*)`
 //!
-//! Example: `_(target, doc ---- "sys::help.identifier", "The URI registry.") |> doc!(*)`
+//! Example: `_(target, doc ---- "sys::identifiers.identifier", "The URI registry.") |> doc!(*)`
 //!
 //! ## Behavior
 //!
@@ -49,10 +49,10 @@ impl BinEntity for DocPredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![
-                ("target".to_string(), "String".to_string()),
-                ("doc".to_string(), "String".to_string()),
-            ]),
+            // EFFECT-ALGEBRA §3 (amended 2026-07-15): the guaranteed core
+            // plus doc!'s one declared addition — the interior `input`
+            // echo of the lifted argument table. doc! declares no payload.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("doc")),
         }
     }
 
@@ -95,32 +95,103 @@ impl EffectExecutable for DocPredicate {
 
         let (target, doc) = system.set_entity_doc(&target, &doc)?;
 
-        let headers = vec![
-            DomainExpression::lvar_builder("target".to_string()).build(),
-            DomainExpression::lvar_builder("doc".to_string()).build(),
-        ];
-        let row = Row {
-            values: vec![
-                DomainExpression::Literal {
-                    value: LiteralValue::String(target),
-                    alias: None,
-                },
-                DomainExpression::Literal {
-                    value: LiteralValue::String(doc),
-                    alias: None,
-                },
-            ],
-        };
+        // EFFECT-ALGEBRA §3 (amended): one receipt — the guaranteed core
+        // plus the interior `input` echo of the (here one-row) lifted
+        // argument table.
+        Ok(EntityResult::Relation(super::input_receipt_result(
+            "doc!",
+            &["target", "doc"],
+            &[vec![Some(target), Some(doc)]],
+            alias,
+        )))
+    }
 
-        Ok(EntityResult::Relation(Relation::Anonymous {
-            column_headers: Some(headers),
-            rows: vec![row],
-            alias: alias.map(|s| s.into()),
-            outer: false,
-            exists_mode: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        }))
+    /// D3b (M2): TRUE setwise application — the entity receives the
+    /// lifted (target, doc) relation whole, documents every element, and
+    /// answers ONE receipt whose `input` echoes the whole lifted table
+    /// (canonicalized). This replaced the mini-runtime's rowwise loop
+    /// (N calls, N receipts) — pinned by directive_contract
+    /// 38_setwise_doc_one_receipt.
+    fn execute_lifted(
+        &self,
+        rows: &[Vec<DomainExpression>],
+        alias: Option<String>,
+        system: &mut crate::system::DelightQLSystem,
+    ) -> Result<EntityResult> {
+        // VALIDATE-FIRST (review hardening): the single setwise
+        // invocation is all-or-nothing — no row applies until every row
+        // has parsed and validated, so an erroring invocation leaves
+        // nothing half-documented.
+        let mut validated: Vec<(String, String)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != 2 {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "doc!() expects rows of (target, doc), got a {}-column row. \
+                         Pipe a relation of (target, doc): `... |> doc!(*)`.",
+                        row.len()
+                    ),
+                    "Invalid argument count",
+                ));
+            }
+            let target = extract_string_literal(&row[0], "target")?;
+            let doc = extract_string_literal(&row[1], "doc")?;
+            if target.is_empty() {
+                return Err(DelightQLError::database_error(
+                    "doc!() target cannot be empty",
+                    "Empty target",
+                ));
+            }
+            validated.push((target, doc));
+        }
+        // ALL-OR-NOTHING (review round 3): shape validation above cannot
+        // see target existence/ambiguity — those resolve inside
+        // set_entity_doc — so the apply batch runs in ONE bootstrap
+        // transaction: any failing element rolls back every earlier
+        // update, keeping the single setwise invocation atomic. Pinned by
+        // directive_contract 47 (a valid-then-invalid batch leaves the
+        // valid target undocumented).
+        fn bootstrap_txn(
+            system: &crate::system::DelightQLSystem,
+            sql: &str,
+        ) -> Result<()> {
+            let conn = system.get_bootstrap_connection();
+            let guard = conn.lock().map_err(|e| {
+                DelightQLError::connection_poison_error(
+                    "Failed to acquire bootstrap lock for doc! batch",
+                    format!("Connection was poisoned: {}", e),
+                )
+            })?;
+            guard.execute_batch(sql).map_err(|e| {
+                DelightQLError::database_error(format!("doc! batch {sql}: {e}"), "doc! atomicity")
+            })
+        }
+        bootstrap_txn(system, "BEGIN")?;
+        let mut echo_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len().max(1));
+        for (target, doc) in validated {
+            match system.set_entity_doc(&target, &doc) {
+                Ok((target, doc)) => echo_rows.push(vec![Some(target), Some(doc)]),
+                Err(e) => {
+                    let _ = bootstrap_txn(system, "ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        bootstrap_txn(system, "COMMIT")?;
+        if echo_rows.is_empty() {
+            // Finding 1: an EMPTY lifted argument still reaches doc! once
+            // (pipe is application) — one YES receipt whose `input` echo
+            // is the empty interior (an all-NULL contributor row, elided
+            // to `[]` by the tree-group constructor). Documenting zero
+            // elements succeeds vacuously.
+            echo_rows.push(vec![None, None]);
+        }
+        Ok(EntityResult::Relation(super::input_receipt_result(
+            "doc!",
+            &["target", "doc"],
+            &echo_rows,
+            alias,
+        )))
     }
 }
 

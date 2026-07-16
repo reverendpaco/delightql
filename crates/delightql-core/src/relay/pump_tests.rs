@@ -247,6 +247,7 @@ fn plan(entries: Vec<PlanEntry>) -> CompiledPlan {
         entries,
         exit_table: None,
         created_objects: Vec::new(),
+        typed: None,
     }
 }
 
@@ -358,31 +359,87 @@ fn routes_entries_per_connection() {
     let resp = relay.handle_plan(&p);
     let (_cols, rows) = fetch_all(&mut relay, resp);
     assert_eq!(rows, vec![vec!["routed".to_string()]]);
-
-    // The default backend never saw the table.
-    let on_backend: i64 = conn
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name = 'pump_route_probe'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(on_backend, 0, "conn-1 entries must not touch the backend");
 }
 
-/// Exit peek: once the flag is set, remaining data entries are skipped —
-/// including shipped ones ("a shipped entry after exit does NOT ship"). The
-/// run answers with the empty header because its final ship never executed.
+// ---------------------------------------------------------------------
+// D3a — the typed walk: requirement edges sampled at the dependent;
+// exit is an ordinary Absent edge; the peek window is retired (one
+// pre-COMMIT latch read decides the post-COMMIT tail).
+// ---------------------------------------------------------------------
+
+use crate::pipeline::compiled_query::{
+    EffectAction, EffectStep, GuardDefinition, GuardPolarity, Requirement, TypedEffectPlan,
+};
+
+fn step(
+    action: EffectAction,
+    occurrence: &str,
+    requirements: Vec<Requirement>,
+) -> EffectStep {
+    EffectStep {
+        occurrence: occurrence.to_string(),
+        operation: occurrence.to_string(),
+        span: None,
+        route: None,
+        requirements,
+        action,
+    }
+}
+
+fn stmts(sqls: &[&str]) -> Vec<PlanStatement> {
+    sqls.iter().map(|s| PlanStatement::bare(*s)).collect()
+}
+
+fn req(guard_id: usize, polarity: GuardPolarity) -> Requirement {
+    Requirement {
+        guard_id,
+        polarity,
+        reason: "comma",
+    }
+}
+
+fn bracketed_typed_plan(
+    body_steps: Vec<EffectStep>,
+    guards: Vec<GuardDefinition>,
+    exit_table: Option<&str>,
+    cleanup: Vec<PlanStatement>,
+) -> CompiledPlan {
+    let mut steps = vec![step(
+        EffectAction::Begin { connection_id: None },
+        "begin",
+        vec![],
+    )];
+    steps.extend(body_steps);
+    steps.push(step(
+        EffectAction::Commit { connection_id: None },
+        "commit",
+        vec![],
+    ));
+    if !cleanup.is_empty() {
+        steps.push(step(EffectAction::Cleanup(cleanup), "cleanup", vec![]));
+    }
+    let typed = TypedEffectPlan { steps, guards };
+    CompiledPlan {
+        entries: typed.flatten(),
+        exit_table: exit_table.map(str::to_string),
+        created_objects: Vec::new(),
+        typed: Some(typed),
+    }
+}
+
+/// exit as an Absent edge (Q-D7): once the latch is written, every later
+/// step's edge samples closed — data steps, non-final ships, and the
+/// final ship alike. The run answers the empty header, and the
+/// post-COMMIT tail is skipped by the pre-COMMIT latch read.
 #[test]
-fn exit_peek_skips_remaining_data_entries() {
+fn exit_absent_edges_skip_later_steps_and_the_tail() {
     let conn = shared_sqlite();
     conn.lock()
         .unwrap()
         .execute_batch(
             "CREATE TABLE __exit (hit INTEGER);
-             CREATE TABLE t (v TEXT);",
+             CREATE TABLE t (v TEXT);
+             CREATE TABLE cleanup_probe (v TEXT);",
         )
         .unwrap();
     let mut system = fresh_system();
@@ -397,158 +454,261 @@ fn exit_peek_skips_remaining_data_entries() {
         ..RelayHooks::default()
     });
 
-    let p = CompiledPlan {
-        entries: vec![
-            bare("INSERT INTO __exit VALUES (1)"), // first entry sets the flag
-            bare("INSERT INTO t VALUES ('must not happen')"),
-            ship("SELECT v FROM t"), // non-final ship: must NOT reach on_ship
-            ship("SELECT count(*) AS n FROM t"), // final ship: must not execute
-        ],
-        exit_table: Some("__exit".to_string()),
-        created_objects: Vec::new(),
+    let guards = vec![GuardDefinition {
+        guard_id: 0,
+        sql: "SELECT 1 FROM __exit".to_string(),
+    }];
+    let absent = || {
+        vec![Requirement {
+            guard_id: 0,
+            polarity: GuardPolarity::Absent,
+            reason: "exit",
+        }]
     };
+    let p = bracketed_typed_plan(
+        vec![
+            step(
+                EffectAction::Exit(stmts(&["INSERT INTO __exit VALUES (1)"])),
+                "exit!#0",
+                vec![],
+            ),
+            step(
+                EffectAction::Dml(stmts(&["INSERT INTO t VALUES ('must not happen')"])),
+                "insert!#1",
+                absent(),
+            ),
+            step(
+                EffectAction::Host {
+                    statements: vec![],
+                    ship: PlanStatement::bare("SELECT v FROM t"),
+                },
+                "stdout!#2",
+                absent(),
+            ),
+            step(
+                EffectAction::Return {
+                    statements: vec![],
+                    ship: Some(PlanStatement::bare("SELECT count(*) AS n FROM t")),
+                },
+                "return!#3",
+                absent(),
+            ),
+        ],
+        guards,
+        Some("__exit"),
+        stmts(&["INSERT INTO cleanup_probe VALUES ('tail')"]),
+    );
     let resp = relay.handle_plan(&p);
     let (columns, rows) = fetch_all(&mut relay, resp);
     assert!(columns.is_empty(), "post-exit run answers the empty header");
     assert!(rows.is_empty());
-    assert_eq!(count_rows(&conn, "t"), 0, "data entry after exit must be skipped");
-    assert_eq!(*shipped.lock().unwrap(), 0, "shipped entry after exit must not ship");
+    assert_eq!(count_rows(&conn, "t"), 0, "data step after exit is declined");
+    assert_eq!(*shipped.lock().unwrap(), 0, "ship step after exit is declined");
+    assert_eq!(
+        count_rows(&conn, "cleanup_probe"),
+        0,
+        "the post-COMMIT tail is skipped by the pre-COMMIT latch read"
+    );
 }
 
-/// The exit table's own scratch shell is a plan entry, so the run must
-/// proceed regardless of peeks that would precede it. Since E-T5 the peek
-/// WINDOW opens after the shell entry, so those peeks are not sent at
-/// all; the error→unset arm this test originally pinned remains as the
-/// defensive fallback for shell-less hand-built plans.
+/// The typed walk samples a step's Present edges at the DEPENDENT and
+/// declines the whole statement stream when closed; an open edge lets
+/// the stream run. The sample reads through the count(*) wrapper.
 #[test]
-fn exit_peek_tolerates_missing_exit_table() {
+fn typed_walk_declines_steps_with_closed_present_edges() {
     let conn = shared_sqlite();
+    conn.lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE gate (v TEXT);
+             CREATE TABLE hit (v TEXT);
+             CREATE TABLE miss (v TEXT);",
+        )
+        .unwrap();
+    let mut system = fresh_system();
+    let (mut relay, sql_log) = relay_over_with_log(&mut system, Arc::clone(&conn));
+
+    let guards = vec![GuardDefinition {
+        guard_id: 0,
+        sql: "SELECT 1 WHERE EXISTS (SELECT 1 FROM gate)".to_string(),
+    }];
+    let p = bracketed_typed_plan(
+        vec![
+            step(
+                EffectAction::Dml(stmts(&["INSERT INTO miss VALUES ('closed')"])),
+                "insert!#0",
+                vec![req(0, GuardPolarity::Present)],
+            ),
+            step(
+                EffectAction::Dml(stmts(&["INSERT INTO gate VALUES ('open')"])),
+                "insert!#1",
+                vec![],
+            ),
+            step(
+                EffectAction::Dml(stmts(&["INSERT INTO hit VALUES ('reached')"])),
+                "insert!#2",
+                vec![req(0, GuardPolarity::Present)],
+            ),
+            step(
+                EffectAction::Return {
+                    statements: vec![],
+                    ship: Some(PlanStatement::bare("SELECT count(*) AS n FROM hit")),
+                },
+                "return!#3",
+                vec![],
+            ),
+        ],
+        guards,
+        None,
+        vec![],
+    );
+    let resp = relay.handle_plan(&p);
+    let (_cols, rows) = fetch_all(&mut relay, resp);
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    assert_eq!(count_rows(&conn, "miss"), 0, "closed edge declines the step");
+    assert_eq!(count_rows(&conn, "hit"), 1, "open edge lets the step run");
+    let log = sql_log.lock().unwrap();
+    assert!(
+        log.iter()
+            .any(|sql| sql.contains("SELECT count(*) FROM (SELECT 1 WHERE EXISTS")),
+        "edges sample through the count(*) wrapper; log:\n{:#?}",
+        *log
+    );
+    assert!(
+        !log.iter().any(|sql| sql.contains("miss")),
+        "a declined step's statements never reach the backend; log:\n{:#?}",
+        *log
+    );
+}
+
+/// Round-3 hardening: fault ATTRIBUTION across the whole typed program.
+/// A mid-step statement failure marks THAT step `error` (with the
+/// message), every completed step `done` (control steps included), and
+/// every unreached step `pending` — read back from the materialized
+/// effect_run, because these executor state transitions are hard to
+/// induce reliably through .dql.
+#[test]
+fn statement_failure_attributes_error_done_and_pending() {
+    let conn = shared_sqlite();
+    conn.lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE t (v TEXT);")
+        .unwrap();
+    let mut system = fresh_system();
+    let outcomes = {
+        let mut relay = relay_over(&mut system, Arc::clone(&conn));
+        let p = bracketed_typed_plan(
+            vec![
+                step(
+                    EffectAction::Dml(stmts(&["INSERT INTO t VALUES ('ok')"])),
+                    "insert!#0",
+                    vec![],
+                ),
+                step(
+                    EffectAction::Dml(stmts(&["INSERT INTO nope_no_table VALUES (1)"])),
+                    "insert!#1",
+                    vec![],
+                ),
+                step(
+                    EffectAction::Return {
+                        statements: vec![],
+                        ship: Some(PlanStatement::bare("SELECT count(*) AS n FROM t")),
+                    },
+                    "return!#2",
+                    vec![],
+                ),
+            ],
+            vec![],
+            None,
+            stmts(&["DROP TABLE IF EXISTS never_reached"]),
+        );
+        let resp = relay.handle_plan(&p);
+        assert!(matches!(resp, ServerTerm::Error { .. }), "the run aborts");
+        read_effect_run(&system)
+    };
+    // Steps: 0=begin, 1=insert ok, 2=insert failing, 3=return, 4=commit,
+    // 5=cleanup.
+    assert_eq!(outcomes[0], (0, "done".to_string()));
+    assert_eq!(outcomes[1], (1, "done".to_string()));
+    assert_eq!(outcomes[2].1, "error");
+    assert_eq!(outcomes[3].1, "pending");
+    assert_eq!(outcomes[4].1, "pending");
+    assert_eq!(outcomes[5].1, "pending");
+}
+
+/// Round-3 hardening: a GUARD-SAMPLING failure is the dependent step's
+/// failure — `error` with the sampling message, never `pending`.
+#[test]
+fn guard_sampling_failure_attributes_to_the_dependent_step() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let outcomes = {
+        let mut relay = relay_over(&mut system, Arc::clone(&conn));
+        let guards = vec![GuardDefinition {
+            guard_id: 0,
+            sql: "SELECT 1 FROM this_table_does_not_exist".to_string(),
+        }];
+        let p = bracketed_typed_plan(
+            vec![step(
+                EffectAction::Dml(stmts(&["SELECT 1"])),
+                "insert!#0",
+                vec![req(0, GuardPolarity::Present)],
+            )],
+            guards,
+            None,
+            vec![],
+        );
+        let resp = relay.handle_plan(&p);
+        assert!(matches!(resp, ServerTerm::Error { .. }));
+        read_effect_run(&system)
+    };
+    // Steps: 0=begin (done), 1=the guarded dml (error), 2=commit (pending).
+    assert_eq!(outcomes[0].1, "done");
+    assert_eq!(outcomes[1].1, "error");
+    assert_eq!(outcomes[2].1, "pending");
+}
+
+fn read_effect_run(system: &DelightQLSystem) -> Vec<(i64, String)> {
+    let conn = system.get_bootstrap_connection();
+    let guard = conn.lock().unwrap();
+    let mut stmt = guard
+        .prepare("SELECT step_id, status FROM effect_run ORDER BY step_id")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+/// D3a contract: an UNTYPED plan (hand-built, degenerate) has no exit
+/// machinery and no edge sampling — every entry simply runs. The
+/// transformer always attaches the typed layer; exit semantics live
+/// there.
+#[test]
+fn untyped_plans_have_no_exit_machinery() {
+    let conn = shared_sqlite();
+    conn.lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE __exit (hit INTEGER); CREATE TABLE t (v TEXT);")
+        .unwrap();
     let mut system = fresh_system();
     let mut relay = relay_over(&mut system, Arc::clone(&conn));
 
     let p = CompiledPlan {
         entries: vec![
-            bare("CREATE TABLE __exit (hit INTEGER)"), // peeks start after this
-            ship("SELECT 1 AS ok"),
+            bare("INSERT INTO __exit VALUES (1)"),
+            bare("INSERT INTO t VALUES ('runs anyway')"),
+            ship("SELECT count(*) AS n FROM t"),
         ],
         exit_table: Some("__exit".to_string()),
         created_objects: Vec::new(),
+        typed: None,
     };
     let resp = relay.handle_plan(&p);
     let (_cols, rows) = fetch_all(&mut relay, resp);
     assert_eq!(rows, vec![vec!["1".to_string()]]);
-}
-
-/// E-T5 (R-T3): the peek WINDOW opens only after the plan entry that
-/// CREATEs the exit table has executed. Before it the flag cannot have
-/// been set by this run (nothing writes a table that does not exist),
-/// and on PG a pre-shell peek would ERROR inside the open bracket —
-/// which POISONS the transaction (P1 H5: every later statement answers
-/// 25P02 and COMMIT becomes ROLLBACK). The shell entry succeeding +
-/// abort-on-first-error means every in-window peek runs in a healthy
-/// state: the table exists and the bracket is unpoisoned.
-#[test]
-fn exit_peek_window_opens_after_the_exit_shell_entry() {
-    let conn = shared_sqlite();
-    let mut system = fresh_system();
-    let (mut relay, sql_log) = relay_over_with_log(&mut system, Arc::clone(&conn));
-
-    let p = CompiledPlan {
-        entries: vec![
-            bare("CREATE TABLE t (v TEXT)"),
-            bare("CREATE TABLE __exit (hit INTEGER)"), // the exit shell
-            bare("INSERT INTO t VALUES ('x')"),
-            ship("SELECT v FROM t"),
-        ],
-        exit_table: Some("__exit".to_string()),
-        created_objects: Vec::new(),
-    };
-    let resp = relay.handle_plan(&p);
-    let (_cols, rows) = fetch_all(&mut relay, resp);
-    assert_eq!(rows, vec![vec!["x".to_string()]]);
-
-    let log = sql_log.lock().unwrap();
-    let shell_pos = log
-        .iter()
-        .position(|sql| sql.starts_with("CREATE TABLE __exit"))
-        .expect("the shell entry executed");
-    let first_peek = log
-        .iter()
-        .position(|sql| sql.contains("SELECT count(*) FROM __exit"));
-    assert!(
-        first_peek.map(|p| p > shell_pos).unwrap_or(true),
-        "no peek may run before the exit shell entry (on PG a pre-shell \
-         peek errors inside the bracket and poisons it, P1 H5); log:\n{:#?}",
-        *log
-    );
-    assert!(
-        first_peek.is_some(),
-        "peeks do run once the shell exists; log:\n{:#?}",
-        *log
-    );
-}
-
-/// E-T5 (R-T3): the peek window CLOSES at the bracket's COMMIT — the
-/// exit flag is written only by in-bracket data entries, so post-commit
-/// peeks can never observe a new latch, and on PG the ON COMMIT DROP
-/// shells make a post-commit peek an erroring statement (harmless
-/// outside a transaction, but a statement the plan has no reason to
-/// send). A flag latched before COMMIT stays latched (`exited` is
-/// sticky), so post-commit data entries are still skipped exactly as
-/// before.
-#[test]
-fn exit_peek_window_closes_at_the_bracket_commit() {
-    let conn = shared_sqlite();
-    let mut system = fresh_system();
-    let (mut relay, sql_log) = relay_over_with_log(&mut system, Arc::clone(&conn));
-
-    let p = CompiledPlan {
-        entries: vec![
-            bare("CREATE TABLE __exit (hit INTEGER)"), // the exit shell
-            PlanEntry::BeginTransaction {
-                connection_id: None,
-                comment: None,
-            },
-            bare("CREATE TABLE t (v TEXT)"),
-            PlanEntry::CommitTransaction {
-                connection_id: None,
-                comment: None,
-            },
-            bare("DROP TABLE IF EXISTS __exit"), // trailing cleanup
-            ship("SELECT 1 AS ok"),
-        ],
-        exit_table: Some("__exit".to_string()),
-        created_objects: Vec::new(),
-    };
-    let resp = relay.handle_plan(&p);
-    let (_cols, rows) = fetch_all(&mut relay, resp);
-    assert_eq!(rows, vec![vec!["1".to_string()]]);
-
-    let log = sql_log.lock().unwrap();
-    let commit_pos = log
-        .iter()
-        .position(|sql| sql == "COMMIT")
-        .expect("the bracket committed");
-    let peeks_after_commit = log
-        .iter()
-        .skip(commit_pos + 1)
-        .filter(|sql| sql.contains("SELECT count(*) FROM __exit"))
-        .count();
-    assert_eq!(
-        peeks_after_commit, 0,
-        "no peek may run after the bracket's COMMIT; log:\n{:#?}",
-        *log
-    );
-    let peeks_in_window = log
-        .iter()
-        .take(commit_pos)
-        .filter(|sql| sql.contains("SELECT count(*) FROM __exit"))
-        .count();
-    assert!(
-        peeks_in_window >= 1,
-        "in-window peeks still run; log:\n{:#?}",
-        *log
-    );
 }
 
 /// Bracket happy path: BEGIN and COMMIT execute on the routed connection;

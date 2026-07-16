@@ -21,7 +21,10 @@
 !hosts/python/Makefile
 !hosts/python/pyproject.toml
 !hosts/python/uv.lock
-!man/man1/*.1
+!assets/Makefile
+!assets/bin/bundle.py
+!assets/books/**
+!assets/man/man1/*.1
 !Cargo.toml
 !Cargo.lock
 !Makefile

@@ -3495,12 +3495,33 @@ pub(super) fn r_lower_signed_witness(
         candidate
     };
 
+    // RULED 2026-07-15 (payload-preserving witness proxy): a NO arm's
+    // proxy row carries `returned = '[]'` — the EMPTY interior — rather
+    // than NULL, for the conventional payload column(s). Releasing a
+    // total ledger's payloads therefore yields ZERO rows for NO arms by
+    // the ordinary empty-interior law; the proxy stays type-honest.
+    let is_payload_col = |name: &str| {
+        name == "returned"
+            || name
+                .strip_prefix("returned_")
+                .map(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false)
+    };
     let mut items: Vec<SelectItem> = Vec::with_capacity(source_names.len() + 1);
     for col in &source_names {
-        items.push(SelectItem::expression_with_alias(
-            SqlDomainExpr::with_qualifier(ColumnQualifier::table("r"), col.as_str()),
-            col.clone(),
-        ));
+        let read = SqlDomainExpr::with_qualifier(ColumnQualifier::table("r"), col.as_str());
+        let expr = if is_payload_col(col) {
+            SqlDomainExpr::function(
+                "coalesce",
+                vec![
+                    read,
+                    SqlDomainExpr::literal(LiteralValue::String("[]".to_string())),
+                ],
+            )
+        } else {
+            read
+        };
+        items.push(SelectItem::expression_with_alias(expr, col.clone()));
     }
     items.push(SelectItem::expression_with_alias(
         SqlDomainExpr::function(

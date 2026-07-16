@@ -18,6 +18,12 @@ module.exports = grammar(dqlGrammar, {
   name: 'delightql_rules',
 
   conflicts: ($, previous) => previous.concat([
+    // liminal_relation_statement (Phase 1A): insert!(audit_log(*)) shares its
+    // prefix with an effect-rule head's ho_param (insert!(audit_log(*)) :- …).
+    // GLR forks; the presence or absence of a following neck decides.
+    [$.qualify_operator, $.ho_param],
+    [$.column_spec_item, $.ho_param],
+
     // DDL definition rules create new ambiguities with inherited DQL rules
 
     // Effect-rule heads (EFFECT-ALGEBRA §1): name!(*) — the * after name!( could
@@ -179,13 +185,32 @@ module.exports = grammar(dqlGrammar, {
     // — all preserved by this rule.
     source_file: $ => repeat1(choice($.definition, $.query_statement, $.ddl_annotation, $.liminal_directive)),
 
-    // Liminal directive: a bare session-directive call at the top of the file
-    // (EFFECT-ALGEBRA §8). The consult pipeline strips these lines textually
-    // (extract_embedded_directives) before this grammar ever sees them, so this
-    // rule exists so that raw .dql files (e.g. TORTURE-TEST.dql) parse without
-    // ERROR nodes under the tree-sitter CLI. Reuses the inherited DQL
-    // pseudo_predicate_call shape: name!(args).
-    liminal_directive: $ => $.pseudo_predicate_call,
+    // Liminal directive: a bare directive call statement at the top of the
+    // file (EFFECT-ALGEBRA §8). Since Phase 1A of the directive convergence
+    // (complete-form extraction), this grammar IS the segmentation authority:
+    // extract_embedded_directives walks these nodes and lifts exactly the
+    // session directives; every other name refuses with the eligibility
+    // message. Reuses the inherited DQL pseudo_predicate_call shape
+    // (name!(args)) plus a relation-argument statement shape so DML
+    // spellings like insert!(audit_log(*)) parse cleanly and can be refused
+    // BY NAME rather than dying as a garbled recovery parse.
+    liminal_directive: $ => choice(
+      $.pseudo_predicate_call,
+      $.liminal_relation_statement,
+    ),
+
+    // A directive-shaped whole statement whose arguments are relation
+    // applications (e.g. insert!(audit_log(*))). Never liminally
+    // executable — it exists so the extraction layer can issue the §8
+    // eligibility refusal with the directive's name (pinned by
+    // effects/liminal--41_dml_not_eligible).
+    liminal_relation_statement: $ => prec.dynamic(-1, seq(
+      field('name', $.identifier),
+      token.immediate('!'),
+      '(',
+      field('relation_args', sep1(',', $.table_access)),
+      ')',
+    )),
 
     // === DDL-specific rules (the only reason this grammar exists) ===
 

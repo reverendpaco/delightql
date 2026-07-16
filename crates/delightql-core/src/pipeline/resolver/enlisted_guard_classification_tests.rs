@@ -97,9 +97,10 @@ fn enlisted_world() -> DelightQLSystem {
         .expect("mount maindb");
     system
         .enlist_namespace("maindb")
-        .expect("enlist maindb into main");
+        .expect("enlist maindb into the home session scope");
     system
 }
+
 
 // ------------------------------------------------------------------
 // Plain-pipeline compile chain (the resolve_query_inline door + the
@@ -301,6 +302,40 @@ fn plain_query_bare_enlisted_antijoin_guard_compiles() {
 /// mechanism qualified view bodies use" (REPORT-3.1 decision 14). A view
 /// whose body carries the bare enlisted guard must expand at its call site.
 /// The bug therefore predates effects; this pins the view-body shape.
+/// STRICT definition independence (Phase 7 stage 2, owner-ratified,
+/// refined): another file's DEFINITION never leaks into what this file
+/// means — even when the CALLER's session has it enlisted. (Physical
+/// DATA tables are the ruled exception: the database is ambient — the
+/// five tests above pin that a session-enlisted data table resolves.)
+/// Here `helper_rule` lives in a session-enlisted LIB namespace, and
+/// the consulted body reads it bare without enlisting `libx` itself:
+/// strict refusal.
+#[test]
+fn definition_from_another_file_never_leaks_via_session() {
+    let mut system = enlisted_world();
+    // A lib file with a rule; the SESSION enlists it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let libpath = dir.path().join("libx.dql");
+    std::fs::write(&libpath, "helper_rule(*) :- maindb.orders(*), amount > 0\n")
+        .expect("write lib file");
+    execute_consult(&mut system, libpath.to_str().unwrap(), "libx", None)
+        .expect("lib consults");
+    system
+        .enlist_namespace("libx")
+        .expect("session enlists libx into home");
+
+    let err = plan_for(
+        "main!(*) :- helper_rule(*) |> insert!(maindb.orders(*))(*)\n",
+        &mut system,
+    )
+    .expect_err("another file's rule must not leak in via the session enlist");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("helper_rule"),
+        "the refusal names the unresolved rule: {msg}"
+    );
+}
+
 #[test]
 fn consulted_view_body_with_bare_enlisted_guard_expands() {
     let mut system = enlisted_world();

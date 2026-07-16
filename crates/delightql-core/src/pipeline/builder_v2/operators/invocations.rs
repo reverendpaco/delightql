@@ -32,11 +32,11 @@ pub(in crate::pipeline::builder_v2) fn parse_piped_invocation(
     }
 
     // Extract optional namespace qualification
-    let namespace = if let Some(ns_node) = node.field("namespace_path") {
-        let (ns, _grounding) = relations::parse_namespace_qualification(ns_node)?;
-        Some(ns)
+    let (namespace, grounding) = if let Some(ns_node) = node.field("namespace_path") {
+        let (ns, grounding) = relations::parse_namespace_qualification(ns_node)?;
+        (Some(ns), grounding)
     } else {
-        None
+        (None, None)
     };
 
     // Collect arguments if present (for multi-param HO views: |> mask_ssn("***")(*))
@@ -81,6 +81,7 @@ pub(in crate::pipeline::builder_v2) fn parse_piped_invocation(
                 first_parens_spec,
                 domain_spec,
                 namespace,
+                grounding,
             },
             cpr_schema: PhaseBox::phantom(),
         }),
@@ -139,16 +140,19 @@ fn parse_dml_pipe_target(
     input: RelationalExpression,
     features: &mut FeatureCollector,
 ) -> Result<RelationalExpression> {
-    use crate::pipeline::asts::core::operators::DmlKind;
-
     let operation = node
         .field_text("operation")
         .ok_or_else(|| DelightQLError::parse_error("No operation in DML pipe target"))?;
 
-    let kind = match operation.as_str() {
-        "update" => DmlKind::Update,
-        "delete" => DmlKind::Delete,
-        "insert" => DmlKind::Insert,
+    match operation.as_str() {
+        // DML directives take their TARGET as a relational designator —
+        // a preserved higher-order term, never a string (Phase 6 slice 5,
+        // the mzynmnok item-4 residue): the effect transformer interprets
+        // it as a whole-table designator or refuses with a teaching
+        // diagnostic, exactly like the DDL path below.
+        "delete" | "insert" | "update" => {
+            return parse_directive_pipe_invocation(node, input, features)
+        }
         // Piped two-paren form of a NON-DML directive:
         //   source |> name!(Rel(*))(spec)
         // returning! and stdout! have exactly ONE higher-order parameter:
@@ -183,49 +187,19 @@ fn parse_dml_pipe_target(
         "returning_other" | "run_namespace" | "exit" | "run" => {
             return parse_directive_pipe_invocation(node, input, features)
         }
+        // DDL directives take their TARGET as a relational designator —
+        // a preserved higher-order term, never a string (Phase 3,
+        // canonical invocation): source |> table!(my::ns.dump_table(*))(*).
+        "table" | "temp_table" | "temp_view" => {
+            return parse_directive_pipe_invocation(node, input, features)
+        }
         _ => {
             return Err(DelightQLError::parse_error(format!(
                 "Unknown DML operation: {}!. Expected update!, delete!, or insert!",
                 operation
             )))
         }
-    };
-
-    // Extract target: either named table_access or anonymous_table
-    let (target, target_namespace) = if let Some(target_node) = node.field("target") {
-        let target = target_node
-            .field_text("table")
-            .unwrap_or_else(|| target_node.text().to_string());
-        let target_namespace = target_node
-            .field("namespace_path")
-            .map(|ns| ns.text().to_string());
-        (target, target_namespace)
-    } else if node.field("anon_target").is_some() {
-        // Anonymous table target: _(*)
-        ("_".to_string(), None)
-    } else {
-        return Err(DelightQLError::parse_error("No target in DML pipe target"));
-    };
-
-    // Parse domain spec (column selection)
-    let domain_spec = if let Some(columns_node) = node.field("columns") {
-        relations::parse_column_spec(columns_node, features)?
-    } else {
-        DomainSpec::Glob
-    };
-
-    Ok(RelationalExpression::Pipe(Box::new(
-        stacksafe::StackSafe::new(PipeExpression {
-            source: input,
-            operator: UnaryRelationalOperator::DmlTerminal {
-                kind,
-                target,
-                target_namespace,
-                domain_spec,
-            },
-            cpr_schema: PhaseBox::phantom(),
-        }),
-    )))
+    }
 }
 
 /// Parse a piped two-paren directive invocation: `source |> name!(Rel(*))(spec)`
@@ -275,15 +249,17 @@ fn parse_directive_pipe_invocation(
     )))
 }
 
-/// Parse the inline directive table-value form: `doc!("a","b")(*)`.
+/// Parse the two-parenthesis directive invocation: `name!(args)(access)`.
 ///
-/// Desugars to the SAME unresolved AST as the piped form `_("a","b") |> doc!(*)`:
-/// an `AnonymousTable` source (positional values → ordinal columns, one `Row`
-/// per `;`-row) wrapped as the source of a `DirectiveTerminal`. The runtime
-/// (`execute_directive_pipe`) is unchanged.
-///
-/// Reached from `base_expression` (standalone) — there is no piped input, the
-/// source IS the inline table.
+/// CANONICAL INVOCATION (DIRECTIVE-CONVERGENCE-PLAN Phase 3): the first
+/// parentheses are the directive's ARGUMENTS and the second are the
+/// returned-relation ACCESS specification. This replaces the historical
+/// "inline directive table" desugaring (`_(values) |> name!(spec)`), which
+/// modeled the first parens as a synthetic anonymous input table and the
+/// second as invocation arguments — the faux higher-order form the audit
+/// confirmed (`enlist!("ns")(success)` bound `success` against the
+/// synthetic input header `col0`). A relational input arrives through a
+/// pipe; it is never spelled inside the argument parentheses.
 pub(in crate::pipeline::builder_v2) fn parse_inline_directive_table(
     node: CstNode,
     features: &mut FeatureCollector,
@@ -292,19 +268,26 @@ pub(in crate::pipeline::builder_v2) fn parse_inline_directive_table(
     use crate::pipeline::query_features::QueryFeature;
 
     features.mark(QueryFeature::PseudoPredicates);
-    features.mark(QueryFeature::AnonymousTables);
 
     let name = node
         .field_text("name")
-        .ok_or_else(|| DelightQLError::parse_error("No name in inline directive table"))?;
+        .ok_or_else(|| DelightQLError::parse_error("No name in directive invocation"))?;
     let full_name = format!("{}!", name);
 
-    // Build the anonymous-table source from the ho_argument_list rows.
-    // Positional values → ordinal columns (no headers); one Row per ;-row.
+    // Qualified invocation (Phase 2 identity): std::prelude.enlist!(…)(…).
+    let namespace: Vec<String> = node
+        .field("namespace_path")
+        .map(|ns| ns.text().split("::").map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    // First parens: the ordered argument list. The grammar shape still
+    // admits `;`-separated rows (the historical table-value spelling);
+    // more than one row is refused with a teaching diagnostic because
+    // arguments are not a table.
     let table_value = node
         .field("table_value")
-        .ok_or_else(|| DelightQLError::parse_error("No table_value in inline directive table"))?;
-    let mut rows: Vec<Row> = Vec::new();
+        .ok_or_else(|| DelightQLError::parse_error("No arguments in directive invocation"))?;
+    let mut rows: Vec<Vec<DomainExpression>> = Vec::new();
     for group in table_value.children() {
         if group.kind() != "ho_argument_group" {
             continue;
@@ -320,62 +303,40 @@ pub(in crate::pipeline::builder_v2) fn parse_inline_directive_table(
                 }
             }
             if !values.is_empty() {
-                rows.push(Row { values });
+                rows.push(values);
             }
         }
     }
-
-    // Rectangularity check (mirror parse_anonymous_table's row-width validation).
-    if let Some(first) = rows.first() {
-        let width = first.values.len();
-        for (i, r) in rows.iter().enumerate().skip(1) {
-            if r.values.len() != width {
-                return Err(DelightQLError::parse_error_categorized(
-                    "anon",
-                    format!(
-                        "Inline directive table row {} has {} value(s) but row 1 has {}",
-                        i + 1,
-                        r.values.len(),
-                        width
-                    ),
-                ));
-            }
-        }
+    if rows.len() > 1 {
+        return Err(DelightQLError::validation_error_categorized(
+            "directive/invocation/arguments",
+            format!(
+                "the first parentheses of {name}!(…)(…) are its arguments, \
+                 not a table — a relational input arrives through a pipe: \
+                 rows |> {name}!(…)(*)"
+            ),
+            "directive arguments",
+        ));
     }
+    let arguments = rows.pop().unwrap_or_default();
 
-    let source = RelationalExpression::Relation(Relation::Anonymous {
-        column_headers: None,
-        rows,
-        alias: None,
-        outer: false,
-        exists_mode: false,
-        qua_target: None,
-        cpr_schema: PhaseBox::phantom(),
-    });
-
-    // Output spec (second paren) → directive arguments. `(*)` → [glob], which
-    // bind_directive_args expands to all row values in column order.
-    let arguments: Vec<DomainExpression> = if let Some(cols) = node.field("columns") {
-        match relations::parse_column_spec(cols, features)? {
-            DomainSpec::Positional(exprs) => exprs,
-            DomainSpec::Bare => Vec::new(),
-            _ => vec![DomainExpression::glob_builder().build()],
-        }
+    // Second parens: returned-relation access.
+    let access = if let Some(cols) = node.field("columns") {
+        relations::parse_column_spec(cols, features)?
     } else {
-        // Non-column_spec output (continuation) — no explicit columns; glob.
-        vec![DomainExpression::glob_builder().build()]
+        // Interior continuation in access position — not yet ruled for the
+        // two-paren form; treat as full access.
+        DomainSpec::Glob
     };
 
-    Ok(RelationalExpression::Pipe(Box::new(
-        stacksafe::StackSafe::new(PipeExpression {
-            source,
-            operator: UnaryRelationalOperator::DirectiveTerminal {
-                name: full_name,
-                arguments,
-            },
-            cpr_schema: PhaseBox::phantom(),
-        }),
-    )))
+    Ok(RelationalExpression::Relation(Relation::PseudoPredicate {
+        name: full_name,
+        namespace,
+        arguments,
+        access,
+        alias: None,
+        cpr_schema: PhaseBox::phantom(),
+    }))
 }
 
 /// Parse HO argument list from CST node.

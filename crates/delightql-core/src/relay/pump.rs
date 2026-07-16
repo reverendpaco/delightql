@@ -27,18 +27,6 @@ use crate::pipeline::{
     verdict,
 };
 
-/// The connection a plan entry routes to (`None` = the session default,
-/// `execute_sql_routed`'s `unwrap_or(2)`).
-fn entry_connection(entry: &PlanEntry) -> Option<i64> {
-    match entry {
-        PlanEntry::Statement(st) | PlanEntry::ShippedStatement(st) => st.connection_id,
-        PlanEntry::Assertion { statement, .. } | PlanEntry::Emit { statement, .. } => {
-            statement.connection_id
-        }
-        PlanEntry::BeginTransaction { connection_id, .. }
-        | PlanEntry::CommitTransaction { connection_id, .. } => *connection_id,
-    }
-}
 
 fn connection_error(msg: String) -> ServerTerm {
     ServerTerm::Error {
@@ -57,29 +45,17 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// - Entries execute first to last on their own routed connection
     ///   (`plays_entries_in_order_and_returns_final_ship`,
     ///   `routes_entries_per_connection`).
-    /// - Exit peek: when the plan carries `exit_table`, the flag is checked
-    ///   before each entry INSIDE THE PEEK WINDOW — the pump's ONLY mid-run
-    ///   read; entries stay dumb (their exit guards are compiled into the
-    ///   SQL by the planner). Once set, remaining DATA entries are skipped;
-    ///   bracket entries still run so an open transaction closes
-    ///   (TORTURE-TEST-NORMAL note D1: the conforming driver's
-    ///   pre-statement check is what removes post-exit inert DDL). The
-    ///   window (E-T5, R-T3): peeks START after the plan entry that CREATEs
-    ///   `exit_table` (before it, this run cannot have set the flag — and
-    ///   on PG, where the shells sit INSIDE the bracket, a pre-shell peek
-    ///   would error mid-bracket and POISON the transaction, P1 H5) and
-    ///   STOP at the bracket's COMMIT (only in-bracket data entries write
-    ///   the flag; a pre-COMMIT latch is sticky). Within the window the
-    ///   peek only ever runs in HEALTHY states — the shell CREATE
-    ///   succeeded, every earlier statement succeeded (first error aborts
-    ///   the run, below), so the table exists and the bracket is
-    ///   unpoisoned; the peek's error→unset arm is defensive, live only
-    ///   for hand-built plans with no shell entry (window open from the
-    ///   start — today's tolerant behavior, kept)
-    ///   (`exit_peek_skips_remaining_data_entries`,
-    ///   `exit_peek_tolerates_missing_exit_table`,
-    ///   `exit_peek_window_opens_after_the_exit_shell_entry`,
-    ///   `exit_peek_window_closes_at_the_bracket_commit`).
+    /// - The typed walk (D3a): a typed plan's steps partition the body;
+    ///   at each step's first entry the pump samples the step's
+    ///   requirement edges at the dependent (Q-D1) through a count(*)
+    ///   wrapper, and DECLINES the whole statement stream when any edge
+    ///   is closed. exit! is an ordinary Absent edge (Q-D7); one
+    ///   pre-COMMIT latch read decides whether the post-COMMIT tail
+    ///   (trailing cleanup) runs — bracket entries always run, so an
+    ///   exit-taken run still commits (graceful exit, not abort)
+    ///   (`exit_absent_edges_skip_later_steps_and_the_tail`,
+    ///   `typed_walk_declines_steps_with_closed_present_edges`,
+    ///   `untyped_plans_have_no_exit_machinery`).
     /// - Transaction bracket: `BeginTransaction` / `CommitTransaction`
     ///   execute as `BEGIN` / `COMMIT` on their routed connection — the
     ///   literal words, identical on SQLite/PG/DuckDB (E-T2 confirmed; no
@@ -123,12 +99,258 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     ///   the exit flag — answers with the empty header
     ///   (`plan_with_no_shipped_entry_returns_empty_header`).
     pub fn handle_plan(&mut self, plan: &CompiledPlan) -> ServerTerm {
+        // THE ONE TYPED PROGRAM (review finding 3): a typed plan is walked
+        // directly — setup, control, effect, return, and cleanup are all
+        // steps, so the D5 trace covers control failures too. The flat
+        // entry list is only ever a projection; the pump never
+        // reconstructs ranges from it. Untyped plans (degenerate
+        // CompiledQuery conversions, hand-built tests) take the plain
+        // entry loop with no gating and no exit machinery.
+        match &plan.typed {
+            Some(typed) => {
+                // D5: per-step outcomes, tracked in memory and
+                // materialized once at the boundary — best-effort,
+                // because bookkeeping never outranks the run. The
+                // reconciliation is sound: execution is sequential and
+                // abort-on-first-error, so at most ONE step is mid-flight
+                // ("running") when the walk stops.
+                let mut trace: Vec<Option<(&'static str, Option<String>)>> =
+                    vec![None; typed.steps.len()];
+                let term = self.play_typed(plan, typed, &mut trace);
+                let is_error = matches!(term, ServerTerm::Error { .. });
+                let err_msg = match &term {
+                    ServerTerm::Error { message, .. } => {
+                        Some(String::from_utf8_lossy(message).to_string())
+                    }
+                    _ => None,
+                };
+                let outcomes: Vec<(&'static str, Option<String>)> = trace
+                    .into_iter()
+                    .map(|slot| match slot {
+                        Some(("running", _)) if is_error => ("error", err_msg.clone()),
+                        Some(("running", _)) => ("done", None),
+                        Some(done_or_skipped) => done_or_skipped,
+                        None => ("pending", None),
+                    })
+                    .collect();
+                let _ = self.system.materialize_effect_run(&outcomes);
+                term
+            }
+            None => self.play_entries(plan),
+        }
+    }
+
+    /// Walk the typed program step by step: sample each step's
+    /// requirement edges at the dependent (Q-D1) and decline the whole
+    /// action when any edge is closed; execute the action otherwise.
+    /// exit! is an ordinary Absent edge on later body steps (Q-D7); ONE
+    /// pre-COMMIT latch read decides whether the Cleanup step runs
+    /// (graceful exit: brackets always run, exit-taken residue is
+    /// drop_plan_scratch's job). The run's return value is the LAST ship
+    /// across all steps — the Return step's when present, else the
+    /// body-ending stdout ship (body_ending_in_stdout_ships_once) — and
+    /// is always buffered eagerly (COMMIT follows every ship by
+    /// construction, exactly as the flat walk behaved).
+    fn play_typed(
+        &mut self,
+        plan: &CompiledPlan,
+        typed: &crate::pipeline::compiled_query::TypedEffectPlan,
+        trace: &mut [Option<(&'static str, Option<String>)>],
+    ) -> ServerTerm {
+        use crate::pipeline::compiled_query::EffectAction;
+        self.last_run_exited = false;
+        let mut open_bracket: Option<Option<i64>> = None;
+        let mut final_response: Option<ServerTerm> = None;
+        let mut exited = false;
+        let last_ship = typed
+            .steps
+            .iter()
+            .rposition(|s| s.action.ship().is_some());
+
+        for (idx, step) in typed.steps.iter().enumerate() {
+            // "Brackets ALWAYS run" is enforced HERE, not merely by the
+            // builder's discipline (review round 3): a Begin/Commit step
+            // never samples edges, so no construction can gate the
+            // bracket closed and strand an open transaction.
+            let bracket = matches!(
+                step.action,
+                EffectAction::Begin { .. } | EffectAction::Commit { .. }
+            );
+            if !bracket && !step.requirements.is_empty() {
+                match self.step_open(step, &typed.guards) {
+                    Ok(None) => {}
+                    Ok(Some(closed_detail)) => {
+                        trace[idx] = Some(("skipped", Some(closed_detail)));
+                        continue;
+                    }
+                    Err(msg) => {
+                        // Review finding 3 (attribution): a guard-sampling
+                        // failure IS the step's failure — never "pending".
+                        trace[idx] =
+                            Some(("error", Some(format!("guard sampling failed: {msg}"))));
+                        self.rollback_open_bracket(&mut open_bracket);
+                        return connection_error(msg);
+                    }
+                }
+            }
+            trace[idx] = Some(("running", None));
+            match &step.action {
+                EffectAction::Begin { connection_id } => {
+                    match self.execute_sql_routed("BEGIN", *connection_id) {
+                        Ok(_) => open_bracket = Some(*connection_id),
+                        Err(msg) => {
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(msg);
+                        }
+                    }
+                }
+                EffectAction::Commit { connection_id } => {
+                    // The pre-COMMIT latch read: the flag can only have
+                    // been written inside the bracket, and on PG the
+                    // ON COMMIT DROP shells vanish at COMMIT — so this is
+                    // the one moment the tail decision can be read.
+                    if !exited {
+                        if let Some(table) = plan.exit_table.as_deref() {
+                            exited = self.exit_flag_set(table, *connection_id);
+                        }
+                    }
+                    match self.execute_sql_routed("COMMIT", *connection_id) {
+                        Ok(_) => open_bracket = None,
+                        Err(msg) => {
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(msg);
+                        }
+                    }
+                }
+                // Phase 10 slice b: annotation steps in the typed program —
+                // the same verdict/abort and notify-never-abort contracts
+                // as the untyped entries (play_entries below).
+                EffectAction::Assertion { statement, .. } => {
+                    match self.execute_sql_routed(&statement.sql, statement.connection_id) {
+                        Ok((_cols, rows)) => {
+                            let passed = rows
+                                .first()
+                                .and_then(|row| row.first())
+                                .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
+                                .unwrap_or(false);
+                            if let Some(ref mut hook) = self.hooks.on_verdict {
+                                let v = verdict::Verdict {
+                                    outcome: if passed {
+                                        verdict::VerdictOutcome::Pass
+                                    } else {
+                                        verdict::VerdictOutcome::Fail
+                                    },
+                                    identity: verdict::VerdictIdentity {
+                                        _name: None,
+                                        _source_location: None,
+                                        body_text: statement.sql.clone(),
+                                    },
+                                    detail: if passed {
+                                        None
+                                    } else {
+                                        Some(format!(
+                                            "Assertion failed\n  SQL: {}",
+                                            statement.sql
+                                        ))
+                                    },
+                                    _intent: None,
+                                };
+                                hook(&v);
+                            }
+                            if !passed {
+                                trace[idx] =
+                                    Some(("error", Some("assertion failed".to_string())));
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return ServerTerm::Error {
+                                    kind: ErrorKind::Permission,
+                                    identity: b"delightql-error://runtime/assertion".to_vec(),
+                                    message: format!(
+                                        "Assertion failed\n  SQL: {}",
+                                        statement.sql
+                                    )
+                                    .into_bytes(),
+                                };
+                            }
+                        }
+                        Err(msg) => {
+                            trace[idx] = Some(("error", Some(msg.clone())));
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(msg);
+                        }
+                    }
+                }
+                EffectAction::Emit {
+                    name, statement, ..
+                } => {
+                    match self.execute_sql_routed(&statement.sql, statement.connection_id) {
+                        Ok((columns, rows)) => {
+                            if let Some(ref mut hook) = self.hooks.on_emit {
+                                hook(name, &columns, &rows);
+                            }
+                        }
+                        Err(_msg) => {
+                            // Today's emit contract: notify, never abort.
+                        }
+                    }
+                }
+                EffectAction::Cleanup(stmts) => {
+                    if exited {
+                        trace[idx] = Some((
+                            "skipped",
+                            Some(
+                                "exit! taken: cleanup residue is drop_plan_scratch's job"
+                                    .to_string(),
+                            ),
+                        ));
+                        continue;
+                    }
+                    for st in stmts {
+                        if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(msg);
+                        }
+                    }
+                }
+                action => {
+                    for st in action.statements() {
+                        if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(msg);
+                        }
+                    }
+                    if let Some(ship) = action.ship() {
+                        match self.execute_sql_routed(&ship.sql, ship.connection_id) {
+                            Ok((columns, rows)) => {
+                                if Some(idx) == last_ship {
+                                    final_response =
+                                        Some(self.eager_header(&columns, &rows));
+                                } else if let Some(ref mut hook) = self.hooks.on_ship {
+                                    hook(&columns, &rows);
+                                }
+                            }
+                            Err(msg) => {
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return connection_error(msg);
+                            }
+                        }
+                    }
+                }
+            }
+            trace[idx] = Some(("done", None));
+        }
+
+        // F5 (Phase 6 slice 6): the receipt binder reads whether this
+        // run answered NO — the exit! latch decides the EMPTY receipt.
+        self.last_run_exited = exited;
+        final_response.unwrap_or_else(|| self.empty_header_response())
+    }
+
+    fn play_entries(&mut self, plan: &CompiledPlan) -> ServerTerm {
         let final_ship_idx = plan
             .entries
             .iter()
             .rposition(|e| matches!(e, PlanEntry::ShippedStatement(_)));
 
-        let mut exited = false;
         // The connection of the currently open bracket, if any.
         let mut open_bracket: Option<Option<i64>> = None;
         let mut assertion_no = 0usize;
@@ -136,50 +358,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // entries after it still have to run.
         let mut final_response: Option<ServerTerm> = None;
 
-        // The peek window's opening edge: the first entry AFTER the one
-        // that CREATEs the exit table (the exit shell — a plan entry
-        // itself). No shell entry (hand-built plans) → window open from
-        // the start, today's tolerant behavior. See the doc comment's
-        // "Exit peek" bullet for why the window exists (PG bracket
-        // poisoning, P1 H5); pinned by
-        // `exit_peek_window_opens_after_the_exit_shell_entry`.
-        let peek_from = plan.exit_table.as_deref().map_or(0, |table| {
-            plan.entries
-                .iter()
-                .position(|e| matches!(
-                    e,
-                    PlanEntry::Statement(st)
-                        if st.sql.trim_start().starts_with("CREATE") && st.sql.contains(table)
-                ))
-                .map_or(0, |i| i + 1)
-        });
-        // The window's closing edge: flips at the bracket's COMMIT (only
-        // in-bracket entries write the flag; a pre-COMMIT latch is
-        // sticky). Pinned by `exit_peek_window_closes_at_the_bracket_commit`.
-        let mut peeking_closed = false;
-
         for (idx, entry) in plan.entries.iter().enumerate() {
-            // Exit peek — the pump's ONLY mid-run read. Latched: once the
-            // flag is seen set it cannot unset, so peeking stops. Runs
-            // only inside the window (see above), where the plan's own
-            // discipline guarantees a healthy state: shell created,
-            // every earlier statement succeeded.
-            if !exited && !peeking_closed && idx >= peek_from {
-                if let Some(table) = plan.exit_table.as_deref() {
-                    exited = self.exit_flag_set(table, entry_connection(entry));
-                }
-            }
-            let is_bracket = matches!(
-                entry,
-                PlanEntry::BeginTransaction { .. } | PlanEntry::CommitTransaction { .. }
-            );
-            if exited && !is_bracket {
-                // Data entries stop at the exit flag; bracket entries still
-                // run so an open transaction commits (exit! is a graceful
-                // exit, not an abort).
-                continue;
-            }
-
             match entry {
                 PlanEntry::BeginTransaction { connection_id, .. } => {
                     match self.execute_sql_routed("BEGIN", *connection_id) {
@@ -195,10 +374,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     match self.execute_sql_routed("COMMIT", *connection_id) {
                         Ok(_) => {
                             open_bracket = None;
-                            // The peek window closes with the bracket: no
-                            // later entry can write the flag, and on PG the
-                            // ON COMMIT DROP shells are gone.
-                            peeking_closed = true;
                         }
                         Err(msg) => {
                             self.rollback_open_bracket(&mut open_bracket);
@@ -391,20 +566,55 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         final_response.unwrap_or_else(|| self.empty_header_response())
     }
 
-    /// Peek the exit flag on the entry's own connection — the same
-    /// connection the entry's compiled exit-guard conjuncts would read it
-    /// on. The table name interpolates VERBATIM: the planner spells it
+    /// D3a: sample one step's requirement edges at the DEPENDENT (Q-D1).
+    /// Every sample reads through a `count(*)` wrapper for the same
+    /// reason `exit_flag_set` does: on the fatboy relay an empty
+    /// mid-bracket SELECT is synthesized as a one-row `affected_rows`
+    /// relation, which a presence read would false-interpret — count
+    /// always yields a genuine row. Any closed edge declines the whole
+    /// step; a sampling error aborts like a statement error (R-T3) —
+    /// the transformer guarantees every referenced shell exists.
+    /// `Ok(None)` = every edge open; `Ok(Some(detail))` = the first
+    /// closed edge, described for the D5 run trace.
+    fn step_open(
+        &mut self,
+        step: &crate::pipeline::compiled_query::EffectStep,
+        guards: &[crate::pipeline::compiled_query::GuardDefinition],
+    ) -> Result<Option<String>, String> {
+        use crate::pipeline::compiled_query::GuardPolarity;
+        for req in &step.requirements {
+            let guard = &guards[req.guard_id];
+            let sql = format!("SELECT count(*) FROM ({}) AS __g", guard.sql);
+            let (_cols, rows) = self.execute_sql_routed(&sql, step.route)?;
+            let present = rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            let (polarity, open) = match req.polarity {
+                GuardPolarity::Present => ("present", present),
+                GuardPolarity::Absent => ("absent", !present),
+            };
+            if !open {
+                return Ok(Some(format!(
+                    "edge closed: guard {} required {} ({})",
+                    req.guard_id, polarity, req.reason
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read the exit latch (the pre-COMMIT tail decision — D3a retired
+    /// the per-entry peek window; requirement edges cover the body). The
+    /// table name interpolates VERBATIM: the planner spells it
     /// schema-qualified in the DIALECT's spelling (`temp.__exit`,
     /// `pg_temp.__exit` — E-T2, pinned by
-    /// `pg_exit_table_and_wrap_guard_spell_pg_temp`), so the peek
+    /// `pg_exit_table_and_wrap_guard_spell_pg_temp`), so the read
     /// structurally cannot false-latch on a user's physical `main.__exit`
     /// (review F3; pinned by the effects ball's
-    /// scratch--53_user_exit_table_survives_run). Inside the peek window
-    /// (see `handle_plan`) the table exists and the bracket is healthy,
-    /// so the error arm is DEFENSIVE: it stays "unreadable counts as
-    /// unset" only for hand-built plans with no shell entry, where the
-    /// window opens at the start; pinned by
-    /// `exit_peek_tolerates_missing_exit_table`.
+    /// scratch--53_user_exit_table_survives_run).
     fn exit_flag_set(&mut self, exit_table: &str, connection_id: Option<i64>) -> bool {
         // The peek asks for the exit table's CARDINALITY, not for a
         // row's presence. `SELECT count(*)` ALWAYS returns exactly one
@@ -445,7 +655,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 
     /// Buffer an eagerly-executed result set and answer with its Header —
     /// the same shape as handle_query's eager primary path.
-    fn eager_header(&mut self, columns: &[String], rows: &[Vec<String>]) -> ServerTerm {
+    pub(super) fn eager_header(&mut self, columns: &[String], rows: &[Vec<String>]) -> ServerTerm {
         let (dimensions, cells) = Self::strings_to_eager_buffer(columns, rows);
         let handle = self.next_handle();
         self.eager_buffers.insert(

@@ -7,6 +7,7 @@
 //! - format: Format/prettify DelightQL code
 //! - jstruct: JSON destructuring from stdin (dql tools jstruct)
 
+pub mod book;
 pub mod csvstruct;
 pub mod delegate;
 pub mod explain;

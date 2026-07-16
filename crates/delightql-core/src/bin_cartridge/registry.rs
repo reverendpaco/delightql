@@ -18,13 +18,23 @@ pub struct BinCartridgeRegistry {
     /// All registered cartridges (in registration order)
     cartridges: Vec<Arc<dyn BinCartridge>>,
 
-    /// Entity name → entity mapping for fast lookup
-    /// Key: entity name (e.g., "mount!", "enlist!")
-    /// Value: The entity implementation (stored as Arc<dyn BinEntity>)
+    /// (namespace fq, local entity name) → entity.
+    ///
+    /// CANONICAL IDENTITY (DIRECTIVE-CONVERGENCE-PLAN Phase 2): registry
+    /// keys contain namespace plus local entity name. A built-in cannot
+    /// become globally callable merely because its local name happens to
+    /// contain `::` — the old single-string index allowed exactly that
+    /// bypass for `sys::execution.compile`.
     ///
     /// We store Arc so the effect executor can clone the reference and release
     /// the registry borrow before executing.
-    entity_index: HashMap<String, Arc<dyn BinEntity>>,
+    entity_index: HashMap<(String, String), Arc<dyn BinEntity>>,
+
+    /// Namespaces whose entities are visible UNQUALIFIED, in registration
+    /// order. Today this is the universal cartridges (std::prelude,
+    /// std::predicates); enlisted/unqualified access works only when
+    /// visibility permits.
+    universal_namespaces: Vec<String>,
 }
 
 impl BinCartridgeRegistry {
@@ -33,55 +43,69 @@ impl BinCartridgeRegistry {
         Self {
             cartridges: Vec::new(),
             entity_index: HashMap::new(),
+            universal_namespaces: Vec::new(),
         }
     }
 
-    /// Register a cartridge and index its entities
-    ///
-    /// # Arguments
-    ///
-    /// * `cartridge` - The cartridge to register
+    /// Register a cartridge and index its entities under their namespace
+    /// identity: the entity's `namespace_override()` if declared, else the
+    /// cartridge's namespace path.
     ///
     /// # Panics
     ///
-    /// Panics if two entities have the same name (name collision).
+    /// Panics if two entities share one (namespace, name) identity.
     /// This is a programming error that should be caught during development.
     pub fn register_cartridge(&mut self, cartridge: Arc<dyn BinCartridge>) {
-        // Index all entities by name
+        let metadata = cartridge.metadata();
         for entity in cartridge.entities() {
+            let namespace = entity
+                .namespace_override()
+                .unwrap_or(&metadata.namespace_path)
+                .to_string();
             let name = entity.name().to_string();
 
-            if self.entity_index.contains_key(&name) {
+            if self
+                .entity_index
+                .insert((namespace.clone(), name.clone()), entity)
+                .is_some()
+            {
                 panic!(
-                    "Entity name collision: '{}' is already registered. \
-                     Each bin entity must have a unique name.",
-                    name
+                    "Entity identity collision: '{}' in namespace '{}' is \
+                     already registered. Each bin entity must have a unique \
+                     (namespace, name) identity.",
+                    name, namespace
                 );
             }
+        }
 
-            self.entity_index.insert(name, entity);
+        if metadata.is_universal
+            && !self
+                .universal_namespaces
+                .contains(&metadata.namespace_path)
+        {
+            self.universal_namespaces
+                .push(metadata.namespace_path.clone());
         }
 
         self.cartridges.push(cartridge);
     }
 
-    /// Look up an entity by name
+    /// Look up an entity by UNQUALIFIED name through the visibility rule:
+    /// only entities whose identity namespace belongs to a universal
+    /// cartridge are reachable without qualification. An entity carrying a
+    /// `namespace_override` outside those namespaces (e.g. compile under
+    /// `sys::execution`) is NOT unqualified-reachable.
     ///
-    /// Returns `Some(Arc<dyn BinEntity>)` if found, `None` if not registered.
-    ///
-    /// This is the primary lookup method used by the effect executor.
     /// Returns an Arc clone so the caller can release the registry borrow.
-    ///
-    /// Caller should downcast to the desired execution trait (e.g., EffectExecutable)
-    /// using methods like `as_effect_executable()`.
     pub fn lookup_entity(&self, name: &str) -> Option<Arc<dyn BinEntity>> {
-        self.entity_index.get(name).cloned()
+        self.universal_namespaces
+            .iter()
+            .find_map(|ns| self.entity_index.get(&(ns.clone(), name.to_string())))
+            .cloned()
     }
 
-    /// Look up an entity by namespace-qualified name
-    ///
-    /// Constructs a qualified key from namespace path + entity name
-    /// (e.g., ["sys", "execution"] + "compile" → "sys::execution.compile")
+    /// Look up an entity by its namespace-qualified identity
+    /// (e.g., ["sys", "execution"] + "compile").
     pub fn lookup_qualified_entity(
         &self,
         namespace_path: &[&str],
@@ -90,8 +114,18 @@ impl BinCartridgeRegistry {
         if namespace_path.is_empty() {
             return self.lookup_entity(name);
         }
-        let qualified = format!("{}.{}", namespace_path.join("::"), name);
-        self.entity_index.get(&qualified).cloned()
+        let namespace = namespace_path.join("::");
+        self.entity_index
+            .get(&(namespace, name.to_string()))
+            .cloned()
+    }
+
+    /// The effective identity namespace of an entity in `cartridge`.
+    pub fn effective_namespace(cartridge: &dyn BinCartridge, entity: &dyn BinEntity) -> String {
+        entity
+            .namespace_override()
+            .unwrap_or(&cartridge.metadata().namespace_path)
+            .to_string()
     }
 
     /// Get all registered cartridges
@@ -181,32 +215,61 @@ mod tests {
 
         registry.register_cartridge(cartridge);
 
-        // Should be able to look up the entity
-        assert!(registry.lookup_entity("test!").is_some());
+        // TestCartridge is NOT universal: unqualified visibility refuses...
+        assert!(registry.lookup_entity("test!").is_none());
+        // ...while the (namespace, name) identity resolves qualified.
+        assert!(registry.lookup_qualified_entity(&["test"], "test!").is_some());
 
-        // Should return None for non-existent entity
-        assert!(registry.lookup_entity("nonexistent!").is_none());
+        // Should return None for non-existent identities
+        assert!(registry.lookup_qualified_entity(&["test"], "nonexistent!").is_none());
+        assert!(registry.lookup_qualified_entity(&["other"], "test!").is_none());
     }
 
     #[test]
     fn test_counts() {
         let mut registry = BinCartridgeRegistry::new();
         assert_eq!(registry.cartridges().len(), 0);
-        assert!(registry.lookup_entity("test!").is_none());
+        assert!(registry.lookup_qualified_entity(&["test"], "test!").is_none());
 
         registry.register_cartridge(Arc::new(TestCartridge));
 
         assert_eq!(registry.cartridges().len(), 1);
-        assert!(registry.lookup_entity("test!").is_some());
+        assert!(registry.lookup_qualified_entity(&["test"], "test!").is_some());
     }
 
     #[test]
-    #[should_panic(expected = "Entity name collision")]
+    #[should_panic(expected = "Entity identity collision")]
     fn test_name_collision_panics() {
         let mut registry = BinCartridgeRegistry::new();
 
         // Register same cartridge twice - should panic on second registration
         registry.register_cartridge(Arc::new(TestCartridge));
         registry.register_cartridge(Arc::new(TestCartridge));
+    }
+
+    #[test]
+    fn universal_visibility_governs_unqualified_lookup() {
+        struct UniversalCartridge;
+        impl BinCartridge for UniversalCartridge {
+            fn metadata(&self) -> BinCartridgeMetadata {
+                BinCartridgeMetadata {
+                    source_uri: "test://universal".to_string(),
+                    namespace_path: "std::testuniv".to_string(),
+                    is_universal: true,
+                    language: Language::DqlStandard,
+                    _description: None,
+                }
+            }
+            fn entities(&self) -> Vec<Arc<dyn BinEntity>> {
+                vec![Arc::new(TestEntity)]
+            }
+        }
+        let mut registry = BinCartridgeRegistry::new();
+        registry.register_cartridge(Arc::new(UniversalCartridge));
+        // Universal namespace: unqualified AND qualified both resolve.
+        assert!(registry.lookup_entity("test!").is_some());
+        assert!(registry
+            .lookup_qualified_entity(&["std", "testuniv"], "test!")
+            .is_some());
     }
 }

@@ -69,6 +69,8 @@ fn qn(name: &str) -> QualifiedName {
 fn sentinel<P>(tag: &str) -> RelationalExpression<P> {
     RelationalExpression::Relation(Relation::PseudoPredicate {
         name: tag.to_string(),
+        namespace: Vec::new(),
+        access: DomainSpec::Glob,
         arguments: vec![],
         alias: None,
         cpr_schema: PhaseBox::phantom(),
@@ -319,6 +321,8 @@ fn r_i4_recursion_closure_matrix() {
         ctes: vec![CteBinding {
             expression: sentinel("cte_body"),
             name: "c".to_string(),
+            origin: Default::default(),
+            resolution_owner: Default::default(),
             effect_label: false,
             is_recursive: PhaseBox::phantom(),
         }],
@@ -597,6 +601,7 @@ fn r_i4_recursion_closure_matrix_extended() {
             first_parens_spec: None,
             domain_spec: DomainSpec::Positional(vec![scalar_sub("hoview_domain_spec")]),
             namespace: None,
+            grounding: None,
         },
     ));
     carriers.push(pipe_with(
@@ -609,6 +614,7 @@ fn r_i4_recursion_closure_matrix_extended() {
             )])),
             domain_spec: DomainSpec::Glob,
             namespace: None,
+            grounding: None,
         },
     ));
 
@@ -969,5 +975,38 @@ fn err_hook_short_circuits_the_walk() {
         !c.seen.iter().any(|s| s == "after"),
         "nodes after the failure must not be visited: {:?}",
         c.seen
+    );
+}
+
+/// REVIEW REMEDIATION (Phase 3a review, P1): `PseudoPredicate.access` is a
+/// recursive field — a demand or subquery embedded in the receipt-access
+/// spec must be visible to every `AstVisit` tenant (effect discipline, R9
+/// discovery, compile purity). This is the structural regression for the
+/// missing walker edge: a sentinel smuggled beneath `access` via a scalar
+/// subquery must be seen by the generic walk.
+#[test]
+fn visit_reaches_pseudo_predicate_access() {
+    let expr: RelationalExpression<Unresolved> =
+        RelationalExpression::Relation(Relation::PseudoPredicate {
+            name: "outer!".to_string(),
+            namespace: Vec::new(),
+            arguments: vec![scalar_sub("inside-arguments")],
+            access: DomainSpec::Positional(vec![scalar_sub("inside-access")]),
+            alias: None,
+            cpr_schema: PhaseBox::phantom(),
+        });
+
+    let mut collector = SentinelCollector::default();
+    walk_visit_relational(&mut collector, &expr).expect("walk succeeds");
+
+    assert!(
+        collector.seen.contains(&"inside-arguments".to_string()),
+        "arguments edge lost: {:?}",
+        collector.seen
+    );
+    assert!(
+        collector.seen.contains(&"inside-access".to_string()),
+        "ACCESS edge lost — the recursive field has no walker edge: {:?}",
+        collector.seen
     );
 }

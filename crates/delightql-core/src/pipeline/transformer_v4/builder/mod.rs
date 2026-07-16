@@ -854,11 +854,19 @@ impl Builder<Unprojected> {
             .collect();
         let all_items = disambiguate_aliases(all_items);
 
-        // Build SELECT with LEFT JOIN json_each (preserves rows with empty arrays).
+        // INNER join json_each (RULED 2026-07-14, DIRECTIVE-CONVERGENCE-PLAN
+        // Rule 6): a NULL or empty interior IS empty — it contributes zero
+        // rows to the expansion, in every form (drill, narrow, brace,
+        // destructure). Interior expansion is not an outer join; a parent
+        // with no children vanishes rather than surviving as a row of NULL
+        // children. This also closes the round trip with tree-group
+        // CONSTRUCTION, which already elides all-NULL contributor rows to
+        // produce `[]`. Pinned by directive_contract/17_null_interior_is_empty
+        // and the drill/narrow cardinality law sum(cardinality(r.t)).
         let joined_from = TableExpression::Join {
             left: Box::new(source_table),
             right: Box::new(je_tvf),
-            join_type: JoinType::Left,
+            join_type: JoinType::Inner,
             join_condition: JoinCondition::On(DomainExpression::literal(
                 crate::pipeline::asts::core::LiteralValue::Boolean(true),
             )),

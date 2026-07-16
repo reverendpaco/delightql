@@ -206,6 +206,18 @@ impl api::DqlHandle for DqlHandleImpl {
     fn selftest(&self) -> Vec<crate::diagnostics::DiagnosticFinding> {
         crate::diagnostics::run_selftest(self.system())
     }
+
+    fn bind_static_bytes(&mut self, name: &str, bytes: &'static [u8]) -> Result<(), String> {
+        self.system
+            .bind_static_bytes(name, bytes)
+            .map_err(|e| e.to_string())
+    }
+
+    fn bind_owned_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+        self.system
+            .bind_owned_bytes(name, bytes)
+            .map_err(|e| e.to_string())
+    }
 }
 
 impl DqlHandleImpl {
@@ -240,7 +252,6 @@ impl DqlHandleImpl {
 pub fn open(
     factory: Box<dyn ConnectionFactory>,
     mount_factory: Option<Box<dyn delightql_types::ConnectionFactory>>,
-    help_surface: Option<api::HelpSurface>,
 ) -> Result<Box<dyn api::DqlHandle>, String> {
     let created = factory
         .create(":memory:")
@@ -253,23 +264,11 @@ pub fn open(
         system.set_connection_factory(mf);
     }
 
-    // sys::help ring 1: seed the host's surface rows (SYS-HELP-DESIGN.md
-    // phase 2). None (wasm/cabi) = no surface = legitimately empty tables.
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(ref surface) = help_surface {
-        system
-            .seed_help_surface(surface)
-            .map_err(|e| format!("{}", e))?;
-    }
-    #[cfg(target_arch = "wasm32")]
-    let _ = help_surface;
-
     // Run embedded seed programs for their effects (e.g. seed/docs.dql
     // self-documents the sys:: tables via doc!). Idempotent — safe on every
-    // startup. Same post-construction point as seed_help_surface: the system
-    // is fully built, so there is no init reentrancy.
+    // startup. The system is fully built here, so there is no init reentrancy.
     //
-    // wasm gate (load-bearing, NOT cargo-culted from seed_help_surface): the
+    // wasm gate (load-bearing): the
     // wasm `DelightQLSystem` is the rusqlite-free minimal struct with NO
     // bootstrap catalog (see wasm_system.rs — `run_seed_programs` isn't even
     // defined there, and `reinit_bootstrap` returns "not supported"). Seeds'

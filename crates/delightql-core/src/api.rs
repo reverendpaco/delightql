@@ -49,6 +49,25 @@ pub trait DqlHandle: Send {
     fn selftest(&self) -> Vec<crate::diagnostics::DiagnosticFinding> {
         Vec::new()
     }
+
+    /// Bind a static SQLite database image under a host-chosen name so DQL
+    /// text can mount it: `mount!("delightql-bytes://<name>", "<ns>")`
+    /// (BYTES-SCHEME-DESIGN.md). Not a mount verb — a name binding, the same
+    /// ontological rank as the filesystem giving meaning to paths. Names are
+    /// lowercase capability labels (`[a-z][a-z0-9._-]*`) and immutable for
+    /// the life of the handle (rebinding refuses). Default: unsupported, for
+    /// hosts (WASM) that cannot attach deserialized native SQLite schemas.
+    fn bind_static_bytes(&mut self, _name: &str, _bytes: &'static [u8]) -> Result<(), String> {
+        Err("bind_static_bytes is not supported by this host".to_string())
+    }
+
+    /// Owned-buffer sibling of `bind_static_bytes`: for database images
+    /// built at runtime (e.g. the CLI's live surface database). Same name
+    /// grammar, immutability, and bind-time validation; the buffer is
+    /// copied into SQLite-owned memory at attach.
+    fn bind_owned_bytes(&mut self, _name: &str, _bytes: Vec<u8>) -> Result<(), String> {
+        Err("bind_owned_bytes is not supported by this host".to_string())
+    }
 }
 
 /// A DQL session for query/fetch/close operations.
@@ -143,44 +162,6 @@ pub trait ConnectionFactory: Send + Sync {
         &self,
         uri: &str,
     ) -> std::result::Result<CreatedConnection, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-// --- sys::help ring 1 (SYS-HELP-DESIGN.md phase 2) ---
-
-/// The host binary's own surface, described as plain data and seeded
-/// into the `sys::help` ring-1 tables at session init. The clap tree
-/// lives in the CLI and the burn-in lives here, so DATA crosses the
-/// boundary and core owns the writes — runtime generation means the
-/// rows structurally cannot drift from the binary that serves them.
-/// Headless hosts (wasm, cabi) pass None: no surface, empty tables.
-#[derive(Default)]
-pub struct HelpSurface {
-    /// (name, parent command or None for root, comma-joined aliases, summary)
-    pub commands: Vec<(String, Option<String>, Option<String>, String)>,
-    /// (command, long, short, value_name, default, global, repeatable, summary)
-    pub options: Vec<HelpOption>,
-    /// (command, option, value, summary, class, grade)
-    pub option_values: Vec<(String, String, String, Option<String>, Option<String>, Option<String>)>,
-    /// (name, summary)
-    pub dot_commands: Vec<(String, String)>,
-    /// (name, effect, equivalent flag)
-    pub envs: Vec<(String, String, Option<String>)>,
-    /// (code, context, meaning, class, grade)
-    pub exit_codes: Vec<(i64, String, String, Option<String>, Option<String>)>,
-    /// (name, section, troff, plain) — plain scrubbed from troff by the
-    /// host at surface-build time (in sync by construction)
-    pub man_pages: Vec<(String, i64, String, String)>,
-}
-
-pub struct HelpOption {
-    pub command: String,
-    pub long: String,
-    pub short: Option<String>,
-    pub value_name: Option<String>,
-    pub default_value: Option<String>,
-    pub global: bool,
-    pub repeatable: bool,
-    pub summary: String,
 }
 
 // --- Entry point ---

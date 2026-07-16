@@ -254,9 +254,9 @@ $ dql x --flag v
     #[test]
     fn all_shipped_pages_stay_inside_the_house_dialect() {
         let man_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../man/man1");
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/man/man1");
         let mut checked = 0;
-        for entry in std::fs::read_dir(&man_dir).expect("man/man1 must exist") {
+        for entry in std::fs::read_dir(&man_dir).expect("assets/man/man1 must exist") {
             let path = entry.unwrap().path();
             if path.extension().and_then(|e| e.to_str()) != Some("1") {
                 continue;

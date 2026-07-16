@@ -28,7 +28,7 @@ pub struct CliArgs {
     // main.rs: clap propagates global flags into every subcommand's
     // --help, including subcommands that refuse them (ALPHA-CLI-UX-
     // WORRIES #1) — so each flag's own text must say where it works.
-    /// SQLite database file (query and server; others refuse it)
+    /// SQLite database file (query, server, book; others refuse it)
     #[arg(long = "db", value_name = "DATABASE", global = true)]
     pub database: Option<PathBuf>,
 
@@ -175,6 +175,16 @@ pub enum Command {
         /// Write every embedded troff page into DIR (release staging)
         #[arg(long, value_name = "DIR")]
         dump: Option<PathBuf>,
+    },
+
+    /// Emit an embedded documentation book as Markdown (bare: list books)
+    Book {
+        /// Book name (currently: reference)
+        name: Option<String>,
+        /// Also write the bundle's images into DIR (default: images/) so
+        /// the emitted markdown's relative references resolve for pandoc
+        #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "images")]
+        export_images: Option<PathBuf>,
     },
 
     /// Show a command's manual page (`dql help query` = `dql man query`; bare = usage)

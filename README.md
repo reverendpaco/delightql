@@ -21,10 +21,18 @@ See delightql.org
 
 # Building
 
-Make sure you have tree-sitter version installed 0.25.2
-and then:
+Requirements: **rustc/cargo** ([rustup.rs](https://rustup.rs)), **make**,
+and **uv** ([docs.astral.sh/uv](https://docs.astral.sh/uv/)) — build.rs
+bundles the embedded documentation databases from `assets/`, and the
+bundler runs under uv (it declares its own python dependencies). Then:
 
-`cargo build --bin dql`
+`make`
+
+(or `cargo build --bin dql` directly — cargo invokes the asset bundling
+itself). `make setup` is the dependency doctor for the wider toolchain
+(wasm, duckdb, tree-sitter regeneration — tree-sitter CLI 0.25.2 is only
+needed when changing the grammar). Building the book PDF additionally
+needs mise: see `press/README.md`.
 
 # Python script conventions
 

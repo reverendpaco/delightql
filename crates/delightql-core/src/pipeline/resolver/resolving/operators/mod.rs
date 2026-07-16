@@ -159,7 +159,43 @@ pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
         // Constructed by builder 2.2 (IMPLEMENTATION-PLAN §2.2); its
         // lowering is the effect transformer. Clean refusal, not a panic:
         // an `x |> f!(r(*))(*)` outside an effect plan reaches here.
-        ast_unresolved::UnaryRelationalOperator::DirectivePipeInvocation { name, .. } => {
+        //
+        // EXCEPTION — the DML designator form (Phase 6 slice 5): since the
+        // builder preserves DML targets as designators, statements the
+        // relay conservatively leaves on this path (annotated or
+        // multi-query DML) interpret the SAME designator here and resolve
+        // through the SAME DML machinery the stringly operator used —
+        // identical semantics on both routes, never a string from the
+        // parser.
+        ast_unresolved::UnaryRelationalOperator::DirectivePipeInvocation {
+            name,
+            argument,
+            domain_spec,
+        } => {
+            use crate::pipeline::asts::core::operators::DmlKind;
+            let kind = match name.trim_end_matches('!') {
+                "insert" => Some(DmlKind::Insert),
+                "update" => Some(DmlKind::Update),
+                "delete" => Some(DmlKind::Delete),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let (target, target_namespace) =
+                    crate::pipeline::asts::effects::target_designator(
+                        name.trim_end_matches('!'),
+                        "effect/dml/target_designator",
+                        "naming where to write",
+                        &argument,
+                    )?;
+                return schema_ops::resolve_dml_terminal_via_fold(
+                    fold,
+                    kind,
+                    target,
+                    target_namespace,
+                    domain_spec,
+                    available,
+                );
+            }
             Err(crate::error::DelightQLError::transformation_error(
                 format!(
                     "the piped directive invocation '|> {}(…)(…)' is not implemented \

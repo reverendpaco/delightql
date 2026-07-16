@@ -90,18 +90,41 @@ pub fn resolve_entity_with_alias(
 
     // Level 4: Database entities
     // Use namespace-aware resolution via the system.
-    // When resolving inside a DDL view body, resolution_namespace scopes
-    // the primary search to the DDL namespace + its engages, with fallback
-    // to main (for entities from other enlisted namespaces and DNS tables).
-    let ns = resolution_namespace.unwrap_or("main");
-    let needs_main_fallback = resolution_namespace.is_some() && ns != "main";
+    // STRICT definition independence (Phase 7 stage 2, owner-ratified):
+    // inside a definition the search is scoped to the owning namespace +
+    // its own edges — NEVER the caller's session. At the prompt (None)
+    // the scope is `home`. The old retry-against-the-session fallback
+    // was the caller-leak: a file's rule could resolve a bare name
+    // through whatever the CALLER happened to have enlisted.
+    let ns = resolution_namespace.unwrap_or("home");
     if let Some(system) = registry.database.system {
-        // First pass: search in the primary namespace (no fallback).
-        // If inside a view body and nothing found, retry against "main"
-        // to pick up entities from other enlisted namespaces.
         let result = system.resolve_unqualified_entity(&actual_name, ns, None);
-        let result = match (&result, needs_main_fallback) {
-            (Ok(None), true) => system.resolve_unqualified_entity(&actual_name, "main", None),
+        // AMBIENT DATA (Phase 7 stage 2, owner-ratified): a definition's
+        // strict miss may still be a physical DATA table in the session's
+        // `home` scope — the database is one shared world, not an import.
+        // The retry reuses the FULL home-scope resolver (so the ambiguity
+        // refusal and its diagnostics are identical to the prompt's), and
+        // the RESULT is gated by namespace kind: only `data`-kind hits
+        // pass. Another file's DEFINITIONS (lib-kind) never leak through
+        // this door.
+        let result = match (&result, resolution_namespace.is_some()) {
+            (Ok(None), true) => {
+                match system.resolve_unqualified_entity(&actual_name, "home", None) {
+                    Ok(Some((path, name))) => {
+                        let fq = path
+                            .iter()
+                            .map(|i| i.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        if system.namespace_is_data_kind(&fq) {
+                            Ok(Some((path, name)))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    other => other,
+                }
+            }
             _ => result,
         };
         match result {
@@ -143,7 +166,9 @@ pub fn resolve_entity_with_alias(
                             .map(|i| i.name.as_str())
                             .collect::<Vec<_>>()
                             .join("::");
-                        if let Some(entity) = registry.consult.lookup_entity(&actual_name, &fq) {
+                        if let Some(entity) = registry
+                            .consult
+                            .lookup_entity(&actual_name, &fq, resolution_namespace) {
                             if entity.entity_type
                                 == BootstrapEntityType::DqlTemporaryViewExpression
                             {

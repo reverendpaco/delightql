@@ -224,8 +224,13 @@ CREATE TABLE entity_resolution (
 -- ============================================================================
 
 -- Namespace: Hierarchical namespace tree
+-- id is AUTOINCREMENT (review qmqwqlms round 3, P1): the liminal-program
+-- compensation boundary is a namespace-id high-water mark, and its
+-- "created since" scan is exact only if ids are NEVER reused. Plain
+-- INTEGER PRIMARY KEY would let SQLite hand a deleted max rowid to the
+-- next insert, hiding that namespace from the failure teardown.
 CREATE TABLE namespace (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     pid INTEGER,
     fq_name TEXT,
@@ -235,6 +240,34 @@ CREATE TABLE namespace (
     source_path TEXT,
     writable INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (pid) REFERENCES namespace(id)
+);
+
+-- Mount binding: one row per mounted namespace.  This is the authoritative
+-- catalog fact for mount identity.
+-- connection_id is deliberately derived through cartridge.connection_id:
+-- keeping a second authoritative copy here would recreate the identity
+-- disagreement this relation is intended to remove.
+CREATE TABLE mount (
+    namespace_id INTEGER PRIMARY KEY REFERENCES namespace(id),
+    cartridge_id INTEGER NOT NULL UNIQUE REFERENCES cartridge(id),
+    attach_alias TEXT UNIQUE,
+    qualification TEXT NOT NULL CHECK (
+        qualification IN ('unqualified', 'aliased', 'engine_schema')
+    ),
+    engine_schema TEXT,
+    class TEXT NOT NULL CHECK (class IN ('attach', 'external')),
+    CHECK (class != 'attach' OR attach_alias IS NOT NULL),
+    CHECK (class != 'attach' OR engine_schema IS NULL),
+    CHECK (qualification != 'aliased' OR class = 'attach'),
+    CHECK (engine_schema IS NULL OR qualification = 'engine_schema'),
+    CHECK (
+        qualification != 'engine_schema'
+        OR (class = 'external' AND engine_schema IS NOT NULL)
+    ),
+    CHECK (
+        qualification != 'unqualified'
+        OR engine_schema IS NULL
+    )
 );
 
 -- Activated Entity: Tracks which entities are active in which namespaces
@@ -272,6 +305,19 @@ CREATE TABLE enlisted_namespace (
 -- Namespace Local Enlist: Records which namespaces were enlisted inside a DDL file.
 -- These are scoped to the DDL's namespace — they don't leak to the caller.
 -- Used by the resolver to activate dependencies when resolving a view body.
+-- Per-source provenance (Phase 8, the consultation lifecycle): one row
+-- per source file consulted into a namespace, in consultation order.
+-- Ordinary consult! writes ordinal 0; consult_concat_into_ns! appends.
+-- A namespace with more than one source refuses reconsult! (multi-source
+-- reload is deliberately out of scope).
+CREATE TABLE namespace_source (
+    namespace_id INTEGER NOT NULL,
+    source_path TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (namespace_id, ordinal),
+    FOREIGN KEY (namespace_id) REFERENCES namespace(id)
+);
+
 CREATE TABLE namespace_local_enlist (
     namespace_id INTEGER NOT NULL,       -- The DDL's own namespace
     enlisted_namespace_id INTEGER NOT NULL, -- The namespace that was enlisted inside the DDL
@@ -395,6 +441,66 @@ CREATE TABLE stack (
     function_name   TEXT NOT NULL,
     max_depth       INTEGER NOT NULL,
     PRIMARY KEY (compilation_id, function_name)
+);
+
+-- ============================================================================
+-- THE TYPED EFFECT PLAN, MATERIALIZED (sys::execution — D4,
+-- DOGFOODING-EFFECT-EXECUTION-PLAN §4; Q-D3/Q-D4 as amended)
+-- ============================================================================
+-- Engine-owned OBSERVATIONAL PROJECTION of the in-memory typed plan
+-- (Q-D11: the typed Rust plan stays the single executable source; these
+-- rows execute nothing). Lifecycle (§7 as amended): populated when a
+-- plan compiles (run or explain), rows PERSIST for post-mortem
+-- inspection, and clear at the START of the next compile — the
+-- fresh-scratch-per-run precedent. Only the engine writes these rows.
+
+-- Scheduled steps ONLY (guards are definitions, not steps — Q-D3).
+CREATE TABLE effect_plan (
+    plan_id       INTEGER NOT NULL,
+    step_id       INTEGER NOT NULL,
+    ordinal       INTEGER NOT NULL,
+    occurrence_id TEXT    NOT NULL,   -- the demand-expansion path (Q-D2)
+    step_kind     TEXT    NOT NULL,   -- effect | return | control
+    action_kind   TEXT    NOT NULL,   -- dml | ddl | sql | host
+    operation     TEXT    NOT NULL,
+    route         INTEGER,
+    sql_display   TEXT    NOT NULL,
+    PRIMARY KEY (plan_id, step_id)
+);
+
+-- Guard DEFINITIONS: no ordinal, no occurrence; sampled at each
+-- dependent (Q-D1), shared by any number of requirements.
+CREATE TABLE effect_guard (
+    plan_id     INTEGER NOT NULL,
+    guard_id    INTEGER NOT NULL,
+    sql_display TEXT    NOT NULL,
+    PRIMARY KEY (plan_id, guard_id)
+);
+
+-- Mutable execution state (D5; Q-D5 as amended): tracked IN MEMORY
+-- during the walk, materialized best-effort at the run's boundary
+-- (success, abort, exit), persisting for post-mortem inspection until
+-- the next compile clears it with the plan. Final statuses: done |
+-- skipped (an edge sampled closed; detail says which) | error (the
+-- aborting step; detail carries the message) | pending (never reached —
+-- the run stopped earlier).
+CREATE TABLE effect_run (
+    plan_id INTEGER NOT NULL,
+    step_id INTEGER NOT NULL,
+    status  TEXT    NOT NULL,
+    detail  TEXT,
+    PRIMARY KEY (plan_id, step_id)
+);
+
+-- Requirement edges. `always` is the ABSENCE of a row, never a third
+-- polarity value.
+CREATE TABLE effect_requirement (
+    plan_id  INTEGER NOT NULL,
+    step_id  INTEGER NOT NULL,
+    guard_id INTEGER NOT NULL,
+    polarity TEXT    NOT NULL,        -- present | absent
+    reason   TEXT    NOT NULL,        -- diagnostics only
+    PRIMARY KEY (plan_id, step_id, guard_id)
 );
 
 -- Ring buffer: keep the most recent 1000 compilations, auto-delete oldest.
@@ -606,8 +712,8 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
     ('postgres', 'scratch.schema', 'template', 'pg_temp');
 
 -- ----------------------------------------------------------------------------
--- sys::help ring 2 — the identifier registry as burned rows
--- (SYS-HELP-DESIGN.md phase 1). AUTHORED-AS-DATA: these rows are the
+-- sys::identifiers — the engine identifier registry as burned rows.
+-- AUTHORED-AS-DATA: these rows are the
 -- SOURCE of truth for `dql explain` and every future projection (the
 -- former uri_registry.rs Rust static is gone; spelling-normalization
 -- stays in code). One upstream per table — never also generate these.
@@ -616,7 +722,7 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
 -- identity — append-only, a hierarchy once minted is never reused or
 -- reworded (URI-DESIGN.md §3); summary/explanation are porcelain and
 -- may improve freely. kind ∈ error | danger | config.
--- Addressed as sys::help.identifier(*) (registered in system.rs
+-- Addressed as sys::identifiers.identifier(*) (registered in system.rs
 -- alongside the other sys tables).
 -- ----------------------------------------------------------------------------
 CREATE TABLE identifier (
@@ -676,76 +782,3 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('diagnostic', 'autoload/consult_failed', 'An autoload module parsed but failed to register.', 'The module parsed, but consulting it (registering its rules/entities) failed — typically a rule references a relation or namespace that does not exist. Check the referenced names in the module against what is available at load time. The finding''s detail carries the consult error.'),
     ('diagnostic', 'catalog', 'Integrity of the entity catalog.', 'The catalog provider (dql selftest) checks that the compiler''s own system tables are properly placed in the catalog. Members: catalog/orphaned_entity.'),
     ('diagnostic', 'catalog/orphaned_entity', 'A system table has no namespace address.', 'A physical system table exists (and is queryable by direct name via the schema fallback) but has no activated_entity row, so it lives in no sys:: namespace and is invisible to the namespace-organized views (sys::util.tables_as_d2, catalog enumeration). Doctrine: everything the compiler or runtime uses should be dogfood-exposed — there are no intentional hidden internals. Fix: activate the table into its namespace (import/activation.rs + import/namespace.rs), as sys::targeting did for the dialect_* tables.');
-
--- ----------------------------------------------------------------------------
--- sys::help ring 1 — the CLI's own shape (SYS-HELP-DESIGN.md phase 2).
--- GENERATED AT SESSION INIT by the host binary from its live clap tree
--- (api::HelpSurface → DelightQLSystem::seed_help_surface): runtime
--- generation means these rows structurally cannot drift from the binary
--- that serves them. One upstream per table — never also author rows
--- here. Headless hosts (wasm, cabi) have no CLI surface; their ring-1
--- tables are legitimately empty.
---
--- class/grade columns carry the porcelain/plumbing declaration
--- (PORCELAIN-AND-PLUMBING.md): class ∈ porcelain | plumbing |
--- 'porcelain+semantic-warranty'; grade ∈ frozen | versioned. NULL =
--- not an output surface (most flags).
--- ----------------------------------------------------------------------------
-CREATE TABLE command (
-    name    TEXT NOT NULL,
-    parent  TEXT,
-    alias   TEXT,
-    summary TEXT NOT NULL,
-    PRIMARY KEY (name, parent)
-);
-CREATE TABLE option (
-    command       TEXT NOT NULL,
-    long          TEXT NOT NULL,
-    short         TEXT,
-    value_name    TEXT,
-    default_value TEXT,
-    global        INTEGER NOT NULL,
-    repeatable    INTEGER NOT NULL,
-    summary       TEXT NOT NULL,
-    PRIMARY KEY (command, long)
-);
-CREATE TABLE option_value (
-    command TEXT NOT NULL,
-    option  TEXT NOT NULL,
-    value   TEXT NOT NULL,
-    summary TEXT,
-    class   TEXT,
-    grade   TEXT,
-    PRIMARY KEY (command, option, value)
-);
-CREATE TABLE dot_command (
-    name    TEXT PRIMARY KEY,
-    summary TEXT NOT NULL
-);
-CREATE TABLE env (
-    name            TEXT PRIMARY KEY,
-    effect          TEXT NOT NULL,
-    equivalent_flag TEXT
-);
-CREATE TABLE exit_code (
-    code    INTEGER NOT NULL,
-    context TEXT NOT NULL,
-    meaning TEXT NOT NULL,
-    class   TEXT,
-    grade   TEXT,
-    PRIMARY KEY (code, context)
-);
-
--- sys::help ring 2: man pages, seeded by the host via HelpSurface
--- (phase 3). troff is the source (authored in the host's man/ tree,
--- embedded at compile time); plain is scrubbed from it AT SEED TIME
--- by the host's closed-dialect scrubber — in sync by construction,
--- the last rung of the dql-man rendering chain. Sections per the
--- ruling: 1 = commands, 7 = language/concepts.
-CREATE TABLE man_page (
-    name    TEXT NOT NULL,
-    section INTEGER NOT NULL,
-    troff   TEXT NOT NULL,
-    plain   TEXT NOT NULL,
-    PRIMARY KEY (name, section)
-);

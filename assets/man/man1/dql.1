@@ -83,8 +83,11 @@ nonzero on any FAIL.
 .TP
 .B man
 Show one of these manual pages, rendered from the copies embedded in
-the binary (a projection of
-.IR sys::help.man_page(*) ).
+the binary. The command mounts the CLI-owned manual database as
+.IR cli::man
+and projects its
+.IR man_page
+relation through DelightQL.
 Name tokens hyphen-join, so
 .B dql man dql target
 and
@@ -103,9 +106,16 @@ composes as expected.
 .I DIR
 writes every embedded troff page into
 .I DIR
-(for packaging and MANPATH installs). To search pages, query them:
+(for packaging and MANPATH installs).
+.TP
+.B book
+With no name, list the books embedded in this binary. With a name, mount
+the CLI-owned book database as
+.IR cli::book
+and emit that ordered book as Markdown. The initial book is
+.BR reference :
 .EX
-$ dql query 'sys::help.man_page(*), +like(plain, "%adapter%")'
+$ dql book reference > reference.md
 .EE
 .TP
 .B help

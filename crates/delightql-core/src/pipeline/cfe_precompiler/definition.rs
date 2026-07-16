@@ -37,7 +37,11 @@ pub fn precompile_query_cfes(
             let mut all_cfes = cfes;
             if let Some(sys) = system {
                 let consult = ConsultRegistry::new_with_system(sys);
-                discover_nested_consulted_functions(&mut all_cfes, &consult)?;
+                // Session scope: inline CFEs written at the prompt
+                // discover their consulted references through `home`
+                // (view-body CFEs resolve through the scoped relation
+                // path, not this discovery walk).
+                discover_nested_consulted_functions(&mut all_cfes, &consult, None)?;
             }
 
             // Precompile each CFE body
@@ -275,6 +279,7 @@ pub(crate) fn precompile_cfe_definition(
 fn discover_nested_consulted_functions(
     cfes: &mut Vec<unresolved::CfeDefinition>,
     consult: &ConsultRegistry,
+    scope: Option<&str>,
 ) -> Result<()> {
     let mut seen: std::collections::HashSet<String> = cfes.iter().map(|c| c.name.clone()).collect();
     let mut i = 0;
@@ -287,17 +292,17 @@ fn discover_nested_consulted_functions(
             }
             let entity = if let Some(ns) = &namespace {
                 let fq = crate::pipeline::resolver::grounding::namespace_path_to_fq(ns);
-                consult.lookup_entity(&name, &fq).filter(|e| {
+                consult.lookup_entity(&name, &fq, scope).filter(|e| {
                     e.entity_type == crate::enums::EntityType::DqlFunctionExpression
                         || e.entity_type
                             == crate::enums::EntityType::DqlContextAwareFunctionExpression
                 })
             } else {
-                let e = consult.lookup_enlisted_function(&name)?;
+                let e = consult.lookup_enlisted_function(&name, scope)?;
                 if e.is_some() {
                     e
                 } else {
-                    consult.lookup_enlisted_context_aware_function(&name)?
+                    consult.lookup_enlisted_context_aware_function(&name, scope)?
                 }
             };
             if let Some(entity) = entity {
@@ -380,6 +385,8 @@ mod tests {
         // top(  scalar-subquery{ src(|> ~> nested() ) }  )
         let src = unresolved::RelationalExpression::Relation(unresolved::Relation::PseudoPredicate {
             name: "src".to_string(),
+            namespace: Vec::new(),
+            access: crate::pipeline::asts::core::DomainSpec::Glob,
             arguments: vec![],
             alias: None,
             cpr_schema: PhaseBox::phantom(),

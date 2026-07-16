@@ -52,7 +52,9 @@ impl BinEntity for GroundPredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![("ns".to_string(), "String".to_string())]),
+            // The receipt heading is the DESCRIPTOR's declaration
+            // (Phase 6 slice 2): core + ruled §8 additions.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("ground")),
         }
     }
 
@@ -95,8 +97,13 @@ impl EffectExecutable for GroundPredicate {
 
         let _count = system.ground_namespace(&data_ns, &lib_ns, &new_ns_name)?;
 
-        Ok(EntityResult::Relation(super::directive_result(
-            &new_ns_name,
+        Ok(EntityResult::Relation(super::descriptor_core_receipt(
+            "ground",
+            &[
+                Some(data_ns.clone()),
+                Some(lib_ns.clone()),
+                Some(new_ns_name.clone()),
+            ],
             alias,
         )))
     }

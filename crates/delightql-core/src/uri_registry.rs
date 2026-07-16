@@ -48,7 +48,7 @@ impl UriKind {
     }
 }
 
-/// One identifier row, as read from the burned `sys::help.identifier`
+/// One identifier row, as read from the burned `sys::identifiers.identifier`
 /// table (SYS-HELP-DESIGN.md phase 1). The rows are AUTHORED in
 /// bootstrap/schema.sql — this module keeps only spelling
 /// normalization and identity vocabulary; the registry data itself
@@ -64,7 +64,7 @@ pub struct IdentifierEntry {
 }
 
 /// UriKind from its URL word ("error" | "danger" | "config") — the
-/// spelling the `kind` column of sys::help.identifier uses.
+/// spelling the `kind` column of sys::identifiers.identifier uses.
 pub fn kind_from_word(word: &str) -> Option<UriKind> {
     UriKind::all().iter().copied().find(|k| k.word() == word)
 }
@@ -334,7 +334,7 @@ mod tests {
     /// Validation → semantic/<sub>, Parse → parse/<sub>). Error sites use
     /// the constants, never raw literals — so a typo'd subcategory fails
     /// HERE instead of silently minting a phantom identifier at runtime.
-    /// (Ported to the burned rows at the sys::help phase-1 cutover.)
+    /// (Ported to the burned system rows at the identifier-registry cutover.)
     #[test]
     fn subcategory_constants_are_registered() {
         let rows = burned_rows();

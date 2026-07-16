@@ -39,7 +39,9 @@ impl BinEntity for UnmountPredicate {
                 data_type: "String".to_string(),
                 _is_optional: false,
             }],
-            output_schema: OutputSchema::Relation(vec![("ns".to_string(), "String".to_string())]),
+            // The receipt heading is the DESCRIPTOR's declaration
+            // (Phase 6 slice 2): core + ruled §8 additions.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("unmount")),
         }
     }
 
@@ -80,8 +82,10 @@ impl EffectExecutable for UnmountPredicate {
 
         system.unmount_database(&namespace)?;
 
-        Ok(EntityResult::Relation(super::directive_result(
-            &namespace, alias,
+        Ok(EntityResult::Relation(super::descriptor_core_receipt(
+            "unmount",
+            &[Some(namespace.clone())],
+            alias,
         )))
     }
 }

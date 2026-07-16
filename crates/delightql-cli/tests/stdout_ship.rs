@@ -153,7 +153,7 @@ fn run_twice_on_one_session_gets_fresh_scratch() {
     drop(conn);
     write(
         &tmp.path().join("ddl/mark.dql"),
-        "main!(*) :- _(msg @ \"ran\") |> insert!(audit_log(msg))(*)\n",
+        "main!(*) :- _(msg @ \"ran\") |> insert!(audit_log(*))(*)\n",
     );
 
     let (ok, stdout, stderr) = run_dql(

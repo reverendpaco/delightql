@@ -138,6 +138,7 @@ fn try_extract_foreign_key(
         functor,
         arguments,
         exists,
+        ..
     } = condition.as_ref()
     else {
         return None;

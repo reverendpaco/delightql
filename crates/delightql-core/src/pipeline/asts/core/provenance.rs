@@ -75,6 +75,41 @@ pub enum CteOrigin {
     CompilerGenerated,
 }
 
+impl Default for CteOrigin {
+    fn default() -> Self {
+        CteOrigin::UserDefined
+    }
+}
+
+/// WHOSE scope resolves a CTE's names — a DIFFERENT property from
+/// `CteOrigin` (who constructed it). The squished HO expansion
+/// compiler-constructs BOTH the caller-side carriers (piped source, join
+/// input, HO arguments — their terms are the caller's text, so they
+/// resolve under the caller's scope) AND the entity's own clause-body
+/// wrappers (the entity's file text, resolved under the entity's scope
+/// where its file-local aliases live). Review qmqwqlms round 3, P1:
+/// keying the 462-weave scope override on CteOrigin conflated the two
+/// and sent entity bodies to the caller's scope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CteResolutionOwner {
+    /// Resolve under the scope the resolver is already in: the entity's
+    /// own scope inside a definition, the query's scope at top level.
+    Entity,
+    /// A carrier for caller-authored terms. The authored namespace is carried
+    /// on the term itself: `None` is the interactive/prompt scope, `Some(ns)`
+    /// is a definition authored in `ns`. Resolution never has to recover this
+    /// fact from a name or a second ambient config field.
+    Caller {
+        resolution_namespace: Option<String>,
+    },
+}
+
+impl Default for CteResolutionOwner {
+    fn default() -> Self {
+        CteResolutionOwner::Entity
+    }
+}
+
 /// Context describing WHY a column has this particular identity at this point
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IdentityContext {

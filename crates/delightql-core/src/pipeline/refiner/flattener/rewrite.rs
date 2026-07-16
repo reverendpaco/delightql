@@ -390,6 +390,7 @@ pub(super) fn apply_scope_aliases_to_sigma(
         }
         resolved::SigmaCondition::SigmaCall {
             functor,
+            namespace,
             arguments,
             exists,
         } => {
@@ -402,6 +403,7 @@ pub(super) fn apply_scope_aliases_to_sigma(
                 .collect();
             resolved::SigmaCondition::SigmaCall {
                 functor,
+                namespace,
                 arguments,
                 exists,
             }

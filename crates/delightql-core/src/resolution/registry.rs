@@ -250,9 +250,16 @@ impl<'a> DatabaseRegistry<'a> {
                 .map(|i| i.name.as_str())
                 .collect::<Vec<_>>()
                 .join("::");
-            system
-                .get_canonical_entity_name(&fq, table_name)?
-                .unwrap_or_else(|| delightql_types::SqlIdentifier::new(table_name))
+            let activated_name = system.get_canonical_entity_name(&fq, table_name)?;
+            // Bootstrap routing is not exposure. Several sys::* namespaces
+            // share connection 1, but a physical bootstrap table is public in
+            // a namespace only when an entity was activated THERE. Without
+            // this gate the raw PRAGMA fallback below made every bootstrap
+            // table reachable through every sys::* qualifier.
+            if connection_id == Some(1) && activated_name.is_none() {
+                return Ok(None);
+            }
+            activated_name.unwrap_or_else(|| delightql_types::SqlIdentifier::new(table_name))
         } else {
             delightql_types::SqlIdentifier::new(table_name)
         };
@@ -682,7 +689,7 @@ impl Default for ConsultRegistry {
 /// Namespace scope for ER-rule queries
 #[cfg(not(target_arch = "wasm32"))]
 enum ErRuleScope<'a> {
-    /// Only rules from namespaces enlisted into 'main'
+    /// Only rules from namespaces enlisted into the session scope `home` (Phase 7/2H)
     Enlisted,
     /// Only rules from a specific namespace (by fq_name)
     Namespace(&'a str),
@@ -697,9 +704,13 @@ impl<'a> ErRuleScope<'a> {
         match self {
             Self::Enlisted => (
                 "",
-                "JOIN enlisted_namespace bn ON bn.from_namespace_id = n.id \
-                 JOIN namespace main_ns ON main_ns.id = bn.to_namespace_id \
-                    AND main_ns.fq_name = 'main'",
+                // Phase 7/2H: admit namespaces enlisted into `home` AND
+                // `home` itself (in-session definitions live in the scope).
+                "JOIN namespace scope_ns ON scope_ns.fq_name = 'home' \
+                    AND (n.id = scope_ns.id OR EXISTS (SELECT 1 \
+                         FROM enlisted_namespace bn \
+                         WHERE bn.from_namespace_id = n.id \
+                           AND bn.to_namespace_id = scope_ns.id))",
             ),
             Self::Namespace(_) => (" AND n.fq_name = ?5", ""),
         }
@@ -711,9 +722,13 @@ impl<'a> ErRuleScope<'a> {
         match self {
             Self::Enlisted => (
                 "",
-                "JOIN enlisted_namespace bn ON bn.from_namespace_id = n.id \
-                 JOIN namespace main_ns ON main_ns.id = bn.to_namespace_id \
-                    AND main_ns.fq_name = 'main'",
+                // Phase 7/2H: admit namespaces enlisted into `home` AND
+                // `home` itself (in-session definitions live in the scope).
+                "JOIN namespace scope_ns ON scope_ns.fq_name = 'home' \
+                    AND (n.id = scope_ns.id OR EXISTS (SELECT 1 \
+                         FROM enlisted_namespace bn \
+                         WHERE bn.from_namespace_id = n.id \
+                           AND bn.to_namespace_id = scope_ns.id))",
             ),
             Self::Namespace(_) => (" AND n.fq_name = ?3", ""),
         }
@@ -933,7 +948,12 @@ impl ConsultRegistry {
     /// Queries bootstrap: entity JOIN activated_entity JOIN namespace
     /// where entity.name = name AND namespace.fq_name = namespace_fq
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn lookup_entity(&self, name: &str, namespace_fq: &str) -> Option<ConsultedEntity> {
+    pub fn lookup_entity(
+        &self,
+        name: &str,
+        namespace_fq: &str,
+        scope: Option<&str>,
+    ) -> Option<ConsultedEntity> {
         let system = self.system?;
         // SAFETY: System pointer is valid for the lifetime of the resolver
         let system_ref = unsafe { &*system };
@@ -966,7 +986,15 @@ impl ConsultRegistry {
                  JOIN namespace n ON n.id = ae.namespace_id
                  WHERE e.name = ?1 COLLATE NOCASE
                    AND (n.fq_name = ?2
-                        OR n.id IN (SELECT target_namespace_id FROM namespace_alias WHERE alias = ?2))",
+                        OR (?3 IS NULL AND n.id IN (
+                              SELECT target_namespace_id FROM namespace_alias
+                              WHERE alias = ?2))
+                        OR (?3 IS NOT NULL AND n.id IN (
+                              SELECT nla.target_namespace_id
+                              FROM namespace_local_alias nla
+                              JOIN namespace owner ON owner.id = nla.namespace_id
+                                 AND owner.fq_name = ?3
+                              WHERE nla.alias = ?2)))",
             )
             .ok()?;
 
@@ -980,7 +1008,7 @@ impl ConsultRegistry {
             ))
         };
 
-        let result = match stmt.query_row(rusqlite::params![name, namespace_fq], map_row) {
+        let result = match stmt.query_row(rusqlite::params![name, namespace_fq, scope], map_row) {
             Ok(r) => r,
             Err(_) => {
                 // §IV MIDDLE ACCESS RUNG (plain qualifier): the exact
@@ -998,7 +1026,7 @@ impl ConsultRegistry {
                 let expanded = crate::system::expand_plain_namespace(&conn, namespace_fq)
                     .ok()
                     .flatten()?;
-                stmt.query_row(rusqlite::params![name, expanded], map_row)
+                stmt.query_row(rusqlite::params![name, expanded, scope], map_row)
                     .ok()?
             }
         };
@@ -1069,7 +1097,7 @@ impl ConsultRegistry {
 
     /// WASM stub: consult lookups not supported
     #[cfg(target_arch = "wasm32")]
-    pub fn lookup_entity(&self, _name: &str, _namespace_fq: &str) -> Option<ConsultedEntity> {
+    pub fn lookup_entity(&self, _name: &str, _namespace_fq: &str, _scope: Option<&str>) -> Option<ConsultedEntity> {
         None
     }
 
@@ -1100,7 +1128,7 @@ impl ConsultRegistry {
         Ok(())
     }
 
-    /// Look up a consulted function by name across all namespaces enlisted into "main".
+    /// Look up a consulted function by name across all namespaces enlisted into the `home` session scope.
     ///
     /// Used for function inlining via enlist (as opposed to grounding).
     /// Only returns functions (entity_type = 1) from consulted namespaces.
@@ -1108,6 +1136,7 @@ impl ConsultRegistry {
     pub fn lookup_enlisted_function(
         &self,
         name: &str,
+        scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         let Some(system) = self.system else {
             return Ok(None);
@@ -1125,10 +1154,17 @@ impl ConsultRegistry {
         let mut stmt = conn
             .prepare(
                 "WITH RECURSIVE reachable(ns_id) AS (
+                    SELECT id FROM namespace WHERE fq_name = ?3
+                    UNION
                     SELECT en.from_namespace_id
                     FROM enlisted_namespace en
-                    JOIN namespace main_ns ON main_ns.id = en.to_namespace_id
-                       AND main_ns.fq_name = 'main'
+                    JOIN namespace scope_ns ON scope_ns.id = en.to_namespace_id
+                       AND scope_ns.fq_name = ?3
+                    UNION
+                    SELECT nle.enlisted_namespace_id
+                    FROM namespace_local_enlist nle
+                    JOIN namespace scope_ns2 ON scope_ns2.id = nle.namespace_id
+                       AND scope_ns2.fq_name = ?3
                     UNION
                     SELECT exp.exposed_namespace_id
                     FROM exposed_namespace exp
@@ -1154,7 +1190,7 @@ impl ConsultRegistry {
 
         let rows: Vec<(i32, String, i32, Option<String>, String)> = stmt
             .query_map(
-                rusqlite::params![name, EntityType::DqlFunctionExpression.as_i32()],
+                rusqlite::params![name, EntityType::DqlFunctionExpression.as_i32(), scope.unwrap_or("home")],
                 |row| {
                     Ok((
                         row.get::<_, i32>(0)?,
@@ -1213,16 +1249,18 @@ impl ConsultRegistry {
     pub fn lookup_enlisted_function(
         &self,
         _name: &str,
+        _scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         Ok(None)
     }
 
     /// Look up a consulted context-aware function (entity_type = 3) by unqualified name
-    /// across all namespaces enlisted into "main".
+    /// across all namespaces enlisted into the `home` session scope.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn lookup_enlisted_context_aware_function(
         &self,
         name: &str,
+        scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         let Some(system) = self.system else {
             return Ok(None);
@@ -1240,10 +1278,17 @@ impl ConsultRegistry {
         let mut stmt = conn
             .prepare(
                 "WITH RECURSIVE reachable(ns_id) AS (
+                    SELECT id FROM namespace WHERE fq_name = ?3
+                    UNION
                     SELECT en.from_namespace_id
                     FROM enlisted_namespace en
-                    JOIN namespace main_ns ON main_ns.id = en.to_namespace_id
-                       AND main_ns.fq_name = 'main'
+                    JOIN namespace scope_ns ON scope_ns.id = en.to_namespace_id
+                       AND scope_ns.fq_name = ?3
+                    UNION
+                    SELECT nle.enlisted_namespace_id
+                    FROM namespace_local_enlist nle
+                    JOIN namespace scope_ns2 ON scope_ns2.id = nle.namespace_id
+                       AND scope_ns2.fq_name = ?3
                     UNION
                     SELECT exp.exposed_namespace_id
                     FROM exposed_namespace exp
@@ -1269,7 +1314,7 @@ impl ConsultRegistry {
 
         let rows: Vec<(i32, String, i32, Option<String>, String)> = stmt
             .query_map(
-                rusqlite::params![name, EntityType::DqlContextAwareFunctionExpression.as_i32()],
+                rusqlite::params![name, EntityType::DqlContextAwareFunctionExpression.as_i32(), scope.unwrap_or("home")],
                 |row| {
                     Ok((
                         row.get::<_, i32>(0)?,
@@ -1328,16 +1373,18 @@ impl ConsultRegistry {
     pub fn lookup_enlisted_context_aware_function(
         &self,
         _name: &str,
+        _scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         Ok(None)
     }
 
     /// Look up a consulted sigma predicate (entity_type = 9) by unqualified name
-    /// across all namespaces enlisted into "main".
+    /// across all namespaces enlisted into the `home` session scope.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn lookup_enlisted_sigma(
         &self,
         name: &str,
+        scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         let Some(system) = self.system else {
             return Ok(None);
@@ -1355,10 +1402,17 @@ impl ConsultRegistry {
         let mut stmt = conn
             .prepare(
                 "WITH RECURSIVE reachable(ns_id) AS (
+                    SELECT id FROM namespace WHERE fq_name = ?3
+                    UNION
                     SELECT en.from_namespace_id
                     FROM enlisted_namespace en
-                    JOIN namespace main_ns ON main_ns.id = en.to_namespace_id
-                       AND main_ns.fq_name = 'main'
+                    JOIN namespace scope_ns ON scope_ns.id = en.to_namespace_id
+                       AND scope_ns.fq_name = ?3
+                    UNION
+                    SELECT nle.enlisted_namespace_id
+                    FROM namespace_local_enlist nle
+                    JOIN namespace scope_ns2 ON scope_ns2.id = nle.namespace_id
+                       AND scope_ns2.fq_name = ?3
                     UNION
                     SELECT exp.exposed_namespace_id
                     FROM exposed_namespace exp
@@ -1384,7 +1438,7 @@ impl ConsultRegistry {
 
         let rows: Vec<(i32, String, i32, Option<String>, String)> = stmt
             .query_map(
-                rusqlite::params![name, EntityType::DqlTemporarySigmaRule.as_i32()],
+                rusqlite::params![name, EntityType::DqlTemporarySigmaRule.as_i32(), scope.unwrap_or("home")],
                 |row| {
                     Ok((
                         row.get::<_, i32>(0)?,
@@ -1444,152 +1498,21 @@ impl ConsultRegistry {
     pub fn lookup_enlisted_sigma(
         &self,
         _name: &str,
+        _scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         Ok(None)
     }
 
-    /// Look up a consulted sigma predicate (entity_type = 9) by unqualified
-    /// name within a CONSULTED SCOPE: the namespace itself, namespaces
-    /// enlisted into it, and their transitive exposures — the same reachable
-    /// set the relation path uses for unqualified entities
-    /// (`DelightQLSystem::resolve_unqualified_entity`). Companion to
-    /// `lookup_enlisted_sigma` (which sees only namespaces enlisted into
-    /// MAIN and therefore missed a same-file sigma rule while its own
-    /// file's body compiled under `resolution_namespace = Some(ns)`).
-    /// Pinned by sigma_guard_scope_tests
-    /// (bugs/sigma-rule-guard-under-consulted-scope).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn lookup_sigma_in_scope(
-        &self,
-        name: &str,
-        namespace_fq: &str,
-    ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
-        let Some(system) = self.system else {
-            return Ok(None);
-        };
-        let system_ref = unsafe { &*system };
 
-        let bootstrap = system_ref.get_bootstrap_connection();
-        let conn = bootstrap.lock().map_err(|e| {
-            DelightQLError::database_error(
-                "Failed to acquire bootstrap lock for scoped sigma lookup",
-                format!("{}", e),
-            )
-        })?;
-
-        let mut stmt = conn
-            .prepare(
-                "WITH RECURSIVE direct(ns_id) AS (
-                    SELECT scope_ns.id
-                    FROM namespace scope_ns
-                    WHERE scope_ns.fq_name = ?3
-                    UNION
-                    SELECT en.from_namespace_id
-                    FROM enlisted_namespace en
-                    JOIN namespace scope_ns ON scope_ns.id = en.to_namespace_id
-                       AND scope_ns.fq_name = ?3
-                 ),
-                 reachable(ns_id) AS (
-                    SELECT ns_id FROM direct
-                    UNION
-                    SELECT exp.exposed_namespace_id
-                    FROM exposed_namespace exp
-                    JOIN reachable r ON r.ns_id = exp.exposing_namespace_id
-                 )
-                 SELECT e.id, e.name, e.type,
-                        (SELECT GROUP_CONCAT(ec.definition, char(10))
-                         FROM (SELECT definition FROM entity_clause WHERE entity_id = e.id ORDER BY ordinal) ec
-                        ) as definition,
-                        n.fq_name
-                 FROM entity e
-                 JOIN activated_entity ae ON ae.entity_id = e.id
-                 JOIN namespace n ON n.id = ae.namespace_id
-                 JOIN reachable r ON r.ns_id = n.id
-                 WHERE e.name = ?1 COLLATE NOCASE AND e.type = ?2",
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to prepare scoped sigma lookup",
-                    e.to_string(),
-                )
-            })?;
-
-        let rows: Vec<(i32, String, i32, Option<String>, String)> = stmt
-            .query_map(
-                rusqlite::params![
-                    name,
-                    EntityType::DqlTemporarySigmaRule.as_i32(),
-                    namespace_fq
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i32>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i32>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                },
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to query scoped sigma predicates",
-                    e.to_string(),
-                )
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        match rows.len() {
-            0 => Ok(None),
-            1 => {
-                let (entity_id, entity_name, entity_type, definition, namespace) =
-                    rows.into_iter().next().unwrap();
-                let definition = definition.unwrap_or_default();
-                let entity_type = EntityType::from_i32(entity_type).map_err(|e| {
-                    DelightQLError::database_error("corrupt catalog: unknown entity_type", e.to_string())
-                })?;
-                let params = Self::query_params(&conn, entity_id, entity_type);
-                Ok(Some(ConsultedEntity {
-                    name: entity_name.into(),
-                    entity_type,
-                    definition,
-                    params,
-                    positions: Vec::new(),
-                    namespace,
-                }))
-            }
-            _ => {
-                let namespaces: Vec<String> =
-                    rows.iter().map(|(_, _, _, _, ns)| ns.clone()).collect();
-                Err(DelightQLError::validation_error(
-                    format!(
-                        "Ambiguous unqualified sigma predicate '{}': found in multiple namespaces reachable from '{}' [{}]. \
-                         Use qualified syntax to disambiguate.",
-                        name,
-                        namespace_fq,
-                        namespaces.join(", "),
-                    ),
-                    "Ambiguous scoped sigma predicate",
-                ))
-            }
-        }
-    }
-
-    /// WASM stub
-    #[cfg(target_arch = "wasm32")]
-    pub fn lookup_sigma_in_scope(
-        &self,
-        _name: &str,
-        _namespace_fq: &str,
-    ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
-        Ok(None)
-    }
 
     /// Check if an enlisted table expression (entity_type = 6) exists by name.
     /// Used to detect DDL-defined facts that can be used as sigma predicates.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn lookup_enlisted_table(&self, name: &str) -> std::result::Result<bool, DelightQLError> {
+    pub fn lookup_enlisted_table(
+        &self,
+        name: &str,
+        scope: Option<&str>,
+    ) -> std::result::Result<bool, DelightQLError> {
         use crate::bootstrap::enums::EntityType;
 
         let Some(system) = self.system else {
@@ -1612,10 +1535,17 @@ impl ConsultRegistry {
                  WHERE e.name = ?1 COLLATE NOCASE AND e.type = ?2
                  AND n.id IN (
                      WITH RECURSIVE reachable(ns_id) AS (
+                         SELECT id FROM namespace WHERE fq_name = ?3
+                         UNION
                          SELECT en.from_namespace_id
                          FROM enlisted_namespace en
-                         JOIN namespace main_ns ON main_ns.id = en.to_namespace_id
-                            AND main_ns.fq_name = 'main'
+                         JOIN namespace scope_ns ON scope_ns.id = en.to_namespace_id
+                            AND scope_ns.fq_name = ?3
+                         UNION
+                         SELECT nle.enlisted_namespace_id
+                         FROM namespace_local_enlist nle
+                         JOIN namespace scope_ns2 ON scope_ns2.id = nle.namespace_id
+                            AND scope_ns2.fq_name = ?3
                          UNION
                          SELECT exp.exposed_namespace_id
                          FROM exposed_namespace exp
@@ -1623,7 +1553,7 @@ impl ConsultRegistry {
                      )
                      SELECT ns_id FROM reachable
                  )",
-                rusqlite::params![name, EntityType::DqlFactExpression.as_i32()],
+                rusqlite::params![name, EntityType::DqlFactExpression.as_i32(), scope.unwrap_or("home")],
                 |row| row.get(0),
             )
             .unwrap_or(0);
@@ -1633,7 +1563,11 @@ impl ConsultRegistry {
 
     /// WASM stub
     #[cfg(target_arch = "wasm32")]
-    pub fn lookup_enlisted_table(&self, _name: &str) -> std::result::Result<bool, DelightQLError> {
+    pub fn lookup_enlisted_table(
+        &self,
+        _name: &str,
+        _scope: Option<&str>,
+    ) -> std::result::Result<bool, DelightQLError> {
         Ok(false)
     }
 
@@ -1642,6 +1576,7 @@ impl ConsultRegistry {
     pub fn lookup_enlisted_ho_view(
         &self,
         name: &str,
+        scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         let Some(system) = self.system else {
             return Ok(None);
@@ -1659,10 +1594,17 @@ impl ConsultRegistry {
         let mut stmt = conn
             .prepare(
                 "WITH RECURSIVE reachable(ns_id) AS (
+                    SELECT id FROM namespace WHERE fq_name = ?3
+                    UNION
                     SELECT en.from_namespace_id
                     FROM enlisted_namespace en
-                    JOIN namespace main_ns ON main_ns.id = en.to_namespace_id
-                       AND main_ns.fq_name = 'main'
+                    JOIN namespace scope_ns ON scope_ns.id = en.to_namespace_id
+                       AND scope_ns.fq_name = ?3
+                    UNION
+                    SELECT nle.enlisted_namespace_id
+                    FROM namespace_local_enlist nle
+                    JOIN namespace scope_ns2 ON scope_ns2.id = nle.namespace_id
+                       AND scope_ns2.fq_name = ?3
                     UNION
                     SELECT exp.exposed_namespace_id
                     FROM exposed_namespace exp
@@ -1688,7 +1630,7 @@ impl ConsultRegistry {
 
         let rows: Vec<(i32, String, i32, Option<String>, String)> = stmt
             .query_map(
-                rusqlite::params![name, EntityType::DqlHoTemporaryViewExpression.as_i32()],
+                rusqlite::params![name, EntityType::DqlHoTemporaryViewExpression.as_i32(), scope.unwrap_or("home")],
                 |row| {
                     Ok((
                         row.get::<_, i32>(0)?,
@@ -1745,6 +1687,7 @@ impl ConsultRegistry {
     pub fn lookup_enlisted_ho_view(
         &self,
         _name: &str,
+        _scope: Option<&str>,
     ) -> std::result::Result<Option<ConsultedEntity>, DelightQLError> {
         Ok(None)
     }
@@ -2057,228 +2000,14 @@ impl ConsultRegistry {
         None
     }
 
-    /// Temporarily activate namespace-local enlists into the DDL's own namespace scope.
-    /// Returns the list of (from_namespace_id, to_namespace_id) rows inserted,
-    /// for later deactivation.
-    ///
-    /// Engages are scoped to the DDL namespace (not main) so that
-    /// `resolve_unqualified_entity(name, ddl_ns)` sees only the DDL's enlisted
-    /// entities — avoiding ambiguity with main's entities when names overlap.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn activate_namespace_local_enlists(&self, namespace_fq: &str) -> Vec<(i32, i32)> {
-        self.activate_namespace_local_enlists_into(namespace_fq, namespace_fq)
-    }
 
-    /// Activate namespace-local enlists into "main" so that `lookup_enlisted_function`
-    /// (which searches enlisted_namespace with to_namespace = main) can find them.
-    /// Used by BorrowedInliner when inlining functions from nested namespaces.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn activate_namespace_local_enlists_into_main(
-        &self,
-        namespace_fq: &str,
-    ) -> Vec<(i32, i32)> {
-        self.activate_namespace_local_enlists_into(namespace_fq, "main")
-    }
 
-    /// Core: activate namespace-local enlists, inserting enlisted_namespace rows
-    /// pointing to `target_ns_fq`.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn activate_namespace_local_enlists_into(
-        &self,
-        namespace_fq: &str,
-        target_ns_fq: &str,
-    ) -> Vec<(i32, i32)> {
-        let Some(system) = self.system else {
-            return Vec::new();
-        };
-        let system_ref = unsafe { &*system };
 
-        let bootstrap = system_ref.get_bootstrap_connection();
-        let conn = match bootstrap.lock() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
 
-        // Get the target namespace ID
-        let target_ns_id: i32 = match conn.query_row(
-            "SELECT id FROM namespace WHERE fq_name = ?1",
-            [target_ns_fq],
-            |row| row.get(0),
-        ) {
-            Ok(id) => id,
-            Err(_) => return Vec::new(),
-        };
 
-        // Get namespace-local enlist IDs
-        let mut stmt = match conn.prepare(
-            "SELECT nle.enlisted_namespace_id
-             FROM namespace_local_enlist nle
-             JOIN namespace ns ON ns.id = nle.namespace_id AND ns.fq_name = ?1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
 
-        let enlisted_ids: Vec<i32> =
-            match stmt.query_map([namespace_fq], |row| row.get::<_, i32>(0)) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => return Vec::new(),
-            };
-        drop(stmt);
 
-        // Insert each as an enlisted_namespace (from=enlisted_ns, to=target_ns)
-        let mut inserted = Vec::new();
-        for enlisted_id in enlisted_ids {
-            // Only insert if not already enlisted
-            let already = conn.query_row(
-                "SELECT COUNT(*) FROM enlisted_namespace WHERE from_namespace_id = ?1 AND to_namespace_id = ?2",
-                rusqlite::params![enlisted_id, target_ns_id],
-                |row| row.get::<_, i32>(0),
-            ).unwrap_or(0);
 
-            if already == 0 {
-                if conn.execute(
-                    "INSERT INTO enlisted_namespace (from_namespace_id, to_namespace_id) VALUES (?1, ?2)",
-                    rusqlite::params![enlisted_id, target_ns_id],
-                ).is_ok() {
-                    inserted.push((enlisted_id, target_ns_id));
-                }
-            }
-        }
 
-        inserted
-    }
 
-    /// WASM stub
-    #[cfg(target_arch = "wasm32")]
-    pub fn activate_namespace_local_enlists(&self, _namespace_fq: &str) -> Vec<(i32, i32)> {
-        Vec::new()
-    }
-
-    /// WASM stub
-    #[cfg(target_arch = "wasm32")]
-    pub fn activate_namespace_local_enlists_into_main(
-        &self,
-        _namespace_fq: &str,
-    ) -> Vec<(i32, i32)> {
-        Vec::new()
-    }
-
-    /// Deactivate previously activated namespace-local enlists.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn deactivate_namespace_local_enlists(&self, activated: &[(i32, i32)]) {
-        let Some(system) = self.system else {
-            return;
-        };
-        let system_ref = unsafe { &*system };
-
-        let bootstrap = system_ref.get_bootstrap_connection();
-        let conn = match bootstrap.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        for (from_id, to_id) in activated {
-            let _ = conn.execute(
-                "DELETE FROM enlisted_namespace WHERE from_namespace_id = ?1 AND to_namespace_id = ?2",
-                rusqlite::params![from_id, to_id],
-            );
-        }
-    }
-
-    /// WASM stub
-    #[cfg(target_arch = "wasm32")]
-    pub fn deactivate_namespace_local_enlists(&self, _activated: &[(i32, i32)]) {}
-
-    /// Activate namespace-local aliases for a DDL namespace during view resolution.
-    /// Returns the list of aliases inserted (for cleanup).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn activate_namespace_local_aliases(&self, namespace_fq: &str) -> Vec<(String, i32)> {
-        let Some(system) = self.system else {
-            return Vec::new();
-        };
-        let system_ref = unsafe { &*system };
-
-        let bootstrap = system_ref.get_bootstrap_connection();
-        let conn = match bootstrap.lock() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-
-        // Query namespace_local_alias for aliases defined in this DDL namespace
-        let mut stmt = match conn.prepare(
-            "SELECT nla.alias, nla.target_namespace_id
-             FROM namespace_local_alias nla
-             JOIN namespace ns ON ns.id = nla.namespace_id AND ns.fq_name = ?1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        let alias_rows: Vec<(String, i32)> = match stmt.query_map([namespace_fq], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(_) => return Vec::new(),
-        };
-        drop(stmt);
-
-        // Insert each into namespace_alias (only if not already present)
-        let mut inserted = Vec::new();
-        for (alias, target_id) in alias_rows {
-            let already = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM namespace_alias WHERE alias = ?1",
-                    rusqlite::params![alias],
-                    |row| row.get::<_, i32>(0),
-                )
-                .unwrap_or(0);
-
-            if already == 0 {
-                if conn
-                    .execute(
-                        "INSERT INTO namespace_alias (alias, target_namespace_id) VALUES (?1, ?2)",
-                        rusqlite::params![alias, target_id],
-                    )
-                    .is_ok()
-                {
-                    inserted.push((alias, target_id));
-                }
-            }
-        }
-
-        inserted
-    }
-
-    /// WASM stub
-    #[cfg(target_arch = "wasm32")]
-    pub fn activate_namespace_local_aliases(&self, _namespace_fq: &str) -> Vec<(String, i32)> {
-        Vec::new()
-    }
-
-    /// Deactivate previously activated namespace-local aliases.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn deactivate_namespace_local_aliases(&self, activated: &[(String, i32)]) {
-        let Some(system) = self.system else {
-            return;
-        };
-        let system_ref = unsafe { &*system };
-
-        let bootstrap = system_ref.get_bootstrap_connection();
-        let conn = match bootstrap.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        for (alias, _target_id) in activated {
-            let _ = conn.execute(
-                "DELETE FROM namespace_alias WHERE alias = ?1",
-                rusqlite::params![alias],
-            );
-        }
-    }
-
-    /// WASM stub
-    #[cfg(target_arch = "wasm32")]
-    pub fn deactivate_namespace_local_aliases(&self, _activated: &[(String, i32)]) {}
 }

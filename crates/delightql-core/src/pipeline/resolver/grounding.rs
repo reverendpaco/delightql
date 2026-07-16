@@ -85,6 +85,7 @@ fn lookup_borrowed_function(
     name: &str,
     namespace: Option<&ast_unresolved::NamespacePath>,
     consult: &ConsultRegistry,
+    scope: Option<&str>,
 ) -> Result<Option<crate::resolution::registry::ConsultedEntity>> {
     if let Some(ns) = namespace {
         let fq = namespace_path_to_fq(ns);
@@ -93,10 +94,10 @@ fn lookup_borrowed_function(
         // gets the badged refusal, not a confusing "no such function".
         consult.refuse_if_blueprint_fq(&fq)?;
         Ok(consult
-            .lookup_entity(name, &fq)
+            .lookup_entity(name, &fq, scope)
             .filter(|e| e.entity_type == EntityType::DqlFunctionExpression))
     } else {
-        consult.lookup_enlisted_function(name)
+        consult.lookup_enlisted_function(name, scope)
     }
 }
 
@@ -105,16 +106,17 @@ fn lookup_borrowed_context_aware_function(
     name: &str,
     namespace: Option<&ast_unresolved::NamespacePath>,
     consult: &ConsultRegistry,
+    scope: Option<&str>,
 ) -> Result<Option<crate::resolution::registry::ConsultedEntity>> {
     if let Some(ns) = namespace {
         let fq = namespace_path_to_fq(ns);
         // Blueprint inertness, loud door (M2, --74) — see lookup_borrowed_function.
         consult.refuse_if_blueprint_fq(&fq)?;
         Ok(consult
-            .lookup_entity(name, &fq)
+            .lookup_entity(name, &fq, scope)
             .filter(|e| e.entity_type == EntityType::DqlContextAwareFunctionExpression))
     } else {
-        consult.lookup_enlisted_context_aware_function(name)
+        consult.lookup_enlisted_context_aware_function(name, scope)
     }
 }
 
@@ -249,11 +251,18 @@ fn discover_nested_cfes_inner(
                 } => {
                     let name_str = name.to_string();
                     if !seen.contains(&name_str) {
-                        // Activate namespace-local enlistments for the source namespace
-                        let activated =
-                            consult.activate_namespace_local_enlists_into_main(source_ns);
-                        let entity =
-                            lookup_borrowed_function(&name_str, namespace.as_ref(), consult);
+                        // STRICT definition independence (Phase 7 stage 2,
+                        // owner-ratified): the lookup is SCOPED to the source
+                        // namespace — its own edges (namespace_local_enlist)
+                        // and itself — never the caller's session. The old
+                        // activate-into-scope dance is gone; the scoped seed
+                        // reads the namespace-owned edges directly.
+                        let entity = lookup_borrowed_function(
+                            &name_str,
+                            namespace.as_ref(),
+                            consult,
+                            Some(source_ns),
+                        );
                         // Also try context-aware functions
                         let ccafe_entity =
                             if entity.as_ref().ok().and_then(|e| e.as_ref()).is_none() {
@@ -261,11 +270,11 @@ fn discover_nested_cfes_inner(
                                     &name_str,
                                     namespace.as_ref(),
                                     consult,
+                                    Some(source_ns),
                                 )
                             } else {
                                 Ok(None)
                             };
-                        consult.deactivate_namespace_local_enlists(&activated);
 
                         let entity = entity?.or(ccafe_entity?);
                         if let Some(entity) = entity {
@@ -356,6 +365,10 @@ fn discover_nested_cfes_inner(
 struct BorrowedInliner<'a> {
     consult: &'a ConsultRegistry,
     data_ns: Option<&'a ast_unresolved::NamespacePath>,
+    /// STRICT definition scope (Phase 7/9): inside a consulted view body
+    /// the sibling-function lookups resolve against the OWNING namespace
+    /// (its own edges), never the caller's session. None = the prompt.
+    scope: Option<&'a str>,
     /// Functions discovered during fold, to be precompiled and injected
     /// as WithPrecompiledCfes by the resolver.
     collected_ccafe_cfes: Vec<CfeDefinition>,
@@ -390,7 +403,7 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
                 // Lookup entity in borrowed namespaces (type=1 — regular functions)
                 if !self.discovery_only {
                     let entity =
-                        lookup_borrowed_function(&name_str, namespace.as_ref(), self.consult)?;
+                        lookup_borrowed_function(&name_str, namespace.as_ref(), self.consult, self.scope)?;
 
                     if let Some(entity) = entity {
                         debug!(
@@ -427,6 +440,7 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
                     &name_str,
                     namespace.as_ref(),
                     self.consult,
+                    self.scope,
                 )?;
                 if let Some(entity) = ccafe_entity {
                     debug!(
@@ -568,7 +582,7 @@ impl BorrowedInliner<'_> {
     fn collect_curried_consulted_function(&mut self, function: &FunctionExpression) -> Result<()> {
         if let Some((name, namespace)) = extract_empty_curried_name(function) {
             // Type=1: regular consulted function
-            let entity = lookup_borrowed_function(&name, namespace.as_ref(), self.consult)?;
+            let entity = lookup_borrowed_function(&name, namespace.as_ref(), self.consult, self.scope)?;
             if let Some(entity) = entity {
                 debug!(
                     "Collecting DDL function '{}' from namespace '{}' for precompilation (cover operator)",
@@ -598,7 +612,7 @@ impl BorrowedInliner<'_> {
 
             // Type=3: context-aware consulted function
             let ccafe_entity =
-                lookup_borrowed_context_aware_function(&name, namespace.as_ref(), self.consult)?;
+                lookup_borrowed_context_aware_function(&name, namespace.as_ref(), self.consult, self.scope)?;
             if let Some(entity) = ccafe_entity {
                 debug!(
                     "Collecting DDL context-aware function '{}' from namespace '{}' for precompilation (cover operator)",
@@ -626,10 +640,12 @@ pub(super) fn inline_consulted_functions_in_operator_borrowed(
     operator: ast_unresolved::UnaryRelationalOperator,
     consult: &ConsultRegistry,
     data_ns: Option<&ast_unresolved::NamespacePath>,
+    scope: Option<&str>,
 ) -> Result<(ast_unresolved::UnaryRelationalOperator, Vec<CfeDefinition>)> {
     let mut inliner = BorrowedInliner {
         consult,
         data_ns,
+        scope,
         collected_ccafe_cfes: vec![],
         discovery_only: false,
     };
@@ -668,13 +684,13 @@ impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
                 let entity = if let Some(ns) = &namespace {
                     let fq = namespace_path_to_fq(ns);
                     self.consult
-                        .lookup_entity(&name, &fq)
+                        .lookup_entity(&name, &fq, None)
                         .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
                 } else {
                     self.grounding.grounded_ns.iter().find_map(|ns| {
                         let fq = namespace_path_to_fq(ns);
                         self.consult
-                            .lookup_entity(&name, &fq)
+                            .lookup_entity(&name, &fq, None)
                             .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
                     })
                 };
@@ -734,13 +750,13 @@ impl GroundedInliner<'_> {
             let entity = if let Some(ns) = &namespace {
                 let fq = namespace_path_to_fq(ns);
                 self.consult
-                    .lookup_entity(&name, &fq)
+                    .lookup_entity(&name, &fq, None)
                     .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
             } else {
                 self.grounding.grounded_ns.iter().find_map(|ns| {
                     let fq = namespace_path_to_fq(ns);
                     self.consult
-                        .lookup_entity(&name, &fq)
+                        .lookup_entity(&name, &fq, None)
                         .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
                 })
             };
@@ -1010,7 +1026,11 @@ pub(super) fn expand_consulted_view(
         let query = ddl_def.into_query().ok_or_else(|| {
             DelightQLError::parse_error("Expected relational body for view, got scalar")
         })?;
-        return Ok(patch_data_ns_query(query, &grounding.data_ns));
+        return Ok(patch_data_ns_query(
+            query,
+            &grounding.data_ns,
+            &std::collections::HashSet::new(),
+        ));
     }
 
     // Multi-clause: synthesize disjunctive CTEs
@@ -1036,7 +1056,7 @@ pub(super) fn expand_multi_clause_view(
             )
         })?;
         let patched = if let Some(ns) = data_ns {
-            patch_data_ns_query(query, ns)
+            patch_data_ns_query(query, ns, &std::collections::HashSet::new())
         } else {
             query
         };
@@ -1045,6 +1065,9 @@ pub(super) fn expand_multi_clause_view(
             ast_unresolved::Query::Relational(expr) => {
                 all_ctes.push(ast_unresolved::CteBinding {
                     name: view_name.clone(),
+                    origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                    resolution_owner:
+                        crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
                     expression: expr,
                     effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
@@ -1061,6 +1084,9 @@ pub(super) fn expand_multi_clause_view(
                 }
                 all_ctes.push(ast_unresolved::CteBinding {
                     name: view_name.clone(),
+                    origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                    resolution_owner:
+                        crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
                     expression: main_expr,
                     effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
@@ -1404,10 +1430,12 @@ pub(super) fn inline_in_query_borrowed(
     query: ast_unresolved::Query,
     consult: &ConsultRegistry,
     data_ns: Option<&ast_unresolved::NamespacePath>,
+    scope: Option<&str>,
 ) -> Result<(ast_unresolved::Query, Vec<CfeDefinition>)> {
     let mut inliner = BorrowedInliner {
         consult,
         data_ns,
+        scope,
         collected_ccafe_cfes: vec![],
         discovery_only: false,
     };
@@ -1717,6 +1745,9 @@ pub(super) fn split_ho_first_parens(
     pipe_source: Option<&ast_unresolved::RelationalExpression>,
     argument_groups: Option<&[crate::pipeline::asts::core::operators::HoCallGroup]>,
     ho_arguments: &[ast_unresolved::HoArgument],
+    aliases: &super::ResolverAliasCounter,
+    registry: &mut crate::resolution::EntityRegistry,
+    caller_scope: Option<&str>,
 ) -> Result<(HoParamBindings, ast_unresolved::DomainSpec, Option<usize>)> {
     use crate::resolution::registry::HoParamKind;
 
@@ -1916,39 +1947,70 @@ pub(super) fn split_ho_first_parens(
 
         match &param.kind {
             HoParamKind::Glob => {
-                // Check ho_arguments for interior table expressions that need CTE materialization.
-                // If the HoArgument::Table has interior (not a bare Ground), materialize as CTE.
+                // EVERY caller-authored Glob argument rides a carrier CTE —
+                // bare references included (review zmvnywzu, P1: the bare
+                // fast path name-substituted the reference INLINE into the
+                // entity's clause bodies, so an enlisted rule or aliased
+                // reference resolved in the ENTITY's scope and missed; it
+                // also dropped a bare reference's namespace qualifier).
+                // The carrier is Caller-owned, so the caller's scope serves
+                // its own names. Carrier names are counter-uniquified: two
+                // invocations in one query must not UNION-merge through the
+                // same-name CTE machinery.
                 if let Some(ast_unresolved::HoArgument::Table(ref rel_expr)) =
                     ho_arguments.get(expr_idx)
                 {
-                    if is_bare_table_ref(rel_expr) {
-                        // Bare table reference — extract name (same as legacy path)
-                        let name = extract_table_name(rel_expr);
+                    let plain_inline_name = match rel_expr {
+                        ast_unresolved::RelationalExpression::Relation(
+                            ast_unresolved::Relation::Ground {
+                                identifier,
+                                domain_spec:
+                                    ast_unresolved::DomainSpec::Glob | ast_unresolved::DomainSpec::Bare,
+                                ..
+                            },
+                        ) if identifier.namespace_path.is_empty()
+                            && identifier.grounding.is_none() =>
+                        {
+                            let name = identifier.name.to_string();
+                            plain_arg_may_inline(&name, registry, caller_scope).then_some(name)
+                        }
+                        _ => None,
+                    };
+                    if let Some(name) = plain_inline_name {
                         bindings.table_params.insert(param.name.clone(), name);
                     } else {
-                        // Interior table expression — materialize as CTE.
                         // Normalize: unwrap InnerRelation, patch Bare→Glob so
                         // columns are visible for filter/projection resolution.
-                        let cte_name = format!("_ho_arg_{}", param.name);
-                        bindings
-                            .table_params
-                            .insert(param.name.clone(), cte_name.clone());
-                        let normalized = normalize_interior_for_cte(rel_expr.clone());
-                        bindings.interior_ctes.push((cte_name, normalized));
+                        let normalized =
+                            normalize_interior_for_cte(patch_bare_to_glob(rel_expr.clone()));
+                        bind_glob_carrier(&mut bindings, &param.name, normalized, aliases);
                     }
                 } else {
-                    // Fallback: use legacy DomainExpression path
+                    // Fallback: legacy DomainExpression path (the piped
+                    // invocation forms supply no ho_arguments) — same inline
+                    // decision; a carried name becomes the reference it
+                    // denotes, resolved in the caller's scope.
                     match expr {
                         ast_unresolved::DomainExpression::Lvar { name, .. } => {
-                            bindings
-                                .table_params
-                                .insert(param.name.clone(), name.to_string());
+                            if plain_arg_may_inline(name.as_str(), registry, caller_scope) {
+                                bindings
+                                    .table_params
+                                    .insert(param.name.clone(), name.to_string());
+                            } else {
+                                let rel = bare_glob_reference(name.as_str());
+                                bind_glob_carrier(&mut bindings, &param.name, rel, aliases);
+                            }
                         }
                         ast_unresolved::DomainExpression::Literal {
                             value: crate::pipeline::asts::core::LiteralValue::String(s),
                             ..
                         } => {
-                            bindings.table_params.insert(param.name.clone(), s.clone());
+                            if plain_arg_may_inline(s, registry, caller_scope) {
+                                bindings.table_params.insert(param.name.clone(), s.clone());
+                            } else {
+                                let rel = bare_glob_reference(s);
+                                bind_glob_carrier(&mut bindings, &param.name, rel, aliases);
+                            }
                         }
                         _ => {
                             return Err(DelightQLError::validation_error(
@@ -2136,25 +2198,71 @@ pub(super) fn split_ho_first_parens(
 /// Check if a relational expression is a bare table reference (just a table name with Glob or Bare domain spec).
 /// Returns false for InnerRelation, Filter, Pipe, and Ground with Positional domain spec
 /// (which represents a projection that needs CTE materialization).
-fn is_bare_table_ref(expr: &ast_unresolved::RelationalExpression) -> bool {
+/// Bind a Glob param to a fresh Caller-carrier CTE holding `expr`.
+/// One shared implementation for the structured (`ho_arguments`) and the
+/// legacy name-only argument roads (review zmqwqlms-family discipline:
+/// invariants live in shared implementations).
+fn bind_glob_carrier(
+    bindings: &mut crate::pipeline::query_features::HoParamBindings,
+    param_name: &str,
+    expr: ast_unresolved::RelationalExpression,
+    aliases: &super::ResolverAliasCounter,
+) {
+    let (alias, _) = aliases.next_alias_with_id();
+    let cte_name = format!("_ho_arg_{}{}", param_name, alias);
+    bindings
+        .table_params
+        .insert(param_name.to_string(), cte_name.clone());
+    bindings.interior_ctes.push((cte_name, expr));
+}
+
+/// May a plain HO argument NAME be inlined into the entity's clause bodies,
+/// or must it ride a Caller carrier? Inline keeps the caller's spelling in
+/// name-reifying positions (`^T` meta-izes the TABLE NAME as data), so it is
+/// preserved exactly where it has always been correct: at the PROMPT, for a
+/// name that is a query-local CTE (scope-free) or a physical table (served
+/// identically in the entity's scope by the ambient-data fallback) — or an
+/// unknown (its refusal should keep the caller's spelling too). A consulted
+/// RULE, an alias, any qualified reference, or ANY name authored inside a
+/// definition resolves scope-DEPENDENTLY and must carry the caller's scope
+/// (review zmvnywzu, P1).
+fn plain_arg_may_inline(
+    name: &str,
+    registry: &mut crate::resolution::EntityRegistry,
+    caller_scope: Option<&str>,
+) -> bool {
+    if caller_scope.is_some() {
+        return false;
+    }
+    use crate::resolution::{resolve_entity_with_alias, ResolutionResult};
     matches!(
-        expr,
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            domain_spec: ast_unresolved::DomainSpec::Glob | ast_unresolved::DomainSpec::Bare,
-            ..
-        })
+        resolve_entity_with_alias(name, None, registry, None),
+        ResolutionResult::CTE(_)
+            | ResolutionResult::DatabaseEntity(_)
+            | ResolutionResult::BuiltInFunction { .. }
+            | ResolutionResult::Unknown(_)
     )
 }
 
-/// Extract the table name from a bare Ground relational expression.
-fn extract_table_name(expr: &ast_unresolved::RelationalExpression) -> String {
-    match expr {
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier,
-            ..
-        }) => identifier.name.to_string(),
-        _ => String::new(),
-    }
+/// A `name(*)` reference for a name-only (legacy) HO argument. The name is
+/// the caller's text, so the carrier resolves it in the caller's scope.
+fn bare_glob_reference(name: &str) -> ast_unresolved::RelationalExpression {
+    ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
+        identifier: ast_unresolved::QualifiedName {
+            namespace_path: ast_unresolved::NamespacePath::empty(),
+            name: name.into(),
+            grounding: None,
+        },
+        canonical_name: ast_unresolved::PhaseBox::phantom(),
+        backend_schema: ast_unresolved::PhaseBox::phantom(),
+        domain_spec: ast_unresolved::DomainSpec::Glob,
+        alias: None,
+        outer: false,
+        mutation_target: false,
+        passthrough: false,
+        cpr_schema: ast_unresolved::PhaseBox::phantom(),
+        hygienic_injections: Vec::new(),
+    })
 }
 
 /// Normalize an interior table expression for use as a CTE source.
@@ -2317,6 +2425,12 @@ fn extract_clause_ctes(
         ast_unresolved::Query::Relational(expr) => {
             all_ctes.push(ast_unresolved::CteBinding {
                 name: function.to_string(),
+                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                // The ENTITY's own clause body: its terms are the entity
+                // file's text, so its file-local aliases must resolve in
+                // the entity's scope (review qmqwqlms round 3, P1).
+                resolution_owner:
+                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
                 expression: expr,
                 effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
@@ -2331,6 +2445,9 @@ fn extract_clause_ctes(
             }
             all_ctes.push(ast_unresolved::CteBinding {
                 name: function.to_string(),
+                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                resolution_owner:
+                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
                 expression: main_expr,
                 effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
@@ -2432,6 +2549,7 @@ pub(super) fn build_squished_relation(
     pipe_source_cte: Option<(String, ast_unresolved::RelationalExpression)>,
     join_input_cte: Option<(String, ast_unresolved::RelationalExpression)>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
+    caller_resolution_namespace: Option<String>,
 ) -> Result<ast_unresolved::Query> {
     let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
 
@@ -2446,11 +2564,32 @@ pub(super) fn build_squished_relation(
     let mut all_ctes = Vec::new();
     let mut er_context: Option<crate::pipeline::asts::core::ErContextSpec> = None;
 
+    // The query-local carrier CTE names — the EXPLICIT exempt set for
+    // data-namespace patching (review qmqwqlms round 3, P2). Collected
+    // up front, before the carriers are consumed into `all_ctes`.
+    let mut local_cte_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some((name, _)) = &pipe_source_cte {
+        local_cte_names.insert(name.clone());
+    }
+    for (name, _) in &table_bindings.interior_ctes {
+        local_cte_names.insert(name.clone());
+    }
+    if let Some((name, _)) = &join_input_cte {
+        local_cte_names.insert(name.clone());
+    }
+
     // Prepend pipe source CTE if present
     if let Some((cte_name, source_expr)) = pipe_source_cte {
         all_ctes.push(ast_unresolved::CteBinding {
             expression: source_expr,
             name: cte_name,
+            origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+            // Caller-authored terms (the piped source): resolve under the
+            // CALLER's scope — the 462 weave (review qmqwqlms round 3, P1).
+            resolution_owner:
+                crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
+                    resolution_namespace: caller_resolution_namespace.clone(),
+                },
             effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
         });
@@ -2460,13 +2599,20 @@ pub(super) fn build_squished_relation(
     // Apply data namespace patching so table refs inside resolve correctly.
     for (cte_name, source_expr) in &table_bindings.interior_ctes {
         let patched_expr = if let Some(dns) = data_ns {
-            patch_data_ns_in_relational_expr(source_expr.clone(), dns)
+            patch_data_ns_in_relational_expr(source_expr.clone(), dns, &local_cte_names)
         } else {
             source_expr.clone()
         };
         all_ctes.push(ast_unresolved::CteBinding {
             expression: patched_expr,
             name: cte_name.clone(),
+            origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+            // Caller-authored HO argument (interior condition at the
+            // call site): the caller's scope owns its names.
+            resolution_owner:
+                crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
+                    resolution_namespace: caller_resolution_namespace.clone(),
+                },
             effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
         });
@@ -2479,6 +2625,13 @@ pub(super) fn build_squished_relation(
         all_ctes.push(ast_unresolved::CteBinding {
             expression: source_expr,
             name: cte_name,
+            origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+            // Caller-authored join input (inverted CTE strategy): the
+            // caller's scope owns its names.
+            resolution_owner:
+                crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
+                    resolution_namespace: caller_resolution_namespace.clone(),
+                },
             effect_label: false,
             is_recursive: ast_unresolved::PhaseBox::phantom(),
         });
@@ -2558,7 +2711,7 @@ pub(super) fn build_squished_relation(
                 inject_scalar_columns(q, &clause_params, &positions, output_head)
             };
             let clause_query = if let Some(dns) = data_ns {
-                patch_data_ns_query(clause_query, dns)
+                patch_data_ns_query(clause_query, dns, &local_cte_names)
             } else {
                 clause_query
             };
@@ -2610,7 +2763,7 @@ pub(super) fn build_squished_relation(
             }
         };
         let clause_query = if let Some(dns) = data_ns {
-            patch_data_ns_query(clause_query, dns)
+            patch_data_ns_query(clause_query, dns, &local_cte_names)
         } else {
             clause_query
         };
@@ -2874,6 +3027,12 @@ pub(super) fn build_argumentative_column_remap(
 /// expressions, and nested domain expressions also get patched.
 struct DataNsPatcher<'a> {
     data_ns: &'a ast_unresolved::NamespacePath,
+    /// Names of the query-local carrier CTEs (`_ho_pipe_src`,
+    /// `_ho_arg_*`, `_ho_scalar_input`) — references to these must not be
+    /// namespace-qualified. An EXPLICIT set from the constructor, never a
+    /// name convention (review qmqwqlms round 3, P2: a user may legally
+    /// write `_ho_*` identifiers, and those SHOULD be patched).
+    local_ctes: &'a std::collections::HashSet<String>,
 }
 
 impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
@@ -2891,8 +3050,11 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
                 cpr_schema,
                 hygienic_injections,
             } => {
-                // Skip namespace patching for HO-generated CTE names (_ho_pipe_src, _ho_arg_T, etc.)
-                if identifier.namespace_path.is_empty() && !identifier.name.starts_with("_ho_") {
+                // Skip namespace patching for the query-local carrier CTEs
+                // (an explicit set — see `local_ctes`).
+                if identifier.namespace_path.is_empty()
+                    && !self.local_ctes.contains(identifier.name.as_str())
+                {
                     identifier.namespace_path = self.data_ns.clone();
                 }
                 // Don't recurse further — Ground's children (domain_spec) don't
@@ -3003,11 +3165,13 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
 }
 
 /// Patch data namespace on all table references in a Query.
+/// `local_ctes`: query-local carrier CTE names to leave unqualified.
 pub(super) fn patch_data_ns_query(
     query: ast_unresolved::Query,
     data_ns: &ast_unresolved::NamespacePath,
+    local_ctes: &std::collections::HashSet<String>,
 ) -> ast_unresolved::Query {
-    DataNsPatcher { data_ns }
+    DataNsPatcher { data_ns, local_ctes }
         .transform_query(query)
         .expect("namespace patching is infallible")
 }
@@ -3016,20 +3180,25 @@ pub(super) fn patch_data_ns_query(
 fn patch_data_ns_in_relational_expr(
     expr: ast_unresolved::RelationalExpression,
     data_ns: &ast_unresolved::NamespacePath,
+    local_ctes: &std::collections::HashSet<String>,
 ) -> ast_unresolved::RelationalExpression {
-    DataNsPatcher { data_ns }
+    DataNsPatcher { data_ns, local_ctes }
         .transform_relational(expr)
         .expect("namespace patching is infallible")
 }
 
 /// Patch data_ns on ScalarSubquery identifiers within a domain expression.
+/// CFE bodies are entity file text with no carrier CTEs in scope.
 fn patch_data_ns_in_domain_expr(
     expr: ast_unresolved::DomainExpression,
     data_ns: &ast_unresolved::NamespacePath,
 ) -> ast_unresolved::DomainExpression {
-    DataNsPatcher { data_ns }
-        .transform_domain(expr)
-        .expect("namespace patching is infallible")
+    DataNsPatcher {
+        data_ns,
+        local_ctes: &std::collections::HashSet::new(),
+    }
+    .transform_domain(expr)
+    .expect("namespace patching is infallible")
 }
 
 #[cfg(test)]

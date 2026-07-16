@@ -48,6 +48,11 @@ pub enum FunctionExpression<Phase = Unresolved> {
     #[lispy("domain_expression:function:higher_order")]
     HigherOrder {
         name: SqlIdentifier,
+        /// Namespace qualifier as authored. Higher-order calls are no less
+        /// name-resolvable than regular/curried calls, so dropping this would
+        /// make the invocation depend on ambient session scope.
+        #[serde(default)]
+        namespace: Option<NamespacePath>,
         curried_arguments: Vec<DomainExpression<Phase>>,
         regular_arguments: Vec<DomainExpression<Phase>>,
         alias: Option<SqlIdentifier>,

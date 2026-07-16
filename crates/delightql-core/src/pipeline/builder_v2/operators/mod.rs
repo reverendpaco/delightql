@@ -49,7 +49,7 @@ fn parse_unary_operator_core(
             .next()
             .ok_or_else(|| DelightQLError::parse_error("Empty unary operator"))?;
 
-        match op_child.kind() {
+        let applied = match op_child.kind() {
             "pipe_operation" => parse_pipe_operation(op_child, input, features)?,
             _ => {
                 return Err(DelightQLError::parse_error(format!(
@@ -57,6 +57,18 @@ fn parse_unary_operator_core(
                     op_child.kind()
                 )))
             }
+        };
+        // Effect-unwrap pipe (DIRECTIVE-CONVERGENCE-PLAN Rule 6):
+        // Q !> S(...) NORMALIZES to Q |> S(...) |> .returned(*). No new
+        // AST node, no directive-only route — the surface operator is
+        // exact sugar over HO application plus context-replacing
+        // narrowing into the conventional `returned` interior relation.
+        // Bang or non-bang callee alike; a missing or schema-unknown
+        // `returned` refuses through the drill's ordinary diagnostics.
+        if node.has_child("unwrap_pipe_operator") {
+            narrow_into_returned(applied)
+        } else {
+            applied
         }
     } else if let Some(agg_node) = node.find_child("aggregate_function") {
         let mut aggregation = if let Some(func_node) = agg_node.find_child("function_call") {
@@ -223,74 +235,7 @@ fn parse_unary_operator_core(
         }
     } else if let Some(drill_node) = node.find_child("drill_operator") {
         // Interior drill-down: .column_name(*) or .column_name(col1, col2)
-        let column = drill_node
-            .field_text("column")
-            .ok_or_else(|| DelightQLError::parse_error("No column name in drill_operator"))?;
-
-        let glob = drill_node.field("glob").is_some();
-        let mut columns = Vec::new();
-        let mut groundings = Vec::new();
-        if let Some(col_spec) = drill_node.field("columns") {
-            // Parse column_spec → column_list → column_spec_item*
-            let col_list = if col_spec.kind() == "column_spec" {
-                col_spec.find_child("column_list").unwrap_or(col_spec)
-            } else {
-                col_spec
-            };
-            for (pos, item) in col_list
-                .children()
-                .filter(|c| c.kind() == "column_spec_item")
-                .enumerate()
-            {
-                if item.has_child("placeholder") {
-                    columns.push("_".to_string());
-                } else if let Some(lit) = item.find_child("literal") {
-                    // Literal grounding: filter on this column's value
-                    let lit_text = lit.text().to_string();
-                    let value = if lit_text.starts_with('"') && lit_text.ends_with('"') {
-                        lit_text[1..lit_text.len() - 1].to_string()
-                    } else {
-                        lit_text
-                    };
-                    columns.push("_".to_string());
-                    groundings.push((pos, value));
-                } else if let Some(paren) = item.find_child("parenthesized_expression") {
-                    // Parenthesized expression: extract literal if simple, else error
-                    // CST nests as: parenthesized_expression → domain_expression → literal
-                    let inner_lit = paren.find_child("literal").or_else(|| {
-                        paren
-                            .find_child("domain_expression")
-                            .and_then(|d| d.find_child("literal"))
-                    });
-                    if let Some(lit) = inner_lit {
-                        let lit_text = lit.text().to_string();
-                        let value = if lit_text.starts_with('"') && lit_text.ends_with('"') {
-                            lit_text[1..lit_text.len() - 1].to_string()
-                        } else {
-                            lit_text
-                        };
-                        columns.push("_".to_string());
-                        groundings.push((pos, value));
-                    } else {
-                        return Err(DelightQLError::parse_error(format!(
-                            "Interior drill-down does not yet support expression grounding \
-                             at position {}. Use a literal value or identifier.",
-                            pos
-                        )));
-                    }
-                } else if let Some(id) = item.find_child("identifier") {
-                    columns.push(crate::pipeline::cst::unstrop(id.text()));
-                } else {
-                    // Catch-all: produce a clear error instead of silently dropping
-                    return Err(DelightQLError::parse_error(format!(
-                        "Interior drill-down: unsupported argument at position {} ('{}'). \
-                         Expected an identifier, underscore (_), or literal value.",
-                        pos,
-                        item.text()
-                    )));
-                }
-            }
-        }
+        let (column, glob, columns, groundings) = parse_drill_spec(drill_node)?;
 
         RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
             source: input,
@@ -299,12 +244,7 @@ fn parse_unary_operator_core(
                 glob,
                 columns,
                 interior_schema: None,
-                // Convert (position, value) to (placeholder_key, value) — the resolver
-                // will map positions to schema column names.
-                groundings: groundings
-                    .iter()
-                    .map(|(pos, val)| (pos.to_string(), val.clone()))
-                    .collect(),
+                groundings,
             },
             cpr_schema: PhaseBox::phantom(),
         })))
@@ -321,6 +261,176 @@ fn parse_unary_operator_core(
     };
 
     Ok(piped)
+}
+
+/// Parse the shared drill/narrow access spec: `.column(*)` or
+/// `.column(col1, col2)` with optional literal groundings. ONE parser for
+/// both the postfix drill and the post-pipe narrowing (Phase 3: one
+/// correlated interior-expansion core; the two forms differ only in
+/// retained context).
+fn parse_drill_spec(
+    drill_node: CstNode,
+) -> Result<(String, bool, Vec<String>, Vec<(String, String)>)> {
+    let column = drill_node
+        .field_text("column")
+        .ok_or_else(|| DelightQLError::parse_error("No column name in interior access"))?;
+
+    let glob = drill_node.field("glob").is_some();
+    let mut columns = Vec::new();
+    let mut groundings = Vec::new();
+    if let Some(col_spec) = drill_node.field("columns") {
+        // Parse column_spec → column_list → column_spec_item*
+        let col_list = if col_spec.kind() == "column_spec" {
+            col_spec.find_child("column_list").unwrap_or(col_spec)
+        } else {
+            col_spec
+        };
+        for (pos, item) in col_list
+            .children()
+            .filter(|c| c.kind() == "column_spec_item")
+            .enumerate()
+        {
+            if item.has_child("placeholder") {
+                columns.push("_".to_string());
+            } else if let Some(lit) = item.find_child("literal") {
+                // Literal grounding: filter on this column's value
+                let lit_text = lit.text().to_string();
+                let value = if lit_text.starts_with('"') && lit_text.ends_with('"') {
+                    lit_text[1..lit_text.len() - 1].to_string()
+                } else {
+                    lit_text
+                };
+                columns.push("_".to_string());
+                groundings.push((pos, value));
+            } else if let Some(paren) = item.find_child("parenthesized_expression") {
+                // Parenthesized expression: extract literal if simple, else error
+                // CST nests as: parenthesized_expression → domain_expression → literal
+                let inner_lit = paren.find_child("literal").or_else(|| {
+                    paren
+                        .find_child("domain_expression")
+                        .and_then(|d| d.find_child("literal"))
+                });
+                if let Some(lit) = inner_lit {
+                    let lit_text = lit.text().to_string();
+                    let value = if lit_text.starts_with('"') && lit_text.ends_with('"') {
+                        lit_text[1..lit_text.len() - 1].to_string()
+                    } else {
+                        lit_text
+                    };
+                    columns.push("_".to_string());
+                    groundings.push((pos, value));
+                } else {
+                    return Err(DelightQLError::parse_error(format!(
+                        "Interior drill-down does not yet support expression grounding \
+                         at position {}. Use a literal value or identifier.",
+                        pos
+                    )));
+                }
+            } else if let Some(id) = item.find_child("identifier") {
+                columns.push(crate::pipeline::cst::unstrop(id.text()));
+            } else {
+                // Catch-all: produce a clear error instead of silently dropping
+                return Err(DelightQLError::parse_error(format!(
+                    "Interior drill-down: unsupported argument at position {} ('{}'). \
+                     Expected an identifier, underscore (_), or literal value.",
+                    pos,
+                    item.text()
+                )));
+            }
+        }
+    }
+
+    // Convert (position, value) to (placeholder_key, value) — the resolver
+    // will map positions to schema column names.
+    let groundings = groundings
+        .iter()
+        .map(|(pos, val)| (pos.to_string(), val.clone()))
+        .collect();
+    Ok((column, glob, columns, groundings))
+}
+
+/// Narrow a relational expression into its conventional `returned`
+/// interior relation: the `.returned(*)` tail of the `!>` normalization
+/// (drill + interior projection — the same one-core shape as
+/// parse_narrowing_access with a fixed column).
+fn narrow_into_returned(applied: RelationalExpression) -> RelationalExpression {
+    let drilled = RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
+        PipeExpression {
+            source: applied,
+            operator: UnaryRelationalOperator::InteriorDrillDown {
+                column: "returned".to_string(),
+                glob: true,
+                columns: Vec::new(),
+                interior_schema: None,
+                groundings: Vec::new(),
+            },
+            cpr_schema: PhaseBox::phantom(),
+        },
+    )));
+    RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
+        source: drilled,
+        operator: UnaryRelationalOperator::General {
+            containment_semantic: ContainmentSemantic::Parenthesis,
+            expressions: vec![DomainExpression::glob_builder()
+                .with_qualifier("returned")
+                .build()],
+        },
+        cpr_schema: PhaseBox::phantom(),
+    })))
+}
+
+/// Parse post-pipe parenthesized narrowing: |> .column(*) or |> .column(a, b)
+/// (DIRECTIVE-CONVERGENCE-PLAN Phase 3). NORMALIZES to the canonical
+/// longhand — the SAME correlated interior expansion as postfix drill-down,
+/// followed by an ordinary projection that retains only the interior
+/// heading:  R |> .t(*)  ==  R.t(*) |> (t.*).  One expansion core, two
+/// context policies; external JSON refuses at resolution exactly like the
+/// drill (schema-known interiors only).
+fn parse_narrowing_access(
+    node: CstNode,
+    input: RelationalExpression,
+) -> Result<RelationalExpression> {
+    let (column, glob, columns, groundings) = parse_drill_spec(node)?;
+
+    // Heading policy: glob narrows to `column.*`; argumentative access
+    // narrows to the bound names (placeholders/groundings contribute no
+    // output column).
+    let projection: Vec<DomainExpression> = if glob {
+        vec![DomainExpression::glob_builder()
+            .with_qualifier(column.clone())
+            .build()]
+    } else {
+        columns
+            .iter()
+            .filter(|c| c.as_str() != "_")
+            .map(|c| DomainExpression::lvar_builder(c.clone()).build())
+            .collect()
+    };
+
+    let drilled = RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
+        PipeExpression {
+            source: input,
+            operator: UnaryRelationalOperator::InteriorDrillDown {
+                column,
+                glob,
+                columns,
+                interior_schema: None,
+                groundings,
+            },
+            cpr_schema: PhaseBox::phantom(),
+        },
+    )));
+
+    Ok(RelationalExpression::Pipe(Box::new(
+        stacksafe::StackSafe::new(PipeExpression {
+            source: drilled,
+            operator: UnaryRelationalOperator::General {
+                containment_semantic: ContainmentSemantic::Parenthesis,
+                expressions: projection,
+            },
+            cpr_schema: PhaseBox::phantom(),
+        }),
+    )))
 }
 
 /// Parse narrowing destructure: |> .column_name{.field1, .field2}
@@ -397,6 +507,7 @@ fn parse_pipe_operation(
         "piped_invocation" => parse_piped_invocation(child, input, features),
         "bang_pipe_operation" => parse_bang_pipe_operation(child, input, features),
         "narrowing_destructure" => parse_narrowing_destructure(child, input),
+        "narrowing_access" => parse_narrowing_access(child, input),
         _ => Err(DelightQLError::parse_error(format!(
             "Pipe operation {} not implemented",
             child.kind()

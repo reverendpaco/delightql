@@ -16,7 +16,7 @@ use crate::pipeline::cst::CstNode;
 
 pub(super) mod case_and_subqueries;
 pub(super) mod functions;
-pub(super) mod literals;
+pub(crate) mod literals;
 pub(super) mod pipes;
 
 // Re-export the main parsing functions for use by parent module

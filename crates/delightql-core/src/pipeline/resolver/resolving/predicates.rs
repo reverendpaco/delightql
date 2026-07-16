@@ -877,6 +877,7 @@ impl crate::pipeline::ast_transform::AstTransform<
 /// Constructs the AST directly without re-parsing.
 pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
     table_name: &str,
+    namespace: crate::pipeline::asts::core::metadata::NamespacePath,
     arguments: Vec<ast_unresolved::DomainExpression>,
     exists: bool,
     outer_columns: &[ast_resolved::ColumnMetadata],
@@ -900,8 +901,11 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // A QUALIFIED citation (`+HL.h(v)`) stamps its qualifier here, so the
+    // inner reference resolves through the qualified-relation machinery —
+    // aliases (session or scope-local), exposure, and its refusals.
     let table_ident = ast_unresolved::QualifiedName {
-        namespace_path: NamespacePath::empty(),
+        namespace_path: namespace,
         name: table_name.into(),
         grounding: None,
     };

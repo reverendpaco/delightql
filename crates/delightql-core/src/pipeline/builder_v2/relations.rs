@@ -254,6 +254,14 @@ pub(super) fn parse_pseudo_predicate_call(
     // Pseudo-predicate names must end with '!'
     let full_name = format!("{}!", name);
 
+    // Qualified built-in access (DIRECTIVE-CONVERGENCE-PLAN Phase 2):
+    // std::prelude.enlist!(...) carries its namespace path so identity
+    // resolves through namespace-aware registry rules, never a global map.
+    let namespace: Vec<String> = node
+        .field("namespace_path")
+        .map(|ns| ns.text().split("::").map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+
     // Check for alias
     let alias = node
         .find_child("table_alias")
@@ -262,7 +270,9 @@ pub(super) fn parse_pseudo_predicate_call(
     if let Some(continuation_node) = node.field("continuation") {
         let base = RelationalExpression::Relation(Relation::PseudoPredicate {
             name: full_name.clone(),
+            namespace: namespace.clone(),
             arguments: Vec::new(),
+            access: DomainSpec::Glob,
             alias: None,
             cpr_schema: PhaseBox::phantom(),
         });
@@ -283,7 +293,9 @@ pub(super) fn parse_pseudo_predicate_call(
             if is_bare_base && matches!(pipe.operator, UnaryRelationalOperator::Qualify) {
                 return Ok(RelationalExpression::Relation(Relation::PseudoPredicate {
                     name: full_name,
+                    namespace,
                     arguments: vec![DomainExpression::glob_builder().build()],
+                    access: DomainSpec::Glob,
                     alias,
                     cpr_schema: PhaseBox::phantom(),
                 }));
@@ -321,7 +333,9 @@ pub(super) fn parse_pseudo_predicate_call(
 
     Ok(RelationalExpression::Relation(Relation::PseudoPredicate {
         name: full_name,
+        namespace,
         arguments,
+        access: DomainSpec::Glob,
         alias,
         cpr_schema: PhaseBox::phantom(),
     }))

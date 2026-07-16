@@ -162,8 +162,19 @@ pub struct EntitySignature {
 /// traits (e.g., EffectExecutable for pseudo-predicates).
 #[allow(dead_code)]
 pub trait BinEntity: Send + Sync {
-    /// Entity name (e.g., "mount!", "concat", "upper")
+    /// LOCAL entity name (e.g., "mount!", "concat", "upper") — never a
+    /// namespace-qualified string. Identity is (namespace, name); see
+    /// `namespace_override`.
     fn name(&self) -> &str;
+
+    /// Identity namespace override. `None` (the default) means the entity
+    /// lives in its cartridge's namespace. An override places the entity
+    /// under a DIFFERENT deliberate identity (e.g. `compile` under
+    /// `sys::execution` while shipped in the prelude cartridge) — and
+    /// thereby outside the cartridge's universal unqualified visibility.
+    fn namespace_override(&self) -> Option<&str> {
+        None
+    }
 
     /// Entity type classification
     fn entity_type(&self) -> EntityType;
@@ -234,6 +245,48 @@ pub trait EffectExecutable: BinEntity {
         alias: Option<String>,
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult>;
+
+    /// D3b (M2 — set-at-a-time application): the entity receives the
+    /// LIFTED argument relation WHOLE and executes ONCE with ONE receipt.
+    /// A piped relation is one demand of the argumentative functor
+    /// (EFFECT-ALGEBRA; higher-order.md's scalar lifting) — never N
+    /// separate calls.
+    ///
+    /// The default covers the scalar case (a one-row lift delegates to
+    /// `execute`), preserves the empty-input no-op (an empty lifted
+    /// argument performs nothing and answers the empty relation — the
+    /// open 0-row question is deferred, status quo kept deliberately),
+    /// and REFUSES a multi-row lift with not-yet (the E1a precedent)
+    /// until the entity opts into true setwise semantics by overriding.
+    /// `doc!` is the first override.
+    fn execute_lifted(
+        &self,
+        rows: &[Vec<DomainExpression>],
+        alias: Option<String>,
+        system: &mut crate::system::DelightQLSystem,
+    ) -> Result<EntityResult> {
+        // CODE-REVIEW-zzpmxuzp::otolxyzl finding 1: pipe is APPLICATION —
+        // an empty relation reaches the callee once, exactly like a
+        // three-row one. For a scalar-signature entity, both are lift
+        // shapes it cannot yet receive, so both get the SAME not-yet
+        // refusal (never a silent no-op, never a different error). A
+        // setwise override (doc!, compile) gives them true semantics.
+        match rows.len() {
+            1 => self.execute(&rows[0], alias, system),
+            n => Err(crate::error::DelightQLError::validation_error_categorized(
+                "effect/pipe/lifted_not_yet",
+                format!(
+                    "{} received a {n}-row lifted argument: a piped relation \
+                     is ONE set-at-a-time demand (the argumentative functor \
+                     receives the whole relation, one receipt — even an empty \
+                     one), and that execution is not built yet for this \
+                     entity. Pipe a single row, or issue separate statements",
+                    self.name()
+                ),
+                "lifted argument not yet",
+            )),
+        }
+    }
 }
 
 // =============================================================================

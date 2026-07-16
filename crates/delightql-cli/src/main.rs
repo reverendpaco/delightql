@@ -172,6 +172,7 @@ fn run() -> Result<()> {
             Command::Explain { .. } => ("explain", false, false, false),
             Command::Target { .. } => ("target", false, false, false),
             Command::Man { .. } => ("man", false, false, false),
+            Command::Book { .. } => ("book", true, false, false),
             Command::Help { .. } => ("help", false, false, false),
             Command::Completions { .. } => ("completions", false, false, false),
             Command::Selftest { .. } => ("selftest", false, false, false),
@@ -248,6 +249,14 @@ fn run() -> Result<()> {
             Command::Man { name, dump } => {
                 delightql_cli::commands::man::handle_man(name, dump.as_deref())
             }
+            Command::Book {
+                name,
+                export_images,
+            } => delightql_cli::commands::book::handle_book(
+                name.as_deref(),
+                export_images.as_deref(),
+                args.database.as_deref(),
+            ),
             // R3.2: `dql help <cmd>` is the SAME projection as `dql man
             // <cmd>` — one mechanism, not a clap essay and a man page
             // drifting apart. Bare `dql help` keeps the usage summary.
@@ -631,8 +640,8 @@ mod tests {
         assert_eq!(out.status.code(), Some(1), "pre-subcommand --db too");
     }
 
-    /// SYS-HELP-DESIGN.md phase 2: ring 1 is seeded from the live clap
-    /// tree, and the audit's drift-between-channels findings become a
+    /// `cli::surface` is derived from the live clap tree, and the audit's
+    /// drift-between-channels findings become a
     /// standing assertion — every option the binary accepts is
     /// documented in its man page. (The audit found help/man/binary
     /// drift BY HAND; this is that check, mechanized.)
@@ -645,13 +654,13 @@ mod tests {
                 "-n",
                 "-f",
                 "jsonl",
-                "sys::help.option(*) |> (command, long)",
+                "cli::surface.option(*) |> (command, long)",
             ])
             .output()
             .unwrap();
         assert!(out.status.success());
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let man_dir = manifest.join("../../man/man1");
+        let man_dir = manifest.join("../../assets/man/man1");
         let page_for = |command: &str| -> &'static str {
             match command {
                 "query" => "dql-query.1",
@@ -689,7 +698,106 @@ mod tests {
         assert!(checked >= 40, "suspiciously few option rows: {checked}");
     }
 
-    /// SYS-HELP-DESIGN.md phase 3: man pages are burned relations and
+    #[test]
+    fn test_book_projects_the_bundled_next_gen_database() {
+        let cli_path = get_cli_path();
+
+        let listed = std::process::Command::new(&cli_path)
+            .args(["book"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "reference");
+
+        let rendered = std::process::Command::new(&cli_path)
+            .args(["book", "reference"])
+            .output()
+            .unwrap();
+        assert!(rendered.status.success());
+        let markdown = String::from_utf8_lossy(&rendered.stdout);
+        // The yml-supplied frontmatter leads the document.
+        assert!(markdown.starts_with("---\ntitle: DelightQL Language Reference"));
+        // Spine depth 0: the chapter opener's h1 is unshifted.
+        assert!(markdown.contains("\n# Data Query Language (DQL) {.dqlh}"));
+        // Spine depth 1: a child atom's h1 emits as h2, and the marker
+        // shares its attribute block with the existing id.
+        assert!(markdown.contains("\n## Projection {#sec:ref-Dql-Projection .dqlh}"));
+        // Spine depth 2: shift-on-emit ran against the bundler's
+        // preorder-walk heading_shift, two levels deep.
+        assert!(markdown.contains("\n### Map Embedding {.dqlh}"));
+        // Fenced pseudo-headings never shift (the sql comment lines).
+        assert!(markdown.contains("\n    --  BirthDate, -- column projected out"));
+        // Image references are pool-normalized (BOOK-NEXT-GEN.md section 10).
+        assert!(markdown.contains("](images/tree-group-construction.svg)"));
+
+        // --export-images materializes the pool beside the emission, byte-
+        // faithful through the hex spelling (section 10 sugar).
+        let dir = std::env::temp_dir().join(format!("dql-book-images-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exported = std::process::Command::new(&cli_path)
+            .args(["book", "reference", "--export-images"])
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(exported.status.success());
+        let svg = std::fs::read_to_string(dir.join("tree-group-construction.svg")).unwrap();
+        assert!(svg.starts_with("<?xml"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 6);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Listing mode refuses the flag: exporting needs a book context.
+        let refused_export = std::process::Command::new(&cli_path)
+            .args(["book", "--export-images"])
+            .output()
+            .unwrap();
+        assert!(!refused_export.status.success());
+
+        // --db: the same bundle from disk is the same book (BOOK-NEXT-GEN
+        // section 8) — the authoring loop renders without recompiling.
+        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/bundled/books.sqlite");
+        let from_db = std::process::Command::new(&cli_path)
+            .args(["book", "reference", "--db"])
+            .arg(&bundled)
+            .output()
+            .unwrap();
+        assert!(from_db.status.success());
+        assert_eq!(from_db.stdout, rendered.stdout);
+
+        let missing_db = std::process::Command::new(&cli_path)
+            .args(["book", "reference", "--db", "/nonexistent-book.sqlite"])
+            .output()
+            .unwrap();
+        assert!(!missing_db.status.success());
+        assert!(String::from_utf8_lossy(&missing_db.stderr).contains("not found"));
+
+        let refused = std::process::Command::new(&cli_path)
+            .args(["book", "x\" |> nope(*)"])
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("invalid book name"));
+    }
+
+    #[test]
+    fn test_cli_and_engine_namespaces_have_single_owners() {
+        let cli_path = get_cli_path();
+        let run = |query: &str| {
+            std::process::Command::new(&cli_path)
+                .args(["query", "-n", query])
+                .output()
+                .unwrap()
+        };
+
+        assert!(run("cli::surface.command(*) |> (name)").status.success());
+        assert!(run("cli::(*)").status.success());
+        assert!(run("sys::identifiers.identifier(*) |> (kind)").status.success());
+        assert!(!run("cli::book.book(*)").status.success());
+        assert!(!run("cli::man.man_page(*)").status.success());
+        assert!(!run("sys::help.identifier(*)").status.success());
+    }
+
+    /// The CLI-owned man database contains burned relations and
     /// `dql man` is their projection — grammar (hyphen-join, dql-
     /// prefix inference), --dump, and the rendering chain's last rung.
     #[test]
@@ -697,7 +805,7 @@ mod tests {
         let cli_path = get_cli_path();
 
         // Short form + prefix inference: `dql man target` → dql-target(1).
-        // Piped stdout = the plumbing face: the burned plain column,
+        // Piped stdout = the plumbing face: plain derived from burned troff,
         // never man/groff (those own the TTY face, untestable here).
         let out = std::process::Command::new(&cli_path)
             .args(["man", "target"])
@@ -714,28 +822,23 @@ mod tests {
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).contains("DQL-TARGET(1)"));
 
-        // The pipe face is BYTE-EQUAL to the burned plain column —
+        // The pipe face is BYTE-EQUAL to the scrubber projection of the
+        // burned troff column —
         // platform-independent by construction (a macOS build and a
         // Linux build pipe identical bytes, whatever man is installed).
-        // The column itself is extracted with our own plumbing: -f raw
-        // is byte-faithful on a single column.
         let piped = std::process::Command::new(&cli_path)
             .args(["man", "version"])
             .output()
             .unwrap();
-        let column = std::process::Command::new(&cli_path)
-            .args([
-                "query",
-                "-f",
-                "raw",
-                "sys::help.man_page(*), name = \"dql-version\" |> (plain)",
-            ])
-            .output()
-            .unwrap();
-        assert!(piped.status.success() && column.status.success());
+        let plain = delightql_cli::man_scrub::scrub(include_str!(
+            "../../../assets/man/man1/dql-version.1"
+        ))
+        .unwrap();
+        assert!(piped.status.success());
         assert_eq!(
-            piped.stdout, column.stdout,
-            "piped dql man must serve exactly the burned plain column"
+            piped.stdout,
+            plain.into_bytes(),
+            "piped dql man must serve exactly the scrubbed burned troff"
         );
 
         // A miss teaches: lists pages and hands over the apropos query.
@@ -746,7 +849,7 @@ mod tests {
         assert_eq!(out.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("dql-query(1)"));
-        assert!(stderr.contains("sys::help.man_page"));
+        assert!(stderr.contains("cli::man.man_page"));
 
         // --dump writes every embedded page (release staging).
         let dir = tempfile::tempdir().unwrap();
@@ -769,7 +872,7 @@ mod tests {
         let cli_path = get_cli_path();
 
         // `dql help query` serves dql-query(1), not a clap essay.
-        // Piped stdout = the burned plain column, so the assertion is
+        // Piped stdout = the derived plain projection, so the assertion is
         // environment-independent by construction.
         let out = std::process::Command::new(&cli_path)
             .args(["help", "query"])
@@ -797,7 +900,270 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("sys::help.man_page"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cli::man.man_page"));
+    }
+
+    /// BYTES-SCHEME-DESIGN.md: the `delightql-bytes://` locator contract.
+    /// The embedded book/man images are BOUND by open_handle and mounted by
+    /// locator — attach-class (joinable), read-only, closed-namespace (no
+    /// ambient authority), zero temp files.
+    #[test]
+    fn test_delightql_bytes_locator_contract() {
+        let cli_path = get_cli_path();
+        // `-f raw` only where a byte-faithful single column is asserted:
+        // raw refuses multi-column receipts (mount!/unmount! ship one).
+        let run_with = |program: &str, extra: &[&str]| {
+            let mut args = vec!["query", "--sequential"];
+            args.extend_from_slice(extra);
+            let mut child = std::process::Command::new(&cli_path)
+                .args(&args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(program.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let run_seq = |program: &str| run_with(program, &[]);
+
+        // Closed namespace: an unbound name refuses and TEACHES — the sorted,
+        // deliberately non-secret binding inventory.
+        let out = run_seq("mount!(\"delightql-bytes://nosuch\", \"x\")\n");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no byte binding named 'nosuch'") && stderr.contains("book, man"),
+            "miss must list the bound names, got: {stderr}"
+        );
+
+        // Attach-class: the mounted image is joinable with a main-side
+        // relation in one query (the property the design pins).
+        let out = run_with(
+            "mount!(\"delightql-bytes://man\", \"m\")\n\
+             m.man_page(*), _(n @ \"dql-query\"), name = n ~> count:(*) as c |> (c)\n",
+            &["-f", "raw"],
+        );
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+
+        // Full-citizen namespace: the `ns::(*)` listing construct resolves
+        // for a bytes mount exactly as for a file mount (regression: the
+        // first implementation skipped register_mounted_catalog_wrappers,
+        // so `m::(*)` was 'Table not found' — caught in code review).
+        let out = run_seq("mount!(\"delightql-bytes://man\", \"m\")\nm::(*)\n");
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("man_page") && stdout.contains("bundle_meta"),
+            "m::(*) must list the mounted namespace's entities, got: {stdout}"
+        );
+
+        // Read-only: DML against the mounted image refuses at SQLite's
+        // readonly enforcement.
+        let out = run_seq(
+            "mount!(\"delightql-bytes://man\", \"m\")\n\
+             _(name, section, troff, content_digest @ \"x\", 9, \"t\", \"d\") \
+             |> insert!(m.man_page(*))(*)\n",
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("readonly"));
+
+        // Lifecycle: refresh! refuses (immutable image); mount_new! refuses
+        // (attach-only locator); unmount! detaches cleanly.
+        let out = run_seq(
+            "mount!(\"delightql-bytes://man\", \"m\")\nrefresh!(\"m\")\n",
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("immutable"));
+        let out = run_seq("mount_new!(\"delightql-bytes://book\", \"x\")\n");
+        assert!(!out.status.success(), "mount_new! must refuse a locator");
+        let out = run_seq(
+            "mount!(\"delightql-bytes://man\", \"m\")\nunmount!(\"m\")\n",
+        );
+        assert!(out.status.success(), "unmount! of a bytes mount must succeed");
+
+        // Zero temp files: dql book / dql man materialize nothing on disk.
+        let tmp = std::env::temp_dir();
+        let count_tempfiles = || {
+            std::fs::read_dir(&tmp)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.starts_with("dql-book-") || n.starts_with("dql-man-")
+                })
+                .count()
+        };
+        let before = count_tempfiles();
+        let out = std::process::Command::new(&cli_path)
+            .args(["book", "reference"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = std::process::Command::new(&cli_path)
+            .args(["man", "version"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            count_tempfiles(),
+            before,
+            "book/man must not materialize temp database files"
+        );
+    }
+
+    /// Seventh review, P1: `main`'s physical attachment identity is stored
+    /// separately from its qualification policy (`cartridge.source_ns` is
+    /// NULL for main by design, so it cannot carry the ATTACH alias).
+    /// unmount!("main") DETACHes and EMPTIES the bootstrap fixture rather
+    /// than destroying its wiring; remount restores full service —
+    /// including unqualified reads — and refresh introspects the attached
+    /// database, not SQLite's hub.
+    #[test]
+    fn test_main_mount_lifecycle_keeps_identity_and_wiring() {
+        let cli_path = get_cli_path();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("mainlc.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);")
+                .unwrap();
+        }
+        let db = db.to_string_lossy().to_string();
+        let run = |program: &str| {
+            let mut child = std::process::Command::new(&cli_path)
+                .args(["query", "--db", &db, "--sequential", "-f", "raw"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(program.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        // unmount → remount → remount again → UNQUALIFIED read still works
+        // (pre-fix: '_imported_N is already in use' on the first remount —
+        // the alias was never DETACHed because source_ns is NULL for main).
+        let out = run(&format!(
+            "unmount!(\"main\")\nmount!(\"{db}\", \"main\")\nunmount!(\"main\")\nmount!(\"{db}\", \"main\")\nt(*) |> (x)\n"
+        ));
+        assert!(
+            out.status.success(),
+            "main unmount/remount cycles must keep identity and wiring: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
+
+        // refresh!("main") introspects the ATTACHED database (pre-fix it
+        // introspected the hub via the namespace name, losing the catalog).
+        let out = run("refresh!(\"main\")\nt(*) |> (x)\n");
+        assert!(
+            out.status.success(),
+            "refresh of main must re-introspect the attached db: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
+    }
+
+    /// MOUNT-SPINE-PLAN.md Phase 1 (review R1): mount identity is
+    /// AUTHORITATIVE — a valid-but-EMPTY database mounts idempotently,
+    /// conflicts correctly, and unmounts cleanly, even though it activates
+    /// zero entities. Before the spine, identity was discovered through
+    /// activated_entity joins, so an empty image had no identity: re-mounts
+    /// attached duplicate aliases and unmount could not find the alias to
+    /// DETACH.
+    #[test]
+    fn test_mount_spine_empty_image_lifecycle() {
+        let cli_path = get_cli_path();
+        // A VALID SQLite database containing no tables at all (a 0-byte file
+        // would be refused as invalid; this one has a real header).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("empty.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); DROP TABLE t;").unwrap();
+        }
+        let db = db.to_string_lossy().to_string();
+
+        let run_seq = |program: &str| {
+            let mut child = std::process::Command::new(&cli_path)
+                .args(["query", "--sequential"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(program.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        // Idempotent re-mount, working namespace functor with ZERO entities,
+        // authoritative refresh (re-introspects to zero entities rather than
+        // "no cartridge"; second review F2), clean unmount — one session.
+        let out = run_seq(&format!(
+            "mount!(\"{db}\", \"e\")\nmount!(\"{db}\", \"e\")\ne::(*)\nrefresh!(\"e\")\nunmount!(\"e\")\n"
+        ));
+        assert!(
+            out.status.success(),
+            "empty image must mount idempotently, answer e::(*), refresh, and unmount cleanly: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Conflict detection still works without entities: a different
+        // source over the same namespace refuses.
+        let out = run_seq(&format!(
+            "mount!(\"{db}\", \"e\")\nmount!(\"delightql-bytes://man\", \"e\")\n"
+        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("already exists"),
+            "different source over an empty-image namespace must conflict: {stderr}"
+        );
+
+        // SIMULTANEOUS empty mounts of one source are LEGAL
+        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md: the stored link makes each
+        // namespace's cartridge distinguishable, repealing the interim
+        // refusal). Unmounting one detaches only its own alias — the other
+        // stays queryable — and the once-corrupting full sequence (mount
+        // a+b, unmount both, mount c+d) runs clean with no leaked alias.
+        let out = run_seq(&format!(
+            "mount!(\"{db}\", \"a\")\nmount!(\"{db}\", \"b\")\nunmount!(\"a\")\nb::(*)\nunmount!(\"b\")\nmount!(\"{db}\", \"c\")\nmount!(\"{db}\", \"d\")\nunmount!(\"c\")\nunmount!(\"d\")\n"
+        ));
+        assert!(
+            out.status.success(),
+            "simultaneous empty mounts must be legal and leak no aliases: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Refreshing an EMPTY image must not duplicate its cartridge (third
+        // review, P1): a duplicate makes unmount sweep both rows but detach
+        // one alias, poisoning later mounts of the same source. Repeated
+        // refresh + unmount + remount stays clean.
+        let out = run_seq(&format!(
+            "mount!(\"{db}\", \"e\")\nrefresh!(\"e\")\nrefresh!(\"e\")\nunmount!(\"e\")\nmount!(\"{db}\", \"f\")\nunmount!(\"f\")\n"
+        ));
+        assert!(
+            out.status.success(),
+            "refreshing an empty image must not duplicate its cartridge: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// ALPHA-CLI-UX-WORRIES.md #1 and #4: help must not teach flags a
@@ -980,11 +1346,11 @@ mod tests {
         );
     }
 
-    /// SYS-HELP-DESIGN.md phase 1: the identifier registry is a burned
+    /// The engine identifier registry is a burned
     /// relation, and `dql explain` is a projection of it — one source,
     /// two faces, pinned to agree.
     #[test]
-    fn test_sys_help_identifier_is_the_registry() {
+    fn test_sys_identifiers_is_the_registry() {
         let cli_path = get_cli_path();
         let run = |args: &[&str]| {
             std::process::Command::new(&cli_path)
@@ -997,7 +1363,7 @@ mod tests {
         let out = run(&[
             "query",
             "-n",
-            "sys::help.identifier(*), hierarchy = \"internal/panic\" |> (summary)",
+            "sys::identifiers.identifier(*), hierarchy = \"internal/panic\" |> (summary)",
         ]);
         assert!(out.status.success());
         let table_summary = String::from_utf8_lossy(&out.stdout).trim().to_string();

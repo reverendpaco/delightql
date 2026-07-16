@@ -292,8 +292,14 @@ fn group_ctes(
 trait CteResolver {
     /// Resolve an unresolved relational expression, returning the resolved form
     /// plus any pipe-collected CFE definitions discovered during resolution.
+    /// `owner` is the CTE's TYPED resolution ownership — the 462-weave
+    /// override keys on Caller (the caller-authored carrier CTEs), never on
+    /// a naming convention (round 2, P2) and never on construction
+    /// provenance (round 3, P1: the squished entity's own clause bodies are
+    /// also compiler-CONSTRUCTED, but the entity scope owns their names).
     fn resolve_cte_expression(
         &mut self,
+        owner: crate::pipeline::asts::core::provenance::CteResolutionOwner,
         expr: ast_unresolved::RelationalExpression,
     ) -> Result<(
         ast_resolved::RelationalExpression,
@@ -308,6 +314,7 @@ trait CteResolver {
 impl CteResolver for ResolverFold<'_, '_> {
     fn resolve_cte_expression(
         &mut self,
+        _owner: crate::pipeline::asts::core::provenance::CteResolutionOwner,
         expr: ast_unresolved::RelationalExpression,
     ) -> Result<(
         ast_resolved::RelationalExpression,
@@ -334,16 +341,37 @@ struct InlineCteResolver<'a, 'db> {
 impl CteResolver for InlineCteResolver<'_, '_> {
     fn resolve_cte_expression(
         &mut self,
+        owner: crate::pipeline::asts::core::provenance::CteResolutionOwner,
         expr: ast_unresolved::RelationalExpression,
     ) -> Result<(
         ast_resolved::RelationalExpression,
         Vec<ast_unresolved::CfeDefinition>,
     )> {
+        // THE 462 WEAVE (Phase 10 slice c): the caller-authored carrier
+        // CTEs — the piped source, join input, and HO arguments, TYPED
+        // Caller-owned at construction — resolve under the CALLER's
+        // scope, while the entity's own body CTEs (Entity-owned, from its
+        // file text) keep the entity scope. One squished query, two
+        // honest scopes; typed ownership, never a naming convention and
+        // never construction provenance (review qmqwqlms round 3, P1).
+        let caller_config;
+        let config: &ResolutionConfig = match owner {
+            crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
+                resolution_namespace,
+            } => {
+                caller_config = ResolutionConfig {
+                    resolution_namespace,
+                    ..self.config.clone()
+                };
+                &caller_config
+            }
+            crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity => self.config,
+        };
         let (resolved, _bubbled, pipe_cfes) = resolve_relational_expression_with_pipe_cfes(
             expr,
             self.registry,
             self.outer_context,
-            self.config,
+            config,
             self.grounding,
         )?;
         Ok((resolved, pipe_cfes))
@@ -386,15 +414,20 @@ fn resolve_cte_bindings(
                 .next()
                 .expect("Group has len==1, must have element - invariant");
             let effect_label = cte.effect_label;
-            let (resolved_expr, pipe_cfes) = resolver.resolve_cte_expression(cte.expression)?;
+            let origin = cte.origin;
+            let resolution_owner = cte.resolution_owner;
+            let (resolved_expr, pipe_cfes) =
+                resolver.resolve_cte_expression(resolution_owner.clone(), cte.expression)?;
             all_pipe_cfes.extend(pipe_cfes);
             let mut cte_schema = extract_cpr_schema(&resolved_expr)?;
-            cte_schema = transform_schema_table_names(cte_schema, name);
+            cte_schema = transform_schema_table_names(cte_schema, name, origin);
             resolver.register_cte(name.clone(), cte_schema);
 
             resolved_ctes.push(ast_resolved::CteBinding {
                 expression: resolved_expr,
                 name: name.clone(),
+                origin,
+                resolution_owner,
                 effect_label,
                 is_recursive: ast_resolved::PhaseBox::phantom(),
             });
@@ -406,14 +439,17 @@ fn resolve_cte_bindings(
 
             for (idx, cte) in group.iter().enumerate() {
                 let (resolved_expr, pipe_cfes) =
-                    resolver.resolve_cte_expression(cte.expression.clone())?;
+                    resolver.resolve_cte_expression(
+                        cte.resolution_owner.clone(),
+                        cte.expression.clone(),
+                    )?;
                 all_pipe_cfes.extend(pipe_cfes);
                 let expr_schema = extract_cpr_schema(&resolved_expr)?;
 
                 // After first head, register the CTE so recursive heads can reference it
                 if idx == 0 {
                     let mut base_schema = expr_schema.clone();
-                    base_schema = transform_schema_table_names(base_schema, name);
+                    base_schema = transform_schema_table_names(base_schema, name, cte.origin);
                     resolver.register_cte(name.clone(), base_schema);
                 }
 
@@ -438,7 +474,11 @@ fn resolve_cte_bindings(
             };
 
             let mut final_schema = final_schema;
-            final_schema = transform_schema_table_names(final_schema, name);
+            final_schema = transform_schema_table_names(
+                final_schema,
+                name,
+                group.first().map(|c| c.origin).unwrap_or_default(),
+            );
             resolver.register_cte(name.clone(), final_schema.clone());
 
             let union_expr = ast_resolved::RelationalExpression::SetOperation {
@@ -453,6 +493,14 @@ fn resolve_cte_bindings(
             resolved_ctes.push(ast_resolved::CteBinding {
                 expression: union_expr,
                 name: name.clone(),
+                origin: group
+                    .first()
+                    .map(|c| c.origin)
+                    .unwrap_or_default(),
+                resolution_owner: group
+                    .first()
+                    .map(|c| c.resolution_owner.clone())
+                    .unwrap_or_default(),
                 effect_label: group.iter().any(|c| c.effect_label),
                 is_recursive: ast_resolved::PhaseBox::phantom(),
             });
@@ -483,7 +531,7 @@ pub fn resolve_query(
     // This ensures functions from borrowed namespaces (consult!() / inline DDL)
     // are expanded in ALL positions (filters, join conditions, argumentative
     // grounding, etc.) — not just inside pipe operators.
-    let (query, ccafe_cfes) = grounding::inline_in_query_borrowed(query, &registry.consult, None)?;
+    let (query, ccafe_cfes) = grounding::inline_in_query_borrowed(query, &registry.consult, None, config.resolution_namespace.as_deref())?;
 
     log::debug!(
         "inline_in_query_borrowed collected {} CFE definitions",
@@ -710,7 +758,7 @@ pub(crate) fn resolve_query_inline(
             // such calls pass through as literal SQL function calls.
             let wrapper_query = ast_unresolved::Query::Relational(expr);
             let (wrapper_query, ccafe_cfes) =
-                grounding::inline_in_query_borrowed(wrapper_query, &registry.consult, None)?;
+                grounding::inline_in_query_borrowed(wrapper_query, &registry.consult, None, config.resolution_namespace.as_deref())?;
             let expr = match wrapper_query {
                 ast_unresolved::Query::Relational(e) => e,
                 _ => unreachable!("inline_in_query_borrowed preserves Relational variant"),
@@ -740,7 +788,7 @@ pub(crate) fn resolve_query_inline(
                 query: main_query,
             };
             let (wrapper_query, ccafe_cfes) =
-                grounding::inline_in_query_borrowed(wrapper_query, &registry.consult, None)?;
+                grounding::inline_in_query_borrowed(wrapper_query, &registry.consult, None, config.resolution_namespace.as_deref())?;
             let (ctes, main_query) = match wrapper_query {
                 ast_unresolved::Query::WithCtes { ctes, query } => (ctes, query),
                 _ => unreachable!("inline_in_query_borrowed preserves WithCtes variant"),

@@ -16,11 +16,24 @@ use delightql_types::{
 };
 use log::debug;
 use rusqlite::{Connection, OptionalExtension};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Result of a `consult_file` operation.
+/// Everything that must land ATOMICALLY with a consultation's
+/// registration (review otolxyzl::qmqwqlms P1): applied inside
+/// `consult_file`'s catalog transaction, so a failure in any of it
+/// rolls the whole consultation back.
+pub(crate) struct ConsultPost<'a> {
+    pub deferred_exposes: Vec<Vec<String>>,
+    pub deferred_docs: Vec<(String, String)>,
+    pub new_enlists: &'a [(i32, i32)],
+    pub new_aliases: &'a [(String, i32)],
+    pub record_source: bool,
+}
+
 pub(crate) struct ConsultResult {
     /// Number of definitions loaded.
     pub definitions_loaded: usize,
@@ -112,6 +125,12 @@ pub(crate) struct DelightQLSystem {
     /// Wrapped in Arc so it can be shared with transformer without cloning
     bin_registry: Arc<crate::bin_cartridge::registry::BinCartridgeRegistry>,
 
+    /// Host-bound static database images for `delightql-bytes://` mounts
+    /// (BYTES-SCHEME-DESIGN.md). Names are bound once by the host via
+    /// `bind_static_bytes` and are immutable for the life of the handle;
+    /// the locator resolves ONLY names in this table (no ambient authority).
+    byte_bindings: HashMap<String, ByteBinding>,
+
     /// When true, the namespace resolver is authoritative: `Ok(None)` from
     /// `resolve_unqualified_entity` means the entity genuinely isn't enlisted.
     /// When false (pipe/SISO connections), namespace resolution is a stub and
@@ -150,6 +169,100 @@ pub(crate) struct DelightQLSystem {
     /// ran a DDL directive pay zero extra bootstrap queries. Never reset:
     /// a stale `true` only costs the probe query, never correctness.
     session_materialized_names: Cell<bool>,
+
+    /// The one OUTERMOST consultation/reconsultation context. Its catalog
+    /// mutations live under a SQLite savepoint; effects outside that catalog
+    /// are recorded in the typed journal. Nested loads inherit this context
+    /// rather than opening competing transaction/rollback mechanisms.
+    active_liminal_program: RefCell<Option<ProgramContext>>,
+}
+
+/// What kind of liminal program owns the current atomic boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiminalProgramKind {
+    /// consult! / consult_concat_into_ns! / consult_tree! — a load;
+    /// pre-program namespaces are strictly read-only for it.
+    Consult,
+    /// reconsult! — a reload; nested reloads of pre-existing CHILDREN are
+    /// the tree-reload semantics and stay allowed (documented residue:
+    /// they are reload-from-source, not compensable state).
+    Reconsult,
+}
+
+/// State outside the bootstrap catalog that an active liminal program must
+/// undo if the program aborts. Catalog rows will move under the program
+/// savepoint; these effects cannot.
+#[derive(Debug)]
+enum ExternalEffect {
+    AttachedSqlite {
+        schema_alias: String,
+    },
+    RegisteredExternalConnection {
+        connection_id: i64,
+    },
+    CreatedFile {
+        path: PathBuf,
+        prior_state: CreatedFilePriorState,
+    },
+}
+
+/// State owned by the outermost liminal program. `namespace_mark` remains a
+/// policy boundary (for operations deliberately forbidden against namespaces
+/// that predate the program), not a substitute for transactional rollback.
+#[derive(Debug)]
+struct ProgramContext {
+    namespace_mark: i64,
+    kind: LiminalProgramKind,
+    external_effects: Vec<ExternalEffect>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CreatedFilePriorState {
+    Absent,
+    Empty,
+}
+
+/// A nestable catalog transaction. SQLite SAVEPOINT works both at the top
+/// level and inside the outer liminal-program savepoint, unlike `BEGIN`.
+/// Uncommitted instances roll back on drop, so early `?`/`return Err` paths
+/// cannot forget cleanup.
+struct CatalogSavepoint<'a> {
+    conn: &'a Connection,
+    name: &'static str,
+    active: bool,
+}
+
+impl<'a> CatalogSavepoint<'a> {
+    fn begin(conn: &'a Connection, name: &'static str, context: &str) -> Result<Self> {
+        conn.execute_batch(&format!("SAVEPOINT {name}"))
+            .map_err(|e| DelightQLError::database_error(context, e.to_string()))?;
+        Ok(Self {
+            conn,
+            name,
+            active: true,
+        })
+    }
+
+    fn commit(mut self, context: &str) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("RELEASE SAVEPOINT {}", self.name))
+            .map_err(|e| DelightQLError::database_error(context, e.to_string()))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for CatalogSavepoint<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .conn
+                .execute_batch(&format!("ROLLBACK TO SAVEPOINT {}", self.name));
+            let _ = self
+                .conn
+                .execute_batch(&format!("RELEASE SAVEPOINT {}", self.name));
+        }
+    }
 }
 
 /// Embedded DQL source for the sys::meta generator HO view.
@@ -160,129 +273,58 @@ const SYS_META_SOURCE: &str = include_str!("../autoload/sys/meta.dql");
 ///
 /// Creates an entity like `main::` with definition `sys::meta.generator("main")(*)`
 /// so that `main::(*)` resolves through normal HO view expansion.
-/// Register the `sys::help` tables (SYS-HELP-DESIGN.md) so they are
-/// addressable as `sys::help.<name>(*)`. Ring 2 (`identifier`) is
-/// burned from bootstrap/schema.sql rows; ring 1 (command/option/...)
-/// is seeded at session init from the host binary's live surface
-/// (`seed_help_surface`). Follows the sys.danger pattern (entity type
-/// 10 = physical table on the bootstrap connection), on a dedicated
-/// cartridge so nothing else's bulk activation sweeps these entities
-/// into a different namespace.
-fn register_sys_help_tables(bootstrap_conn: &Connection, bootstrap_conn_id: i64) -> Result<()> {
+/// Register the engine-owned identifier registry as
+/// `sys::identifiers.identifier`. The burned rows live in
+/// bootstrap/schema.sql; CLI-shaped facts belong to the host instead.
+fn register_sys_identifier_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64) -> Result<()> {
     bootstrap_conn
         .execute(
             "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
-             VALUES (?1, ?2, 'sys://help', NULL, 1, ?3, 0)",
+             VALUES (?1, ?2, 'sys://identifiers', NULL, 1, ?3, 0)",
             rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
         )
         .map_err(|e| {
             DelightQLError::database_error(
-                format!("Failed to create sys::help cartridge: {}", e),
+                format!("Failed to create sys::identifiers cartridge: {}", e),
                 e.to_string(),
             )
         })?;
-    let help_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
+    let identifiers_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
 
-    let help_ns_id: i32 = bootstrap_conn
+    let identifiers_ns_id: i32 = bootstrap_conn
         .query_row(
-            "SELECT id FROM namespace WHERE fq_name = 'sys::help'",
+            "SELECT id FROM namespace WHERE fq_name = 'sys::identifiers'",
             [],
             |row| row.get(0),
         )
         .map_err(|e| {
             DelightQLError::database_error(
-                format!("Failed to query sys::help namespace: {}", e),
+                format!("Failed to query sys::identifiers namespace: {}", e),
                 e.to_string(),
             )
         })?;
 
     // (table/entity name, columns as (name, sqlite type, nullable))
     type Col = (&'static str, &'static str, bool);
-    let tables: &[(&str, &[Col])] = &[
-        (
-            "identifier",
-            &[
-                ("kind", "TEXT", false),
-                ("hierarchy", "TEXT", false),
-                ("summary", "TEXT", false),
-                ("explanation", "TEXT", false),
-            ],
-        ),
-        (
-            "command",
-            &[
-                ("name", "TEXT", false),
-                ("parent", "TEXT", true),
-                ("alias", "TEXT", true),
-                ("summary", "TEXT", false),
-            ],
-        ),
-        (
-            "option",
-            &[
-                ("command", "TEXT", false),
-                ("long", "TEXT", false),
-                ("short", "TEXT", true),
-                ("value_name", "TEXT", true),
-                ("default_value", "TEXT", true),
-                ("global", "INTEGER", false),
-                ("repeatable", "INTEGER", false),
-                ("summary", "TEXT", false),
-            ],
-        ),
-        (
-            "option_value",
-            &[
-                ("command", "TEXT", false),
-                ("option", "TEXT", false),
-                ("value", "TEXT", false),
-                ("summary", "TEXT", true),
-                ("class", "TEXT", true),
-                ("grade", "TEXT", true),
-            ],
-        ),
-        (
-            "dot_command",
-            &[("name", "TEXT", false), ("summary", "TEXT", false)],
-        ),
-        (
-            "env",
-            &[
-                ("name", "TEXT", false),
-                ("effect", "TEXT", false),
-                ("equivalent_flag", "TEXT", true),
-            ],
-        ),
-        (
-            "man_page",
-            &[
-                ("name", "TEXT", false),
-                ("section", "INTEGER", false),
-                ("troff", "TEXT", false),
-                ("plain", "TEXT", false),
-            ],
-        ),
-        (
-            "exit_code",
-            &[
-                ("code", "INTEGER", false),
-                ("context", "TEXT", false),
-                ("meaning", "TEXT", false),
-                ("class", "TEXT", true),
-                ("grade", "TEXT", true),
-            ],
-        ),
-    ];
+    let tables: &[(&str, &[Col])] = &[(
+        "identifier",
+        &[
+            ("kind", "TEXT", false),
+            ("hierarchy", "TEXT", false),
+            ("summary", "TEXT", false),
+            ("explanation", "TEXT", false),
+        ],
+    )];
 
     for (table, columns) in tables {
         bootstrap_conn
             .execute(
                 "INSERT INTO entity (name, type, cartridge_id) VALUES (?1, 10, ?2)",
-                rusqlite::params![table, help_cartridge_id],
+                rusqlite::params![table, identifiers_cartridge_id],
             )
             .map_err(|e| {
                 DelightQLError::database_error(
-                    format!("Failed to insert sys::help.{} entity: {}", table, e),
+                    format!("Failed to insert sys::identifiers.{} entity: {}", table, e),
                     e.to_string(),
                 )
             })?;
@@ -291,12 +333,12 @@ fn register_sys_help_tables(bootstrap_conn: &Connection, bootstrap_conn_id: i64)
         bootstrap_conn
             .execute(
                 "INSERT INTO entity_clause (entity_id, ordinal, definition)
-                 VALUES (?1, 1, '-- sys::help burned/seeded table (SYS-HELP-DESIGN.md)')",
+                 VALUES (?1, 1, '-- engine-owned identifier registry')",
                 rusqlite::params![entity_id],
             )
             .map_err(|e| {
                 DelightQLError::database_error(
-                    format!("Failed to insert sys::help.{} clause: {}", table, e),
+                    format!("Failed to insert sys::identifiers.{} clause: {}", table, e),
                     e.to_string(),
                 )
             })?;
@@ -318,7 +360,7 @@ fn register_sys_help_tables(bootstrap_conn: &Connection, bootstrap_conn_id: i64)
                 .map_err(|e| {
                     DelightQLError::database_error(
                         format!(
-                            "Failed to insert sys::help.{} column '{}': {}",
+                            "Failed to insert sys::identifiers.{} column '{}': {}",
                             table, col_name, e
                         ),
                         e.to_string(),
@@ -329,11 +371,11 @@ fn register_sys_help_tables(bootstrap_conn: &Connection, bootstrap_conn_id: i64)
         bootstrap_conn
             .execute(
                 "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![entity_id, help_ns_id, help_cartridge_id],
+                rusqlite::params![entity_id, identifiers_ns_id, identifiers_cartridge_id],
             )
             .map_err(|e| {
                 DelightQLError::database_error(
-                    format!("Failed to activate sys::help.{}: {}", table, e),
+                    format!("Failed to activate sys::identifiers.{}: {}", table, e),
                     e.to_string(),
                 )
             })?;
@@ -461,6 +503,186 @@ fn register_sys_connection_table(bootstrap_conn: &Connection, bootstrap_conn_id:
     Ok(())
 }
 
+/// Register ONE curated sys::ns catalog relation (the sys::connections
+/// precedent, NAMESPACE-CARTRIDGE-LINK-DESIGN.md §4b): an explicit column
+/// ALLOWLIST entity over a physical bootstrap table, so the public shape is
+/// deliberate and a column added to the physical table later is
+/// default-deny. The raw introspected entity stays orphaned by design
+/// (import/activation.rs no longer bulk-activates bootstrap tables); the
+/// shared implementation exists so every curated relation gets identical
+/// registration mechanics.
+fn register_curated_sys_ns_table(
+    bootstrap_conn: &Connection,
+    bootstrap_conn_id: i64,
+    table_name: &str,
+    clause_comment: &str,
+    columns: &[(&str, &str, i32, bool)],
+) -> Result<()> {
+    // ONE sys://ns cartridge shared by every curated relation — created on
+    // the first registration, reused after.
+    let existing: Option<i32> = bootstrap_conn
+        .query_row(
+            "SELECT id FROM cartridge WHERE source_uri = 'sys://ns' AND connection_id = ?1",
+            [bootstrap_conn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to query sys::ns cartridge for '{table_name}': {e}"),
+                e.to_string(),
+            )
+        })?;
+    let ns_cartridge_id = match existing {
+        Some(id) => id,
+        None => {
+            bootstrap_conn
+                .execute(
+                    "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+                     VALUES (?1, ?2, 'sys://ns', NULL, 1, ?3, 0)",
+                    rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!("Failed to create sys::ns cartridge for '{table_name}': {e}"),
+                        e.to_string(),
+                    )
+                })?;
+            bootstrap_conn.last_insert_rowid() as i32
+        }
+    };
+
+    let ns_ns_id: i32 = bootstrap_conn
+        .query_row(
+            "SELECT id FROM namespace WHERE fq_name = 'sys::ns'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to query sys::ns namespace: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO entity (name, type, cartridge_id) VALUES (?1, 10, ?2)",
+            rusqlite::params![table_name, ns_cartridge_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to insert sys::ns.{table_name} entity: {e}"),
+                e.to_string(),
+            )
+        })?;
+    let entity_id = bootstrap_conn.last_insert_rowid() as i32;
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO entity_clause (entity_id, ordinal, definition)
+             VALUES (?1, 1, ?2)",
+            rusqlite::params![entity_id, clause_comment],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to insert sys::ns.{table_name} clause: {e}"),
+                e.to_string(),
+            )
+        })?;
+
+    for (col_name, data_type, position, nullable) in columns {
+        bootstrap_conn
+            .execute(
+                "INSERT INTO entity_attribute
+                 (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
+                 VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
+                rusqlite::params![entity_id, col_name, data_type, position, nullable],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!(
+                        "Failed to insert sys::ns.{table_name} column '{col_name}': {e}"
+                    ),
+                    e.to_string(),
+                )
+            })?;
+    }
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![entity_id, ns_ns_id, ns_cartridge_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to activate sys::ns.{table_name}: {e}"),
+                e.to_string(),
+            )
+        })?;
+
+    Ok(())
+}
+
+/// Register the CURATED sys::ns relations: `namespace` (the ratified public
+/// shape — NAMESPACE-CARTRIDGE-LINK-DESIGN.md), plus the two taxonomy
+/// decisions ruled 2026-07-16 (dql selftest's orphaned_entity findings):
+/// `mount` (MOUNT-RELATION-DESIGN.md §4 anticipated this curated
+/// projection — mount identity queryable deliberately) and
+/// `namespace_source` (Phase 8 consultation provenance — which files, in
+/// which order, built a consulted namespace).
+fn register_sys_ns_namespace_table(
+    bootstrap_conn: &Connection,
+    bootstrap_conn_id: i64,
+) -> Result<()> {
+    // Exactly the columns namespace(*) has always shown. Mount identity is
+    // deliberately absent HERE — it lives in its own curated relation below,
+    // not as columns grafted onto namespace.
+    register_curated_sys_ns_table(
+        bootstrap_conn,
+        bootstrap_conn_id,
+        "namespace",
+        "-- sys::ns curated public columns (NAMESPACE-CARTRIDGE-LINK-DESIGN.md)",
+        &[
+            ("id", "INTEGER", 1, false),
+            ("name", "TEXT", 2, false),
+            ("pid", "INTEGER", 3, true),
+            ("fq_name", "TEXT", 4, true),
+            ("default_data_ns", "TEXT", 5, true),
+            ("kind", "TEXT", 6, false),
+            ("provenance", "TEXT", 7, true),
+            ("source_path", "TEXT", 8, true),
+            ("writable", "INTEGER", 9, false),
+        ],
+    )?;
+    register_curated_sys_ns_table(
+        bootstrap_conn,
+        bootstrap_conn_id,
+        "mount",
+        "-- sys::ns curated public columns (MOUNT-RELATION-DESIGN.md §4)",
+        &[
+            ("namespace_id", "INTEGER", 1, false),
+            ("cartridge_id", "INTEGER", 2, false),
+            ("attach_alias", "TEXT", 3, true),
+            ("qualification", "TEXT", 4, false),
+            ("engine_schema", "TEXT", 5, true),
+            ("class", "TEXT", 6, false),
+        ],
+    )?;
+    register_curated_sys_ns_table(
+        bootstrap_conn,
+        bootstrap_conn_id,
+        "namespace_source",
+        "-- sys::ns curated public columns (Phase 8 consultation provenance)",
+        &[
+            ("namespace_id", "INTEGER", 1, false),
+            ("source_path", "TEXT", 2, false),
+            ("ordinal", "INTEGER", 3, false),
+        ],
+    )?;
+    Ok(())
+}
+
 fn register_catalog_wrapper(
     conn: &Connection,
     ns_fq: &str,
@@ -469,6 +691,33 @@ fn register_catalog_wrapper(
 ) -> Result<()> {
     let entity_name = format!("{}::", ns_fq);
     let definition = format!(r#"_(*) :- sys::meta.generator("{}")(*)"#, ns_fq);
+
+    // Catalog initialization registers wrappers for every namespace already
+    // present. Mount paths also call this function after lazy initialization
+    // so that later namespaces receive a wrapper. Make that overlap explicitly
+    // idempotent: a namespace has exactly one wrapper in the catalog cartridge.
+    let already_registered: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM entity e
+                 JOIN activated_entity ae ON ae.entity_id = e.id
+                 WHERE e.name = ?1
+                   AND e.cartridge_id = ?2
+                   AND ae.namespace_id = ?3
+             )",
+            rusqlite::params![&entity_name, cartridge_id, sys_meta_ns_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to check catalog wrapper '{}': {}", entity_name, e),
+                e.to_string(),
+            )
+        })?;
+    if already_registered {
+        return Ok(());
+    }
 
     conn.execute(
         "INSERT INTO entity (name, type, cartridge_id) VALUES (?1, ?2, ?3)",
@@ -518,6 +767,311 @@ fn register_catalog_wrapper(
         entity_name
     );
     Ok(())
+}
+
+/// Materialize the namespace tree required by a mounted data leaf.
+///
+/// A qualified mount such as `cli::surface` is two catalog facts, not one flat
+/// row whose `name` happens to contain `::`: `cli` is a structural container
+/// parented to `_`, and `surface` is the data namespace parented to `cli`.
+/// Existing ancestors are reused without changing their ownership kind (a data
+/// mount may legitimately live below a consulted library namespace).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountBinding {
+    namespace_id: i64,
+    cartridge_id: i64,
+    connection_id: i64,
+    attach_alias: Option<String>,
+    qualification: String,
+    engine_schema: Option<String>,
+    class: String,
+}
+
+impl MountBinding {
+    fn attach(
+        namespace_id: i64,
+        cartridge_id: i64,
+        connection_id: i64,
+        alias: impl Into<String>,
+        qualification: impl Into<String>,
+    ) -> Self {
+        Self {
+            namespace_id,
+            cartridge_id,
+            connection_id,
+            attach_alias: Some(alias.into()),
+            qualification: qualification.into(),
+            engine_schema: None,
+            class: "attach".to_string(),
+        }
+    }
+
+    fn external(
+        namespace_id: i64,
+        cartridge_id: i64,
+        connection_id: i64,
+        engine_schema: Option<String>,
+    ) -> Self {
+        Self {
+            namespace_id,
+            cartridge_id,
+            connection_id,
+            attach_alias: None,
+            qualification: if engine_schema.is_some() {
+                "engine_schema".to_string()
+            } else {
+                "unqualified".to_string()
+            },
+            engine_schema,
+            class: "external".to_string(),
+        }
+    }
+}
+
+/// Parameters for one attach-class mount, consumed by the shared spine
+/// (`mount_attach_class`, MOUNT-SPINE-PLAN.md). The path-specific halves —
+/// how to attach, and what counts as the same source — travel as closures.
+struct AttachClassMount<'a> {
+    /// Target namespace fq_name.
+    namespace: &'a str,
+    /// `cartridge.source_uri` (also the conflict-message spelling).
+    source_uri: String,
+    /// `namespace.source_path` value (file path or locator).
+    source_path: String,
+    /// `namespace.provenance` ("file" | "bytes").
+    provenance: &'static str,
+    /// sys::connections registration: resource / mechanism / identity.
+    conn_resource: &'a str,
+    conn_mechanism: &'static str,
+    conn_identity: Option<String>,
+    conn_description: String,
+}
+
+/// Best-effort DETACH-on-drop for a freshly attached mount alias (second
+/// review, F3): armed immediately after ATTACH and disarmed only after a
+/// successful COMMIT, so BEGIN failure, any registration failure, AND
+/// COMMIT failure all leave no alias behind. Cleanup failures are logged,
+/// never surfaced — the original error is the story.
+struct DetachOnDrop<'a> {
+    connection: &'a Arc<Mutex<dyn DatabaseConnection>>,
+    alias: &'a str,
+    armed: bool,
+}
+
+impl Drop for DetachOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.connection.lock() {
+            Ok(conn) => {
+                if let Err(e) = conn.execute(&format!("DETACH DATABASE '{}'", self.alias), &[]) {
+                    debug!("mount cleanup: DETACH '{}' failed: {}", self.alias, e);
+                }
+            }
+            Err(_) => debug!(
+                "mount cleanup: connection lock poisoned; alias '{}' may leak",
+                self.alias
+            ),
+        }
+    }
+}
+
+/// RAII savepoint bracket over the bootstrap connection (fourth review,
+/// P2): constructed before a multi-statement registration/cascade, it
+/// ROLLS BACK on drop unless `commit()` ran — so every scattered `?`
+/// early-return inside the bracket restores the catalog whole (the mount
+/// link included). SAVEPOINT rather than BEGIN so nesting inside any
+/// caller-held transaction stays legal.
+struct BootstrapTxn<'a> {
+    conn: &'a Connection,
+    name: &'static str,
+    armed: bool,
+}
+
+impl<'a> BootstrapTxn<'a> {
+    fn begin(conn: &'a Connection, name: &'static str) -> Result<Self> {
+        conn.execute_batch(&format!("SAVEPOINT {}", name))
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to open bootstrap savepoint",
+                    e.to_string(),
+                )
+            })?;
+        Ok(Self {
+            conn,
+            name,
+            armed: true,
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        // RELEASE first, disarm only on success (fifth review, P1): if the
+        // release fails (e.g. a deferred constraint), the guard stays armed
+        // and Drop rolls the still-open savepoint back — disarming early
+        // would leave the partial transaction dangling.
+        self.conn
+            .execute_batch(&format!("RELEASE {}", self.name))
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to release bootstrap savepoint",
+                    e.to_string(),
+                )
+            })?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for BootstrapTxn<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(e) = self.conn.execute_batch(&format!(
+                "ROLLBACK TO {name}; RELEASE {name}",
+                name = self.name
+            )) {
+                debug!("bootstrap savepoint rollback failed: {}", e);
+            }
+        }
+    }
+}
+
+/// A host-bound database image (BYTES-SCHEME-DESIGN.md): static rodata
+/// (`include_bytes!`, referenced zero-copy at attach) or an owned
+/// runtime-built buffer (copied into SQLite memory at attach). Both are
+/// validated once, at bind time, in a scratch connection.
+#[derive(Clone)]
+pub(crate) enum ByteBinding {
+    Static(&'static [u8]),
+    Owned(std::sync::Arc<[u8]>),
+}
+
+impl ByteBinding {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            ByteBinding::Static(b) => b,
+            ByteBinding::Owned(a) => a,
+        }
+    }
+}
+
+/// Byte-binding names are lowercase capability labels
+/// (BYTES-SCHEME-DESIGN.md): `[a-z][a-z0-9._-]*`.
+fn valid_byte_binding_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Validate a bound image ONCE, at bind time, in a scratch connection —
+/// never on the session connection. sqlite3_deserialize installs a buffer
+/// without validating it (validation is lazy, on first access), and a
+/// garbage image POISONS the hosting connection: every later statement,
+/// including the DETACH that would remove it, fails with "file is not a
+/// database". Bindings are immutable, so one bind-time proof covers every
+/// future mount.
+fn validate_sqlite_image(name: &str, bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 100 || !bytes.starts_with(b"SQLite format 3\0") {
+        return Err(DelightQLError::validation_error(
+            format!(
+                "byte binding '{}' is not a valid SQLite database image",
+                name
+            ),
+            "delightql-bytes:// bindings must be complete SQLite images",
+        ));
+    }
+    let mut scratch = Connection::open_in_memory().map_err(|e| {
+        DelightQLError::database_error(
+            "Failed to open scratch connection for image validation",
+            e.to_string(),
+        )
+    })?;
+    scratch
+        .deserialize_read_exact("main", bytes, bytes.len(), true)
+        .and_then(|_| {
+            scratch.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .map_err(|e| {
+            DelightQLError::validation_error(
+                format!(
+                    "byte binding '{}' is not a valid SQLite database image: {}",
+                    name, e
+                ),
+                "delightql-bytes:// bindings must be complete SQLite images",
+            )
+        })?;
+    Ok(())
+}
+
+fn create_mounted_namespace_path(
+    conn: &Connection,
+    namespace: &str,
+    provenance: &str,
+    source_path: &str,
+) -> Result<(i32, Vec<String>)> {
+    let mut specs = crate::import::namespace::parse_namespace_path(conn, namespace)
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to construct namespace path '{}': {}", namespace, e),
+                e.to_string(),
+            )
+        })?;
+
+    let created_names: Vec<String> = specs.iter().map(|spec| spec.fq_name.clone()).collect();
+    for spec in &mut specs {
+        if spec.fq_name == namespace {
+            spec.kind = "data".into();
+            spec.provenance = Some(provenance.into());
+            spec.source_path = Some(source_path.into());
+        } else {
+            spec.kind = "container".into();
+            spec.provenance = Some("mount".into());
+            spec.source_path = None;
+        }
+    }
+
+    crate::import::namespace::create_namespace_hierarchy(conn, &specs).map_err(|e| {
+        DelightQLError::database_error(
+            format!("Failed to create namespace path '{}': {}", namespace, e),
+            e.to_string(),
+        )
+    })?;
+
+    let leaf_id = if let Some(leaf) = specs.last() {
+        leaf.id
+    } else {
+        conn.query_row(
+            "SELECT id FROM namespace WHERE fq_name = ?1",
+            [namespace],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to find namespace '{}': {}", namespace, e),
+                e.to_string(),
+            )
+        })?
+    };
+
+    Ok((leaf_id, created_names))
+}
+
+fn register_mounted_catalog_wrappers(
+    conn: &Connection,
+    namespace: &str,
+    created_names: &[String],
+    sys_meta_ns_id: i32,
+    catalog_id: i32,
+) -> Result<()> {
+    for fq_name in created_names {
+        register_catalog_wrapper(conn, fq_name, sys_meta_ns_id, catalog_id)?;
+    }
+    // Reused empty leaves (notably `main`, and a former structural parent)
+    // are absent from `created_names`; the idempotent registration covers both.
+    register_catalog_wrapper(conn, namespace, sys_meta_ns_id, catalog_id)
 }
 
 /// RAII rollback for the imprint target transaction.
@@ -815,10 +1369,9 @@ pub(crate) fn imprint_clash_probe_sql(master: &str, name_lit: &str) -> String {
     )
 }
 
-/// The engine's OWN default schema for a fatboy `connection_type` — the
-/// downstream resolution of a NULL (bare-mount) `source_ns` (schema-mount
-/// Phase A; the read side of `fatboy_exec.rs::default_schema`, which is the
-/// write side the introspector uses). 3 = postgres → `public`, 4 = duckdb →
+/// The engine's OWN default schema for an unqualified fatboy mount (the read
+/// side of `fatboy_exec.rs::default_schema`, which is the write side the
+/// introspector uses). 3 = postgres → `public`, 4 = duckdb →
 /// `main`; every other type (SQLite primary, siso, unknown) has no derivable
 /// engine schema and answers `None`. Pinned by
 /// `schema_mount_recording_tests::bare_mount_falls_back_to_the_engine_default`.
@@ -1055,8 +1608,9 @@ pub(crate) fn validate_user_namespace_target(fq: &str) -> Result<()> {
 ///      `home::chz` (a child), never `home::a::b` (a grandchild). One prefix
 ///      join per parent, no recursion.
 ///
-/// The enlist set is `enlisted_namespace` joined to its `to = 'main'` session
-/// scope (Deviation #7's magic target). The returned fq re-enters the normal
+/// The enlist set is `enlisted_namespace` joined to its `to = 'home'` session
+/// scope (Phase 7/2H — the interactive environment's own namespace). The
+/// returned fq re-enters the normal
 /// resolution path at every call site, so the blueprint-inertness guard applies
 /// to the expanded fq unchanged.
 pub(crate) fn expand_plain_namespace(conn: &Connection, path: &str) -> Result<Option<String>> {
@@ -1067,14 +1621,19 @@ pub(crate) fn expand_plain_namespace(conn: &Connection, path: &str) -> Result<Op
         return Ok(None);
     }
 
-    // The enlisted parents (from_namespace) for this session scope (to='main').
+    // The enlisted parents (from_namespace) for the session scope
+    // (to='home'), PLUS the scope itself — named scratch lives at
+    // home::<name>, and home is its own parent now that it IS the scope
+    // (Phase 7/2H; precedence rule 2 already prefers the home child).
     let mut stmt = conn
         .prepare(
             "SELECT p.fq_name
              FROM enlisted_namespace en
              JOIN namespace p ON p.id = en.from_namespace_id
              JOIN namespace target ON target.id = en.to_namespace_id
-             WHERE target.fq_name = 'main'",
+             WHERE target.fq_name = 'home'
+             UNION
+             SELECT 'home'",
         )
         .map_err(|e| DelightQLError::database_error("prepare enlist-set scan", e.to_string()))?;
     let parents: Vec<String> = stmt
@@ -1280,9 +1839,13 @@ mod expand_plain_namespace_tests {
              CREATE TABLE enlisted_namespace (from_namespace_id INTEGER, to_namespace_id INTEGER);",
         )
         .unwrap();
-        // 'main' is always present (the session scope).
-        let mut all: Vec<&str> = vec!["main"];
+        // 'home' is always present (the session scope, Phase 7/2H);
+        // 'main' stays as the ambient data namespace.
+        let mut all: Vec<&str> = vec!["home", "main"];
         all.extend_from_slice(namespaces);
+        all.dedup_by(|a, b| a == b);
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|fq| seen.insert(*fq));
         for (i, fq) in all.iter().enumerate() {
             c.execute(
                 "INSERT OR IGNORE INTO namespace (id, fq_name) VALUES (?1, ?2)",
@@ -1298,11 +1861,11 @@ mod expand_plain_namespace_tests {
             )
             .unwrap()
         };
-        let main_id = id_of("main");
+        let home_id = id_of("home");
         for e in enlisted {
             c.execute(
                 "INSERT INTO enlisted_namespace (from_namespace_id, to_namespace_id) VALUES (?1, ?2)",
-                rusqlite::params![id_of(e), main_id],
+                rusqlite::params![id_of(e), home_id],
             )
             .unwrap();
         }
@@ -1568,12 +2131,11 @@ mod readback_sql_tests {
 #[cfg(test)]
 mod schema_mount_recording_tests {
     //! schema-mount Phase A (EFFECTS-ON-TARGETS-PLAN §4.1): the mounted
-    //! engine schema is a RECORDED per-mount fact — the cartridge's
-    //! `source_ns`, fed by `ConnectionComponents.mounted_schema` — not a
-    //! connection-type derivation. A mount given a specific schema records
-    //! THAT schema (and introspects it); a bare mount records NULL and the
-    //! namespace-keyed lookup resolves the engine default downstream, so it
-    //! is behavior-identical to the pre-Phase-A derivation.
+    //! engine schema is a RECORDED per-mount fact. Mount qualification is read
+    //! from `mount`; cartridge.source_ns remains source metadata and is never
+    //! a second policy authority. A mount given a specific schema records THAT
+    //! schema (and introspects it); a bare mount records unqualified policy and
+    //! the namespace-keyed lookup resolves the engine default downstream.
     use super::DelightQLSystem;
     use delightql_types::factory::ConnectionComponents;
     use delightql_types::introspect::{
@@ -1636,13 +2198,31 @@ mod schema_mount_recording_tests {
         }
     }
 
-    /// A mount given a SPECIFIC schema records it as `source_ns`; the
-    /// namespace-keyed lookup reads that recorded fact VERBATIM (type 3 would
+    fn shared_pg_components(
+        mounted_schema: &str,
+        identity: &str,
+        connection: Arc<Mutex<dyn delightql_types::DatabaseConnection>>,
+    ) -> ConnectionComponents {
+        ConnectionComponents {
+            connection,
+            schema: Box::new(MockSchemaProvider::new()),
+            introspector: Box::new(SchemaEchoIntrospector {
+                schema: Some(mounted_schema.to_string()),
+            }),
+            db_type: "postgresql".to_string(),
+            mechanism: "fatboy".to_string(),
+            identity: Some(identity.to_string()),
+            mounted_schema: Some(mounted_schema.to_string()),
+        }
+    }
+
+    /// A mount given a SPECIFIC schema records it on `mount`; the namespace-
+    /// keyed lookup reads that recorded fact VERBATIM (type 3 would
     /// have DERIVED `public`); and the mount introspected THAT schema's
     /// entity. Red before Phase A: `mounted_engine_schema_for_connection`
     /// derived `public` from connection_type, ignoring the recorded schema.
     #[test]
-    fn mount_records_the_schema_as_source_ns_and_the_lookup_reads_it() {
+    fn mount_records_the_engine_schema_and_the_lookup_reads_it() {
         let mut system = fresh_system();
         let (conn_id, count) = system
             .register_external_connection(pg_components(Some("reporting")), "rep", "mock://rep")
@@ -1670,8 +2250,8 @@ mod schema_mount_recording_tests {
         );
     }
 
-    /// A BARE mount (mounted_schema None) records a NULL `source_ns`; the
-    /// lookup falls back to the engine default for the connection type
+    /// A BARE mount records unqualified policy; the lookup falls back to the
+    /// engine default for the connection type
     /// (postgres → `public`, duckdb → `main`) — byte-identical to the
     /// pre-Phase-A derivation, keeping reads unqualified.
     #[test]
@@ -1683,7 +2263,7 @@ mod schema_mount_recording_tests {
         assert_eq!(
             system.mounted_engine_schema_for_namespace("plain").unwrap(),
             Some("public".to_string()),
-            "a NULL source_ns resolves the engine default downstream"
+            "unqualified mount policy resolves the engine default downstream"
         );
         assert_eq!(
             system.mounted_engine_schema_for_connection(conn_id).unwrap(),
@@ -1697,6 +2277,156 @@ mod schema_mount_recording_tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Qualified mounts create catalog topology, rather than storing the full
+    /// path in a flat leaf row. This is shared by URI mounts and SQLite ATTACH
+    /// mounts, so the cheap mock path pins the engine-level invariant while the
+    /// corpus exercises the real file mount.
+    #[test]
+    fn qualified_mount_materializes_and_protects_its_container_parent() {
+        let mut system = fresh_system();
+        system
+            .register_external_connection(
+                pg_components(Some("reporting")),
+                "client::reporting",
+                "mock://nested-reporting",
+            )
+            .expect("register a qualified external mount");
+
+        let bootstrap = system.get_bootstrap_connection();
+        let conn = bootstrap.lock().unwrap();
+        let root_id: i32 = conn
+            .query_row("SELECT id FROM namespace WHERE fq_name = '_'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let (parent_id, parent_name, parent_pid, parent_kind): (
+            i32,
+            String,
+            Option<i32>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT id, name, pid, kind FROM namespace WHERE fq_name = 'client'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let (leaf_name, leaf_pid, leaf_kind): (String, Option<i32>, String) = conn
+            .query_row(
+                "SELECT name, pid, kind FROM namespace WHERE fq_name = 'client::reporting'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(parent_name, "client");
+        assert_eq!(parent_pid, Some(root_id));
+        assert_eq!(parent_kind, "container");
+        assert_eq!(leaf_name, "reporting", "leaf name is one path segment");
+        assert_eq!(leaf_pid, Some(parent_id));
+        assert_eq!(leaf_kind, "data");
+
+        let wrapper_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM entity e
+                 JOIN cartridge c ON c.id = e.cartridge_id
+                 WHERE c.source_uri = 'catalog://sys::meta'
+                   AND e.name IN ('client::', 'client::reporting::')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrapper_count, 2, "parent and leaf each have one wrapper");
+        drop(conn);
+
+        let err = system
+            .unconsult_namespace("client")
+            .expect_err("a structural mount parent is not a consulted library");
+        assert!(err.to_string().contains("structural container"));
+    }
+
+    #[test]
+    fn shared_connection_survives_until_the_last_tree_binding_is_unmounted() {
+        let mut system = fresh_system();
+        let shared: Arc<Mutex<dyn delightql_types::DatabaseConnection>> =
+            Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        let (connection_id, _) = system
+            .register_external_connection(
+                shared_pg_components("a", "pg-system-id:tree", Arc::clone(&shared)),
+                "tree::a",
+                "mock://tree",
+            )
+            .expect("mount first schema");
+        let (same_connection_id, _) = system
+            .register_external_connection(
+                shared_pg_components("b", "pg-system-id:tree", Arc::clone(&shared)),
+                "tree::b",
+                "mock://tree",
+            )
+            .expect("mount second schema");
+        assert_eq!(connection_id, same_connection_id);
+
+        system.unmount_database("tree::a").expect("unmount first leaf");
+        assert!(
+            system.get_connection(connection_id).is_ok(),
+            "a sibling mount row still owns the shared live connection"
+        );
+
+        system.unmount_database("tree::b").expect("unmount final leaf");
+        assert!(
+            system.get_connection(connection_id).is_err(),
+            "the last mount row releases the shared live connection"
+        );
+    }
+
+    struct FailingIntrospector;
+    impl DatabaseIntrospector for FailingIntrospector {
+        fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
+            Err(delightql_types::DelightQLError::database_error(
+                "induced external introspection failure",
+                "schema_mount_recording_tests",
+            ))
+        }
+
+        fn introspect_entities_in_schema(&self, _schema: &str) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn failed_external_mount_rolls_back_connection_namespace_and_binding() {
+        let mut system = fresh_system();
+        let components = ConnectionComponents {
+            connection: Arc::new(Mutex::new(MockDatabaseConnection::new())),
+            schema: Box::new(MockSchemaProvider::new()),
+            introspector: Box::new(FailingIntrospector),
+            db_type: "postgresql".to_string(),
+            mechanism: "fatboy".to_string(),
+            identity: Some("pg-system-id:failing".to_string()),
+            mounted_schema: Some("public".to_string()),
+        };
+
+        system
+            .register_external_connection(components, "failed", "mock://failed")
+            .expect_err("the injected introspection failure must abort the mount");
+
+        let conn = system.bootstrap_connection.lock().unwrap();
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM namespace WHERE fq_name = 'failed') +
+                    (SELECT count(*) FROM connection WHERE resource_uri = 'mock://failed') +
+                    (SELECT count(*) FROM cartridge WHERE source_uri = 'mock://failed') +
+                    (SELECT count(*) FROM mount m JOIN namespace n ON n.id = m.namespace_id
+                     WHERE n.fq_name = 'failed')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0, "external mount failure must leave no catalog fragment");
     }
 }
 
@@ -2107,16 +2837,17 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
         register_catalog_wrapper(bootstrap_conn, ns_fq, sys_meta_ns_id, catalog_cartridge_id)?;
     }
 
-    // Auto-enlist sys::meta into main
-    let main_ns_id: i32 = bootstrap_conn
+    // Auto-enlist sys::meta into `home` — the interactive scope (Phase
+    // 7/2H: enlistment edges are owned by the environment they extend).
+    let home_ns_id: i32 = bootstrap_conn
         .query_row(
-            "SELECT id FROM namespace WHERE fq_name = 'main'",
+            "SELECT id FROM namespace WHERE fq_name = 'home'",
             [],
             |row| row.get(0),
         )
         .map_err(|e| {
             DelightQLError::database_error(
-                format!("Failed to query main namespace for enlist: {}", e),
+                format!("Failed to query home namespace for enlist: {}", e),
                 e.to_string(),
             )
         })?;
@@ -2125,21 +2856,23 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
         .execute(
             "INSERT OR IGNORE INTO enlisted_namespace (from_namespace_id, to_namespace_id)
              VALUES (?1, ?2)",
-            [sys_meta_ns_id, main_ns_id],
+            [sys_meta_ns_id, home_ns_id],
         )
         .map_err(|e| {
             DelightQLError::database_error(
-                format!("Failed to enlist sys::meta into main: {}", e),
+                format!("Failed to enlist sys::meta into home: {}", e),
                 e.to_string(),
             )
         })?;
 
-    // Auto-enlist `home` into main (catechism §I/§IV: home is one of the five
-    // session-start enlistments — "everything you author in-session" is bare
-    // because home is enlisted). Uses the same magic `to = main` target as the
-    // rest of session bootstrap (Deviation #7); mirror the sys::meta idiom above.
-    if let Ok(home_ns_id) = bootstrap_conn.query_row(
-        "SELECT id FROM namespace WHERE fq_name = 'home'",
+    // Auto-enlist `main` into `home` (Phase 7/2H; catechism §I/§IV): the
+    // interactive session's scope is `home`, and bare table names keep
+    // working BECAUSE `main` — the default data namespace — is enlisted
+    // into it. This replaces the old inverted home→main edge, which
+    // pretended the session was `main` (Deviation #7's magic target,
+    // now retired).
+    if let Ok(main_ns_id) = bootstrap_conn.query_row(
+        "SELECT id FROM namespace WHERE fq_name = 'main'",
         [],
         |row| row.get::<_, i32>(0),
     ) {
@@ -2147,18 +2880,18 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
             .execute(
                 "INSERT OR IGNORE INTO enlisted_namespace (from_namespace_id, to_namespace_id)
                  VALUES (?1, ?2)",
-                [home_ns_id, main_ns_id],
+                [main_ns_id, home_ns_id],
             )
             .map_err(|e| {
                 DelightQLError::database_error(
-                    format!("Failed to enlist home into main: {}", e),
+                    format!("Failed to enlist main into home: {}", e),
                     e.to_string(),
                 )
             })?;
     }
 
     debug!(
-        "register_catalog_views: Registered {} catalog wrappers, enlisted sys::meta + home into main",
+        "register_catalog_views: Registered {} catalog wrappers, enlisted sys::meta + main into home",
         ns_names.len()
     );
 
@@ -2172,7 +2905,32 @@ fn ensure_catalog_initialized(
     bootstrap_conn: &Connection,
 ) -> Result<i32> {
     if let Some(id) = catalog_cartridge_id.get() {
-        return Ok(id);
+        // Validate before reuse (fifth review P2, tightened sixth review
+        // P1): the Cell can be set inside a mount savepoint that later
+        // ROLLS BACK — and SQLite may then REUSE the freed rowid for an
+        // unrelated cartridge, so existence of the id alone proves
+        // nothing. The row must also carry the catalog cartridge's
+        // identity markers (the exact values register_catalog_views
+        // stamps). Anything else: drop the cache and re-initialize.
+        let is_catalog: bool = bootstrap_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cartridge
+                 WHERE id = ?1
+                   AND source_uri = 'catalog://sys::meta'
+                   AND source_ns = 'sys::meta')",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to validate catalog cartridge cache",
+                    e.to_string(),
+                )
+            })?;
+        if is_catalog {
+            return Ok(id);
+        }
+        catalog_cartridge_id.set(None);
     }
     let id = register_catalog_views(bootstrap_conn)?;
     catalog_cartridge_id.set(Some(id));
@@ -2205,6 +2963,87 @@ fn ensure_namespace_available(conn: &rusqlite::Connection, fq_name: &str) -> Res
 }
 
 impl DelightQLSystem {
+    /// Read the authoritative mount binding for a namespace.  The connection
+    /// is intentionally derived through the cartridge: `mount` owns the
+    /// namespace↔cartridge binding, while `cartridge.connection_id` remains
+    /// the single connection authority during this migration.
+    fn mount_binding(
+        bootstrap_conn: &Connection,
+        namespace_id: i64,
+    ) -> Result<Option<MountBinding>> {
+        bootstrap_conn
+            .query_row(
+                "SELECT m.namespace_id, m.cartridge_id, c.connection_id,
+                        m.attach_alias, m.qualification, m.engine_schema, m.class
+                 FROM mount m
+                 JOIN cartridge c ON c.id = m.cartridge_id
+                 WHERE m.namespace_id = ?1",
+                [namespace_id],
+                |row| {
+                    Ok(MountBinding {
+                        namespace_id: row.get(0)?,
+                        cartridge_id: row.get(1)?,
+                        connection_id: row.get(2)?,
+                        attach_alias: row.get(3)?,
+                        qualification: row.get(4)?,
+                        engine_schema: row.get(5)?,
+                        class: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to read namespace mount binding",
+                    e.to_string(),
+                )
+            })
+    }
+
+    /// Insert the single binding for a mounted namespace. The
+    /// UNIQUE/FK constraints in `mount` make invalid sharing and orphaned
+    /// bindings loud. Refresh explicitly clears the old row before inserting
+    /// its replacement; an unexpected second writer therefore refuses rather
+    /// than silently re-pointing a live namespace. Callers must invoke this
+    /// inside their catalog transaction.
+    fn record_mount_binding(
+        bootstrap_conn: &Connection,
+        binding: &MountBinding,
+    ) -> Result<()> {
+        bootstrap_conn
+            .execute(
+                "INSERT INTO mount
+                 (namespace_id, cartridge_id, attach_alias, qualification,
+                  engine_schema, class)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    binding.namespace_id,
+                    binding.cartridge_id,
+                    binding.attach_alias,
+                    binding.qualification,
+                    binding.engine_schema,
+                    binding.class,
+                ],
+            )
+            .map_err(|e| DelightQLError::database_error(
+                "Failed to record mount binding",
+                e.to_string(),
+            ))?;
+        Ok(())
+    }
+
+    /// Remove a binding before its cartridge/namespace is deleted.  Callers
+    /// must invoke this inside the same catalog transaction as the cascade.
+    fn clear_mount_binding(bootstrap_conn: &Connection, namespace_id: i64) -> Result<()> {
+        bootstrap_conn
+            .execute("DELETE FROM mount WHERE namespace_id = ?1", [namespace_id])
+            .map_err(|e| DelightQLError::database_error(
+                "Failed to clear mount binding",
+                e.to_string(),
+            ))?;
+        Ok(())
+    }
+
     /// Create a new DelightQL system from an injected connection
     ///
     /// Creates:
@@ -2575,16 +3414,18 @@ impl DelightQLSystem {
             )
         })?;
 
-        // sys::help ring 2 (SYS-HELP-DESIGN.md phase 1): register the
-        // burned identifier table (rows authored in bootstrap/schema.sql)
-        // as sys::help.identifier. Its own cartridge so the bulk
+        // Register the burned identifier table (rows authored in
+        // bootstrap/schema.sql) as sys::identifiers.identifier. Its own cartridge so the bulk
         // activation above cannot leak it into bare `sys`.
-        register_sys_help_tables(&bootstrap_conn, bootstrap_conn_id)?;
+        register_sys_identifier_table(&bootstrap_conn, bootstrap_conn_id)?;
 
         // sys::connections: the curated safe-subset `connection` entity
         // (non-secret columns only). Own cartridge so the bulk activation
         // above cannot leak it into bare `sys`.
         register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
+        // sys::ns: curated public-column `namespace` entity (the physical
+        // table carries the internal mount relation).
+        register_sys_ns_namespace_table(&bootstrap_conn, bootstrap_conn_id)?;
 
         // Initialize connection routing map
         let mut connection_map: HashMap<i64, Arc<Mutex<dyn DatabaseConnection>>> = HashMap::new();
@@ -2609,6 +3450,8 @@ impl DelightQLSystem {
             db_type: db_type.to_string(),
             effects_executed: Cell::new(0),
             session_materialized_names: Cell::new(false),
+            active_liminal_program: RefCell::new(None),
+            byte_bindings: HashMap::new(),
         };
 
         // Eagerly load stdlib DQL overlays for universal (auto-enlisted) namespaces
@@ -2726,10 +3569,16 @@ impl DelightQLSystem {
     /// (pipeline/effect_transformer/tests.rs).
     pub fn fatboy_main_connection_for_effect_plan(&self) -> Option<i64> {
         let conn = self.bootstrap_connection.lock().ok()?;
+        // Mount identity via the STORED link
+        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md; fourth-review audit miss) —
+        // main's cartridge records its connection directly, instead of
+        // matching source_path against connection.resource_uri strings.
         conn.query_row(
-            "SELECT co.id FROM connection co
-             WHERE co.resource_uri =
-                   (SELECT source_path FROM namespace WHERE fq_name = 'main')
+            "SELECT co.id FROM namespace n
+             JOIN mount m ON m.namespace_id = n.id
+             JOIN cartridge c ON c.id = m.cartridge_id
+             JOIN connection co ON co.id = c.connection_id
+             WHERE n.fq_name = 'main'
                AND co.connection_type IN (3, 4)
              LIMIT 1",
             [],
@@ -2795,25 +3644,53 @@ impl DelightQLSystem {
         // is reused and populated below.
         let mut empty_namespace_id: Option<i32> = None;
         {
+            // Mount identity via the STORED link
+            // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md) — never entity joins.
             let existing: Option<String> = match bootstrap_conn.query_row(
                 "SELECT c.source_uri FROM namespace n
-                 JOIN activated_entity ae ON ae.namespace_id = n.id
-                 JOIN entity e ON e.id = ae.entity_id
-                 JOIN cartridge c ON c.id = e.cartridge_id
-                 WHERE n.fq_name = ?1
-                 LIMIT 1",
+                 JOIN mount m ON m.namespace_id = n.id
+                 JOIN cartridge c ON c.id = m.cartridge_id
+                 WHERE n.fq_name = ?1",
                 [namespace],
                 |row| row.get(0),
             ) {
                 Ok(uri) => Some(uri),
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    empty_namespace_id = bootstrap_conn
-                        .query_row(
-                            "SELECT id FROM namespace WHERE fq_name = ?1",
-                            [namespace],
-                            |row| row.get(0),
-                        )
-                        .ok();
+                    // No mount link. The namespace may still EXIST — and if
+                    // it holds activated entities it is someone else's
+                    // (a lib/consult namespace deliberately has a NULL
+                    // link): reusing it would flip it to 'data' and mix the
+                    // new cartridge into its definitions (fourth review,
+                    // P1). Mirror the attach spine's occupancy check: only
+                    // a genuinely EMPTY namespace is reusable.
+                    if let Ok(ns_id) = bootstrap_conn.query_row(
+                        "SELECT id FROM namespace WHERE fq_name = ?1",
+                        [namespace],
+                        |row| row.get::<_, i32>(0),
+                    ) {
+                        let occupied: bool = bootstrap_conn
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM activated_entity WHERE namespace_id = ?1)",
+                                [ns_id],
+                                |row| row.get(0),
+                            )
+                            .map_err(|e| {
+                                DelightQLError::database_error(
+                                    "Failed to check namespace occupancy",
+                                    e.to_string(),
+                                )
+                            })?;
+                        if occupied {
+                            return Err(DelightQLError::database_error(
+                                format!(
+                                    "Namespace '{}' already exists and is in use, cannot mount '{}' over it",
+                                    namespace, connection_uri
+                                ),
+                                "Namespace occupied",
+                            ));
+                        }
+                        empty_namespace_id = Some(ns_id);
+                    }
                     None
                 }
                 Err(e) => {
@@ -2852,12 +3729,10 @@ impl DelightQLSystem {
                     let existing_identity: Option<String> = bootstrap_conn
                         .query_row(
                             "SELECT co.identity FROM namespace n
-                             JOIN activated_entity ae ON ae.namespace_id = n.id
-                             JOIN entity e ON e.id = ae.entity_id
-                             JOIN cartridge c ON c.id = e.cartridge_id
+                             JOIN mount m ON m.namespace_id = n.id
+                             JOIN cartridge c ON c.id = m.cartridge_id
                              JOIN connection co ON co.id = c.connection_id
-                             WHERE n.fq_name = ?1
-                             LIMIT 1",
+                             WHERE n.fq_name = ?1",
                             [namespace],
                             |row| row.get(0),
                         )
@@ -2909,6 +3784,13 @@ impl DelightQLSystem {
             ),
         };
 
+        // Atomic registration (fourth review, P2a): every bootstrap write
+        // from here — connection, cartridge, entities, namespace, link,
+        // wrappers — rolls back together on any failure, so a partially
+        // registered external mount (e.g. a linked namespace whose
+        // connection never reached connection_map) cannot exist.
+        let txn = BootstrapTxn::begin(&bootstrap_conn, "external_mount")?;
+
         // Register the connection in bootstrap
         let connection_id = crate::import::register_connection(
             &bootstrap_conn,
@@ -2933,14 +3815,11 @@ impl DelightQLSystem {
             )
         })?;
 
-        // Install as a cartridge, RECORDING the mounted engine schema as
-        // this cartridge's `source_ns` (schema-mount Phase A,
-        // EFFECTS-ON-TARGETS-PLAN §4.1). `None` — a bare mount — stays NULL,
-        // meaning "the engine's own default", resolved downstream by
-        // `mounted_engine_schema_for_namespace`; reads therefore stay
-        // unqualified, behavior-identical to the pre-Phase-A NULL. A specific
-        // schema (Phase B `#schema` / Phase C `mount_tree!`) is spelled here
-        // and flows to both durable placement and read qualification.
+        // Install the source cartridge. `source_ns` remains source metadata;
+        // the binding written below owns qualification policy. A specific
+        // schema (Phase B `#schema` / Phase C `mount_tree!`) is retained here
+        // for non-mount source consumers too, but mounted reads do not infer
+        // policy from this nullable field.
         let cartridge_id = {
             bootstrap_conn
                 .execute(
@@ -2980,10 +3859,12 @@ impl DelightQLSystem {
 
         // Create the namespace — or reuse a pre-existing EMPTY one (the
         // "main" namespace open() pre-creates), recording its new source.
-        let namespace_id = if let Some(id) = empty_namespace_id {
+        let (namespace_id, created_names) = if let Some(id) = empty_namespace_id {
             bootstrap_conn
                 .execute(
-                    "UPDATE namespace SET provenance = 'uri', source_path = ?2 WHERE id = ?1",
+                    "UPDATE namespace
+                     SET kind = 'data', provenance = 'uri', source_path = ?2
+                     WHERE id = ?1",
                     rusqlite::params![id, connection_uri],
                 )
                 .map_err(|e| {
@@ -2993,22 +3874,9 @@ impl DelightQLSystem {
                         Box::new(e),
                     )
                 })?;
-            id
+            (id, Vec::new())
         } else {
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO namespace (name, pid, fq_name, kind, provenance, source_path)
-                     VALUES (?1, NULL, ?2, 'data', 'uri', ?3)",
-                    rusqlite::params![namespace, namespace, connection_uri],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to create namespace",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
-            bootstrap_conn.last_insert_rowid() as i32
+            create_mounted_namespace_path(&bootstrap_conn, namespace, "uri", connection_uri)?
         };
 
         // Activate all entities from the cartridge in the namespace
@@ -3024,6 +3892,19 @@ impl DelightQLSystem {
             )
         })?;
 
+        // External/factory mounts have no ATTACH alias.  Their qualification
+        // policy is the mounted engine schema (or unqualified engine default)
+        // and their live connection is retained in the registry-owned maps.
+        Self::record_mount_binding(
+            &bootstrap_conn,
+            &MountBinding::external(
+                namespace_id as i64,
+                cartridge_id as i64,
+                connection_id,
+                components.mounted_schema.clone(),
+            ),
+        )?;
+
         // Register catalog wrapper for the new namespace (lazy-init catalog if needed)
         let catalog_id = ensure_catalog_initialized(&self.catalog_cartridge_id, &bootstrap_conn)?;
         let sys_meta_ns_id: i32 = bootstrap_conn
@@ -3038,12 +3919,22 @@ impl DelightQLSystem {
                     e.to_string(),
                 )
             })?;
-        register_catalog_wrapper(&bootstrap_conn, namespace, sys_meta_ns_id, catalog_id)?;
+        register_mounted_catalog_wrappers(
+            &bootstrap_conn,
+            namespace,
+            &created_names,
+            sys_meta_ns_id,
+            catalog_id,
+        )?;
 
         debug!(
             "register_external_connection: Registered {} entities in namespace '{}' (connection_id={})",
             entity_count, namespace, connection_id
         );
+
+        // All bootstrap writes landed — commit before touching the
+        // in-memory maps, so catalog and maps can never disagree.
+        txn.commit()?;
 
         // Drop bootstrap lock before mutating self's maps
         drop(bootstrap_conn);
@@ -3052,6 +3943,7 @@ impl DelightQLSystem {
         self.connection_map
             .insert(connection_id, components.connection);
         self.schema_map.insert(connection_id, components.schema);
+        self.journal_external_connection(connection_id);
 
         Ok((connection_id, entity_count))
     }
@@ -3110,7 +4002,23 @@ impl DelightQLSystem {
                 }
             };
             for schema in &schemas {
-                let _ = user_conn.execute(&format!("DETACH DATABASE '{}'", schema), &[]);
+                // A failed DETACH must ABORT the reinit (eighth review, P1):
+                // proceeding would replace the catalog — and every recorded
+                // cleanup identity — while the database stays physically
+                // attached. Failing here leaves the old catalog intact and
+                // consistent with the attachment state.
+                if let Err(e) =
+                    user_conn.execute(&format!("DETACH DATABASE '{}'", schema), &[])
+                {
+                    return Err(DelightQLError::database_error(
+                        format!(
+                            "reset aborted: could not DETACH '{}' — the session \
+                             catalog is left intact: {}",
+                            schema, e
+                        ),
+                        e.to_string(),
+                    ));
+                }
             }
         }
 
@@ -3422,6 +4330,9 @@ impl DelightQLSystem {
         // sys::connections: curated safe-subset `connection` entity, own
         // cartridge (mirrors the primary bootstrap path).
         register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
+        // sys::ns: curated public-column `namespace` entity (the physical
+        // table carries the internal mount relation).
+        register_sys_ns_namespace_table(&bootstrap_conn, bootstrap_conn_id)?;
 
         // 9. Swap bootstrap connection
         *self.bootstrap_connection.lock().map_err(|e| {
@@ -3530,14 +4441,26 @@ impl DelightQLSystem {
         let count = ddl.definitions.len();
         let path = format!("embedded://{}", namespace_fq);
 
-        bootstrap_conn.execute_batch("BEGIN").ok();
+        let transaction = match CatalogSavepoint::begin(
+            &bootstrap_conn,
+            "dql_stdlib_load",
+            "Failed to begin stdlib load transaction",
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                report_stdlib_load_failure(namespace_fq, &error);
+                return StdlibLoad::Failed {
+                    phase: LoadPhase::Consult,
+                    error,
+                };
+            }
+        };
 
         // Autoload modules have no liminal space (§8: created by other
         // means — empty liminal), hence the empty receipts.
         match Self::consult_file_inner(&bootstrap_conn, &path, namespace_fq, ddl, count, None, &[])
         {
             Ok(_) => {
-                let _ = bootstrap_conn.execute_batch("COMMIT");
                 // Register catalog wrapper for the newly-loaded stdlib namespace
                 if let Ok(catalog_id) =
                     ensure_catalog_initialized(&self.catalog_cartridge_id, &bootstrap_conn)
@@ -3555,10 +4478,19 @@ impl DelightQLSystem {
                         );
                     }
                 }
-                StdlibLoad::Loaded
+                match transaction.commit("Failed to commit stdlib load transaction") {
+                    Ok(()) => StdlibLoad::Loaded,
+                    Err(error) => {
+                        report_stdlib_load_failure(namespace_fq, &error);
+                        StdlibLoad::Failed {
+                            phase: LoadPhase::Consult,
+                            error,
+                        }
+                    }
+                }
             }
             Err(e) => {
-                let _ = bootstrap_conn.execute_batch("ROLLBACK");
+                drop(transaction);
                 report_stdlib_load_failure(namespace_fq, &e);
                 StdlibLoad::Failed {
                     phase: LoadPhase::Consult,
@@ -3685,88 +4617,6 @@ impl DelightQLSystem {
     /// (`pipe://`, etc.). Without it, `mount_database` on a URI errors with
     /// "connection factory not available in this context". Installed by
     /// `open()` when the embedding provides a types-level factory.
-    /// Seed the sys::help ring-1 tables from the host binary's surface
-    /// (SYS-HELP-DESIGN.md phase 2). Called once at open(); the tables
-    /// were created empty by bootstrap/schema.sql and registered by
-    /// register_sys_help_tables. Runtime generation from the live clap
-    /// tree: the rows structurally cannot drift from the binary.
-    pub fn seed_help_surface(&self, surface: &crate::api::HelpSurface) -> Result<()> {
-        let conn = self.bootstrap_connection.lock().map_err(|_| {
-            DelightQLError::database_error(
-                "seed_help_surface: bootstrap connection poisoned".to_string(),
-                String::new(),
-            )
-        })?;
-        let db_err = |what: &str, e: rusqlite::Error| {
-            DelightQLError::database_error(
-                format!("seed_help_surface: {} insert failed: {}", what, e),
-                e.to_string(),
-            )
-        };
-        for (name, parent, alias, summary) in &surface.commands {
-            conn.execute(
-                "INSERT INTO command (name, parent, alias, summary) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![name, parent, alias, summary],
-            )
-            .map_err(|e| db_err("command", e))?;
-        }
-        for o in &surface.options {
-            conn.execute(
-                "INSERT INTO option (command, long, short, value_name, default_value, global, repeatable, summary)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![
-                    o.command,
-                    o.long,
-                    o.short,
-                    o.value_name,
-                    o.default_value,
-                    o.global,
-                    o.repeatable,
-                    o.summary
-                ],
-            )
-            .map_err(|e| db_err("option", e))?;
-        }
-        for (command, option, value, summary, class, grade) in &surface.option_values {
-            conn.execute(
-                "INSERT INTO option_value (command, option, value, summary, class, grade)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![command, option, value, summary, class, grade],
-            )
-            .map_err(|e| db_err("option_value", e))?;
-        }
-        for (name, summary) in &surface.dot_commands {
-            conn.execute(
-                "INSERT INTO dot_command (name, summary) VALUES (?1, ?2)",
-                rusqlite::params![name, summary],
-            )
-            .map_err(|e| db_err("dot_command", e))?;
-        }
-        for (name, effect, flag) in &surface.envs {
-            conn.execute(
-                "INSERT INTO env (name, effect, equivalent_flag) VALUES (?1, ?2, ?3)",
-                rusqlite::params![name, effect, flag],
-            )
-            .map_err(|e| db_err("env", e))?;
-        }
-        for (name, section, troff, plain) in &surface.man_pages {
-            conn.execute(
-                "INSERT INTO man_page (name, section, troff, plain) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![name, section, troff, plain],
-            )
-            .map_err(|e| db_err("man_page", e))?;
-        }
-        for (code, context, meaning, class, grade) in &surface.exit_codes {
-            conn.execute(
-                "INSERT INTO exit_code (code, context, meaning, class, grade)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![code, context, meaning, class, grade],
-            )
-            .map_err(|e| db_err("exit_code", e))?;
-        }
-        Ok(())
-    }
-
     pub fn set_connection_factory(&mut self, factory: Box<dyn ConnectionFactory>) {
         self.connection_factory = Some(factory);
     }
@@ -3846,12 +4696,79 @@ impl DelightQLSystem {
         Ok(created)
     }
 
+    /// Bind a static database image under a host-chosen name, resolvable by
+    /// `mount!("delightql-bytes://<name>", ...)` (BYTES-SCHEME-DESIGN.md).
+    /// Names are lowercase capability labels (`[a-z][a-z0-9._-]*`) and are
+    /// immutable for the life of the handle: rebinding refuses, even to the
+    /// same bytes, so a locator's referent can never change underneath a
+    /// mounted namespace.
+    pub fn bind_static_bytes(&mut self, name: &str, bytes: &'static [u8]) -> Result<()> {
+        if !valid_byte_binding_name(name) {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "invalid byte-binding name '{}': expected [a-z][a-z0-9._-]*",
+                    name
+                ),
+                "Binding names are lowercase capability labels",
+            ));
+        }
+        if self.byte_bindings.contains_key(name) {
+            return Err(DelightQLError::validation_error(
+                format!("byte binding '{}' already exists — bindings are immutable", name),
+                "Rebinding refuses so a locator's referent cannot change",
+            ));
+        }
+        validate_sqlite_image(name, bytes)?;
+        self.byte_bindings
+            .insert(name.to_string(), ByteBinding::Static(bytes));
+        Ok(())
+    }
+
+    /// Owned-buffer sibling of `bind_static_bytes` (same grammar,
+    /// immutability, and bind-time validation): for images built at
+    /// runtime, e.g. the CLI's live surface database. The buffer is copied
+    /// into SQLite-owned memory at attach.
+    pub fn bind_owned_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<()> {
+        if !valid_byte_binding_name(name) {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "invalid byte-binding name '{}': expected [a-z][a-z0-9._-]*",
+                    name
+                ),
+                "Binding names are lowercase capability labels",
+            ));
+        }
+        if self.byte_bindings.contains_key(name) {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "byte binding '{}' already exists — bindings are immutable",
+                    name
+                ),
+                "Rebinding refuses so a locator's referent cannot change",
+            ));
+        }
+        validate_sqlite_image(name, &bytes)?;
+        self.byte_bindings.insert(
+            name.to_string(),
+            ByteBinding::Owned(std::sync::Arc::from(bytes)),
+        );
+        Ok(())
+    }
+
     pub fn mount_database(&mut self, db_path: &str, namespace: &str) -> Result<()> {
         // System name guard (catechism Deviation #3): a USER-TYPED mount target
         // may not take over or nest under a reserved system name. mount_database
         // is only reached from the user-facing mount! verb (surface + embedded
         // directive), never from system-minted machinery.
         validate_user_namespace_target(namespace)?;
+
+        // delightql-bytes:// resolves BEFORE the generic URI→factory routing
+        // (BYTES-SCHEME-DESIGN.md): it is attach-class — the image joins the
+        // session connection's schema space so the mounted namespace is
+        // joinable — never a separate factory-created backend.
+        if let Some(binding_name) = db_path.strip_prefix("delightql-bytes://") {
+            return self.mount_database_from_static_bytes(binding_name, namespace);
+        }
 
         // If a ConnectionFactory is available and the path looks like a URI scheme,
         // use the factory path (supports pipe://, fatboy://, etc.)
@@ -3952,7 +4869,78 @@ impl DelightQLSystem {
             }
         }
 
-        // Get bootstrap connection
+        // ── Everything past validation is the shared attach-class spine
+        // (MOUNT-SPINE-PLAN.md): authoritative idempotency, atomic
+        // registration, one unforgettable tail. Only the file-mount
+        // specifics live here, as closures.
+        let attach_identity = std::fs::canonicalize(db_path)
+            .ok()
+            .map(|abs| format!("realpath:{}", abs.display()));
+        let same_path = db_path.to_string();
+        let same_source = move |existing: &str| -> bool {
+            // Different SPELLING may still be the same FILE (the symlink
+            // trap, URI-DESIGN.md §4): compare filesystem identity.
+            if existing == same_path {
+                return true;
+            }
+            match (
+                std::fs::canonicalize(existing),
+                std::fs::canonicalize(&same_path),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        };
+        let attach_path = db_path.to_string();
+        let attach = move |conn: &dyn DatabaseConnection, alias: &str| -> Result<()> {
+            conn.execute(
+                &format!("ATTACH DATABASE '{}' AS '{}'", attach_path, alias),
+                &[],
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to attach database: {}", e),
+                    e.to_string(),
+                )
+            })
+        };
+        self.mount_attach_class(
+            AttachClassMount {
+                namespace,
+                source_uri: format!("file://{}", db_path),
+                source_path: db_path.to_string(),
+                provenance: "file",
+                conn_resource: db_path,
+                conn_mechanism: "attach",
+                conn_identity: attach_identity,
+                conn_description: format!("Mounted database: {}", namespace),
+            },
+            &same_source,
+            &attach,
+        )
+    }
+
+    /// The shared attach-class mount spine (MOUNT-SPINE-PLAN.md). Every
+    /// attach-class mount path (file, `delightql-bytes://`; `mount_new!` by
+    /// delegation) runs through here, so the recipe is correct exactly once:
+    ///
+    /// - IDENTITY IS AUTHORITATIVE: idempotency consults
+    ///   `namespace.source_path` — never `activated_entity` joins — so a
+    ///   valid-but-empty database has an identity too (review R1).
+    /// - FAILURE IS ATOMIC: all bootstrap writes run inside one transaction,
+    ///   and any failure after attachment rolls the metadata back AND
+    ///   detaches the alias — a failed mount leaves nothing behind (R2).
+    /// - THE TAIL IS UNFORGETTABLE: connection → cartridge → entities →
+    ///   namespace → activation → catalog wrappers → schema refresh happen
+    ///   here, so a new mount path cannot partially transcribe the recipe
+    ///   (the `m::(*)` bug class).
+    fn mount_attach_class(
+        &mut self,
+        m: AttachClassMount<'_>,
+        same_source: &dyn Fn(&str) -> bool,
+        attach: &dyn Fn(&dyn DatabaseConnection, &str) -> Result<()>,
+    ) -> Result<()> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
                 "Failed to acquire bootstrap database lock for mount",
@@ -3960,92 +4948,65 @@ impl DelightQLSystem {
             )
         })?;
 
-        // Idempotent mount: if namespace already exists with the SAME database file,
-        // this mount is a no-op. If a different file, that's an error.
-        // If the namespace exists but is empty (e.g. "main" with :memory:), fall through
-        // and reuse the existing namespace_id.
-        let existing_namespace_id: Option<i32>;
-        {
-            let connection_uri = format!("file://{}", db_path);
-            let existing: Option<String> = match bootstrap_conn.query_row(
-                "SELECT c.source_uri FROM namespace n
-                 JOIN activated_entity ae ON ae.namespace_id = n.id
-                 JOIN entity e ON e.id = ae.entity_id
-                 JOIN cartridge c ON c.id = e.cartridge_id
-                 WHERE n.fq_name = ?1
-                 LIMIT 1",
-                [namespace],
-                |row| row.get(0),
-            ) {
-                Ok(uri) => Some(uri),
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    // Namespace might exist but have no entities — check namespace directly
-                    match bootstrap_conn.query_row(
-                        "SELECT 1 FROM namespace WHERE fq_name = ?1",
-                        [namespace],
-                        |_| Ok(()),
-                    ) {
-                        Ok(()) => Some(String::new()), // exists but empty
-                        Err(_) => None,                // doesn't exist
-                    }
-                }
-                Err(e) => {
-                    return Err(DelightQLError::database_error(
-                        "Failed to check namespace existence",
-                        e.to_string(),
-                    ));
-                }
-            };
-            if let Some(existing_uri) = existing {
-                if existing_uri == connection_uri {
-                    // Same database — true idempotent, skip
+        // ── Authoritative idempotency (namespace.source_path, R1) ──
+        let existing: Option<(i32, Option<String>)> = match bootstrap_conn.query_row(
+            "SELECT id, source_path FROM namespace WHERE fq_name = ?1",
+            [m.namespace],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(pair) => Some(pair),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                return Err(DelightQLError::database_error(
+                    "Failed to check namespace existence",
+                    e.to_string(),
+                ));
+            }
+        };
+        let existing_namespace_id: Option<i32> = match existing {
+            None => None,
+            Some((_, Some(ref existing_source))) if !existing_source.is_empty() => {
+                if same_source(existing_source) {
+                    // Same resource (any spelling) — idempotent, skip.
                     drop(bootstrap_conn);
                     return Ok(());
-                } else if existing_uri.is_empty() {
-                    // Namespace exists but has no file-backed entities (e.g. "main" with :memory:).
-                    // Fall through to mount, reusing the existing namespace row.
-                    let ns_id: i32 = bootstrap_conn
-                        .query_row(
-                            "SELECT id FROM namespace WHERE fq_name = ?1",
-                            [namespace],
-                            |row| row.get(0),
+                }
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "Namespace '{}' already exists (mounted from '{}'), cannot re-mount from '{}'",
+                        m.namespace, existing_source, m.source_uri
+                    ),
+                    "Duplicate namespace with different source",
+                ));
+            }
+            Some((ns_id, _)) => {
+                // Namespace exists with no recorded source (e.g. a
+                // pre-created empty "main"). Reusable only while nothing is
+                // activated in it — an occupied namespace is someone else's.
+                let occupied: bool = bootstrap_conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM activated_entity WHERE namespace_id = ?1)",
+                        [ns_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            "Failed to check namespace occupancy",
+                            e.to_string(),
                         )
-                        .map_err(|e| {
-                            DelightQLError::database_error(
-                                "Failed to query existing namespace id",
-                                e.to_string(),
-                            )
-                        })?;
-                    existing_namespace_id = Some(ns_id);
-                } else {
-                    // Different SPELLING may still be the same FILE (the
-                    // symlink trap, URI-DESIGN.md §4): compare filesystem
-                    // identity before declaring a conflict.
-                    let existing_path = existing_uri.trim_start_matches("file://");
-                    let same_file = match (
-                        std::fs::canonicalize(existing_path),
-                        std::fs::canonicalize(db_path),
-                    ) {
-                        (Ok(a), Ok(b)) => a == b,
-                        _ => false,
-                    };
-                    if same_file {
-                        // Same resource, different spelling — idempotent.
-                        drop(bootstrap_conn);
-                        return Ok(());
-                    }
+                    })?;
+                if occupied {
                     return Err(DelightQLError::database_error(
                         format!(
-                            "Namespace '{}' already exists (mounted from '{}'), cannot re-mount from '{}'",
-                            namespace, existing_uri, connection_uri
+                            "Namespace '{}' already exists and is in use, cannot mount '{}' over it",
+                            m.namespace, m.source_uri
                         ),
-                        "Duplicate namespace with different source",
+                        "Namespace occupied",
                     ));
                 }
-            } else {
-                existing_namespace_id = None;
+                Some(ns_id)
             }
-        }
+        };
 
         // Auto-generate unique SQLite schema alias
         let next_id: i32 = bootstrap_conn
@@ -4062,211 +5023,289 @@ impl DelightQLSystem {
                 )
             })?;
         let schema_alias = format!("_imported_{}", next_id);
-        debug!("mount_database: Generated schema alias: {}", schema_alias);
+        debug!(
+            "mount_attach_class: alias {} for {} -> {}",
+            schema_alias, m.source_uri, m.namespace
+        );
 
-        // ATTACH the database to the user connection
-        let user_conn = self.connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire user connection lock",
-                format!("Connection was poisoned: {}", e),
-            )
-        })?;
-
-        let attach_sql = format!("ATTACH DATABASE '{}' AS '{}'", db_path, schema_alias);
-        debug!("mount_database: Executing ATTACH: {}", attach_sql);
-        user_conn.execute(&attach_sql, &[]).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to attach database: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // Register the connection in bootstrap. Resource = the path as
-        // given; identity = filesystem identity (canonical path), which
-        // folds symlinked/re-spelled mounts of one file into one row.
-        let attach_identity = std::fs::canonicalize(db_path)
-            .ok()
-            .map(|abs| format!("realpath:{}", abs.display()));
-        let _connection_id = crate::import::register_connection(
-            &bootstrap_conn,
-            db_path,
-            "attach",
-            attach_identity.as_deref(),
-            1, // sqlite-file
-            &format!("Mounted database: {}", namespace),
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to register connection: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // Introspect the attached database using the schema-specific method
-        let entities = self
-            .introspector
-            .introspect_entities_in_schema(&schema_alias)
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Failed to introspect attached database schema '{}': {}",
-                        schema_alias, e
-                    ),
-                    e.to_string(),
+        // ── Attach. No bootstrap writes have happened yet, so an attach
+        // failure needs no rollback. ──
+        {
+            let user_conn = self.connection.lock().map_err(|e| {
+                DelightQLError::connection_poison_error(
+                    "Failed to acquire user connection lock",
+                    format!("Connection was poisoned: {}", e),
                 )
             })?;
-        debug!(
-            "mount_database: Discovered {} entities in schema '{}'",
-            entities.len(),
-            schema_alias
-        );
+            attach(&*user_conn, &schema_alias)?;
+        }
+        // A liminal program abort must detach what it attached; the journal
+        // rollback is best-effort, so a mount failure that already detached
+        // the alias makes the abort's DETACH a harmless no-op.
+        self.journal_attached_sqlite(schema_alias.clone());
 
-        // Install as a cartridge
-        // When mounting into "main", set source_ns = NULL so unqualified table
-        // references resolve via SQLite's cross-schema search (matches the --db
-        // path behavior, and keeps generated SQL spelling target-portable).
-        // CAUTION: reads may be unqualified, but WRITES may not — CREATE does
-        // not search schemas. imprint_namespace recovers the attach alias via
-        // PRAGMA database_list when it targets a mounted namespace whose
-        // cartridge carries no alias.
-        let effective_source_ns: Option<&str> = if namespace == "main" {
-            None
-        } else {
-            Some(&schema_alias)
+        // ── Registration, atomically (R2): one bootstrap transaction, with
+        // the alias guard armed from here — BEGIN failure, registration
+        // failure, and COMMIT failure all detach on every exit path. ──
+        let mut alias_guard = DetachOnDrop {
+            connection: &self.connection,
+            alias: &schema_alias,
+            armed: true,
         };
-        let cartridge_id = {
-            let sql = r#"
-                INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
-                VALUES (?1, ?2, ?3, ?4, 1, ?5, 0)
-            "#;
-            bootstrap_conn
-                .execute(
-                    sql,
-                    rusqlite::params![
-                        3, // SQLite language ID
-                        crate::bootstrap::SourceType::Db.as_i32(),
-                        &format!("file://{}", db_path),
-                        effective_source_ns,
-                        2, // connection_id=2 (user connection where database is attached)
-                    ],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert cartridge",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
-            bootstrap_conn.last_insert_rowid() as i32
-        };
-
-        // Insert discovered entities into bootstrap
-        crate::bootstrap::introspect::insert_discovered_entities(
+        // A nestable savepoint, not BEGIN: mount! is liminal-eligible, so
+        // this registration may run INSIDE the liminal-program savepoint
+        // (where a raw BEGIN is "cannot start a transaction within a
+        // transaction" — the semantic merge conflict between the mount
+        // reification and the program spine, caught by review zmvnywzu's
+        // battery at this tip).
+        let transaction = CatalogSavepoint::begin(
             &bootstrap_conn,
-            cartridge_id,
-            &entities,
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to insert discovered entities: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // Create or reuse the namespace. The reuse branch records the new
-        // source just like creation does — an empty pre-created "main" that
-        // gets mounted over must carry the mount's locator.
-        let namespace_id = if let Some(ns_id) = existing_namespace_id {
-            debug!(
-                "mount_database: Reusing existing namespace_id={} for '{}'",
-                ns_id, namespace
-            );
-            bootstrap_conn
-                .execute(
-                    "UPDATE namespace SET provenance = 'file', source_path = ?2 WHERE id = ?1",
-                    rusqlite::params![ns_id, db_path],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to record mount source on reused namespace",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
-            ns_id
-        } else {
-            let sql = r#"
-                INSERT INTO namespace (name, pid, fq_name, kind, provenance, source_path)
-                VALUES (?1, NULL, ?2, 'data', 'file', ?3)
-            "#;
-            debug!(
-                "mount_database: Creating namespace name='{}', fq_name='{}'",
-                namespace, namespace
-            );
-            bootstrap_conn
-                .execute(sql, rusqlite::params![namespace, namespace, db_path])
-                .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to create namespace",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
-            let id = bootstrap_conn.last_insert_rowid() as i32;
-            debug!("mount_database: Created namespace_id={}", id);
-            id
-        };
-
-        // Activate all entities from the cartridge in the namespace
-        let activated_count = crate::import::activate_entities_from_cartridge(
-            &bootstrap_conn,
-            cartridge_id,
-            namespace_id,
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate entities: {}", e),
-                e.to_string(),
-            )
-        })?;
-        debug!(
-            "mount_database: Activated {} entities in namespace '{}'",
-            activated_count, namespace
-        );
-
-        // Note: The ATTACH path shares the user connection (connection_id=2),
-        // so no additional entry in connection_map is needed. The attached schema
-        // is accessed through the existing connection via the schema alias prefix.
-
-        // Register catalog wrapper for the new namespace (lazy-init catalog if needed)
-        let catalog_id = ensure_catalog_initialized(&self.catalog_cartridge_id, &bootstrap_conn)?;
-        let sys_meta_ns_id: i32 = bootstrap_conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = 'sys::meta'",
-                [],
-                |row| row.get(0),
+            "dql_mount_attach",
+            "Failed to begin mount transaction",
+        )?;
+        let registered = (|| -> Result<()> {
+            crate::import::register_connection(
+                &bootstrap_conn,
+                m.conn_resource,
+                m.conn_mechanism,
+                m.conn_identity.as_deref(),
+                1, // sqlite-format data
+                &m.conn_description,
             )
             .map_err(|e| {
                 DelightQLError::database_error(
-                    "Failed to query sys::meta namespace for catalog wrapper",
+                    format!("Failed to register connection: {}", e),
                     e.to_string(),
                 )
             })?;
-        register_catalog_wrapper(&bootstrap_conn, namespace, sys_meta_ns_id, catalog_id)?;
 
-        // Explicitly drop the bootstrap connection lock to ensure all writes are committed
-        // This is necessary for sequential query execution to see the mounted namespace
+            let entities = self
+                .introspector
+                .introspect_entities_in_schema(&schema_alias)
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!(
+                            "Failed to introspect attached database schema '{}': {}",
+                            schema_alias, e
+                        ),
+                        e.to_string(),
+                    )
+                })?;
+
+            // source_ns records the physical source namespace uniformly.
+            // Whether generated SQL spells it is a separate fact carried by
+            // mount.qualification; main is no longer encoded by NULL-ness.
+            let effective_source_ns = Some(schema_alias.as_str());
+            let cartridge_id = {
+                let sql = r#"
+                    INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+                    VALUES (?1, ?2, ?3, ?4, 1, ?5, 0)
+                "#;
+                bootstrap_conn
+                    .execute(
+                        sql,
+                        rusqlite::params![
+                            3, // SQLite language ID
+                            crate::bootstrap::SourceType::Db.as_i32(),
+                            &m.source_uri,
+                            effective_source_ns,
+                            2, // user connection (the schema is attached there)
+                        ],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error_with_source(
+                            "Failed to insert cartridge",
+                            e.to_string(),
+                            Box::new(e),
+                        )
+                    })?;
+                bootstrap_conn.last_insert_rowid() as i32
+            };
+
+            crate::bootstrap::introspect::insert_discovered_entities(
+                &bootstrap_conn,
+                cartridge_id,
+                &entities,
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to insert discovered entities: {}", e),
+                    e.to_string(),
+                )
+            })?;
+
+            let (namespace_id, created_names) = if let Some(ns_id) = existing_namespace_id {
+                bootstrap_conn
+                    .execute(
+                        "UPDATE namespace
+                         SET kind = 'data', provenance = ?2, source_path = ?3
+                         WHERE id = ?1",
+                        rusqlite::params![ns_id, m.provenance, &m.source_path],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error_with_source(
+                            "Failed to record mount source on reused namespace",
+                            e.to_string(),
+                            Box::new(e),
+                        )
+                    })?;
+                (ns_id, Vec::new())
+            } else {
+                create_mounted_namespace_path(
+                    &bootstrap_conn,
+                    m.namespace,
+                    m.provenance,
+                    &m.source_path,
+                )?
+            };
+
+            let activated_count = crate::import::activate_entities_from_cartridge(
+                &bootstrap_conn,
+                cartridge_id,
+                namespace_id,
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!("Failed to activate entities: {}", e),
+                    e.to_string(),
+                )
+            })?;
+            debug!(
+                "mount_attach_class: activated {} entities in '{}'",
+                activated_count, m.namespace
+            );
+
+            // Authoritative mount relation: `main` keeps unqualified
+            // resolution policy while the relation retains the physical
+            // attachment alias separately.
+            Self::record_mount_binding(
+                &bootstrap_conn,
+                &MountBinding::attach(
+                    namespace_id as i64,
+                    cartridge_id as i64,
+                    2,
+                    &schema_alias,
+                    if m.namespace == "main" {
+                        "unqualified"
+                    } else {
+                        "aliased"
+                    },
+                ),
+            )?;
+
+            // Catalog wrapper: what makes `ns::(*)` resolve for the mount.
+            let catalog_id =
+                ensure_catalog_initialized(&self.catalog_cartridge_id, &bootstrap_conn)?;
+            let sys_meta_ns_id: i32 = bootstrap_conn
+                .query_row(
+                    "SELECT id FROM namespace WHERE fq_name = 'sys::meta'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        "Failed to query sys::meta namespace for catalog wrapper",
+                        e.to_string(),
+                    )
+                })?;
+            register_mounted_catalog_wrappers(
+                &bootstrap_conn,
+                m.namespace,
+                &created_names,
+                sys_meta_ns_id,
+                catalog_id,
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = registered {
+            drop(transaction); // rolls back the savepoint
+            return Err(e); // alias_guard detaches on unwind
+        }
+        // A failed RELEASE rolls back via the savepoint's Drop, and the
+        // still-armed alias_guard detaches on the error return.
+        transaction.commit("Failed to commit mount transaction")?;
+        alias_guard.armed = false;
+        drop(alias_guard);
+
+        // Drop the bootstrap lock so sequential execution sees the mount,
+        // then point the schema provider at the refreshed metadata.
         drop(bootstrap_conn);
-
-        // Set the schema provider to read from bootstrap metadata.
-        // This replaces the old DynamicSqliteSchema that queried the live connection.
-        // Now column information comes from bootstrap's entity_attribute table,
-        // which was populated by the introspection above.
         self.schema = Some(Box::new(
             crate::bootstrap_schema::BootstrapBackedSchema::new(self.bootstrap_connection.clone()),
         ));
 
         Ok(())
+    }
+
+    /// Mount a host-bound static database image (`delightql-bytes://<name>`,
+    /// BYTES-SCHEME-DESIGN.md). Attach-class via the shared mount spine: the
+    /// image is deserialized into a fresh in-memory schema ATTACHed to the
+    /// session connection (joinable with `main`), read-only by rule. All
+    /// bytes-specific refusals (bad name, unbound name, non-SQLite primary
+    /// via the trait default) fire before any attachment.
+    fn mount_database_from_static_bytes(
+        &mut self,
+        binding_name: &str,
+        namespace: &str,
+    ) -> Result<()> {
+        let locator = format!("delightql-bytes://{}", binding_name);
+
+        if !valid_byte_binding_name(binding_name) {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "mount!() failed: invalid byte-binding name '{}': expected [a-z][a-z0-9._-]*",
+                    binding_name
+                ),
+                "Binding names are lowercase capability labels",
+            ));
+        }
+        let Some(binding) = self.byte_bindings.get(binding_name).cloned() else {
+            // Bound names are an intentionally enumerable, non-secret host
+            // surface (BYTES-SCHEME-DESIGN.md) — the miss teaches, like dql man.
+            let mut known: Vec<&str> = self
+                .byte_bindings
+                .keys()
+                .map(|s| s.as_str())
+                .collect();
+            known.sort_unstable();
+            return Err(DelightQLError::database_error(
+                format!(
+                    "mount!() failed: no byte binding named '{}' (bound: {})",
+                    binding_name,
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ),
+                "delightql-bytes:// resolves only names the host has bound",
+            ));
+        };
+
+        let expected = locator.clone();
+        let same_source = move |existing: &str| existing == expected;
+        let attach = move |conn: &dyn DatabaseConnection, alias: &str| -> Result<()> {
+            match &binding {
+                // Static rodata: referenced in place, zero-copy.
+                ByteBinding::Static(b) => conn.attach_static_bytes(alias, b),
+                // Runtime-built buffer: copied into SQLite-owned memory.
+                ByteBinding::Owned(a) => conn.attach_bytes_copied(alias, a),
+            }
+        };
+        self.mount_attach_class(
+            AttachClassMount {
+                namespace,
+                source_uri: locator.clone(),
+                source_path: locator.clone(),
+                provenance: "bytes",
+                conn_resource: &locator,
+                conn_mechanism: "deserialize",
+                conn_identity: Some(format!("host-binding:{}", binding_name)),
+                conn_description: format!("Mounted embedded database: {}", namespace),
+            },
+            &same_source,
+            &attach,
+        )
     }
 
     /// Provision a fresh, valid, empty SQLite database at `db_path` and bind it
@@ -4322,7 +5361,7 @@ impl DelightQLSystem {
         // CLOBBER POLICY: refuse a path already holding content. Only a MISSING
         // or 0-byte path is ours to create. (A non-empty DuckDB file lands here
         // too — refused as a clobber; attach it with mount!.)
-        if path.exists() {
+        let prior_state = if path.exists() {
             let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if len > 0 {
                 return Err(DelightQLError::database_error(
@@ -4333,7 +5372,10 @@ impl DelightQLSystem {
                     "Refuse to clobber",
                 ));
             }
-        }
+            CreatedFilePriorState::Empty
+        } else {
+            CreatedFilePriorState::Absent
+        };
 
         // MATERIALIZE a valid empty SQLite database (a header-bearing 4096-byte
         // file). `PRAGMA user_version = 0` forces the header page out — a bare
@@ -4361,6 +5403,11 @@ impl DelightQLSystem {
                 )
             })?;
         }
+
+        // The file exists independently of the bootstrap catalog. If an
+        // enclosing consultation later aborts, catalog rollback/unmount is not
+        // enough: restore the exact pre-program filesystem state as well.
+        self.journal_created_file(path.to_path_buf(), prior_state);
 
         // Delegate to the ordinary mount path: the resulting mount is identical
         // to mount!() of a valid empty database.
@@ -4393,6 +5440,7 @@ impl DelightQLSystem {
         namespace: &str,
         ddl: DDLFile,
         liminal_receipts: &[LiminalReceipt],
+        post: Option<&ConsultPost<'_>>,
     ) -> Result<ConsultResult> {
         let count = ddl.definitions.len();
         debug!(
@@ -4407,9 +5455,11 @@ impl DelightQLSystem {
             )
         })?;
 
-        bootstrap_conn.execute_batch("BEGIN").map_err(|e| {
-            DelightQLError::database_error("Failed to begin consult transaction", e.to_string())
-        })?;
+        let transaction = CatalogSavepoint::begin(
+            &bootstrap_conn,
+            "dql_consult_file",
+            "Failed to begin consult transaction",
+        )?;
 
         // Determine ambient DataNs for scratch namespaces.
         // Inline DDL views should be able to reference base tables from the
@@ -4436,13 +5486,62 @@ impl DelightQLSystem {
             liminal_receipts,
         );
 
+        // The atomic post-registration payload (review otolxyzl::qmqwqlms
+        // P1): deferred exposes, deferred doc!s (with the shared candidate
+        // ladder), namespace-local edge recording, and per-source
+        // provenance ALL land in this same transaction — any failure below
+        // rolls the whole consultation back.
+        let result = result.and_then(|cr| {
+            if let Some(post) = post {
+                for resolved_args in &post.deferred_exposes {
+                    for resolved_ns in resolved_args {
+                        Self::expose_namespace_on(&bootstrap_conn, namespace, resolved_ns)?;
+                    }
+                }
+                for (target, doc) in &post.deferred_docs {
+                    let candidates = [
+                        format!("{}.{}", namespace, target),
+                        format!("{}.{}!", namespace, target),
+                        target.clone(),
+                    ];
+                    let mut last_err = None;
+                    let mut done = false;
+                    for candidate in &candidates {
+                        match Self::set_entity_doc_on(&bootstrap_conn, candidate, doc) {
+                            Ok(()) => {
+                                done = true;
+                                break;
+                            }
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    if !done {
+                        return Err(last_err.expect("candidates is non-empty"));
+                    }
+                }
+                if !post.new_enlists.is_empty() {
+                    Self::record_namespace_local_enlists_on(
+                        &bootstrap_conn,
+                        namespace,
+                        post.new_enlists,
+                    )?;
+                }
+                if !post.new_aliases.is_empty() {
+                    Self::record_namespace_local_aliases_on(
+                        &bootstrap_conn,
+                        namespace,
+                        post.new_aliases,
+                    )?;
+                }
+                if post.record_source {
+                    Self::record_namespace_source_on(&bootstrap_conn, namespace, path)?;
+                }
+            }
+            Ok(cr)
+        });
+
         if result.is_ok() {
-            bootstrap_conn.execute_batch("COMMIT").map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to commit consult transaction",
-                    e.to_string(),
-                )
-            })?;
+            transaction.commit("Failed to commit consult transaction")?;
 
             // If consult created a new namespace, register a catalog wrapper for it.
             // Check by looking for an existing wrapper entity named "namespace::" in sys::meta.
@@ -4477,7 +5576,7 @@ impl DelightQLSystem {
                 }
             }
         } else {
-            let _ = bootstrap_conn.execute_batch("ROLLBACK");
+            drop(transaction);
         }
 
         drop(bootstrap_conn);
@@ -5556,17 +6655,18 @@ impl DelightQLSystem {
         // fq so a plain-name enlist of an archived-blueprint child stays refused.
         refuse_if_blueprint(&bootstrap_conn, &resolved_fq)?;
 
-        // Get the "main" namespace ID (to_namespace = "main")
-        // This is the default namespace where entities are enlisted when no target is specified
+        // The interactive session's scope is `home` (Phase 7/2H): a
+        // prompt-level enlist attaches its edge to home, never to the
+        // `main` data namespace.
         let to_namespace_id: i32 = bootstrap_conn
             .query_row(
-                "SELECT id FROM namespace WHERE fq_name = 'main'",
+                "SELECT id FROM namespace WHERE fq_name = 'home'",
                 [],
                 |row| row.get(0),
             )
             .map_err(|e| {
                 DelightQLError::database_error(
-                    "Default namespace 'main' not found in bootstrap (database corruption)",
+                    "Session namespace 'home' not found in bootstrap (database corruption)",
                     e.to_string(),
                 )
             })?;
@@ -5656,15 +6756,14 @@ impl DelightQLSystem {
     /// Record that `exposing_ns` re-exports `exposed_ns` through its facade.
     /// When someone enlists `exposing_ns`, entities from `exposed_ns` become
     /// visible via a recursive CTE at resolution time.
-    pub fn expose_namespace(&mut self, exposing_ns: &str, exposed_ns: &str) -> Result<()> {
-        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire bootstrap database lock for expose",
-                format!("Connection was poisoned: {}", e),
-            )
-        })?;
-
-        let exposing_id: i64 = bootstrap_conn
+    /// Conn-level expose (review otolxyzl::qmqwqlms P1: applied inside
+    /// the consult transaction). Same validations as `expose_namespace`.
+    pub(crate) fn expose_namespace_on(
+        conn: &rusqlite::Connection,
+        exposing_ns: &str,
+        exposed_ns: &str,
+    ) -> Result<()> {
+        let exposing_id: i64 = conn
             .query_row(
                 "SELECT id FROM namespace WHERE fq_name = ?1",
                 [exposing_ns],
@@ -5676,8 +6775,7 @@ impl DelightQLSystem {
                     "Namespace not found",
                 )
             })?;
-
-        let exposed_id: i64 = bootstrap_conn
+        let exposed_id: i64 = conn
             .query_row(
                 "SELECT id FROM namespace WHERE fq_name = ?1",
                 [exposed_ns],
@@ -5689,8 +6787,6 @@ impl DelightQLSystem {
                     "Namespace not found",
                 )
             })?;
-
-        // Validate: exposed must be a child of exposing
         if !exposed_ns.starts_with(&format!("{}::", exposing_ns)) {
             return Err(DelightQLError::database_error(
                 format!(
@@ -5700,27 +6796,20 @@ impl DelightQLSystem {
                 "Invalid expose target",
             ));
         }
-
-        bootstrap_conn
-            .execute(
-                "INSERT OR IGNORE INTO exposed_namespace
-                 (exposing_namespace_id, exposed_namespace_id) VALUES (?1, ?2)",
-                rusqlite::params![exposing_id, exposed_id],
+        conn.execute(
+            "INSERT OR IGNORE INTO exposed_namespace
+             (exposing_namespace_id, exposed_namespace_id) VALUES (?1, ?2)",
+            rusqlite::params![exposing_id, exposed_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to expose namespace '{}': {}", exposed_ns, e),
+                e.to_string(),
             )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to expose namespace '{}': {}", exposed_ns, e),
-                    e.to_string(),
-                )
-            })?;
-
-        debug!(
-            "expose_namespace: '{}' now re-exports '{}'",
-            exposing_ns, exposed_ns
-        );
-
+        })?;
         Ok(())
     }
+
 
     /// Register a namespace alias (e.g., "l" → "lib::math")
     ///
@@ -5806,17 +6895,18 @@ impl DelightQLSystem {
                 )
             })?;
 
-        // Get the "main" namespace ID (to_namespace = "main")
-        // This is the default namespace where entities are enlisted when no target is specified
+        // The interactive session's scope is `home` (Phase 7/2H): a
+        // prompt-level enlist attaches its edge to home, never to the
+        // `main` data namespace.
         let to_namespace_id: i32 = bootstrap_conn
             .query_row(
-                "SELECT id FROM namespace WHERE fq_name = 'main'",
+                "SELECT id FROM namespace WHERE fq_name = 'home'",
                 [],
                 |row| row.get(0),
             )
             .map_err(|e| {
                 DelightQLError::database_error(
-                    "Default namespace 'main' not found in bootstrap (database corruption)",
+                    "Session namespace 'home' not found in bootstrap (database corruption)",
                     e.to_string(),
                 )
             })?;
@@ -5936,57 +7026,6 @@ impl DelightQLSystem {
         Ok(())
     }
 
-    /// Record which namespaces were enlisted inside a DDL as namespace-local dependencies.
-    /// The enlisted_namespace rows (from_namespace_id, to_namespace_id) represent the delta
-    /// of enlists that happened during the DDL. We store them as local dependencies of the
-    /// DDL's namespace so the resolver can activate them during view body resolution.
-    pub fn record_namespace_local_enlists(
-        &mut self,
-        namespace: &str,
-        new_enlists: &[(i32, i32)],
-    ) -> Result<()> {
-        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire bootstrap lock for record_namespace_local_enlists",
-                format!("Connection was poisoned: {}", e),
-            )
-        })?;
-
-        // Look up the namespace ID
-        let namespace_id: i32 = bootstrap_conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = ?1",
-                [namespace],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Namespace '{}' not found for local enlist recording",
-                        namespace
-                    ),
-                    e.to_string(),
-                )
-            })?;
-
-        for (from_ns_id, _to_ns_id) in new_enlists {
-            // The enlist was (from=enlisted_ns, to=main).
-            // We record it as: namespace_id depends on from_ns_id.
-            bootstrap_conn
-                .execute(
-                    "INSERT OR IGNORE INTO namespace_local_enlist (namespace_id, enlisted_namespace_id) VALUES (?1, ?2)",
-                    rusqlite::params![namespace_id, from_ns_id],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to record namespace local enlist",
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        Ok(())
-    }
 
     /// Snapshot the current namespace_alias state.
     /// Returns all (alias, target_namespace_id) rows for later restoration.
@@ -6053,65 +7092,75 @@ impl DelightQLSystem {
         Ok(())
     }
 
-    /// Record which namespace aliases were created inside a DDL file.
-    /// These are scoped to the DDL's namespace.
-    pub fn record_namespace_local_aliases(
-        &mut self,
-        namespace: &str,
-        new_aliases: &[(String, i32)],
-    ) -> Result<()> {
-        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire bootstrap lock for record_namespace_local_aliases",
-                format!("Connection was poisoned: {}", e),
-            )
-        })?;
-
-        let namespace_id: i32 = bootstrap_conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = ?1",
-                [namespace],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Namespace '{}' not found for local alias recording",
-                        namespace
-                    ),
-                    e.to_string(),
-                )
-            })?;
-
-        for (alias, target_ns_id) in new_aliases {
-            bootstrap_conn
-                .execute(
-                    "INSERT OR IGNORE INTO namespace_local_alias (namespace_id, alias, target_namespace_id) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![namespace_id, alias, target_ns_id],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to record namespace local alias",
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        Ok(())
-    }
-
     /// Destroy a namespace and cascade-delete all its bootstrap metadata.
     ///
     /// Returns `(connection_id, source_ns)` from the cartridge so the caller
     /// can handle physical cleanup (DETACH, connection_map removal).
-    fn destroy_namespace(&mut self, namespace_fq: &str) -> Result<(Option<i64>, Option<String>)> {
-        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire bootstrap database lock for destroy_namespace",
-                format!("Connection was poisoned: {}", e),
+    /// Empty `main` back to its pre-created bootstrap state (the unmount
+    /// counterpart of open()'s pre-creation): contents and the mount
+    /// cartridge go, the ROW and its wiring (home enlistment, routing)
+    /// stay, and the mount facts are cleared so the next mount reuses it.
+    /// Returns the physical cleanup identity like destroy_namespace.
+    fn empty_main_namespace(
+        bootstrap_conn: &Connection,
+    ) -> Result<(Option<i64>, Option<String>)> {
+        let ns_id: i64 = bootstrap_conn
+            .query_row(
+                "SELECT id FROM namespace WHERE fq_name = 'main'",
+                [],
+                |row| row.get(0),
             )
-        })?;
+            .map_err(|e| {
+                DelightQLError::database_error("main namespace missing", e.to_string())
+            })?;
 
+        // Physical cleanup identity, read from the authoritative relation
+        // BEFORE clearing it (the legacy namespace link is transitional).
+        let link_identity = Self::mount_binding(&bootstrap_conn, ns_id)?.map(|binding| {
+            (
+                binding.cartridge_id,
+                Some(binding.connection_id),
+                binding.attach_alias,
+            )
+        });
+
+        let txn = BootstrapTxn::begin(&bootstrap_conn, "empty_main")?;
+        // FK choreography: un-point before the cartridge dies; restore the
+        // row's pre-created face.
+        Self::clear_mount_binding(&bootstrap_conn, ns_id)?;
+        bootstrap_conn
+            .execute(
+                "UPDATE namespace
+                 SET source_path = NULL, provenance = 'bootstrap'
+                 WHERE id = ?1",
+                [ns_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to reset main namespace",
+                    e.to_string(),
+                )
+            })?;
+        Self::clear_namespace_contents(&bootstrap_conn, ns_id)?;
+        if let Some((cart_id, _, _)) = link_identity {
+            Self::clear_cartridge_entities(&bootstrap_conn, cart_id)?;
+        }
+        txn.commit()?;
+
+        Ok(link_identity
+            .map(|(_, conn_id, alias)| (conn_id, alias))
+            .unwrap_or((None, None)))
+    }
+
+    /// Catalog-only destruction. Takes the bootstrap connection from the
+    /// CALLER (eighth review, P1): unmount holds one guard — and one
+    /// transaction window — across every destroy AND the physical DETACH,
+    /// so a failed DETACH rolls the catalog back instead of losing the
+    /// cleanup identity.
+    fn destroy_namespace(
+        bootstrap_conn: &Connection,
+        namespace_fq: &str,
+    ) -> Result<(Option<i64>, Option<String>)> {
         // Look up namespace
         let namespace_id: i64 = bootstrap_conn
             .query_row(
@@ -6126,15 +7175,22 @@ impl DelightQLSystem {
                 )
             })?;
 
-        // Find ALL cartridge(s) and their connection info
+        // Find ALL cartridge(s) and their connection info. The mount's own
+        // cartridge comes from the STORED link
+        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md) — authoritative even for a
+        // valid-but-EMPTY image, so its alias always DETACHes. The entity
+        // join still contributes any entity-bearing cartridges. The old
+        // source-match fallback (and its double-empty ambiguity) is
+        // REPEALED: identity is read, never inferred.
         let cartridge_infos: Vec<(i64, Option<i64>, Option<String>)> = {
             let mut stmt = bootstrap_conn
                 .prepare(
                     "SELECT DISTINCT c.id, c.connection_id, c.source_ns
                      FROM cartridge c
-                     JOIN entity e ON e.cartridge_id = c.id
-                     JOIN activated_entity ae ON ae.entity_id = e.id
-                     WHERE ae.namespace_id = ?1",
+                     WHERE c.id = (SELECT cartridge_id FROM mount WHERE namespace_id = ?1)
+                        OR c.id IN (SELECT e.cartridge_id FROM entity e
+                                    JOIN activated_entity ae ON ae.entity_id = e.id
+                                    WHERE ae.namespace_id = ?1)",
                 )
                 .map_err(|e| {
                     DelightQLError::database_error("Failed to query cartridges", e.to_string())
@@ -6149,10 +7205,36 @@ impl DelightQLSystem {
             rows.flatten().collect()
         };
 
-        let (connection_id, source_ns) = cartridge_infos
-            .first()
-            .map(|(_, conn_id, src_ns)| (*conn_id, src_ns.clone()))
-            .unwrap_or((None, None));
+        // Physical-cleanup identity comes from the LINK, read BEFORE it is
+        // cleared (fifth review, P1): the union above deliberately includes
+        // entity-bearing auxiliary cartridges as a DELETION set, so taking
+        // `.first()` of it could hand physical cleanup an auxiliary's
+        // (connection, alias) and leave the real mount attached. Unlinked
+        // data namespaces fall back to the union's first row, as before.
+        // Only QueryReturnedNoRows means "unlinked" (sixth review, P2): any
+        // other SQLite error must ABORT the destroy rather than silently
+        // falling back to the arbitrary auxiliary path — the exact behavior
+        // this read exists to eliminate.
+        let link_identity = Self::mount_binding(bootstrap_conn, namespace_id)?
+            .map(|binding| (Some(binding.connection_id), binding.attach_alias));
+
+        // Atomic cascade (fourth review, P2b): the link clear and every
+        // delete below share one savepoint — a mid-cascade failure rolls the
+        // whole destroy back, identity fact included, instead of leaving
+        // partial metadata with the link already lost.
+        let txn = BootstrapTxn::begin(&bootstrap_conn, "destroy_namespace")?;
+
+        // FK choreography (NAMESPACE-CARTRIDGE-LINK-DESIGN.md §3): clear the
+        // link BEFORE the cascade deletes its cartridge row — under the
+        // restrictive FK an accidental ordering mistake is loud, never a
+        // silently orphaned namespace.
+        Self::clear_mount_binding(&bootstrap_conn, namespace_id)?;
+        let (connection_id, source_ns) = link_identity.unwrap_or_else(|| {
+            cartridge_infos
+                .first()
+                .map(|(_, conn_id, src_ns)| (*conn_id, src_ns.clone()))
+                .unwrap_or((None, None))
+        });
 
         // Cascade delete — order matters for FK constraints
         // 1. Namespace linking tables
@@ -6165,6 +7247,11 @@ impl DelightQLSystem {
             "DELETE FROM namespace_local_enlist WHERE namespace_id = ?1 OR enlisted_namespace_id = ?1",
             [namespace_id],
         ).map_err(|e| DelightQLError::database_error("Failed to delete namespace_local_enlist", e.to_string()))?;
+
+        bootstrap_conn.execute(
+            "DELETE FROM namespace_source WHERE namespace_id = ?1",
+            [namespace_id],
+        ).map_err(|e| DelightQLError::database_error("Failed to delete namespace_source", e.to_string()))?;
 
         bootstrap_conn
             .execute(
@@ -6341,7 +7428,7 @@ impl DelightQLSystem {
                 DelightQLError::database_error("Failed to delete namespace", e.to_string())
             })?;
 
-        drop(bootstrap_conn);
+        txn.commit()?;
 
         Ok((connection_id, source_ns))
     }
@@ -6352,6 +7439,15 @@ impl DelightQLSystem {
     /// grounded namespace. If clear, cascade-deletes all bootstrap metadata
     /// and performs physical cleanup (DETACH or connection_map removal).
     pub fn unmount_database(&mut self, namespace: &str) -> Result<()> {
+        // A consulted file may undo a mount it created itself, but may not
+        // rearrange a mount owned by the caller's pre-program session. The
+        // savepoint makes the catalog mutation reversible; this remains a
+        // language/session policy rather than a rollback limitation.
+        self.refuse_preexisting_namespace_mutation_in_program(
+            namespace,
+            "unmounting",
+            "directive/unmount/uncompensable",
+        )?;
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
                 "Failed to acquire bootstrap database lock for unmount",
@@ -6465,17 +7561,65 @@ impl DelightQLSystem {
             }
         }
 
-        drop(bootstrap_conn);
+        // 4–6 run under ONE transaction window (eighth review, P1): the
+        // catalog cascade AND the physical DETACHes commit or fail
+        // together. A failed DETACH rolls the catalog back, so the mount
+        // identity is retained and the operation reports failure — never
+        // "unmounted" in the catalog with the database still attached.
+        // (In-memory map removals are collected and applied only after
+        // COMMIT, so memory follows the catalog.)
+        // Snapshot the re-attach plan BEFORE the cascade (inside the window
+        // the destroyed rows are already invisible): alias → source_path
+        // for every attach-class mount under the target, so a mid-cascade
+        // DETACH failure can restore already-detached siblings.
+        let reattach_paths: std::collections::HashMap<String, String> = {
+            let mut stmt = bootstrap_conn
+                .prepare(
+                    "SELECT m.attach_alias, n.source_path
+                     FROM namespace n
+                     JOIN mount m ON m.namespace_id = n.id
+                     JOIN cartridge c ON c.id = m.cartridge_id
+                     WHERE (n.fq_name = ?1 OR n.fq_name LIKE ?1 || '::%')
+                       AND c.connection_id = 2
+                       AND m.class = 'attach'",
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        "Failed to snapshot unmount re-attach plan",
+                        e.to_string(),
+                    )
+                })?;
+            let rows = stmt
+                .query_map([namespace], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        "Failed to snapshot unmount re-attach plan",
+                        e.to_string(),
+                    )
+                })?;
+            rows.flatten()
+                .filter_map(|(alias, path)| Some((alias?, path?)))
+                .collect()
+        };
 
-        // 4. Cascade delete: descendants first (deepest first), then parent
+        let unmount_txn = BootstrapTxn::begin(&bootstrap_conn, "unmount_window")?;
+
         let mut schemas_to_detach: Vec<String> = Vec::new();
+        let mut connections_to_remove: Vec<i64> = Vec::new();
+
+        // Cascade delete: descendants first (deepest first), then parent
         for (desc_fq, desc_kind) in &descendants {
-            let (connection_id, source_ns) = self.destroy_namespace(desc_fq)?;
+            let (connection_id, source_ns) =
+                Self::destroy_namespace(&bootstrap_conn, desc_fq)?;
             if desc_kind == "data" {
                 if let Some(conn_id) = connection_id {
                     if conn_id > 2 {
-                        self.connection_map.remove(&conn_id);
-                        self.schema_map.remove(&conn_id);
+                        connections_to_remove.push(conn_id);
                     }
                 }
                 if let Some(schema) = source_ns {
@@ -6483,20 +7627,30 @@ impl DelightQLSystem {
                 }
             }
         }
-        let (connection_id, source_ns) = self.destroy_namespace(namespace)?;
-
-        // 5. Physical cleanup for parent
+        // `main` is a bootstrap FIXTURE (namespace-catechism Deviation #4):
+        // unmount EMPTIES it back to its pre-created state instead of
+        // destroying the row — destroying loses the wiring open() gave it
+        // (home enlistment, unqualified-read routing), which a later
+        // remount cannot recreate (seventh review, P1 follow-through). The
+        // next mount then takes the ordinary reuse-empty branch.
+        let (connection_id, source_ns) = if namespace == "main" {
+            Self::empty_main_namespace(&bootstrap_conn)?
+        } else {
+            Self::destroy_namespace(&bootstrap_conn, namespace)?
+        };
         if let Some(conn_id) = connection_id {
             if conn_id > 2 {
-                self.connection_map.remove(&conn_id);
-                self.schema_map.remove(&conn_id);
+                connections_to_remove.push(conn_id);
             }
         }
         if let Some(schema) = source_ns {
             schemas_to_detach.push(schema);
         }
 
-        // 6. DETACH all released schemas from the user connection
+        // Physical DETACH, inside the window: any failure returns Err and
+        // the guard rolls the whole catalog cascade back. (`unmount_txn` is
+        // on the BOOTSTRAP connection; the DETACH runs on the USER
+        // connection, so the two cannot deadlock.)
         if !schemas_to_detach.is_empty() {
             let user_conn = self.connection.lock().map_err(|e| {
                 DelightQLError::connection_poison_error(
@@ -6504,9 +7658,70 @@ impl DelightQLSystem {
                     format!("Connection was poisoned: {}", e),
                 )
             })?;
-            for schema in &schemas_to_detach {
-                let _ = user_conn.execute(&format!("DETACH DATABASE '{}'", schema), &[]);
+            for (i, schema) in schemas_to_detach.iter().enumerate() {
+                if let Err(e) =
+                    user_conn.execute(&format!("DETACH DATABASE '{}'", schema), &[])
+                {
+                    // Best-effort: re-ATTACH any schemas already detached in
+                    // this cascade (paths from the pre-cascade snapshot —
+                    // inside the window the destroyed rows are invisible) so
+                    // physical state matches the catalog the guard is about
+                    // to restore. Failures here are logged — the returned
+                    // error is the story.
+                    for reattach in &schemas_to_detach[..i] {
+                        if let Some(path) = reattach_paths.get(reattach) {
+                            if let Err(re) = user_conn.execute(
+                                &format!("ATTACH DATABASE '{}' AS '{}'", path, reattach),
+                                &[],
+                            ) {
+                                debug!(
+                                    "unmount cleanup: re-ATTACH '{}' failed: {}",
+                                    reattach, re
+                                );
+                            }
+                        }
+                    }
+                    return Err(DelightQLError::database_error(
+                        format!(
+                            "unmount!() failed: could not DETACH '{}' — the mount is \
+                             retained (catalog rolled back): {}",
+                            schema, e
+                        ),
+                        e.to_string(),
+                    )); // unmount_txn rolls back on unwind
+                }
             }
+        }
+
+        unmount_txn.commit()?;
+
+        // A mount_tree! creates several binding rows over one connection.
+        // Do not retire a live routing resource while a sibling binding still
+        // references it; the relation is now the refcount authority.
+        connections_to_remove.sort_unstable();
+        connections_to_remove.dedup();
+        let connections_to_remove: Vec<i64> = connections_to_remove
+            .into_iter()
+            .filter(|connection_id| {
+                !bootstrap_conn
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM mount m
+                             JOIN cartridge c ON c.id = m.cartridge_id
+                             WHERE c.connection_id = ?1
+                         )",
+                        [connection_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(true)
+            })
+            .collect();
+        drop(bootstrap_conn);
+
+        // Memory follows the committed catalog.
+        for conn_id in connections_to_remove {
+            self.connection_map.remove(&conn_id);
+            self.schema_map.remove(&conn_id);
         }
 
         debug!(
@@ -6519,10 +7734,16 @@ impl DelightQLSystem {
 
     /// Unconsult a lib/grounded/scratch namespace, removing all its definitions.
     ///
-    /// Validates the namespace is not of kind 'data' or 'system'. For lib namespaces,
+    /// Validates the namespace is not of kind 'data', 'system', or 'container'. For lib namespaces,
     /// checks that no grounded namespace borrows from it. Then cascade-deletes all
     /// bootstrap metadata.
     pub fn unconsult_namespace(&mut self, namespace: &str) -> Result<()> {
+        // See unmount_database: pre-program deletions are uncompensable.
+        self.refuse_preexisting_namespace_mutation_in_program(
+            namespace,
+            "unconsulting",
+            "directive/unconsult/uncompensable",
+        )?;
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
                 "Failed to acquire bootstrap database lock for unconsult",
@@ -6558,6 +7779,15 @@ impl DelightQLSystem {
                 return Err(DelightQLError::database_error(
                     format!(
                         "Cannot unconsult '{}' — system namespaces cannot be removed.",
+                        namespace
+                    ),
+                    "Protected namespace",
+                ));
+            }
+            "container" => {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "Cannot unconsult '{}' — structural container namespaces cannot be removed. Unmount or unconsult their child namespaces instead.",
                         namespace
                     ),
                     "Protected namespace",
@@ -6656,22 +7886,27 @@ impl DelightQLSystem {
             }
         }
 
-        drop(bootstrap_conn);
-
-        // 4. Cascade delete: descendants first (deepest first), then parent
+        // 4. Cascade delete: descendants first (deepest first), then parent.
+        // Map removals are collected and applied after the guard drops
+        // (destroy_namespace now takes the caller's connection).
+        let mut connections_to_remove: Vec<i64> = Vec::new();
         for (desc_fq, desc_kind) in &descendants {
-            let (connection_id, _source_ns) = self.destroy_namespace(desc_fq)?;
-            // Physical cleanup for data descendants
+            let (connection_id, _source_ns) =
+                Self::destroy_namespace(&bootstrap_conn, desc_fq)?;
             if desc_kind == "data" {
                 if let Some(conn_id) = connection_id {
                     if conn_id > 2 {
-                        self.connection_map.remove(&conn_id);
-                        self.schema_map.remove(&conn_id);
+                        connections_to_remove.push(conn_id);
                     }
                 }
             }
         }
-        let _result = self.destroy_namespace(namespace)?;
+        let _result = Self::destroy_namespace(&bootstrap_conn, namespace)?;
+        drop(bootstrap_conn);
+        for conn_id in connections_to_remove {
+            self.connection_map.remove(&conn_id);
+            self.schema_map.remove(&conn_id);
+        }
 
         debug!(
             "unconsult_namespace: Unconsulted namespace '{}' (cascade-deleted {} descendants)",
@@ -7164,6 +8399,20 @@ impl DelightQLSystem {
             .map_err(|e| {
                 DelightQLError::database_error(
                     "Failed to delete namespace_local_enlist",
+                    e.to_string(),
+                )
+            })?;
+
+        // Per-source provenance dies with the contents (Phase 8): the
+        // reload re-records its single source at ordinal 0.
+        bootstrap_conn
+            .execute(
+                "DELETE FROM namespace_source WHERE namespace_id = ?1",
+                [namespace_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to delete namespace_source",
                     e.to_string(),
                 )
             })?;
@@ -7741,7 +8990,7 @@ impl DelightQLSystem {
     }
 
     /// Set the `doc` string on a catalog entity, addressed by its
-    /// fully-qualified name (e.g. `"sys::help.identifier"`).
+    /// fully-qualified name (e.g. `"sys::identifiers.identifier"`).
     ///
     /// The fq name is `<namespace fq_name>.<entity name>`, so it is matched
     /// against `n.fq_name || '.' || e.name` over activated entities — the same
@@ -7751,6 +9000,66 @@ impl DelightQLSystem {
     /// cartridges) it is reported as ambiguous.
     ///
     /// Session-scoped: writes the in-memory bootstrap catalog for this session.
+    /// Conn-level doc write (review otolxyzl::qmqwqlms P1: the deferred
+    /// liminal doc!s apply INSIDE the consult transaction). Same candidate
+    /// resolution as `set_entity_doc`, against the provided connection.
+    pub(crate) fn set_entity_doc_on(
+        conn: &rusqlite::Connection,
+        target: &str,
+        doc: &str,
+    ) -> Result<()> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT e.id FROM entity e
+                 JOIN activated_entity ae ON ae.entity_id = e.id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 WHERE n.fq_name || '.' || e.name = ?1",
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to prepare entity lookup for doc!()",
+                    e.to_string(),
+                )
+            })?;
+        let ids: Vec<i64> = stmt
+            .query_map([target], |row| row.get(0))
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
+            })?
+            .collect::<std::result::Result<Vec<i64>, _>>()
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
+            })?;
+        drop(stmt);
+        match ids.as_slice() {
+            [] => Err(DelightQLError::database_error(
+                format!("no such entity '{}'", target),
+                "doc!() target not found",
+            )),
+            [entity_id] => {
+                conn.execute(
+                    "UPDATE entity SET doc = ?1 WHERE id = ?2",
+                    rusqlite::params![doc, entity_id],
+                )
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!("Failed to set doc on entity '{}'", target),
+                        e.to_string(),
+                    )
+                })?;
+                Ok(())
+            }
+            many => Err(DelightQLError::database_error(
+                format!(
+                    "ambiguous doc!() target '{}' resolves to {} entities",
+                    target,
+                    many.len()
+                ),
+                "Ambiguous entity reference",
+            )),
+        }
+    }
+
     pub fn set_entity_doc(&mut self, target: &str, doc: &str) -> Result<(String, String)> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
@@ -7856,7 +9165,7 @@ impl DelightQLSystem {
                 )
             })?;
 
-        if source_kind == "data" || source_kind == "system" {
+        if source_kind == "data" || source_kind == "system" || source_kind == "container" {
             return Err(DelightQLError::database_error(
                 format!(
                     "imprint!() source '{}' is a {} namespace. Source must be a lib namespace.",
@@ -7913,35 +9222,38 @@ impl DelightQLSystem {
             ));
         }
 
-        // 4. Get target connection info: schema alias + connection_id.
-        // First try the entity path (populated namespaces), then the mount
-        // linkage (namespace.source_path = cartridge.source_uri) — an EMPTY
-        // mounted namespace has no activated entities, and falling through
-        // to the primary connection would silently write the imprinted
-        // tables into the wrong physical database (the session's primary
-        // schema instead of the mounted file).
+        // 4. Get target connection info: schema alias + connection_id, via
+        // the STORED mount link (NAMESPACE-CARTRIDGE-LINK-DESIGN.md; fourth
+        // review P1). The old entity-path + source-match fallback was
+        // ambiguous once simultaneous same-source mounts became legal — its
+        // ORDER BY c.id DESC chose the NEWEST cartridge for the source, not
+        // the cartridge of the REQUESTED namespace, so imprinting into `a`
+        // could target `b`'s image. The link answers for the namespace
+        // itself, empty or not.
         let (target_schema_alias, connection_id): (Option<String>, i64) = bootstrap_conn
             .query_row(
-                "SELECT c.source_ns, c.connection_id
-                 FROM cartridge c
-                 JOIN entity e ON e.cartridge_id = c.id
-                 JOIN activated_entity ae ON ae.entity_id = e.id
-                 JOIN namespace n ON ae.namespace_id = n.id
-                 WHERE n.fq_name = ?1
-                 LIMIT 1",
+                "SELECT CASE WHEN m.qualification IN ('aliased', 'engine_schema')
+                                THEN COALESCE(m.attach_alias, m.engine_schema)
+                            ELSE NULL END,
+                        c.connection_id
+                 FROM mount m
+                 JOIN cartridge c ON c.id = m.cartridge_id
+                 JOIN namespace n ON n.id = m.namespace_id
+                 WHERE n.fq_name = ?1",
                 [target_ns],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .or_else(|_| {
-                // namespace.source_path stores the bare locator; cartridge
-                // .source_uri may carry the file:// spelling of the same path.
+                // Non-mount data namespaces (no link) fall through to the
+                // entity path: their contents live on whatever connection
+                // their activated entities record.
                 bootstrap_conn.query_row(
                     "SELECT c.source_ns, c.connection_id
-                     FROM namespace n
-                     JOIN cartridge c ON c.source_uri = n.source_path
-                                      OR c.source_uri = 'file://' || n.source_path
-                     WHERE n.fq_name = ?1 AND n.source_path IS NOT NULL
-                     ORDER BY c.id DESC
+                     FROM cartridge c
+                     JOIN entity e ON e.cartridge_id = c.id
+                     JOIN activated_entity ae ON ae.entity_id = e.id
+                     JOIN namespace n ON ae.namespace_id = n.id
+                     WHERE n.fq_name = ?1
                      LIMIT 1",
                     [target_ns],
                     |row| Ok((row.get(0)?, row.get(1)?)),
@@ -8905,13 +10217,42 @@ impl DelightQLSystem {
             }
         };
 
-        // Step 2: Get the backend schema (source_ns) and connection_id for this namespace
-        // First try to find cartridges with activated entities
+        // Step 2: mounted namespaces resolve routing and qualification from
+        // their authoritative binding, including valid empty mounts.
+        let mounted = conn.query_row(
+            "SELECT CASE
+                        WHEN m.qualification = 'aliased' THEN m.attach_alias
+                        WHEN m.qualification = 'engine_schema' THEN m.engine_schema
+                        ELSE NULL
+                    END,
+                    c.connection_id
+             FROM mount m
+             JOIN cartridge c ON c.id = m.cartridge_id
+             WHERE m.namespace_id = ?1",
+            [namespace_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        );
+        match mounted {
+            Ok(binding) => return Ok(Some(binding)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => {
+                return Err(DelightQLError::database_error_with_source(
+                    "Failed to resolve namespace mount binding",
+                    e.to_string(),
+                    Box::new(e),
+                ));
+            }
+        }
+
+        // Non-mount namespaces retain the cartridge source namespace model.
         let result = conn.query_row(
             "SELECT DISTINCT c.source_ns, c.connection_id
              FROM activated_entity ae
              JOIN cartridge c ON ae.cartridge_id = c.id
              WHERE ae.namespace_id = ?1
+               AND NOT EXISTS (
+                    SELECT 1 FROM mount m WHERE m.cartridge_id = c.id
+               )
              LIMIT 1",
             [namespace_id],
             |row| {
@@ -8963,6 +10304,355 @@ impl DelightQLSystem {
     /// results, the fallback scope is searched too. This supports DDL view
     /// body resolution: the DDL namespace is primary (with its own enlists),
     /// and "main" is the fallback for database tables not in any enlist.
+    /// The kind gate for the AMBIENT-DATA fallback (Phase 7 stage 2,
+    /// owner-ratified): true iff the fq names a `data`-kind namespace.
+    /// Tables live in data namespaces; DEFINITIONS live in lib-kind
+    /// namespaces and never leak through the ambient door.
+    /// Conn-level recorder cores (review otolxyzl::qmqwqlms P1: recording
+    /// happens INSIDE the consult transaction).
+    pub(crate) fn record_namespace_local_enlists_on(
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        new_enlists: &[(i32, i32)],
+    ) -> Result<()> {
+        let namespace_id: i32 = conn
+            .query_row(
+                "SELECT id FROM namespace WHERE fq_name = ?1",
+                [namespace],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("namespace lookup for local enlists", e.to_string())
+            })?;
+        for (from_id, _to_id) in new_enlists {
+            conn.execute(
+                "INSERT OR IGNORE INTO namespace_local_enlist (namespace_id, enlisted_namespace_id) VALUES (?1, ?2)",
+                rusqlite::params![namespace_id, from_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("record namespace_local_enlist", e.to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_namespace_local_aliases_on(
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        new_aliases: &[(String, i32)],
+    ) -> Result<()> {
+        let namespace_id: i32 = conn
+            .query_row(
+                "SELECT id FROM namespace WHERE fq_name = ?1",
+                [namespace],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("namespace lookup for local aliases", e.to_string())
+            })?;
+        for (alias, target_id) in new_aliases {
+            conn.execute(
+                "INSERT OR IGNORE INTO namespace_local_alias (namespace_id, alias, target_namespace_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![namespace_id, alias, target_id],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("record namespace_local_alias", e.to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_namespace_source_on(
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        source_path: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO namespace_source (namespace_id, source_path, ordinal)
+             SELECT n.id, ?2, COALESCE((SELECT MAX(ordinal) + 1 FROM namespace_source
+                                        WHERE namespace_id = n.id), 0)
+             FROM namespace n WHERE n.fq_name = ?1",
+            rusqlite::params![namespace, source_path],
+        )
+        .map_err(|e| DelightQLError::database_error("record namespace source", e.to_string()))?;
+        Ok(())
+    }
+
+
+
+    /// The (kind, provenance) pair for a namespace, when it exists.
+    pub fn namespace_kind_and_provenance(
+        &self,
+        fq: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for namespace kind",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        Ok(conn
+            .query_row(
+                "SELECT kind, provenance FROM namespace WHERE fq_name = ?1",
+                [fq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| DelightQLError::database_error("namespace kind", e.to_string()))?)
+    }
+
+    /// Enter a liminal program. If no program is active, this call becomes
+    /// the OUTERMOST one (owning the catalog savepoint and external journal)
+    /// and
+    /// `true` is returned — the caller must `end_liminal_program()` on
+    /// every exit path. A nested call
+    /// leaves the enclosing boundary in place and returns `false`.
+    pub(crate) fn begin_liminal_program(
+        &self,
+        mark: i64,
+        kind: LiminalProgramKind,
+    ) -> Result<bool> {
+        if self.active_liminal_program.borrow().is_none() {
+            let conn = self.bootstrap_connection.lock().map_err(|e| {
+                DelightQLError::connection_poison_error(
+                    "Failed to acquire bootstrap lock for liminal program",
+                    format!("Connection was poisoned: {e}"),
+                )
+            })?;
+            conn.execute_batch("SAVEPOINT dql_liminal_program")
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        "Failed to begin liminal program transaction",
+                        e.to_string(),
+                    )
+                })?;
+            drop(conn);
+            self.active_liminal_program.replace(Some(ProgramContext {
+                namespace_mark: mark,
+                kind,
+                external_effects: Vec::new(),
+            }));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Close the OUTERMOST liminal program (see `begin_liminal_program`).
+    /// The catalog is one savepoint spanning directive execution through
+    /// registration; failure restores pre-existing children as well as rows
+    /// created by the program.
+    pub(crate) fn end_liminal_program(&self, commit: bool) -> Result<()> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock to close liminal program",
+                format!("Connection was poisoned: {e}"),
+            )
+        })?;
+        let result = if commit {
+            conn.execute_batch("RELEASE SAVEPOINT dql_liminal_program")
+        } else {
+            conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT dql_liminal_program; \
+                 RELEASE SAVEPOINT dql_liminal_program",
+            )
+        }
+        .map_err(|e| {
+            DelightQLError::database_error(
+                "Failed to close liminal program transaction",
+                e.to_string(),
+            )
+        });
+        if !commit {
+            // Rust-side caches of catalog rows must not outlive a rollback
+            // (review zmvnywzu, P3): if this program CREATED the catalog
+            // cartridge (a session that touched no catalog feature before
+            // consulting), the memoized id now points at erased rows —
+            // re-verify and forget it so the next use re-initializes.
+            if let Some(id) = self.catalog_cartridge_id.get() {
+                let still_there: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM cartridge WHERE id = ?1)",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                if !still_there {
+                    self.catalog_cartridge_id.set(None);
+                }
+            }
+        }
+        drop(conn);
+        self.active_liminal_program.replace(None);
+        result
+    }
+
+    /// Record a file materialized by `mount_new!` while a liminal program is
+    /// active. The prior state is deliberately explicit: on abort an absent
+    /// path is removed, while a caller-owned zero-byte placeholder is restored
+    /// to zero bytes rather than deleted.
+    fn journal_created_file(&self, path: PathBuf, prior_state: CreatedFilePriorState) {
+        if let Some(context) = self.active_liminal_program.borrow_mut().as_mut() {
+            context
+                .external_effects
+                .push(ExternalEffect::CreatedFile { path, prior_state });
+        }
+    }
+
+    fn journal_attached_sqlite(&self, schema_alias: String) {
+        if let Some(context) = self.active_liminal_program.borrow_mut().as_mut() {
+            context
+                .external_effects
+                .push(ExternalEffect::AttachedSqlite { schema_alias });
+        }
+    }
+
+    fn journal_external_connection(&self, connection_id: i64) {
+        if let Some(context) = self.active_liminal_program.borrow_mut().as_mut() {
+            context
+                .external_effects
+                .push(ExternalEffect::RegisteredExternalConnection { connection_id });
+        }
+    }
+
+    /// Reverse non-catalog effects in LIFO order. This is best-effort so a
+    /// cleanup problem cannot hide the program's actual failure.
+    pub(crate) fn rollback_liminal_external_effects(&mut self) {
+        let effects = self
+            .active_liminal_program
+            .borrow_mut()
+            .as_mut()
+            .map(|context| std::mem::take(&mut context.external_effects))
+            .unwrap_or_default();
+        for effect in effects.into_iter().rev() {
+            match effect {
+                ExternalEffect::AttachedSqlite { schema_alias } => {
+                    if let Ok(conn) = self.connection.lock() {
+                        let escaped = schema_alias.replace('\'', "''");
+                        let _ = conn.execute(&format!("DETACH DATABASE '{escaped}'"), &[]);
+                    }
+                }
+                ExternalEffect::RegisteredExternalConnection { connection_id } => {
+                    self.connection_map.remove(&connection_id);
+                    self.schema_map.remove(&connection_id);
+                }
+                ExternalEffect::CreatedFile { path, prior_state } => match prior_state {
+                    CreatedFilePriorState::Absent => {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    CreatedFilePriorState::Empty => {
+                        let _ = std::fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(path);
+                    }
+                },
+            }
+        }
+    }
+
+    /// The active liminal program's (mark, kind), if any.
+    pub(crate) fn active_liminal_program(&self) -> Option<(i64, LiminalProgramKind)> {
+        self.active_liminal_program
+            .borrow()
+            .as_ref()
+            .map(|context| (context.namespace_mark, context.kind))
+    }
+
+    /// The namespace row id for an fq name, if it exists.
+    pub(crate) fn namespace_id(&self, fq: &str) -> Result<Option<i64>> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for namespace id",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        conn.query_row("SELECT id FROM namespace WHERE fq_name = ?1", [fq], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| DelightQLError::database_error("namespace id", e.to_string()))
+    }
+
+    /// Policy refusal for session-rearranging operations against namespaces
+    /// that predate a consulted program. The catalog savepoint now makes such
+    /// operations technically reversible; the refusal remains because a file
+    /// describes its library rather than imperatively rearranging its caller's
+    /// session. It lives on the shared road so every invocation route receives
+    /// the policy inductively. Existing error badges retain `uncompensable` for
+    /// compatibility even though that is no longer the implementation reason.
+    pub(crate) fn refuse_preexisting_namespace_mutation_in_program(
+        &self,
+        target_fq: &str,
+        verb: &str,
+        badge: &'static str,
+    ) -> Result<()> {
+        let Some((mark, _kind)) = self.active_liminal_program() else {
+            return Ok(());
+        };
+        if let Some(id) = self.namespace_id(target_fq)? {
+            if id <= mark {
+                return Err(DelightQLError::validation_error_categorized(
+                    badge,
+                    format!(
+                        "a consulted file executes as ONE atomic program: if any part \
+                         fails, everything the program created is torn down. \
+                         '{target_fq}' existed BEFORE this program began, so {verb} it \
+                         here could not be undone by that teardown — the program \
+                         refuses rather than risk leaving the session half-changed. \
+                         Do it at the prompt, outside the file"
+                    ),
+                    "uncompensable in liminal program",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn max_namespace_id(&self) -> Result<i64> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for namespace snapshot",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        Ok(conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM namespace", [], |r| r.get(0))
+            .unwrap_or(0))
+    }
+
+    /// Does a namespace row exist for this fq name?
+    pub fn namespace_exists(&self, fq: &str) -> Result<bool> {
+        let conn = self.bootstrap_connection.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for namespace existence",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM namespace WHERE fq_name = ?1",
+                [fq],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| DelightQLError::database_error("namespace existence", e.to_string()))?
+            .is_some())
+    }
+
+    pub fn namespace_is_data_kind(&self, fq: &str) -> bool {
+        let Ok(conn) = self.bootstrap_connection.lock() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT kind FROM namespace WHERE fq_name = ?1",
+            [fq],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|k| k == "data")
+        .unwrap_or(false)
+    }
+
     pub fn resolve_unqualified_entity(
         &self,
         entity_name: &str,
@@ -9011,6 +10701,10 @@ impl DelightQLSystem {
                 SELECT en.from_namespace_id
                 FROM enlisted_namespace en
                 WHERE en.to_namespace_id = ?2
+                UNION
+                SELECT nle.enlisted_namespace_id
+                FROM namespace_local_enlist nle
+                WHERE nle.namespace_id = ?2
             ),
             reachable(ns_id) AS (
                 SELECT ns_id FROM direct
@@ -9202,6 +10896,237 @@ impl DelightQLSystem {
     /// placement (`<conn-ns>::temp` mirror + scoped enlistment edges) is
     /// that spec's own later work; this is the session-catalog slice the
     /// entry points need.
+    /// CODE-REVIEW-zzpmxuzp::otolxyzl finding 2: the RESOLVED owner of an
+    /// effect target — identity, not spelling. A spelled qualifier
+    /// resolves through the exact fq, then the global alias table; a bare
+    /// target resolves through the scope's enlisted reachability. The
+    /// answer is the owning namespace's fq and CATALOG KIND, so the
+    /// engine-ownership refusal covers aliases, enlistment, and future
+    /// indirections automatically. `None` = the target does not resolve
+    /// here; later resolution speaks with its own diagnostic.
+    pub fn effect_target_owner(
+        &self,
+        target: &str,
+        spelled_namespace: Option<&str>,
+        scope_namespace: &str,
+    ) -> Result<Option<(String, String)>> {
+        use rusqlite::OptionalExtension;
+        let db = |what: &str, e: rusqlite::Error| {
+            DelightQLError::database_error(format!("{what}: {e}"), "effect target ownership")
+        };
+        let fq: Option<String> = match spelled_namespace {
+            Some(ns) => {
+                let conn = self.get_bootstrap_connection();
+                let guard = conn.lock().map_err(|e| {
+                    DelightQLError::connection_poison_error(
+                        "Failed to acquire bootstrap lock for target ownership",
+                        format!("Connection was poisoned: {}", e),
+                    )
+                })?;
+                let exact: Option<String> = guard
+                    .query_row(
+                        "SELECT fq_name FROM namespace WHERE fq_name = ?1",
+                        [ns],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| db("resolving spelled namespace", e))?;
+                match exact {
+                    Some(f) => Some(f),
+                    None => guard
+                        .query_row(
+                            "SELECT n.fq_name FROM namespace_alias a \
+                             JOIN namespace n ON n.id = a.target_namespace_id \
+                             WHERE a.alias = ?1",
+                            [ns],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| db("resolving namespace alias", e))?,
+                }
+            }
+            // Bare target: ambiguity or lookup errors are not ownership's
+            // business — later resolution speaks.
+            None => self
+                .resolve_unqualified_entity(target, scope_namespace, None)
+                .unwrap_or(None)
+                .map(|(path, _)| {
+                    path.iter()
+                        .map(|seg| seg.name.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                }),
+        };
+        let Some(fq) = fq else {
+            return Ok(None);
+        };
+        let conn = self.get_bootstrap_connection();
+        let guard = conn.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for target ownership",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let kind: Option<String> = guard
+            .query_row(
+                "SELECT kind FROM namespace WHERE fq_name = ?1",
+                [&fq],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| db("reading namespace kind", e))?;
+        Ok(kind.map(|k| (fq, k)))
+    }
+
+    /// D4: materialize the typed effect plan's OBSERVATIONAL PROJECTION
+    /// into the engine-owned sys::execution relations (effect_plan /
+    /// effect_guard / effect_requirement — Q-D3's normalized shape).
+    /// Clear-then-insert IS the ruled lifecycle: rows persist after a run
+    /// for post-mortem inspection and clear at the START of the next
+    /// compile (the fresh-scratch-per-run precedent). Only the engine
+    /// calls this; the rows execute nothing (Q-D11: the typed Rust plan
+    /// stays the single executable source).
+    pub fn materialize_effect_plan(
+        &self,
+        typed: &crate::pipeline::compiled_query::TypedEffectPlan,
+    ) -> Result<()> {
+        use crate::pipeline::compiled_query::GuardPolarity;
+        let conn = self.get_bootstrap_connection();
+        let guard = conn.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for effect-plan materialization",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let step = |msg: &str, e: rusqlite::Error| {
+            DelightQLError::database_error(format!("{msg}: {e}"), "effect-plan materialization")
+        };
+        // Atomic clear-and-replace (review hardening): a mid-
+        // materialization failure must not leave a partial "canonical"
+        // projection behind.
+        guard
+            .execute_batch(
+                "BEGIN; \
+                 DELETE FROM effect_run; \
+                 DELETE FROM effect_requirement; \
+                 DELETE FROM effect_guard; \
+                 DELETE FROM effect_plan;",
+            )
+            .map_err(|e| step("clearing the prior plan", e))?;
+        let finish = |guard: &std::sync::MutexGuard<'_, Connection>, r: Result<()>| match r {
+            Ok(()) => guard.execute_batch("COMMIT").map_err(|e| step("committing", e)),
+            Err(e) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        };
+        let body = (|| -> Result<()> {
+        for (ordinal, s) in typed.steps.iter().enumerate() {
+            let (step_kind, action_kind) = s.kind().projection_kinds();
+            guard
+                .execute(
+                    "INSERT INTO effect_plan (plan_id, step_id, ordinal, occurrence_id, \
+                     step_kind, action_kind, operation, route, sql_display) \
+                     VALUES (1, ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        ordinal as i64,
+                        s.occurrence,
+                        step_kind,
+                        action_kind,
+                        s.operation.clone(),
+                        s.route,
+                        s.sql_display(),
+                    ],
+                )
+                .map_err(|e| step("inserting a step", e))?;
+            for r in &s.requirements {
+                guard
+                    .execute(
+                        "INSERT INTO effect_requirement (plan_id, step_id, guard_id, \
+                         polarity, reason) VALUES (1, ?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            ordinal as i64,
+                            r.guard_id as i64,
+                            match r.polarity {
+                                GuardPolarity::Present => "present",
+                                GuardPolarity::Absent => "absent",
+                            },
+                            r.reason,
+                        ],
+                    )
+                    .map_err(|e| step("inserting a requirement edge", e))?;
+            }
+        }
+        for g in &typed.guards {
+            guard
+                .execute(
+                    "INSERT INTO effect_guard (plan_id, guard_id, sql_display) \
+                     VALUES (1, ?1, ?2)",
+                    rusqlite::params![g.guard_id as i64, g.sql],
+                )
+                .map_err(|e| step("inserting a guard definition", e))?;
+        }
+        Ok(())
+        })();
+        finish(&guard, body)
+    }
+
+    /// D5: materialize the run's per-step outcomes (Q-D5 as amended):
+    /// tracked in memory during the walk, written ONCE at the run's
+    /// boundary, persisting for post-mortem inspection until the next
+    /// compile clears them with the plan. The caller treats failure as
+    /// best-effort — bookkeeping never outranks the run.
+    pub fn materialize_effect_run(
+        &self,
+        outcomes: &[(&'static str, Option<String>)],
+    ) -> Result<()> {
+        let conn = self.get_bootstrap_connection();
+        let guard = conn.lock().map_err(|e| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap lock for effect-run materialization",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        // Atomic (review round 3): a bookkeeping failure must not leave
+        // a PARTIAL post-mortem behind — same boundary discipline as the
+        // plan materializer.
+        guard.execute_batch("BEGIN").map_err(|e| {
+            DelightQLError::database_error(
+                format!("beginning the run-outcome batch: {e}"),
+                "effect-run materialization",
+            )
+        })?;
+        let body = (|| -> Result<()> {
+            for (step_id, (status, detail)) in outcomes.iter().enumerate() {
+                guard
+                    .execute(
+                        "INSERT OR REPLACE INTO effect_run (plan_id, step_id, status, detail) \
+                         VALUES (1, ?1, ?2, ?3)",
+                        rusqlite::params![step_id as i64, status, detail],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            format!("inserting a run outcome: {e}"),
+                            "effect-run materialization",
+                        )
+                    })?;
+            }
+            Ok(())
+        })();
+        match body {
+            Ok(()) => guard.execute_batch("COMMIT").map_err(|e| {
+                DelightQLError::database_error(
+                    format!("committing the run-outcome batch: {e}"),
+                    "effect-run materialization",
+                )
+            }),
+            Err(e) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     pub fn register_run_created_object(
         &mut self,
         name: &str,
@@ -9577,13 +11502,15 @@ impl DelightQLSystem {
                 format!("Connection was poisoned: {}", e),
             )
         })?;
+        // Mount identity via the STORED link
+        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md) — resolves even for a mount
+        // whose image holds zero entities.
         Ok(conn
             .query_row(
                 "SELECT n.fq_name
-                 FROM activated_entity ae
-                 JOIN entity e ON e.id = ae.entity_id
-                 JOIN cartridge c ON c.id = e.cartridge_id
-                 JOIN namespace n ON n.id = ae.namespace_id
+                 FROM namespace n
+                 JOIN mount m ON m.namespace_id = n.id
+                 JOIN cartridge c ON c.id = m.cartridge_id
                  WHERE c.connection_id = ?1
                    AND c.source_uri <> 'session://materialized'
                  LIMIT 1",
@@ -9597,12 +11524,11 @@ impl DelightQLSystem {
     /// targets, now a per-mount RECORDED fact (schema-mount Phase A,
     /// EFFECTS-ON-TARGETS-PLAN §4.1, ratified 2026-07-12; it closes the
     /// E-T4 coupling note this method's comment used to carry). The fact is
-    /// the cartridge's `source_ns`, written by `register_external_connection`
-    /// from `ConnectionComponents.mounted_schema`:
+    /// `mount.qualification` plus `mount.engine_schema`:
     /// - a SPELLED schema (Phase B `#schema` / Phase C `mount_tree!`) is
     ///   returned verbatim — the mount introspected THAT schema, so durable
     ///   placement and read qualification agree with it;
-    /// - a NULL `source_ns` (a bare mount — "the engine's own default")
+    /// - an unqualified binding (a bare mount — "the engine's own default")
     ///   resolves DOWNSTREAM here to the engine default by connection type
     ///   (3 = postgres → `public`, 4 = duckdb → `main`), so a bare mount is
     ///   byte-identical to the pre-Phase-A derivation while its reads stay
@@ -9618,7 +11544,7 @@ impl DelightQLSystem {
     /// namespace↔schema mapping is 1:1 today. Pinned by
     /// `pg_table_bang_ctas_spells_the_mounted_schema_and_registers_on_the_connection`
     /// (effect_transformer/tests.rs) and
-    /// `mount_records_the_schema_as_source_ns_and_the_lookup_reads_it`
+    /// `mount_records_the_engine_schema_and_the_lookup_reads_it`
     /// (schema_mount_recording_tests).
     pub fn mounted_engine_schema_for_namespace(
         &self,
@@ -9630,16 +11556,22 @@ impl DelightQLSystem {
                 format!("Connection was poisoned: {}", e),
             )
         })?;
-        // The mount cartridge (never the session-materialization cartridge,
-        // whose source_ns is deliberately NULL) carries both the recorded
-        // schema and the connection type that seeds the default.
+        // The binding carries qualification/schema; the cartridge supplies
+        // only the connection whose type seeds an unqualified default.
+        // Mount identity via the STORED link
+        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md) — an empty mounted image has
+        // a recorded schema too.
         let recorded: Option<(Option<String>, Option<i64>)> = conn
             .query_row(
-                "SELECT c.source_ns, co.connection_type
-                 FROM activated_entity ae
-                 JOIN entity e ON e.id = ae.entity_id
-                 JOIN cartridge c ON c.id = e.cartridge_id
-                 JOIN namespace n ON n.id = ae.namespace_id
+                "SELECT CASE
+                            WHEN m.qualification = 'engine_schema' THEN m.engine_schema
+                            WHEN m.qualification = 'aliased' THEN m.attach_alias
+                            ELSE NULL
+                        END,
+                        co.connection_type
+                 FROM namespace n
+                 JOIN mount m ON m.namespace_id = n.id
+                 JOIN cartridge c ON c.id = m.cartridge_id
                  LEFT JOIN connection co ON co.id = c.connection_id
                  WHERE n.fq_name = ?1
                    AND c.source_uri <> 'session://materialized'
@@ -9766,25 +11698,57 @@ impl DelightQLSystem {
         }
 
         // 2. Retrieve cartridge metadata for re-introspection
-        let cartridge_meta: Option<(i64, Option<i64>, Option<String>, Option<String>)> =
+        // The mount's cartridge is the STORED link
+        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md) — authoritative even for a
+        // valid-but-EMPTY image (a file image re-introspects to zero
+        // entities; a bytes image reaches the immutable refusal below). The
+        // old entity-join lookup and its source-match fallback are REPEALED.
+        let cartridge_meta: Option<(
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        )> =
             bootstrap_conn
                 .query_row(
-                    "SELECT c.id, c.connection_id, c.source_ns, c.source_uri
-                 FROM cartridge c
-                 JOIN entity e ON e.cartridge_id = c.id
-                 JOIN activated_entity ae ON ae.entity_id = e.id
-                 WHERE ae.namespace_id = ?1
-                 LIMIT 1",
+                    "SELECT m.cartridge_id, c.connection_id, c.source_ns, c.source_uri,
+                            m.attach_alias, m.class, m.engine_schema
+                     FROM mount m
+                     JOIN cartridge c ON c.id = m.cartridge_id
+                     WHERE m.namespace_id = ?1",
                     [ns_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
                 )
-                .ok();
+                .optional()
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        "Failed to read mount binding for refresh",
+                        e.to_string(),
+                    )
+                })?;
 
-        let (connection_id, schema_alias, source_uri) = match &cartridge_meta {
-            Some((_, conn_id, src_ns, src_uri)) => (
+        let (old_cartridge_id, connection_id, source_ns, source_uri, attach_alias, mount_class, engine_schema) = match &cartridge_meta {
+            Some((cart_id, conn_id, src_ns, src_uri, alias, class, engine_schema)) => (
+                *cart_id,
                 conn_id.unwrap_or(2),
                 src_ns.clone(),
                 src_uri.clone().unwrap_or_default(),
+                alias.clone(),
+                class.clone(),
+                engine_schema.clone(),
             ),
             None => {
                 return Err(DelightQLError::database_error(
@@ -9797,26 +11761,66 @@ impl DelightQLSystem {
             }
         };
 
-        // 3. Begin transaction
-        bootstrap_conn.execute_batch("BEGIN").map_err(|e| {
-            DelightQLError::database_error("Failed to begin refresh transaction", e.to_string())
-        })?;
+        // delightql-bytes:// mounts refuse refresh (BYTES-SCHEME-DESIGN.md):
+        // an immutable embedded image cannot have changed, so a refresh has
+        // nothing to observe. unmount!/mount! if a re-mount is really wanted.
+        if source_uri.starts_with("delightql-bytes://") {
+            return Err(DelightQLError::database_error(
+                format!(
+                    "Cannot refresh '{}': it is mounted from an immutable embedded image ({}). \
+                     Use unmount!() and mount!() to re-mount.",
+                    namespace, source_uri
+                ),
+                "Embedded images are immutable",
+            ));
+        }
 
-        // 4. Clear contents
-        let clear_result = Self::clear_namespace_contents(&bootstrap_conn, ns_id);
+        // 3. Begin a nestable transaction: refresh! is liminal-eligible and
+        // may therefore run under the program-level savepoint.
+        let transaction = CatalogSavepoint::begin(
+            &bootstrap_conn,
+            "dql_refresh_namespace",
+            "Failed to begin refresh transaction",
+        )?;
+
+        // 4. Clear contents — FK choreography first
+        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md §3): un-point the link BEFORE
+        // the old cartridge row is deleted, inside this transaction, so a
+        // rollback restores link and cartridge TOGETHER. Then clear the
+        // entity-discovered cartridges plus the authoritative one from the
+        // link (an ENTITYLESS cartridge is invisible to the entity scan —
+        // third review P1; the explicit clear is a no-op when the scan
+        // already removed it).
+        let clear_result = Self::clear_mount_binding(&bootstrap_conn, ns_id)
+            .and_then(|_| Self::clear_namespace_contents(&bootstrap_conn, ns_id))
+            .and_then(|_| Self::clear_cartridge_entities(&bootstrap_conn, old_cartridge_id));
         if let Err(e) = clear_result {
-            let _ = bootstrap_conn.execute_batch("ROLLBACK");
             return Err(e);
         }
 
         // 5. Re-introspect
         let entities = if connection_id == 2 {
-            // ATTACH path: use schema alias
-            let alias = schema_alias.as_deref().unwrap_or(namespace);
+            // ATTACH path: the PHYSICAL alias comes from the mount binding
+            // (seventh review, P1). Substituting the namespace NAME
+            // introspected SQLite's hub instead of the attached database.
+            // The read is LOUD (eighth review, P2): for an attach-class
+            // mount the alias is REQUIRED identity — a catalog error or a
+            // NULL is an internal consistency failure, never a silent
+            // fallback that would recreate the hub-introspection bug.
+            let Some(alias) = attach_alias.as_deref() else {
+                let _ = bootstrap_conn.execute_batch("ROLLBACK");
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "Cannot refresh '{}': it has a mount cartridge but no recorded \
+                         attachment alias — internal catalog inconsistency",
+                        namespace
+                    ),
+                    "Missing attach_alias for attach-class mount",
+                ));
+            };
             match self.introspector.introspect_entities_in_schema(alias) {
                 Ok(e) => e,
                 Err(e) => {
-                    let _ = bootstrap_conn.execute_batch("ROLLBACK");
                     return Err(DelightQLError::database_error(
                         format!("Failed to re-introspect schema '{}': {}", alias, e),
                         e.to_string(),
@@ -9830,7 +11834,6 @@ impl DelightQLSystem {
                     let components = match factory.create(&source_uri) {
                         Ok(c) => c,
                         Err(e) => {
-                            let _ = bootstrap_conn.execute_batch("ROLLBACK");
                             return Err(DelightQLError::database_error(
                                 format!("Failed to create connection for refresh: {}", e),
                                 e.to_string(),
@@ -9840,7 +11843,6 @@ impl DelightQLSystem {
                     match components.introspector.introspect_entities() {
                         Ok(e) => e,
                         Err(e) => {
-                            let _ = bootstrap_conn.execute_batch("ROLLBACK");
                             return Err(DelightQLError::database_error(
                                 format!("Failed to re-introspect '{}': {}", source_uri, e),
                                 e.to_string(),
@@ -9849,7 +11851,6 @@ impl DelightQLSystem {
                     }
                 }
                 None => {
-                    let _ = bootstrap_conn.execute_batch("ROLLBACK");
                     return Err(DelightQLError::database_error(
                         "Cannot refresh factory-mounted namespace without connection factory",
                         "No connection factory",
@@ -9881,15 +11882,35 @@ impl DelightQLSystem {
                     language,
                     crate::bootstrap::SourceType::Db.as_i32(),
                     &source_uri,
-                    schema_alias.as_deref(),
+                    source_ns.as_deref(),
                     connection_id,
                 ],
             ).map_err(|e| {
-                let _ = bootstrap_conn.execute_batch("ROLLBACK");
                 DelightQLError::database_error("Failed to create refresh cartridge", e.to_string())
             })?;
             bootstrap_conn.last_insert_rowid() as i32
         };
+
+        let replacement = if mount_class == "attach" {
+            MountBinding::attach(
+                ns_id,
+                cartridge_id as i64,
+                connection_id,
+                attach_alias.clone().ok_or_else(|| {
+                    DelightQLError::database_error(
+                        "Cannot refresh attach mount without an attachment alias",
+                        "Missing mount alias",
+                    )
+                })?,
+                if namespace == "main" { "unqualified" } else { "aliased" },
+            )
+        } else {
+            MountBinding::external(ns_id, cartridge_id as i64, connection_id, engine_schema)
+        };
+        if let Err(e) = Self::record_mount_binding(&bootstrap_conn, &replacement) {
+            let _ = bootstrap_conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
 
         let entity_count = entities.len();
         if let Err(e) = crate::bootstrap::introspect::insert_discovered_entities(
@@ -9897,7 +11918,6 @@ impl DelightQLSystem {
             cartridge_id,
             &entities,
         ) {
-            let _ = bootstrap_conn.execute_batch("ROLLBACK");
             return Err(DelightQLError::database_error(
                 format!("Failed to insert discovered entities: {}", e),
                 e.to_string(),
@@ -9909,7 +11929,6 @@ impl DelightQLSystem {
             cartridge_id,
             ns_id as i32,
         ) {
-            let _ = bootstrap_conn.execute_batch("ROLLBACK");
             return Err(DelightQLError::database_error(
                 format!("Failed to activate entities: {}", e),
                 e.to_string(),
@@ -9927,7 +11946,6 @@ impl DelightQLSystem {
                  WHERE g.data_namespace_id = ?1",
                 )
                 .map_err(|e| {
-                    let _ = bootstrap_conn.execute_batch("ROLLBACK");
                     DelightQLError::database_error("Failed to query groundings", e.to_string())
                 })?;
             let groundings: Vec<(i64, i64, String, String)> = gnd_stmt
@@ -9935,7 +11953,6 @@ impl DelightQLSystem {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })
                 .map_err(|e| {
-                    let _ = bootstrap_conn.execute_batch("ROLLBACK");
                     DelightQLError::database_error("Failed to query groundings", e.to_string())
                 })?
                 .flatten()
@@ -9949,16 +11966,13 @@ impl DelightQLSystem {
                     ns_id,
                     namespace,
                 ) {
-                    let _ = bootstrap_conn.execute_batch("ROLLBACK");
                     return Err(e);
                 }
             }
         }
 
         // 8. Commit
-        bootstrap_conn.execute_batch("COMMIT").map_err(|e| {
-            DelightQLError::database_error("Failed to commit refresh transaction", e.to_string())
-        })?;
+        transaction.commit("Failed to commit refresh transaction")?;
 
         drop(bootstrap_conn);
 
@@ -9980,6 +11994,17 @@ impl DelightQLSystem {
         namespace: &str,
         new_file_path: Option<&str>,
     ) -> Result<usize> {
+        // A fresh consultation may not reload a caller-owned namespace as a
+        // side effect. During reconsult, the same shape is intentional tree
+        // replay: existing children reload atomically under the outer
+        // savepoint, so it stays allowed.
+        if let Some((_, LiminalProgramKind::Consult)) = self.active_liminal_program() {
+            self.refuse_preexisting_namespace_mutation_in_program(
+                namespace,
+                "reloading",
+                "directive/reconsult/uncompensable",
+            )?;
+        }
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
             DelightQLError::connection_poison_error(
                 "Failed to acquire bootstrap database lock for reconsult",
@@ -10001,6 +12026,29 @@ impl DelightQLSystem {
                 )
             })?;
 
+        // Phase 8: multi-source reload is deliberately out of scope — a
+        // namespace built by consult_concat_into_ns! refuses reconsult!
+        // rather than silently reloading only its FIRST source.
+        let source_count: i64 = bootstrap_conn
+            .query_row(
+                "SELECT COUNT(*) FROM namespace_source WHERE namespace_id = ?1",
+                [ns_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if source_count > 1 {
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/reconsult/multi_source",
+                format!(
+                    "'{namespace}' was built from {source_count} sources \
+                     (consult_concat_into_ns!) — multi-source reload is not \
+                     defined. unconsult!(\"{namespace}\") and rebuild it, \
+                     source by source"
+                ),
+                "multi-source reconsult",
+            ));
+        }
+
         match kind.as_str() {
             "data" => {
                 return Err(DelightQLError::database_error(
@@ -10015,6 +12063,15 @@ impl DelightQLSystem {
                 return Err(DelightQLError::database_error(
                     format!(
                         "Cannot reconsult '{}' — system namespaces cannot be modified.",
+                        namespace
+                    ),
+                    "Protected namespace",
+                ));
+            }
+            "container" => {
+                return Err(DelightQLError::database_error(
+                    format!(
+                        "Cannot reconsult '{}' — structural container namespaces have no authored source. Reconsult their child namespaces instead.",
                         namespace
                     ),
                     "Protected namespace",
@@ -10088,63 +12145,42 @@ impl DelightQLSystem {
         })?;
 
         let (cleaned_source, directives) =
-            crate::bin_cartridge::prelude::consult::extract_embedded_directives(&source)?;
+            crate::bin_cartridge::prelude::consult::extract_embedded_directives(&source).map_err(
+                |e| match e {
+                    // Phase 1A: the extraction parse is the complete-form
+                    // boundary; its parse failures get the same reconsult!()
+                    // wrapper (and error class) the cleaned-source parse below
+                    // has always used.
+                    DelightQLError::ParseError { .. } => DelightQLError::database_error(
+                        format!("reconsult!() failed to parse '{}': {}", file_path, e),
+                        "Parse error",
+                    ),
+                    other => other,
+                },
+            )?;
 
-        // Save enlist/alias state before processing embedded directives
-        let saved_enlisted = self.save_enlisted_state()?;
-        let saved_aliases = self.save_alias_state()?;
+        // The shared loader owns the program savepoint and caller-state
+        // restoration. Reconsult supplies only its replacement body.
+        crate::bin_cartridge::prelude::consult::run_liminal_program(
+            self,
+            LiminalProgramKind::Reconsult,
+            |this, saved| {
+        let self_ = this;
+        let saved_enlisted = &saved.enlisted;
+        let saved_aliases = &saved.aliases;
 
-        // Execute embedded directives (resolve .:: and :: prefixes relative to namespace)
-        // THE LIMINAL RELATION (EFFECT-ALGEBRA §8): reconsult REPLACES the
-        // ledger whole — clear_namespace_contents deletes the old rows and
-        // consult_file_inner re-inserts THIS pass's receipts, both inside the
-        // reconsult transaction (pinned by
-        // `liminal_ledger_reconsult_replaces_whole`).
-        let mut liminal_receipts: Vec<LiminalReceipt> = Vec::new();
-        for directive in &directives {
-            liminal_receipts.push(crate::bin_cartridge::prelude::consult::liminal_receipt_for(
-                &directive.name,
-                &directive.args,
-            ));
-            match directive.name.as_str() {
-                "consult" => {
-                    if directive.args.len() == 2 {
-                        let resolved_ns = crate::bin_cartridge::prelude::consult::resolve_ns_prefix(&directive.args[1], namespace)?;
-                        crate::bin_cartridge::prelude::consult::execute_consult(
-                            self,
-                            &directive.args[0],
-                            &resolved_ns,
-                            Some(namespace),
-                        )?;
-                    }
-                }
-                "mount" => {
-                    if directive.args.len() == 2 {
-                        let resolved_ns = crate::bin_cartridge::prelude::consult::resolve_ns_prefix(&directive.args[1], namespace)?;
-                        self.mount_database(&directive.args[0], &resolved_ns)?;
-                    }
-                }
-                "enlist" => {
-                    if directive.args.len() == 1 {
-                        let resolved_ns = crate::bin_cartridge::prelude::consult::resolve_ns_prefix(&directive.args[0], namespace)?;
-                        self.enlist_namespace(&resolved_ns)?;
-                    }
-                }
-                "delist" => {
-                    if directive.args.len() == 1 {
-                        let resolved_ns = crate::bin_cartridge::prelude::consult::resolve_ns_prefix(&directive.args[0], namespace)?;
-                        self.delist_namespace(&resolved_ns)?;
-                    }
-                }
-                "alias" => {
-                    if directive.args.len() == 2 {
-                        let resolved_ns = crate::bin_cartridge::prelude::consult::resolve_ns_prefix(&directive.args[0], namespace)?;
-                        self.register_namespace_alias(&directive.args[1], &resolved_ns)?;
-                    }
-                }
-                other => panic!("catch-all hit in system.rs reconsult_namespace directive processing: unexpected directive name: {}", other),
-            }
-        }
+        // The ONE directive interpreter supplies the same validation,
+        // deferral, receipts, and entity dispatch as consult. Replay mode's
+        // only distinction is that an existing nested consult! child reloads.
+        let prepared = crate::bin_cartridge::prelude::consult::execute_liminal_directives(
+            self_,
+            &directives,
+            namespace,
+            crate::bin_cartridge::prelude::consult::LiminalDirectiveMode::Replay,
+        )?;
+        let liminal_receipts = prepared.receipts;
+        let deferred_exposes = prepared.deferred_exposes;
+        let deferred_docs = prepared.deferred_docs;
 
         // Parse DDL
         let ddl = crate::pipeline::parser::parse_ddl_file(&cleaned_source).map_err(|e| {
@@ -10155,9 +12191,6 @@ impl DelightQLSystem {
         })?;
 
         if ddl.definitions.is_empty() {
-            // Restore state and return error
-            let _ = self.restore_enlisted_state(&saved_enlisted);
-            let _ = self.restore_alias_state(&saved_aliases);
             return Err(DelightQLError::database_error(
                 format!(
                     "reconsult!() failed: '{}' contains no DDL definitions.",
@@ -10167,25 +12200,39 @@ impl DelightQLSystem {
             ));
         }
 
+        // The enlist/alias deltas are FINAL before the transaction (the
+        // liminal directives already ran) — computed here, recorded
+        // inside the transaction (review qmqwqlms round 2, P1).
+        let current_enlisted = self_.save_enlisted_state()?;
+        let current_aliases = self_.save_alias_state()?;
+        let new_enlists: Vec<(i32, i32)> = current_enlisted
+            .iter()
+            .filter(|row| !saved_enlisted.contains(row))
+            .cloned()
+            .collect();
+        let new_aliases: Vec<(String, i32)> = current_aliases
+            .iter()
+            .filter(|row| !saved_aliases.contains(row))
+            .cloned()
+            .collect();
+
         // 4. Transaction: clear old contents, insert new, validate groundings
         let entity_count = {
-            let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
+            let bootstrap_conn = self_.bootstrap_connection.lock().map_err(|e| {
                 DelightQLError::connection_poison_error(
                     "Failed to acquire bootstrap database lock for reconsult",
                     format!("Connection was poisoned: {}", e),
                 )
             })?;
 
-            bootstrap_conn.execute_batch("BEGIN").map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to begin reconsult transaction",
-                    e.to_string(),
-                )
-            })?;
+            let transaction = CatalogSavepoint::begin(
+                &bootstrap_conn,
+                "dql_reconsult_namespace",
+                "Failed to begin reconsult transaction",
+            )?;
 
             // 5. Clear old contents
             if let Err(e) = Self::clear_namespace_contents(&bootstrap_conn, ns_id) {
-                let _ = bootstrap_conn.execute_batch("ROLLBACK");
                 return Err(e);
             }
 
@@ -10201,7 +12248,6 @@ impl DelightQLSystem {
                 &liminal_receipts,
             );
             if let Err(e) = result {
-                let _ = bootstrap_conn.execute_batch("ROLLBACK");
                 return Err(e);
             }
             let entity_count = result.unwrap().definitions_loaded;
@@ -10215,7 +12261,6 @@ impl DelightQLSystem {
                      JOIN namespace dn ON dn.id = g.data_namespace_id
                      WHERE g.lib_namespace_id = ?1",
                 ).map_err(|e| {
-                    let _ = bootstrap_conn.execute_batch("ROLLBACK");
                     DelightQLError::database_error("Failed to query groundings for reconsult", e.to_string())
                 })?;
                 let groundings: Vec<(i64, i64, String, String)> = gnd_stmt
@@ -10223,7 +12268,6 @@ impl DelightQLSystem {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                     })
                     .map_err(|e| {
-                        let _ = bootstrap_conn.execute_batch("ROLLBACK");
                         DelightQLError::database_error(
                             "Failed to query groundings for reconsult",
                             e.to_string(),
@@ -10240,7 +12284,6 @@ impl DelightQLSystem {
                         *data_id,
                         data_fq,
                     ) {
-                        let _ = bootstrap_conn.execute_batch("ROLLBACK");
                         return Err(e);
                     }
 
@@ -10250,7 +12293,6 @@ impl DelightQLSystem {
                         namespace,
                         data_fq,
                     ) {
-                        let _ = bootstrap_conn.execute_batch("ROLLBACK");
                         return Err(e);
                     }
                 }
@@ -10264,7 +12306,6 @@ impl DelightQLSystem {
                         rusqlite::params![&file_path, ns_id],
                     )
                     .map_err(|e| {
-                        let _ = bootstrap_conn.execute_batch("ROLLBACK");
                         DelightQLError::database_error(
                             "Failed to update source_path",
                             e.to_string(),
@@ -10272,46 +12313,93 @@ impl DelightQLSystem {
                     })?;
             }
 
+            // Review qmqwqlms round 2, P1: EVERYTHING that must land
+            // atomically with the replacement lands INSIDE this
+            // transaction — the consult pass's exact discipline.
+            // (a) Provenance: the clear wiped namespace_source; re-record
+            //     the effective source, restoring the count the
+            //     multi-source refusal depends on (the erasure let a
+            //     reconsult after concat silently drop a source).
+            // (b) Stale exposures: the clear now also drops this
+            //     namespace's own exposing edges; the deferred exposes
+            //     re-record the current file's.
+            // (c) Deferred exposes and doc!s + namespace-local recording,
+            //     via the conn-level helpers.
+            let in_txn: Result<()> = (|| {
+                Self::record_namespace_source_on(&bootstrap_conn, namespace, &file_path)?;
+                if !new_enlists.is_empty() {
+                    Self::record_namespace_local_enlists_on(
+                        &bootstrap_conn,
+                        namespace,
+                        &new_enlists,
+                    )?;
+                }
+                if !new_aliases.is_empty() {
+                    Self::record_namespace_local_aliases_on(
+                        &bootstrap_conn,
+                        namespace,
+                        &new_aliases,
+                    )?;
+                }
+                bootstrap_conn
+                    .execute(
+                        "DELETE FROM exposed_namespace WHERE exposing_namespace_id = ?1",
+                        [ns_id],
+                    )
+                    .map_err(|e| {
+                        DelightQLError::database_error(
+                            "Failed to clear stale exposures",
+                            e.to_string(),
+                        )
+                    })?;
+                for resolved_args in &deferred_exposes {
+                    for resolved_ns in resolved_args {
+                        Self::expose_namespace_on(&bootstrap_conn, namespace, resolved_ns)?;
+                    }
+                }
+                for (target, doc) in &deferred_docs {
+                    let candidates = [
+                        format!("{}.{}", namespace, target),
+                        format!("{}.{}!", namespace, target),
+                        target.clone(),
+                    ];
+                    let mut last_err = None;
+                    let mut done = false;
+                    for candidate in &candidates {
+                        match Self::set_entity_doc_on(&bootstrap_conn, candidate, doc) {
+                            Ok(()) => {
+                                done = true;
+                                break;
+                            }
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    if !done {
+                        return Err(last_err.expect("candidates is non-empty"));
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = in_txn {
+                return Err(e);
+            }
+
             // 9. Commit
-            bootstrap_conn.execute_batch("COMMIT").map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to commit reconsult transaction",
-                    e.to_string(),
-                )
-            })?;
+            transaction.commit("Failed to commit reconsult transaction")?;
 
             entity_count
         }; // bootstrap_conn dropped here
 
-        // 10. Record namespace-local enlists/aliases, restore caller state
-        let current_enlisted = self.save_enlisted_state()?;
-        let current_aliases = self.save_alias_state()?;
-        let new_enlists: Vec<(i32, i32)> = current_enlisted
-            .iter()
-            .filter(|row| !saved_enlisted.contains(row))
-            .cloned()
-            .collect();
-        let new_aliases: Vec<(String, i32)> = current_aliases
-            .iter()
-            .filter(|row| !saved_aliases.contains(row))
-            .cloned()
-            .collect();
-
-        if !new_enlists.is_empty() {
-            self.record_namespace_local_enlists(namespace, &new_enlists)?;
-        }
-        if !new_aliases.is_empty() {
-            self.record_namespace_local_aliases(namespace, &new_aliases)?;
-        }
-        self.restore_enlisted_state(&saved_enlisted)?;
-        self.restore_alias_state(&saved_aliases)?;
-
+        // (Deferred exposes/docs + local recording landed INSIDE the
+        // replacement transaction — review qmqwqlms round 2, P1.)
         debug!(
             "reconsult_namespace: Reconsulted namespace '{}' from '{}' with {} entities",
             namespace, file_path, entity_count
         );
 
         Ok(entity_count)
+            },
+        )
     }
 
     /// THE LIMINAL RELATION (EFFECT-ALGEBRA §8): the corresponding-union echo
@@ -10807,6 +12895,615 @@ mod seed_program_tests {
 }
 
 #[cfg(test)]
+mod detach_guard_tests {
+    //! MOUNT-SPINE-PLAN.md / second review F3: the alias guard's contract.
+    //! Armed from immediately after ATTACH to just after COMMIT, it must
+    //! DETACH on every early exit and stay silent once disarmed.
+
+    use super::DetachOnDrop;
+    use delightql_types::test_utils::MockDatabaseConnection;
+    use delightql_types::DatabaseConnection;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn armed_guard_detaches_and_disarmed_guard_does_not() {
+        let mock = Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        let conn: Arc<Mutex<dyn DatabaseConnection>> = mock.clone();
+
+        // Armed guard dropped (any early return after ATTACH) → DETACH runs.
+        {
+            let _guard = DetachOnDrop {
+                connection: &conn,
+                alias: "_imported_991",
+                armed: true,
+            };
+        }
+        assert!(
+            mock.lock()
+                .unwrap()
+                .assert_executed("DETACH DATABASE '_imported_991'"),
+            "armed guard must DETACH its alias on drop"
+        );
+
+        // Disarmed guard (post-COMMIT) → no DETACH.
+        {
+            let mut guard = DetachOnDrop {
+                connection: &conn,
+                alias: "_imported_992",
+                armed: true,
+            };
+            guard.armed = false;
+        }
+        assert!(
+            !mock.lock().unwrap().assert_executed("_imported_992"),
+            "disarmed guard must not DETACH"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mount_link_tests {
+    //! NAMESPACE-CARTRIDGE-LINK-DESIGN.md: the stored mount fact. Written
+    //! by the spine, re-pointed by refresh, cleared by unmount; UNIQUE
+    //! encodes the 1:1 claim; identity consumers read it (an EMPTY image is
+    //! a full citizen); a failed refresh rolls back link and cartridge
+    //! TOGETHER; the bootstrap catalog stays FK-consistent.
+
+    use super::DelightQLSystem;
+    use delightql_types::introspect::{
+        DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity,
+    };
+    use delightql_types::namespace::NamespacePath;
+    use delightql_types::test_utils::MockDatabaseConnection;
+    use delightql_types::{DatabaseConnection, Result};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct EmptyIntrospector;
+    impl DatabaseIntrospector for EmptyIntrospector {
+        fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+        fn introspect_entities_in_schema(&self, _s: &str) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+    }
+
+    struct OneTableIntrospector;
+    impl DatabaseIntrospector for OneTableIntrospector {
+        fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+
+        fn introspect_entities_in_schema(&self, _s: &str) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![DiscoveredEntity {
+                name: "mounted_t".into(),
+                entity_type_id: 10,
+                attributes: vec![DiscoveredAttribute {
+                    name: "id".into(),
+                    data_type: "INTEGER".to_string(),
+                    position: 0,
+                    is_nullable: false,
+                }],
+            }])
+        }
+    }
+
+    /// Succeeds `ok_calls` times, then fails — induces a mid-refresh
+    /// introspection failure AFTER the transaction has cleared contents.
+    struct FlakyIntrospector {
+        calls: AtomicUsize,
+        ok_calls: usize,
+    }
+    impl DatabaseIntrospector for FlakyIntrospector {
+        fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+        fn introspect_entities_in_schema(&self, _s: &str) -> Result<Vec<DiscoveredEntity>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.ok_calls {
+                Ok(vec![])
+            } else {
+                Err(delightql_types::DelightQLError::database_error(
+                    "induced introspection failure",
+                    "mount_link_tests",
+                ))
+            }
+        }
+    }
+
+    fn system_with(introspector: Box<dyn DatabaseIntrospector>) -> DelightQLSystem {
+        let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        DelightQLSystem::new(conn, introspector, "sqlite").expect("system should build")
+    }
+
+    /// A VALID SQLite file with zero tables — the empty-image case.
+    fn empty_db(dir: &tempfile::TempDir, name: &str) -> String {
+        let path = dir.path().join(name);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); DROP TABLE t;").unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn link_of(system: &DelightQLSystem, ns: &str) -> Option<i64> {
+        let conn = system.bootstrap_connection.lock().unwrap();
+        conn.query_row(
+            "SELECT m.cartridge_id
+             FROM mount m JOIN namespace n ON n.id = m.namespace_id
+             WHERE n.fq_name = ?1",
+            [ns],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn cartridge_exists(system: &DelightQLSystem, id: i64) -> bool {
+        let conn = system.bootstrap_connection.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cartridge WHERE id = ?1)",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn mount_of(system: &DelightQLSystem, ns: &str) -> Option<(i64, String, String)> {
+        let conn = system.bootstrap_connection.lock().unwrap();
+        conn.query_row(
+            "SELECT m.cartridge_id, m.class, m.qualification
+             FROM mount m JOIN namespace n ON n.id = m.namespace_id
+             WHERE n.fq_name = ?1",
+            [ns],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn link_is_set_repointed_by_refresh_and_dies_with_unmount() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "lk.sqlite");
+        let mut system = system_with(Box::new(EmptyIntrospector));
+
+        system.mount_database(&db, "lk").expect("empty mount");
+        let _c1 = link_of(&system, "lk").expect("link set at mount");
+        let (m1, class, qualification) = mount_of(&system, "lk").expect("mount row set");
+        assert_eq!(class, "attach");
+        assert_eq!(qualification, "aliased");
+        assert_eq!(m1, _c1);
+
+        system.refresh_namespace("lk").expect("empty refresh");
+        let c2 = link_of(&system, "lk").expect("link survives refresh");
+        assert_eq!(mount_of(&system, "lk").map(|m| m.0), Some(c2));
+        // SQLite reuses the freed max rowid, so the NUMERIC id may coincide
+        // with the old one — the invariant is single ownership: exactly one
+        // cartridge exists for this source, and the link points at it.
+        let (count, only_id): (i64, i64) = {
+            let conn = system.bootstrap_connection.lock().unwrap();
+            conn.query_row(
+                "SELECT count(*), max(id) FROM cartridge WHERE source_uri = 'file://' || ?1",
+                [&db],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(count, 1, "refresh must not duplicate the cartridge");
+        assert_eq!(c2, only_id, "the link must point at the surviving cartridge");
+
+        system.unmount_database("lk").expect("unmount");
+        assert_eq!(link_of(&system, "lk"), None, "namespace row gone with unmount");
+        assert_eq!(mount_of(&system, "lk"), None, "mount row gone with unmount");
+        assert!(!cartridge_exists(&system, c2), "cartridge gone with unmount");
+    }
+
+    #[test]
+    fn unique_constraint_refuses_shared_cartridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_a = empty_db(&dir, "a.sqlite");
+        let db_b = empty_db(&dir, "b.sqlite");
+        let mut system = system_with(Box::new(EmptyIntrospector));
+        system.mount_database(&db_a, "ua").expect("mount a");
+        system.mount_database(&db_b, "ub").expect("mount b");
+        let ca = link_of(&system, "ua").unwrap();
+
+        let conn = system.bootstrap_connection.lock().unwrap();
+        let err = conn
+            .execute(
+                "UPDATE mount SET cartridge_id = ?1
+                 WHERE namespace_id = (SELECT id FROM namespace WHERE fq_name = 'ub')",
+                [ca],
+            )
+            .expect_err("two namespaces must never share a mount cartridge");
+        assert!(
+            err.to_string().to_lowercase().contains("unique"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_stays_fk_consistent_across_the_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "fk.sqlite");
+        let mut system = system_with(Box::new(EmptyIntrospector));
+        system.mount_database(&db, "fkns").expect("mount");
+        system.refresh_namespace("fkns").expect("refresh");
+        {
+            let conn = system.bootstrap_connection.lock().unwrap();
+            let mismatches: i64 = conn
+                .query_row(
+                    "SELECT count(*)
+                     FROM mount m
+                     LEFT JOIN namespace n ON n.id = m.namespace_id
+                     WHERE n.id IS NULL OR n.kind != 'data'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(mismatches, 0, "mount rows must bind data namespaces");
+        }
+        system.unmount_database("fkns").expect("unmount");
+
+        let conn = system.bootstrap_connection.lock().unwrap();
+        let violations: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_foreign_key_check('namespace')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(violations, 0, "namespace FK references must all resolve");
+    }
+
+    #[test]
+    fn refresh_rollback_preserves_old_link_and_cartridge_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "rb.sqlite");
+        // One successful introspection (the mount), then failure (the refresh).
+        let mut system = system_with(Box::new(FlakyIntrospector {
+            calls: AtomicUsize::new(0),
+            ok_calls: 1,
+        }));
+        system.mount_database(&db, "rb").expect("mount");
+        let c1 = link_of(&system, "rb").expect("link set");
+
+        system
+            .refresh_namespace("rb")
+            .expect_err("induced refresh failure");
+        assert_eq!(
+            link_of(&system, "rb"),
+            Some(c1),
+            "rollback must restore the OLD link"
+        );
+        assert!(
+            cartridge_exists(&system, c1),
+            "rollback must restore the old cartridge WITH its link"
+        );
+    }
+
+    /// Fifth review, P1: physical cleanup reads its (connection, alias)
+    /// identity from the LINK, not from an arbitrary `.first()` of the
+    /// deletion set — an entity-bearing auxiliary cartridge on the same
+    /// namespace must not steal the DETACH from the real mount alias.
+    #[test]
+    fn unmount_detaches_the_link_alias_despite_auxiliary_cartridges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "aux.sqlite");
+        let mock = Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        let conn: Arc<Mutex<dyn DatabaseConnection>> = mock.clone();
+        let mut system =
+            DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite").unwrap();
+
+        // The auxiliary cartridge is created BEFORE the mount (sixth
+        // review): its LOWER id precedes the mount cartridge in the
+        // deletion-set query, so the old `.first()` implementation would
+        // genuinely have handed physical cleanup the auxiliary's identity
+        // — this test was not red pre-fix with the auxiliary created
+        // after the mount.
+        let (aux_cart, ent) = {
+            let c = system.bootstrap_connection.lock().unwrap();
+            c.execute_batch(
+                "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+                 VALUES (3, 2, 'aux://side', NULL, 1, 2, 0);",
+            )
+            .unwrap();
+            let aux_cart = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO entity (name, type, cartridge_id) VALUES ('side_t', 1, ?1)",
+                [aux_cart],
+            )
+            .unwrap();
+            (aux_cart, c.last_insert_rowid())
+        };
+
+        system.mount_database(&db, "auxns").expect("mount");
+        let link = link_of(&system, "auxns").unwrap();
+        assert!(
+            aux_cart < link,
+            "the auxiliary must precede the mount cartridge for the pin to bite"
+        );
+
+        // Activate the pre-existing auxiliary in the mounted namespace.
+        let mount_alias: String = {
+            let c = system.bootstrap_connection.lock().unwrap();
+            let alias: String = c
+                .query_row(
+                    "SELECT source_ns FROM cartridge WHERE id = ?1",
+                    [link],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            c.execute(
+                "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id)
+                 SELECT ?1, id, ?2 FROM namespace WHERE fq_name = 'auxns'",
+                [ent, aux_cart],
+            )
+            .unwrap();
+            alias
+        };
+
+        system.unmount_database("auxns").expect("unmount");
+        assert!(
+            mock.lock()
+                .unwrap()
+                .assert_executed(&format!("DETACH DATABASE '{mount_alias}'")),
+            "physical cleanup must DETACH the LINK's alias, not an auxiliary's identity"
+        );
+        assert_eq!(link_of(&system, "auxns"), None, "namespace gone");
+    }
+
+    /// Fifth review, P2: the lazily-cached catalog-cartridge id self-heals
+    /// when the transaction that initialized it rolled back — the Cell is
+    /// validated against the catalog before reuse.
+    #[test]
+    fn catalog_cache_survives_a_rolled_back_initialization() {
+        let system = system_with(Box::new(EmptyIntrospector));
+        let first = {
+            let conn = system.bootstrap_connection.lock().unwrap();
+            let id =
+                super::ensure_catalog_initialized(&system.catalog_cartridge_id, &conn)
+                    .expect("initialized (or cached from construction)");
+            // Simulate the rolled-back initialization: the catalog
+            // cartridge row vanishes while the Cell keeps its id — and
+            // SQLite may then REUSE the freed rowid for an UNRELATED
+            // cartridge (sixth review, P1). An existence-only validation
+            // accepts this impostor as the catalog cartridge; the
+            // identity-marker validation must reject it.
+            // (FKs are enforced on bootstrap — clear the cartridge's
+            // dependents the same way the production paths do.)
+            super::DelightQLSystem::clear_cartridge_entities(&conn, id as i64).unwrap();
+            conn.execute(
+                "INSERT INTO cartridge (id, language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+                 VALUES (?1, 3, 2, 'impostor://not-the-catalog', NULL, 1, 2, 0)",
+                [id],
+            )
+            .unwrap();
+            id
+        };
+        // The Cell now caches an id held by an unrelated cartridge. The
+        // property under test: ensure must NEVER adopt the impostor as the
+        // catalog cartridge (the pre-fix existence-only validation returned
+        // Ok(first) here). Whether re-initialization then succeeds depends
+        // on how much of the original initialization this simulation
+        // removed — a REAL rollback removes all of it together — so both a
+        // fresh id and a refusal are acceptable; returning the impostor is
+        // not.
+        let result = {
+            let conn = system.bootstrap_connection.lock().unwrap();
+            super::ensure_catalog_initialized(&system.catalog_cartridge_id, &conn)
+        };
+        match result {
+            Ok(second) => assert_ne!(
+                first, second,
+                "the impostor's id must not be adopted as the catalog cartridge"
+            ),
+            Err(_) => assert_ne!(
+                system.catalog_cartridge_id.get(),
+                Some(first),
+                "on refusal the poisoned cache entry must have been dropped"
+            ),
+        }
+    }
+
+    /// Eighth review, P1: a failed DETACH must not split-brain the
+    /// lifecycle — the catalog cascade rolls back, the mount identity is
+    /// retained, and the operation reports failure. Once the obstruction
+    /// clears, unmount succeeds normally.
+    #[test]
+    fn failed_detach_preserves_catalog_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "dt.sqlite");
+        let mock = Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        let conn: Arc<Mutex<dyn DatabaseConnection>> = mock.clone();
+        let mut system =
+            DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite").unwrap();
+        system.mount_database(&db, "dtns").expect("mount");
+        let link = link_of(&system, "dtns").expect("link set");
+
+        mock.lock()
+            .unwrap()
+            .expect_error("DETACH DATABASE '_imported_", "database is locked");
+        let err = system
+            .unmount_database("dtns")
+            .expect_err("unmount must FAIL when DETACH fails");
+        assert!(
+            err.to_string().contains("retained"),
+            "the error must state the mount is retained: {err}"
+        );
+        assert_eq!(
+            link_of(&system, "dtns"),
+            Some(link),
+            "the catalog identity must survive a failed DETACH"
+        );
+
+        // Obstruction cleared: unmount completes.
+        mock.lock().unwrap().reset();
+        system
+            .unmount_database("dtns")
+            .expect("unmount succeeds once DETACH can run");
+        assert_eq!(link_of(&system, "dtns"), None);
+    }
+
+    /// Eighth review, P2: for an attach-class mount the recorded alias is
+    /// REQUIRED identity — refresh refuses loudly on a missing alias
+    /// instead of silently falling back toward hub introspection.
+    #[test]
+    fn refresh_refuses_when_attach_alias_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "na.sqlite");
+        let mut system = system_with(Box::new(EmptyIntrospector));
+        system.mount_database(&db, "nans").expect("mount");
+        {
+            let conn = system.bootstrap_connection.lock().unwrap();
+            let err = conn.execute(
+                "UPDATE mount SET attach_alias = NULL
+                 WHERE namespace_id = (SELECT id FROM namespace WHERE fq_name = 'nans')",
+                [],
+            )
+            .expect_err("attach mount aliases must be unrepresentable when absent");
+            assert!(err.to_string().contains("CHECK"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn empty_mount_identity_consumers_read_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "id.sqlite");
+        let mut system = system_with(Box::new(EmptyIntrospector));
+        system.mount_database(&db, "idns").expect("empty mount");
+
+        // The mounted-engine-schema lookup resolves for a ZERO-entity mount
+        // (previously derived through entities, so it could not).
+        let schema = system
+            .mounted_engine_schema_for_namespace("idns")
+            .expect("lookup runs");
+        assert!(
+            schema.as_deref().map(|s| s.starts_with("_imported_")) == Some(true),
+            "empty mount must resolve its engine schema via the link, got {schema:?}"
+        );
+    }
+
+    #[test]
+    fn qualification_ignores_cartridge_source_ns_policy_conventions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "qualification.sqlite");
+        let mut system = system_with(Box::new(OneTableIntrospector));
+        system.mount_database(&db, "qualified").expect("mount");
+
+        let recorded_alias: String = {
+            let conn = system.bootstrap_connection.lock().unwrap();
+            let alias: String = conn
+                .query_row(
+                    "SELECT m.attach_alias
+                     FROM mount m JOIN namespace n ON n.id = m.namespace_id
+                     WHERE n.fq_name = 'qualified'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE cartridge SET source_ns = 'deliberately-wrong'
+                 WHERE id = (SELECT m.cartridge_id FROM mount m
+                             JOIN namespace n ON n.id = m.namespace_id
+                             WHERE n.fq_name = 'qualified')",
+                [],
+            )
+            .unwrap();
+            alias
+        };
+
+        let resolved = system
+            .resolve_namespace_path(&NamespacePath::single("qualified"))
+            .expect("resolution")
+            .expect("mounted namespace resolves");
+        assert_eq!(resolved.0.as_deref(), Some(recorded_alias.as_str()));
+
+        let columns = system
+            .schema
+            .as_ref()
+            .expect("bootstrap-backed schema")
+            .get_table_columns(Some(&recorded_alias), "mounted_t")
+            .expect("mounted relation columns resolve by mount qualification");
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name.as_str(), "id");
+    }
+
+    #[test]
+    fn main_mount_records_physical_alias_but_resolves_unqualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "main.sqlite");
+        let mut system = system_with(Box::new(EmptyIntrospector));
+        system.mount_database(&db, "main").expect("mount main");
+
+        let (attach_alias, source_ns, qualification): (String, String, String) = {
+            let conn = system.bootstrap_connection.lock().unwrap();
+            conn.query_row(
+                "SELECT m.attach_alias, c.source_ns, m.qualification
+                 FROM mount m
+                 JOIN namespace n ON n.id = m.namespace_id
+                 JOIN cartridge c ON c.id = m.cartridge_id
+                 WHERE n.fq_name = 'main'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(source_ns, attach_alias, "source metadata is not NULL policy");
+        assert_eq!(qualification, "unqualified");
+        assert_eq!(
+            system
+                .resolve_namespace_path(&NamespacePath::single("main"))
+                .unwrap(),
+            Some((None, 2)),
+            "mount.qualification alone controls generated qualification"
+        );
+    }
+
+    #[test]
+    fn reset_rebuilds_catalog_and_live_indexes_without_mount_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = empty_db(&dir, "reset.sqlite");
+        let mut system = system_with(Box::new(EmptyIntrospector));
+        system.mount_database(&db, "resetns").expect("mount");
+        assert!(link_of(&system, "resetns").is_some());
+
+        system.reinit_bootstrap().expect("reset");
+        assert_eq!(link_of(&system, "resetns"), None);
+        assert!(system.get_connection(2).is_ok(), "primary live route is rebuilt");
+        let mount_rows: i64 = system
+            .bootstrap_connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM mount", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mount_rows, 0);
+    }
+
+    #[test]
+    fn mount_identity_legacy_columns_cannot_reappear_silently() {
+        let source = include_str!("system.rs");
+        for legacy in [
+            ["mount", "cartridge", "id"].join("_"),
+            ["mount", "schema", "alias"].join("_"),
+        ] {
+            assert!(
+                !source.contains(&legacy),
+                "legacy mount identity column '{legacy}' reappeared; identity belongs to mount"
+            );
+        }
+        for mutation in [
+            ["INSERT", "INTO", "mount"].join(" "),
+            ["DELETE", "FROM", "mount"].join(" "),
+        ] {
+            assert_eq!(
+                source.matches(&mutation).count(),
+                1,
+                "mount catalog mutation '{mutation}' must stay centralized in its typed helper"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod mount_new_database_tests {
     //! `mount_new!` (EFFECT-ALGEBRA §6): PROVISION a fresh, valid, empty SQLite
     //! database and bind it — the create-intent counterpart of `mount!`. These
@@ -10815,7 +13512,7 @@ mod mount_new_database_tests {
     //! round-trip (mount_new! then mount! the same file, with a real read-back)
     //! is the CLI `mount_new_roundtrip` integration test.
 
-    use super::DelightQLSystem;
+    use super::{DelightQLSystem, LiminalProgramKind};
     use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
     use delightql_types::test_utils::MockDatabaseConnection;
     use delightql_types::Result;
@@ -10868,9 +13565,8 @@ mod mount_new_database_tests {
 
         // The namespace is registered and reachable: enlist_namespace requires
         // the namespace to exist (the enlisted-guard-classification test's
-        // proof-of-registration pattern). resolve_namespace_path returns None
-        // for an EMPTY db (no activated entities), so it is not the right probe
-        // here — the CLI round-trip test proves an in-session read end-to-end.
+        // proof-of-registration pattern). The CLI round-trip test proves an
+        // in-session read end-to-end.
         system
             .enlist_namespace("freshns")
             .expect("mount_new!'s namespace must be registered + reachable");
@@ -10918,6 +13614,38 @@ mod mount_new_database_tests {
             .mount_new_database(path.to_str().unwrap(), "zerons")
             .expect("mount_new! should materialize over a 0-byte file");
         assert!(is_valid_sqlite(&path), "0-byte file must become a valid db");
+    }
+
+    /// The external journal distinguishes a caller-owned zero-byte placeholder
+    /// from an absent path. Aborting the program restores the placeholder; it
+    /// must not delete it as though mount_new! had created the path itself.
+    #[test]
+    fn aborted_program_restores_zero_byte_mount_new_placeholder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("placeholder.db");
+        std::fs::write(&path, b"").expect("touch 0-byte file");
+
+        let mut system = fresh_system();
+        let mark = system.max_namespace_id().expect("namespace mark");
+        assert!(system
+            .begin_liminal_program(mark, LiminalProgramKind::Consult)
+            .expect("begin program"));
+        system
+            .mount_new_database(path.to_str().unwrap(), "temporary_mount")
+            .expect("mount_new inside program");
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+
+        system.rollback_liminal_external_effects();
+        system
+            .end_liminal_program(false)
+            .expect("rollback program catalog");
+
+        assert!(path.exists(), "caller-owned placeholder must remain");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "placeholder must return to its exact pre-program state"
+        );
     }
 
     /// v1 SCOPE: a URI target (postgres://, …) refuses cleanly with the

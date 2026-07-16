@@ -1225,6 +1225,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             ref first_parens_spec,
             ref arguments,
             ref namespace,
+            grounding: ref invocation_grounding,
             ..
         } = pipe_expr.operator
         {
@@ -1232,11 +1233,38 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             // When namespace is explicit (e.g., std::json.tg_keys), use
             // lookup_entity with the FQ namespace — same as the non-piped
             // TVF path. Otherwise, search enlisted namespaces by bare name.
-            let entity = if let Some(ref ns) = namespace {
+            let entity = if let Some(invocation_grounding) = invocation_grounding {
+                invocation_grounding
+                    .grounded_ns
+                    .iter()
+                    .find_map(|ns| {
+                        let fq = super::grounding::namespace_path_to_fq(ns);
+                        self.registry
+                            .consult
+                            .lookup_entity(
+                                function,
+                                &fq,
+                                self.config.resolution_namespace.as_deref(),
+                            )
+                            .filter(|entity| {
+                                entity.entity_type
+                                    == crate::enums::EntityType::DqlHoTemporaryViewExpression
+                            })
+                    })
+                    .ok_or_else(|| {
+                        crate::error::DelightQLError::validation_error(
+                            format!(
+                                "Unknown grounded piped HO view '{}'. Ensure its library namespace is consulted.",
+                                function
+                            ),
+                            "Grounded piped HO view not found",
+                        )
+                    })?
+            } else if let Some(ref ns) = namespace {
                 let fq = super::grounding::namespace_path_to_fq(ns);
                 self.registry
                     .consult
-                    .lookup_entity(function, &fq)
+                    .lookup_entity(function, &fq, self.config.resolution_namespace.as_deref())
                     .filter(|e| {
                         e.entity_type
                             == crate::enums::EntityType::DqlHoTemporaryViewExpression
@@ -1253,7 +1281,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             } else {
                 self.registry
                     .consult
-                    .lookup_enlisted_ho_view(function)?
+                    .lookup_enlisted_ho_view(function, self.config.resolution_namespace.as_deref())?
                     .ok_or_else(|| {
                         crate::error::DelightQLError::validation_error(
                             format!(
@@ -1281,6 +1309,9 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 Some(&pipe_expr.source),
                 groups_ref,
                 &[], // piped path: no ho_arguments (pipe source handled separately)
+                &self.config.alias_counter,
+                self.registry,
+                self.config.resolution_namespace.as_deref(),
             )?;
 
             // Build grounding context
@@ -1294,21 +1325,20 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                     format!("{:?}", e),
                 )
             })?;
-            let ho_grounding = ast_unresolved::GroundedPath {
-                data_ns: ast_unresolved::NamespacePath::empty(),
-                grounded_ns: vec![entity_ns],
-            };
+            let has_explicit_grounding = invocation_grounding.is_some();
+            let ho_grounding = invocation_grounding
+                .clone()
+                .unwrap_or(ast_unresolved::GroundedPath {
+                    data_ns: ast_unresolved::NamespacePath::empty(),
+                    grounded_ns: vec![entity_ns],
+                });
 
             // Scope ER-rule lookups to the HO-view's namespace
-            let ho_config = if !entity.namespace.is_empty() && entity.namespace != "main" {
-                ResolutionConfig {
-                    resolution_namespace: Some(entity.namespace.clone()),
-                    ..self.config.clone()
-                }
-            } else {
-                self.config.clone()
-            };
-
+            // THE 462 WEAVE (Phase 10 slice c): the squished query mixes
+            // the ENTITY's body (its scope) with CALLER-authored `_ho_*`
+            // CTEs (the piped source and arguments) — two honest scopes,
+            // carried together. The per-CTE override in the inline
+            // resolver applies the caller scope to the `_ho_*` names.
             let (expr, bubbled, _absorbed) = super::relation_resolver::expand_ho_view(
                 function,
                 &entity,
@@ -1316,11 +1346,11 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 table_bindings,
                 Some(pipe_expr.source),
                 None, // no join_input for pipes
-                None,
+                has_explicit_grounding.then_some(&ho_grounding.data_ns),
                 &ho_grounding,
                 self.registry,
                 outer_context,
-                &ho_config,
+                &self.config,
                 None,
             )?;
             return Ok((expr, bubbled));
@@ -1710,6 +1740,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                         unresolved_operator,
                         &self.registry.consult,
                         source_data_ns,
+                        self.config.resolution_namespace.as_deref(),
                     )?;
                 self.collected_pipe_cfes.extend(pipe_cfes);
                 op
@@ -2263,6 +2294,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
             // HigherOrder: Glob-preserving arg resolution
             ast_unresolved::FunctionExpression::HigherOrder {
                 name,
+                namespace,
                 curried_arguments,
                 regular_arguments,
                 alias,
@@ -2285,6 +2317,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 };
                 Ok(ast_resolved::FunctionExpression::HigherOrder {
                     name,
+                    namespace,
                     curried_arguments: resolved_curried_args,
                     regular_arguments: resolved_regular_args,
                     alias,
@@ -2398,9 +2431,60 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
             // SigmaCall → consulted sigma lookup + expansion
             ast_unresolved::SigmaCondition::SigmaCall {
                 functor,
+                namespace,
                 arguments,
                 exists,
             } => {
+                // QUALIFIED sigma citation (`+HL.h(v)`, `+a::b.h(v)`) —
+                // review qmqwqlms round 3: the builder used to DROP the
+                // qualifier, so a qualified citation resolved as its bare
+                // functor (and usually died at SQL generation). The
+                // qualifier now resolves through the SAME alias- and
+                // scope-aware door as qualified relations
+                // (`lookup_entity`: exact fq, session alias at the
+                // prompt, the OWNING namespace's local alias inside a
+                // definition, §IV plain-qualifier expansion). A
+                // sigma-rule hit expands here; any other outcome falls
+                // through to the unqualified probes below — the pre-fix
+                // behavior — so nothing that resolved before resolves
+                // differently now.
+                if !namespace.is_empty() {
+                    let fq = namespace.fq_string();
+                    if let Some(entity) = self.registry.consult.lookup_entity(
+                        &functor,
+                        &fq,
+                        self.config.resolution_namespace.as_deref(),
+                    ) {
+                        if entity.entity_type == crate::enums::EntityType::DqlTemporarySigmaRule
+                        {
+                            let expanded =
+                                super::resolving::predicates::expand_consulted_sigma(
+                                    &entity.definition,
+                                    &functor,
+                                    arguments,
+                                    exists,
+                                )?;
+                            let resolved = self.transform_boolean(expanded)?;
+                            return Ok(ast_resolved::SigmaCondition::Predicate(resolved));
+                        }
+                    }
+                    // Not a sigma rule: cite it as an inner-exists with
+                    // the qualifier STAMPED on the inner reference — the
+                    // qualified-relation machinery (aliases, exposure,
+                    // §IV expansion, and its loud refusals) resolves it.
+                    // A qualified citation always names a namespace
+                    // entity; it never falls through to the bin
+                    // predicates.
+                    let expanded = super::resolving::predicates::expand_table_as_sigma(
+                        &functor,
+                        namespace,
+                        arguments,
+                        exists,
+                        &self.available,
+                    )?;
+                    let resolved = self.transform_boolean(expanded)?;
+                    return Ok(ast_resolved::SigmaCondition::Predicate(resolved));
+                }
                 // Check if functor matches a consulted sigma predicate
                 // (entity_type = 9). Scope first: under a consulted scope
                 // (resolution_namespace = Some(ns) — effect bodies, view
@@ -2416,16 +2500,18 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 // (before the table probes and the bin fall-through).
                 // Pinned by sigma_guard_scope_tests
                 // (bugs/sigma-rule-guard-under-consulted-scope).
-                let consulted_sigma = match self.config.resolution_namespace.as_deref() {
-                    Some(ns) if ns != "main" => {
-                        self.registry.consult.lookup_sigma_in_scope(&functor, ns)?
-                    }
-                    _ => None,
-                };
-                let consulted_sigma = match consulted_sigma {
-                    some @ Some(_) => some,
-                    None => self.registry.consult.lookup_enlisted_sigma(&functor)?,
-                };
+                // STRICT definition independence (Phase 7 stage 2,
+                // owner-ratified): inside a definition the sigma lookup is
+                // scoped to the OWNING namespace — itself + its own edges —
+                // with NO session fallback; at the prompt (None) the scope
+                // is `home`. The old scoped-probe-then-session-fallback
+                // two-step was the caller-leak: a file's rule could
+                // silently find a sigma through what the CALLER happened
+                // to have enlisted.
+                let consulted_sigma = self
+                    .registry
+                    .consult
+                    .lookup_enlisted_sigma(&functor, self.config.resolution_namespace.as_deref())?;
                 if let Some(entity) = consulted_sigma {
                     let expanded = super::resolving::predicates::expand_consulted_sigma(
                         &entity.definition,
@@ -2452,11 +2538,15 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 // Pinned by enlisted_guard_classification_tests
                 // (bugs/enlisted-guard-predicate-rewrite).
                 if self.registry.database.lookup_table(&functor).is_some()
-                    || self.registry.consult.lookup_enlisted_table(&functor)?
+                    || self
+                        .registry
+                        .consult
+                        .lookup_enlisted_table(&functor, self.config.resolution_namespace.as_deref())?
                     || self.functor_is_relation_entity(&functor)
                 {
                     let expanded = super::resolving::predicates::expand_table_as_sigma(
                         &functor,
+                        crate::pipeline::asts::core::metadata::NamespacePath::empty(),
                         arguments,
                         exists,
                         &self.available,
@@ -2472,6 +2562,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(ast_resolved::SigmaCondition::SigmaCall {
                     functor,
+                    namespace,
                     arguments: resolved_args,
                     exists,
                 })

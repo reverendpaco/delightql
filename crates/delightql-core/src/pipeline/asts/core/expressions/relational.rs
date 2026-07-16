@@ -393,8 +393,18 @@ pub enum Relation<Phase = Unresolved> {
     PseudoPredicate {
         /// Pseudo-predicate name (includes `!` suffix)
         name: String,
+        /// Namespace qualification (empty = unqualified). Qualified access
+        /// (`std::prelude.enlist!(...)`) resolves through namespace-aware
+        /// registry identity (DIRECTIVE-CONVERGENCE-PLAN Phase 2).
+        namespace: Vec<String>,
         /// Arguments (literal expressions in MVP, complex expressions in future)
         arguments: Vec<DomainExpression<Phase>>,
+        /// Returned-relation access specification — the SECOND parentheses
+        /// of `name!(args)(spec)` (DIRECTIVE-CONVERGENCE-PLAN Phase 3:
+        /// first parens parameterize, second parens access the receipt;
+        /// never a synthetic anonymous input table). `Glob` for the bare
+        /// one-paren form.
+        access: DomainSpec<Phase>,
         /// Optional alias for result table (enables dependency chains in Phase 2+)
         alias: Option<String>,
         /// Result schema (populated during effect execution)

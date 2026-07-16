@@ -350,10 +350,18 @@ pub fn walk_visit_relation<P, F: AstVisit<P> + ?Sized>(
         }
         Relation::InnerRelation { pattern, .. } => child!(walk_visit_inner_relation(v, pattern)),
         Relation::ConsultedView { body, .. } => child!(walk_visit_query(v, body)),
-        Relation::PseudoPredicate { arguments, .. } => {
+        Relation::PseudoPredicate {
+            arguments, access, ..
+        } => {
             for e in arguments {
                 child!(walk_visit_domain(v, e));
             }
+            // The receipt-access spec is a recursive field: a demand or
+            // subquery embedded in it must be visible to every AstVisit
+            // tenant (effect discipline, R9 discovery, compile purity).
+            // A recursive field without its walker edge is the historical
+            // bug class the inductive-traversal work exists to prevent.
+            child!(walk_visit_domain_spec(v, access));
         }
     }
     exit!(v.exit_relation(rel));

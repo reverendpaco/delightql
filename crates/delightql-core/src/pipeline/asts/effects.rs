@@ -37,45 +37,6 @@ use crate::pipeline::ast_visit::{
 // Directive categories (EFFECT-ALGEBRA §3)
 // ============================================================================
 
-/// Session directives — direct the session's namespace tree; the ONLY
-/// liminal-eligible category (EFFECT-ALGEBRA §8). `doc!` is included: it is
-/// a session directive (annotation only) and is additionally R9-exempt.
-pub const SESSION_DIRECTIVES: &[&str] = &[
-    "consult",
-    "consult_tree",
-    "reconsult",
-    "unconsult",
-    "mount",
-    "mount_new",
-    "mount_tree",
-    "unmount",
-    "refresh",
-    "ground",
-    "enlist",
-    "delist",
-    "alias",
-    "expose",
-    "doc",
-];
-
-/// DDL directives — create database objects (EFFECT-ALGEBRA §3).
-pub const DDL_DIRECTIVES: &[&str] = &[
-    "temp_table",
-    "table",
-    "temp_view",
-    "imprint",
-    "imprint_replace",
-];
-
-/// DML directives — write rows in user tables (EFFECT-ALGEBRA §3).
-pub const DML_DIRECTIVES: &[&str] = &["insert", "update", "delete"];
-
-/// Execution directives — start runs (EFFECT-ALGEBRA §9).
-pub const EXECUTION_DIRECTIVES: &[&str] = &["run", "run_namespace"];
-
-/// Utility directives — direct the run itself (EFFECT-ALGEBRA §3, §5).
-pub const UTILITY_DIRECTIVES: &[&str] = &["exit", "returning", "returning_other", "stdout"];
-
 /// The category of a directive, by what it directs (EFFECT-ALGEBRA §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveCategory {
@@ -94,22 +55,277 @@ pub enum DirectiveCategory {
     User,
 }
 
-/// Classify a directive name (with or without the trailing `!`).
-pub fn directive_category(name: &str) -> DirectiveCategory {
-    let bare = name.strip_suffix('!').unwrap_or(name);
-    if SESSION_DIRECTIVES.contains(&bare) {
-        DirectiveCategory::Session
-    } else if DDL_DIRECTIVES.contains(&bare) {
-        DirectiveCategory::Ddl
-    } else if DML_DIRECTIVES.contains(&bare) {
-        DirectiveCategory::Dml
-    } else if EXECUTION_DIRECTIVES.contains(&bare) {
-        DirectiveCategory::Execution
-    } else if UTILITY_DIRECTIVES.contains(&bare) {
-        DirectiveCategory::Utility
-    } else {
-        DirectiveCategory::User
+// ============================================================================
+// The authoritative directive descriptor (DIRECTIVE-CONVERGENCE-PLAN Phase 2)
+// ============================================================================
+
+/// How a built-in directive is realized by the implementation. Every
+/// intentional contextual absence is a POLICY here, never a missing
+/// registration accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectiveRealization {
+    /// A registered bin entity, invocable as a pseudo-predicate through
+    /// namespace-aware registry identity.
+    Entity,
+    /// A syntax pipe terminal (`source |> name!(args)(*)`): it has no
+    /// callable entity because its meaning requires the piped input
+    /// relation. Direct pseudo-predicate invocation refuses by policy.
+    SyntaxPipeTerminal,
+    /// Legal only in the liminal space of a consulted file; there is no
+    /// callable entity by policy.
+    LiminalOnly,
+}
+
+/// A typed higher-order parameter in a directive's descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectiveParam {
+    pub name: &'static str,
+    /// Today every registered built-in binds string/path arguments; the
+    /// kind field exists so relation-target and relational parameters
+    /// (Phase 3+) extend the descriptor rather than bypass it.
+    pub kind: DirectiveParamKind,
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectiveParamKind {
+    /// A string literal or bare `::`-qualified namespace path.
+    StringOrPath,
+    /// A namespace-positioned parameter (Phase 9): in the liminal space
+    /// its argument takes `.::`/`::` prefix resolution relative to the
+    /// consulting namespace — the ONE piece of liminal argument policy,
+    /// declared here instead of hand-spelled per directive arm.
+    Namespace,
+}
+
+/// What a directive packages in its receipt's `returned` interior relation
+/// (DIRECTIVE-CONVERGENCE-PLAN Rule 5/6). `None` means the receipt declares
+/// no payload — unwrapping it with `!>` or `.returned(*)` is a category
+/// error taught as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptPayload {
+    /// No `returned` payload declared (deliberately preserved option).
+    None,
+    /// Packages its input relation (heading = HO parameter 1's heading).
+    Input,
+    /// Packages its OTHER relational parameter (`returning_other!`).
+    OtherRelation,
+    /// Packages a produced collection (e.g. `run!`'s result table).
+    RunResult,
+    /// Packages the namespaces the operation established (`consult!`,
+    /// `mount_tree!` — one row per created sub-namespace).
+    Namespaces,
+    /// Packages the consulted files (`consult_tree!`): one row per file,
+    /// `⟦path, namespace, definitions⟧`.
+    ConsultedFiles,
+    /// Packages the manifest entities the operation materialized
+    /// (`imprint!`/`imprint_replace!`): one row per entity,
+    /// `⟦entity, status⟧`.
+    MaterializedEntities,
+}
+
+/// One declared flat echo column in a directive's receipt (EFFECT-ALGEBRA
+/// §3 amended / §8 ledger): a scalar column after the guaranteed
+/// `(success, operation)` core. An OPTIONAL echo is always present in the
+/// heading and carries NULL when the call form omits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptEcho {
+    pub name: &'static str,
+    pub optional: bool,
+}
+
+/// One built-in directive's authoritative descriptor. Catalog
+/// synchronization, argument binding, contextual refusal, and receipt
+/// construction derive from this record; entity-local metadata must agree
+/// (enforced by `descriptor_agreement` unit tests) and is never a second
+/// authority.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectiveDescriptor {
+    /// Bare name, no `!` suffix.
+    pub name: &'static str,
+    pub category: DirectiveCategory,
+    /// Catalog identity namespace (fully qualified).
+    pub namespace: &'static str,
+    pub realization: DirectiveRealization,
+    /// Typed parameters for Entity realizations; empty for syntax
+    /// terminals (their parameters are ruled with Phase 3/4 receipts).
+    pub params: &'static [DirectiveParam],
+    /// The declared flat echo columns after the `(success, operation)`
+    /// core (EFFECT-ALGEBRA §8's ledger, in ledger order). Echo names are
+    /// ruled per directive and need not mirror parameter names
+    /// (`ground!`'s params are `data_ns/lib_ns/new_ns_name`; its echoes
+    /// are `data_namespace/lib_namespace/namespace`).
+    pub receipt_echoes: &'static [ReceiptEcho],
+    /// Whether the receipt carries the interior `input` echo of the
+    /// lifted argument table (`consult!`, `doc!`).
+    pub receipt_input_echo: bool,
+    pub receipt_payload: ReceiptPayload,
+    /// Side-effect character (compile is the notable pure entity).
+    pub side_effects: bool,
+}
+
+impl DirectiveDescriptor {
+    /// The receipt heading this descriptor declares, as `(name, type)`
+    /// columns: the guaranteed core, then the flat echoes, then the
+    /// interior additions in ruled order (`input` before `returned`).
+    /// This is THE source entities' output schemas and the transformer's
+    /// receipt shapes derive from — never a second copy beside it.
+    pub fn receipt_columns(&self) -> Vec<(String, String)> {
+        let mut cols = vec![
+            ("success".to_string(), "Integer".to_string()),
+            ("operation".to_string(), "String".to_string()),
+        ];
+        for e in self.receipt_echoes {
+            cols.push((e.name.to_string(), "String".to_string()));
+        }
+        if self.receipt_input_echo {
+            cols.push(("input".to_string(), "Interior".to_string()));
+        }
+        if self.receipt_payload != ReceiptPayload::None {
+            cols.push(("returned".to_string(), "Interior".to_string()));
+        }
+        cols
     }
+}
+
+const fn p(name: &'static str) -> DirectiveParam {
+    DirectiveParam {
+        name,
+        kind: DirectiveParamKind::StringOrPath,
+        optional: false,
+    }
+}
+
+const fn pn(name: &'static str) -> DirectiveParam {
+    DirectiveParam {
+        name,
+        kind: DirectiveParamKind::Namespace,
+        optional: false,
+    }
+}
+
+const fn e(name: &'static str) -> ReceiptEcho {
+    ReceiptEcho {
+        name,
+        optional: false,
+    }
+}
+
+const fn eo(name: &'static str) -> ReceiptEcho {
+    ReceiptEcho {
+        name,
+        optional: true,
+    }
+}
+
+const STD_PRELUDE: &str = "std::prelude";
+
+/// The 30 built-in directives (EFFECT-ALGEBRA §3), one descriptor each.
+pub const DIRECTIVE_DESCRIPTORS: &[DirectiveDescriptor] = &[
+    // --- Session (16): direct the session's namespace tree; liminal-eligible.
+    DirectiveDescriptor { name: "consult", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("file_path"), pn("namespace")], receipt_echoes: &[], receipt_input_echo: true, receipt_payload: ReceiptPayload::Namespaces, side_effects: true },
+    DirectiveDescriptor { name: "consult_concat_into_ns", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("file_path"), pn("namespace")], receipt_echoes: &[], receipt_input_echo: true, receipt_payload: ReceiptPayload::Namespaces, side_effects: true },
+    DirectiveDescriptor { name: "consult_tree", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("dir_path"), pn("root_namespace")], receipt_echoes: &[e("path"), e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::ConsultedFiles, side_effects: true },
+    DirectiveDescriptor { name: "reconsult", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("namespace"), DirectiveParam { name: "new_file_path", kind: DirectiveParamKind::StringOrPath, optional: true }], receipt_echoes: &[e("namespace"), eo("path")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "unconsult", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("namespace")], receipt_echoes: &[e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "mount", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("db_path"), pn("namespace")], receipt_echoes: &[e("path"), e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "mount_new", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("db_path"), pn("namespace")], receipt_echoes: &[e("path"), e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "mount_tree", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("db_uri"), pn("namespace")], receipt_echoes: &[e("path"), e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::Namespaces, side_effects: true },
+    DirectiveDescriptor { name: "unmount", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("namespace")], receipt_echoes: &[e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "refresh", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("namespace")], receipt_echoes: &[e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "ground", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("data_ns"), pn("lib_ns"), pn("new_ns_name")], receipt_echoes: &[e("data_namespace"), e("lib_namespace"), e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "enlist", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("namespace")], receipt_echoes: &[e("namespace"), eo("into")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "delist", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("namespace")], receipt_echoes: &[e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "alias", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[pn("namespace"), p("shorthand")], receipt_echoes: &[e("namespace"), e("shorthand")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "expose", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::LiminalOnly, params: &[pn("namespace")], receipt_echoes: &[], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "doc", category: DirectiveCategory::Session, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("target"), p("doc")], receipt_echoes: &[], receipt_input_echo: true, receipt_payload: ReceiptPayload::None, side_effects: true },
+    // --- DDL (5): create database objects.
+    DirectiveDescriptor { name: "temp_table", category: DirectiveCategory::Ddl, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[e("name")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "table", category: DirectiveCategory::Ddl, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[e("name")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "temp_view", category: DirectiveCategory::Ddl, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[e("name")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "imprint", category: DirectiveCategory::Ddl, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("source_ns"), p("target_ns")], receipt_echoes: &[e("source_namespace"), e("target_namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::MaterializedEntities, side_effects: true },
+    DirectiveDescriptor { name: "imprint_replace", category: DirectiveCategory::Ddl, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("source_ns"), p("target_ns")], receipt_echoes: &[e("source_namespace"), e("target_namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::MaterializedEntities, side_effects: true },
+    // --- DML (3): write rows in user tables.
+    DirectiveDescriptor { name: "insert", category: DirectiveCategory::Dml, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[e("target")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "update", category: DirectiveCategory::Dml, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[e("target")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "delete", category: DirectiveCategory::Dml, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[e("target")], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    // --- Execution (2): start runs.
+    DirectiveDescriptor { name: "run", category: DirectiveCategory::Execution, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("file_path")], receipt_echoes: &[e("path")], receipt_input_echo: false, receipt_payload: ReceiptPayload::RunResult, side_effects: true },
+    DirectiveDescriptor { name: "run_namespace", category: DirectiveCategory::Execution, namespace: STD_PRELUDE, realization: DirectiveRealization::Entity, params: &[p("namespace")], receipt_echoes: &[e("namespace")], receipt_input_echo: false, receipt_payload: ReceiptPayload::RunResult, side_effects: true },
+    // --- Utility (4): direct the run itself.
+    DirectiveDescriptor { name: "exit", category: DirectiveCategory::Utility, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[], receipt_input_echo: false, receipt_payload: ReceiptPayload::None, side_effects: true },
+    DirectiveDescriptor { name: "returning", category: DirectiveCategory::Utility, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[], receipt_input_echo: false, receipt_payload: ReceiptPayload::Input, side_effects: false },
+    DirectiveDescriptor { name: "returning_other", category: DirectiveCategory::Utility, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[], receipt_input_echo: false, receipt_payload: ReceiptPayload::OtherRelation, side_effects: false },
+    DirectiveDescriptor { name: "stdout", category: DirectiveCategory::Utility, namespace: STD_PRELUDE, realization: DirectiveRealization::SyntaxPipeTerminal, params: &[], receipt_echoes: &[], receipt_input_echo: false, receipt_payload: ReceiptPayload::Input, side_effects: true },
+];
+
+/// Look up the descriptor for a built-in directive name (with or without
+/// the trailing `!`). `None` means the name is not a built-in — user
+/// effect rules and unknown names alike.
+pub fn descriptor(name: &str) -> Option<&'static DirectiveDescriptor> {
+    let bare = name.strip_suffix('!').unwrap_or(name);
+    DIRECTIVE_DESCRIPTORS.iter().find(|d| d.name == bare)
+}
+
+/// Extract a directive's target designator from a preserved relational
+/// argument: a whole-table access (`name(*)`), optionally
+/// namespace-qualified. Anything else — filters, projections, anonymous
+/// tables, derived expressions — refuses with a teaching diagnostic: a
+/// target NAMES where the effect lands, it is not a relation to
+/// evaluate. One interpreter for DDL and DML (Phase 6 slice 5); the
+/// badge and verb phrase say which family taught the refusal.
+pub fn target_designator(
+    bare: &str,
+    badge: &'static str,
+    verb_phrase: &str,
+    argument: &RelationalExpression<Unresolved>,
+) -> Result<(String, Option<String>)> {
+    if let RelationalExpression::Relation(Relation::Ground {
+        identifier,
+        domain_spec: DomainSpec::Glob,
+        ..
+    }) = argument
+    {
+        let ns = if identifier.namespace_path.is_empty() {
+            None
+        } else {
+            Some(
+                identifier
+                    .namespace_path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            )
+        };
+        return Ok((identifier.name.to_string(), ns));
+    }
+    Err(DelightQLError::validation_error_categorized(
+        badge,
+        format!(
+            "{bare}!'s target is a whole-table DESIGNATOR — `name(*)`, optionally \
+             namespace-qualified (`my::ns.name(*)`) — {verb_phrase}; \
+             filters, projections, and derived relations do not belong in a \
+             target"
+        ),
+        "target designator",
+    ))
+}
+
+/// Renamed pseudo-predicates: one table for every frontend (the liminal
+/// loader and the effect executor previously kept divergent copies).
+pub const RENAMED_DIRECTIVES: &[(&str, &str)] = &[
+    ("engage", "enlist"),
+    ("part", "delist"),
+    ("ground_into", "ground"),
+];
+
+/// Classify a directive name (with or without the trailing `!`). Derived
+/// from the authoritative descriptor table.
+pub fn directive_category(name: &str) -> DirectiveCategory {
+    descriptor(name)
+        .map(|d| d.category)
+        .unwrap_or(DirectiveCategory::User)
 }
 
 /// Is this directive name (with or without `!`) liminal-eligible?
@@ -618,6 +834,8 @@ mod tests {
     fn directive(name: &str) -> RelationalExpression<Unresolved> {
         RelationalExpression::Relation(Relation::PseudoPredicate {
             name: name.to_string(),
+            namespace: Vec::new(),
+            access: DomainSpec::Glob,
             arguments: vec![],
             alias: None,
             cpr_schema: PhaseBox::phantom(),
@@ -716,6 +934,8 @@ mod tests {
         };
         let outer = RelationalExpression::Relation(Relation::PseudoPredicate {
             name: "outer!".to_string(),
+            namespace: Vec::new(),
+            access: DomainSpec::Glob,
             arguments: vec![inner_in_arg],
             alias: None,
             cpr_schema: PhaseBox::phantom(),

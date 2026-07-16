@@ -145,6 +145,295 @@ pub enum PlanEntry {
     },
 }
 
+// ============================================================================
+// The typed effect plan (D2, DOGFOODING-EFFECT-EXECUTION-PLAN §5)
+// ============================================================================
+
+/// A guard edge's polarity. `always` is the ABSENCE of a requirement row,
+/// never a third value (Q-D3, ruled 2026-07-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardPolarity {
+    /// Continue when the guard relation has a row.
+    Present,
+    /// Continue when the guard relation has no row (the exit latch).
+    Absent,
+}
+
+/// A guard DEFINITION (Q-D3 as amended): typed guard identity plus its
+/// SQL lowering — a pure one-row SELECT; any row = open. NOT a scheduled
+/// step: no ordinal, no occurrence. Sampled at each DEPENDENT (Q-D1;
+/// early sampling only under provable interval stability). Shared by any
+/// number of requirements.
+#[derive(Debug, Clone)]
+pub struct GuardDefinition {
+    pub guard_id: usize,
+    /// The SQL lowering, standalone (`SELECT 1 WHERE EXISTS (…)`).
+    pub sql: String,
+}
+
+/// One requirement edge: a dependent step samples `guard_id` with
+/// `polarity` when it is reached.
+#[derive(Debug, Clone)]
+pub struct Requirement {
+    pub guard_id: usize,
+    pub polarity: GuardPolarity,
+    /// Diagnostics only (`"comma"`, `"exit"`) — the runner must never
+    /// branch on provenance (§3 of the dogfooding plan).
+    pub reason: &'static str,
+}
+
+/// What a scheduled step's action IS — the ruled sum type
+/// (CODE-REVIEW-zzpmxuzp::otolxyzl finding 3: illegal combinations such
+/// as "DDL carrying a shipped host statement" are structurally
+/// inexpressible; only Host and Return can ship). Each SQL-bearing
+/// variant owns its LOWERED statement stream in emission order — the
+/// §5.1 adjacency discipline lives here (Q-D9).
+#[derive(Debug, Clone)]
+pub enum EffectAction {
+    /// A statement-level ASSERTION (Phase 10 slice b: annotated
+    /// statements ride the typed program — the same semantic policy as
+    /// unannotated ones). Runs FIRST, read-only, aborts the run on a
+    /// false verdict; never inside the bracket.
+    Assertion {
+        statement: PlanStatement,
+        source_location: Option<(usize, usize)>,
+    },
+    /// A statement-level EMIT stream (side-channel rows via the on_emit
+    /// hook; notify-never-abort, today's emit contract).
+    Emit {
+        name: String,
+        statement: PlanStatement,
+        source_location: Option<(usize, usize)>,
+    },
+    /// DML occurrence: statement + adjacent receipt machinery.
+    Dml(Vec<PlanStatement>),
+    /// DDL occurrence: replace/holder drops + CREATE + receipt.
+    Ddl(Vec<PlanStatement>),
+    /// exit!: the latch insert (plus any machinery lowered en route).
+    Exit(Vec<PlanStatement>),
+    /// Rule-boundary machinery (clause receipt sinks).
+    RuleBoundary(Vec<PlanStatement>),
+    /// Host-visible output (stdout!): machinery, then the SHIP.
+    Host {
+        statements: Vec<PlanStatement>,
+        ship: PlanStatement,
+    },
+    /// The run's return value: trailing machinery, then the final ship —
+    /// ship absent when the body's last host ship already IS the return
+    /// (body_ending_in_stdout_ships_once).
+    Return {
+        statements: Vec<PlanStatement>,
+        ship: Option<PlanStatement>,
+    },
+    /// Scratch shells. Placement is the step's POSITION: before Begin on
+    /// SQLite/DuckDB, after Begin on PG (ON COMMIT DROP) — invariant
+    /// §5.6, carried by order instead of assembly-time branching.
+    Setup(Vec<PlanStatement>),
+    /// Open the transaction bracket.
+    Begin { connection_id: Option<i64> },
+    /// Close the transaction bracket.
+    Commit { connection_id: Option<i64> },
+    /// Trailing scratch cleanup (skipped after a taken exit!).
+    Cleanup(Vec<PlanStatement>),
+}
+
+/// The projection's step-kind vocabulary, DERIVED from the action — the
+/// former sidecar enum no longer travels beside the stream (finding 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectStepKind {
+    Assertion,
+    Emit,
+    Dml,
+    Ddl,
+    Exit,
+    Host,
+    Return,
+    RuleBoundary,
+    Setup,
+    Begin,
+    Commit,
+    Cleanup,
+}
+
+impl EffectAction {
+    pub fn kind(&self) -> EffectStepKind {
+        match self {
+            EffectAction::Assertion { .. } => EffectStepKind::Assertion,
+            EffectAction::Emit { .. } => EffectStepKind::Emit,
+            EffectAction::Dml(_) => EffectStepKind::Dml,
+            EffectAction::Ddl(_) => EffectStepKind::Ddl,
+            EffectAction::Exit(_) => EffectStepKind::Exit,
+            EffectAction::RuleBoundary(_) => EffectStepKind::RuleBoundary,
+            EffectAction::Host { .. } => EffectStepKind::Host,
+            EffectAction::Return { .. } => EffectStepKind::Return,
+            EffectAction::Setup(_) => EffectStepKind::Setup,
+            EffectAction::Begin { .. } => EffectStepKind::Begin,
+            EffectAction::Commit { .. } => EffectStepKind::Commit,
+            EffectAction::Cleanup(_) => EffectStepKind::Cleanup,
+        }
+    }
+
+    /// The action's plain statements (excluding any ship).
+    pub fn statements(&self) -> &[PlanStatement] {
+        match self {
+            EffectAction::Dml(s)
+            | EffectAction::Ddl(s)
+            | EffectAction::Exit(s)
+            | EffectAction::RuleBoundary(s)
+            | EffectAction::Setup(s)
+            | EffectAction::Cleanup(s) => s,
+            EffectAction::Host { statements, .. } | EffectAction::Return { statements, .. } => {
+                statements
+            }
+            EffectAction::Begin { .. } | EffectAction::Commit { .. } => &[],
+            EffectAction::Assertion { statement, .. } => std::slice::from_ref(statement),
+            EffectAction::Emit { statement, .. } => std::slice::from_ref(statement),
+        }
+    }
+
+    /// The action's shipped statement, when its variant can ship.
+    pub fn ship(&self) -> Option<&PlanStatement> {
+        match self {
+            EffectAction::Host { ship, .. } => Some(ship),
+            EffectAction::Return { ship, .. } => ship.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// One scheduled step of the typed plan. Ordinal = position in
+/// `TypedEffectPlan::steps`; occurrence identity is the demand-expansion
+/// path (Q-D2).
+#[derive(Debug, Clone)]
+pub struct EffectStep {
+    /// Demand-expansion path + per-plan counter (`fx::route#3`): two
+    /// mentions are two occurrences (mention is instantiation).
+    pub occurrence: String,
+    /// The directive's name as written (`insert!`) — STORED, never parsed
+    /// out of the occurrence string (review finding 3).
+    pub operation: String,
+    /// Source span provenance (byte start, end). OWED: ratified with
+    /// occurrence identity (Q-D2); populated once directive AST nodes
+    /// carry spans through the builder — the field keeps the debt
+    /// visible instead of silently dropped.
+    pub span: Option<(usize, usize)>,
+    /// The step's connection route (`None` = the session default).
+    pub route: Option<i64>,
+    /// The guard edges this step samples when reached. Empty = always.
+    pub requirements: Vec<Requirement>,
+    /// What this step DOES — the typed action owning its statement
+    /// stream.
+    pub action: EffectAction,
+}
+
+impl EffectStepKind {
+    /// The ruled step_kind / action_kind projection vocabulary (Q-D4):
+    /// step_kind ∈ effect|return|control, action_kind ∈ dml|ddl|sql|host.
+    pub fn projection_kinds(self) -> (&'static str, &'static str) {
+        match self {
+            EffectStepKind::Assertion | EffectStepKind::Emit => ("control", "sql"),
+            EffectStepKind::Dml => ("effect", "dml"),
+            EffectStepKind::Ddl => ("effect", "ddl"),
+            EffectStepKind::Exit => ("effect", "sql"),
+            EffectStepKind::Host => ("effect", "host"),
+            EffectStepKind::Return => ("return", "sql"),
+            EffectStepKind::RuleBoundary
+            | EffectStepKind::Setup
+            | EffectStepKind::Begin
+            | EffectStepKind::Commit
+            | EffectStepKind::Cleanup => ("control", "sql"),
+        }
+    }
+}
+
+impl EffectStep {
+    /// The step's kind, derived from its action.
+    pub fn kind(&self) -> EffectStepKind {
+        self.action.kind()
+    }
+
+    /// The step's lowered statement stream as display text.
+    pub fn sql_display(&self) -> String {
+        match &self.action {
+            EffectAction::Begin { .. } => "BEGIN".to_string(),
+            EffectAction::Commit { .. } => "COMMIT".to_string(),
+            action => {
+                let mut parts: Vec<String> =
+                    action.statements().iter().map(|st| st.sql.clone()).collect();
+                if let Some(ship) = action.ship() {
+                    parts.push(ship.sql.clone());
+                }
+                parts.join(";\n")
+            }
+        }
+    }
+}
+
+/// The typed in-memory plan (D2): scheduled steps + guard definitions.
+/// This is the CANONICAL structure the transformer builds; the flat
+/// `CompiledPlan::entries` list is derived from it at assembly (shells +
+/// BEGIN + step streams + COMMIT + cleanup). The system relations of
+/// D4/D5 are a read-only projection of THIS (Q-D11: observational).
+#[derive(Debug, Clone, Default)]
+pub struct TypedEffectPlan {
+    pub steps: Vec<EffectStep>,
+    pub guards: Vec<GuardDefinition>,
+}
+
+impl TypedEffectPlan {
+    /// Derive the flat entry list — the ONE typed program is the source;
+    /// the positional rendering is a projection (review finding 3: no
+    /// cloned streams to drift, no arithmetic reconstruction).
+    pub fn flatten(&self) -> Vec<PlanEntry> {
+        let mut out = Vec::new();
+        for step in &self.steps {
+            match &step.action {
+                EffectAction::Begin { connection_id } => {
+                    out.push(PlanEntry::BeginTransaction {
+                        connection_id: *connection_id,
+                        comment: None,
+                    });
+                }
+                EffectAction::Commit { connection_id } => {
+                    out.push(PlanEntry::CommitTransaction {
+                        connection_id: *connection_id,
+                        comment: None,
+                    });
+                }
+                EffectAction::Assertion {
+                    statement,
+                    source_location,
+                } => {
+                    out.push(PlanEntry::Assertion {
+                        statement: statement.clone(),
+                        source_location: *source_location,
+                    });
+                }
+                EffectAction::Emit {
+                    name,
+                    statement,
+                    source_location,
+                } => {
+                    out.push(PlanEntry::Emit {
+                        name: name.clone(),
+                        statement: statement.clone(),
+                        source_location: *source_location,
+                    });
+                }
+                action => {
+                    for st in action.statements() {
+                        out.push(PlanEntry::Statement(st.clone()));
+                    }
+                    if let Some(ship) = action.ship() {
+                        out.push(PlanEntry::ShippedStatement(ship.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The generalized compilation output: an ordered entry list the pump
 /// plays start to finish. NOTHING here executes; compilation stays pure
 /// string → strings.
@@ -161,11 +450,11 @@ pub struct CompiledPlan {
     /// on SQLite/DuckDB, `pg_temp.__exit` on PG — R-T2; the pump runs it
     /// VERBATIM, so the planner owns the spelling; pinned by
     /// `pg_exit_table_and_wrap_guard_spell_pg_temp` in
-    /// pipeline/effect_transformer/tests.rs). This is the pump's ONLY
-    /// mid-run read: it peeks this table before each entry and stops the
-    /// run once a row appears (IMPLEMENTATION-ARCHITECTURE §4). `None` =
-    /// no exit machinery; the pump never peeks. Populated by the effect
-    /// transformer (Epic 3).
+    /// pipeline/effect_transformer/tests.rs). Since D3a the exit flag
+    /// rides Absent requirement edges on later steps; this name serves
+    /// the ONE remaining latch read — pre-COMMIT, deciding whether the
+    /// post-COMMIT tail (trailing cleanup) runs. `None` = no exit
+    /// machinery. Populated by the effect transformer.
     pub exit_table: Option<String>,
     /// The user-visible objects this plan's DDL directives create
     /// (`temp_table!`/`table!`/`temp_view!` targets — NOT the `__`-scratch
@@ -175,6 +464,13 @@ pub struct CompiledPlan {
     /// "catalog-registered"; pinned by the effects ball's
     /// ddl_receipt--12/--13/--14 and util--36 post-state reads).
     pub created_objects: Vec<PlanCreatedObject>,
+    /// The typed plan this entry list was derived FROM
+    /// (`TypedEffectPlan::flatten`). `None` for degenerate plans
+    /// (`From<CompiledQuery>`) and hand-built test plans — those take the
+    /// pump's plain entry loop; a typed plan is walked DIRECTLY
+    /// (`play_typed`), and `entries` serves rendering and the degenerate
+    /// consumers only. D4 projects this into `sys::execution`.
+    pub typed: Option<TypedEffectPlan>,
 }
 
 /// One object a plan creates (see `CompiledPlan::created_objects`).
@@ -232,6 +528,9 @@ impl From<CompiledQuery> for CompiledPlan {
             entries,
             exit_table: None,
             created_objects: Vec::new(),
+            // Degenerate plans carry no typed layer (D2): nothing here is
+            // an effect occurrence.
+            typed: None,
         }
     }
 }
@@ -428,6 +727,7 @@ mod tests {
             ))],
             exit_table: None,
             created_objects: Vec::new(),
+            typed: None,
         };
         assert_eq!(
             plan.render_sql(),
@@ -441,6 +741,7 @@ mod tests {
             entries: vec![PlanEntry::Statement(PlanStatement::bare("SELECT 1;"))],
             exit_table: None,
             created_objects: Vec::new(),
+            typed: None,
         };
         assert_eq!(plan.render_sql(), "SELECT 1;");
     }
@@ -477,6 +778,7 @@ mod tests {
             ],
             exit_table: Some("__exit".to_string()),
             created_objects: Vec::new(),
+            typed: None,
         };
         let expected = "\
 -- [plan] scratch: receipts + exit flag
@@ -517,6 +819,7 @@ INSERT INTO __r_s SELECT 1, 'staged';";
             ],
             exit_table: Some("__exit".to_string()),
             created_objects: Vec::new(),
+            typed: None,
         };
         let expected = "\
 CREATE TEMP TABLE __exit (hit INTEGER);
@@ -550,6 +853,7 @@ COMMIT;";
             ],
             exit_table: None,
             created_objects: Vec::new(),
+            typed: None,
         };
         let expected = "\
 -- [assert]
@@ -573,6 +877,7 @@ SELECT * FROM t;";
             })],
             exit_table: None,
             created_objects: Vec::new(),
+            typed: None,
         };
         let expected = "\
 -- [arm k!] cleanup respelled as delete!

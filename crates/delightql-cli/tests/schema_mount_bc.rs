@@ -285,7 +285,8 @@ fn pg_mount_tree_creates_persistent_subnamespaces() {
     pg_two_schema_fixture(&db);
     let dir = tempfile::tempdir().unwrap();
 
-    // The one-row receipt.
+    // The one-row receipt (Phase 6 slice 3: core + path/namespace echoes;
+    // the created sub-namespaces are the `returned` interior tree).
     let q = format!("mount_tree!(\"{}\", \"allpg\")", db.uri());
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), &q, false);
     assert!(ok, "mount_tree! must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -301,7 +302,7 @@ fn pg_mount_tree_creates_persistent_subnamespaces() {
         !stdout.contains("pg_temp") && !stdout.contains("pg_toast"),
         "transient schemas must be excluded (R-S2).\nstdout:\n{stdout}"
     );
-    assert!(stdout.contains('['), "sub_namespaces is a JSON array.\nstdout:\n{stdout}");
+    assert!(stdout.contains('['), "the returned tree renders as ONE JSON array.\nstdout:\n{stdout}");
     // ONE row: exactly one JSON array opener in the output.
     assert_eq!(
         stdout.matches('[').count(),

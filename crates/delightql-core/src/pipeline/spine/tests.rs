@@ -17,6 +17,8 @@ use crate::pipeline::asts::core::{
 fn sentinel(tag: &str) -> RelationalExpression<Unresolved> {
     RelationalExpression::Relation(Relation::PseudoPredicate {
         name: tag.to_string(),
+        namespace: Vec::new(),
+        access: crate::pipeline::asts::core::DomainSpec::Glob,
         arguments: vec![],
         alias: None,
         cpr_schema: PhaseBox::phantom(),

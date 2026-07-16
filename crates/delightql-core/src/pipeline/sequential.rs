@@ -305,7 +305,7 @@ pub fn process_inline_ddl_block(
     let result = system
         // Inline DDL blocks have no liminal space — the scratch namespace's
         // liminal is empty (EFFECT-ALGEBRA §8: created by other means).
-        .consult_file("(inline)", namespace, ddl, &[])
+        .consult_file("(inline)", namespace, ddl, &[], None)
         .map_err(|e| {
             DelightQLError::database_error(
                 format!("Inline DDL registration failed: {}", e),

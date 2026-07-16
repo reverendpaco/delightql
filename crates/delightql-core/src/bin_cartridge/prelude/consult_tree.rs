@@ -45,11 +45,12 @@ impl BinEntity for ConsultTreePredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![
-                ("file_path".to_string(), "String".to_string()),
-                ("namespace".to_string(), "String".to_string()),
-                ("definitions".to_string(), "Integer".to_string()),
-            ]),
+            // The receipt heading is the DESCRIPTOR's declaration
+            // (Phase 6 slice 3): core + `path, namespace` echoes +
+            // the `returned` tree of consulted files.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
+                "consult_tree",
+            )),
         }
     }
 
@@ -108,8 +109,11 @@ impl EffectExecutable for ConsultTreePredicate {
         collect_dql_files(dir, &mut dql_files)?;
         dql_files.sort();
 
-        // Consult each file
-        let mut rows = Vec::new();
+        // Consult each file; the collection becomes the receipt's
+        // `returned` tree (EFFECT-ALGEBRA §3/§8, ruled 2026-07-15 —
+        // Phase 6 slice 3): one interior row per consulted file,
+        // cardinality back to zero-or-one.
+        let mut returned_rows: Vec<Vec<Option<String>>> = Vec::new();
         for file_path in &dql_files {
             let relative = file_path.strip_prefix(dir).unwrap_or(file_path.as_path());
             let stem = relative
@@ -128,48 +132,27 @@ impl EffectExecutable for ConsultTreePredicate {
                 Some(&root_namespace),
             )?;
 
-            rows.push(Row {
-                values: vec![
-                    DomainExpression::Literal {
-                        value: LiteralValue::String(file_path_str),
-                        alias: None,
-                    },
-                    DomainExpression::Literal {
-                        value: LiteralValue::String(namespace),
-                        alias: None,
-                    },
-                    DomainExpression::Literal {
-                        value: LiteralValue::Number(count.to_string()),
-                        alias: None,
-                    },
-                ],
-            });
+            returned_rows.push(vec![
+                Some(file_path_str),
+                Some(namespace),
+                Some(count.to_string()),
+            ]);
         }
 
-        if rows.is_empty() {
+        if returned_rows.is_empty() {
             return Err(DelightQLError::database_error(
                 format!("consult_tree!() found no .dql files in '{}'", dir_path),
                 "Empty directory tree",
             ));
         }
 
-        let headers = vec![
-            DomainExpression::lvar_builder("file_path".to_string()).build(),
-            DomainExpression::lvar_builder("namespace".to_string()).build(),
-            DomainExpression::lvar_builder("definitions".to_string()).build(),
-        ];
-
-        let result_table = Relation::Anonymous {
-            column_headers: Some(headers),
-            rows,
-            alias: alias.map(|s| s.into()),
-            outer: false,
-            exists_mode: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        };
-
-        Ok(EntityResult::Relation(result_table))
+        Ok(EntityResult::Relation(super::descriptor_tree_receipt(
+            "consult_tree",
+            &[Some(dir_path.clone()), Some(root_namespace.clone())],
+            &["path", "namespace", "definitions"],
+            &returned_rows,
+            alias,
+        )))
     }
 }
 

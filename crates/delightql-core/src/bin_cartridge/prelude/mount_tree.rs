@@ -57,11 +57,12 @@ impl BinEntity for MountTreePredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![
-                ("path".to_string(), "String".to_string()),
-                ("namespace".to_string(), "String".to_string()),
-                ("sub_namespaces".to_string(), "String".to_string()),
-            ]),
+            // The receipt heading is the DESCRIPTOR's declaration
+            // (Phase 6 slice 3): core + `path, namespace` echoes +
+            // the `returned` tree of created sub-namespaces.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
+                "mount_tree",
+            )),
         }
     }
 
@@ -106,42 +107,24 @@ impl EffectExecutable for MountTreePredicate {
         // badges (the namespace/name/reserved guard, the SQLite refusal).
         let created = system.mount_database_tree(&db_uri, &namespace)?;
 
-        Ok(EntityResult::Relation(mount_tree_receipt(
-            &db_uri, &namespace, &created, alias,
+        // The created sub-namespaces are the receipt's `returned` tree
+        // (ruled 2026-07-15, Phase 6 slice 3): R-S3's "which schemas did
+        // I mount?" is answered by DRILLING the payload with ordinary
+        // operators — the JSON-array string column is retired. An empty
+        // enumeration ships the all-NULL contributor row, which elides
+        // to `[]`.
+        let returned_rows: Vec<Vec<Option<String>>> = if created.is_empty() {
+            vec![vec![None]]
+        } else {
+            created.iter().map(|ns| vec![Some(ns.clone())]).collect()
+        };
+        Ok(EntityResult::Relation(super::descriptor_tree_receipt(
+            "mount_tree",
+            &[Some(db_uri.clone()), Some(namespace.clone())],
+            &["namespace"],
+            &returned_rows,
+            alias,
         )))
-    }
-}
-
-/// The SINGLE-ROW receipt (R-S3): `path, namespace, sub_namespaces`, the
-/// last a JSON array of the created sub-namespaces so "which schemas did I
-/// mount?" is answerable from one row.
-fn mount_tree_receipt(
-    path: &str,
-    namespace: &str,
-    created: &[String],
-    alias: Option<String>,
-) -> Relation {
-    let headers = vec![
-        DomainExpression::lvar_builder("path".to_string()).build(),
-        DomainExpression::lvar_builder("namespace".to_string()).build(),
-        DomainExpression::lvar_builder("sub_namespaces".to_string()).build(),
-    ];
-    let sub_json = serde_json::to_string(created).unwrap_or_else(|_| "[]".to_string());
-    let lit = |s: &str| DomainExpression::Literal {
-        value: LiteralValue::String(s.to_string()),
-        alias: None,
-    };
-    let row = Row {
-        values: vec![lit(path), lit(namespace), lit(&sub_json)],
-    };
-    Relation::Anonymous {
-        column_headers: Some(headers),
-        rows: vec![row],
-        alias: alias.map(|s| s.into()),
-        outer: false,
-        exists_mode: false,
-        qua_target: None,
-        cpr_schema: PhaseBox::phantom(),
     }
 }
 

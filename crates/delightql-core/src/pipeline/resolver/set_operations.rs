@@ -130,6 +130,35 @@ pub(super) fn build_corresponding_schema(
             if !seen_names.contains(&col_name) {
                 seen_names.insert(col_name);
                 unified_columns.push(col.clone());
+            } else {
+                // TAGGED SUM (EFFECT-ALGEBRA §3, amended 2026-07-15): a
+                // same-named column whose arms declare DIFFERENT interior
+                // headings stays legal to union (each row keeps its own
+                // heading; `operation` is the tag) but must not be
+                // RELEASED across arms — mark the kept metadata so the
+                // drill refuses with the narrow-first teaching error.
+                // An arm WITHOUT the column (NULL pad) is not a conflict:
+                // pads release as empty (NULL-interior-is-empty).
+                // Pinned by directive_contract 35 (conflict) / 36
+                // (agreeing headings release freely).
+                if let Some(kept) = unified_columns.iter_mut().find(|u| {
+                    u.info
+                        .name()
+                        .or_else(|| u.info.original_name())
+                        .map(|n| n == col_name)
+                        .unwrap_or(false)
+                }) {
+                    if col.interior_schema_conflict {
+                        kept.interior_schema_conflict = true;
+                    }
+                    if let (Some(a), Some(b)) =
+                        (&kept.interior_schema, &col.interior_schema)
+                    {
+                        if a != b {
+                            kept.interior_schema_conflict = true;
+                        }
+                    }
+                }
             }
         }
     }

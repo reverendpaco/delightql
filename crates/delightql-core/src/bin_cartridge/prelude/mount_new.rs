@@ -55,7 +55,9 @@ impl BinEntity for MountNewPredicate {
                     _is_optional: false,
                 },
             ],
-            output_schema: OutputSchema::Relation(vec![("ns".to_string(), "String".to_string())]),
+            // The receipt heading is the DESCRIPTOR's declaration
+            // (Phase 6 slice 2): core + ruled §8 additions.
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("mount_new")),
         }
     }
 
@@ -106,8 +108,10 @@ impl EffectExecutable for MountNewPredicate {
         // badges (e.g. the namespace/name/reserved guard).
         system.mount_new_database(&db_path, &namespace)?;
 
-        Ok(EntityResult::Relation(super::directive_result(
-            &namespace, alias,
+        Ok(EntityResult::Relation(super::descriptor_core_receipt(
+            "mount_new",
+            &[Some(db_path.clone()), Some(namespace.clone())],
+            alias,
         )))
     }
 }

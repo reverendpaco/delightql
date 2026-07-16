@@ -271,6 +271,7 @@ impl AstTransform<Addressed, Addressed> for CfeSubstituter<'_> {
             // HigherOrder: validate curried arguments, then walk
             ast::FunctionExpression::HigherOrder {
                 name,
+                namespace,
                 curried_arguments,
                 regular_arguments,
                 alias,
@@ -307,6 +308,7 @@ impl AstTransform<Addressed, Addressed> for CfeSubstituter<'_> {
                     self,
                     ast::FunctionExpression::HigherOrder {
                         name,
+                        namespace,
                         curried_arguments,
                         regular_arguments,
                         alias,

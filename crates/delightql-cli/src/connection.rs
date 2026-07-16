@@ -499,17 +499,215 @@ pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
     // Second factory (types-level) powers mount!/import! of URI-scheme
     // databases (pipe://, etc.). Same unit struct, both trait impls.
     let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
-    delightql_core::api::open(
-        factory,
-        Some(mount_factory),
-        Some(crate::help_surface::build()),
-    )
-    .map_err(|e| anyhow::anyhow!("{}", e))
+    let mut handle = delightql_core::api::open(factory, Some(mount_factory))
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Bind the CLI's embedded database images (BYTES-SCHEME-DESIGN.md).
+    // A binding is a name→bytes map entry, not a mount: no attachment, no
+    // I/O, no cost until a session actually runs
+    // `mount!("delightql-bytes://book", ...)`. Binding on every handle is
+    // what makes the locators typeable from any session, REPL included.
+    handle
+        .bind_static_bytes("book", crate::embedded_db::BOOK_BYTES)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    handle
+        .bind_static_bytes("man", crate::embedded_db::MAN_BYTES)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    crate::cli_surface::attach(handle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BYTES-SCHEME-DESIGN.md: bindings are immutable for the life of a
+    /// handle — rebinding refuses, even to the same bytes, so a locator's
+    /// referent can never change underneath a mounted namespace.
+    #[test]
+    fn byte_bindings_are_immutable() {
+        let mut handle = open_handle().unwrap();
+        let err = handle
+            .bind_static_bytes("book", crate::embedded_db::BOOK_BYTES)
+            .expect_err("rebinding 'book' must refuse");
+        assert!(err.contains("already exists"), "got: {err}");
+        // And names outside the grammar refuse before touching the table.
+        let err = handle
+            .bind_static_bytes("Not-Valid", b"")
+            .expect_err("uppercase name must refuse");
+        assert!(err.contains("invalid byte-binding name"), "got: {err}");
+    }
+
+    /// MOUNT-SPINE-PLAN.md Phase 1 (review R2): invalid images refuse AT
+    /// BIND, in a scratch connection — never on the session connection.
+    /// (sqlite3_deserialize installs a buffer without validating it; a
+    /// garbage image poisons the hosting connection, including the DETACH
+    /// that would remove it. Bind-time validation makes that state
+    /// unrepresentable.) And refusal-class mount failures leave nothing
+    /// behind: the target namespace stays cleanly mountable.
+    #[test]
+    fn failed_mount_leaves_nothing_behind() {
+        let mut handle = open_handle().unwrap();
+
+        // Raw garbage: refused by the header check.
+        let err = handle
+            .bind_static_bytes("junk", b"this is not a sqlite database image")
+            .expect_err("garbage must refuse at bind");
+        assert!(err.contains("not a valid SQLite database image"), "got: {err}");
+
+        // Header-prefixed garbage: refused by the scratch-connection probe.
+        static CRAFTED: [u8; 512] = {
+            let mut b = [0x5au8; 512];
+            let magic = *b"SQLite format 3\0";
+            let mut i = 0;
+            while i < 16 {
+                b[i] = magic[i];
+                i += 1;
+            }
+            b
+        };
+        let err = handle
+            .bind_static_bytes("crafted", &CRAFTED)
+            .expect_err("header-prefixed garbage must refuse at bind");
+        assert!(err.contains("not a valid SQLite database image"), "got: {err}");
+
+        // Refusal-class mount failures (unbound name) leave the namespace
+        // cleanly mountable afterwards.
+        let mut session = handle.session().unwrap();
+        session
+            .query("mount!(\"delightql-bytes://junk\", \"spot\")")
+            .err()
+            .expect("unbound name must refuse");
+        session
+            .query("mount!(\"delightql-bytes://man\", \"spot\")")
+            .expect("a refused mount must not leave metadata that blocks the namespace");
+    }
+
+    /// Owned bindings (bind_owned_bytes) share the whole contract: bind-time
+    /// validation, locator mounting — and an EMPTY bytes image reaches the
+    /// deliberate immutable-image refresh refusal (second review F2) rather
+    /// than "no cartridge".
+    #[test]
+    fn owned_empty_image_refresh_refuses_as_immutable() {
+        // A valid, empty, runtime-built image.
+        let image = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t(x); DROP TABLE t;").unwrap();
+            conn.serialize("main").unwrap().to_vec()
+        };
+        let mut handle = open_handle().unwrap();
+        handle.bind_owned_bytes("emptyimg", image).unwrap();
+        let mut session = handle.session().unwrap();
+        session
+            .query("mount!(\"delightql-bytes://emptyimg\", \"emptyns\")")
+            .expect("empty owned image must mount");
+        let err = session
+            .query("refresh!(\"emptyns\")")
+            .err()
+            .expect("refresh of a bytes image must refuse");
+        assert!(
+            err.contains("immutable"),
+            "empty bytes image must reach the immutable refusal, got: {err}"
+        );
+    }
+
+    /// Refresh-to-empty transitions are LEGAL
+    /// (NAMESPACE-CARTRIDGE-LINK-DESIGN.md: each namespace's cartridge is
+    /// a stored link, so multiple same-source empty mounts stay
+    /// distinguishable — the interim refusal is repealed). Both mounts
+    /// refresh into empties, both unmount cleanly, the source mounts
+    /// again — no leaked alias.
+    #[test]
+    fn refresh_to_empty_transition_keeps_lifecycle_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("shrink.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(x);")
+            .unwrap();
+        let db_s = db.to_string_lossy().to_string();
+
+        let mut handle = open_handle().unwrap();
+        let mut session = handle.session().unwrap();
+        session
+            .query(&format!("mount!(\"{db_s}\", \"a\")"))
+            .expect("non-empty mount a");
+        session
+            .query(&format!("mount!(\"{db_s}\", \"b\")"))
+            .expect("non-empty same-source mount b is allowed");
+
+        // The source loses its table out from under both mounts.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP TABLE t;")
+            .unwrap();
+
+        session
+            .query("refresh!(\"a\")")
+            .expect("first refresh-to-empty");
+        session
+            .query("refresh!(\"b\")")
+            .expect("second refresh-to-empty is legal under the stored link");
+
+        // Lifecycle stays sound afterwards.
+        session.query("unmount!(\"a\")").expect("unmount a");
+        session.query("unmount!(\"b\")").expect("unmount b");
+        session
+            .query(&format!("mount!(\"{db_s}\", \"c\")"))
+            .expect("no leaked alias: the source mounts again");
+    }
+
+    /// Fourth review, P1: imprint! must target the REQUESTED namespace's
+    /// mount, not the newest same-source cartridge. One owned image mounted
+    /// twice (same locator → same source_path → two independent deserialized
+    /// copies): imprinting into `ia` must land the table in ia's image and
+    /// leave ib's untouched. Pre-fix, the ORDER BY c.id DESC source-match
+    /// fallback routed the imprint into `ib`.
+    #[test]
+    fn imprint_targets_the_requested_mount_not_the_newest() {
+        let image = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE seed(x); DROP TABLE seed;")
+                .unwrap();
+            conn.serialize("main").unwrap().to_vec()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.dql");
+        std::fs::write(
+            &lib,
+            "t(*) :- _(x @ 1)\n\
+             (~~ddl:\"_internal\"\n\
+             imprinting(entity, materialization, extent) :-\n\
+               _(entity, materialization, extent\n\
+                 ---------------------------------\n\
+                 \"t\", \"table\", \"permanent\")\n\
+             ~~)\n",
+        )
+        .unwrap();
+        let lib_path = lib.to_string_lossy().to_string();
+
+        let mut handle = open_handle().unwrap();
+        handle.bind_owned_bytes("imprintimg", image).unwrap();
+        let mut session = handle.session().unwrap();
+        session
+            .query("mount!(\"delightql-bytes://imprintimg\", \"ia\")")
+            .expect("mount ia");
+        session
+            .query("mount!(\"delightql-bytes://imprintimg\", \"ib\")")
+            .expect("second same-source mount ib is legal under the link");
+        session
+            .query(&format!("consult!(\"{lib_path}\", \"lib::imp\")"))
+            .expect("consult");
+        session
+            .query("imprint!(\"lib::imp\", \"ia\")")
+            .expect("imprint into ia");
+
+        session
+            .query("ia.t(*)")
+            .expect("the imprinted table must live in ia's image");
+        session
+            .query("ib.t(*)")
+            .err()
+            .expect("ib's image must be untouched");
+    }
 
     #[test]
     fn postgres_urls_route_to_the_fatboy() {

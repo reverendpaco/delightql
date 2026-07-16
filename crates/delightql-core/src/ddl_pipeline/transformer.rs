@@ -403,6 +403,7 @@ fn transform_ddl_predicate(
                 functor,
                 arguments,
                 exists,
+                ..
             } => match functor.as_str() {
                 "like" => {
                     if arguments.len() != 2 {
@@ -701,6 +702,7 @@ mod tests {
             expr: Box::new(BooleanExpression::Sigma {
                 condition: Box::new(SigmaCondition::SigmaCall {
                     functor: "like".to_string(),
+                    namespace: Default::default(),
                     arguments: vec![value_placeholder(), lit_str("%abc")],
                     exists: true,
                 }),
@@ -726,6 +728,7 @@ mod tests {
             expr: Box::new(BooleanExpression::Sigma {
                 condition: Box::new(SigmaCondition::SigmaCall {
                     functor: "like".to_string(),
+                    namespace: Default::default(),
                     arguments: vec![value_placeholder(), lit_str("%test%")],
                     exists: false,
                 }),

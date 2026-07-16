@@ -121,6 +121,12 @@ pub enum SigmaCondition<Phase = Unresolved> {
     SigmaCall {
         /// Functor name (e.g., "like", "=", "<")
         functor: String,
+        /// Namespace qualifier (`+HL.h(v)`, `+a::b.h(v)`): the alias or
+        /// path text as WRITTEN — resolved alias- and scope-aware by the
+        /// resolver's sigma arm. Empty = unqualified. (Review qmqwqlms
+        /// round 3: the builder used to DROP the qualifier silently.)
+        #[serde(default)]
+        namespace: crate::pipeline::asts::core::metadata::NamespacePath,
         /// Arguments to the predicate
         arguments: Vec<DomainExpression<Phase>>,
         /// True for EXISTS (+), false for NOT EXISTS (\+)

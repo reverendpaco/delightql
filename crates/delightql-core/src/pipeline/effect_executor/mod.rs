@@ -104,6 +104,15 @@ pub fn execute_effects(query: Query, system: &mut DelightQLSystem) -> Result<Que
             })
         }
         Query::WithErContext { context, query } => {
+            // R9 (DIRECTIVE-CONVERGENCE-PLAN Phase 1B): a transparent ER
+            // context is not the REPL/CLI top level, so a session-directive
+            // demand beneath it must refuse with the rule-citing diagnostic
+            // instead of surviving into the resolver as a pseudo-predicate
+            // panic. Recursive DISCOVERY only — do not recurse execution
+            // here: blind recursion was tried during wvvrqxzv and regressed
+            // snapshot--82/83/84 and torture--99 through duplicate/altered
+            // enlist context. Pinned by directive_contract/04_er_wrapper_r9.
+            refuse_nested_session_directives_in_query(&query)?;
             Ok(Query::WithErContext { context, query })
         }
         Query::ReplTempView { query, view_name } => {
@@ -309,6 +318,110 @@ fn nested_session_guard() -> NestedSessionDirectiveGuard {
     }
 }
 
+/// Compile purity (DIRECTIVE-CONVERGENCE-PLAN Phase 1B): find every demand
+/// that Phase 1.X would EXECUTE, so a pure inspection surface can refuse it
+/// cleanly before any mutation. The executing positions mirror this module's
+/// dispatch exactly: pseudo-predicate relations, directive pipe terminals,
+/// and namespace-qualified bin executables in Ground/TVF/piped positions.
+/// DML terminals are absent deliberately — they lower to SQL and execute
+/// only when the compiled query runs, so inspecting them is already pure
+/// (pinned by directive_contract/06_compile_is_pure).
+struct ExecutingDemandGuard<'a> {
+    registry: &'a crate::bin_cartridge::registry::BinCartridgeRegistry,
+    stage: &'a str,
+}
+
+impl ExecutingDemandGuard<'_> {
+    fn refuse(&self, name: &str) -> DelightQLError {
+        DelightQLError::validation_error_categorized(
+            "effect/compile/purity",
+            format!(
+                "sys::execution.compile is pure: compiling to stage '{}' would \
+                 execute '{}' — inspection must never mutate the namespace, \
+                 database, filesystem, output, or session. Compile to 'cst' or \
+                 'ast-unresolved' to inspect this source, or run it as a query \
+                 to execute it.",
+                self.stage, name
+            ),
+            "compile purity",
+        )
+    }
+
+    fn is_bin_executable(&self, ns: &[&str], name: &str) -> bool {
+        self.registry
+            .lookup_qualified_entity(ns, name)
+            .and_then(|entity| entity.as_effect_executable().map(|_| ()))
+            .is_some()
+    }
+}
+
+impl AstVisit<Unresolved> for ExecutingDemandGuard<'_> {
+    fn enter_relation(&mut self, relation: &Relation) -> Result<Descent> {
+        match relation {
+            Relation::PseudoPredicate { name, .. } => Err(self.refuse(name)),
+            Relation::Ground {
+                identifier,
+                ..
+            } if !identifier.namespace_path.is_empty() => {
+                let ns: Vec<&str> = identifier
+                    .namespace_path
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect();
+                if self.is_bin_executable(&ns, identifier.name.as_str()) {
+                    return Err(self.refuse(identifier.name.as_str()));
+                }
+                Ok(Descent::Continue)
+            }
+            Relation::TVF {
+                function,
+                namespace: Some(ns),
+                ..
+            } if !ns.is_empty() => {
+                let ns: Vec<&str> = ns.iter().map(|item| item.name.as_str()).collect();
+                if self.is_bin_executable(&ns, function.as_str()) {
+                    return Err(self.refuse(function.as_str()));
+                }
+                Ok(Descent::Continue)
+            }
+            _ => Ok(Descent::Continue),
+        }
+    }
+
+    fn enter_operator(&mut self, operator: &UnaryRelationalOperator) -> Result<Descent> {
+        match operator {
+            UnaryRelationalOperator::DirectiveTerminal { name, .. }
+            | UnaryRelationalOperator::DirectivePipeInvocation { name, .. } => {
+                Err(self.refuse(name))
+            }
+            UnaryRelationalOperator::HoViewApplication {
+                function,
+                namespace: Some(ns),
+                ..
+            } => {
+                let ns: Vec<&str> = ns.iter().map(|item| item.name.as_str()).collect();
+                if self.is_bin_executable(&ns, function.as_str()) {
+                    return Err(self.refuse(function.as_str()));
+                }
+                Ok(Descent::Continue)
+            }
+            _ => Ok(Descent::Continue),
+        }
+    }
+}
+
+/// Refuse every demand Phase 1.X would execute, for a pure inspection of
+/// `query` rendered at `stage`. See `ExecutingDemandGuard`.
+pub(crate) fn refuse_executing_demands_for_inspection(
+    query: &Query,
+    registry: &crate::bin_cartridge::registry::BinCartridgeRegistry,
+    stage: &str,
+) -> Result<()> {
+    let mut guard = ExecutingDemandGuard { registry, stage };
+    walk_visit_query(&mut guard, query)?;
+    Ok(())
+}
+
 fn refuse_nested_session_directives_in_relational(expr: &RelationalExpression) -> Result<()> {
     walk_visit_relational(&mut nested_session_guard(), expr)?;
     Ok(())
@@ -367,10 +480,12 @@ fn execute_effects_in_relation(
         // This is the key case: execute the pseudo-predicate!
         Relation::PseudoPredicate {
             name,
+            namespace,
             arguments,
+            access,
             alias,
             ..
-        } => execute_pseudo_predicate(&name, &arguments, alias, system),
+        } => execute_pseudo_predicate(&name, &namespace, &arguments, &access, alias, system),
 
         // InnerRelation contains a subquery that might have pseudo-predicates
         Relation::InnerRelation {
@@ -487,6 +602,14 @@ fn execute_effects_in_relation(
 
 /// Execute a directive pipe: source |> terminal!(args)
 ///
+/// THE SESSION-CHAIN DISPATCHER (M3's legal Phase-1.X path, RECONCILED
+/// by D3c — see EFFECT-BARRIER-DESIGN M4): top-level session
+/// orchestration lives here deliberately, now set-at-a-time (one lifted
+/// call, never a row loop). Its stringly binding
+/// (`bind_directive_args`) remains the fenced interim seam, retired
+/// when `execute_lifted` takes a typed relation — the typed-program
+/// consolidation step.
+///
 /// 1. Execute the source expression (recursively handles chained pipes)
 /// 2. Extract rows from the source (anonymous fast path, or full pipeline)
 /// 3. For each row, bind the terminal arguments and execute the terminal directive
@@ -498,46 +621,108 @@ fn execute_directive_pipe(
     ctes: &[CteBinding],
     system: &mut DelightQLSystem,
 ) -> Result<RelationalExpression> {
+    // EFFECT-ALGEBRA §3 (amended 2026-07-15): piping a WHOLE receipt where
+    // a directive's argumentative functor expects its PAYLOAD is a shape
+    // error, taught as such. Detected structurally, before anything
+    // executes: the source is itself a directive invocation (its value is
+    // a receipt) and the receipt's declared width does not match the
+    // terminal's parameter list. Pinned by directive_contract
+    // 34_bare_receipt_chain_refused.
+    if let RelationalExpression::Relation(Relation::PseudoPredicate {
+        name: source_name,
+        namespace: source_ns,
+        ..
+    }) = &source
+    {
+        let bare = terminal_name.strip_suffix('!').unwrap_or(terminal_name);
+        let terminal_arity = crate::pipeline::asts::effects::descriptor(terminal_name)
+            .map(|d| d.params.len());
+        let ns_strs: Vec<&str> = source_ns.iter().map(|s| s.as_str()).collect();
+        let source_entity = if ns_strs.is_empty() {
+            system.bin_registry().lookup_entity(source_name)
+        } else {
+            system
+                .bin_registry()
+                .lookup_qualified_entity(&ns_strs, source_name)
+        };
+        let receipt_width = source_entity.and_then(|e| match e.signature().output_schema {
+            crate::bin_cartridge::OutputSchema::Relation(cols) => Some(cols.len()),
+            crate::bin_cartridge::OutputSchema::Void => None,
+        });
+        if let (Some(arity), Some(width)) = (terminal_arity, receipt_width) {
+            if width != arity {
+                return Err(DelightQLError::validation_error_categorized(
+                    "directive/chain/receipt_shape",
+                    format!(
+                        "{source_name} |> {terminal_name} pipes a WHOLE receipt \
+                         ({width} declared column(s)) into {bare}!'s \
+                         {arity}-parameter argumentative functor — a shape error. \
+                         Release the payload first: \
+                         {source_name}(…) |> .returned(*) |> {terminal_name}(*) \
+                         (EFFECT-ALGEBRA §3)",
+                    ),
+                    "receipt into directive",
+                ));
+            }
+        }
+    }
+
     // 1. Execute source (recursively handles chained directive pipes and pseudo-predicates)
     let executed_source = execute_effects_in_expression(source, ctes, system)?;
 
     // 2. Extract rows — fast path for anonymous, full pipeline for anything else
     let (headers, rows) = extract_rows(executed_source, ctes, system)?;
 
-    // 3. For each row, bind arguments and execute the terminal directive
-    let mut all_result_rows = Vec::new();
-    let mut result_headers: Option<Vec<DomainExpression>> = None;
+    // 3. ONE set-at-a-time application (D3b, subsuming M1's boundary):
+    // the rowwise loop is DELETED. A piped relation is one demand of the
+    // terminal's argumentative functor (M2 reframe) — the lifted rows
+    // bind once and the entity executes ONCE:
+    //
+    //   - doc! (the first setwise override) receives the whole lifted
+    //     relation and answers ONE receipt (directive_contract 38);
+    //   - a ONE-row lift takes the scalar path (execute_pseudo_predicate,
+    //     with its descriptor arity and receipt-access discipline) — the
+    //     shape every pinned session chain uses;
+    //   - a MULTI-row lift to any non-overriding terminal refuses with
+    //     not-yet (the E1a precedent; directive_contract 37) — the
+    //     refusal now lives in EffectExecutable::execute_lifted's
+    //     default, uniformly for every category;
+    //   - an EMPTY lift stays the status-quo no-op.
+    let bound_rows: Vec<Vec<DomainExpression>> = rows
+        .iter()
+        .map(|row_values| bind_directive_args(&headers, row_values, terminal_args))
+        .collect::<Result<_>>()?;
 
-    for row_values in &rows {
-        let bound_args = bind_directive_args(&headers, row_values, terminal_args)?;
-        let result = execute_pseudo_predicate(terminal_name, &bound_args, None, system)?;
+    let bare = terminal_name.strip_suffix('!').unwrap_or(terminal_name);
+    let result = if bare == "doc" || bound_rows.len() != 1 {
+        let entity = system.bin_registry().lookup_entity(terminal_name).ok_or_else(|| {
+            DelightQLError::database_error(
+                format!("Unknown pseudo-predicate: {}", terminal_name),
+                "Entity not found",
+            )
+        })?;
+        let executable = entity.as_effect_executable().ok_or_else(|| {
+            DelightQLError::database_error(
+                format!("Entity '{}' is not effect-executable", terminal_name),
+                "Not an effect-executable entity",
+            )
+        })?;
+        system.note_effect_executed();
+        let crate::bin_cartridge::EntityResult::Relation(r) =
+            executable.execute_lifted(&bound_rows, None, system)?;
+        r
+    } else {
+        execute_pseudo_predicate(
+            terminal_name,
+            &[],
+            &bound_rows[0],
+            &crate::pipeline::asts::core::DomainSpec::Glob,
+            None,
+            system,
+        )?
+    };
 
-        if let Relation::Anonymous {
-            column_headers,
-            rows: result_rows,
-            ..
-        } = result
-        {
-            if result_headers.is_none() {
-                result_headers = column_headers;
-            }
-            all_result_rows.extend(result_rows);
-        } else {
-            // Non-anonymous results (e.g., Ground relations) — skip collecting rows,
-            // the directive executed its side effects successfully
-        }
-    }
-
-    // 4. Return combined Anonymous relation
-    Ok(RelationalExpression::Relation(Relation::Anonymous {
-        column_headers: result_headers,
-        rows: all_result_rows,
-        alias: None,
-        outer: false,
-        exists_mode: false,
-        qua_target: None,
-        cpr_schema: PhaseBox::phantom(),
-    }))
+    Ok(RelationalExpression::Relation(result))
 }
 
 /// Execute a bin entity in a piped context: source |> ns::entity(*)
@@ -554,45 +739,19 @@ fn execute_bin_entity_pipe(
 ) -> Result<RelationalExpression> {
     let executed_source = execute_effects_in_expression(source, ctes, system)?;
     let (_headers, rows) = extract_rows(executed_source, ctes, system)?;
-    if rows.is_empty() {
-        return Err(DelightQLError::database_error(
-            "No rows to pass to bin entity",
-            "Empty source",
-        ));
-    }
 
-    let mut all_result_rows = Vec::new();
-    let mut result_headers: Option<Vec<DomainExpression>> = None;
-
-    for row_values in &rows {
-        system.note_effect_executed();
-        let result = executable.execute(row_values, None, system)?;
-        match result {
-            crate::bin_cartridge::EntityResult::Relation(Relation::Anonymous {
-                column_headers,
-                rows: result_rows,
-                ..
-            }) => {
-                if result_headers.is_none() {
-                    result_headers = column_headers;
-                }
-                all_result_rows.extend(result_rows);
-            }
-            crate::bin_cartridge::EntityResult::Relation(_) => {
-                // Non-anonymous relation result — skip row collection
-            }
-        }
-    }
-
-    Ok(RelationalExpression::Relation(Relation::Anonymous {
-        column_headers: result_headers,
-        rows: all_result_rows,
-        alias: None,
-        outer: false,
-        exists_mode: false,
-        qua_target: None,
-        cpr_schema: PhaseBox::phantom(),
-    }))
+    // D3c: ONE set-at-a-time application (the last rowwise loop deleted).
+    // Finding 1 (CODE-REVIEW-zzpmxuzp::otolxyzl): an EMPTY source is not
+    // refused here — pipe is application, so the lift reaches the entity
+    // once regardless of cardinality; execute_lifted (or its override)
+    // owns the semantics.
+    // The lifted default delegates one-row lifts to the scalar execute
+    // and refuses multi-row lifts with not-yet; a setwise entity (doc!)
+    // receives the whole relation and answers one receipt.
+    system.note_effect_executed();
+    let crate::bin_cartridge::EntityResult::Relation(r) =
+        executable.execute_lifted(&rows, None, system)?;
+    Ok(RelationalExpression::Relation(r))
 }
 
 /// Extract rows from a source expression.
@@ -770,38 +929,131 @@ fn bind_directive_args(
 }
 
 /// Execute a specific pseudo-predicate and return its result as an inline table
+///
+/// Resolution (DIRECTIVE-CONVERGENCE-PLAN Phase 2): identity is
+/// (namespace, name). Qualified invocations resolve their spelled path
+/// exactly; unqualified invocations reach only universal-visibility
+/// namespaces. Contextual absences refuse by DESCRIPTOR POLICY with a
+/// teaching diagnostic, never with a bare "unknown" error, and the
+/// descriptor's arity is authoritative before the entity runs.
 fn execute_pseudo_predicate(
     name: &str,
+    namespace: &[String],
     arguments: &[DomainExpression],
+    access: &crate::pipeline::asts::core::DomainSpec,
     alias: Option<String>,
     system: &mut DelightQLSystem,
 ) -> Result<Relation> {
-    // Look up the entity in the bin cartridge registry
-    // lookup_entity() returns Arc<dyn BinEntity>, which we can hold after
-    // the registry borrow is released (Arc keeps the entity alive)
-    let entity = system.bin_registry().lookup_entity(name).ok_or_else(|| {
-        // Check for renamed pseudo-predicates and give a helpful error
-        const RENAMED: &[(&str, &str)] = &[
-            ("engage!", "enlist!"),
-            ("part!", "delist!"),
-            ("ground_into!", "ground!"),
-        ];
-        if let Some((_, new_name)) = RENAMED.iter().find(|(old, _)| *old == name) {
-            DelightQLError::database_error(
-                format!("{}() has been renamed to {}(). Please update your code.", name, new_name),
+    use crate::pipeline::asts::effects::{descriptor, DirectiveRealization, RENAMED_DIRECTIVES};
+
+    let ns_strs: Vec<&str> = namespace.iter().map(|s| s.as_str()).collect();
+    let entity = if ns_strs.is_empty() {
+        system.bin_registry().lookup_entity(name)
+    } else {
+        system
+            .bin_registry()
+            .lookup_qualified_entity(&ns_strs, name)
+    };
+
+    let entity = entity.ok_or_else(|| {
+        let bare = name.strip_suffix('!').unwrap_or(name);
+        // Renamed pseudo-predicates get the migration hint first.
+        if let Some((_, new_name)) = RENAMED_DIRECTIVES.iter().find(|(old, _)| *old == bare) {
+            return DelightQLError::database_error(
+                format!(
+                    "{}!() has been renamed to {}!(). Please update your code.",
+                    bare, new_name
+                ),
                 "Renamed directive",
-            )
-        } else {
-            DelightQLError::database_error(
-                format!("Unknown pseudo-predicate: {}", name),
-                "Pseudo-predicate not found in registry. Make sure it's registered in a bin cartridge.",
-            )
+            );
         }
+        // Descriptor policy: an intentional contextual absence refuses with
+        // a rule-citing diagnostic, never a registration accident.
+        if let Some(desc) = descriptor(name) {
+            match desc.realization {
+                DirectiveRealization::SyntaxPipeTerminal => {
+                    return DelightQLError::validation_error_categorized(
+                        "directive/context/pipe_terminal",
+                        format!(
+                            "'{bare}!' is a pipe terminal, not a callable \
+                             pseudo-predicate — it needs its piped input \
+                             relation: source |> {bare}!(…)(*)"
+                        ),
+                        "directive policy",
+                    );
+                }
+                DirectiveRealization::LiminalOnly => {
+                    return DelightQLError::validation_error_categorized(
+                        "directive/context/liminal_only",
+                        format!(
+                            "'{bare}!' is legal only in the liminal space of a \
+                             consulted file, not as a query invocation"
+                        ),
+                        "directive policy",
+                    );
+                }
+                DirectiveRealization::Entity => {
+                    // A registered entity that this lookup could not see:
+                    // either a wrong qualifier or non-universal visibility.
+                    return DelightQLError::database_error(
+                        format!(
+                            "'{}!' is not visible {} — its identity is {}.{bare}!",
+                            bare,
+                            if ns_strs.is_empty() {
+                                "unqualified".to_string()
+                            } else {
+                                format!("in namespace '{}'", ns_strs.join("::"))
+                            },
+                            desc.namespace,
+                        ),
+                        "Directive not visible",
+                    );
+                }
+            }
+        }
+        DelightQLError::database_error(
+            format!("Unknown pseudo-predicate: {}", name),
+            "Pseudo-predicate not found in registry. Make sure it's registered in a bin cartridge.",
+        )
     })?;
     // Registry borrow ends here, but Arc keeps entity alive
 
+    // Descriptor arity is AUTHORITATIVE for binding: refuse before the
+    // entity runs. (Entities keep internal checks as redundancy; agreement
+    // between descriptor and entity signature is pinned by unit tests.)
+    if let Some(desc) = descriptor(name) {
+        let required = desc.params.iter().filter(|p| !p.optional).count();
+        let maximum = desc.params.len();
+        if arguments.len() < required || arguments.len() > maximum {
+            let bare = name.strip_suffix('!').unwrap_or(name);
+            let expectation = if required == maximum {
+                format!("{required}")
+            } else {
+                format!("{required}..{maximum}")
+            };
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/binding/arity",
+                format!(
+                    "{bare}! expects {expectation} argument(s) ({}), got {}",
+                    desc.params
+                        .iter()
+                        .map(|p| p.name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    arguments.len()
+                ),
+                "directive arity",
+            ));
+        }
+    }
+
+    // EFFECT DISCIPLINE (Phase 3a review remediation, P1): a rejected
+    // program must not leave behind the effect whose result it failed to
+    // bind. Receipt access is validated against the entity's DECLARED
+    // output schema BEFORE execution — never discovered by executing first.
+    prevalidate_receipt_access(&entity.signature().output_schema, access, name)?;
+
     // Downcast to EffectExecutable
-    // This is safe because we only look up pseudo-predicates here, and they all implement EffectExecutable
     let executable = entity.as_effect_executable().ok_or_else(|| {
         DelightQLError::database_error(
             format!(
@@ -817,7 +1069,286 @@ fn execute_pseudo_predicate(
     system.note_effect_executed();
     let result = executable.execute(arguments, alias, system)?;
 
-    // Convert EntityResult to Relation
+    // Convert EntityResult to Relation, then apply the returned-relation
+    // access specification (the SECOND parentheses — Phase 3 canonical
+    // invocation: parameters first, receipt access second).
     let crate::bin_cartridge::EntityResult::Relation(relation) = result;
-    Ok(relation)
+    apply_receipt_access(relation, access, name, &entity.signature().output_schema)
+}
+
+/// Prevalidate a returned-relation access specification against a
+/// directive's DECLARED output schema — before any effect executes.
+///
+/// INTERIM GATE (pre-Phase-4): only `(*)` and a positional list of plain
+/// unqualified names whose arity matches the declared receipt heading are
+/// permitted. Everything else refuses HERE, so a malformed access can
+/// never consult/enlist/mount first and fail second. Phase 4's canonical
+/// receipts replace this gate (and the binder below) with ordinary
+/// relation-access machinery over authoritative receipt headings.
+fn prevalidate_receipt_access(
+    schema: &crate::bin_cartridge::OutputSchema,
+    access: &crate::pipeline::asts::core::DomainSpec,
+    directive_name: &str,
+) -> Result<()> {
+    use crate::pipeline::asts::core::DomainSpec;
+
+    let exprs = match access {
+        DomainSpec::Glob | DomainSpec::Bare => return Ok(()),
+        DomainSpec::Positional(exprs) => exprs,
+        other => {
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/invocation/access",
+                format!(
+                    "unsupported receipt access on {directive_name}: {other:?} — \
+                     use (*) for the whole receipt or a positional binding list"
+                ),
+                "receipt access",
+            ))
+        }
+    };
+    if exprs.len() == 1
+        && matches!(
+            &exprs[0],
+            DomainExpression::Projection(
+                crate::pipeline::asts::core::expressions::domain::ProjectionExpr::Glob { .. }
+            )
+        )
+    {
+        return Ok(());
+    }
+    for e in exprs {
+        if !matches!(
+            e,
+            DomainExpression::Lvar {
+                qualifier: None,
+                ..
+            }
+        ) {
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/invocation/access",
+                format!(
+                    "receipt access on {directive_name} must be a positional \
+                     binding list of plain names, got {e:?}"
+                ),
+                "receipt access",
+            ));
+        }
+    }
+    match schema {
+        crate::bin_cartridge::OutputSchema::Relation(cols) => {
+            if exprs.len() != cols.len() {
+                let heading = cols
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(DelightQLError::validation_error_categorized(
+                    "directive/invocation/access",
+                    format!(
+                        "receipt access on {directive_name} binds {} column(s) but \
+                         the declared receipt has {} ({heading}) — positional \
+                         binding requires the exact arity, or (*) for the whole \
+                         receipt",
+                        exprs.len(),
+                        cols.len()
+                    ),
+                    "receipt access",
+                ));
+            }
+        }
+        crate::bin_cartridge::OutputSchema::Void => {
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/invocation/access",
+                format!(
+                    "receipt access on {directive_name}: this entity declares no \
+                     receipt columns — use (*)"
+                ),
+                "receipt access",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply a returned-relation access specification to a directive's result.
+///
+/// INTERIM GATE (pre-Phase-4, see `prevalidate_receipt_access`): NOT the
+/// final binder. `(*)` is the full receipt; a positional access list binds
+/// the receipt's columns positionally by RENAMING — prevalidated against
+/// the declared schema before execution, so a failure here means the
+/// entity broke its own declaration. Phase 4 replaces this with ordinary
+/// relation-access machinery over canonical receipts (unification,
+/// placeholders, and qualified access included).
+fn apply_receipt_access(
+    relation: Relation,
+    access: &crate::pipeline::asts::core::DomainSpec,
+    directive_name: &str,
+    declared_schema: &crate::bin_cartridge::OutputSchema,
+) -> Result<Relation> {
+    use crate::pipeline::asts::core::DomainSpec;
+
+    let exprs = match access {
+        DomainSpec::Glob | DomainSpec::Bare => return Ok(relation),
+        DomainSpec::Positional(exprs) => exprs,
+        other => {
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/invocation/access",
+                format!(
+                    "unsupported receipt access on {directive_name}: {other:?} — \
+                     use (*) for the whole receipt or a positional binding list"
+                ),
+                "receipt access",
+            ))
+        }
+    };
+    // A lone glob inside the positional list is still the full receipt.
+    if exprs.len() == 1
+        && matches!(
+            &exprs[0],
+            DomainExpression::Projection(
+                crate::pipeline::asts::core::expressions::domain::ProjectionExpr::Glob { .. }
+            )
+        )
+    {
+        return Ok(relation);
+    }
+
+    let binder_names: Vec<String> = exprs
+        .iter()
+        .map(|e| match e {
+            DomainExpression::Lvar {
+                name,
+                qualifier: None,
+                ..
+            } => Ok(name.to_string()),
+            other => Err(DelightQLError::validation_error_categorized(
+                "directive/invocation/access",
+                format!(
+                    "receipt access on {directive_name} must be a positional \
+                     binding list of plain names, got {other:?}"
+                ),
+                "receipt access",
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // An interior-bearing receipt (EFFECT-ALGEBRA §3 amended: the
+    // construction is an inner relation, not an inline table) binds
+    // positionally by RENAMING through an ordinary projection over the
+    // DECLARED heading — prevalidation already matched the arity.
+    if let Relation::InnerRelation { .. } = &relation {
+        let crate::bin_cartridge::OutputSchema::Relation(cols) = declared_schema else {
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/invocation/access",
+                format!(
+                    "receipt access on {directive_name}: this entity declares no \
+                     receipt columns — use (*)"
+                ),
+                "receipt access",
+            ));
+        };
+        use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
+        use crate::pipeline::asts::core::expressions::PipeExpression;
+        use crate::pipeline::asts::core::ContainmentSemantic;
+        let renamed = RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
+            PipeExpression {
+                source: RelationalExpression::Relation(relation),
+                operator: UnaryRelationalOperator::General {
+                    containment_semantic: ContainmentSemantic::Parenthesis,
+                    expressions: cols
+                        .iter()
+                        .zip(binder_names.iter())
+                        .map(|((declared, _), bound)| {
+                            let mut b =
+                                DomainExpression::lvar_builder(declared.clone());
+                            if bound != declared {
+                                b = b.with_alias(bound.clone());
+                            }
+                            b.build()
+                        })
+                        .collect(),
+                },
+                cpr_schema: PhaseBox::phantom(),
+            },
+        )));
+        let wrapper = format!("__b_{}", directive_name.trim_end_matches('!'));
+        return Ok(Relation::InnerRelation {
+            pattern: InnerRelationPattern::Indeterminate {
+                identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
+                    namespace_path: crate::pipeline::asts::core::metadata::NamespacePath::empty(),
+                    name: wrapper.clone().into(),
+                    grounding: None,
+                },
+                subquery: Box::new(renamed),
+            },
+            alias: Some(wrapper.into()),
+            outer: false,
+            cpr_schema: PhaseBox::phantom(),
+        });
+    }
+
+    let Relation::Anonymous {
+        column_headers,
+        rows,
+        alias,
+        outer,
+        exists_mode,
+        qua_target,
+        ..
+    } = relation
+    else {
+        return Err(DelightQLError::validation_error_categorized(
+            "directive/invocation/access",
+            format!(
+                "receipt access on {directive_name}: the directive result is \
+                 not an inline receipt relation"
+            ),
+            "receipt access",
+        ));
+    };
+
+    let receipt_width = column_headers
+        .as_ref()
+        .map(|h| h.len())
+        .or_else(|| rows.first().map(|r| r.values.len()))
+        .unwrap_or(0);
+    if binder_names.len() != receipt_width {
+        let heading = column_headers
+            .as_ref()
+            .map(|hs| {
+                hs.iter()
+                    .filter_map(|h| match h {
+                        DomainExpression::Lvar { name, .. } => Some(name.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Err(DelightQLError::validation_error_categorized(
+            "directive/invocation/access",
+            format!(
+                "receipt access on {directive_name} binds {} column(s) but the \
+                 receipt has {} ({heading}) — positional binding requires the \
+                 exact arity, or (*) for the whole receipt",
+                binder_names.len(),
+                receipt_width
+            ),
+            "receipt access",
+        ));
+    }
+
+    let bound_headers = binder_names
+        .into_iter()
+        .map(|n| DomainExpression::lvar_builder(n).build())
+        .collect();
+    Ok(Relation::Anonymous {
+        column_headers: Some(bound_headers),
+        rows,
+        alias,
+        outer,
+        exists_mode,
+        qua_target,
+        cpr_schema: PhaseBox::phantom(),
+    })
 }

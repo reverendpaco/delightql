@@ -271,6 +271,20 @@ pub struct CteBinding<Phase = Unresolved> {
     /// The name to bind this expression to
     #[lispy("name")]
     pub name: String,
+    /// TYPED provenance (review qmqwqlms round 2, P2): who authored this
+    /// CTE — set at CONSTRUCTION, never inferred from the name (a user
+    /// may legally write `_ho_*` identifiers). The 462-weave scope
+    /// override keys on this.
+    #[serde(default)]
+    #[lispy("origin")]
+    pub origin: crate::pipeline::asts::core::provenance::CteOrigin,
+    /// WHOSE scope resolves this CTE's names (review qmqwqlms round 3,
+    /// P1) — Caller only for the squished weave's caller-side carriers;
+    /// the entity's own clause-body wrappers stay Entity even though
+    /// they are compiler-CONSTRUCTED. Distinct from `origin` above.
+    #[serde(default)]
+    #[lispy("resolution_owner")]
+    pub resolution_owner: crate::pipeline::asts::core::provenance::CteResolutionOwner,
     /// True when the label carries the `!` effect marker (`expression : name!`,
     /// EFFECT-ALGEBRA R4): the CTE's expression demands a directive. Read
     /// from the CST's `effect_marker` field by the builder (REPORT-2.1 note 1

@@ -22,6 +22,8 @@ fn address_query_inner(query: ast_refined::Query) -> Result<ast_addressed::Query
                     ast_addressed::CteBinding {
                         expression: addressed_expr,
                         name: cte.name,
+                        origin: cte.origin,
+                        resolution_owner: cte.resolution_owner,
                         effect_label: cte.effect_label,
                         is_recursive: is_recursive.new(),
                     }

@@ -127,7 +127,7 @@ use crate::pipeline::asts::core::{
 };
 use crate::pipeline::asts::ddl::HoParamKind;
 use crate::pipeline::asts::effects::{self, DirectiveCategory, EffectCteDef, EffectRule};
-use crate::pipeline::compiled_query::{CompiledPlan, PlanCreatedObject, PlanEntry, PlanStatement};
+use crate::pipeline::compiled_query::{self, CompiledPlan, PlanCreatedObject, PlanEntry, PlanStatement};
 use crate::pipeline::sql_ast_v3::{
     DomainExpression as SqlExpr, JoinCondition, JoinType, QueryExpression, SelectItem,
     SelectStatement, SqlStatement, TableExpression,
@@ -226,11 +226,29 @@ pub(crate) fn compile_query_plan(
     query: &Query,
     namespace: Option<&str>,
 ) -> Result<CompiledPlan> {
+    compile_query_plan_annotated(system, query, namespace, &[], &[])
+}
+
+/// Phase 10 slice b (semantic routing): annotated statements ride the
+/// SAME typed program as unannotated ones — assertions and emits become
+/// typed steps at the head of the plan, in the ruled order (assertions
+/// first, abort on failure; emits notify-never-abort).
+pub(crate) fn compile_query_plan_annotated(
+    system: &DelightQLSystem,
+    query: &Query,
+    namespace: Option<&str>,
+    assertions: &[crate::pipeline::asts::core::queries::AssertionSpec],
+    emits: &[crate::pipeline::asts::core::queries::EmitSpec],
+) -> Result<CompiledPlan> {
     let body = effects::EffectBody::from_query(query)?;
     compile_with_settled_connection(
         system,
         || PlanBuilder::new(system, namespace),
-        |b| b.compile_top_body(body.clone()),
+        |b| {
+            b.pending_assertions = assertions.to_vec();
+            b.pending_emits = emits.to_vec();
+            b.compile_top_body(body.clone())
+        },
     )
 }
 
@@ -308,7 +326,7 @@ fn lookup_effect_rule(
 ) -> Result<Option<EffectRule>> {
     let schema = system.get_schema()?;
     let registry = EntityRegistry::new_with_system(schema, system);
-    let Some(entity) = registry.consult.lookup_entity(rule_name, namespace) else {
+    let Some(entity) = registry.consult.lookup_entity(rule_name, namespace, None) else {
         return Ok(None);
     };
     if entity.entity_type != crate::enums::EntityType::DqlEffectRule {
@@ -387,6 +405,45 @@ struct ReceiptSink {
 
 /// Static shape of a receipt-producing directive's row (EFFECT-ALGEBRA §3):
 /// `success`, `operation`, then the parameter echoes — compile-time
+/// The `(returned.*)` interior-heading projection — the second operator
+/// of the canonical release shape (txmyxvos fusion trigger).
+fn is_returned_heading_projection(op: &UnaryRelationalOperator) -> bool {
+    use crate::pipeline::asts::core::expressions::domain::ProjectionExpr;
+    matches!(
+        op,
+        UnaryRelationalOperator::General { expressions, .. }
+            if expressions.len() == 1
+                && matches!(
+                    &expressions[0],
+                    DomainExpression::Projection(ProjectionExpr::Glob {
+                        qualifier: Some(q),
+                        ..
+                    }) if q.as_str() == "returned"
+                )
+    )
+}
+
+/// The exact glob drill into `returned` — the first operator of the
+/// canonical release shape (no narrowing, no groundings).
+fn is_returned_glob_drill(op: &UnaryRelationalOperator) -> bool {
+    matches!(
+        op,
+        UnaryRelationalOperator::InteriorDrillDown {
+            column,
+            glob: true,
+            columns,
+            groundings,
+            ..
+        } if column == "returned" && columns.is_empty() && groundings.is_empty()
+    )
+}
+
+/// The outcome of an observed-payload fusion attempt (txmyxvos).
+enum FuseOutcome {
+    Fused(RelationalExpression),
+    NotApplicable(RelationalExpression),
+}
+
 /// constants.
 struct ReceiptShape {
     /// The producing directive's name as written (`"insert!"`).
@@ -452,6 +509,11 @@ struct PlanBuilder<'a> {
     system: &'a DelightQLSystem,
     config: resolver::ResolutionConfig,
 
+    /// Phase 10 slice b: annotation specs riding the typed program —
+    /// compiled into Assertion/Emit steps at the head of the plan.
+    pending_assertions: Vec<crate::pipeline::asts::core::queries::AssertionSpec>,
+    pending_emits: Vec<crate::pipeline::asts::core::queries::EmitSpec>,
+
     /// Scratch shells (receipt tables + exit flag): assembled BEFORE the
     /// transaction bracket (invariant §5.6).
     shells: Vec<PlanEntry>,
@@ -490,6 +552,28 @@ struct PlanBuilder<'a> {
     created_objects: Vec<PlanCreatedObject>,
     /// Dialect pack, loaded once per plan compile (mirrors Pipeline).
     pack: Option<std::sync::Arc<dialect_pack::DialectPack>>,
+
+    /// D2 (typed plan): step marks — each is an occurrence's slice of
+    /// `body`, closed by `mark_step` at the dispatch site right after the
+    /// handler emitted. The marks partition `body[0..step_marked]` in
+    /// order, so the typed steps' statement streams concatenate to the
+    /// flat entry list exactly (asserted by the D2 lib pins).
+    step_marks: Vec<StepMark>,
+    /// `body` index up to which entries have been claimed by a mark.
+    step_marked: usize,
+    /// D2: guard DEFINITIONS (Q-D3 as amended) — deduplicated by their
+    /// rendered SQL; requirements reference them by id.
+    guard_defs: Vec<compiled_query::GuardDefinition>,
+}
+
+/// D2: one occurrence's claim on a `body` range (see `mark_step`).
+struct StepMark {
+    start: usize,
+    end: usize,
+    kind: compiled_query::EffectStepKind,
+    occurrence: String,
+    operation: String,
+    requirements: Vec<compiled_query::Requirement>,
 }
 
 impl<'a> PlanBuilder<'a> {
@@ -500,6 +584,8 @@ impl<'a> PlanBuilder<'a> {
                 resolution_namespace: namespace.map(|n| n.to_string()),
                 ..resolver::ResolutionConfig::default()
             },
+            pending_assertions: Vec::new(),
+            pending_emits: Vec::new(),
             shells: Vec::new(),
             body: Vec::new(),
             notes: Vec::new(),
@@ -515,6 +601,9 @@ impl<'a> PlanBuilder<'a> {
             pending_comment: None,
             created_objects: Vec::new(),
             pack: None,
+            step_marks: Vec::new(),
+            step_marked: 0,
+            guard_defs: Vec::new(),
         }
     }
 
@@ -591,32 +680,202 @@ impl<'a> PlanBuilder<'a> {
             }));
         }
 
+        // THE ONE TYPED PROGRAM (CODE-REVIEW-zzpmxuzp::otolxyzl finding
+        // 3): setup, control, effect, return, and cleanup are ALL typed
+        // steps, and the flat entry list is DERIVED from them
+        // (`TypedEffectPlan::flatten`) — one source, no second positional
+        // authority to drift from, no arithmetic range reconstruction.
+        let armed = self.exit_armed;
+        self.mark_step(compiled_query::EffectStepKind::Return, "return", None, armed)?;
+        let entry_route = |e: &PlanEntry| match e {
+            PlanEntry::Statement(st) | PlanEntry::ShippedStatement(st) => st.connection_id,
+            PlanEntry::Assertion { statement, .. } | PlanEntry::Emit { statement, .. } => {
+                statement.connection_id
+            }
+            PlanEntry::BeginTransaction { connection_id, .. }
+            | PlanEntry::CommitTransaction { connection_id, .. } => *connection_id,
+        };
+        // A statement-only stream (every action but Host/Return).
+        let stmts_only = |entries: &[PlanEntry]| -> Result<Vec<PlanStatement>> {
+            entries
+                .iter()
+                .map(|e| match e {
+                    PlanEntry::Statement(st) => Ok(st.clone()),
+                    other => Err(internal(format!(
+                        "typed-plan construction: a ship inside a \
+                         statement-only action stream: {other:?}"
+                    ))),
+                })
+                .collect()
+        };
+        let control_step = |name: &str,
+                            route: Option<i64>,
+                            action: compiled_query::EffectAction| {
+            compiled_query::EffectStep {
+                occurrence: name.to_string(),
+                operation: name.to_string(),
+                span: None,
+                route,
+                requirements: Vec::new(),
+                action,
+            }
+        };
 
-        // Assemble the bracket. SQLite/DuckDB: scratch shells FIRST, then
-        // BEGIN, body, COMMIT (invariant §5.6; pinned by
-        // `bracket_scratch_shells_before_begin`). PG: the shells move
-        // INSIDE the bracket, right after BEGIN, because they carry
-        // ON COMMIT DROP (R-T3's recommended PG form — outside a
-        // transaction an ON COMMIT DROP table dies at end of its own
+        let mut steps: Vec<compiled_query::EffectStep> = Vec::new();
+        // Phase 10 slice b: annotation steps lead the plan — assertions
+        // first (read-only pre-checks, abort on a false verdict), then
+        // emit streams (notify-never-abort) — the SAME ruled order the
+        // degenerate conversion pins (`degenerate_entry_order_mirrors_relay`).
+        // Both sit OUTSIDE the bracket, before Setup/Begin.
+        let pending_assertions = std::mem::take(&mut self.pending_assertions);
+        for (i, spec) in pending_assertions.iter().enumerate() {
+            let text = self.compile_value_text(&spec.body)?;
+            let right_sql = match &spec.right_operand {
+                Some(r) => Some(self.compile_value_text(r)?.sql),
+                None => None,
+            };
+            let bool_sql = crate::pipeline::assertion_bool_wrap(
+                &spec.predicate,
+                &text.sql,
+                right_sql.as_deref(),
+            );
+            let conn = self.route(text.connection_id)?;
+            steps.push(compiled_query::EffectStep {
+                occurrence: format!("assert#{}", i + 1),
+                operation: "assert".to_string(),
+                span: spec.source_location,
+                route: conn,
+                requirements: Vec::new(),
+                action: compiled_query::EffectAction::Assertion {
+                    statement: PlanStatement {
+                        sql: bool_sql,
+                        connection_id: conn,
+                        comment: Some("assertion".to_string()),
+                    },
+                    source_location: spec.source_location,
+                },
+            });
+        }
+        let pending_emits = std::mem::take(&mut self.pending_emits);
+        for (i, spec) in pending_emits.iter().enumerate() {
+            let text = self.compile_value_text(&spec.body)?;
+            let conn = self.route(text.connection_id)?;
+            steps.push(compiled_query::EffectStep {
+                occurrence: format!("emit#{}", i + 1),
+                operation: "emit".to_string(),
+                span: spec.source_location,
+                route: conn,
+                requirements: Vec::new(),
+                action: compiled_query::EffectAction::Emit {
+                    name: spec.name.clone(),
+                    statement: PlanStatement {
+                        sql: text.sql,
+                        connection_id: conn,
+                        comment: Some(format!("emit:{}", spec.name)),
+                    },
+                    source_location: spec.source_location,
+                },
+            });
+        }
+        // Setup (scratch shells). POSITION encodes the dialect's placement
+        // (invariant §5.6): before Begin on SQLite/DuckDB; after Begin on
+        // PG, whose shells carry ON COMMIT DROP (R-T3's recommended form —
+        // outside a transaction such a table dies at end of its own
         // statement, P1 §A; pinned by
         // `pg_shells_move_in_bracket_with_on_commit_drop_and_pg_temp_spelling`).
-        let mut entries = Vec::with_capacity(self.shells.len() + self.body.len() + 2);
         let shells_in_bracket = self.shells_in_bracket_with_on_commit_drop();
+        let shells = std::mem::take(&mut self.shells);
+        let setup = if shells.is_empty() {
+            None
+        } else {
+            Some(control_step(
+                "setup",
+                self.plan_connection,
+                compiled_query::EffectAction::Setup(stmts_only(&shells)?),
+            ))
+        };
         if !shells_in_bracket {
-            entries.append(&mut self.shells);
+            steps.extend(setup.clone());
         }
-        entries.push(PlanEntry::BeginTransaction {
-            connection_id: self.plan_connection,
-            comment: None,
-        });
+        steps.push(control_step(
+            "begin",
+            self.plan_connection,
+            compiled_query::EffectAction::Begin {
+                connection_id: self.plan_connection,
+            },
+        ));
         if shells_in_bracket {
-            entries.append(&mut self.shells);
+            steps.extend(setup);
         }
-        entries.append(&mut self.body);
-        entries.push(PlanEntry::CommitTransaction {
-            connection_id: self.plan_connection,
-            comment: None,
-        });
+        // The body's marked occurrences, each converted to its typed
+        // action (the sum type validates ship placement structurally:
+        // only Host and Return can carry one).
+        for m in &self.step_marks {
+            let slice = &self.body[m.start..m.end];
+            let route = slice.iter().find_map(entry_route);
+            let action = match m.kind {
+                compiled_query::EffectStepKind::Dml => {
+                    compiled_query::EffectAction::Dml(stmts_only(slice)?)
+                }
+                compiled_query::EffectStepKind::Ddl => {
+                    compiled_query::EffectAction::Ddl(stmts_only(slice)?)
+                }
+                compiled_query::EffectStepKind::Exit => {
+                    compiled_query::EffectAction::Exit(stmts_only(slice)?)
+                }
+                compiled_query::EffectStepKind::RuleBoundary => {
+                    compiled_query::EffectAction::RuleBoundary(stmts_only(slice)?)
+                }
+                compiled_query::EffectStepKind::Host => {
+                    let (last, init) = slice.split_last().ok_or_else(|| {
+                        internal("typed-plan construction: an empty host stream".to_string())
+                    })?;
+                    let PlanEntry::ShippedStatement(ship) = last else {
+                        return Err(internal(
+                            "typed-plan construction: a host action must end in \
+                             its ship"
+                                .to_string(),
+                        ));
+                    };
+                    compiled_query::EffectAction::Host {
+                        statements: stmts_only(init)?,
+                        ship: ship.clone(),
+                    }
+                }
+                compiled_query::EffectStepKind::Return => {
+                    let (ship, init) = match slice.split_last() {
+                        Some((PlanEntry::ShippedStatement(ship), init)) => {
+                            (Some(ship.clone()), init)
+                        }
+                        _ => (None, slice),
+                    };
+                    compiled_query::EffectAction::Return {
+                        statements: stmts_only(init)?,
+                        ship,
+                    }
+                }
+                other => {
+                    return Err(internal(format!(
+                        "typed-plan construction: unexpected mark kind {other:?}"
+                    )))
+                }
+            };
+            steps.push(compiled_query::EffectStep {
+                occurrence: m.occurrence.clone(),
+                operation: m.operation.clone(),
+                span: None,
+                route,
+                requirements: m.requirements.clone(),
+                action,
+            });
+        }
+        steps.push(control_step(
+            "commit",
+            self.plan_connection,
+            compiled_query::EffectAction::Commit {
+                connection_id: self.plan_connection,
+            },
+        ));
         // Trailing scratch cleanup (review F1/F3's invariant, the read
         // direction): a persisting temp scratch table SHADOWS a same-named
         // user `main` table for every later unqualified read on this
@@ -624,28 +883,36 @@ impl<'a> PlanBuilder<'a> {
         // plan. After COMMIT: receipts were already read by the final
         // ship; abort never reaches these (in-bracket scratch rolls back;
         // shell residue is `drop_plan_scratch`'s job, relay/entry.rs).
-        // Exit-taken runs SKIP these entries (the pump skips post-exit
-        // data entries) — that residue is also drop_plan_scratch's job.
-        // Pinned by scratch--51/scratch--53 (effects ball).
-        // The drops are dialect-spelled through the `scratch.schema` slot.
-        // On PG the SHELL drops are clean no-ops (ON COMMIT DROP already
-        // removed them at COMMIT; DROP IF EXISTS of a missing pg_temp name
-        // is NOTICE + success, P1 H2) — kept, not suppressed (E-T2 flag 1):
-        // the in-bracket scratch (__snap_*/__src_in/__aff_*) is created
-        // WITHOUT ON COMMIT DROP and survives COMMIT, so its trailing drop
-        // is LOAD-BEARING on PG; distinguishing shell names from those to
-        // suppress only the former is fragile name-matching for zero
-        // benefit (the no-op drops are harmless). Verified LIVE: the E-T5
-        // capstone asserts zero `__`-named residue in ANY schema after a
-        // full PG run (`pg_run_torture_shaped_script_the_capstone`,
-        // crates/delightql-cli/tests/effects_on_targets.rs).
-        for name in &self.scratch_tables {
-            entries.push(PlanEntry::Statement(PlanStatement {
-                sql: format!("DROP TABLE IF EXISTS {}.{}", scratch_schema, name),
-                connection_id: self.plan_connection,
-                comment: Some("plan-scratch cleanup".to_string()),
-            }));
+        // Exit-taken runs SKIP the cleanup step (the pump's pre-COMMIT
+        // latch read) — that residue is also drop_plan_scratch's job.
+        // Pinned by scratch--51/scratch--53 (effects ball). The drops are
+        // dialect-spelled through the `scratch.schema` slot; on PG the
+        // SHELL drops are clean no-ops while the in-bracket scratch drops
+        // are LOAD-BEARING (E-T2 flag 1; the E-T5 capstone asserts zero
+        // `__`-named residue live).
+        if !self.scratch_tables.is_empty() {
+            let drops: Vec<PlanStatement> = self
+                .scratch_tables
+                .iter()
+                .map(|name| PlanStatement {
+                    sql: format!("DROP TABLE IF EXISTS {}.{}", scratch_schema, name),
+                    connection_id: self.plan_connection,
+                    comment: Some("plan-scratch cleanup".to_string()),
+                })
+                .collect();
+            steps.push(control_step(
+                "cleanup",
+                self.plan_connection,
+                compiled_query::EffectAction::Cleanup(drops),
+            ));
         }
+
+        let typed = compiled_query::TypedEffectPlan {
+            steps,
+            guards: self.guard_defs.clone(),
+        };
+        let entries = typed.flatten();
+        self.body.clear();
 
         Ok(CompiledPlan {
             entries,
@@ -662,6 +929,7 @@ impl<'a> PlanBuilder<'a> {
                 None
             },
             created_objects: std::mem::take(&mut self.created_objects),
+            typed: Some(typed),
         })
     }
 
@@ -779,7 +1047,9 @@ impl<'a> PlanBuilder<'a> {
         match rel {
             Relation::PseudoPredicate {
                 name,
+                namespace: _,
                 arguments,
+                access: _,
                 alias: _,
                 cpr_schema: _,
             } => self.walk_directive_call(&name, &arguments, ctx),
@@ -853,7 +1123,10 @@ impl<'a> PlanBuilder<'a> {
         match effects::directive_category(name) {
             DirectiveCategory::Utility if bare == "exit" => {
                 require_glob_args(name, arguments)?;
-                self.handle_exit(None, ctx)
+                let armed = self.exit_armed;
+                let v = self.handle_exit(None, ctx)?;
+                self.mark_step(compiled_query::EffectStepKind::Exit, "exit", Some(ctx), armed)?;
+                Ok(v)
             }
             DirectiveCategory::User => {
                 require_glob_args(name, arguments)?;
@@ -916,17 +1189,53 @@ impl<'a> PlanBuilder<'a> {
         operator: UnaryRelationalOperator,
         ctx: &WalkCtx,
     ) -> Result<RelationalExpression> {
-        match operator {
-            // Emission 1: DML terminal.
-            UnaryRelationalOperator::DmlTerminal {
-                kind,
-                target,
-                target_namespace,
-                domain_spec,
-            } => {
-                let walked_source = self.walk_value(source, &ctx.without_sink())?;
-                self.handle_dml(walked_source, kind, target, target_namespace, domain_spec, ctx)
+        // OBSERVED-PAYLOAD FUSION (ELEVATED, change txmyxvos): when the
+        // immediately-following operator is the EXACT `returned` release
+        // (`!>`'s normalization — glob drill, no narrowing, no
+        // groundings) and the descriptor PROVES the payload's relational
+        // provenance, substitute the originating relation instead of
+        // constructing and re-expanding a JSON interior. This is
+        // semantic, not just cost: a JSON round trip cannot represent
+        // every backend value. Dispatch is by declared provenance —
+        // `ReceiptPayload::Input` / `OtherRelation` — never a name list;
+        // a future input-returning directive fuses by declaration alone.
+        // Produced/arbitrary payloads and any other observation keep the
+        // general receipt semantics.
+        // The trigger is the FULL canonical release — the two-operator
+        // shape `!>` (and the longhand `|> .returned(*)`) normalize to:
+        // the glob drill into `returned` followed by the interior-heading
+        // projection `(returned.*)`. Fusing on the drill alone would be
+        // wrong twice over: the trailing projection would go stale, and
+        // the context-KEEPING postfix drill (`receipt.returned(*)`) must
+        // keep its receipt context.
+        let source = if is_returned_heading_projection(&operator) {
+            match source {
+                RelationalExpression::Pipe(rel_pipe)
+                    if is_returned_glob_drill(&rel_pipe.operator) =>
+                {
+                    let drill = (*rel_pipe).into_inner();
+                    match self.try_fuse_released_payload(drill.source, ctx)? {
+                        FuseOutcome::Fused(v) => return Ok(v),
+                        FuseOutcome::NotApplicable(s) => make_pipe(s, drill.operator),
+                    }
+                }
+                other => other,
             }
+        } else {
+            source
+        };
+        match operator {
+            // Phase 10 (superseded-path sweep): the stringly SURFACE
+            // DmlTerminal is retired — the builder produces the preserved
+            // designator invocation (Phase 6 slice 5), and DmlTerminal
+            // survives only as the post-interpretation LOWERING vehicle
+            // (constructed by handle_dml, consumed by the ordinary
+            // pipeline). One reaching the walker is a construction bug.
+            UnaryRelationalOperator::DmlTerminal { .. } => Err(internal(
+                "the stringly surface DmlTerminal is retired (Phase 10): DML \
+                 targets ride the preserved designator invocation"
+                    .to_string(),
+            )),
 
             // Emission 5: the signed witness is a VALUE-level marker; its
             // lowering happens when the value compiles (`compile_value_qe`).
@@ -942,19 +1251,32 @@ impl<'a> PlanBuilder<'a> {
                     "temp_table" | "temp_view" | "table" => {
                         let walked_source = self.walk_value(source, &ctx.without_sink())?;
                         let target = single_name_argument(&name, &arguments)?;
-                        self.handle_ddl(walked_source, &bare, &target, ctx)
+                        let armed = self.exit_armed;
+                        let v = self.handle_ddl(walked_source, &bare, &target, ctx)?;
+                        self.mark_step(compiled_query::EffectStepKind::Ddl, &bare, Some(ctx), armed)?;
+                        Ok(v)
                     }
                     // Emission 6: stdout! ships and passes through.
                     "stdout" => {
                         let walked_source = self.walk_value(source, &ctx.without_sink())?;
-                        self.handle_stdout(walked_source, ctx)
+                        let armed = self.exit_armed;
+                        let v = self.handle_stdout(walked_source, ctx)?;
+                        self.mark_step(compiled_query::EffectStepKind::Host, "stdout", Some(ctx), armed)?;
+                        Ok(v)
                     }
-                    // returning! returns the piped relation unchanged (§5).
-                    "returning" => self.walk_value(source, &ctx.without_sink()),
+                    // returning! packages the piped relation in its
+                    // receipt's `returned` payload (§5, Phase 4).
+                    "returning" => {
+                        let walked_source = self.walk_value(source, &ctx.without_sink())?;
+                        Ok(Self::inline_payload_receipt(walked_source, "returning"))
+                    }
                     // Piped exit!: the piped relation is the exit condition.
                     "exit" => {
                         let walked_source = self.walk_value(source, &ctx.without_sink())?;
-                        self.handle_exit(Some(walked_source), ctx)
+                        let armed = self.exit_armed;
+                        let v = self.handle_exit(Some(walked_source), ctx)?;
+                        self.mark_step(compiled_query::EffectStepKind::Exit, "exit", Some(ctx), armed)?;
+                        Ok(v)
                     }
                     // The standalone two-paren form `run_namespace!(ns)(*)`
                     // parses as a one-row anonymous source (carrying the
@@ -1001,6 +1323,62 @@ impl<'a> PlanBuilder<'a> {
                 domain_spec,
             } => {
                 let bare = bare_name(&name).to_string();
+                // Emission 2, relation-target form (Phase 3 canonical
+                // invocation): the DDL target is a preserved relational
+                // DESIGNATOR — a whole-table access, optionally
+                // namespace-qualified. Its structure is interpreted
+                // deliberately or refused; never silently discarded.
+                // Emission 1, designator form (Phase 6 slice 5 — the
+                // mzynmnok item-4 residue closed): the DML target arrives
+                // as the same preserved relational DESIGNATOR the DDL path
+                // carries; interpreted deliberately or refused — never a
+                // string minted by the parser.
+                let dml_kind = match bare.as_str() {
+                    "insert" => Some(DmlKind::Insert),
+                    "update" => Some(DmlKind::Update),
+                    "delete" => Some(DmlKind::Delete),
+                    _ => None,
+                };
+                if let Some(kind) = dml_kind {
+                    let (target, target_namespace) = effects::target_designator(
+                        &bare,
+                        "effect/dml/target_designator",
+                        "naming where to write",
+                        &argument,
+                    )?;
+                    let walked_source = self.walk_value(source, &ctx.without_sink())?;
+                    let armed = self.exit_armed;
+                    let v = self.handle_dml(
+                        walked_source,
+                        kind,
+                        target,
+                        target_namespace,
+                        domain_spec,
+                        ctx,
+                    )?;
+                    self.mark_step(compiled_query::EffectStepKind::Dml, &bare, Some(ctx), armed)?;
+                    return Ok(v);
+                }
+                if matches!(bare.as_str(), "table" | "temp_table" | "temp_view") {
+                    require_glob_spec(&name, &domain_spec)?;
+                    let (target, target_namespace) = effects::target_designator(
+                        &bare,
+                        "effect/ddl/target_designator",
+                        "naming where to create",
+                        &argument,
+                    )?;
+                    let walked_source = self.walk_value(source, &ctx.without_sink())?;
+                    let armed = self.exit_armed;
+                    let v = self.handle_ddl_namespaced(
+                        walked_source,
+                        &bare,
+                        &target,
+                        target_namespace.as_deref(),
+                        ctx,
+                    )?;
+                    self.mark_step(compiled_query::EffectStepKind::Ddl, &bare, Some(ctx), armed)?;
+                    return Ok(v);
+                }
                 if bare != "returning_other" {
                     return Err(unsupported(format!(
                         "piped two-paren directive '{}' is not supported in the v0.1 \
@@ -1010,9 +1388,11 @@ impl<'a> PlanBuilder<'a> {
                 }
                 require_glob_spec(&name, &domain_spec)?;
                 // Ordering: the piped input's effects happen first; its
-                // value is discarded as data (a sequencing directive).
+                // value is discarded as data (a sequencing directive). The
+                // receipt packages the OTHER relation (§5, Phase 4).
                 let _ = self.walk_value(source, &ctx.without_sink())?;
-                self.walk_value(*argument, ctx)
+                let walked_argument = self.walk_value(*argument, ctx)?;
+                Ok(Self::inline_payload_receipt(walked_argument, "returning_other"))
             }
 
             // Every other operator is pure: pass through. But a pure operator's
@@ -1020,6 +1400,27 @@ impl<'a> PlanBuilder<'a> {
             // subquery (W4 / P2, close the recursive type) — that is not lowered
             // on the spine, so refuse it honestly (Q-I1(b)).
             other => {
+                // CATEGORY ERROR, taught (EFFECT-ALGEBRA §3/§5a, Phase 4):
+                // releasing `returned` from a receipt that declares NO
+                // payload — identical for the `!>` sugar and the longhand
+                // drill, because they are the same operation.
+                if let UnaryRelationalOperator::InteriorDrillDown { column, .. } = &other {
+                    if column == "returned" {
+                        if let Some(name) = tail_payload_free_directive(&source) {
+                            let bare = bare_name(&name);
+                            return Err(DelightQLError::validation_error_categorized(
+                                "directive/receipt/no_payload",
+                                format!(
+                                    "{bare}!'s receipt declares no `returned` payload — \
+                                     its receipt continues through `|>` (unwrapping a \
+                                     payload-free receipt is a category error; see \
+                                     EFFECT-ALGEBRA §3)"
+                                ),
+                                "no returned payload",
+                            ));
+                        }
+                    }
+                }
                 if effects::operator_demands_directive(&other) {
                     return Err(effect_head_predicate_unsupported(
                         "a pipe operator argument",
@@ -1061,6 +1462,12 @@ impl<'a> PlanBuilder<'a> {
                 "a DML terminal's access specification",
             ));
         }
+        // ENGINE OWNERSHIP (dogfooding plan invariant 11; Q-D8): a
+        // system-kind namespace is engine-owned — programs cannot mutate
+        // its rows, refused at compile on this mutation path. Pinned by
+        // directive_contract 42 (a forged effect_plan insert SUCCEEDED
+        // before this check, 2026-07-15 probe).
+        self.refuse_system_namespace_target(&target, target_namespace.as_deref(), "DML")?;
         // Invariant §5.4 / D2: a self-referential mutation whose source
         // reads the target THROUGH a plan-created view materializes the
         // derived relation first (pinned by
@@ -1086,14 +1493,15 @@ impl<'a> PlanBuilder<'a> {
         stamp_statement(&mut compiled.stmt, gates);
         let conn = self.route(compiled.connection_id)?;
 
-        // The receipt: (success, operation, target) — echo ruling Q2 + D4.
+        // The receipt: the core + the descriptor's declared `target` echo
+        // (echo ruling Q2 + D4; Phase 6 slice 2 — descriptor authority).
         let display_target = match &target_namespace {
             Some(ns) => format!("{}.{}", ns, target),
             None => target.clone(),
         };
         let shape = ReceiptShape {
+            echoes: descriptor_echo_values(&operation, vec![display_target]),
             operation,
-            echoes: vec![("target".to_string(), display_target)],
         };
         let table = self.receipt_table_for(ctx, &shape)?;
 
@@ -1169,6 +1577,63 @@ impl<'a> PlanBuilder<'a> {
     /// Emission 2: DDL directive → CTAS / CREATE VIEW + UNCONDITIONAL
     /// receipt insert (invariant §5.3); the created object's schema becomes
     /// a plan note (REPORT-3.0b) so later statements resolve against it.
+    /// `handle_ddl` with a namespace-qualified target designator: the
+    /// namespace must route to the SAME connection the source routes to
+    /// (materialize-pipe §2 counts connections after resolution); a
+    /// cross-connection placement refuses with a teaching diagnostic
+    /// rather than creating somewhere surprising.
+    fn handle_ddl_namespaced(
+        &mut self,
+        walked_source: RelationalExpression,
+        bare: &str,
+        target: &str,
+        target_namespace: Option<&str>,
+        ctx: &WalkCtx,
+    ) -> Result<RelationalExpression> {
+        // ENGINE OWNERSHIP (invariant 11; Q-D8): same refusal as DML —
+        // a system-kind namespace is never a creation target.
+        self.refuse_system_namespace_target(target, target_namespace, "DDL")?;
+        if let Some(ns) = target_namespace {
+            let compiled = self.compile_statement(Query::Relational(walked_source.clone()))?;
+            let source_conn = self.route(compiled.connection_id)?;
+            let ns_path = delightql_types::namespace::NamespacePath::from_parts(
+                ns.split("::").map(|s| s.to_string()).collect(),
+            );
+            let resolved = self.system.resolve_namespace_path(&ns_path).map_err(|e| {
+                DelightQLError::validation_error_categorized(
+                    "effect/ddl/target_namespace",
+                    format!("{bare}!'s target namespace '{ns}' does not resolve: {e}"),
+                    "DDL target namespace",
+                )
+            })?;
+            let Some((_, ns_conn)) = resolved else {
+                return Err(DelightQLError::validation_error_categorized(
+                    "effect/ddl/target_namespace",
+                    format!(
+                        "{bare}!'s target namespace '{ns}' is not a known namespace"
+                    ),
+                    "DDL target namespace",
+                ));
+            };
+            if let Some(sc) = source_conn {
+                let nc = ns_conn;
+                if sc != nc {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "effect/ddl/target_namespace",
+                        format!(
+                            "{bare}!({ns}.{target}) refuses: the target namespace \
+                             routes to a different connection than the source \
+                             reads from — cross-connection placement is not \
+                             supported (materialize-pipe §2)"
+                        ),
+                        "DDL target namespace",
+                    ));
+                }
+            }
+        }
+        self.handle_ddl(walked_source, bare, target, ctx)
+    }
+
     fn handle_ddl(
         &mut self,
         walked_source: RelationalExpression,
@@ -1423,13 +1888,11 @@ impl<'a> PlanBuilder<'a> {
                     } else {
                         format!("DROP TABLE IF EXISTS {}.{}", scratch_schema, target)
                     };
-                    self.body.push(PlanEntry::Statement(PlanStatement {
-                        sql: holder_drop,
-                        connection_id: conn,
-                        comment: Some(
-                            "name clash: cross-kind holder drops first (§3)".to_string(),
-                        ),
-                    }));
+                    self.emit_ddl_action(
+                        holder_drop,
+                        conn,
+                        Some("name clash: cross-kind holder drops first (§3)".to_string()),
+                    );
                 }
             }
             let drop_sql = if creating_view {
@@ -1437,13 +1900,14 @@ impl<'a> PlanBuilder<'a> {
             } else {
                 format!("DROP TABLE IF EXISTS {}.{}", scratch_schema, target)
             };
-            self.body.push(PlanEntry::Statement(PlanStatement {
-                sql: drop_sql,
-                connection_id: conn,
-                comment: Some("name clash: temp creations replace (§3)".to_string()),
-            }));
+            self.emit_ddl_action(
+                drop_sql,
+                conn,
+                Some("name clash: temp creations replace (§3)".to_string()),
+            );
         }
-        self.emit_statement(sql, conn);
+        let create_comment = self.pending_comment.take();
+        self.emit_ddl_action(sql, conn, create_comment);
         // Surfaced as `CompiledPlan::created_objects` for the entry point's
         // post-run catalog registration (materialize-pipe §1: the created
         // object resolves bare for the rest of the session — pinned by
@@ -1473,7 +1937,7 @@ impl<'a> PlanBuilder<'a> {
 
         let shape = ReceiptShape {
             operation: format!("{}!", bare),
-            echoes: vec![("name".to_string(), target.to_string())],
+            echoes: descriptor_echo_values(bare, vec![target.to_string()]),
         };
         let table = self.receipt_table_for(ctx, &shape)?;
         // Invariant §5.3: creation receipts are UNCONDITIONAL (no rowcount
@@ -1488,6 +1952,203 @@ impl<'a> PlanBuilder<'a> {
     /// ship and the consumer are emitted adjacently, with no mutation
     /// between (invariant §5.8; pinned by
     /// `stdout_prefix_reevaluates_adjacently`).
+    /// Wrap a walked relational value as an inline payload RECEIPT
+    /// (EFFECT-ALGEBRA §3/§5, Phase 4): one row — `success`, `operation` —
+    /// whose `returned` interior relation is the tree-grouped payload.
+    /// Construction is the ordinary machinery a programmer could write:
+    ///
+    /// ```text
+    /// payload ~> {*} as returned
+    ///         |> +(1 as success, "op!" as operation)
+    ///         |> (success, operation, returned)
+    /// ```
+    ///
+    /// The whole-table aggregate yields exactly ONE row (an empty payload
+    /// packages as the empty interior, which releases zero rows under the
+    /// NULL-interior-is-empty law), and the tree-group construction is what
+    /// makes `returned` a schema-known interior for drills, narrows, and
+    /// `!>` in the SAME statement chain.
+    /// The observed-payload fusion body (ELEVATED, change txmyxvos): the
+    /// tail directive of `source` is inspected for DESCRIPTOR-PROVEN
+    /// payload provenance. `Input` without side effects fuses to pure
+    /// substitution (the payload IS the piped relation); `Input` WITH
+    /// side effects snapshots ONCE into plan scratch, runs the
+    /// directive's OWN emission over the snapshot (its host action
+    /// observes exactly the rows passed downstream — ship-once by
+    /// construction), and continues from the snapshot; `OtherRelation`
+    /// demands the piped input for its effects (the walk registers them;
+    /// the value is discarded — the directive's existing sequencing
+    /// semantics) and continues with the OTHER relation directly. The
+    /// snapshot is a typed relational scratch table — native heading and
+    /// values, NOT the prohibited JSON round trip. Anything else —
+    /// produced payloads, user-authored interiors, unproven provenance —
+    /// is handed back untouched for the general receipt semantics.
+    fn try_fuse_released_payload(
+        &mut self,
+        source: RelationalExpression,
+        ctx: &WalkCtx,
+    ) -> Result<FuseOutcome> {
+        use crate::pipeline::asts::effects::ReceiptPayload;
+        let RelationalExpression::Pipe(pipe) = source else {
+            return Ok(FuseOutcome::NotApplicable(source));
+        };
+        let provenance = match &pipe.operator {
+            UnaryRelationalOperator::DirectiveTerminal { name, .. }
+            | UnaryRelationalOperator::DirectivePipeInvocation { name, .. } => effects::descriptor(name)
+                .map(|d| (d.receipt_payload, d.side_effects)),
+            _ => None,
+        };
+        match provenance {
+            Some((ReceiptPayload::Input, side_effects)) => {
+                let inner = (*pipe).into_inner();
+                let name = match &inner.operator {
+                    UnaryRelationalOperator::DirectiveTerminal { name, .. } => name.clone(),
+                    _ => {
+                        return Err(internal(
+                            "fusion: an Input payload on a non-terminal operator".to_string(),
+                        ))
+                    }
+                };
+                let walked = self.walk_value(inner.source, &ctx.without_sink())?;
+                if !side_effects {
+                    return Ok(FuseOutcome::Fused(walked));
+                }
+                let snap =
+                    self.snapshot_relation(walked, &format!("__tee_{}", bare_name(&name)))?;
+                let _receipt = self.walk_pipe(ground_read(&snap), inner.operator, ctx)?;
+                Ok(FuseOutcome::Fused(ground_read(&snap)))
+            }
+            Some((ReceiptPayload::OtherRelation, _)) => {
+                let inner = (*pipe).into_inner();
+                let UnaryRelationalOperator::DirectivePipeInvocation {
+                    name,
+                    argument,
+                    domain_spec,
+                } = inner.operator
+                else {
+                    return Err(internal(
+                        "fusion: an OtherRelation payload on a non-invocation operator"
+                            .to_string(),
+                    ));
+                };
+                require_glob_spec(&name, &domain_spec)?;
+                let _ = self.walk_value(inner.source, &ctx.without_sink())?;
+                let fused = self.walk_value(*argument, ctx)?;
+                Ok(FuseOutcome::Fused(fused))
+            }
+            _ => Ok(FuseOutcome::NotApplicable(RelationalExpression::Pipe(pipe))),
+        }
+    }
+
+    /// Materialize a walked relation ONCE into a typed plan-scratch table
+    /// (the txmyxvos snapshot: native heading and values). The DROP+CTAS
+    /// land in the CURRENT step (`mark_step` spans from the previous
+    /// mark), so a closed edge skips snapshot and consumer together.
+    fn snapshot_relation(
+        &mut self,
+        walked: RelationalExpression,
+        tag: &str,
+    ) -> Result<String> {
+        let snapshot = self.alloc_scratch(tag);
+        let compiled = self
+            .compile_statement(Query::Relational(walked))
+            .map_err(|e| {
+                internal(format!(
+                    "observed-payload snapshot '{snapshot}' failed to compile its \
+                     source: {e}"
+                ))
+            })?;
+        let source_query = match compiled.stmt {
+            SqlStatement::Query { query, .. } => query,
+            _ => {
+                return Err(internal(
+                    "snapshot source did not compile to a SELECT".to_string(),
+                ))
+            }
+        };
+        let ctas = SqlStatement::CreateTempTable {
+            table_name: snapshot.clone(),
+            with_clause: None,
+            query: source_query,
+        };
+        let sql = self.finish_statement(&ctas)?;
+        let conn = self.route(compiled.connection_id)?;
+        let scratch_schema = self.scratch_schema()?;
+        self.body.push(PlanEntry::Statement(PlanStatement {
+            sql: format!("DROP TABLE IF EXISTS {}.{}", scratch_schema, snapshot),
+            connection_id: conn,
+            comment: None,
+        }));
+        self.emit_statement(sql, conn);
+        self.register_note(&snapshot, &compiled.columns);
+        Ok(snapshot)
+    }
+
+    fn inline_payload_receipt(
+        payload: RelationalExpression,
+        operation: &str,
+    ) -> RelationalExpression {
+        use crate::pipeline::asts::core::expressions::functions::CurlyMember;
+        use crate::pipeline::asts::core::FunctionExpression;
+        use crate::pipeline::asts::core::metadata::NamespacePath;
+        use crate::pipeline::asts::core::specs::{ModuloSpec, OutputDomainExpression};
+        use crate::pipeline::asts::core::ContainmentSemantic;
+        use crate::pipeline::asts::core::expressions::domain::ProjectionExpr;
+        use crate::pipeline::asts::core::literals::LiteralValue;
+
+        let curly = DomainExpression::Function(FunctionExpression::Curly {
+            members: vec![CurlyMember::Glob],
+            inner_grouping_keys: Vec::new(),
+            cte_requirements: None,
+            alias: Some("returned".into()),
+        });
+        let grouped = make_pipe(
+            payload,
+            UnaryRelationalOperator::Modulo {
+                containment_semantic: ContainmentSemantic::Parenthesis,
+                spec: ModuloSpec::GroupBy {
+                    reducing_by: Vec::new(),
+                    reducing_on: vec![OutputDomainExpression {
+                        expr: curly,
+                        output: PhaseBox::phantom(),
+                    }],
+                    delegates: Vec::new(),
+                },
+            },
+        );
+        let widened = make_pipe(
+            grouped,
+            UnaryRelationalOperator::General {
+                containment_semantic: ContainmentSemantic::Parenthesis,
+                expressions: vec![
+                    DomainExpression::Projection(ProjectionExpr::Glob {
+                        qualifier: None,
+                        namespace_path: NamespacePath::empty(),
+                    }),
+                    DomainExpression::Literal {
+                        value: LiteralValue::Number("1".to_string()),
+                        alias: Some("success".into()),
+                    },
+                    DomainExpression::Literal {
+                        value: LiteralValue::String(format!("{operation}!")),
+                        alias: Some("operation".into()),
+                    },
+                ],
+            },
+        );
+        make_pipe(
+            widened,
+            UnaryRelationalOperator::General {
+                containment_semantic: ContainmentSemantic::Parenthesis,
+                expressions: vec![
+                    DomainExpression::lvar_builder("success".to_string()).build(),
+                    DomainExpression::lvar_builder("operation".to_string()).build(),
+                    DomainExpression::lvar_builder("returned".to_string()).build(),
+                ],
+            },
+        )
+    }
+
     fn handle_stdout(
         &mut self,
         walked_source: RelationalExpression,
@@ -1507,7 +2168,9 @@ impl<'a> PlanBuilder<'a> {
             connection_id: conn,
             comment: Some(comment),
         }));
-        Ok(walked_source)
+        // stdout!'s receipt packages its input (§5, Phase 4) — the payload
+        // is what makes the generic unwrap (`!>`) tee-like for it.
+        Ok(Self::inline_payload_receipt(walked_source, "stdout"))
     }
 
     /// Emission 4: exit! sets the flag; the demand context (left-conjunct
@@ -1675,56 +2338,247 @@ impl<'a> PlanBuilder<'a> {
         }
 
         // R5 ruling: every clause's ending receipt lands in ONE receipt
-        // table. The sink applies when every clause ends in a DML/DDL
-        // terminal (the receipt case); a single clause ending otherwise
-        // (returning!/returning_other!/a nested rule) takes its value
-        // compositionally.
-        let ending_shapes: Vec<Option<Vec<String>>> = rule
+        // table — and under receipt universality (§4) EVERY receipt-era
+        // ending qualifies: DML/DDL terminals write their own receipts
+        // into the shell; compositional endings (utility payload
+        // producers, nested user directives) are sunk by this loop with a
+        // corresponding-aligned insert. A SINGLE-clause rule stays
+        // compositional (no shell): its value is already receipt-shaped,
+        // and skipping the table round trip preserves the payload's
+        // interior schema for same-statement release.
+        let ending_kinds: Vec<Option<(Vec<String>, bool)>> = rule
             .clauses
             .iter()
-            .map(|c| ending_receipt_columns(&c.body.expression))
+            .map(|c| ending_kind(&c.body.expression))
             .collect();
-        let all_sinkable = ending_shapes.iter().all(|s| s.is_some());
-        let sink = if all_sinkable {
-            let mut columns: Vec<String> = Vec::new();
-            for shape in ending_shapes.iter().flatten() {
+        let mut sink_columns: Vec<String> = Vec::new();
+        let sink = if rule.clauses.len() == 1 {
+            None
+        } else if ending_kinds.iter().all(|s| s.is_some()) {
+            for (shape, _) in ending_kinds.iter().flatten() {
                 for col in shape {
-                    if !columns.contains(col) {
-                        columns.push(col.clone());
+                    if !sink_columns.contains(col) {
+                        sink_columns.push(col.clone());
                     }
                 }
             }
-            let table = self.alloc_receipt_shell(&bare, &columns)?;
+            let table = self.alloc_receipt_shell(&bare, &sink_columns)?;
             Some(ReceiptSink { table })
-        } else if rule.clauses.len() == 1 {
-            None
         } else {
             return Err(unsupported(format!(
                 "multi-clause effect rule '{}' has a clause that does not end in a \
-                 DML/DDL directive; this shape is not supported in v0.1",
+                 receipt-producing disposition (EFFECT-ALGEBRA R2)",
                 rule.name
             )));
         };
 
         // Clauses execute in definition order (R5).
         let mut clause_values = Vec::with_capacity(rule.clauses.len());
-        for clause in &rule.clauses {
+        for (clause, kind) in rule.clauses.iter().zip(&ending_kinds) {
+            let self_sinking = kind.as_ref().map(|(_, s)| *s).unwrap_or(false);
             let clause_ctx = WalkCtx {
                 guards: ctx.guards.clone(),
                 label_hint: Some(bare.clone()),
-                sink: sink.clone(),
+                sink: if self_sinking { sink.clone() } else { None },
                 ctes: clause.body.ctes.clone(),
                 bindings: bindings.clone(),
             };
-            clause_values.push(self.walk_value(clause.body.expression.clone(), &clause_ctx)?);
+            let value = self.walk_value(clause.body.expression.clone(), &clause_ctx)?;
+            if let (Some(s), false) = (&sink, self_sinking) {
+                // Corresponding-aligned sink of a compositional clause
+                // receipt: shell columns the clause lacks pad with NULL.
+                let clause_shape = kind
+                    .as_ref()
+                    .map(|(shape, _)| shape.clone())
+                    .unwrap_or_default();
+                let armed = self.exit_armed;
+                self.sink_compositional_receipt(&s.table, &sink_columns, &clause_shape, &value, ctx)?;
+                self.mark_step(
+                    compiled_query::EffectStepKind::RuleBoundary,
+                    &bare,
+                    Some(ctx),
+                    armed,
+                )?;
+            }
+            clause_values.push(value);
         }
 
-        match sink {
-            Some(s) => Ok(ground_read(&s.table)),
-            None => Ok(clause_values
+        // THE UNIVERSAL BOUNDARY (EFFECT-ALGEBRA §4, Phase 4): the
+        // invocation's value is ONE zero-or-one outer receipt whose
+        // `returned` payload tree-groups the clause-receipt union C —
+        // for sinkable rules C is the shared receipt table; for a
+        // single compositional clause C is its (already receipt-shaped)
+        // value. Multiplicity moves into the payload; NO propagates.
+        let c_value = match sink {
+            Some(s) => ground_read(&s.table),
+            None => clause_values
                 .pop()
-                .expect("single-clause rule has one clause value")),
-        }
+                .expect("single-clause rule has one clause value"),
+        };
+        let receipt = Self::outer_rule_receipt(c_value, &bare);
+        // Give the derived receipt a RELATION IDENTITY so it composes in
+        // joins like the shell reads it replaced — colliding receipt
+        // columns then follow the ordinary glob-join convention
+        // (EFFECT-ALGEBRA §3: no receipt-specific rule). The alias is
+        // invocation-unique.
+        let alias = format!("__i_{}_{}", sanitize(&bare), self.body.len());
+        Ok(RelationalExpression::Relation(Relation::InnerRelation {
+            pattern: crate::pipeline::asts::core::expressions::relational::InnerRelationPattern::Indeterminate {
+                identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
+                    namespace_path: crate::pipeline::asts::core::metadata::NamespacePath::empty(),
+                    name: alias.clone().into(),
+                    grounding: None,
+                },
+                subquery: Box::new(receipt),
+            },
+            alias: Some(alias.into()),
+            outer: false,
+            cpr_schema: PhaseBox::phantom(),
+        }))
+    }
+
+    /// Sink a compositional clause's receipt VALUE into the shared shell
+    /// (R5 + receipt universality): `INSERT INTO <shell> (<shell cols>)
+    /// SELECT <clause col or NULL> FROM (<value sql>)` — corresponding
+    /// alignment pads shell columns the clause receipt lacks with NULL.
+    /// Context/exit gates ride the compiled value through the shipped
+    /// wrap, exactly like every other emission.
+    fn sink_compositional_receipt(
+        &mut self,
+        shell: &str,
+        shell_columns: &[String],
+        clause_shape: &[String],
+        value: &RelationalExpression,
+        ctx: &WalkCtx,
+    ) -> Result<()> {
+        let text = self.compile_value_text(value)?;
+        let gates = self.gate_exprs(ctx, true)?;
+        let gated = self.wrap_shipped_with_gates(text.sql, gates)?;
+        let aligned: Vec<String> = shell_columns
+            .iter()
+            .map(|c| {
+                if clause_shape.iter().any(|k| k == c) {
+                    format!("__c.{}", c)
+                } else {
+                    format!("NULL AS {}", c)
+                }
+            })
+            .collect();
+        let scratch_schema = self.scratch_schema()?;
+        let sql = format!(
+            "INSERT INTO {}.{} ({})\nSELECT {}\nFROM ({}) AS __c",
+            scratch_schema,
+            shell,
+            shell_columns.join(", "),
+            aligned.join(", "),
+            gated
+        );
+        let conn = self.route(text.connection_id)?;
+        self.body.push(PlanEntry::Statement(PlanStatement {
+            sql,
+            connection_id: conn,
+            comment: Some("clause receipt sink".to_string()),
+        }));
+        Ok(())
+    }
+
+    /// Consolidate a rule invocation's clause-receipt union `C` into the
+    /// ONE outer rule receipt (EFFECT-ALGEBRA §4, Phase 4): a YES receipt
+    /// whose `returned` payload is the tree-grouped C ledger, guarded so
+    /// empty C answers NO. C is mentioned ONCE: the same whole-table
+    /// aggregate that packages the ledger also counts it, and the count
+    /// filter is the emptiness gate — decided before the widened receipt
+    /// exists, so aggregation cannot manufacture a YES from zero
+    /// successful clauses (and no cloned mention can collide aliases or
+    /// re-evaluate anything).
+    fn outer_rule_receipt(c_value: RelationalExpression, bare: &str) -> RelationalExpression {
+        use crate::pipeline::asts::core::expressions::functions::CurlyMember;
+        use crate::pipeline::asts::core::expressions::metadata_types::FilterOrigin;
+        use crate::pipeline::asts::core::specs::{ModuloSpec, OutputDomainExpression};
+        use crate::pipeline::asts::core::{BooleanExpression, SigmaCondition};
+        use crate::pipeline::asts::core::ContainmentSemantic;
+        use crate::pipeline::asts::core::expressions::domain::ProjectionExpr;
+        use crate::pipeline::asts::core::literals::LiteralValue;
+        use crate::pipeline::asts::core::metadata::NamespacePath;
+        use crate::pipeline::asts::core::FunctionExpression;
+
+        let curly = DomainExpression::Function(FunctionExpression::Curly {
+            members: vec![CurlyMember::Glob],
+            inner_grouping_keys: Vec::new(),
+            cte_requirements: None,
+            alias: Some("returned".into()),
+        });
+        let count = DomainExpression::Function(FunctionExpression::Regular {
+            name: "count".into(),
+            namespace: None,
+            arguments: vec![DomainExpression::Projection(ProjectionExpr::Glob {
+                qualifier: None,
+                namespace_path: NamespacePath::empty(),
+            })],
+            conditioned_on: None,
+            alias: Some("__clause_count".into()),
+        });
+        let grouped = make_pipe(
+            c_value,
+            UnaryRelationalOperator::Modulo {
+                containment_semantic: ContainmentSemantic::Parenthesis,
+                spec: ModuloSpec::GroupBy {
+                    reducing_by: Vec::new(),
+                    reducing_on: vec![
+                        OutputDomainExpression {
+                            expr: curly,
+                            output: PhaseBox::phantom(),
+                        },
+                        OutputDomainExpression {
+                            expr: count,
+                            output: PhaseBox::phantom(),
+                        },
+                    ],
+                    delegates: Vec::new(),
+                },
+            },
+        );
+        let gated = RelationalExpression::Filter {
+            source: Box::new(grouped),
+            condition: SigmaCondition::Predicate(BooleanExpression::Comparison {
+                operator: ">".to_string(),
+                left: Box::new(DomainExpression::lvar_builder("__clause_count".to_string()).build()),
+                right: Box::new(DomainExpression::Literal {
+                    value: LiteralValue::Number("0".to_string()),
+                    alias: None,
+                }),
+            }),
+            origin: FilterOrigin::UserWritten,
+            cpr_schema: PhaseBox::phantom(),
+        };
+        let widened = make_pipe(
+            gated,
+            UnaryRelationalOperator::General {
+                containment_semantic: ContainmentSemantic::Parenthesis,
+                expressions: vec![
+                    DomainExpression::lvar_builder("returned".to_string()).build(),
+                    DomainExpression::Literal {
+                        value: LiteralValue::Number("1".to_string()),
+                        alias: Some("success".into()),
+                    },
+                    DomainExpression::Literal {
+                        value: LiteralValue::String(format!("{bare}!")),
+                        alias: Some("operation".into()),
+                    },
+                ],
+            },
+        );
+        make_pipe(
+            widened,
+            UnaryRelationalOperator::General {
+                containment_semantic: ContainmentSemantic::Parenthesis,
+                expressions: vec![
+                    DomainExpression::lvar_builder("success".to_string()).build(),
+                    DomainExpression::lvar_builder("operation".to_string()).build(),
+                    DomainExpression::lvar_builder("returned".to_string()).build(),
+                ],
+            },
+        )
     }
 
     /// Splice a bound HO input at its reference site. Invariant §5.8: if a
@@ -2174,15 +3028,36 @@ impl<'a> PlanBuilder<'a> {
             candidate
         };
 
+        // RULED 2026-07-15 (payload-preserving witness proxy): a NO arm's
+        // proxy row carries `returned = '[]'` — the EMPTY interior — for
+        // the conventional payload column(s), so total-ledger payload
+        // release yields ZERO rows for NO arms by the ordinary
+        // empty-interior law. Mirrors r_lower_signed_witness.
+        let is_payload_col = |name: &str| {
+            name == "returned"
+                || name
+                    .strip_prefix("returned_")
+                    .map(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+        };
         let mut items: Vec<SelectItem> = Vec::with_capacity(inner.columns.len() + 1);
         for col in &inner.columns {
-            items.push(SelectItem::expression_with_alias(
-                SqlExpr::with_qualifier(
-                    crate::pipeline::sql_ast_v3::ColumnQualifier::table("r"),
-                    col.as_str(),
-                ),
-                col.clone(),
-            ));
+            let read = SqlExpr::with_qualifier(
+                crate::pipeline::sql_ast_v3::ColumnQualifier::table("r"),
+                col.as_str(),
+            );
+            let expr = if is_payload_col(col) {
+                SqlExpr::function(
+                    "coalesce",
+                    vec![
+                        read,
+                        SqlExpr::literal(ast_refined::LiteralValue::String("[]".to_string())),
+                    ],
+                )
+            } else {
+                read
+            };
+            items.push(SelectItem::expression_with_alias(expr, col.clone()));
         }
         items.push(SelectItem::expression_with_alias(
             SqlExpr::function(
@@ -2538,6 +3413,169 @@ impl<'a> PlanBuilder<'a> {
 
     fn emit_statement(&mut self, sql: String, connection_id: Option<i64>) {
         let comment = self.pending_comment.take();
+        self.body.push(PlanEntry::Statement(PlanStatement {
+            sql,
+            connection_id,
+            comment,
+        }));
+    }
+
+    /// D2: intern a guard definition by its rendered SQL (structural
+    /// identity — one definition shared by every dependent, the
+    /// single-mention discipline).
+    /// ENGINE OWNERSHIP (dogfooding plan invariant 11; Q-D8 ruled;
+    /// re-based on IDENTITY by CODE-REVIEW-zzpmxuzp::otolxyzl finding 2):
+    /// the target resolves — through aliases, enlistment, or
+    /// qualification — to its OWNING namespace, and a system-KIND owner
+    /// refuses at compile. Spelling inspection covered none of the
+    /// indirections; the catalog's kind covers them all.
+    fn refuse_system_namespace_target(
+        &self,
+        target: &str,
+        target_namespace: Option<&str>,
+        verb: &str,
+    ) -> Result<()> {
+        let scope = self.namespace().unwrap_or("main").to_string();
+        let owner = self
+            .system
+            .effect_target_owner(target, target_namespace, &scope)?;
+        if let Some((fq, kind)) = owner {
+            if kind == "system" {
+                return Err(DelightQLError::validation_error_categorized(
+                    "effect/target/engine_owned",
+                    format!(
+                        "{verb} target '{target}' resolves into the engine-owned \
+                         namespace '{fq}': programs cannot mutate system \
+                         relations (the sys::execution plan artifact is an \
+                         observational projection written only by the engine) \
+                         — query it, never write it",
+                    ),
+                    "engine-owned namespace",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// D2 (typed plan): render ONE guard conjunct as a standalone one-row
+    /// SELECT — a GuardDefinition's SQL lowering.
+    fn render_guard_select(&mut self, w: SqlExpr) -> Result<String> {
+        let select = SelectStatement::builder()
+            .select(SelectItem::expression(SqlExpr::literal(
+                ast_refined::LiteralValue::Number("1".to_string()),
+            )))
+            .where_clause(w)
+            .build()
+            .map_err(internal)?;
+        self.finish_statement(&SqlStatement::Query {
+            with_clause: None,
+            query: QueryExpression::Select(Box::new(select)),
+        })
+    }
+
+    /// D2: intern a guard definition by its rendered SQL (structural
+    /// identity — one definition shared by every dependent, the
+    /// single-mention discipline).
+    fn guard_def_id(&mut self, sql: String) -> usize {
+        if let Some(g) = self.guard_defs.iter().find(|g| g.sql == sql) {
+            return g.guard_id;
+        }
+        let id = self.guard_defs.len();
+        self.guard_defs.push(compiled_query::GuardDefinition {
+            guard_id: id,
+            sql,
+        });
+        id
+    }
+
+    /// D2 (typed plan): close the current step — claim every entry pushed
+    /// since the last mark as ONE occurrence's statement stream, with its
+    /// requirement edges. Called at the DISPATCH site right after a
+    /// handler returns, so lowering machinery emitted en route (precount
+    /// stages, snapshots) folds into the occurrence that needed it (Q-D9:
+    /// adjacency lives in the lowered stream). A mark with nothing
+    /// emitted records no step (PG's fused DML is one entry; a pure value
+    /// is none). `exit_armed_before` is the flag AS OF the handler's
+    /// entry, so exit!'s own step does not wear an absent-edge on the
+    /// latch it is about to set.
+    fn mark_step(
+        &mut self,
+        kind: compiled_query::EffectStepKind,
+        bare: &str,
+        ctx: Option<&WalkCtx>,
+        exit_armed_before: bool,
+    ) -> Result<()> {
+        use compiled_query::{GuardPolarity, Requirement};
+        let end = self.body.len();
+        if end == self.step_marked {
+            return Ok(());
+        }
+        let mut requirements = Vec::new();
+        if let Some(ctx) = ctx {
+            let sources = ctx.guards.clone();
+            for g in &sources {
+                let expr = self.guard_to_sql(g)?;
+                let sql = self.render_guard_select(expr)?;
+                let guard_id = self.guard_def_id(sql);
+                // Review hardening: two comma conjuncts can intern to ONE
+                // guard definition — deduplicate edges so the normalized
+                // effect_requirement key holds.
+                if !requirements
+                    .iter()
+                    .any(|r: &Requirement| r.guard_id == guard_id)
+                {
+                    requirements.push(Requirement {
+                        guard_id,
+                        polarity: GuardPolarity::Present,
+                        reason: "comma",
+                    });
+                }
+            }
+        }
+        if exit_armed_before {
+            let scratch = self.scratch_schema()?;
+            let sql = format!("SELECT 1 FROM {}.{}", scratch, EXIT_TABLE);
+            let guard_id = self.guard_def_id(sql);
+            requirements.push(Requirement {
+                guard_id,
+                polarity: GuardPolarity::Absent,
+                reason: "exit",
+            });
+        }
+        let occurrence = {
+            let n = self.step_marks.len();
+            let path = self.rule_stack.join("::");
+            if path.is_empty() {
+                format!("{bare}!#{n}")
+            } else {
+                format!("{path}::{bare}!#{n}")
+            }
+        };
+        self.step_marks.push(StepMark {
+            start: self.step_marked,
+            end,
+            kind,
+            occurrence,
+            operation: format!("{bare}!"),
+            requirements,
+        });
+        self.step_marked = end;
+        Ok(())
+    }
+
+    /// Push a DDL action statement. D3c: M0's per-entry GuardedStatement
+    /// special case is RETIRED — a suppressed occurrence's CREATE/DROP
+    /// must not run at all (§2.2's scope correction), and since D3a that
+    /// suppression is the typed walk's requirement-edge sampling, which
+    /// declines the WHOLE step (drops + CREATE + receipt together).
+    /// Pinned by the effects ball's ddl_gate--94..97, which stayed green
+    /// across M0's landing, D3a's generalization, and this retirement.
+    fn emit_ddl_action(
+        &mut self,
+        sql: String,
+        connection_id: Option<i64>,
+        comment: Option<String>,
+    ) {
         self.body.push(PlanEntry::Statement(PlanStatement {
             sql,
             connection_id,
@@ -3044,60 +4082,174 @@ fn value_contains_witness(expr: &RelationalExpression) -> bool {
 }
 
 
-/// The echo columns of a clause's ENDING directive, when the ending is a
-/// DML/DDL terminal (the sinkable case, R5). Mirrors
-/// `effects::ends_in_directive`'s notion of "end": the last pipe operator,
-/// the rightmost conjunct, every union arm.
-fn ending_receipt_columns(expr: &RelationalExpression) -> Option<Vec<String>> {
-    // Rides Helper B `fold_tail` (the ending/tail spine): Join→right, and a
-    // union's echo shape is the name-preserving merge of its arms' shapes (an
-    // arm with no sinkable ending collapses the whole union to `None`). Only the
-    // Join→right / SetOp→arms RECURSION is shared; the per-node echo columns are
-    // `ending_receipt_leaf`. Byte-equivalent to the old hand-rolled walk. Pinned
-    // by `fold_tail_descends_join_right_and_all_setop_arms` and the effects ball
-    // `rules--49_multiclause_table_sinkable`.
+
+
+
+/// The tail directive of `expr` when that directive's receipt declares NO
+/// `returned` payload (DML and DDL terminals today — the descriptor's
+/// deliberately preserved absence). Drives the category-error teaching
+/// diagnostic for `.returned(*)` / `!>` over such receipts.
+fn tail_payload_free_directive(expr: &RelationalExpression) -> Option<String> {
+    use crate::pipeline::asts::effects::ReceiptPayload;
     crate::pipeline::spine::fold_tail(
         expr,
-        &ending_receipt_leaf,
-        &|arms: Vec<Option<Vec<String>>>| {
-            let shapes: Vec<Vec<String>> = arms.into_iter().collect::<Option<_>>()?;
+        &|leaf: &RelationalExpression| -> Option<String> {
+            match leaf {
+                RelationalExpression::Pipe(pipe) => match &pipe.operator {
+                    UnaryRelationalOperator::DirectiveTerminal { name, .. }
+                    | UnaryRelationalOperator::DirectivePipeInvocation { name, .. } => {
+                        match effects::descriptor(name) {
+                            Some(d) if d.receipt_payload == ReceiptPayload::None => {
+                                Some(name.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        },
+        &|arms: Vec<Option<String>>| {
+            // Every arm must be payload-free for the union's release to be
+            // the category error; a mixed union flows to ordinary
+            // resolution.
+            let names: Vec<String> = arms.into_iter().collect::<Option<_>>()?;
+            names.into_iter().next()
+        },
+    )
+}
+
+/// The tail-LEAF kind for R5 consolidation: `(shape, self_sinking)`.
+/// DML/DDL terminals write their own receipts into the shared shell
+/// (`self_sinking = true`); receipt-era compositional endings — the
+/// utility payload producers and nested user directives — have the
+/// universal receipt shape and are sunk by the invocation loop
+/// (`self_sinking = false`). `None` = not a receipt-producing ending.
+fn ending_kind(expr: &RelationalExpression) -> Option<(Vec<String>, bool)> {
+    crate::pipeline::spine::fold_tail(
+        expr,
+        &|leaf: &RelationalExpression| -> Option<(Vec<String>, bool)> {
+            if let Some(shape) = ending_receipt_leaf(leaf) {
+                return Some((shape, true));
+            }
+            let universal = || {
+                Some((
+                    vec![
+                        "success".to_string(),
+                        "operation".to_string(),
+                        "returned".to_string(),
+                    ],
+                    false,
+                ))
+            };
+            match leaf {
+                RelationalExpression::Pipe(pipe) => match &pipe.operator {
+                    UnaryRelationalOperator::DirectiveTerminal { name, .. }
+                        if matches!(bare_name(name), "stdout" | "returning") =>
+                    {
+                        universal()
+                    }
+                    UnaryRelationalOperator::DirectiveTerminal { name, .. }
+                        if effects::directive_category(name) == DirectiveCategory::User =>
+                    {
+                        universal()
+                    }
+                    UnaryRelationalOperator::DirectivePipeInvocation { name, .. }
+                        if bare_name(name) == "returning_other" =>
+                    {
+                        universal()
+                    }
+                    // Relation-target DDL and DML endings sink their own
+                    // receipts, like the bare-name terminal form (DML rides
+                    // the same pipe-invocation designator since slice 5).
+                    UnaryRelationalOperator::DirectivePipeInvocation { name, .. }
+                        if matches!(
+                            bare_name(name),
+                            "temp_table" | "temp_view" | "table" | "insert" | "update" | "delete"
+                        ) =>
+                    {
+                        Some((receipt_shape_from_descriptor(bare_name(name)), true))
+                    }
+                    _ => None,
+                },
+                RelationalExpression::Relation(Relation::PseudoPredicate { name, .. })
+                    if effects::directive_category(name) == DirectiveCategory::User =>
+                {
+                    universal()
+                }
+                _ => None,
+            }
+        },
+        &|arms: Vec<Option<(Vec<String>, bool)>>| {
+            let kinds: Vec<(Vec<String>, bool)> = arms.into_iter().collect::<Option<_>>()?;
             let mut merged: Vec<String> = Vec::new();
-            for shape in shapes {
+            let mut self_sinking = true;
+            for (shape, sinks) in kinds {
+                self_sinking &= sinks;
                 for c in shape {
                     if !merged.contains(&c) {
                         merged.push(c);
                     }
                 }
             }
-            Some(merged)
+            Some((merged, self_sinking))
         },
     )
 }
+
+/// A self-sinking terminal's receipt SHAPE, read from its descriptor's
+/// declared echoes (Phase 6 slice 2 — descriptor authority): the
+/// guaranteed core followed by the ledger-ordered echo names.
+fn receipt_shape_from_descriptor(bare: &str) -> Vec<String> {
+    let desc = effects::descriptor(bare)
+        .unwrap_or_else(|| panic!("no directive descriptor for '{bare}'"));
+    let mut shape = vec!["success".to_string(), "operation".to_string()];
+    shape.extend(desc.receipt_echoes.iter().map(|e| e.name.to_string()));
+    shape
+}
+
+/// Zip a terminal's descriptor-declared echo NAMES with this emission's
+/// VALUES, in ledger order (Phase 6 slice 2): the emitter supplies only
+/// values; the names are the descriptor's. An arity mismatch is an
+/// internal invariant violation and panics rather than emitting a
+/// receipt the declared ledger disowns.
+fn descriptor_echo_values(name: &str, values: Vec<String>) -> Vec<(String, String)> {
+    let desc = effects::descriptor(name)
+        .unwrap_or_else(|| panic!("no directive descriptor for '{name}'"));
+    assert_eq!(
+        desc.receipt_echoes.len(),
+        values.len(),
+        "'{name}': echo values disagree with the descriptor's declared echoes"
+    );
+    desc.receipt_echoes
+        .iter()
+        .zip(values)
+        .map(|(e, v)| (e.name.to_string(), v))
+        .collect()
+}
+
 
 /// The tail-LEAF half of `ending_receipt_columns`: the echo columns of THIS tail
 /// node when it is a sinkable DML/DDL terminal (R5), else `None`.
 fn ending_receipt_leaf(expr: &RelationalExpression) -> Option<Vec<String>> {
     match expr {
         RelationalExpression::Pipe(pipe) => match &pipe.operator {
-            UnaryRelationalOperator::DmlTerminal { .. } => Some(vec![
-                "success".to_string(),
-                "operation".to_string(),
-                "target".to_string(),
-            ]),
+            UnaryRelationalOperator::DirectivePipeInvocation { name, .. }
+                if matches!(bare_name(name), "insert" | "update" | "delete") =>
+            {
+                Some(receipt_shape_from_descriptor("insert"))
+            }
             // All three DDL creation directives are R5-sinkable — `table!`
             // included (EFFECT-ALGEBRA §3; review F4, which caught its
             // omission producing a FALSE multi-clause refusal). Echo
-            // columns (success, operation, name), same as `handle_ddl`
-            // emits. Pinned by the effects ball's
+            // columns from the descriptor (success, operation, name), same
+            // as `handle_ddl` emits. Pinned by the effects ball's
             // rules--49_multiclause_table_sinkable.
             UnaryRelationalOperator::DirectiveTerminal { name, .. }
                 if matches!(bare_name(name), "temp_table" | "temp_view" | "table") =>
             {
-                Some(vec![
-                    "success".to_string(),
-                    "operation".to_string(),
-                    "name".to_string(),
-                ])
+                Some(receipt_shape_from_descriptor(bare_name(name)))
             }
             // Operator-KIND classification: any other tail operator is not a
             // sinkable DML/DDL terminal, so there are no ending receipt columns —
