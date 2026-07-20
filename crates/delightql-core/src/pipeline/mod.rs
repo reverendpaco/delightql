@@ -170,7 +170,7 @@ impl<'a> Pipeline<'a> {
             source,
             system,
             resolver::ResolutionConfig::default(),
-            sql_optimizer::level_from_env(),
+            sql_optimizer::OptimizationLevel::Basic,
             false, // inline_ctes
             false, // is_repl
         )
@@ -188,7 +188,7 @@ impl<'a> Pipeline<'a> {
             "<injected>",
             system,
             resolver::ResolutionConfig::default(),
-            sql_optimizer::level_from_env(),
+            sql_optimizer::OptimizationLevel::Basic,
             false,
             false,
         );
@@ -1171,7 +1171,7 @@ fn generate_sql_v3_only(ast_addressed: ast_addressed::RelationalExpression) -> R
     let optimized_sql_ast_v3 = lower_statement(
         sql_ast_v3,
         generator_v3::SqlDialect::SQLite,
-        sql_optimizer::level_from_env(),
+        sql_optimizer::OptimizationLevel::Basic,
     )?;
     let generator = generator_v3::SqlGenerator::new();
     generator
@@ -1235,7 +1235,7 @@ fn generate_sql_with_ctes(
     let optimized = lower_statement(
         statement,
         generator_v3::SqlDialect::SQLite,
-        sql_optimizer::level_from_env(),
+        sql_optimizer::OptimizationLevel::Basic,
     )?;
     let generator = generator_v3::SqlGenerator::new();
     generator

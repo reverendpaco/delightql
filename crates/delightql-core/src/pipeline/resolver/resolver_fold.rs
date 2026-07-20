@@ -22,7 +22,6 @@ use crate::pipeline::asts::core::phases::{Resolved, Unresolved};
 use crate::pipeline::asts::core::RelationalExpression;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 use delightql_types::error::{DelightQLError, Result};
-use delightql_types::schema::ColumnInfo;
 
 /// Scope frame — tracks context at recursion boundaries.
 struct ResolverScope {
@@ -707,33 +706,49 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                         let table_name = &identifier.name;
                         let schema = self.registry.database.schema();
 
-                        // Get table schema — check CTEs first, then database
-                        let maybe_table_columns = if let Some(cte_schema) =
-                            self.registry.query_local.lookup_cte(table_name)
-                        {
-                            match cte_schema {
-                                ast_resolved::CprSchema::Resolved(cols) => Some(
-                                    cols.iter()
-                                        .enumerate()
-                                        .map(|(idx, col)| ColumnInfo {
-                                            name: col.name().into(),
-                                            nullable: true,
-                                            position: idx + 1,
-                                            declared_type: col.declared_type.clone(),
-                                        })
-                                        .collect(),
-                                ),
-                                _ => {
-                                    return Err(DelightQLError::TableNotFoundError {
-                                        table_name: table_name.to_string(),
-                                        context: "CTE schema not resolved for positional pattern"
-                                            .to_string(),
-                                    });
+                        // Get table schema — check CTEs first, then database.
+                        // BOTH branches yield rich ColumnMetadata: squeezing a
+                        // CTE's columns through ColumnInfo (the narrow
+                        // database-boundary type) stripped every value fact the
+                        // thin type cannot hold — the interior heading of a
+                        // staged tree died here BY TYPE, and nullability was
+                        // hardcoded true. Value facts are conserved (the
+                        // carrying law); only identity is rebuilt below.
+                        let maybe_table_columns: Option<Vec<ast_resolved::ColumnMetadata>> =
+                            if let Some(cte_schema) =
+                                self.registry.query_local.lookup_cte(table_name)
+                            {
+                                match cte_schema {
+                                    ast_resolved::CprSchema::Resolved(cols) => Some(cols.clone()),
+                                    _ => {
+                                        return Err(DelightQLError::TableNotFoundError {
+                                            table_name: table_name.to_string(),
+                                            context:
+                                                "CTE schema not resolved for positional pattern"
+                                                    .to_string(),
+                                        });
+                                    }
                                 }
-                            }
-                        } else {
-                            schema.get_table_columns(None, table_name)
-                        };
+                            } else {
+                                schema.get_table_columns(None, table_name).map(|infos| {
+                                    infos
+                                        .iter()
+                                        .map(|info| {
+                                            ast_resolved::ColumnMetadata::new(
+                                                ast_resolved::ColumnProvenance::from_column(
+                                                    info.name.clone(),
+                                                ),
+                                                ast_resolved::TableName::Named(
+                                                    table_name.clone().into(),
+                                                ),
+                                                Some(info.position),
+                                            )
+                                            .with_declared_type(info.declared_type.clone())
+                                            .with_nullable(Some(info.nullable))
+                                        })
+                                        .collect()
+                                })
+                            };
 
                         // Track connection_id for namespace-qualified tables
                         // (the positional-pattern shortcut bypasses resolve_ground,
@@ -762,17 +777,19 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             ));
                             }
 
-                            // Convert to ColumnMetadata for pattern resolver.
-                            // Use alias as table_name when present — this is the
-                            // SQL-visible name, so qualified refs like `t.val` match.
+                            // Rebuild identity for the pattern resolver (alias
+                            // as table_name when present — the SQL-visible name,
+                            // so qualified refs like `t.val` match) while
+                            // CARRYING each column's value facts.
                             let visible_name = alias.as_deref().unwrap_or(table_name);
                             let table_schema: Vec<ast_resolved::ColumnMetadata> = table_columns
                                 .iter()
                                 .enumerate()
                                 .map(|(idx, col)| {
-                                    ast_resolved::ColumnMetadata::new(
+                                    ast_resolved::ColumnMetadata::carrying(
+                                        col,
                                         ast_resolved::ColumnProvenance::from_table_column(
-                                            col.name.clone(),
+                                            col.name().to_string(),
                                             ast_resolved::TableName::Named(visible_name.into()),
                                             crate::pipeline::asts::core::QualificationSource::None,
                                         ),
@@ -2583,6 +2600,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                     &pattern, &mode,
                 )?;
                 super::resolving::predicates::validate_no_sibling_explosions(&pattern)?;
+                super::resolving::predicates::validate_distinct_bindings(&pattern)?;
                 let pattern_func =
                     super::resolving::predicates::convert_destructure_pattern_to_resolved(
                         *pattern,

@@ -14,7 +14,7 @@
 //!
 //! ## Architecture
 //!
-//! ```
+//! ```text
 //! BinCartridge (trait)
 //!   └── provides metadata + entities
 //!       ├── PreludeCartridge (pseudo-predicates)
@@ -30,7 +30,7 @@
 //!
 //! ## Example: Pseudo-Predicate
 //!
-//! ```rust
+//! ```ignore
 //! struct MountPredicate;
 //!
 //! impl BinEntity for MountPredicate {

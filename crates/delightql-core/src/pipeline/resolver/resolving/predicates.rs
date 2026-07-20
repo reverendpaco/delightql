@@ -363,6 +363,109 @@ pub(in crate::pipeline::resolver) fn validate_unresolved_pattern_for_mode(
 
 /// EPOCH 5: Validate no sibling explosions (multiple ~> at same pattern level)
 /// Sibling explosions create ambiguous cartesian products
+/// Refuse a destructure pattern that binds the same column name more
+/// than once — at any level. The bindings share one flat output
+/// heading, so a duplicate is not two extractions: one silently
+/// overwrites the other and the loser's value is unobservable.
+pub(in crate::pipeline::resolver) fn validate_distinct_bindings(
+    pattern: &ast_unresolved::FunctionExpression,
+) -> Result<()> {
+    let mut bindings: Vec<delightql_types::SqlIdentifier> = Vec::new();
+    collect_pattern_bindings(pattern, &mut bindings)?;
+    Ok(())
+}
+
+fn bind_pattern_name(
+    name: &delightql_types::SqlIdentifier,
+    seen: &mut Vec<delightql_types::SqlIdentifier>,
+) -> Result<()> {
+    if seen.contains(name) {
+        return Err(DelightQLError::validation_error(
+            format!(
+                "destructure pattern binds '{}' more than once — the bindings \
+                 share one output heading, so one extraction silently overwrites \
+                 the other. Give each a distinct column name with an explicit \
+                 key: \"{}\": other_name",
+                name, name
+            ),
+            "destructuring",
+        ));
+    }
+    seen.push(name.clone());
+    Ok(())
+}
+
+fn collect_pattern_bindings(
+    pattern: &ast_unresolved::FunctionExpression,
+    seen: &mut Vec<delightql_types::SqlIdentifier>,
+) -> Result<()> {
+    match pattern {
+        ast_unresolved::FunctionExpression::MetadataTreeGroup {
+            key_column,
+            constructor,
+            ..
+        } => {
+            bind_pattern_name(key_column, seen)?;
+            collect_pattern_bindings(constructor, seen)
+        }
+        ast_unresolved::FunctionExpression::Curly { members, .. } => {
+            for member in members {
+                match member {
+                    ast_unresolved::CurlyMember::Shorthand { column, .. } => bind_pattern_name(column, seen)?,
+                    ast_unresolved::CurlyMember::KeyValue { value, .. } => match &**value {
+                        ast_unresolved::DomainExpression::Lvar { name, .. } => bind_pattern_name(name, seen)?,
+                        ast_unresolved::DomainExpression::Function(nested) => {
+                            collect_pattern_bindings(nested, seen)?
+                        }
+                        _ => {}
+                    },
+                    ast_unresolved::CurlyMember::PathLiteral { path, alias } => {
+                        if let Some(name) = path_binding_name(path, alias) {
+                            bind_pattern_name(&name, seen)?
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        ast_unresolved::FunctionExpression::Array { members, .. } => {
+            for ast_unresolved::ArrayMember::Index { path, alias } in members {
+                if let Some(name) = path_binding_name(path, alias) {
+                    bind_pattern_name(&name, seen)?
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The output column a path-literal member binds: its alias, or the
+/// path's last object key. Index-terminated unaliased paths derive
+/// positional names elsewhere and cannot collide by spelling.
+fn path_binding_name(
+    path: &ast_unresolved::DomainExpression,
+    alias: &Option<delightql_types::SqlIdentifier>,
+) -> Option<delightql_types::SqlIdentifier> {
+    if let Some(a) = alias {
+        return Some(a.clone());
+    }
+    if let ast_unresolved::DomainExpression::Projection(ProjectionExpr::JsonPathLiteral {
+        segments,
+        ..
+    }) = path
+    {
+        if let Some(crate::pipeline::asts::core::expressions::functions::PathSegment::ObjectKey(
+            key,
+        )) = segments.last()
+        {
+            return Some(delightql_types::SqlIdentifier::from(key.as_str()));
+        }
+    }
+    None
+}
+
 pub(in crate::pipeline::resolver) fn validate_no_sibling_explosions(
     pattern: &ast_unresolved::FunctionExpression,
 ) -> Result<()> {

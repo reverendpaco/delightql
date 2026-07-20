@@ -536,6 +536,7 @@ pub(super) fn s_lower_lvar(
             .unwrap_or_else(|| super::builder::QualifiedColumn {
                 name: name.to_string(),
                 qualifier: Some(table.to_string()),
+                has_interior_schema: false,
             }),
         None => match qualify.qualify(name) {
             Ok(qc) => qc,
@@ -1443,7 +1444,15 @@ pub(super) fn s_lower_curly_scalar(
                     column.as_str().to_string(),
                 )));
                 let qual_str = qualifier.as_ref().map(|q| q.as_str());
-                args.push(s_lower_lvar(column.as_str(), qual_str, qualify, ctx)?);
+                let lowered = s_lower_lvar(column.as_str(), qual_str, qualify, ctx)?;
+                // A staged tree column re-embeds via json() so it splices
+                // instead of escaping as TEXT — same treatment the internal
+                // CTE staging path gives its own aggregate columns.
+                args.push(if qualify.tree_valued(column.as_str(), qual_str) {
+                    SqlDomainExpr::function("json", vec![lowered])
+                } else {
+                    lowered
+                });
             }
             CurlyMember::KeyValue {
                 key,
@@ -1451,7 +1460,19 @@ pub(super) fn s_lower_curly_scalar(
                 nested_reduction: false,
             } => {
                 args.push(SqlDomainExpr::literal(LiteralValue::String(key)));
-                args.push(s_lower_expression(*value, qualify, ctx)?);
+                let is_tree = match value.as_ref() {
+                    ast_addressed::DomainExpression::Lvar {
+                        name, qualifier, ..
+                    } => qualify
+                        .tree_valued(name.as_str(), qualifier.as_ref().map(|q| q.as_str())),
+                    _ => false,
+                };
+                let lowered = s_lower_expression(*value, qualify, ctx)?;
+                args.push(if is_tree {
+                    SqlDomainExpr::function("json", vec![lowered])
+                } else {
+                    lowered
+                });
             }
             CurlyMember::KeyValue {
                 key,

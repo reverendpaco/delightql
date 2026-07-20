@@ -52,8 +52,7 @@
 //!     §5.2 holds because no transaction control is ever emitted between a
 //!     DML and its receipt — the bracket wraps the whole body).
 //!
-//! Plan scratch is un-collidable with user space (the review's one
-//! invariant behind every SEV-1, 2026-07-11): every scratch NAME is
+//! Plan scratch is un-collidable with user space: every scratch NAME is
 //! `__`-prefixed and every scratch REFERENCE is session-temp-qualified
 //! in the dialect's spelling (`qualify_scratch_refs` + the
 //! `scratch.schema` slot — R-T2's two layers, both engine-portable:
@@ -62,11 +61,11 @@
 //! user targets (`handle_ddl`'s name guard), and scratch dies with its
 //! plan (the trailing cleanup; abort/exit residue is
 //! `relay::entry::drop_plan_scratch`'s job). Name-clash semantics for
-//! USER objects (EFFECT-ALGEBRA §3, ruled 2026-07-11): temp creations
+//! USER objects (EFFECT-ALGEBRA §3): temp creations
 //! REPLACE (adjacent drop inside the bracket), durable `table!` REFUSES
 //! (`table_replace!` reserved).
 //!
-//! Receipt schema (EFFECT-ALGEBRA §3, amended 2026-07-11): `success`
+//! Receipt schema (EFFECT-ALGEBRA §3): `success`
 //! first, `operation` second — the producing directive's name as written
 //! (`'insert!'`, `'temp_table!'`) — then the directive's parameter echoes
 //! (compile-time constants). DML receipts gate on the DML's matched
@@ -79,8 +78,7 @@
 //! transformer_v4/builder/state.rs:581, applied via
 //! `disambiguated_select_items` in transformer_v4/builder/mod.rs).
 //!
-//! EMISSION DIALECTING (E-T2, EFFECTS-ON-TARGETS-PLAN §3; R-T2/R-T6
-//! ratified 2026-07-11): every raw-text emission part goes through the
+//! EMISSION DIALECTING (E-T2): every raw-text emission part goes through the
 //! data-driven dialect road, keyed on the SETTLED connection's dialect
 //! (E-T1 guarantees settlement before any emission). "Code chooses the
 //! form, data spells it":
@@ -103,7 +101,7 @@
 //! whose bare-join legalization already covers PG/DuckDB (pinned by
 //! `receipt_join_has_no_bare_inner_join_outside_sqlite`).
 //!
-//! DURABLE PLACEMENT ON TARGETS (E-T4; R-T4 ratified 2026-07-11): the
+//! DURABLE PLACEMENT ON TARGETS (E-T4): the
 //! `table!` CTAS is placed per engine at compile time — PG spells the
 //! MOUNTED schema (`public.<name>`) or refuses when it is unknowable;
 //! DuckDB's direct-open primary keeps the unqualified CREATE (abstention
@@ -461,7 +459,7 @@ impl ReceiptShape {
 }
 
 /// The receipt insert's gate — the ONE emission whose variance is
-/// STATEMENT SHAPE per engine, not spelling (R-T6, ratified 2026-07-11:
+/// STATEMENT SHAPE per engine, not spelling (R-T6:
 /// the gate is PURE SQL on every engine; `success` = the DML's MATCHED
 /// cardinality, which every engine answers natively). Code chooses the
 /// form here, keyed on the settled connection's dialect (`handle_dml`);
@@ -1108,15 +1106,33 @@ impl<'a> PlanBuilder<'a> {
     ) -> Result<RelationalExpression> {
         let bare = bare_name(name);
 
-        // 1. Effect-CTE label: the mention IS the instantiation (E2).
-        if let Some(cte) = ctx.ctes.iter().find(|c| c.name == bare).cloned() {
+        // 1. Effect-CTE label: the mention IS the instantiation (E2), and
+        //    ALL same-label definitions accumulate — the label denotes
+        //    their corresponding union, the same label semantics as
+        //    main-pipeline duplicate CTE labels and R5 multi-clause
+        //    rules. A first-match here dropped every later arm silently,
+        //    mutations included, under a success receipt.
+        let matching: Vec<_> = ctx.ctes.iter().filter(|c| c.name == bare).cloned().collect();
+        if !matching.is_empty() {
             require_glob_args(name, arguments)?;
             self.pending_comment
                 .get_or_insert_with(|| format!("[arm {}!]", bare));
             let mut arm_ctx = ctx.clone();
             arm_ctx.label_hint = Some(bare.to_string());
             arm_ctx.sink = None;
-            return self.walk_value(cte.expression, &arm_ctx);
+            let mut walked = Vec::with_capacity(matching.len());
+            for cte in matching {
+                walked.push(self.walk_value(cte.expression, &arm_ctx)?);
+            }
+            if walked.len() == 1 {
+                return Ok(walked.pop().expect("one walked arm"));
+            }
+            return Ok(RelationalExpression::SetOperation {
+                operator: crate::pipeline::asts::core::expressions::metadata_types::SetOperator::UnionCorresponding,
+                operands: walked,
+                correlation: PhaseBox::phantom(),
+                cpr_schema: PhaseBox::phantom(),
+            });
         }
 
         // 2. Built-ins.
@@ -1465,8 +1481,8 @@ impl<'a> PlanBuilder<'a> {
         // ENGINE OWNERSHIP (dogfooding plan invariant 11; Q-D8): a
         // system-kind namespace is engine-owned — programs cannot mutate
         // its rows, refused at compile on this mutation path. Pinned by
-        // directive_contract 42 (a forged effect_plan insert SUCCEEDED
-        // before this check, 2026-07-15 probe).
+        // directive_contract 42 (a forged effect_plan insert succeeds
+        // without this check).
         self.refuse_system_namespace_target(&target, target_namespace.as_deref(), "DML")?;
         // Invariant §5.4 / D2: a self-referential mutation whose source
         // reads the target THROUGH a plan-created view materializes the
@@ -1667,7 +1683,7 @@ impl<'a> PlanBuilder<'a> {
         // resolution). A zero-connection source (pure computed relation)
         // routes None and places on the primary — §2 requirement 3.
         let conn = self.route(compiled.connection_id)?;
-        // Durable name clash REFUSES (ruled 2026-07-11, EFFECT-ALGEBRA §3):
+        // Durable name clash REFUSES (EFFECT-ALGEBRA §3):
         // replacement of a durable is worn in the name — `table_replace!`
         // is the reserved spelling for that intent (§6, the
         // imprint!/imprint_replace! precedent). The clash check is the
@@ -1742,8 +1758,7 @@ impl<'a> PlanBuilder<'a> {
                 with_clause: None,
                 query: source_query,
             })?;
-            // DURABLE PLACEMENT, per engine (R-T4 ratified 2026-07-11;
-            // E-T4): the durable home is a compile-time fact of the
+            // DURABLE PLACEMENT, per engine (R-T4; E-T4): the durable home is a compile-time fact of the
             // object's CONNECTION, never of engine session state.
             let durable_conn = conn.unwrap_or(2);
             match self.dialect() {
@@ -1756,10 +1771,10 @@ impl<'a> PlanBuilder<'a> {
                     // three silent breakages: empty path errors,
                     // pg_temp-first mints a silent temp, missing schemas
                     // skip). Unknowable schema → REFUSE, never an
-                    // unqualified durable CTAS on PG. Since E-T5 the
+                    // unqualified durable CTAS on PG. This
                     // refusal arm is DEFENSIVE: the only topology that
-                    // reached it (siso-typed postgres, connection_type 6)
-                    // now refuses earlier at route()'s latch (the RULED
+                    // reaches it (siso-typed postgres, connection_type 6)
+                    // refuses earlier at route()'s latch (the
                     // siso refusal, pinned by
                     // `pg_table_bang_on_siso_connection_hits_the_siso_refusal_first`);
                     // it stays because the R-T4 invariant must hold even
@@ -1847,13 +1862,13 @@ impl<'a> PlanBuilder<'a> {
             };
             self.finish_statement(&ddl_stmt)?
         };
-        // Temp name clash REPLACES (ruled 2026-07-11, EFFECT-ALGEBRA §3):
+        // Temp name clash REPLACES (EFFECT-ALGEBRA §3):
         // the DROP is adjacent to its CREATE, INSIDE the bracket, so an
         // abort's ROLLBACK restores the previous object (SQLite rolls back
         // temp DDL) and a script re-runs on one session without ceremony
         // (F3-re-runnability). Two same-name creations in one plan = last
         // wins, deliberately (mention is instantiation, E3). Replacement
-        // is by NAME, not kind (§3, ruled 2026-07-11): when the catalog
+        // is by NAME, not kind (§3): when the catalog
         // knows the name is HELD by the other kind — this plan's own
         // earlier creation, or a prior run's registration — the holder's
         // kind-matched DROP is emitted first (SQLite refuses a wrong-kind
@@ -2409,13 +2424,18 @@ impl<'a> PlanBuilder<'a> {
         // for sinkable rules C is the shared receipt table; for a
         // single compositional clause C is its (already receipt-shaped)
         // value. Multiplicity moves into the payload; NO propagates.
+        let has_shell = sink.is_some();
         let c_value = match sink {
             Some(s) => ground_read(&s.table),
             None => clause_values
                 .pop()
                 .expect("single-clause rule has one clause value"),
         };
-        let receipt = Self::outer_rule_receipt(c_value, &bare);
+        let receipt = Self::outer_rule_receipt(
+            c_value,
+            &bare,
+            has_shell.then(|| sink_columns.as_slice()),
+        );
         // Give the derived receipt a RELATION IDENTITY so it composes in
         // joins like the shell reads it replaced — colliding receipt
         // columns then follow the ordinary glob-join convention
@@ -2491,7 +2511,11 @@ impl<'a> PlanBuilder<'a> {
     /// exists, so aggregation cannot manufacture a YES from zero
     /// successful clauses (and no cloned mention can collide aliases or
     /// re-evaluate anything).
-    fn outer_rule_receipt(c_value: RelationalExpression, bare: &str) -> RelationalExpression {
+    fn outer_rule_receipt(
+        c_value: RelationalExpression,
+        bare: &str,
+        shell_columns: Option<&[String]>,
+    ) -> RelationalExpression {
         use crate::pipeline::asts::core::expressions::functions::CurlyMember;
         use crate::pipeline::asts::core::expressions::metadata_types::FilterOrigin;
         use crate::pipeline::asts::core::specs::{ModuloSpec, OutputDomainExpression};
@@ -2502,8 +2526,46 @@ impl<'a> PlanBuilder<'a> {
         use crate::pipeline::asts::core::metadata::NamespacePath;
         use crate::pipeline::asts::core::FunctionExpression;
 
+        // Shell reads lose interior schema (a table round trip cannot carry
+        // it — the single-clause path skips the shell for exactly that
+        // reason), so glob inference cannot know `returned` is a tree.
+        // The transformer DOES know, by receipt universality: `returned`
+        // is the payload column it mints, JSON-or-NULL by construction —
+        // spell the json() re-splice explicitly instead of inferring it.
+        let members = match shell_columns {
+            None => vec![CurlyMember::Glob],
+            Some(cols) => cols
+                .iter()
+                .map(|col| {
+                    if col == "returned" {
+                        CurlyMember::KeyValue {
+                            key: "returned".to_string(),
+                            nested_reduction: false,
+                            value: Box::new(DomainExpression::Function(
+                                FunctionExpression::Regular {
+                                    name: "json".into(),
+                                    namespace: None,
+                                    arguments: vec![DomainExpression::lvar_builder(
+                                        "returned".to_string(),
+                                    )
+                                    .build()],
+                                    conditioned_on: None,
+                                    alias: None,
+                                },
+                            )),
+                        }
+                    } else {
+                        CurlyMember::Shorthand {
+                            column: col.as_str().into(),
+                            qualifier: None,
+                            schema: None,
+                        }
+                    }
+                })
+                .collect(),
+        };
         let curly = DomainExpression::Function(FunctionExpression::Curly {
-            members: vec![CurlyMember::Glob],
+            members,
             inner_grouping_keys: Vec::new(),
             cte_requirements: None,
             alias: Some("returned".into()),
@@ -2754,7 +2816,7 @@ impl<'a> PlanBuilder<'a> {
         let lowered = super::lower_statement(
             stmt,
             dialect,
-            crate::pipeline::sql_optimizer::level_from_env(),
+            crate::pipeline::sql_optimizer::OptimizationLevel::Basic,
         )?;
         let pack = self.dialect_pack()?;
         let generator = generator_v3::SqlGenerator::new()
@@ -2930,8 +2992,7 @@ impl<'a> PlanBuilder<'a> {
     /// by hand here because these wrappers never pass through the
     /// transformer's own disambiguation).
     ///
-    /// BINDING (ruled 2026-07-11, resolving the 3.1 report's deviation):
-    /// a trailing postfix operator binds the ACCUMULATED union — the
+    /// BINDING: a trailing postfix operator binds the ACCUMULATED union — the
     /// language's one uniform rule; per-arm scoping is spelled interior
     /// (`s!(+-)`, task 3.1b). This function lowers whatever shape the
     /// parser hands it, which is now correct by construction: the
@@ -3028,7 +3089,7 @@ impl<'a> PlanBuilder<'a> {
             candidate
         };
 
-        // RULED 2026-07-15 (payload-preserving witness proxy): a NO arm's
+        // PAYLOAD-PRESERVING WITNESS PROXY: a NO arm's
         // proxy row carries `returned = '[]'` — the EMPTY interior — for
         // the conventional payload column(s), so total-ledger payload
         // release yields ZERO rows for NO arms by the ordinary
@@ -3583,8 +3644,7 @@ impl<'a> PlanBuilder<'a> {
         }));
     }
 
-    /// E-T5 SISO REFUSAL (EFFECTS-ON-TARGETS-PLAN §3 E-T5, RULED
-    /// 2026-07-11): a PERMANENT refusal, not an interim strike — effect
+    /// E-T5 SISO REFUSAL: a PERMANENT refusal, not an interim strike — effect
     /// plans that settle on a siso-mounted connection (connection_type 6)
     /// refuse at compile. The siso transport is error-blind
     /// (ALL-SQL-TARGETING-STATE §1: it cannot surface statement

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! F2 fix pinning (COMMENTS-ON-EFFECT-IMPLEMENTATION.md F2 + RULINGS item 2;
-//! materialize-pipe.md §6, RULED 2026-07-11): temp shadows main — SQLite's
+//! Temp shadows main — SQLite's
 //! semantics, UNQUALIFIED names only. The shadow is a resolution
 //! PREFERENCE, not a catalog edit:
 //!
@@ -353,7 +352,7 @@ fn qualified_read_reaches_physical_after_same_name_temp() {
 
 // ------------------------------------------------------------------
 // (b) BARE reads prefer the session-materialized temp (SQLite's
-// temp-shadows-main, adopted by the 2026-07-11 ruling).
+// temp-shadows-main semantics).
 // ------------------------------------------------------------------
 
 #[test]

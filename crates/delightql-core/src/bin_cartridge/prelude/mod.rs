@@ -94,11 +94,9 @@ pub(crate) fn descriptor_core_receipt(
     core_receipt_result(&format!("{bare_name}!"), &echoes, alias)
 }
 
-/// A CORE receipt with flat scalar echoes (EFFECT-ALGEBRA §3, amended
-/// 2026-07-15; Phase 6 session-family migration): one row —
+/// A CORE receipt with flat scalar echoes (EFFECT-ALGEBRA §3): one row —
 /// `(success, operation, <declared echo columns>)`. The echoes are the
-/// directive's ruled §8 additions; an optional echo is present with
-/// NULL. This retired the pre-amendment single-column `ns` result.
+/// directive's §8 additions; an optional echo is present with NULL.
 /// Reach it through `descriptor_core_receipt` — direct calls re-state
 /// echo names the descriptor already declares.
 fn core_receipt_result(
@@ -143,8 +141,8 @@ fn core_receipt_result(
     }
 }
 
-/// A receipt with interior DECLARED ADDITIONS (EFFECT-ALGEBRA §3,
-/// amended 2026-07-15): one row `(success, operation, input, returned)`
+/// A receipt with interior DECLARED ADDITIONS (EFFECT-ALGEBRA §3):
+/// one row `(success, operation, input, returned)`
 /// where `input` is the faithful interior echo of the lifted argument
 /// table and `returned` carries the directive's produced result.
 ///

@@ -49,7 +49,7 @@ impl BinEntity for DocPredicate {
                     _is_optional: false,
                 },
             ],
-            // EFFECT-ALGEBRA §3 (amended 2026-07-15): the guaranteed core
+            // EFFECT-ALGEBRA §3: the guaranteed core
             // plus doc!'s one declared addition — the interior `input`
             // echo of the lifted argument table. doc! declares no payload.
             output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("doc")),

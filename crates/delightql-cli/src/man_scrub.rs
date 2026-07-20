@@ -5,8 +5,8 @@
 //!
 //! This is NOT a roff renderer. Roff in general is a Turing tar pit
 //! (macro definitions, conditionals, registers); this module handles
-//! the closed dialect our pages actually use — measured 2026-07-05:
-//! 16 macros, 5 escapes — and REFUSES everything else. The
+//! the closed dialect our pages actually use — 16 macros, 5
+//! escapes — and REFUSES everything else. The
 //! `test_man_pages_stay_inside_the_house_dialect` bin test walks every
 //! shipped page through here, so the dialect stays closed by
 //! assertion: extend this scrubber or stay inside the dialect, never

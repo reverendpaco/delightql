@@ -131,7 +131,7 @@ pub(super) fn build_corresponding_schema(
                 seen_names.insert(col_name);
                 unified_columns.push(col.clone());
             } else {
-                // TAGGED SUM (EFFECT-ALGEBRA §3, amended 2026-07-15): a
+                // TAGGED SUM (EFFECT-ALGEBRA §3): a
                 // same-named column whose arms declare DIFFERENT interior
                 // headings stays legal to union (each row keeps its own
                 // heading; `operation` is the tag) but must not be

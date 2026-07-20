@@ -4,7 +4,7 @@
 //! its real stdin/stdout — the exact channel dql speaks.
 //!
 //! - default (no flag): WRITABLE — an INSERT succeeds and persists in
-//!   the file after the child exits (the 2026-07-11 ruling).
+//!   the file after the child exits.
 //! - `--readonly`: the explicit opt-in — the engine refuses the INSERT,
 //!   reads still work, and the file is untouched.
 //!

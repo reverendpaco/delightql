@@ -12,7 +12,7 @@
 //! pattern on TOKEN PRESENCE (never on recovery shape, which shifts
 //! across grammar regenerations), and speaks only when unambiguous — a
 //! specific wrong hint is worse than a generic true one (the "needs
-//! spaces" lesson, outside-eyes F10). Each diagnosis mints its own
+//! spaces" lesson). Each diagnosis mints its own
 //! badge under parse/ so it is explainable and annotation-matchable.
 
 use crate::pipeline::cst::CstNode;
@@ -38,7 +38,12 @@ pub(super) fn diagnose_failed_parse(root: &CstNode, source: &str) -> Option<Pars
     collect_leaf_tokens(root, &mut tokens);
     tokens.sort_by_key(|t| t.start);
 
-    diagnose_is_null(&tokens, source)
+    // Dash-comment MUST run first: comment text is arbitrary prose, so a
+    // `-- check x is null` line would otherwise feed the other patterns
+    // words they would misread as the user's query.
+    diagnose_dash_comment(&tokens, source)
+        .or_else(|| diagnose_sort_minus(&tokens))
+        .or_else(|| diagnose_is_null(&tokens, source))
         .or_else(|| diagnose_anon_space(&tokens))
         .or_else(|| diagnose_pony(&tokens))
 }
@@ -93,28 +98,72 @@ fn collect_leaf_tokens(node: &CstNode, out: &mut Vec<Token>) {
 /// single-character symbols. Enough for token-presence patterns; never
 /// used on text the tree parsed successfully.
 fn lex_span(text: &str, base: usize, out: &mut Vec<Token>) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    // char_indices, not a byte walk: recovery text is user-controlled
+    // and slicing at a mid-codepoint byte index panics.
+    let mut iter = text.char_indices().peekable();
+    while let Some((start, c)) = iter.next() {
         if c.is_whitespace() {
-            i += 1;
             continue;
         }
-        let start = i;
+        let mut end = start + c.len_utf8();
         if c.is_alphanumeric() || c == '_' {
-            while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
+            while let Some(&(i, next)) = iter.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    end = i + next.len_utf8();
+                    iter.next();
+                } else {
+                    break;
+                }
             }
-        } else {
-            i += 1;
         }
         out.push(Token {
-            text: text[start..i].to_string(),
+            text: text[start..end].to_string(),
             start: base + start,
-            end: base + i,
+            end: base + end,
         });
     }
+}
+
+/// `--` — SQL's line comment, which DelightQL does not have: it lexes as
+/// two `-` operators and breaks the parse. Keyed on an ADJACENT minus
+/// pair (`a - -b` has a gap and stays silent); a pair behind an odd
+/// number of `"` is inside a string literal and stays silent too.
+fn diagnose_dash_comment(tokens: &[Token], source: &str) -> Option<ParseDiagnosis> {
+    for pair in tokens.windows(2) {
+        if pair[0].text == "-" && pair[1].text == "-" && pair[1].start == pair[0].end {
+            let quotes_before = source[..pair[0].start].matches('"').count();
+            if quotes_before % 2 == 1 {
+                continue; // inside a string literal — ordinary text
+            }
+            return Some(ParseDiagnosis {
+                subcategory: crate::uri_registry::subcat::PARSE_COMMENT,
+                message: "`--` is not a comment in DelightQL — it lexes as two `-` \
+                          operators. Line comments are `//`. (If subtraction of a \
+                          negative was meant, group it: `a - (-b)`.)"
+                    .to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// `#(-col)` — minus-prefix descending sort, which DelightQL does not
+/// have; the spelling is `#(col desc)`. Keyed on `-` directly after the
+/// sort sigil's `(`; a minus deeper in the window (`#(0 - col)`) is
+/// arithmetic and stays silent.
+fn diagnose_sort_minus(tokens: &[Token]) -> Option<ParseDiagnosis> {
+    for w in tokens.windows(3) {
+        if w[0].text == "#" && w[1].text == "(" && w[2].text == "-" {
+            return Some(ParseDiagnosis {
+                subcategory: crate::uri_registry::subcat::PARSE_SORT_MINUS,
+                message: "`#(-col)` is not descending sort — the spelling is \
+                          `#(col desc)`, per key: `#(a desc, b)`. (Unary minus \
+                          as arithmetic needs grouping: `#((0 - col))`.)"
+                    .to_string(),
+            });
+        }
+    }
+    None
 }
 
 /// `col is null` / `col is not null` — SQL spelling with no DelightQL
@@ -239,5 +288,55 @@ mod tests {
     #[test]
     fn anon_space_fires() {
         assert_eq!(diagnose("_ (x @ 1)"), Some("anon_space"));
+    }
+
+    #[test]
+    fn dash_comment_fires_trailing_and_leading() {
+        assert_eq!(diagnose("_(x @ 1), # < 1 -- trailing note"), Some("comment"));
+        assert_eq!(diagnose("-- a comment\n_(x @ 1"), Some("comment"));
+    }
+
+    #[test]
+    fn dash_comment_beats_patterns_inside_comment_text() {
+        // The comment's prose contains an is_null shape and a PONY shape;
+        // the comment diagnosis must win — the prose is not the query.
+        assert_eq!(diagnose("_(x @ 1), # < 1 -- check x is null"), Some("comment"));
+        assert_eq!(diagnose("_(x @ 1), # < 1 -- was x * 2 + 1"), Some("comment"));
+    }
+
+    #[test]
+    fn sort_minus_fires_and_arithmetic_stays_silent() {
+        assert_eq!(diagnose("_(x @ 1) |> #(-x)"), Some("sort_minus"));
+        // minus deeper in the window is arithmetic, not descending intent
+        assert_ne!(diagnose("_(x @ 1) |> #(0 - x) is"), Some("sort_minus"));
+    }
+
+    #[test]
+    fn dash_comment_silent_on_gap_and_inside_string() {
+        // `- -` with a gap is subtraction of a negative, not a comment.
+        assert_ne!(diagnose("_(x @ 1), x - - 1 = 3"), Some("comment"));
+        // `--` inside a string literal is ordinary text; the real mistake
+        // here is `is null` and that diagnosis must still win.
+        assert_eq!(diagnose("_(s @ \"a--b\"), s is null"), Some("is_null"));
+    }
+
+    #[test]
+    fn multibyte_recovery_text_never_panics() {
+        // Recovery text is user-controlled; the lexer must hold char
+        // boundaries. Accented, CJK, and emoji, in error spans and gaps.
+        let _ = diagnose("_(x @ 1), x * é + 1");
+        let _ = diagnose("_(x @ 1), x * 日本語 + 1");
+        let _ = diagnose("_(x @ 1), x * 🎉 + 1");
+        let _ = diagnose("é日🎉");
+        let _ = diagnose("_(é @ 1), é is null");
+    }
+
+    #[test]
+    fn diagnosis_still_fires_after_multibyte_text() {
+        // Multibyte text ahead of the pattern must not derail token
+        // positions: the `--` pair is still adjacent, the `#(-` window
+        // still matches.
+        assert_eq!(diagnose("_(x @ \"café\"), # < 1 -- note"), Some("comment"));
+        assert_eq!(diagnose("_(x @ \"café\") |> #(-x)"), Some("sort_minus"));
     }
 }

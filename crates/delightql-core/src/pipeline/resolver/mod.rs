@@ -2090,11 +2090,16 @@ fn rename_qualifier_in_resolved_domain(
     }
 }
 
-/// BFS path-finding in the ER graph. Returns the shortest path, or an error
-/// if no path exists or multiple shortest paths exist (ambiguity).
+/// Path-finding in the ER graph: enumerate ALL simple paths between the
+/// endpoints. Exactly one → that path; zero → no-path error; two or
+/// more → the ambiguity error, regardless of relative length — the
+/// contract is "if multiple paths exist, the query fails", so a direct
+/// edge never silently outranks a longer business path. Enumeration
+/// must be exhaustive: a search that stops early (at the shortest, or
+/// with a global visited set that suppresses paths sharing an
+/// intermediate node) refuses some competitor shapes and silently
+/// selects through others, which is worse than either consistent rule.
 fn bfs_path(adjacency: &HashMap<String, Vec<String>>, from: &str, to: &str) -> Result<Vec<String>> {
-    use std::collections::VecDeque;
-
     if from == to {
         return Err(DelightQLError::validation_error(
             "ER-transitive join endpoints must be different tables",
@@ -2102,41 +2107,47 @@ fn bfs_path(adjacency: &HashMap<String, Vec<String>>, from: &str, to: &str) -> R
         ));
     }
 
-    let mut queue: VecDeque<Vec<String>> = VecDeque::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ER contexts are hand-authored and small; simple-path enumeration is
+    // cheap there. The expansion cap is a refuse-loudly backstop for a
+    // pathologically dense context — uniqueness that cannot be verified
+    // is reported, never assumed.
+    const MAX_EXPANSIONS: usize = 100_000;
+    let mut expansions = 0usize;
+
     let mut found_paths: Vec<Vec<String>> = Vec::new();
-    let mut shortest_len: Option<usize> = None;
+    let mut stack: Vec<Vec<String>> = vec![vec![from.to_string()]];
 
-    queue.push_back(vec![from.to_string()]);
-    visited.insert(from.to_string());
-
-    while let Some(path) = queue.pop_front() {
+    while let Some(path) = stack.pop() {
         let current = path.last().unwrap();
-
-        // If we've already found shortest paths and this path is longer, stop
-        if let Some(len) = shortest_len {
-            if path.len() > len {
-                break;
-            }
-        }
-
         if let Some(neighbors) = adjacency.get(current.as_str()) {
             for neighbor in neighbors {
-                let mut new_path = path.clone();
-                new_path.push(neighbor.clone());
-
+                expansions += 1;
+                if expansions > MAX_EXPANSIONS {
+                    return Err(DelightQLError::validation_error(
+                        format!(
+                            "ER-context too dense to verify a unique join path \
+                             from '{}' to '{}'; spell the join explicitly with `&`.",
+                            from, to,
+                        ),
+                        "ER path search cap",
+                    ));
+                }
                 if neighbor == to {
-                    if shortest_len.is_none() {
-                        shortest_len = Some(new_path.len());
-                    }
-                    found_paths.push(new_path);
-                } else if !visited.contains(neighbor) {
-                    visited.insert(neighbor.clone());
-                    queue.push_back(new_path);
+                    let mut p = path.clone();
+                    p.push(neighbor.clone());
+                    found_paths.push(p);
+                } else if !path.contains(neighbor) {
+                    let mut p = path.clone();
+                    p.push(neighbor.clone());
+                    stack.push(p);
                 }
             }
         }
     }
+
+    // Deterministic order (shortest first) — the adjacency map is a
+    // HashMap, so discovery order is not stable across runs.
+    found_paths.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
 
     match found_paths.len() {
         0 => Err(DelightQLError::validation_error(

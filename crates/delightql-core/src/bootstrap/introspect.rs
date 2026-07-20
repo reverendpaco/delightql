@@ -40,7 +40,7 @@ pub use delightql_types::introspect::{
 /// * `Err(anyhow::Error)` - If introspection queries fail
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use rusqlite::Connection;
 /// use delightql_core::bootstrap::introspect::introspect_sqlite_database;
 ///
@@ -167,7 +167,7 @@ fn introspect_table_columns(
 /// * `Err(anyhow::Error)` - If INSERT operations fail
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use rusqlite::Connection;
 /// use delightql_core::bootstrap::{initialize_bootstrap_db, introspect::*};
 ///

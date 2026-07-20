@@ -136,6 +136,7 @@ impl<'a> DatabaseRegistry<'a> {
                             Some(idx + 1), // 1-based position
                         )
                         .with_declared_type(col.declared_type.clone())
+                        .with_nullable(Some(col.nullable))
                     })
                     .collect();
 
@@ -271,9 +272,9 @@ impl<'a> DatabaseRegistry<'a> {
             connection_id, backend_schema_opt, table_name
         );
 
-        // F2 shadow punch-through, QUALIFIED references only (materialize-pipe
-        // §6, RULED 2026-07-11: temp shadows main for unqualified names; a
-        // qualified read must reach the physical entity). When a
+        // Shadow punch-through, QUALIFIED references only (temp shadows
+        // main for unqualified names; a qualified read must reach the
+        // physical entity). When a
         // session-materialized entity and a competitor share this name in the
         // namespace, answer the COMPETITOR's registered columns with an
         // explicit backend schema — the ATTACH alias where the namespace's
@@ -315,6 +316,7 @@ impl<'a> DatabaseRegistry<'a> {
                                         Some(idx + 1),
                                     )
                                     .with_declared_type(col.declared_type.clone())
+                        .with_nullable(Some(col.nullable))
                                 })
                                 .collect();
                             return Ok(Some((
@@ -360,6 +362,7 @@ impl<'a> DatabaseRegistry<'a> {
                                 Some(idx + 1),
                             )
                             .with_declared_type(col.declared_type.clone())
+                        .with_nullable(Some(col.nullable))
                         })
                         .collect();
                     return Ok(Some((
@@ -496,6 +499,7 @@ impl<'a> DatabaseRegistry<'a> {
                         Some(idx + 1), // 1-based position
                     )
                     .with_declared_type(col.declared_type.clone())
+                        .with_nullable(Some(col.nullable))
                 })
                 .collect();
 
@@ -1856,19 +1860,26 @@ impl ConsultRegistry {
         .filter_map(|r| r.ok())
         .collect();
 
-        // Check for cross-namespace ambiguity
-        let namespaces: std::collections::HashSet<&str> =
-            rows.iter().map(|(_, _, _, ns)| ns.as_str()).collect();
-        if namespaces.len() > 1 {
-            let ns_list: Vec<&str> = namespaces.into_iter().collect();
+        // Ambiguity is a property of the ROW COUNT, not of how the rows
+        // spread across namespaces: two rules covering the same pair in
+        // ONE namespace (a&b and b&a with different bodies) are exactly
+        // as ambiguous as two namespaces each holding one — and the
+        // query has no ORDER BY, so a first-row pick is scan-order
+        // arbitrary, silently choosing a join condition.
+        if rows.len() > 1 {
+            let mut sources: Vec<String> = rows
+                .iter()
+                .map(|(name, _, _, ns)| format!("{}::{}", ns, name))
+                .collect();
+            sources.sort();
             return Err(DelightQLError::validation_error(
                 format!(
-                    "Ambiguous ER-rule for ({}, {}) in context '{}': found in namespaces [{}].{}",
+                    "Ambiguous ER-rule for ({}, {}) in context '{}': {} rules cover this pair [{}].",
                     table_a,
                     table_b,
                     context,
-                    ns_list.join(", "),
-                    "",
+                    sources.len(),
+                    sources.join(", "),
                 ),
                 "Ambiguous ER-rule",
             ));

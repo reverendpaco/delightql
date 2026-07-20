@@ -149,6 +149,26 @@ fn display_results(
         print!("{}", output);
     }
 
+    // An empty relation still has a heading: formats whose contract can
+    // carry one emit it for zero rows — table/tsv/csv print the header
+    // line, box the header frame. Rows-only contracts (list) stay
+    // zero-byte, like the machine formats with their own empty spellings
+    // (json `[]`, jsonl zero lines, raw zero bytes) on their own paths.
+    if total_rows == 0
+        && !no_headers
+        && matches!(
+            output_format,
+            crate::output_format::OutputFormat::Table
+                | crate::output_format::OutputFormat::Tsv
+                | crate::output_format::OutputFormat::Csv
+                | crate::output_format::OutputFormat::Box
+        )
+    {
+        let output =
+            format_output_with_zebra(&columns, &[], output_format, zebra_mode, false, no_sanitize);
+        print!("{}", output);
+    }
+
     let _ = session
         .close(qr.handle)
         .map_err(|e| anyhow::anyhow!("{}", e));
@@ -235,7 +255,7 @@ fn display_results_json(
 }
 
 /// `-f raw` — the byte-preservation doctrine's user-facing exit
-/// (PORCELAIN-AND-PLUMBING.md §7 knob 4, ratified 2026-07-05): verbatim
+/// (PORCELAIN-AND-PLUMBING.md §7 knob 4): verbatim
 /// cell bytes, no separators ever (a separator would corrupt binary),
 /// NULL writes zero bytes, multi-row = byte-stream concatenation.
 /// Single column ONLY — multi-column concatenation ("1John2Jane") is
@@ -505,10 +525,9 @@ fn display_compile_stage(
     let columns = vec!["representation".to_string()];
 
     // Raw = the pasteable artifact itself: bare text, real newlines, no
-    // header. This caller previously fell through to display paths whose
-    // Raw arm is (correctly) unreachable!() — the panic of
-    // bugs/cli-surface-2026-07-05/PLAN.md #1. It also closes the audit's
-    // "no clean just-the-SQL spelling" gap: `--to sql -f raw` is it.
+    // header. Falling through to the display paths panics — their Raw
+    // arm is (correctly) unreachable!(), so this caller must handle Raw
+    // itself. `--to sql -f raw` is the clean just-the-SQL spelling.
     if output_format == OutputFormat::Raw {
         println!("{}", representation);
         return Ok(Some(ResultMetadata {

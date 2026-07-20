@@ -329,6 +329,16 @@ impl BuilderState {
         }
     }
 
+    /// Mutable access to the scope (interior-schema adoption).
+    pub(super) fn scope_mut(&mut self) -> &mut ScopeEntry {
+        match self {
+            Self::Table { scope, .. }
+            | Self::Segment { scope, .. }
+            | Self::Select { scope, .. }
+            | Self::Frozen { scope, .. } => scope,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // State transitions
     // -----------------------------------------------------------------------

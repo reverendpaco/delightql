@@ -24,6 +24,13 @@ standard input, when stdin is not a terminal;
 .IP \(bu 3
 otherwise an interactive REPL is started.
 .PP
+The stdin path reads
+.B until EOF
+and blocks until the pipe closes; a notice announcing the wait (and
+the escape hatches) is printed to stderr before the read, so a
+harness whose pipe never delivers EOF has its diagnosis in the
+captured stderr. Stdout stays reserved for results.
+.PP
 A file (or stdin) may contain multiple statements (with
 .BR \-\-sequential ).
 They execute in order; the
@@ -49,8 +56,7 @@ queries).
 .BI \-\-consult " FILE"
 Unsupported \(em refuses with a pointer: use
 .B consult!()
-in the DQL source instead, which also works in files, test balls, and
-the REPL.
+in the DQL source instead, which also works in files and the REPL.
 .TP
 .BI \-\-attach " ATTACH"
 Attach an external database.
@@ -113,9 +119,6 @@ to drop the header.
 .BI \-\-dialect " DIALECT"
 Target dialect for the generated SQL. See
 .BR dql (1).
-.TP
-.BI \-\-soptimize " N"
-SQL optimization level, 0\-3. Default 0.
 .SS Output
 .TP
 .BI \-f ", " \-\-format " FORMAT"

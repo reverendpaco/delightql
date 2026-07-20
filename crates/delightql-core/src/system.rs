@@ -625,11 +625,11 @@ fn register_curated_sys_ns_table(
 }
 
 /// Register the CURATED sys::ns relations: `namespace` (the ratified public
-/// shape — NAMESPACE-CARTRIDGE-LINK-DESIGN.md), plus the two taxonomy
-/// decisions ruled 2026-07-16 (dql selftest's orphaned_entity findings):
-/// `mount` (MOUNT-RELATION-DESIGN.md §4 anticipated this curated
-/// projection — mount identity queryable deliberately) and
-/// `namespace_source` (Phase 8 consultation provenance — which files, in
+/// shape — NAMESPACE-CARTRIDGE-LINK-DESIGN.md), plus two curated taxonomy
+/// relations:
+/// `mount` (MOUNT-RELATION-DESIGN.md §4 — mount identity queryable
+/// deliberately) and
+/// `namespace_source` (consultation provenance — which files, in
 /// which order, built a consulted namespace).
 fn register_sys_ns_namespace_table(
     bootstrap_conn: &Connection,
@@ -1021,6 +1021,11 @@ fn create_mounted_namespace_path(
         })?;
 
     let created_names: Vec<String> = specs.iter().map(|spec| spec.fq_name.clone()).collect();
+    // Every segment this mount will CREATE must honor the
+    // alias/namespace exclusivity invariant.
+    for name in &created_names {
+        ensure_namespace_available(conn, name)?;
+    }
     for spec in &mut specs {
         if spec.fq_name == namespace {
             spec.kind = "data".into();
@@ -1462,7 +1467,7 @@ pub(crate) fn refuse_if_blueprint(conn: &Connection, fq_name: &str) -> Result<()
 }
 
 /// Guard a USER-TYPED namespace-creation target against the reserved system
-/// name pool (namespace-catechism Deviation #3, re-ruled 2026-07-07).
+/// name pool.
 ///
 /// The top level of the namespace tree stays OPEN to user names — `consult!`
 /// and `mount!` mint exactly where they say. What this refuses, loudly and
@@ -1721,7 +1726,7 @@ pub(crate) fn home_child_shadows(conn: &Connection, path: &str) -> bool {
 
 #[cfg(test)]
 mod name_guard_tests {
-    //! The system name guard (catechism Deviation #3, re-ruled 2026-07-07).
+    //! The system name guard.
     //! Each prong, the home relaxation, the main exemption, and
     //! case-insensitivity. The guard is a pure string function, so these are
     //! the authoritative behavior pins; the balls prove the wiring.
@@ -2959,6 +2964,39 @@ fn ensure_namespace_available(conn: &rusqlite::Connection, fq_name: &str) -> Res
             "Duplicate namespace",
         ));
     }
+
+    // The inverse of register_namespace_alias's guard — the exclusivity
+    // invariant (an alias shorthand and an exact namespace name never
+    // coexist) must hold from BOTH creation orders. A namespace shadowing
+    // an alias makes every lookup for the name two-headed: the entity
+    // resolution query ORs the exact-fq and alias branches with no
+    // ordering, so which entity answers is scan order — silent
+    // wrong-entity resolution, not an error.
+    let alias_target: Option<String> = conn
+        .query_row(
+            "SELECT n.fq_name FROM namespace_alias a
+             JOIN namespace n ON n.id = a.target_namespace_id
+             WHERE a.alias = ?1",
+            [fq_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| {
+            DelightQLError::database_error("Failed to check alias collision", e.to_string())
+        })?;
+
+    if let Some(target) = alias_target {
+        return Err(DelightQLError::database_error(
+            format!(
+                "'{}' is already an alias for namespace '{}'. A namespace may not \
+                take an alias's name — every reference to '{}' would resolve to \
+                whichever entity the scan found first. Pick a different name, or \
+                drop the alias first.",
+                fq_name, target, fq_name
+            ),
+            "Alias collision",
+        ));
+    }
     Ok(())
 }
 
@@ -3587,8 +3625,7 @@ impl DelightQLSystem {
         .ok()
     }
 
-    /// E-T5 siso refusal support (EFFECTS-ON-TARGETS-PLAN §3 E-T5, RULED
-    /// 2026-07-11, PERMANENT): is this connection a siso/pipe mount
+    /// E-T5 siso refusal support (PERMANENT): is this connection a siso/pipe mount
     /// (connection_type 6)? Effect plans that settle on one refuse at
     /// compile — the siso transport is error-blind, so R-T3's
     /// failure-aborts bracket discipline cannot be honored over it. A
@@ -5681,6 +5718,7 @@ impl DelightQLSystem {
                     id
                 }
                 None => {
+                    ensure_namespace_available(&bootstrap_conn, namespace)?;
                     let (ns_kind, ns_provenance, ns_source, ns_writable) = if path == "(inline)" {
                         ("scratch", "scratch", None, 1i32)
                     } else if path.starts_with("embedded://") {
@@ -6025,8 +6063,8 @@ impl DelightQLSystem {
                 ddl_defs
             };
 
-            // foo/foo! name collision (IMPLEMENTATION-PLAN §3.0, ruled
-            // 2026-07-11): a namespace may not hold both a functor `foo` and
+            // foo/foo! name collision: a namespace may not hold both a
+            // functor `foo` and
             // an effect rule `foo!`. Enforced at registration time in BOTH
             // directions, before either insert branch below (normal and
             // deferred-HO alike). Same-file collisions are caught too:
@@ -6838,6 +6876,35 @@ impl DelightQLSystem {
                     e.to_string(),
                 )
             })?;
+
+        // A shorthand that names an EXISTING namespace makes every lookup
+        // for that name two-headed: the entity resolution query ORs the
+        // exact-fq and alias branches with no ordering, so which head
+        // wins is scan order. Refuse the collision at registration.
+        let collision: Option<i64> = bootstrap_conn
+            .query_row(
+                "SELECT id FROM namespace WHERE fq_name = ?1",
+                [alias],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    "Failed to check alias collision",
+                    e.to_string(),
+                )
+            })?;
+        if collision.is_some() {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "alias!() shorthand '{}' collides with an existing namespace of \
+                     the same name — lookups for '{}' would be ambiguous. Choose a \
+                     different shorthand.",
+                    alias, alias
+                ),
+                "Alias shorthand collision",
+            ));
+        }
 
         bootstrap_conn
             .execute(
@@ -9308,8 +9375,15 @@ impl DelightQLSystem {
             manifest::find_internal_ns(&bootstrap_conn, source_ns)?.ok_or_else(|| {
                 DelightQLError::database_error(
                     format!(
-                        "imprint!() source '{}' has no _internal namespace \
-                         (no schema/constraints/defaults definitions)",
+                        "imprint!() source '{}' has no schema definitions to \
+                         materialize. imprint! consumes a library whose .dql \
+                         file declares companion definitions — schema `(^)`, \
+                         constraints `(+)`, and/or defaults `($)` sigil blocks \
+                         alongside the rules (these populate the library's \
+                         _internal namespace). A rules-only library has \
+                         nothing to imprint; to persist its VIEWS, run the \
+                         queries via `dql query --to sql` against the target \
+                         instead.",
                         source_ns
                     ),
                     "No _internal namespace",
@@ -9566,7 +9640,7 @@ impl DelightQLSystem {
             // --- Table materialization forks on the declaration signal:
             //   declared  → typed CREATE TABLE (from schema) [+ INSERT … SELECT]
             //   bare rule → CREATE TABLE … AS SELECT (engine derives real types)
-            // Option A (doeklund 2026-07-07): constraints/defaults require a
+            // Constraints/defaults require a
             // schema() so column types are always declared, not guessed.
             if item.schema_rows.is_empty()
                 && (!item.constraint_rows.is_empty() || !item.default_rows.is_empty())
@@ -10185,22 +10259,58 @@ impl DelightQLSystem {
                 // this plain name (home first). Fires ONLY here, on a confirmed
                 // miss, so no path that resolves today is affected (rule 1). The
                 // expanded fq re-enters via the same blueprint guard.
-                match expand_plain_namespace(&conn, &fq_name)? {
-                    Some(expanded) => match conn.query_row(
-                        "SELECT id FROM namespace WHERE fq_name = ?1",
-                        [&expanded],
-                        |row| row.get::<_, i64>(0),
-                    ) {
-                        Ok(id) => {
+                let expanded_id = match expand_plain_namespace(&conn, &fq_name)? {
+                    Some(expanded) => conn
+                        .query_row(
+                            "SELECT id FROM namespace WHERE fq_name = ?1",
+                            [&expanded],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .ok()
+                        .map(|id| -> Result<i64> {
                             refuse_if_blueprint(&conn, &expanded)?;
-                            id
-                        }
-                        _ => return Ok(None),
-                    },
+                            Ok(id)
+                        })
+                        .transpose()?,
+                    None => None,
+                };
+                match expanded_id {
+                    Some(id) => id,
                     None => {
-                        // Namespace not found
-                        debug!("resolve_namespace_path: Namespace '{}' not found", fq_name);
-                        return Ok(None);
+                        // LAST RUNG — alias! shorthands. Fires only after
+                        // both the exact fq and the enlist-set expansion
+                        // miss, so a real namespace always beats a
+                        // same-named alias. The target re-enters the
+                        // blueprint guard under its canonical name. This
+                        // is the chokepoint that makes alias!'s success
+                        // receipt true for TABLE access, not just for the
+                        // entity registry's own alias arm.
+                        match conn.query_row(
+                            "SELECT n.id, n.fq_name FROM namespace_alias a \
+                             JOIN namespace n ON n.id = a.target_namespace_id \
+                             WHERE a.alias = ?1",
+                            [&fq_name],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                        ) {
+                            Ok((id, target_fq)) => {
+                                refuse_if_blueprint(&conn, &target_fq)?;
+                                id
+                            }
+                            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                                debug!(
+                                    "resolve_namespace_path: Namespace '{}' not found",
+                                    fq_name
+                                );
+                                return Ok(None);
+                            }
+                            Err(e) => {
+                                return Err(DelightQLError::database_error_with_source(
+                                    "Failed to resolve namespace alias",
+                                    e.to_string(),
+                                    Box::new(e),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -10849,8 +10959,8 @@ impl DelightQLSystem {
     /// which is exactly how SQLite finds temp-schema objects
     /// (materialize-pipe §3).
     ///
-    /// The retirement is SCOPED to the session cartridge (F2, RULED
-    /// 2026-07-11): a same-name mount-introspected physical entity keeps
+    /// The retirement is SCOPED to the session cartridge: a same-name
+    /// mount-introspected physical entity keeps
     /// its registration — the temp SHADOWS it for unqualified resolution
     /// (materialize-pipe §6, a preference, not a catalog edit), and a
     /// qualified read still reaches it. Pinned by session_shadow_tests::
@@ -11489,9 +11599,7 @@ impl DelightQLSystem {
     }
 
     /// The ENGINE SCHEMA a namespace's mount binds — R-T4's durable home on
-    /// targets, now a per-mount RECORDED fact (schema-mount Phase A,
-    /// EFFECTS-ON-TARGETS-PLAN §4.1, ratified 2026-07-12; it closes the
-    /// E-T4 coupling note this method's comment used to carry). The fact is
+    /// targets, a per-mount RECORDED fact. The fact is
     /// `mount.qualification` plus `mount.engine_schema`:
     /// - a SPELLED schema (Phase B `#schema` / Phase C `mount_tree!`) is
     ///   returned verbatim — the mount introspected THAT schema, so durable
@@ -11588,7 +11696,7 @@ impl DelightQLSystem {
     /// The KIND (`is_view`) of the session-materialized object holding
     /// `name` on `connection_id`, if the session catalog knows one — the
     /// compile-time holder probe behind the cross-kind temp replace
-    /// (EFFECT-ALGEBRA §3, ruled 2026-07-11: replacement is by NAME, not
+    /// (EFFECT-ALGEBRA §3: replacement is by NAME, not
     /// kind; the replace DROP must match whatever HOLDS the name). Gated
     /// like `session_shadow_split`: sessions that never materialized
     /// anything answer without touching bootstrap. An object minted

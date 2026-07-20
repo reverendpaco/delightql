@@ -113,7 +113,7 @@ impl<T, P> PhaseBox<T, P> {
 /// This is deliberately NOT a phase-generic `as_inner()` on `PhaseBox<T, P>`: a
 /// generic borrow would let `PhaseBox<CprSchema, Unresolved>` be read, defeating
 /// the phase-typestate whose whole point is that a schema read in an unresolved
-/// phase is impossible at compile time (ruled 2026-07-12).
+/// phase is impossible at compile time.
 impl<P> PhaseBox<Option<BooleanExpression<P>>, P> {
     pub fn correlation(&self) -> Option<&BooleanExpression<P>> {
         self.data.as_ref()

@@ -20,9 +20,8 @@
 //!   ALL other opens, even read-only) — an eager open would deadlock
 //!   the pair. Lazy, only the party that actually speaks takes the
 //!   lock; pinned by `connect_does_not_take_the_file_lock`.
-//! - **Writable by default** (E-T3b, RULED 2026-07-11: DuckDB goes
-//!   writable; EFFECTS-ON-TARGETS-PLAN §1 finding 2). `connect_readonly`
-//!   preserves the old posture — concurrent read-only opens across
+//! - **Writable by default** (E-T3b). `connect_readonly`
+//!   preserves the read-only posture — concurrent read-only opens across
 //!   processes, every write refused by the engine; the binary's
 //!   `--readonly` flag reaches it (pinned by tests/readonly_flag.rs).
 //! - **Descriptors are empty** (v1): the backends executor abstracts
@@ -69,7 +68,7 @@ pub struct DuckParty {
 }
 
 impl DuckParty {
-    /// Connect WRITABLE (the default since the 2026-07-11 ruling),
+    /// Connect WRITABLE (the default),
     /// fail-closed (the file must already exist) and lazy (the file —
     /// and DuckDB's exclusive write lock — is not taken until the
     /// first Query).

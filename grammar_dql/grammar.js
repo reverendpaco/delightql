@@ -618,7 +618,11 @@ module.exports = grammar({
     metadata_tree_group: $ => seq(
       field('key', $.lvar),           // The column that becomes keys
       choice(
-        token.immediate(':~>'),         // No space before :~>
+        // One immediate token, interior whitespace allowed: covers both
+        // `title:~>` and `title: ~>`. MUST stay a single token — a bare
+        // immediate ':' steals the colon from no-space CTE labels
+        // (`age: a`) at lex time and only then looks for `~>`.
+        token.immediate(/:\s*~>/),
         token.immediate('::')
       ),
       choice(

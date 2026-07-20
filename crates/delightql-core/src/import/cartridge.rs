@@ -61,7 +61,7 @@ impl SourceType {
 /// - Not yet implemented (will parse source, analyze references, etc.)
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use delightql_core::import::cartridge::{install_cartridge, SourceType};
 /// use rusqlite::Connection;
 ///

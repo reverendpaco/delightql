@@ -109,7 +109,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             danger_overrides: Vec::new(),
             option_overrides: Vec::new(),
             is_repl: false,
-            sql_optimization_level: pipeline::sql_optimizer::level_from_env(),
+            sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel::Basic,
             inline_ctes: false,
             last_run_exited: false,
             hooks: RelayHooks::default(),
@@ -127,8 +127,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// Install the session-baseline danger overrides (CLI `--danger`).
     /// Specs arrive already validated (`parse_cli_danger_spec` refuses
     /// unknown gates and non-CLI-overridable ones); each query's pipeline
-    /// re-validates as defense in depth. This field was write-never until
-    /// 2026-07-17 — the CLI flag was dead wiring (outside-eyes F2).
+    /// re-validates as defense in depth.
     pub fn set_danger_overrides(&mut self, specs: Vec<pipeline::ast_unresolved::DangerSpec>) {
         self.danger_overrides = specs;
     }
@@ -365,7 +364,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 },
                 Err(e) => ServerTerm::Error {
                     kind: ErrorKind::Connection,
-                    identity: vec![],
+                    identity: b"delightql-error://runtime/execution".to_vec(),
                     message: e.message.into_bytes(),
                 },
             }
@@ -387,7 +386,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 }
                 Err(msg) => ServerTerm::Error {
                     kind: ErrorKind::Connection,
-                    identity: vec![],
+                    identity: b"delightql-error://runtime/execution".to_vec(),
                     message: msg.into_bytes(),
                 },
             }
@@ -703,7 +702,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 Err(e) => {
                                     return ServerTerm::Error {
                                         kind: ErrorKind::Connection,
-                                        identity: vec![],
+                                        identity: b"delightql-error://runtime/execution".to_vec(),
                                         message: e.message.into_bytes(),
                                     };
                                 }
@@ -727,7 +726,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 Err(msg) => {
                                     return ServerTerm::Error {
                                         kind: ErrorKind::Connection,
-                                        identity: vec![],
+                                        identity: b"delightql-error://runtime/execution".to_vec(),
                                         message: msg.into_bytes(),
                                     };
                                 }
@@ -740,7 +739,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         {
                             return ServerTerm::Error {
                                 kind: ErrorKind::Connection,
-                                identity: vec![],
+                                identity: b"delightql-error://runtime/execution".to_vec(),
                                 message: msg.into_bytes(),
                             };
                         }
@@ -1044,7 +1043,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             },
             Err(e) => ServerTerm::Error {
                 kind: ErrorKind::Connection,
-                identity: vec![],
+                identity: b"delightql-error://runtime/execution".to_vec(),
                 message: e.message.into_bytes(),
             },
         }
@@ -1094,7 +1093,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 },
                 Err(e) => ServerTerm::Error {
                     kind: ErrorKind::Connection,
-                    identity: vec![],
+                    identity: b"delightql-error://runtime/execution".to_vec(),
                     message: e.message.into_bytes(),
                 },
             },

@@ -126,6 +126,51 @@ pub fn is_dot_command(input: &str) -> bool {
     input.trim().starts_with('.')
 }
 
+/// One REPL dot command, as data.
+pub struct DotCommand {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    /// Argument hint for display, "" when the command takes none.
+    pub args: &'static str,
+    /// Help-screen section this command renders under.
+    pub section: &'static str,
+    pub summary: &'static str,
+    /// Worked example for the help screen, "" when self-evident.
+    pub example: &'static str,
+}
+
+/// THE enumerable dot-command surface — every other surface is a
+/// projection of this table: the `.help` screen, tab completion, and
+/// `cli::surface`'s `dot_command` rows all render from it, and the
+/// dispatcher's match arms are welded to it in both directions by
+/// `registry_and_dispatch_agree`. Adding an arm without a row (or a row
+/// without an arm) fails that test — there is no second source to drift.
+pub const DOT_COMMANDS: &[DotCommand] = &[
+    DotCommand { name: ".help", aliases: &[], args: "", section: "General", summary: "Show this help message", example: "" },
+    DotCommand { name: ".exit", aliases: &[".quit"], args: "", section: "General", summary: "Exit the REPL", example: "" },
+    DotCommand { name: ".version", aliases: &[], args: "", section: "General", summary: "Show version information", example: "" },
+    DotCommand { name: ".info", aliases: &[], args: "", section: "Display & Output", summary: "Show multi-pane TUI (Ctrl+T toggles while typing)", example: "" },
+    DotCommand { name: ".format", aliases: &[], args: "[FORMAT]", section: "Display & Output", summary: "Set or show output format (table, json, csv, tsv, list)", example: "" },
+    DotCommand { name: ".zebra", aliases: &[], args: "[0-4]", section: "Display & Output", summary: "Column coloring (0=off [default], 2=blue/cyan, 3=RWB, 4=RWBG)", example: "" },
+    DotCommand { name: ".to", aliases: &[], args: "[STAGE]", section: "Display & Output", summary: "Show output stage (cst, ast-unresolved, ast-resolved, etc.)", example: "" },
+    DotCommand { name: ".attach", aliases: &[], args: "'path' to \"namespace\"", section: "Database Operations", summary: "Attach external database and import entities", example: ".attach 'nba.db' to \"sports::nba\"" },
+    DotCommand { name: ".enlist", aliases: &[], args: "<namespace> [in <target>]", section: "Database Operations", summary: "Enlist namespace entities (default target: main)", example: ".enlist import::nba" },
+    DotCommand { name: ".delist", aliases: &[], args: "<namespace> [from <target>]", section: "Database Operations", summary: "Delist namespace (remove from scope)", example: ".delist import::nba" },
+    DotCommand { name: ".dql", aliases: &[], args: "[query]", section: "Mode Commands", summary: "Switch to DQL mode (default); with a query, execute one-off", example: "" },
+    DotCommand { name: ".sql", aliases: &[], args: "[query]", section: "Mode Commands", summary: "Switch to SQL mode; with a query, execute one-off", example: "" },
+    DotCommand { name: ".multiline", aliases: &[], args: "[on|off]", section: "Mode Commands", summary: "Toggle multiline input mode (default: on)", example: "" },
+    DotCommand { name: ".file", aliases: &[], args: "<path>", section: "File & Diagnostics", summary: "Execute queries from a file", example: "" },
+    DotCommand { name: ".bug", aliases: &[], args: "", section: "File & Diagnostics", summary: "Create a bug report tarball from this session", example: "" },
+];
+
+/// Every spelling the dispatcher accepts (names + aliases), in registry
+/// order — the projection consumed by tab completion and the surface rows.
+pub fn dot_command_spellings() -> impl Iterator<Item = &'static str> {
+    DOT_COMMANDS
+        .iter()
+        .flat_map(|c| std::iter::once(c.name).chain(c.aliases.iter().copied()))
+}
+
 /// Handle dot commands
 pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<CommandResult> {
     let cmd = cmd.trim();
@@ -638,40 +683,34 @@ fn handle_bug_command(repl_state: &mut ReplState) -> Result<()> {
 /// Print help message
 fn print_help() {
     println!("DelightQL REPL Commands:");
-    println!();
-    println!("General:");
-    println!("  .help              Show this help message");
-    println!("  .exit, .quit       Exit the REPL");
-    println!("  .version           Show version information");
-    println!();
-    println!("Display & Output:");
-    println!("  .info              Show multi-pane TUI (Ctrl+T toggles while typing)");
-    println!("  .format [FORMAT]   Set or show output format (table, json, csv, tsv, list)");
-    println!("  .zebra [0-4]       Column coloring (0=off [default], 2=blue/cyan, 3=RWB, 4=RWBG)");
-    println!("  .to [STAGE]        Show output stage (cst, ast-unresolved, ast-resolved, etc.)");
-    println!();
-    println!("Database Operations:");
-    println!("  .attach 'path' to \"namespace\"");
-    println!("                     Attach external database and import entities");
-    println!("                     Example: .attach 'nba.db' to \"sports::nba\"");
-    println!();
-    println!("  .enlist <namespace> [in <target>]");
-    println!("                     Enlist namespace entities (default target: main)");
-    println!("                     Example: .enlist import::nba");
-    println!("  .delist <namespace> [from <target>]");
-    println!("                     Delist namespace (remove from scope)");
-    println!("                     Example: .delist import::nba");
-    println!();
-    println!("Mode Commands:");
-    println!("  .dql               Switch to DQL mode (default)");
-    println!("  .dql <query>       Execute one-off DQL query (stays in current mode)");
-    println!("  .sql               Switch to SQL mode");
-    println!("  .sql <query>       Execute one-off SQL query (stays in current mode)");
-    println!("  .multiline [on|off]  Toggle multiline input mode (default: on)");
-    println!();
-    println!("File & Diagnostics:");
-    println!("  .file <path>       Execute queries from a file");
-    println!("  .bug               Create a bug report tarball from this session");
+    // Dot commands render FROM the registry — this screen cannot know a
+    // command the dispatcher doesn't, or miss one it does.
+    let mut current_section = "";
+    for cmd in DOT_COMMANDS {
+        if cmd.section != current_section {
+            println!();
+            println!("{}:", cmd.section);
+            current_section = cmd.section;
+        }
+        let mut invocation = cmd.name.to_string();
+        for alias in cmd.aliases {
+            invocation.push_str(", ");
+            invocation.push_str(alias);
+        }
+        if !cmd.args.is_empty() {
+            invocation.push(' ');
+            invocation.push_str(cmd.args);
+        }
+        if invocation.len() <= 18 {
+            println!("  {:<18} {}", invocation, cmd.summary);
+        } else {
+            println!("  {}", invocation);
+            println!("  {:<18} {}", "", cmd.summary);
+        }
+        if !cmd.example.is_empty() {
+            println!("  {:<18} Example: {}", "", cmd.example);
+        }
+    }
     println!();
     println!("Keyboard Shortcuts:");
     println!("  Enter              Continue query (multiline on) or execute (multiline off)");
@@ -681,8 +720,8 @@ fn print_help() {
     println!("  Ctrl+T             Toggle multi-pane TUI (H/J/K/L to navigate)");
     println!();
     println!("Query Examples:");
-    println!("  users(*) |> [name, email]");
-    println!("  products(*) |> [price > 10] |> {{avg(price)}}");
+    println!("  users(*) |> (name, email)");
+    println!("  products(*), price > 10 ~> avg:(price)");
     println!();
     println!("Introspection (Meta-Circular System):");
     println!("  sys::cartridges.cartridge(*)       List all installed cartridges");
@@ -1152,4 +1191,51 @@ fn execute_sql_directly(
     println!("({} rows)", row_count);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// The weld: the dispatcher's match arms and DOT_COMMANDS must agree
+    /// in BOTH directions. Arm literals are extracted from this file's
+    /// own source (an arm is a line containing `=>` whose quoted strings
+    /// start with '.'), so neither side can drift without failing here.
+    #[test]
+    fn registry_and_dispatch_agree() {
+        const SRC: &str = include_str!("commands.rs");
+        let mut arm_spellings = std::collections::BTreeSet::new();
+        for line in SRC.lines() {
+            let Some(arrow) = line.find("=>") else { continue };
+            let head = &line[..arrow];
+            // Quoted literals in the arm head: ".exit" | ".quit"
+            let mut parts = head.split('"');
+            while let (Some(_), Some(lit)) = (parts.next(), parts.next()) {
+                if lit.starts_with('.')
+                    && lit.len() > 1
+                    && lit[1..].chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                {
+                    arm_spellings.insert(lit.to_string());
+                }
+            }
+        }
+        let registry: std::collections::BTreeSet<String> =
+            dot_command_spellings().map(String::from).collect();
+
+        let arms_not_registered: Vec<_> = arm_spellings.difference(&registry).collect();
+        assert!(
+            arms_not_registered.is_empty(),
+            "dispatch arms missing from DOT_COMMANDS (help/completion/surface \
+             will not know them): {:?}",
+            arms_not_registered
+        );
+        let registered_not_arms: Vec<_> = registry.difference(&arm_spellings).collect();
+        assert!(
+            registered_not_arms.is_empty(),
+            "DOT_COMMANDS rows with no dispatch arm (help/completion/surface \
+             would advertise a command the REPL rejects): {:?}",
+            registered_not_arms
+        );
+        assert!(!registry.is_empty(), "registry must not be empty");
+    }
 }

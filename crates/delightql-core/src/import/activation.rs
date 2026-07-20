@@ -26,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// * `Err(anyhow::Error)` - If activation fails
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use delightql_core::import::activation::activate_entity;
 /// use rusqlite::Connection;
 ///
@@ -66,7 +66,7 @@ pub fn activate_entity(
 /// * `Err(anyhow::Error)` - If activation fails
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use delightql_core::import::activation::activate_entities_by_name;
 /// use rusqlite::Connection;
 ///

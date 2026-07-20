@@ -107,10 +107,10 @@ impl EffectExecutable for MountTreePredicate {
         // badges (the namespace/name/reserved guard, the SQLite refusal).
         let created = system.mount_database_tree(&db_uri, &namespace)?;
 
-        // The created sub-namespaces are the receipt's `returned` tree
-        // (ruled 2026-07-15, Phase 6 slice 3): R-S3's "which schemas did
-        // I mount?" is answered by DRILLING the payload with ordinary
-        // operators — the JSON-array string column is retired. An empty
+        // The created sub-namespaces are the receipt's `returned` tree:
+        // "which schemas did I mount?" is answered by DRILLING the
+        // payload with ordinary operators — never a JSON-array string
+        // column. An empty
         // enumeration ships the all-NULL contributor row, which elides
         // to `[]`.
         let returned_rows: Vec<Vec<Option<String>>> = if created.is_empty() {

@@ -345,9 +345,14 @@ impl SqlParty {
                     state.exhausted = true;
                 }
                 Ok(StreamBatch::Error(msg)) => {
+                    // The ENGINE refused a row mid-stream (e.g. a json()
+                    // call hit malformed text) — an execution failure, not
+                    // a channel problem; badge it so the error is
+                    // explainable. The other Connection arms here are
+                    // genuine session-state errors and stay unbadged.
                     return ServerTerm::Error {
                         kind: ErrorKind::Connection,
-                        identity: vec![],
+                        identity: b"delightql-error://runtime/execution".to_vec(),
                         message: msg.into_bytes(),
                     };
                 }

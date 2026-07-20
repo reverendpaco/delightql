@@ -433,7 +433,7 @@ fn format_as_box_with_zebra(
 }
 
 /// SQLite type affinity of a declared type, reduced to what JSON
-/// emission needs (bugs/cli-surface-2026-07-05/PLAN.md #5).
+/// emission needs.
 enum JsonAffinity {
     Integer,
     Numeric, // REAL / NUMERIC / BOOLEAN — try integer, then float

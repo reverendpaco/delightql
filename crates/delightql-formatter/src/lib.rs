@@ -62,8 +62,7 @@ fn has_bang_operator_error_pattern(tree: &tree_sitter::Tree, source: &str) -> bo
 /// What `format_outcome` actually did — the safety fallbacks (return the
 /// input unchanged rather than risk corrupting code) are sound, but they
 /// must be VISIBLE to callers: a CI gate that can't tell "already
-/// formatted" from "formatter gave up" blesses unformatted code
-/// (bugs/cli-surface-2026-07-05/PLAN.md #3, half A).
+/// formatted" from "formatter gave up" blesses unformatted code.
 #[derive(Debug)]
 pub enum FormatOutcome {
     /// The visitor handled everything and the result re-parses.

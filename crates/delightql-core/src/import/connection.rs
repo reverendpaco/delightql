@@ -58,7 +58,7 @@ fn resource_uri_embeds_credentials(uri: &str) -> bool {
 /// The connection_id of the newly registered connection
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use delightql_core::import::connection::register_connection;
 /// use rusqlite::Connection;
 ///

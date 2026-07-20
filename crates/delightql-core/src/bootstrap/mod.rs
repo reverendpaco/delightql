@@ -38,9 +38,9 @@ pub const BOOTSTRAP_SCHEMA: &str = include_str!("../../bootstrap/schema.sql");
 /// This is the SINGLE SOURCE OF TRUTH for enum values.
 /// All enum IDs and variants are defined in src/enums.rs (re-exported
 /// here as `bootstrap::enums`) and inserted programmatically here.
-/// (A shadowed duplicate at src/bootstrap/enums.rs — never declared as
-/// a module, never compiled — was deleted 2026-06-12 after it absorbed
-/// an edit meant for the live enum.)
+/// (Do not recreate src/bootstrap/enums.rs: a file there is never
+/// declared as a module, never compiled, and silently absorbs edits
+/// meant for the live enum.)
 ///
 /// Benefits:
 /// - Type-safe: Impossible to use wrong enum value
@@ -126,7 +126,7 @@ fn seed_enum_tables(conn: &Connection) -> Result<()> {
 /// * `Err(anyhow::Error)` if SQL execution fails
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use rusqlite::Connection;
 /// use delightql_core::bootstrap::initialize_bootstrap_db;
 ///

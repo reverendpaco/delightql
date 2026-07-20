@@ -90,10 +90,9 @@ pub fn is_cli_overridable(uri: &str) -> bool {
 }
 
 /// Parse a CLI `--danger hierarchy=STATE` argument into a validated
-/// `DangerSpec`. Every failure is a loud teaching error — the flag was
-/// silently dropped for its whole life (outside-eyes F2; the `--danger`
-/// arg was parsed by clap and never read), so the contract now is:
-/// a `--danger` that cannot take effect refuses, never no-ops.
+/// `DangerSpec`. Every failure is a loud teaching error: a `--danger`
+/// that cannot take effect refuses, never no-ops — a silently ignored
+/// safety flag is worse than no flag.
 pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
     let (hierarchy, state_text) = input.split_once('=').ok_or_else(|| {
         crate::error::DelightQLError::validation_error(
@@ -165,7 +164,8 @@ mod cli_danger_spec_tests {
         assert_eq!(spec.state, DangerState::On);
     }
 
-    // outside-eyes F2: this refusal used to be a silent no-op.
+    // The refusal must be LOUD — a silently ignored override spec is
+    // the tempting regression.
     #[test]
     fn non_overridable_gate_refuses_with_inline_teaching() {
         let err = parse_cli_danger_spec("cardinality/nulljoin=ON").unwrap_err();

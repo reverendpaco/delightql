@@ -21,7 +21,7 @@
 //! ## Architecture
 //!
 //! Phase 1.X hooks between Builder (Phase 1) and Resolver (Phase 2):
-//! ```
+//! ```text
 //! CST → Builder → Effect Executor → CFE Precompiler → Resolver → ...
 //!      (Phase 1)   (Phase 1.X)        (Phase 1.5)      (Phase 2)
 //! ```
@@ -623,7 +623,7 @@ fn execute_directive_pipe(
     ctes: &[CteBinding],
     system: &mut DelightQLSystem,
 ) -> Result<RelationalExpression> {
-    // EFFECT-ALGEBRA §3 (amended 2026-07-15): piping a WHOLE receipt where
+    // EFFECT-ALGEBRA §3: piping a WHOLE receipt where
     // a directive's argumentative functor expects its PAYLOAD is a shape
     // error, taught as such. Detected structurally, before anything
     // executes: the source is itself a directive invocation (its value is
@@ -1013,11 +1013,10 @@ fn execute_pseudo_predicate(
                 }
             }
         }
-        // The old text here ("register it in a bin cartridge") pointed end
-        // users at a compiler-internal mechanism — and it convinced two
-        // independent evaluators that USER effect rules were unimplemented
-        // (outside-eyes F14/codex F-10: a false negative about a shipped,
-        // load-bearing feature). Whether a user effect rule may be demanded
+        // Do not point end users at "register it in a bin cartridge" —
+        // that is a compiler-internal mechanism, and naming it here reads
+        // as "USER effect rules are unimplemented" (a false negative about
+        // a shipped, load-bearing feature). Whether a user effect rule may be demanded
         // directly at the prompt is an open ruling (R-2); until then, teach
         // the road that works.
         DelightQLError::validation_error_categorized(

@@ -84,12 +84,12 @@ pub(in crate::pipeline::resolver) fn sanitize_engine_managed_columns(
 /// - Nested reduction members (with ~>) stay in `reducing_on`
 ///
 /// Example transformation:
-/// ```
+/// ```text
 /// reducing_by: []
 /// reducing_on: [{country, "people": ~> {...}}]
 /// ```
 /// becomes:
-/// ```
+/// ```text
 /// reducing_by: [country]
 /// reducing_on: [{"people": ~> {...}}]
 /// ```

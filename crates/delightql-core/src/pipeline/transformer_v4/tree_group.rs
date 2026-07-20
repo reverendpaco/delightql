@@ -370,7 +370,7 @@ fn lower_leaf_members_to_group_by(
     select_items: &mut Vec<SelectItem>,
 ) -> Result<()> {
     for member in members {
-        if let Some((col_name, sql_col)) = lower_leaf_member(member, input, ctx)? {
+        if let Some((col_name, sql_col, _)) = lower_leaf_member(member, input, ctx)? {
             group_by_exprs.push(sql_col.clone());
             select_items.push(SelectItem::Expression {
                 expr: sql_col,
@@ -393,9 +393,13 @@ fn lower_nested_as_aggregates(
             let mut lowered_args = Vec::new();
             let mut null_checks = Vec::new();
             for member in inner_members {
-                if let Some((_, sql_col)) = lower_leaf_member(member, input, ctx)? {
+                if let Some((_, sql_col, is_tree)) = lower_leaf_member(member, input, ctx)? {
                     null_checks.push(sql_col.clone());
-                    lowered_args.push(sql_col);
+                    lowered_args.push(if is_tree {
+                        SqlExpr::function("json", vec![sql_col])
+                    } else {
+                        sql_col
+                    });
                 }
             }
             let json_array = SqlExpr::function("JSON_ARRAY", lowered_args);
@@ -950,15 +954,20 @@ fn build_metadata_aggregate(
     Ok(())
 }
 
-/// Lower a leaf CurlyMember to (json_key, sql_expr) for JSON_OBJECT construction.
+/// Lower a leaf CurlyMember to (json_key, sql_expr, is_tree) for
+/// JSON_OBJECT construction.
 ///
 /// Handles both Shorthand (`{col}` → key is column name) and non-nested
 /// KeyValue (`"key": expr` → key is explicit, expr is scalar-lowered).
+/// `is_tree` is true when the member is a bare reference to a column with
+/// a known interior schema (a staged tree-group column): the caller must
+/// wrap it in `json()` for the embedding to splice — the same treatment
+/// `inner_agg_refs` members get — or the engine escapes it as TEXT.
 fn lower_leaf_member(
     member: &CurlyMember<Addressed>,
     input: &super::builder::CteInput,
     ctx: &TransformCtx,
-) -> Result<Option<(String, SqlExpr)>> {
+) -> Result<Option<(String, SqlExpr, bool)>> {
     match member {
         CurlyMember::Shorthand {
             column, qualifier, ..
@@ -975,7 +984,10 @@ fn lower_leaf_member(
                 Some(q) => SqlExpr::with_qualifier(ColumnQualifier::table(q), &qc.name),
                 None => SqlExpr::column(&qc.name),
             };
-            Ok(Some((col_name.to_string(), sql_col)))
+            // Tree-valuedness comes from the SAME resolution that chose
+            // the SQL spelling — one identity question, one answer.
+            let is_tree = qc.has_interior_schema;
+            Ok(Some((col_name.to_string(), sql_col, is_tree)))
         }
         CurlyMember::KeyValue {
             key,
@@ -985,8 +997,14 @@ fn lower_leaf_member(
             // Lower the value expression — typically an Lvar like `o.id`.
             // If the expression references columns not in the CTE scope
             // (e.g., nested curlies), skip gracefully.
+            let is_tree = match &**value {
+                ast_addressed::DomainExpression::Lvar {
+                    name, qualifier, ..
+                } => input.tree_valued(name.as_str(), qualifier.as_ref().map(|q| q.as_str())),
+                _ => false,
+            };
             match lower_domain_expr_for_cte(value, input, ctx) {
-                Ok(sql_expr) => Ok(Some((key.clone(), sql_expr))),
+                Ok(sql_expr) => Ok(Some((key.clone(), sql_expr, is_tree))),
                 Err(_) => Ok(None),
             }
         }
@@ -1016,9 +1034,13 @@ fn build_regular_aggregate(
     let mut null_checks = Vec::new();
 
     for member in &level.leaf_members {
-        if let Some((key, sql_col)) = lower_leaf_member(member, input, ctx)? {
+        if let Some((key, sql_col, is_tree)) = lower_leaf_member(member, input, ctx)? {
             json_args.push(SqlExpr::literal(LiteralValue::String(key)));
-            json_args.push(sql_col.clone());
+            json_args.push(if is_tree {
+                SqlExpr::function("json", vec![sql_col.clone()])
+            } else {
+                sql_col.clone()
+            });
             null_checks.push(sql_col);
         }
     }
@@ -1058,9 +1080,14 @@ fn build_sibling_aggregate(
     let mut cols = Vec::new();
 
     for member in &sibling.members {
-        if let Some((key, sql_col)) = lower_leaf_member(member, input, ctx)? {
+        if let Some((key, sql_col, is_tree)) = lower_leaf_member(member, input, ctx)? {
             null_checks.push(sql_col.clone());
-            cols.push((key, sql_col));
+            let embedded = if is_tree {
+                SqlExpr::function("json", vec![sql_col])
+            } else {
+                sql_col
+            };
+            cols.push((key, embedded));
         }
     }
 

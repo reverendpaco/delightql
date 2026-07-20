@@ -33,20 +33,12 @@ pub struct DotCommandCompleter {
 impl DotCommandCompleter {
     pub fn new() -> Self {
         Self {
-            commands: vec![
-                ".help".to_string(),
-                ".exit".to_string(),
-                ".info".to_string(),
-                ".debug-last".to_string(),
-                ".debug-last-dump".to_string(),
-                ".version".to_string(),
-                ".format".to_string(),
-                ".to".to_string(),
-                ".dql".to_string(),
-                ".sql".to_string(),
-                ".bug".to_string(),
-                ".multiline".to_string(),
-            ],
+            // Projection of the dot-command registry — a hand-list here
+            // completed fossils (.debug-last had no dispatch arm) and
+            // missed real commands.
+            commands: super::commands::dot_command_spellings()
+                .map(String::from)
+                .collect(),
             // schema: None, // Temporarily disabled
         }
     }
@@ -63,7 +55,7 @@ impl DotCommandCompleter {
         // Check for column name context
         // Pattern 1: "table(*), " - filter condition
         // Pattern 2: "table(col, " - field list
-        // Pattern 3: "table(*) |> [" - projection
+        // Pattern 3: "table(*) |> (" - projection
         // Pattern 4: Multiple tables
 
         // Simple heuristic: if we have a table name followed by parentheses or pipe
@@ -371,7 +363,7 @@ mod tests {
     #[test]
     fn test_detect_column_context_after_pipe() {
         let completer = DotCommandCompleter::new();
-        let context = completer.detect_context("users(*) |> [", 13);
+        let context = completer.detect_context("users(*) |> (", 13);
         match context {
             CompletionContext::ColumnName { tables } => {
                 assert_eq!(tables, vec!["users".to_string()]);

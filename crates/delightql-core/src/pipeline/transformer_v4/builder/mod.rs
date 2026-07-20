@@ -57,6 +57,12 @@ pub struct QualifiedColumn {
     /// The SQL qualifier (table alias or scope name).
     /// `None` means the column is unqualified (outermost scope / Top).
     pub qualifier: Option<String>,
+    /// The MATCHED column holds a tree (known interior schema). Carried
+    /// by qualification itself so the identity question is answered
+    /// once — a separate by-name lookup can select a different
+    /// same-named column than the qualifier did. False on fallback
+    /// paths with no column record behind them.
+    pub has_interior_schema: bool,
 }
 
 pub(in crate::pipeline) use names::NameGenerator;
@@ -106,6 +112,27 @@ pub(crate) trait Qualify {
     /// to contribute — appropriate for DummyQualify, ChainedQualify, etc.).
     fn scope_columns(&self) -> Vec<ColumnMetadata> {
         vec![]
+    }
+
+    /// Whether the column this reference RESOLVES TO holds a tree (a
+    /// known interior schema — a staged tree-group column). Embedding
+    /// such a column into a JSON constructor must go through `json()`
+    /// or the engine escapes it as TEXT.
+    ///
+    /// Rides the qualification road itself — never a separate by-name
+    /// scan, which can select a DIFFERENT same-named column than the
+    /// qualifier did and wrap a plain string in `json()`.
+    fn tree_valued(&self, col_name: &str, qualifier: Option<&str>) -> bool {
+        match qualifier {
+            Some(q) => self
+                .try_qualify_with_table(col_name, q)
+                .map(|qc| qc.has_interior_schema)
+                .unwrap_or(false),
+            None => self
+                .qualify(col_name)
+                .map(|qc| qc.has_interior_schema)
+                .unwrap_or(false),
+        }
     }
 }
 
@@ -185,6 +212,10 @@ impl Qualify for CteInput {
     fn try_qualify_with_table(&self, col_name: &str, table: &str) -> Option<QualifiedColumn> {
         self.qualify_with_table(col_name, table)
     }
+
+    fn scope_columns(&self) -> Vec<ColumnMetadata> {
+        self.columns.clone()
+    }
 }
 
 /// What a `push_cte` closure returns: the CTE body and its output columns.
@@ -236,6 +267,35 @@ impl<P> Builder<P> {
     /// Read-only access to the scope's columns.
     pub(in crate::pipeline::transformer_v4) fn columns(&self) -> &[ColumnMetadata] {
         &self.state.scope().columns
+    }
+
+    /// Adopt the resolver-stamped interior schemas into this scope. The
+    /// transformer re-derives stage output columns structurally and cannot
+    /// see tree-typedness; the resolver's CprSchema for the same stage can.
+    /// Matches by name, only when unambiguous on BOTH sides — never
+    /// positionally (an index zip misbinds when either side reorders), and
+    /// never overwrites an interior the scope already carries.
+    pub(in crate::pipeline::transformer_v4) fn adopt_interior_schemas(
+        &mut self,
+        cpr: &crate::pipeline::asts::resolved::CprSchema,
+    ) {
+        let crate::pipeline::asts::resolved::CprSchema::Resolved(cpr_cols) = cpr else {
+            return;
+        };
+        let scope = self.state.scope_mut();
+        for cc in cpr_cols {
+            let Some(interior) = &cc.interior_schema else { continue };
+            let name = cc.name();
+            let mut hits = scope
+                .columns
+                .iter_mut()
+                .filter(|c| c.name().eq_ignore_ascii_case(name));
+            if let (Some(target), None) = (hits.next(), hits.next()) {
+                if target.interior_schema.is_none() {
+                    target.interior_schema = Some(interior.clone());
+                }
+            }
+        }
     }
 
     /// Internal: change the phase marker without changing any runtime state.
@@ -429,6 +489,81 @@ impl Builder<Unprojected> {
             accumulated_ctes: ctes,
             _phase: PhantomData,
         }
+    }
+
+    /// Join two operands FULL OUTER with USING, projecting each USING
+    /// column as `COALESCE(left.col, right.col)`.
+    ///
+    /// The merged column must carry the key of WHICHEVER side is present.
+    /// A one-sided qualified projection (`left.col`) is NULL on exactly
+    /// the other side's orphan rows — the rows full outer exists to keep.
+    pub(in crate::pipeline::transformer_v4) fn from_join_full_outer_using(
+        left: JoinOperand,
+        right: JoinOperand,
+        using_cols: Vec<String>,
+    ) -> Result<Builder<Projected>> {
+        let side_qualifier = |cols: &[ColumnMetadata], name: &str| -> Option<String> {
+            cols.iter()
+                .find(|c| delightql_types::SqlIdentifier::str_eq(name, col_name(c)))
+                .and_then(|c| state::col_qualifier(c).map(str::to_string))
+        };
+        let coalesce_sides: Vec<(String, Option<String>, Option<String>)> = using_cols
+            .iter()
+            .map(|uc| {
+                (
+                    uc.clone(),
+                    side_qualifier(&left.columns, uc),
+                    side_qualifier(&right.columns, uc),
+                )
+            })
+            .collect();
+
+        let joined = Self::from_join(
+            left,
+            right,
+            JoinType::Full,
+            JoinCondition::Using(using_cols),
+        );
+
+        let scope_items = match &joined.state {
+            BuilderState::Segment { scope, .. } => scope.disambiguated_select_items().0,
+            _ => unreachable!("from_join returns Segment state"),
+        };
+        let items: Vec<SelectItem> = scope_items
+            .into_iter()
+            .map(|item| match item {
+                SelectItem::Expression { expr, alias } => {
+                    let sides = alias.as_deref().and_then(|a| {
+                        coalesce_sides.iter().find(|(name, _, _)| {
+                            delightql_types::SqlIdentifier::str_eq(name, a)
+                        })
+                    });
+                    match sides {
+                        Some((name, Some(lq), Some(rq))) => SelectItem::Expression {
+                            expr: DomainExpression::Function {
+                                name: "coalesce".to_string(),
+                                args: vec![
+                                    DomainExpression::with_qualifier(
+                                        crate::pipeline::sql_ast_v3::ColumnQualifier::table(lq),
+                                        name,
+                                    ),
+                                    DomainExpression::with_qualifier(
+                                        crate::pipeline::sql_ast_v3::ColumnQualifier::table(rq),
+                                        name,
+                                    ),
+                                ],
+                                distinct: false,
+                            },
+                            alias,
+                        },
+                        _ => SelectItem::Expression { expr, alias },
+                    }
+                }
+                other => other,
+            })
+            .collect();
+
+        joined.add_projection(items)
     }
 
     /// Assemble a left-deep join from N prepared operands (from
@@ -854,8 +989,8 @@ impl Builder<Unprojected> {
             .collect();
         let all_items = disambiguate_aliases(all_items);
 
-        // INNER join json_each (RULED 2026-07-14, DIRECTIVE-CONVERGENCE-PLAN
-        // Rule 6): a NULL or empty interior IS empty — it contributes zero
+        // INNER join json_each: a NULL or empty interior IS empty — it
+        // contributes zero
         // rows to the expansion, in every form (drill, narrow, brace,
         // destructure). Interior expansion is not an outer join; a parent
         // with no children vanishes rather than surviving as a row of NULL
@@ -1317,6 +1452,7 @@ pub(in crate::pipeline::transformer_v4) fn qualify_in_columns(
         return Ok(QualifiedColumn {
             name: col_name_str.to_string(),
             qualifier: None,
+            has_interior_schema: false,
         });
     }
 
@@ -1330,6 +1466,7 @@ pub(in crate::pipeline::transformer_v4) fn qualify_in_columns(
         1 => Ok(QualifiedColumn {
             name: col_name(matches[0]).to_string(),
             qualifier: col_qualifier(matches[0]).map(|s| s.to_string()),
+            has_interior_schema: matches[0].interior_schema.is_some(),
         }),
         0 => {
             // Tier 2: identity stack walk.
@@ -1342,6 +1479,7 @@ pub(in crate::pipeline::transformer_v4) fn qualify_in_columns(
                 1 => Ok(QualifiedColumn {
                     name: col_name(historical[0]).to_string(),
                     qualifier: col_qualifier(historical[0]).map(|s| s.to_string()),
+                    has_interior_schema: historical[0].interior_schema.is_some(),
                 }),
                 0 => Err(crate::error::DelightQLError::ParseError {
                     message: format!(
@@ -1391,11 +1529,15 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
         return Some(QualifiedColumn {
             name: col_name(col).to_string(),
             qualifier: col_qualifier(col).map(|s| s.to_string()),
+            has_interior_schema: col.interior_schema.is_some(),
         });
     }
 
-    // Tier 2: identity stack walk.
-    let historical = columns.iter().find(|c| {
+    // Tier 2: identity stack walk. Uniqueness-guarded like every other
+    // stack walk in this module — a self-join carries the same original
+    // (table, name) at the bottom of BOTH sides' stacks, and ambiguity
+    // is never resolved by first-match; zero or ≥2 matches fall through.
+    let mut historical = columns.iter().filter(|c| {
         c.info.identity_stack().iter().any(|id| {
             id.name == col_name_str
                 && match &id.table_qualifier {
@@ -1405,10 +1547,11 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
         })
     });
 
-    if let Some(col) = historical {
+    if let (Some(col), None) = (historical.next(), historical.next()) {
         return Some(QualifiedColumn {
             name: col_name(col).to_string(),
             qualifier: col_qualifier(col).map(|s| s.to_string()),
+            has_interior_schema: col.interior_schema.is_some(),
         });
     }
 
@@ -1436,6 +1579,7 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
             return Some(QualifiedColumn {
                 name: col_name(col).to_string(),
                 qualifier: col_qualifier(col).map(|s| s.to_string()),
+                has_interior_schema: col.interior_schema.is_some(),
             });
         }
     }
@@ -1695,6 +1839,7 @@ fn derive_columns_from_items(
                 // This preserves the identity stack so that Tier 2 lookups
                 // (identity stack walk) can resolve renamed columns back to
                 // their original (table, name) pair.
+                let mut passthrough_source = None;
                 let provenance = if let Some(m) = find_input_column(&expr, input_columns) {
                     let mut prov = m.col.info.clone();
                     match m.derived_via {
@@ -1710,6 +1855,12 @@ fn derive_columns_from_items(
                                     scope_name,
                                 );
                             }
+                            // A passthrough carries the SAME value, so every
+                            // value fact rides along (declared type,
+                            // nullability, interior heading). Derived values
+                            // (the Some arm) get honest unknowns — a cast/
+                            // function output is not the source value.
+                            passthrough_source = Some(m.col);
                         }
                         Some(via) => {
                             // The value changed (cast/function/arithmetic). The
@@ -1734,7 +1885,13 @@ fn derive_columns_from_items(
                         QualificationSource::Resolver,
                     )
                 };
-                columns.push(ColumnMetadata::new(provenance, TableName::Fresh, None));
+                let out_col = match passthrough_source {
+                    Some(src) => {
+                        ColumnMetadata::carrying(src, provenance, TableName::Fresh, None)
+                    }
+                    None => ColumnMetadata::new(provenance, TableName::Fresh, None),
+                };
+                columns.push(out_col);
                 out_items.push(SelectItem::Expression {
                     expr,
                     alias: final_alias,
@@ -1864,12 +2021,25 @@ fn find_by_name_and_qual<'a>(
     qual: Option<&str>,
     input_columns: &'a [ColumnMetadata],
 ) -> Option<&'a ColumnMetadata> {
-    // Tier 1.
-    if let Some(col) = input_columns.iter().find(|c| {
-        delightql_types::SqlIdentifier::str_eq(col_name(c), name)
-            && (qual.is_none() || delightql_types::SqlIdentifier::opt_str_eq(col_qualifier(c), qual))
-    }) {
-        return Some(col);
+    // Tier 1. With a qualifier the (name, qual) pair is unique
+    // post-disambiguation; without one, name-only matching over a
+    // multi-source scope must be uniqueness-guarded — an ambiguous
+    // identity is no identity (the caller's Honest-Fresh fallback is
+    // the correct answer, not the first column encountered).
+    if qual.is_some() {
+        if let Some(col) = input_columns.iter().find(|c| {
+            delightql_types::SqlIdentifier::str_eq(col_name(c), name)
+                && delightql_types::SqlIdentifier::opt_str_eq(col_qualifier(c), qual)
+        }) {
+            return Some(col);
+        }
+    } else {
+        let mut hits = input_columns
+            .iter()
+            .filter(|c| delightql_types::SqlIdentifier::str_eq(col_name(c), name));
+        if let (Some(col), None) = (hits.next(), hits.next()) {
+            return Some(col);
+        }
     }
 
     // Tier 2.

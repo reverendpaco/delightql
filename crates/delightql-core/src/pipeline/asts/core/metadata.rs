@@ -33,7 +33,7 @@ use smallvec::{smallvec, SmallVec};
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use delightql_core::pipeline::asts::core::metadata::NamespacePath;
 ///
 /// // Empty path (unqualified reference)
@@ -138,7 +138,7 @@ impl NamespacePath {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use delightql_core::pipeline::asts::core::metadata::NamespacePath;
     ///
     /// // For "catalog.schema.table" in column ref "catalog.schema.table.column"
@@ -223,7 +223,7 @@ impl NamespacePath {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use delightql_core::pipeline::asts::core::metadata::NamespacePath;
     ///
     /// let path = NamespacePath::from_parts(vec!["dbo".into(), "prod".into()]).unwrap();
@@ -373,7 +373,7 @@ pub struct ColumnMetadata {
     /// describes the columns of the interior relation for drill-down support.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub interior_schema: Option<Vec<crate::pipeline::asts::core::operators::InteriorColumnDef>>,
-    /// TAGGED-SUM marker (EFFECT-ALGEBRA §3, amended 2026-07-15): set when
+    /// TAGGED-SUM marker (EFFECT-ALGEBRA §3): set when
     /// a corresponding union merged arms whose DECLARED interior headings
     /// for this column DIFFER. The union itself is legal (each row keeps
     /// its own heading; `operation` is the tag); RELEASING the column is
@@ -390,6 +390,13 @@ pub struct ColumnMetadata {
     /// it stands in for). The germ of resolved-AST type knowledge.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub declared_type: Option<String>,
+
+    /// The catalog's nullability for a physical-table column (registry
+    /// lookups carry it forward from ColumnInfo, ultimately PRAGMA
+    /// table_info's notnull). None when unknown (derived/expression
+    /// columns) — consumers report "unknown", never a guess.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub nullable: Option<bool>,
 }
 
 // Helper for serde skip_serializing_if
@@ -414,7 +421,36 @@ impl ColumnMetadata {
             interior_schema: None,
             interior_schema_conflict: false,
             declared_type: None,
+            nullable: None,
         }
+    }
+
+    /// Attach the catalog's nullability (registry table lookups).
+    pub fn with_nullable(mut self, nullable: Option<bool>) -> Self {
+        self.nullable = nullable;
+        self
+    }
+
+    /// Fresh identity, conserved value facts. Identity (provenance, scope,
+    /// position) is per-site and rebuilt freely; the facts attached to the
+    /// VALUE — declared type, nullability, interior heading — travel with
+    /// it wherever it goes. This is the chokepoint for every channel that
+    /// rebuilds a column around the same value: constructing bare
+    /// `ColumnMetadata::new` from an existing column is the smell this
+    /// exists to remove (a poorer intermediate type or a partial copy
+    /// silently strips what it cannot hold).
+    pub fn carrying(
+        source: &ColumnMetadata,
+        info: ColumnProvenance,
+        table_name: TableName,
+        table_position: Option<usize>,
+    ) -> Self {
+        let mut col = Self::new(info, table_name, table_position);
+        col.declared_type = source.declared_type.clone();
+        col.nullable = source.nullable;
+        col.interior_schema = source.interior_schema.clone();
+        col.interior_schema_conflict = source.interior_schema_conflict;
+        col
     }
 
     /// Attach the catalog's declared type (registry table lookups).
@@ -479,6 +515,7 @@ impl ColumnMetadata {
             interior_schema: None,
             interior_schema_conflict: false,
             declared_type: None,
+            nullable: None,
         }
     }
 

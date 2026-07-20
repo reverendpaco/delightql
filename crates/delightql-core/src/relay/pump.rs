@@ -12,7 +12,7 @@
 //! query-position directives); also exercised by `relay/pump_tests.rs` over
 //! hand-constructed plans.
 //!
-//! Protocol shape (Epic 3 ruling, 2026-07-11): the run's return value is
+//! Protocol shape: the run's return value is
 //! the ONE wire response — the FINAL `ShippedStatement`'s result set,
 //! delivered on the existing Query → Header cycle. Every OTHER shipped
 //! result set (`stdout!`) delivers live through the hook side channel
@@ -28,10 +28,15 @@ use crate::pipeline::{
 };
 
 
+/// An engine-side execution failure: compilation succeeded and the
+/// database refused the SQL (or a transaction statement) at run time.
+/// Badged runtime/execution so the error is explainable and
+/// annotation-matchable; the protocol-level Connection kind stays for
+/// wire compatibility.
 fn connection_error(msg: String) -> ServerTerm {
     ServerTerm::Error {
         kind: ErrorKind::Connection,
-        identity: vec![],
+        identity: b"delightql-error://runtime/execution".to_vec(),
         message: msg.into_bytes(),
     }
 }

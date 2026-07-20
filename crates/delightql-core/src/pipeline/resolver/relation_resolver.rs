@@ -337,13 +337,12 @@ pub(super) fn resolve_ground(
                 format!("{}::{}", matched_fq, identifier.name),
                 "resolver::consulted_expansion",
             )?;
-            // Capture view name and namespace for error context
+            // Capture view name and namespace for error context — the
+            // namespace the entity was actually FOUND in, not the first
+            // grounded namespace (they differ whenever the match came
+            // from a later namespace in the grounding list).
             let view_name = identifier.name.clone();
-            let view_ns = grounding
-                .grounded_ns
-                .first()
-                .map(|ns| super::grounding::namespace_path_to_fq(ns))
-                .unwrap_or_default();
+            let view_ns = matched_fq.clone();
 
             if entity_type == BootstrapEntityType::DqlFactExpression {
                 // Fact: parse all clauses and merge into one anonymous table
@@ -1483,9 +1482,9 @@ pub(super) fn r_resolve_unknown(
             let ns_str = super::grounding::namespace_path_to_fq(&identifier.namespace_path);
             // Report the FULL path the user wrote, never the bare leaf: the
             // leaf-only "Table not found: orders" for `sales.orders(*)`
-            // hid the actual mistake (an under-qualified namespace) and sent
-            // readers hunting for a missing TABLE (outside-eyes F5 — it
-            // manufactured a false "mount! is broken" diagnosis).
+            // hid the actual mistake (an under-qualified namespace), sent
+            // readers hunting for a missing TABLE, and manufactured a
+            // false "mount! is broken" diagnosis.
             (
                 format!("{}.{}", ns_str, identifier.name),
                 format!("Entity '{}' not found in namespace '{}'. The namespace prefix as written did not resolve — check it against your mounts (sys::ns.namespace(*) lists them; a mount under 'data::{}' is reached as 'data::{}.{}'). Other causes: entity not activated, or missing backend schema configuration.", identifier.name, ns_str, ns_str, ns_str, identifier.name)

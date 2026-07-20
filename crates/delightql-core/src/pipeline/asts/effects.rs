@@ -703,10 +703,9 @@ pub fn domain_spec_demands_directive(spec: &DomainSpec<Unresolved>) -> bool {
 /// (INDUCTIVE-TRAVERSAL-PLAN §5 W1, R-I6). The default `AstVisit` walk performs
 /// the complete structural descent; this collector only names the demand
 /// positions. Demand ORDER (load-bearing for R9's positional reads and for the
-/// lowering walker) follows the 2026-07-12 ruling: EVERY directive is recorded
+/// lowering walker): EVERY directive is recorded
 /// on `exit_*`, so a directive nested in another's argument is demanded first
-/// (inputs before invocation). For flat cases this is order-identical to the
-/// former walker. Pinned by the effects ball's rules--79/80/81 (a directive
+/// (inputs before invocation). Pinned by the effects ball's rules--79/80/81 (a directive
 /// under a PURE head, now seen through a predicate subquery, so R1 refuses) and
 /// by `nested_directive_argument_is_demanded_before_enclosing` (the order).
 #[derive(Default)]
@@ -715,15 +714,13 @@ struct DirectiveDemandCollector {
 }
 
 impl AstVisit<Unresolved> for DirectiveDemandCollector {
-    // RULED 2026-07-12 (inputs before invocation): EVERY directive form is
+    // INPUTS BEFORE INVOCATION: EVERY directive form is
     // recorded on `exit_*`, AFTER its argument expressions have been descended.
     // A directive is thus demanded AFTER the demands nested in its arguments
     // (inner-before-outer), CONSISTENT across all forms — arguments are inputs,
-    // so their demands precede the enclosing invocation. (Previously
-    // PseudoPredicate/DirectiveTerminal/DmlTerminal recorded on enter while the
-    // two-paren form recorded on exit — an inconsistency other-code-review.md
-    // flagged.) For flat, non-nested cases this is order-identical to the former
-    // walker (no directive is recorded during a non-directive arg descent).
+    // so their demands precede the enclosing invocation. Recording some forms
+    // on `enter_` while others record on exit misbinds the order
+    // (outer-before-inner for the enter-recorded forms).
     // Pinned by `nested_directive_argument_is_demanded_before_enclosing`.
     fn exit_relation(&mut self, r: &Relation<Unresolved>) -> Result<Descent> {
         if let Relation::PseudoPredicate {
@@ -922,11 +919,11 @@ mod tests {
 
     #[test]
     fn nested_directive_argument_is_demanded_before_enclosing() {
-        // RULED 2026-07-12 (inputs before invocation): a directive nested in
+        // INPUTS BEFORE INVOCATION: a directive nested in
         // another directive's ARGUMENT is demanded FIRST (inner-before-outer),
         // because every directive is recorded on `exit_*` — after its arguments
-        // are descended. Pre-fix, expression-position calls recorded on `enter_`
-        // (outer-before-inner), the inconsistency other-code-review.md flagged.
+        // are descended. Recording expression-position calls on `enter_`
+        // misbinds: outer-before-inner.
         let inner_in_arg = DomainExpression::ScalarSubquery {
             identifier: qn("s"),
             subquery: Box::new(directive("inner!")),

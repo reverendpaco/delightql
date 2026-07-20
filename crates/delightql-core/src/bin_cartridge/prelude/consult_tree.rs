@@ -111,8 +111,8 @@ impl EffectExecutable for ConsultTreePredicate {
         dql_files.sort();
 
         // Consult each file; the collection becomes the receipt's
-        // `returned` tree (EFFECT-ALGEBRA §3/§8, ruled 2026-07-15 —
-        // Phase 6 slice 3): one interior row per consulted file,
+        // `returned` tree (EFFECT-ALGEBRA §3/§8): one interior row
+        // per consulted file,
         // cardinality back to zero-or-one.
         let mut returned_rows: Vec<Vec<Option<String>>> = Vec::new();
         for file_path in &dql_files {

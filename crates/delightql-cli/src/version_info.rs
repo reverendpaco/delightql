@@ -56,6 +56,20 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
     },
 };
 
+/// sha256 of this binary's own executable file. Distinguishes two builds
+/// whose version strings are identical — the identity contract reports
+/// "dev" for every from-source build, so without this a swapped dev
+/// binary is invisible to `dql version`. Computed only on demand (the
+/// version command), never at startup.
+pub fn binary_sha256() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let exe = std::env::current_exe().ok()?;
+    let bytes = std::fs::read(exe).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Get version information as a formatted string
 pub fn get_version_info() -> String {
     if BUILD_INFO.change_id_short != "unavailable" {

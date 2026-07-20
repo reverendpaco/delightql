@@ -29,9 +29,9 @@ pub struct EntityInfo {
     pub definition: EntityDefinition,
 }
 
-/// What kind of thing the entity is (resolution-level; renamed from
-/// EntityType 2026-07-05, STRING-FLOOR Batch 2, to end the collision with
-/// the 19-variant catalog enums::EntityType).
+/// What kind of thing the entity is (resolution-level; deliberately NOT
+/// named EntityType — that name collides with the 19-variant catalog
+/// enums::EntityType).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedEntityKind {
     /// Tables, views, CTEs, TVFs - has rows and columns

@@ -348,8 +348,8 @@ impl DelightQLError {
                 // default `semantic/` prefix below (spelled `semantic/effect/…`).
                 // Effect discipline IS a semantic error; the documented hierarchy
                 // is parse/semantic/runtime and `error://semantic` must keep
-                // matching them (ruled 2026-07-12; pinned by the effects ball's
-                // rules--79/80/81_r1_predicate_* hooks, now `semantic/effect/…`).
+                // matching them (pinned by the effects ball's
+                // rules--79/80/81_r1_predicate_* hooks, `semantic/effect/…`).
                 // imprint! lifecycle refusals (blueprint inertness) are their
                 // own top segment, not a query-semantic error.
                 Some(sub) if sub.starts_with("imprint/") => format!("{S}{}", sub),

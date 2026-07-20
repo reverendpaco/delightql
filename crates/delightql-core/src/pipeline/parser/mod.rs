@@ -755,6 +755,16 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
         // has_error=true containing a garbled body). Silent acceptance of such
         // nodes is the "mortal sin" that produced the disjunctive_function bug.
         if child.has_error() {
+            // Same pattern diagnosis as create_ddl_error — a specific
+            // teaching (`--` comment, `is null`, PONY) beats the generic
+            // sigil-collision hint, which misattributes those mistakes.
+            if let Some(d) = diagnosis::diagnose_failed_parse(&child, source) {
+                return Err(DelightQLError::ParseError {
+                    message: d.message,
+                    source: None,
+                    subcategory: Some(d.subcategory),
+                });
+            }
             let display = truncate_for_display(child.text(), 80);
             let pos = child.raw_node().start_position();
             return Err(DelightQLError::ParseError {
@@ -1751,8 +1761,8 @@ high_value_users(*) :- users(*), balance > 500
     }
 
     // ========================================================================
-    // Interior continuations for pseudo-predicate calls (task 3.1b).
-    // THE RULING (2026-07-11): a postfix operator extends the complete query
+    // Interior continuations for pseudo-predicate calls.
+    // A postfix operator extends the complete query
     // to its left; per-arm scoping is spelled with INTERIORITY, and the glob
     // is optional — `s!(+-)` is the total-ledger arm spelling
     // (EFFECT-ALGEBRA §3, book/reference/dql/witness.md "Dictates").
@@ -1939,7 +1949,7 @@ main!(*) :-
         );
     }
 
-    /// IMPLEMENTATION-PLAN §3.0 (ruled 2026-07-11): the `:=` neck is stricken
+    /// The `:=` neck is stricken
     /// for effect rules — `name!(*) := body` must refuse AT THE GRAMMAR
     /// (effect_rule_definition takes `:-` only; hard removal, no curated
     /// message). The `:-` neck keeps parsing, and `:=` stays valid for the

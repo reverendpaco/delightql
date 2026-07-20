@@ -41,11 +41,6 @@ pub(crate) use wasm_system as system;
 pub use delightql_types::error;
 pub use delightql_types::{DelightQLError, Result};
 
-// CLI-facing danger-gate surface: the --danger flag parser and the spec
-// type it produces (consumed by api::DqlHandle::set_danger_overrides).
-pub use pipeline::ast_unresolved::DangerSpec;
-pub use pipeline::danger_gates::parse_cli_danger_spec;
-
 /// Whether `name` is a dialect family the compiler accepts (aliases
 /// included: "postgresql" for postgres). The CLI's eager --dialect /
 /// DQL_DIALECT validation consults this so flag validation and pipeline

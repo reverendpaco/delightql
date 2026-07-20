@@ -219,11 +219,14 @@ impl api::DqlHandle for DqlHandleImpl {
             .map_err(|e| e.to_string())
     }
 
-    fn set_danger_overrides(
-        &mut self,
-        specs: Vec<crate::pipeline::ast_unresolved::DangerSpec>,
-    ) -> Result<(), String> {
-        self.danger_overrides = specs;
+    fn set_danger_overrides(&mut self, specs: &[String]) -> Result<(), String> {
+        // Parsing lives HERE, not in the host: the textual spec is the
+        // API surface; the compiler's DangerSpec never crosses it.
+        self.danger_overrides = specs
+            .iter()
+            .map(|s| crate::pipeline::danger_gates::parse_cli_danger_spec(s))
+            .collect::<crate::error::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 

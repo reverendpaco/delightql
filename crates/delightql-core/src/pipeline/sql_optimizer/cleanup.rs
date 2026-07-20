@@ -338,6 +338,20 @@ fn scan_and_inline_inner(
                         return Ok((table.clone(), false));
                     }
                 }
+                // A TVF argument referencing this alias can only be
+                // rewritten by qualifier swap when its mapped definition
+                // is a plain column. `json_each(alias._extracted)` over
+                // an EXPRESSION definition has no legal rewrite
+                // (TvfArgument carries no expressions); inlining anyway
+                // leaves the argument naming a table that no longer
+                // exists.
+                if let Some(from) = outer.from() {
+                    for t in from {
+                        if tvf_refs_block_inline(t, alias, &col_map) {
+                            return Ok((table.clone(), false));
+                        }
+                    }
+                }
             }
 
             // For star-passthrough, build a qualifier-swap map:
@@ -392,6 +406,44 @@ fn scan_and_inline_inner(
             }
         }
         _ => Ok((table.clone(), false)),
+    }
+}
+
+/// Does any TVF in this table tree reference `alias` with a column whose
+/// mapped definition is NOT a plain column (or is unmapped)? Such a
+/// reference blocks inlining — see the guard at the decision site.
+fn tvf_refs_block_inline(
+    table: &TableExpression,
+    alias: &str,
+    col_map: &std::collections::HashMap<String, ColDef>,
+) -> bool {
+    use crate::pipeline::sql_ast_v3::TvfArgument;
+    match table {
+        TableExpression::Join { left, right, .. } => {
+            tvf_refs_block_inline(left, alias, col_map)
+                || tvf_refs_block_inline(right, alias, col_map)
+        }
+        TableExpression::TVF { arguments, .. } => arguments.iter().any(|arg| {
+            let column = match arg {
+                TvfArgument::QualifiedRef { qualifier, column } if qualifier == alias => {
+                    Some(column)
+                }
+                TvfArgument::ColumnRef { qualifier, column }
+                    if qualifier.table_name() == alias =>
+                {
+                    Some(column)
+                }
+                _ => None,
+            };
+            match column {
+                Some(c) => !matches!(
+                    col_map.get(c).map(|d| &d.expr),
+                    Some(DomainExpression::Column { .. })
+                ),
+                None => false,
+            }
+        }),
+        _ => false,
     }
 }
 

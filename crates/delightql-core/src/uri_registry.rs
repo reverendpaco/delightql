@@ -121,18 +121,17 @@ pub const ERROR_TOP_SEGMENTS: &[&str] = &[
     "operational",
     "runtime",
     "target",
-    // Added 2026-07-05 with the CLI panic hook (main.rs mints
+    // The CLI panic hook (main.rs mints
     // delightql-error://internal/panic on any Rust panic): dql's own
     // bugs get their own top segment, distinct from runtime/ (the
     // query failed) — internal/ means DQL failed.
     "internal",
-    // Added 2026-07-07 with blueprint-inertness enforcement (Change 3):
+    // Blueprint-inertness enforcement:
     // imprint!'s linear lifecycle refusals (imprint/blueprint/inert — an
     // archived blueprint namespace is visible but inert). Its own top
     // segment: not a query semantic error, a lifecycle-policy refusal.
     "imprint",
-    // Added 2026-07-08 with the system name guard (namespace work step 3a,
-    // catechism Deviation #3): USER-facing namespace creation refuses the
+    // The system name guard: USER-facing namespace creation refuses the
     // reserved system name pool (exact sys/std/home, sys*/std* prefixes, `_`
     // machinery segments, the sys::/std:: subtree). Its own top segment: a
     // creation-policy refusal, not a query semantic error.
@@ -179,12 +178,16 @@ pub mod subcat {
     pub const PARSE_PONY: &str = "pony";
     pub const PARSE_IS_NULL: &str = "is_null";
     pub const PARSE_ANON_SPACE: &str = "anon_space";
+    pub const PARSE_COMMENT: &str = "comment";
+    pub const PARSE_SORT_MINUS: &str = "sort_minus";
     pub const PARSE_FAMILY: &[&str] = &[
         PARSE_DDL,
         PARSE_SIGIL,
         PARSE_PONY,
         PARSE_IS_NULL,
         PARSE_ANON_SPACE,
+        PARSE_COMMENT,
+        PARSE_SORT_MINUS,
     ];
 }
 

@@ -11,9 +11,9 @@ use delightql_cli::args::CliArgs;
 use delightql_cli::output_format::OutputFormat;
 
 // Thread-local storage for error formatting.
-// (--assert / --if-errors and their diagnostics-db plumbing were removed
-// 2026-07-05 — dead wiring since the exec_ng refactor; the in-language
-// assertion hooks are the living replacement. PLAN.md #2.)
+// (--assert / --if-errors are deliberately absent: the in-language
+// assertion hooks are the replacement — CLI flags here would be dead
+// wiring.)
 thread_local! {
     static CLI_FLAGS: std::cell::RefCell<Option<CliFlags>> = const { std::cell::RefCell::new(None) };
 }
@@ -203,7 +203,7 @@ fn run() -> Result<()> {
     // The flag is clap-validated (args.rs::parse_dialect); an externally set
     // DQL_DIALECT is validated here, once, loudly: an ignored explicit
     // override is a silent-wrong — same principle as the DQL_FATBOY_DIR
-    // hard pin (bugs/cli-surface-2026-07-05/PLAN.md #4).
+    // hard pin.
     if let Some(ref dialect) = args.dialect {
         std::env::set_var("DQL_DIALECT", dialect);
     } else if let Ok(v) = std::env::var("DQL_DIALECT") {
@@ -233,10 +233,25 @@ fn run() -> Result<()> {
 
         return match command {
             Command::Version { json } => {
+                // The self-hash distinguishes builds the identity contract
+                // cannot: every from-source build reports "dev".
+                let self_hash = delightql_cli::version_info::binary_sha256();
                 if *json {
-                    println!("{}", delightql_buildinfo::json());
+                    // buildinfo's json() is hand-rolled (the crate is
+                    // dependency-free by charter); splice the additive key
+                    // here rather than teach buildinfo about hashing.
+                    let base = delightql_buildinfo::json();
+                    let base = base.trim_end_matches('}');
+                    let hash_field = match &self_hash {
+                        Some(h) => format!("\"{}\"", h),
+                        None => "null".to_string(),
+                    };
+                    println!("{},\"binary_sha256\":{}}}", base, hash_field);
                 } else {
                     println!("{}", delightql_buildinfo::human());
+                    if let Some(h) = self_hash {
+                        println!("binary sha256: {}", h);
+                    }
                 }
                 Ok(())
             }
@@ -467,7 +482,7 @@ mod tests {
         );
     }
 
-    /// bugs/cli-surface-2026-07-05/PLAN.md — the surface fixes stay fixed.
+    /// The CLI surface fixes stay fixed.
     #[test]
     fn test_cli_surface_fixes_2026_07_05() {
         let cli_path = get_cli_path();
@@ -1521,7 +1536,7 @@ mod tests {
         assert_eq!(parsed[1]["pad"], serde_json::json!("42"));
     }
 
-    /// PORCELAIN-AND-PLUMBING.md §7 knob 4 (ratified 2026-07-05): raw is
+    /// PORCELAIN-AND-PLUMBING.md §7 knob 4: raw is
     /// byte-faithful single-column extraction. Verbatim-ness is FROZEN at
     /// v0.1 — these assertions are that freeze.
     #[test]

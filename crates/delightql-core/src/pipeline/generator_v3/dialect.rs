@@ -48,8 +48,8 @@ impl SqlDialect {
                     // The dql CLI refuses an unknown DQL_DIALECT at startup
                     // (delightql-cli main.rs), so this lenient path serves
                     // embedded/library contexts only. Once: this is consulted
-                    // per compile stage and used to warn three times for one
-                    // query (bugs/cli-surface-2026-07-05/PLAN.md #4).
+                    // per compile stage, so an unguarded warn fires three
+                    // times for one query.
                     static WARNED: std::sync::Once = std::sync::Once::new();
                     WARNED.call_once(|| {
                         eprintln!(

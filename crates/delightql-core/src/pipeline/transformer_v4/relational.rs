@@ -1092,8 +1092,8 @@ pub(super) fn reconcile_inner_with_cpr(
 /// output index-for-index. A scoped schema does not: a positional
 /// caller pattern with discards keeps a SUBSET of the body heading, so
 /// the source column must be identified — never taken from the list
-/// index. Zipping by index shifted every binding after a non-trailing
-/// discard (bugs/rule-call-discard-misbind).
+/// index. Zipping by index misbinds: it shifts every binding after a
+/// non-trailing discard.
 ///
 /// The key is the scoped column's ORIGINAL name, which is the body's
 /// output name for both head styles (a caller rename rides in `alias`).
@@ -1391,6 +1391,12 @@ pub(super) fn r_lower_join(
                     ast_addressed::UsingColumn::Negated(_) => None,
                 })
                 .collect();
+            if sql_join_type == SqlJoinType::Full {
+                // Full outer must project USING columns as COALESCE —
+                // either side's orphan rows carry the key alone.
+                return Builder::from_join_full_outer_using(left_op, right_op, column_names)?
+                    .demote();
+            }
             SqlJoinCondition::Using(column_names)
         }
         Some(bool_expr) => {
@@ -1659,6 +1665,7 @@ impl Qualify for DummyQualify {
         Ok(super::builder::QualifiedColumn {
             name: col_name.to_string(),
             qualifier: None,
+            has_interior_schema: false,
         })
     }
 
@@ -1670,6 +1677,7 @@ impl Qualify for DummyQualify {
         Some(super::builder::QualifiedColumn {
             name: col_name.to_string(),
             qualifier: Some(table.to_string()),
+            has_interior_schema: false,
         })
     }
 }
@@ -1810,6 +1818,12 @@ pub(super) fn r_lower_pipe(
                 });
             }
         };
+
+        // The stage's resolver-stamped schema knows tree-typedness the
+        // structural re-derivation above cannot; adopt it so a later
+        // stage embedding this column can re-splice it.
+        let mut result = result;
+        result.adopt_interior_schemas(cpr_schema.get());
 
         if i == last_idx {
             return Ok(result);
@@ -3422,11 +3436,18 @@ pub(super) fn r_lower_meta_ize(
             SqlDomainExpr::literal(ast_addressed::LiteralValue::Number((idx + 1).to_string())),
         ];
         if detailed {
+            // The catalog's DECLARED type and nullability, carried from
+            // ColumnInfo through the registry. "unknown" is the honest
+            // answer for derived columns — never a guess. (Declarations
+            // are intent metadata; sqlite storage stays dynamic.)
             vals.push(SqlDomainExpr::literal(ast_addressed::LiteralValue::String(
-                "unknown".to_string(),
+                col.declared_type.clone().unwrap_or_else(|| "unknown".to_string()),
             )));
             vals.push(SqlDomainExpr::literal(ast_addressed::LiteralValue::String(
-                "true".to_string(),
+                match col.nullable {
+                    Some(b) => b.to_string(),
+                    None => "unknown".to_string(),
+                },
             )));
         }
         vals
@@ -3617,7 +3638,7 @@ pub(super) fn r_lower_signed_witness(
         candidate
     };
 
-    // RULED 2026-07-15 (payload-preserving witness proxy): a NO arm's
+    // PAYLOAD-PRESERVING WITNESS PROXY: a NO arm's
     // proxy row carries `returned = '[]'` — the EMPTY interior — rather
     // than NULL, for the conventional payload column(s). Releasing a
     // total ledger's payloads therefore yields ZERO rows for NO arms by
@@ -4934,9 +4955,9 @@ mod scoped_subset_positions_tests {
         c
     }
 
-    // bugs/rule-call-discard-misbind: `hr(_, uid, rating)` — the
-    // leading discard makes the subset a non-prefix; name matching
-    // must select positions 2 and 3, never 1 and 2.
+    // `hr(_, uid, rating)` — the leading discard makes the subset a
+    // non-prefix; name matching must select positions 2 and 3, never
+    // 1 and 2 (index-zipping's misbind).
     #[test]
     fn non_prefix_subset_keys_by_name() {
         let inner = names(&["rid", "uid", "rating"]);

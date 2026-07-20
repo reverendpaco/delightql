@@ -150,7 +150,7 @@ pub enum PlanEntry {
 // ============================================================================
 
 /// A guard edge's polarity. `always` is the ABSENCE of a requirement row,
-/// never a third value (Q-D3, ruled 2026-07-15).
+/// never a third value (Q-D3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardPolarity {
     /// Continue when the guard relation has a row.

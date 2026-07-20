@@ -735,10 +735,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         // A VALID SQLite database with no tables. A bare rusqlite open
-        // leaves a 0-byte file, which mount! REFUSES since the nullmount
-        // ruling (2026-07-12: mount! is attach-only and rejects
-        // missing/empty/invalid files) — write the header so the file is
-        // a real database, the same way mount_new! provisions one.
+        // leaves a 0-byte file, which mount! REFUSES (mount! is
+        // attach-only and rejects missing/empty/invalid files) — write
+        // the header so the file is a real database, the same way
+        // mount_new! provisions one.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         drop(conn);

@@ -89,10 +89,6 @@ pub enum Command {
         #[arg(long)]
         debug: Option<String>,
 
-        /// SQL optimization level (0-3)
-        #[arg(long = "soptimize", default_value = "0")]
-        sql_optimize: u8,
-
         /// Suppress headers in results
         #[arg(long, short = 'n')]
         no_headers: bool,
@@ -393,7 +389,7 @@ pub enum Stage {
 
 /// Eager --dialect validation, mirroring --format's contract: a bogus
 /// value is a hard usage error before anything runs, never a lazy
-/// warning downstream (bugs/cli-surface-2026-07-05/PLAN.md #4). Accepts
+/// warning downstream. Accepts
 /// exactly what `SqlDialect::from_family_name` accepts, aliases included.
 fn parse_dialect(s: &str) -> Result<String, String> {
     if delightql_core::is_known_dialect_family(s.trim()) {

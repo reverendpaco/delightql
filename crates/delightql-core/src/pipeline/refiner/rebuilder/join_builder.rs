@@ -255,18 +255,36 @@ pub(super) fn create_join(
 }
 
 pub(super) fn determine_join_type(analyzed: &AnalyzedSegment, table_idx: usize) -> JoinType {
-    let right_outer = analyzed.tables[table_idx].outer;
+    // Markedness, not comma position, determines join role: the unmarked
+    // tables form the required core; each ?-marked table LEFT-joins onto
+    // the tree; FULL OUTER happens only when EVERY join party is marked
+    // (left-fold in written order). EXISTS-mode anonymous tables lower as
+    // filters, not joins, so they carry no vote here.
+    let is_join_party =
+        |t: &flattener::FlatTable| t.anonymous_data.as_ref().is_none_or(|a| !a.exists_mode);
 
-    let left_needs_preserving = (0..table_idx).any(|i| analyzed.tables[i].outer);
-
-    // Semantic meaning:
-    // - right_outer=true (? on right table) means right table is optional -> LEFT OUTER JOIN
-    // - left_needs_preserving=true (? on left tables) means left tables are optional -> preserve left side
-    match (left_needs_preserving, right_outer) {
-        (true, true) => JoinType::FullOuter,   // Both sides optional
-        (true, false) => JoinType::RightOuter, // Left side optional, right required
-        (false, true) => JoinType::LeftOuter,  // Left required, right optional
-        (false, false) => JoinType::Inner,     // Both required
+    if analyzed
+        .tables
+        .iter()
+        .filter(|t| is_join_party(t))
+        .all(|t| t.outer)
+    {
+        return JoinType::FullOuter;
+    }
+    if analyzed.tables[table_idx].outer {
+        return JoinType::LeftOuter;
+    }
+    // Right side unmarked: if everything joined so far is marked, this
+    // table anchors the tree and the accumulated optional cluster
+    // preserves as a unit — RIGHT here; the transformer swaps operands
+    // back to LEFT.
+    if (0..table_idx)
+        .filter(|&i| is_join_party(&analyzed.tables[i]))
+        .all(|i| analyzed.tables[i].outer)
+    {
+        JoinType::RightOuter
+    } else {
+        JoinType::Inner
     }
 }
 
@@ -395,79 +413,58 @@ fn validate_outer_join_markers(
         )));
     }
 
-    // Rule 2: For each join operator, check if outer markers require conditions
-    // Join operator at position i connects table i to table i+1
-    for (join_idx, _op) in analyzed.operators.iter().enumerate() {
-        let left_table_idx = join_idx;
-        let right_table_idx = join_idx + 1;
+    // Rule 2: FULL OUTER — the all-marked case — requires a join
+    // condition. The ? sigil marks its relation as OPTIONAL; a one-sided
+    // mark without a condition is a legal LEFT join over the cross
+    // product. Only when EVERY relation is marked does the join become
+    // FULL OUTER, whose two-part construction needs a condition to find
+    // each side's unmatched rows.
+    let all_marked = analyzed
+        .tables
+        .iter()
+        .filter(|t| t.anonymous_data.as_ref().is_none_or(|a| !a.exists_mode))
+        .all(|t| t.outer);
+    if !all_marked {
+        return Ok(());
+    }
 
+    for (join_idx, _op) in analyzed.operators.iter().enumerate() {
+        let right_table_idx = join_idx + 1;
         if right_table_idx >= analyzed.tables.len() {
             continue; // No right table (shouldn't happen but be safe)
         }
-
-        let left_table = &analyzed.tables[left_table_idx];
+        let left_table = &analyzed.tables[join_idx];
         let right_table = &analyzed.tables[right_table_idx];
 
-        log::debug!(
-            "  Join {}: '{}' (outer={}) <-> '{}' (outer={})",
-            join_idx,
-            left_table.identifier.name,
-            left_table.outer,
-            right_table.identifier.name,
-            right_table.outer
-        );
-
-        // Check if either side has an outer marker
-        let needs_condition = left_table.outer || right_table.outer;
-
-        if needs_condition {
-            // Check if this join has any FJC predicates
-            let op_ref = OperatorRef::Join { position: join_idx };
-            let has_join_condition = op_predicates
-                .get(&op_ref)
-                .map(|preds| !preds.is_empty())
-                .unwrap_or(false)
-                || matches!(
-                    &analyzed.operators[join_idx].kind,
-                    flattener::FlatOperatorKind::Join {
-                        using_columns: Some(_)
-                    }
-                );
-
-            log::debug!(
-                "  Join {} needs_condition={}, has_condition={}",
-                join_idx,
-                needs_condition,
-                has_join_condition
+        let op_ref = OperatorRef::Join { position: join_idx };
+        let has_join_condition = op_predicates
+            .get(&op_ref)
+            .map(|preds| !preds.is_empty())
+            .unwrap_or(false)
+            || matches!(
+                &analyzed.operators[join_idx].kind,
+                flattener::FlatOperatorKind::Join {
+                    using_columns: Some(_)
+                }
             );
 
-            if !has_join_condition {
-                // Determine which table(s) have the marker for error message
-                let table_with_marker = if left_table.outer && right_table.outer {
-                    format!(
-                        "'{}' and '{}'",
-                        left_table.identifier.name, right_table.identifier.name
-                    )
-                } else if left_table.outer {
-                    format!("'{}'", left_table.identifier.name)
-                } else {
-                    format!("'{}'", right_table.identifier.name)
-                };
-
-                return Err(DelightQLError::parse_error(format!(
-                    "FULL OUTER marker requires explicit join condition\n\n\
-                    {} ha{} a FULL OUTER marker (?) but no join condition\n\
-                    specifying how the tables connect.\n\n\
-                    Add a join condition:\n  ?{}(*), ?{}(*), {}.id = {}.foreign_key\n\n\
-                    Or remove the marker if a regular join is intended:\n  {}(*), {}(*), {}.id = {}.foreign_key",
-                    table_with_marker,
-                    if left_table.outer && right_table.outer { "ve" } else { "s" },
-                    left_table.identifier.name, right_table.identifier.name,
-                    left_table.identifier.name, right_table.identifier.name,
-                    left_table.identifier.name, right_table.identifier.name,
-                    left_table.identifier.name, right_table.identifier.name
-                )));
-            }
+        if !has_join_condition {
+            return Err(DelightQLError::parse_error_categorized(
+                "general",
+                format!(
+                "FULL OUTER JOIN requires an explicit join condition\n\n\
+                Every relation in this chain is marked optional (?), which makes\n\
+                the join FULL OUTER — but the join between '{l}' and '{r}' has no\n\
+                condition saying how the two sides align, so there is no way to\n\
+                tell which rows of each side are unmatched.\n\n\
+                Add a join condition:\n  {l}?(*), {r}?(*), {l}.id = {r}.{l}_id\n\n\
+                Or give the patterns a shared variable:\n  {l}?(id, x), {r}?(id, y)\n\n\
+                (One-sided ? marks do not need a condition: the marked relation\n\
+                LEFT-joins the rest.)",
+                    l = left_table.identifier.name,
+                    r = right_table.identifier.name,
+                ),
+            ));
         }
     }
 

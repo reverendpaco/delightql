@@ -198,7 +198,7 @@ impl EffectExecutable for ConsultPredicate {
 
         let _count = execute_consult(system, &file_path, &namespace, None)?;
 
-        // EFFECT-ALGEBRA §3 (amended 2026-07-15): (success, operation,
+        // EFFECT-ALGEBRA §3: (success, operation,
         // input, returned) — input echoes the lifted argument row,
         // returned carries the consulted namespaces.
         Ok(EntityResult::Relation(super::interior_receipt_result(
@@ -1242,10 +1242,10 @@ mod liminal_abort_tests {
 
 #[cfg(test)]
 mod name_collision_tests {
-    //! foo/foo! name collision (IMPLEMENTATION-PLAN §3.0, ruled 2026-07-11).
-    //! The two ruled directions are pinned red-first by effects-ball
+    //! foo/foo! name collision.
+    //! Both directions are pinned red-first by effects-ball
     //! rules--47/rules--48 (views vs effect rules). This module pins the
-    //! §3.0 scope FINDING: colon-functions (`foo:(x)`) register plain-named
+    //! scope: colon-functions (`foo:(x)`) register plain-named
     //! into the SAME entity table/namespace as relations, so they share the
     //! functor namespace and the collision rule covers them too — in both
     //! directions.

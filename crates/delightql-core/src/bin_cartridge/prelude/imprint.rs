@@ -171,7 +171,7 @@ fn run_imprint(
     let results = system.imprint_namespace(&source_ns, &target_ns, mode)?;
 
     // The manifest enumeration is the receipt's `returned` tree
-    // (EFFECT-ALGEBRA §3, ruled 2026-07-15 — Phase 6 slice 4): one
+    // (EFFECT-ALGEBRA §3): one
     // interior row per materialized entity, cardinality back to
     // zero-or-one. An empty manifest ships the all-NULL contributor
     // row, which elides to `[]`.

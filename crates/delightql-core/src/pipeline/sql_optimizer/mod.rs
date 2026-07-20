@@ -29,16 +29,6 @@ pub enum OptimizationLevel {
     Basic,
 }
 
-/// Read the optimization level from the DQL_SOPTIMIZE environment variable.
-/// Falls back to `Basic` if unset or unparseable.
-pub fn level_from_env() -> OptimizationLevel {
-    match std::env::var("DQL_SOPTIMIZE").as_deref() {
-        Ok("0") => OptimizationLevel::None,
-        Ok("1") => OptimizationLevel::Basic,
-        _ => OptimizationLevel::Basic,
-    }
-}
-
 /// Main entry point for SQL optimization
 /// Takes a SQL AST v3 and returns an optimized version
 pub fn optimize(statement: SqlStatement, level: OptimizationLevel) -> Result<SqlStatement> {

@@ -659,7 +659,7 @@ pub(super) fn resolve_interior_drill_down(
                 )
             })?;
 
-    // 1b. TAGGED SUM (EFFECT-ALGEBRA §3, amended 2026-07-15): a ledger
+    // 1b. TAGGED SUM (EFFECT-ALGEBRA §3): a ledger
     // column whose arms declare DIFFERENT interior headings must not be
     // released across arms — the first arm's heading would silently drop
     // the other arms' rows. The union stays legal; the RELEASE teaches.
@@ -712,24 +712,49 @@ pub(super) fn resolve_interior_drill_down(
     let interior_cols: Vec<&InteriorColumnDef> = if glob {
         schema.iter().collect()
     } else {
-        // Try name-based lookup first
-        let mut selected = Vec::new();
-        let mut all_matched = true;
-        for col_name in &columns {
-            if col_name == "_" {
-                // Underscore can't be a named column — force positional path
-                all_matched = false;
-                break;
-            }
-            if let Some(def) = schema.iter().find(|d| d.name == *col_name) {
-                selected.push(def);
-            } else {
-                all_matched = false;
-                break;
-            }
+        // ALL-OR-NOTHING mode selection: every name matches the interior
+        // schema → named selection; none match → positional rename; a
+        // MIX refuses — falling to positional on a partial match silently
+        // rebound a real interior name to different data (a typo in one
+        // name relabeled every column). A "_" is an EXPLICIT positional
+        // declaration (the language-wide pattern idiom `users(_, name)`),
+        // so underscore-bearing patterns are positional by intent and the
+        // mixed refusal applies only to underscore-free patterns.
+        let is_match = |c: &String| c != "_" && schema.iter().any(|d| d.name == *c);
+        let has_underscore = columns.iter().any(|c| c == "_");
+        let matched_count = columns.iter().filter(|c| is_match(c)).count();
+        let all_matched =
+            !has_underscore && matched_count == columns.len() && !columns.is_empty();
+        if !has_underscore && matched_count > 0 && !all_matched {
+            let (hits, misses): (Vec<&str>, Vec<&str>) = columns
+                .iter()
+                .map(|c| c.as_str())
+                .partition(|c| is_match(&c.to_string()));
+            return Err(crate::error::DelightQLError::validation_error(
+                format!(
+                    "Interior drill-down on '{}' mixes named and positional: \
+                     [{}] name interior columns but [{}] do not. Either ALL \
+                     names match the interior schema (named selection) or \
+                     NONE do (positional rename). Available: {}.",
+                    column,
+                    hits.join(", "),
+                    misses.join(", "),
+                    schema.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "),
+                ),
+                "Fix the typo for named selection, or choose fresh names for positional binding."
+                    .to_string(),
+            ));
         }
         if all_matched {
-            selected
+            columns
+                .iter()
+                .map(|c| {
+                    schema
+                        .iter()
+                        .find(|d| d.name == *c)
+                        .expect("all_matched guarantees presence")
+                })
+                .collect()
         } else if columns.len() == schema.len() {
             // Positional binding: arity matches, names are fresh.
             // Select all interior columns; alias with user-supplied names.

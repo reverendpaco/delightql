@@ -9,8 +9,7 @@
 //! counts the children with a shim pinned via DQL_FATBOY_DIR (the hard-pin
 //! lookup dir, fatboy_exec.rs FATBOY_DIR_ENV): a wrapper that appends to a
 //! counter file then `exec`s the real adapter. Exactly ONE spawn is the
-//! contract; it was observed at TWO against the pre-fix binary
-//! (2026-07-12, both duckdb and the sweep-lane postgres).
+//! contract.
 //!
 //! The spawn happens BEFORE resolution, so the query may error on
 //! table-not-found and the count is still observable — but the target must

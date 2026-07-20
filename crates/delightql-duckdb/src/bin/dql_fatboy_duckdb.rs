@@ -5,8 +5,8 @@
 //! Pattern sibling of dql-fatboy-postgres: relay protocol over its
 //! stdin/stdout (the LSP model), the duckdb crate behind it. dql spawns
 //! one per duckdb-file connection and reaps it on drop; the pipe is the
-//! lifecycle. The database opens WRITABLE by default (E-T3b, ruled
-//! 2026-07-11) and LAZILY — the first Query takes DuckDB's exclusive
+//! lifecycle. The database opens WRITABLE by default (E-T3b) and
+//! LAZILY — the first Query takes DuckDB's exclusive
 //! write lock, which then excludes ALL other opens of the file (even
 //! read-only ones) for this process's lifetime. `--readonly` opts back
 //! into the old posture: concurrent read-only opens across processes,

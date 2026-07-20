@@ -360,7 +360,7 @@ fn receipt_mention_gates_later_directive_with_exists() {
     let update_sql = sql_at(&plan, update);
     // `temp.`-qualified per the scratch-collision invariant (review F1/F3;
     // the generator quotes the schema keyword).
-    // Receipt-era (2026-07-15): the mention's value is route!'s OUTER
+    // The mention's value is route!'s OUTER
     // receipt (built over its receipt shell), so the gate is EXISTS over
     // that derived receipt — still a 0/1 guard on __r_route's emptiness.
     let flat_update = flat(update_sql.clone());
@@ -697,8 +697,8 @@ fn stdout_prefix_snapshots_once() {
         "the prefix is evaluated exactly once, in the snapshot CTAS: {}",
         snap_ctas
     );
-    // Between the ship and the CTAS sits only the §3 replace drop (ruled
-    // 2026-07-11: temp creations replace).
+    // Between the ship and the CTAS sits only the §3 replace drop
+    // (temp creations replace).
     let drop_sql = sql_at(&plan, i + 1);
     assert!(
         drop_sql.starts_with("DROP TABLE IF EXISTS temp.staged"),
@@ -912,8 +912,8 @@ fn namespace_without_main_refuses() {
 }
 
 // ============================================================================
-// The name guard (review F3c, materialize-pipe §1) and the §3 clash
-// semantics (ruled 2026-07-11) — layer 2 of the scratch-collision
+// The name guard and the §3 clash
+// semantics — layer 2 of the scratch-collision
 // invariant, plus the temp-replace / durable-refuse pair. E2e pins:
 // effects ball scratch--54 / main--26 / clash--55.
 // ============================================================================
@@ -1086,7 +1086,7 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     );
     let update = index_of(&plan, "UPDATE");
     let update_sql = sql_at(&plan, update);
-    // Receipt-era (2026-07-15): the gate is EXISTS over route!'s derived
+    // The gate is EXISTS over route!'s derived
     // OUTER receipt — still a 0/1 guard on __r_route's emptiness.
     let flat_update = flat(update_sql.clone());
     assert!(
@@ -1114,7 +1114,7 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     );
 
     // [tail] the total ledger — INTERIOR signed witness per arm
-    // (`s!(+-) ; x!(+-) ; …`, task 3.1b; THE RULING 2026-07-11).
+    // (`s!(+-) ; x!(+-) ; …`).
     // OBSERVED-PAYLOAD FUSION (txmyxvos): the tee's `!>` releases
     // stdout!'s payload immediately, so the union materializes ONCE into
     // the typed snapshot (`__tee_stdout_2`) — the ship reads the
@@ -1220,7 +1220,7 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     // four flat labeled-count arms, one per bucket — never the nested
     // count-of-accumulated-union shape of the exterior spelling.
     let final_flat = flat(final_ship);
-    // Receipt-era (2026-07-15): 4 arm counts + 1 __clause_count from
+    // 4 arm counts + 1 __clause_count from
     // main!'s outer-receipt emptiness gate (the universal boundary).
     assert_eq!(
         final_flat.matches("count(*)").count(),
@@ -1256,16 +1256,16 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
 }
 
 // ============================================================================
-// Epic 4.1: durable placement + cross-kind temp replace (EFFECT-ALGEBRA §3,
-// ruled 2026-07-11: temp replacement is by NAME, not kind) + the
+// Durable placement + cross-kind temp replace (EFFECT-ALGEBRA §3:
+// temp replacement is by NAME, not kind) + the
 // multi-connection refusals for table! (materialize-pipe §2).
 // ============================================================================
 
 /// Cross-kind replace, in-plan half (the same-plan `created_objects` path):
 /// a temp VIEW over a temp TABLE created earlier in the plan must drop the
-/// TABLE — the name is the collision domain, not the kind. Red-observed
-/// 2026-07-11: only the directive-kind `DROP VIEW` preceded the CREATE, so
-/// the engine died "use DROP TABLE to delete table sw". The cross-PLAN half
+/// TABLE — the name is the collision domain, not the kind. A
+/// directive-kind-only `DROP VIEW` misbinds: the engine dies
+/// "use DROP TABLE to delete table sw" at execution. The cross-PLAN half
 /// (session-catalog probe) is pinned by the CLI integration tests
 /// `temp_view_over_temp_table_replaces_the_table` /
 /// `temp_table_over_temp_view_replaces_the_view` (durable_placement.rs).
@@ -1297,8 +1297,8 @@ fn cross_kind_replace_view_over_table_drops_the_table_in_plan() {
 }
 
 /// Cross-kind replace, reverse direction: a temp TABLE over a temp VIEW
-/// created earlier in the plan must drop the VIEW. Red-observed 2026-07-11
-/// ("use DROP VIEW to delete view sw" at execution).
+/// created earlier in the plan must drop the VIEW (otherwise the engine
+/// dies "use DROP VIEW to delete view sw" at execution).
 #[test]
 fn cross_kind_replace_table_over_view_drops_the_view_in_plan() {
     let plan = plan_for(
@@ -1452,11 +1452,9 @@ fn table_bang_on_second_connection_in_one_plan_refuses() {
 }
 
 // ------------------------------------------------------------------
-// Fatboy-topology worlds + the T0 strike's surviving controls. The T0
-// INTERIM STRIKE was DELETED by E-T5 (2026-07-11) — honest execution
-// replaced the honest refusal; its two refusal pins are superseded by
-// the E-T1 attribution pins below (now on the PRODUCTION compile
-// entries) and end-to-end by
+// Fatboy-topology worlds. These plans EXECUTE — there is no
+// compile-time fatboy strike; the attribution pins below cover the
+// PRODUCTION compile entries, end-to-end by
 // crates/delightql-cli/tests/effects_on_targets.rs. The two controls
 // stay: all-SQLite topologies must keep compiling untouched.
 // ------------------------------------------------------------------
@@ -2072,8 +2070,8 @@ fn duckdb_update_precount_counts_the_matched_predicate() {
 
 /// SQLite emission is BYTE-IDENTICAL after E-T2: the full rendered entry
 /// list of a representative DML plan, pinned exactly, so any future
-/// dialecting drift on the canonical path is loud. Captured from the
-/// pre-E-T2 compiler (2026-07-11) and required to stay stable.
+/// dialecting drift on the canonical path is loud. Required to stay
+/// stable byte-for-byte.
 #[test]
 fn sqlite_representative_plan_render_pinned_byte_for_byte() {
     let plan = plan_for(
@@ -2160,7 +2158,7 @@ fn pg_table_bang_ctas_spells_the_mounted_schema_and_registers_on_the_connection(
 /// R-T4's refusal arm, RESHAPED by E-T5's siso refusal: the only
 /// production topology where a postgres-dialect connection had no
 /// derivable mounted schema was a siso-typed postgres connection
-/// (connection_type 6), and E-T5's RULED siso refusal now fires FIRST —
+/// (connection_type 6), and E-T5's siso refusal fires FIRST —
 /// at `route()`'s latch, before handle_ddl's durable-placement arm is
 /// reached. This pins the preemption; the "mounted schema is unknowable"
 /// refusal in handle_ddl stays as DEFENSE (its comment says so) because
@@ -2482,8 +2480,8 @@ fn duckdb_readback_keeps_pragma_and_tolerates_the_boolean_shape() {
 }
 
 // ------------------------------------------------------------------
-// E-T5 — the siso refusal (EFFECTS-ON-TARGETS-PLAN §3 E-T5, RULED
-// 2026-07-11, PERMANENT — not an interim strike): effect plans that
+// E-T5 — the siso refusal (PERMANENT — not an interim strike):
+// effect plans that
 // settle on a siso-mounted connection (connection_type 6) refuse at
 // compile. The siso transport is error-blind (ALL-SQL-TARGETING-STATE
 // §1), and R-T3's failure-aborts discipline requires seeing statement

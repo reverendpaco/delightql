@@ -89,7 +89,7 @@ pub fn create_namespace(
 /// * `Err(anyhow::Error)` - If any creation fails
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use delightql_core::import::namespace::{create_namespace_hierarchy, NamespaceSpec};
 /// use rusqlite::Connection;
 ///

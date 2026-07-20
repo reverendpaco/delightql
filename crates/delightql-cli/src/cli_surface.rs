@@ -257,11 +257,30 @@ fn seed_exit_codes(surface: &mut Surface) {
     }
 }
 
+#[cfg(feature = "repl")]
 fn seed_dot_commands(surface: &mut Surface) {
-    // The REPL's dot commands are not yet enumerable from code (their
-    // dispatch is a match); until they are, seed nothing rather than
-    // hand-author a second source that can drift. SYS-HELP-DESIGN.md
-    // open item.
+    // Projection of the REPL's dot-command registry — the same table the
+    // dispatcher is welded to (registry_and_dispatch_agree), so these
+    // rows structurally cannot drift from what the REPL accepts. One row
+    // per accepted SPELLING: aliases get their own row naming the
+    // canonical form.
+    for cmd in crate::repl::commands::DOT_COMMANDS {
+        surface
+            .dot_commands
+            .push((cmd.name.to_string(), cmd.summary.to_string()));
+        for alias in cmd.aliases {
+            surface.dot_commands.push((
+                alias.to_string(),
+                format!("{} (alias of {})", cmd.summary, cmd.name),
+            ));
+        }
+    }
+}
+
+#[cfg(not(feature = "repl"))]
+fn seed_dot_commands(surface: &mut Surface) {
+    // No REPL in this build → honestly empty rows, same contract as
+    // headless HelpSurface tables.
     let _ = surface;
 }
 

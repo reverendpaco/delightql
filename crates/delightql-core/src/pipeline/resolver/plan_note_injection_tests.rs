@@ -166,7 +166,7 @@ fn injected_plan_note_compiles_nonexistent_table_to_sql() {
     )
     .expect("an injected plan note must make the table resolvable");
 
-    // Emitted SQL (probe run 2026-07-11):
+    // Emitted SQL:
     //   SELECT plan_scratch.x AS x
     //   FROM plan_scratch
     //   WHERE plan_scratch.x > 0

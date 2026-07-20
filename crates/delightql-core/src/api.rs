@@ -70,13 +70,12 @@ pub trait DqlHandle: Send {
     }
 
     /// Set the handle's session-baseline danger overrides (CLI `--danger`).
-    /// Every session and relay created afterward inherits them. Specs must
-    /// be pre-validated via `danger_gates::parse_cli_danger_spec` — hosts
-    /// pass only what that parser accepted. Default: unsupported.
-    fn set_danger_overrides(
-        &mut self,
-        _specs: Vec<crate::pipeline::ast_unresolved::DangerSpec>,
-    ) -> Result<(), String> {
+    /// Every session and relay created afterward inherits them. Specs are
+    /// the textual `hierarchy=STATE` forms; CORE parses and validates —
+    /// unknown gates, bad states, and non-overridable gates refuse with a
+    /// teaching error. Hosts never see the compiler's representation.
+    /// Default: unsupported.
+    fn set_danger_overrides(&mut self, _specs: &[String]) -> Result<(), String> {
         Err("danger overrides are not supported by this host".to_string())
     }
 }

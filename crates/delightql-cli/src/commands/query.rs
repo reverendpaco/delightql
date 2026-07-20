@@ -119,7 +119,6 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         no_sanitize,
         consult_files,
         attach,
-        sql_optimize,
         sequential,
         dangers,
         #[cfg(feature = "repl")]
@@ -138,9 +137,6 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
 
-    if *sql_optimize > 0 {
-        std::env::set_var("DQL_SOPTIMIZE", sql_optimize.to_string());
-    }
     if *no_sanitize {
         eprintln!("warning: output sanitization disabled, terminal injection possible");
     }
@@ -187,18 +183,13 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
 
     let mut handle = connection::open_handle()?;
 
-    // Apply --danger session-baseline overrides. Parse+validation refuses
-    // unknown gates, bad states, and non-CLI-overridable (semantic) gates
-    // with teaching errors — this flag was parsed-and-dropped dead wiring
-    // until 2026-07-17 (outside-eyes F2: a silently ignored safety flag).
+    // Apply --danger session-baseline overrides. Core parses and
+    // validates the textual specs — unknown gates, bad states, and
+    // non-CLI-overridable (semantic) gates refuse with teaching errors;
+    // a --danger that cannot take effect refuses, never no-ops.
     if !dangers.is_empty() {
-        let specs = dangers
-            .iter()
-            .map(|d| delightql_core::parse_cli_danger_spec(d))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
         handle
-            .set_danger_overrides(specs)
+            .set_danger_overrides(&dangers)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 
@@ -251,7 +242,16 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         )
     } else {
         // No query, no file, and (per the interactive check above) stdin is
-        // NOT a terminal: read the piped program from stdin.
+        // NOT a terminal: read the piped program from stdin. ANNOUNCE the
+        // wait first — a pipe that never delivers EOF (a common agent/CI
+        // wiring) otherwise blocks here with zero output, and the eventual
+        // timeout-kill leaves no evidence of why. Every state the tool
+        // enters must emit evidence of that state on stderr; stdout stays
+        // machine-clean.
+        eprintln!(
+            "reading query from stdin (end with EOF; or pass the query as \
+             an argument, or --file <path>)"
+        );
         let mut buffer = String::new();
         io::stdin().read_to_string(&mut buffer)?;
         if buffer.trim().is_empty() {

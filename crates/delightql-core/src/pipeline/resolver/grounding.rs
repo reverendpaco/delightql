@@ -1140,8 +1140,7 @@ pub(super) fn expand_multi_clause_view(
 // how we apply it to the body.
 // ============================================================================
 
-/// Ground-Position Naming Rule (clause-head-catechism.md §II, ruled 2026-07-08,
-/// activated 2026-07-08 now that head-`as` parses).
+/// Ground-Position Naming Rule.
 ///
 /// A relational rule-head POSITION that every clause supplies with GROUND terms —
 /// i.e. zero naming offers across all clauses (per `offered_name()` all-None: no
@@ -1731,16 +1730,13 @@ fn wrap_query_with_pipe(
     }
 }
 
-/// R-3 (CALLER-PATTERN-SEAM-PLAN.md, RULED 2026-07-17): the trailing
-/// access group on a parameterized-rule call is ordinary argumentative
-/// access over the declared heading — uniform with plain-rule calls and
-/// with directive receipt access. The binding is not built yet
-/// (bugs/param-rule-access-inert): before this refusal the pattern was
-/// silently IGNORED — the full heading leaked under its own names,
-/// "bound" names never existed, and a unification join on one
-/// cross-joined without error. Refuse-first until the binding lands
-/// through the scoped-subset road; glob access stays
-/// payload-transparent.
+/// The trailing access group on a parameterized-rule call is ordinary
+/// argumentative access over the declared heading — uniform with
+/// plain-rule calls and with directive receipt access. The binding is
+/// not built yet, so positional access REFUSES rather than accepts:
+/// silent acceptance leaks the full heading under its own names, the
+/// "bound" names never exist, and a unification join on one
+/// cross-joins without error. Glob access stays payload-transparent.
 pub(super) fn refuse_positional_ho_access(
     function: &str,
     access: &ast_unresolved::DomainSpec,

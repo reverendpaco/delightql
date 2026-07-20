@@ -1066,12 +1066,11 @@ mod effect_builder_tests {
     }
 
     // ------------------------------------------------------------------
-    // Interior continuations on directive calls (task 3.1b, THE RULING
-    // 2026-07-11): a continuation inside the access parens scopes to that
-    // relation, exactly like a functor interior. RED before 3.1b: the CST
-    // forms were parse errors (`s!(+-)`), and the builder ignored a
-    // continuation field entirely (sabotage-verified: disabling the
-    // continuation branch silently builds a bare `s!()`).
+    // Interior continuations on directive calls: a continuation inside
+    // the access parens scopes to that relation, exactly like a functor
+    // interior. Sabotage-verified: disabling the builder's continuation
+    // branch silently builds a bare `s!()` — the failure mode is silent,
+    // so these pins stay.
     // ------------------------------------------------------------------
 
     /// `s!(*)` — under functor-paren uniformity the `*` parses as a qualify

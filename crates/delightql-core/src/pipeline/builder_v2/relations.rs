@@ -233,7 +233,7 @@ pub(super) fn parse_catalog_functor(
 
 /// Parse pseudo-predicate call (e.g., mount!(), enlist!())
 ///
-/// INTERIORITY (task 3.1b, THE RULING 2026-07-11): the access parens accept
+/// INTERIORITY: the access parens accept
 /// an interior continuation, exactly like a functor's — it applies to this
 /// relation, scoped (`s!(+-)` is the per-arm total-ledger spelling;
 /// EFFECT-ALGEBRA §3, witness.md "Dictates"). The bare qualify continuation
@@ -1098,7 +1098,24 @@ fn parse_sparse_data_row(
         if inner.kind() == "sparse_fill" {
             // Parse sparse fill: _(col1, col2 @ val1, val2)
             let fill_pairs = parse_sparse_fill_node(inner, sparse_names, features)?;
-            fills.extend(fill_pairs);
+            // Two fills for one column (within a group or across groups)
+            // are a contradiction — a first-match consumer would silently
+            // drop the later value. Admit pair-by-pair so within-group
+            // duplicates are caught too.
+            for (name, val) in fill_pairs {
+                if fills.iter().any(|(existing, _)| existing == &name) {
+                    return Err(DelightQLError::parse_error_categorized(
+                        "anon",
+                        format!(
+                            "Duplicate sparse fill for column '{}' in row {}: \
+                             each sparse column may be filled at most once per row.",
+                            name,
+                            row_idx + 1,
+                        ),
+                    ));
+                }
+                fills.push((name, val));
+            }
         } else {
             // Regular positional value
             positional.push(parse_expression(inner, features)?);
