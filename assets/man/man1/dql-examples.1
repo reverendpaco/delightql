@@ -1,0 +1,203 @@
+.TH DQL-EXAMPLES 1 "2026-07-17" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql\-examples \- worked, copy\-pasteable examples: the CLI flags in
+practice, then the language itself
+.SH DESCRIPTION
+Every example on this page was executed against the binary it ships in
+before it was written down. Most language examples use anonymous tables
+(\fB_( ... )\fR) so they run with no database at all \(em paste them
+straight into
+.B dql query
+and they work. Examples that need a database state their schema inline.
+.SH INVOCATION \(em THE FLAGS IN PRACTICE
+Three ways to supply the query text:
+.EX
+$ dql query --db app.db 'users(*), age > 30'      # inline argument
+$ echo 'users(*) ~> count:(*)' | dql query --db app.db    # stdin
+$ dql query --db app.db --file report.dql --sequential
+.EE
+With
+.BR \-\-sequential ,
+a multi\-statement file executes in order and the \fBfinal\fR
+statement's result is returned; earlier statements run for their
+effects (mounts, consults, writes).
+.PP
+See the SQL instead of running it \(em for any dialect:
+.EX
+$ dql query --to sql -f raw '_(x @ 1)'
+$ dql query --dialect postgres --to sql -f raw '_(x @ 1)'
+.EE
+.PP
+Stable identities for regression testing:
+.B \-\-to hash
+(data only, column names ignored),
+.B \-\-to totalhash
+(schema + data \(em a column rename changes it),
+.B \-\-to fingerprint
+(the full JSON record):
+.EX
+$ dql query --to hash -f raw '_(x @ 1)'
+.EE
+.PP
+Output formats: \fB-f\fR \fBtable\fR (default), \fBbox\fR, \fBjson\fR,
+\fBjsonl\fR, \fBcsv\fR, \fBtsv\fR, \fBlist\fR, \fBraw\fR.
+.PP
+Query JSON from a pipe as a relation \(em destructure with the
+tree\-unify operator \fB~=\fR, then use the whole language on it:
+.EX
+$ echo '[{"name":"Ada","age":36},{"name":"Alan","age":41}]' \e
+    | dql tools jstruct 'j(j), j ~= ~> {name, age} |> -(j)'
+name  age
+Ada   36
+Alan  41
+.EE
+.PP
+Every error carries an addressable badge; the badge is a door, not a
+dead end:
+.EX
+$ dql explain parse/pony
+$ dql explain semantic/arity
+.EE
+.SH QUERIES
+.SS Anonymous tables \(em data with no database
+.EX
+_(x @ 1)                     # one row, one column
+_(a, b @ 1, 2 ; 3, 4)        # header @ rows; ; separates rows
+.EE
+.SS Positional patterns \(em destructuring, not projection
+A table access is a pattern that must cover \fBevery\fR column: bind a
+position with a name, discard it with \fB_\fR, keep everything with
+\fB*\fR. Assuming \fBusers(user_id, name, age)\fR:
+.EX
+users(_, name, _)            # just the names
+users(uid, name, age), age > 30
+.EE
+.SS The join IS the shared variable
+Two patterns binding the same bare name unify \(em no JOIN, no ON:
+.EX
+_(uid, name @ 1, "ada") as u, _(uid, total @ 1, 9.5) as o
+uid  name  total
+1    ada   9.5
+.EE
+Caution: \fBglob\fR access qualifies its names, so
+\fBusers(*), orders(*)\fR shares no bare names and cross\-joins.
+Join globs with an explicit condition
+(\fBusers.id = orders.user_id\fR) or bind the key argumentatively.
+.SS Pipelines: group, aggregate, order, limit
+.EX
+_(dept, n @ "eng", 1 ; "eng", 2 ; "ops", 5)
+  |> %(dept ~> sum:(n) as total)
+  |> #(total descending), # < 2
+.EE
+\fB|>\fR is the pipe; \fB%()\fR groups (left of \fB~>\fR = keys, right
+= aggregates); \fB#()\fR orders; \fB# < 2\fR limits.
+.SS Computed columns \(em and the no\-PEMDAS rule
+.EX
+_(n @ 3) |> +( (n * 2) as dbl )
+.EE
+DelightQL has \fBno operator precedence\fR: \fBa * b + c\fR does not
+parse. Group every composition: \fB((a * b) + c)\fR.
+.SS Rename, project, project\-out
+.EX
+_(a, b @ 1, 2) |> *( a as x )    # rename, everything else passes
+_(a, b @ 1, 2) |> (b)            # keep only b
+_(a, b @ 1, 2) |> -(a)           # drop a, keep the rest
+.EE
+.SS Aggregates, bare and filtered
+.EX
+_(n @ 1 ; 2) ~> count:(*)                # whole-relation reduction
+_(n @ 1 ; 2 ; 3) ~> count:(n | n > 1)    # | filters the aggregate
+.EE
+.SS Case analysis
+.EX
+_(n @ 2 ; 5) |> +( _:( n > 3 -> "big"; _ -> "small") as size )
+.EE
+.SS Null is spelled with = (there is no `is null`)
+\fB=\fR is the null\-safe equality (IS NOT DISTINCT FROM); \fB==\fR is
+traditional SQL equality where NULL never matches:
+.EX
+_(x @ 1), x != null          # "x is not null"
+.EE
+.SS Recursion \(em a CTE that references its own name
+.EX
+_(n @ 1) : nums
+nums(*), n < 100 |> (n + 1 as n) : nums
+nums(*) ~> sum:(n)           # 5050
+.EE
+.SS Semi\-join and anti\-join
+With \fBpeople(id, name, age)\fR and \fBgrownups(name, age)\fR:
+.EX
+people(_, name, _), +grownups(name)     # names WITH a grownups row
+people(_, name, _), \e+grownups(name)    # names WITHOUT one
+.EE
+.SS Reshaping: melt (wide to long)
+.EX
+_(region, q1, q2 @ "north", 10, 20), _( quarter, amount
+                 ----------------
+                 "Q1", q1;
+                 "Q2", q2 ) |> (region, quarter, amount)
+region  quarter  amount
+north   Q1       10
+north   Q2       20
+.EE
+.SS Tree groups \(em a query shaped like the tree it returns
+.EX
+_(dept, n @ "eng", 1 ; "eng", 2 ; "ops", 5)
+  ~> { dept, "items": ~> {n} }
+[{"dept":"eng","items":[{"n":1},{"n":2}]},
+ {"dept":"ops","items":[{"n":5}]}]
+.EE
+.SH RULES AND EFFECTS
+Rule definitions live in files, not at the prompt. Given
+\fBmylib.dql\fR:
+.EX
+adults(uid, name) :- people(uid, name, age), age >= 18
+.EE
+consult it, enlist it, call it:
+.EX
+$ dql query --db app.db --sequential '
+consult!("mylib.dql", "mylib")
+enlist!("mylib")
+adults(_, name)'
+.EE
+A write is a relation too \(em evaluate it, get a receipt back:
+.EX
+_(msg @ "hello") |> insert!(log(*))(*)
+success  operation  target
+1        insert!    log
+.EE
+User \fBeffect rules\fR (rules whose evaluation writes) also live in
+files and execute inside a run \(em never as a bare prompt invocation.
+Given \fBjob.dql\fR:
+.EX
+route!(*) :- people(_, name, age), age >= 18 |> insert!(grownups(*))(*)
+main!(*)  :- route!(*)
+.EE
+.EX
+$ dql query --db app.db --sequential '
+consult!("job.dql", "job")
+run_namespace!(job)(*)'
+.EE
+.SH THE FIVE TRAPS
+The mistakes every newcomer makes, in one place:
+.IP 1. 3
+\fBPatterns are not projections.\fR \fBusers(name, age)\fR on a
+3\-column table is an arity error \(em cover every position
+(\fBusers(_, name, age)\fR) or use \fB*\fR.
+.IP 2. 3
+\fBThe pipe is |>\fR, feeding relational operators
+(\fB%() #() +()\fR). \fB~>\fR is the aggregate separator.
+.IP 3. 3
+\fBNo PEMDAS.\fR \fBa * b + c\fR does not parse; group every
+composition explicitly.
+.IP 4. 3
+\fBNo `is null`.\fR Write \fBcol = null\fR / \fBcol != null\fR.
+.IP 5. 3
+\fB_( is one token.\fR \fB_ (id @ 1)\fR (with a space) does not
+parse.
+.SH SEE ALSO
+.BR dql (1),
+.BR dql\-query (1),
+.BR dql\-explain (1).
+The full language reference:
+.B dql book reference

@@ -3,8 +3,7 @@
 //! Bare enlisted-table guards must classify as table-as-sigma, not fall
 //! through to the bin-rewrite (PredicateRewrite) path.
 //!
-//! Bug pinned here (bugs/enlisted-guard-predicate-rewrite/ANALYSIS.md, the
-//! torture--99 blocker): a guard `+customers(customer_id)` whose functor is
+//! Bug pinned here (the torture--99 blocker): a guard `+customers(customer_id)` whose functor is
 //! resolvable only through an ENLISTED namespace (a mounted db enlisted into
 //! main — a physical table, not a DDL fact) fell through both classification
 //! checks in `transform_sigma` (resolver_fold.rs): `database.lookup_table`

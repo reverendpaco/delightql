@@ -173,7 +173,19 @@ pub mod subcat {
     /// ParseError family — rendered as `parse/<const>`.
     pub const PARSE_DDL: &str = "ddl";
     pub const PARSE_SIGIL: &str = "sigil";
-    pub const PARSE_FAMILY: &[&str] = &[PARSE_DDL, PARSE_SIGIL];
+    /// Parse-failure diagnoses (parser/diagnosis.rs): teaching errors
+    /// mined from the recovery tree for rules the grammar itself
+    /// enforces and therefore cannot explain.
+    pub const PARSE_PONY: &str = "pony";
+    pub const PARSE_IS_NULL: &str = "is_null";
+    pub const PARSE_ANON_SPACE: &str = "anon_space";
+    pub const PARSE_FAMILY: &[&str] = &[
+        PARSE_DDL,
+        PARSE_SIGIL,
+        PARSE_PONY,
+        PARSE_IS_NULL,
+        PARSE_ANON_SPACE,
+    ];
 }
 
 

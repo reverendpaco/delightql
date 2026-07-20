@@ -13,6 +13,8 @@
 use crate::error::{DelightQLError, KnownLimitationType, Result};
 use crate::pipeline::asts::core::queries::InlineDdlSpec;
 use crate::pipeline::cst::{CstNode, CstTree};
+
+mod diagnosis;
 use tree_sitter::{Language, Parser, Tree};
 
 extern "C" {
@@ -199,6 +201,16 @@ pub fn parse_ddl(source: &str) -> Result<Tree> {
 fn create_ddl_error(tree: &Tree, source: &str) -> DelightQLError {
     let root = CstNode::new(tree.root_node(), source);
 
+    // Same pattern diagnosis as the query path — `is null` and PONY
+    // shapes appear in rule bodies too.
+    if let Some(d) = diagnosis::diagnose_failed_parse(&root, source) {
+        return DelightQLError::ParseError {
+            message: d.message,
+            source: None,
+            subcategory: Some(d.subcategory),
+        };
+    }
+
     // Find definitions with errors — the most actionable info for the user
     for child in root.children() {
         if child.has_error() {
@@ -209,7 +221,10 @@ fn create_ddl_error(tree: &Tree, source: &str) -> DelightQLError {
                 message: format!(
                     "DDL parse error at line {}:{}: syntax error in '{}'. \
                      Tree-sitter error recovery produced a garbled parse tree. \
-                     Check for operator ambiguity (e.g., `x/2` needs spaces: `x / 2`).",
+                     Bare infix arithmetic and `%` collide with the sigil \
+                     operators in assertion mode — wrap the arithmetic in \
+                     parentheses (e.g., `(price * 2) > 0`, `(n % 2) = 0`); \
+                     for `/`, spaces also disambiguate (`x / 2`).",
                     pos.row + 1,
                     pos.column + 1,
                     display,
@@ -368,6 +383,18 @@ fn check_bang_pattern_recursive(
 fn create_detailed_error(tree: &CstTree, source: &str) -> DelightQLError {
     let root = tree.root();
 
+    // Pattern diagnosis over the recovery tree first: the rules users
+    // most need taught (PONY, no `is null`, `_(` one-token) fail in the
+    // grammar, which can only say "expected valid syntax". Each pattern
+    // is token-presence-keyed and fires only when unambiguous.
+    if let Some(d) = diagnosis::diagnose_failed_parse(&root, source) {
+        return DelightQLError::ParseError {
+            message: d.message,
+            source: None,
+            subcategory: Some(d.subcategory),
+        };
+    }
+
     // Check for MISSING nodes first (they provide the most specific information)
     if let Some(missing_info) = find_missing_node_info(root, source) {
         return DelightQLError::parse_error(format!(
@@ -451,7 +478,7 @@ fn find_missing_node_info(node: CstNode, _source: &str) -> Option<MissingNodeInf
 /// std's `str::floor_char_boundary` is still unstable; same contract.
 /// Error positions are byte offsets, and arbitrary byte arithmetic on them
 /// (context windows, display truncation) can land inside a multi-byte
-/// character — slicing there panics (bugs/run-non-ascii-panic). Pinned by
+/// character — slicing there panics. Pinned by
 /// `parse_error_context_is_char_boundary_safe` and
 /// `get_context_around_error_clamps_both_edges`.
 pub(crate) fn floor_char_boundary(s: &str, index: usize) -> usize {
@@ -733,7 +760,10 @@ fn extract_ddl_file(tree: &Tree, source: &str) -> Result<DDLFile> {
             return Err(DelightQLError::ParseError {
                 message: format!(
                     "DDL parse error at line {}:{}: syntax error in '{}'. \
-                     Check for operator ambiguity (e.g., `x/2` needs spaces: `x / 2`).",
+                     Bare infix arithmetic and `%` collide with the sigil \
+                     operators in assertion mode — wrap the arithmetic in \
+                     parentheses (e.g., `(price * 2) > 0`, `(n % 2) = 0`); \
+                     for `/`, spaces also disambiguate (`x / 2`).",
                     pos.row + 1,
                     pos.column + 1,
                     display,
@@ -1251,6 +1281,11 @@ pub fn setup_errors_table_on_bootstrap(conn: &rusqlite::Connection) -> Result<()
 }
 
 #[cfg(test)]
+pub(crate) fn parse_allow_errors_for_test(source: &str) -> Tree {
+    create_parser_and_parse(source, None).expect("parser init")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1285,7 +1320,7 @@ mod tests {
         }
     }
 
-    /// Pins bugs/run-non-ascii-panic: parse-error context extraction sliced
+    /// Pins the non-ASCII slicing panic: parse-error context extraction sliced
     /// the source at `position ± CONTEXT_SIZE` without clamping to char
     /// boundaries, so a parse error near multi-byte characters panicked
     /// ("byte index N is not a char boundary") instead of reporting the error.
@@ -1302,7 +1337,7 @@ mod tests {
         );
     }
 
-    /// Pins bugs/run-non-ascii-panic (helper level): both context-window
+    /// Pins the non-ASCII slicing panic (helper level): both context-window
     /// edges must clamp to char boundaries, including the start side.
     #[test]
     fn get_context_around_error_clamps_both_edges() {
@@ -1314,7 +1349,7 @@ mod tests {
         assert!(ctx.chars().all(|c| c == '─'), "got: {ctx}");
     }
 
-    /// Pins bugs/run-non-ascii-panic sibling: `create_ddl_error` truncated
+    /// Pins the non-ASCII slicing panic's sibling: `create_ddl_error` truncated
     /// the errored definition text at byte 80 without a char-boundary check.
     #[test]
     fn ddl_error_display_truncation_is_char_boundary_safe() {

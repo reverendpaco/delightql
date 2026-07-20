@@ -17,21 +17,20 @@ mod string_templates;
 #[cfg(test)]
 mod plan_note_injection_tests;
 
-/// SQL-shape pins for argumentative semi/anti-join correlation
-/// (bugs/correlated-semijoin-lost-correlation): the `+rel(col)` guard must
+/// SQL-shape pins for argumentative semi/anti-join correlation: the `+rel(col)` guard must
 /// compare the OUTER column to the fact column, never `_fact` to itself.
 #[cfg(test)]
 mod semijoin_correlation_tests;
 
 /// Classification pins for bare guards on enlisted tables / consulted rules
-/// (bugs/enlisted-guard-predicate-rewrite, the torture--99 blocker): a
+/// (the torture--99 blocker): a
 /// guard functor resolvable through enlistment or the Some(ns) resolution
 /// scope must classify as table-as-sigma, never fall to PredicateRewrite.
 #[cfg(test)]
 mod enlisted_guard_classification_tests;
 
 /// Scope pins for sigma-predicate rule guards
-/// (bugs/sigma-rule-guard-under-consulted-scope, IMPLEMENTATION-PLAN §4.2):
+/// (IMPLEMENTATION-PLAN §4.2):
 /// a sigma rule visible in the Some(ns) consulted scope must expand to its
 /// boolean body — scope first, enlisted-into-main as fallback.
 #[cfg(test)]

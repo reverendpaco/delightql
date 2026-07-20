@@ -10,6 +10,29 @@ socket path is printed alone on the first stdout line (convenient for
 scripts), followed by a human-readable status line naming the worker
 count, database, and timeouts. This is the execution backend used by
 the test-ball runner.
+.SH PROTOCOL
+The relay protocol is an
+.B internal detail exposed as a subcommand
+\(em a framed binary protocol that
+.B carries no compatibility promise.
+A bare text write to the socket (e.g. via
+.BR nc )
+receives no reply by design: sessions begin with a version handshake,
+and the frame format may change between releases without notice.
+.PP
+The protocol is not unspecified \(em it follows a draft logical\-model
+specification (the SQL9 relay\-protocol documents in the
+.B delightql\-protocol
+crate of the source tree), whose long\-term ambition is a public,
+content\-blind contract for moving relations between processes. Until
+that specification is ratified, it remains Draft and the protocol
+remains internal: nothing about today's frames is promised.
+.PP
+For programmatic use today, the supported surfaces are the CLI
+.RB ( "dql query \-f json"
+with
+.BR "\-\-error\-format json" ,
+structured errors on stderr) and the C\-ABI embedding.
 .SH OPTIONS
 .TP
 .BI \-\-socket " PATH"
@@ -39,4 +62,5 @@ $ sock=$(dql server --socket-idle-timeout 30 | head -1)
 .EE
 .SH SEE ALSO
 .BR dql (1),
-.BR dql-target (1)
+.BR dql\-query (1),
+.BR dql\-target (1)

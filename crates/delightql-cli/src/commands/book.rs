@@ -233,62 +233,10 @@ fn shift_headings(content: &str, shift: usize) -> String {
     output
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_narrow_book_names() {
-        assert!(valid_book_name("reference"));
-        assert!(valid_book_name("reference-v2.1"));
-        assert!(!valid_book_name("Reference"));
-        assert!(!valid_book_name("x\" |> nope(*)"));
-    }
-
-    #[test]
-    fn heading_shift_ignores_fences() {
-        let source = "# A {.dqlh}\n```\n# code {.dqlh}\n```\n";
-        assert_eq!(
-            shift_headings(source, 1),
-            "## A {.dqlh}\n```\n# code {.dqlh}\n```\n"
-        );
-    }
-
-    #[test]
-    fn heading_shift_ignores_indented_code() {
-        // 4+ leading spaces = indented code (CommonMark): literal even
-        // when it looks marked. 1-3 spaces = a real heading, and the
-        // added #s go AFTER the indentation, not before it.
-        let source = "# A {.dqlh}\n\n    # code {.dqlh}\n\n  ## B {.dqlh}\n";
-        assert_eq!(
-            shift_headings(source, 1),
-            "## A {.dqlh}\n\n    # code {.dqlh}\n\n  ### B {.dqlh}\n"
-        );
-    }
-
-    #[test]
-    fn fences_close_by_char_and_length() {
-        // A ``` quoted inside a ```` block must not close it; only a run
-        // of the same char at least as long as the opener does.
-        let source = "````markdown\n```\n# quoted {.dqlh}\n```\n````\n# real {.dqlh}\n";
-        assert_eq!(
-            shift_headings(source, 1),
-            "````markdown\n```\n# quoted {.dqlh}\n```\n````\n## real {.dqlh}\n"
-        );
-    }
-
-    #[test]
-    fn marker_lives_in_the_single_attribute_block() {
-        // Pandoc allows one attribute block per heading: an id and the
-        // marker share it. A block without the class is not a marker.
-        assert!(has_dqlh_marker("# Projection {#sec:ref-Dql-Projection .dqlh}"));
-        assert!(has_dqlh_marker("## Plain {.dqlh}"));
-        assert!(!has_dqlh_marker("# Unmarked {#sec:only-an-id}"));
-        assert!(!has_dqlh_marker("# No block at all"));
-        assert!(!has_dqlh_marker("# Mid-line {.dqlh} not trailing"));
-        assert_eq!(
-            shift_headings("# P {#sec:x .dqlh}\n", 2),
-            "### P {#sec:x .dqlh}\n"
-        );
-    }
-}
+// No unit tests here, deliberately (tests-are-invariants): every emitter
+// invariant — per-depth shifting, merged attribute blocks, unmarked
+// pass-through, indented-heading hash placement, indented-code and
+// nested-fence immunity, name validation — is stated as fixture content
+// and pinned at the process boundary by tests/book_fixture_emission.rs
+// (the golden file) and the bin book test (stage agreement). The
+// functions in this file are free to be renamed, split, or replaced.

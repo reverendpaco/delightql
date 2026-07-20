@@ -8,7 +8,7 @@
 //! because each Pipeline runs the full source-text path with its own
 //! FeatureCollector.
 //!
-//! Effects (consult!, engage!) accumulate on the shared DelightQLSystem
+//! Effects (consult!, enlist!) accumulate on the shared DelightQLSystem
 //! between queries — query N's side effects are visible to query N+1.
 
 use crate::error::DelightQLError;
@@ -63,7 +63,7 @@ pub struct PerQueryResult {
 
 /// Parse a multi-query source string and compile each query sequentially.
 ///
-/// Effects from earlier queries (consult!, engage!) are visible to later
+/// Effects from earlier queries (consult!, enlist!) are visible to later
 /// queries because the same `system` is shared across all compilations.
 ///
 /// Returns one `PerQueryResult` per query. On compilation error (without

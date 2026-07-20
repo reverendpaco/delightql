@@ -10276,40 +10276,8 @@ impl DelightQLSystem {
         }
     }
 
-    /// Resolve an unqualified entity name to its namespace path
-    ///
-    /// Queries the bootstrap metadata to find where an entity is activated
-    /// and whether it's accessible from the current namespace.
-    ///
-    /// # Algorithm
-    /// 1. Look up namespace_id for current_namespace (e.g., "main")
-    /// 2. Search activated_entity for entity_name in:
-    ///    - Current namespace
-    ///    - Engaged namespaces (via enlisted_namespace table)
-    /// 3. If found, return the namespace path
-    /// 4. If not found, return None
-    ///
-    /// # Arguments
-    /// * `entity_name` - Unqualified entity name (e.g., "team")
-    /// * `current_namespace` - Current namespace (typically "main")
-    ///
-    /// # Returns
-    /// * `Ok(Some(namespace_path))` - Entity found in accessible namespace
-    /// * `Ok(None)` - Entity not found or not accessible
-    /// * `Err(...)` - Database error during resolution
-    /// Resolve an unqualified entity name within a namespace scope.
-    ///
-    /// Searches `current_namespace` and its enlisted namespaces. When
-    /// `fallback_namespace` is provided and the primary search yields no
-    /// results, the fallback scope is searched too. This supports DDL view
-    /// body resolution: the DDL namespace is primary (with its own enlists),
-    /// and "main" is the fallback for database tables not in any enlist.
-    /// The kind gate for the AMBIENT-DATA fallback (Phase 7 stage 2,
-    /// owner-ratified): true iff the fq names a `data`-kind namespace.
-    /// Tables live in data namespaces; DEFINITIONS live in lib-kind
-    /// namespaces and never leak through the ambient door.
-    /// Conn-level recorder cores (review otolxyzl::qmqwqlms P1: recording
-    /// happens INSIDE the consult transaction).
+    /// Conn-level recorder core: recording happens INSIDE the consult
+    /// transaction, never after it.
     pub(crate) fn record_namespace_local_enlists_on(
         conn: &rusqlite::Connection,
         namespace: &str,

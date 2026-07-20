@@ -1140,7 +1140,7 @@ mod tier1_tests {
 
 #[cfg(test)]
 mod liminal_abort_tests {
-    //! bugs/liminal-abort-state-leak: a consult that aborts mid-file must
+    //! A consult that aborts mid-file must
     //! restore the caller's enlist/alias state on ALL exit paths, not just
     //! the success path.
 
@@ -1328,7 +1328,7 @@ mod directive_line_tests {
     const VIEW: &str = "myview(*) :- _(z @ 1) |> (z)\n";
 
     /// A trailing `//` comment must not un-recognize a liminal directive
-    /// (bugs/directive-trailing-comment): comments are grammar extras.
+    /// — comments are grammar extras.
     #[test]
     fn directive_with_trailing_comment_is_recognized() {
         let src = format!("consult!(\"lib.dql\", \"lib\")   // load the library\n{VIEW}");

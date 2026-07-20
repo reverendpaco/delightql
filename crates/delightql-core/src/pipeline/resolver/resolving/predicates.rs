@@ -789,8 +789,7 @@ pub(in crate::pipeline::resolver) fn expand_consulted_sigma(
 /// row with the fact row (shared-name correlation, book/reference/dql/
 /// where.md). The expansion places the comparison INSIDE the EXISTS
 /// subquery, where an unqualified name legally binds to the innermost
-/// scope (`_fact`) — which turned the guard into a self-comparison
-/// (bugs/correlated-semijoin-lost-correlation). Qualifying the argument's
+/// scope (`_fact`) — which turned the guard into a self-comparison. Qualifying the argument's
 /// lvars with their outer table here preserves the correlation through
 /// inner-first name binding.
 ///

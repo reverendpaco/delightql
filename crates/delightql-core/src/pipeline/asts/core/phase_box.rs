@@ -107,7 +107,7 @@ impl<T, P> PhaseBox<T, P> {
 /// The non-consuming `AstVisit` walk borrows `SetOperation.correlation` here;
 /// the consuming `AstTransform` walk uses `try_map_correlation` below. Both
 /// therefore reach this recursive edge
-/// (INDUCTIVE-INVENTORY §5 finding 9; pinned by
+/// (pinned by
 /// `ast_visit::tests::visit_reaches_setoperation_correlation`).
 ///
 /// This is deliberately NOT a phase-generic `as_inner()` on `PhaseBox<T, P>`: a

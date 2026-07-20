@@ -658,7 +658,7 @@ fn r_lower_consulted_view(
     let body_sql = match body {
         ast_addressed::Query::Relational(expr) => {
             let inner_builder = super::descend::descend_as_final(expr, names, ctx)?;
-            reconcile_inner_with_cpr(inner_builder, &cpr_columns)?
+            reconcile_scoped_subset(inner_builder, &cpr_columns)?
         }
         ast_addressed::Query::WithCtes { ctes, query: expr } => {
             let sql_ctes: Vec<crate::pipeline::sql_ast_v3::Cte> = ctes
@@ -667,7 +667,7 @@ fn r_lower_consulted_view(
                 .collect::<Result<_>>()?;
 
             let inner_builder = super::descend::descend_as_final(expr, names, ctx)?;
-            let main_query = reconcile_inner_with_cpr(inner_builder, &cpr_columns)?;
+            let main_query = reconcile_scoped_subset(inner_builder, &cpr_columns)?;
 
             if sql_ctes.is_empty() {
                 main_query
@@ -1084,6 +1084,128 @@ pub(super) fn reconcile_inner_with_cpr(
         .collect();
 
     inner_builder.add_projection(rename_items)?.to_sql()
+}
+
+/// Reconcile a consulted-view body with the caller's SCOPED schema.
+///
+/// `reconcile_inner_with_cpr` assumes its CprSchema describes the inner
+/// output index-for-index. A scoped schema does not: a positional
+/// caller pattern with discards keeps a SUBSET of the body heading, so
+/// the source column must be identified — never taken from the list
+/// index. Zipping by index shifted every binding after a non-trailing
+/// discard (bugs/rule-call-discard-misbind).
+///
+/// The key is the scoped column's ORIGINAL name, which is the body's
+/// output name for both head styles (a caller rename rides in `alias`).
+/// `table_position` is only a secondary key: named-head rules number it
+/// heading-relative but glob-head rules keep the physical table's
+/// numbering, so it alone cannot address the body output. Discarded
+/// heading columns are dropped here, not by downstream narrowing;
+/// unconsumed `__`-prefixed hygienic columns pass through (JOIN ON
+/// needs them).
+///
+/// Falls back to the aligned-rename reconciliation when neither key
+/// addresses the inner output unambiguously.
+pub(super) fn reconcile_scoped_subset(
+    inner_builder: Builder<Projected>,
+    cpr_columns: &[ColumnMetadata],
+) -> Result<crate::pipeline::sql_ast_v3::QueryExpression> {
+    use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
+
+    if cpr_columns.is_empty() {
+        return inner_builder.to_sql();
+    }
+
+    let inner_names: Vec<String> = inner_builder
+        .columns()
+        .iter()
+        .map(|c| col_name(c).to_string())
+        .collect();
+
+    let positions: Vec<usize> = match scoped_subset_positions(&inner_names, cpr_columns) {
+        Some(p) => p,
+        None => return reconcile_inner_with_cpr(inner_builder, cpr_columns),
+    };
+
+    // Identity fast path: the pattern kept every column under its own name.
+    let full_cover = positions.len() == inner_names.len();
+    let unrenamed = cpr_columns
+        .iter()
+        .zip(&positions)
+        .all(|(col, p)| col_name(col) == inner_names[p - 1]);
+    if full_cover && unrenamed {
+        return inner_builder.to_sql();
+    }
+
+    let consumed: std::collections::HashSet<usize> = positions.iter().copied().collect();
+    let mut items: Vec<SelectItem> = cpr_columns
+        .iter()
+        .zip(&positions)
+        .map(|(col, p)| SelectItem::Expression {
+            expr: SqlDomainExpr::column(&inner_names[p - 1]),
+            alias: Some(col_name(col).to_string()),
+        })
+        .collect();
+    for (i, name) in inner_names.iter().enumerate() {
+        if !consumed.contains(&(i + 1)) && name.starts_with("__") {
+            items.push(SelectItem::Expression {
+                expr: SqlDomainExpr::column(name),
+                alias: Some(name.clone()),
+            });
+        }
+    }
+
+    inner_builder.add_projection(items)?.to_sql()
+}
+
+/// Source positions (1-based, into the body output) for a scoped
+/// subset. Primary: unique original-name match (the scoped column's
+/// original is the body output name in both head styles; a caller
+/// rename rides in `alias`). Secondary: in-range `table_position`
+/// (heading-relative for named heads only — glob heads keep the
+/// physical table's numbering, which is why name is primary). Both
+/// keys demand a strictly increasing sequence — a caller pattern binds
+/// each heading position at most once, left to right; anything else
+/// (duplicate originals from a disambiguated join, union-merged
+/// HO-view metadata with duplicate positions) is not a scoped subset
+/// and returns None for the aligned fallback.
+fn scoped_subset_positions(
+    inner_names: &[String],
+    cpr_columns: &[ColumnMetadata],
+) -> Option<Vec<usize>> {
+    let by_name = || -> Option<Vec<usize>> {
+        let mut acc: Vec<usize> = Vec::with_capacity(cpr_columns.len());
+        for col in cpr_columns {
+            let mut hits = inner_names
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.as_str() == col.original_name());
+            match (hits.next(), hits.next()) {
+                (Some((i, _)), None) if acc.last().map_or(true, |prev| *prev < i + 1) => {
+                    acc.push(i + 1)
+                }
+                _ => return None,
+            }
+        }
+        Some(acc)
+    };
+    let by_position = || -> Option<Vec<usize>> {
+        let mut acc: Vec<usize> = Vec::with_capacity(cpr_columns.len());
+        for col in cpr_columns {
+            match col.table_position {
+                Some(p)
+                    if p >= 1
+                        && p <= inner_names.len()
+                        && acc.last().map_or(true, |prev| *prev < p) =>
+                {
+                    acc.push(p)
+                }
+                _ => return None,
+            }
+        }
+        Some(acc)
+    };
+    by_name().or_else(by_position)
 }
 
 /// Extract `Vec<ColumnMetadata>` from a `CprSchema`, pushing a scope transition
@@ -1667,7 +1789,7 @@ pub(super) fn r_lower_pipe(
                 // followed by `,`/`;` and a further term — the multi-step DML
                 // shape (comma=dataflow, semicolon=sequential), documented
                 // scripting but not implemented. Refuse cleanly instead of
-                // the old unreachable!() panic (bugs/dml-multiterminal-panic).
+                // the old unreachable!() panic.
                 return Err(DelightQLError::validation_error_categorized(
                     "dml/shape/multi_terminal",
                     "a DML terminal (insert!/update!/delete!) must be the \
@@ -4790,5 +4912,94 @@ mod resolver_alias_seam_tests {
     #[test]
     fn unknown_schema_empty() {
         assert!(cpr_output_columns(&CprSchema::Unknown).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scoped_subset_positions_tests {
+    use super::*;
+    use crate::pipeline::asts::core::provenance::ColumnProvenance;
+
+    fn names(ns: &[&str]) -> Vec<String> {
+        ns.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn scoped(original: &str, pos: Option<usize>) -> ColumnMetadata {
+        ColumnMetadata::new(ColumnProvenance::from_column(original), TableName::Fresh, pos)
+    }
+
+    fn scoped_renamed(original: &str, alias: &str, pos: Option<usize>) -> ColumnMetadata {
+        let mut c = scoped(original, pos);
+        c.set_alias(alias.to_string());
+        c
+    }
+
+    // bugs/rule-call-discard-misbind: `hr(_, uid, rating)` — the
+    // leading discard makes the subset a non-prefix; name matching
+    // must select positions 2 and 3, never 1 and 2.
+    #[test]
+    fn non_prefix_subset_keys_by_name() {
+        let inner = names(&["rid", "uid", "rating"]);
+        let cpr = vec![scoped("uid", Some(2)), scoped("rating", Some(3))];
+        assert_eq!(scoped_subset_positions(&inner, &cpr), Some(vec![2, 3]));
+    }
+
+    // Glob-head rules keep the PHYSICAL table's numbering (uid=2,
+    // rating=4 into an 8-column table) — out of range of the 3-column
+    // body. Name matching must carry the day.
+    #[test]
+    fn physical_positions_defer_to_name() {
+        let inner = names(&["rid", "uid", "rating"]);
+        let cpr = vec![scoped("uid", Some(2)), scoped("rating", Some(4))];
+        assert_eq!(scoped_subset_positions(&inner, &cpr), Some(vec![2, 3]));
+    }
+
+    // A caller rename rides in `alias`; the ORIGINAL still names the
+    // body output column.
+    #[test]
+    fn caller_rename_keys_by_original() {
+        let inner = names(&["rid", "uid", "rating"]);
+        let cpr = vec![
+            scoped_renamed("uid", "x", Some(2)),
+            scoped_renamed("rating", "y", Some(3)),
+        ];
+        assert_eq!(scoped_subset_positions(&inner, &cpr), Some(vec![2, 3]));
+    }
+
+    // Diamond joins produce duplicate ORIGINALS (`|1|`, `|1|`) over
+    // disambiguated output names — per-column matching would send both
+    // to the first source. Must refuse (None → aligned fallback).
+    #[test]
+    fn duplicate_originals_refuse() {
+        let inner = names(&["|1|", "|1|_2"]);
+        let cpr = vec![
+            scoped("|1|", Some(1)),
+            scoped_renamed("|1|", "|1|_2", Some(1)),
+        ];
+        assert_eq!(scoped_subset_positions(&inner, &cpr), None);
+    }
+
+    // Union-merged HO-view metadata (ddl/453 family): duplicate
+    // table_positions and an original naming the embed's SOURCE column
+    // (present EARLIER in the body) — non-increasing under both keys.
+    #[test]
+    fn union_merged_metadata_refuses() {
+        let inner = names(&["age", "status", "label", "extra_column_at_end"]);
+        let cpr = vec![
+            scoped("age", Some(1)),
+            scoped("status", Some(2)),
+            scoped("label", Some(3)),
+            scoped_renamed("status", "extra_column_at_end", Some(3)),
+        ];
+        assert_eq!(scoped_subset_positions(&inner, &cpr), None);
+    }
+
+    // When names cannot serve (scoped originals absent from the body
+    // output), valid heading-relative positions still key the subset.
+    #[test]
+    fn positions_serve_when_names_missing() {
+        let inner = names(&["a", "b", "c"]);
+        let cpr = vec![scoped("p", Some(1)), scoped("q", Some(3))];
+        assert_eq!(scoped_subset_positions(&inner, &cpr), Some(vec![1, 3]));
     }
 }

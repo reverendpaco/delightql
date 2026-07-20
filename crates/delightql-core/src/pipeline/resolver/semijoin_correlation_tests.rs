@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! SQL-shape pins for argumentative semi/anti-join correlation
-//! (bugs/correlated-semijoin-lost-correlation/ANALYSIS.md).
+//! SQL-shape pins for argumentative semi/anti-join correlation.
 //!
 //! `orders(*), +customers(customer_id)` must correlate the OUTER row's
 //! `customer_id` with the fact row's positional column:

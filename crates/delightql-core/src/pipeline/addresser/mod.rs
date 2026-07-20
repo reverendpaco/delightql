@@ -82,8 +82,7 @@ fn address_query_inner(query: ast_refined::Query) -> Result<ast_addressed::Query
 // N4 (`semantic/recursion/self_subquery`). So closing this hole cannot change
 // the outcome of any legal query: a subquery-only self-reference is N4-illegal
 // regardless, and the SQL-level marker already detects everything this walk now
-// detects. Pinned by the recursion_contract ball staying 16/16
-// (epic1/REPORT-INDUCTIVE-D-RISK-CANDIDATES.md, W7).
+// detects. Pinned by the recursion_contract ball staying 16/16.
 fn expression_references_name(expr: &ast_refined::RelationalExpression, name: &str) -> bool {
     let mut finder = NameReferenceFinder {
         name: SqlIdentifier::new(name),
@@ -123,7 +122,6 @@ impl AstVisit<Refined> for NameReferenceFinder {
 // resolver's `cpr_schema`, `transformer_v4/tree_group.rs`), and `_tg_` never
 // appeared in a generated-SQL baseline — the assignment was vestigial. Deleting
 // it is behavior-preserving (proven by the corpus being outcome-identical).
-// Details: epic1/REPORT-INDUCTIVE-D-RISK-CANDIDATES.md (W8) and the Phase E
-// report. NB: `system.rs::walk_relational_for_tree_groups` shares only the NAME
+// NB: `system.rs::walk_relational_for_tree_groups` shares only the NAME
 // — it registers `interior_entity` schemas (a live consumer) and is unrelated.
 // ---------------------------------------------------------------------------

@@ -121,6 +121,7 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         attach,
         sql_optimize,
         sequential,
+        dangers,
         #[cfg(feature = "repl")]
         quiet,
         #[cfg(feature = "repl")]
@@ -165,7 +166,7 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
     // opening a handle and mounting here would create a backend only to
     // discard it. Hand the manager over and let the REPL be the SOLE
     // backend-opener on its path — one child, mirroring the one-shot mount!
-    // (bugs/duplicate-fatboy-spawn-one-shot; pinned indirectly by the
+    // (pinned indirectly by the
     // REPL smoke path — no ball coverage).
     if query.is_none() && file.is_none() && io::stdin().is_terminal() {
         #[cfg(feature = "repl")]
@@ -185,6 +186,21 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
     }
 
     let mut handle = connection::open_handle()?;
+
+    // Apply --danger session-baseline overrides. Parse+validation refuses
+    // unknown gates, bad states, and non-CLI-overridable (semantic) gates
+    // with teaching errors — this flag was parsed-and-dropped dead wiring
+    // until 2026-07-17 (outside-eyes F2: a silently ignored safety flag).
+    if !dangers.is_empty() {
+        let specs = dangers
+            .iter()
+            .map(|d| delightql_core::parse_cli_danger_spec(d))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        handle
+            .set_danger_overrides(specs)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
 
     // mount! the user database as "main" (if specified). Under
     // --make-new-db-if-missing a missing/empty target is CREATE intent and

@@ -492,8 +492,7 @@ impl ConnectionManager {
 /// manager's own backend — the session's one backend is created by the
 /// `mount!` first-query, not by any pre-opened `ConnectionManager`. Keeping
 /// it self-less makes that separation explicit (it used to be a `&self`
-/// method that ignored `self`, which read as if a manager fed the handle;
-/// bugs/duplicate-fatboy-spawn-one-shot).
+/// method that ignored `self`, which read as if a manager fed the handle).
 pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
     let factory = Box::new(crate::connection_factory::CliConnectionFactory);
     // Second factory (types-level) powers mount!/import! of URI-scheme

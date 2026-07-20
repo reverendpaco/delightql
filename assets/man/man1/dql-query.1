@@ -24,8 +24,12 @@ standard input, when stdin is not a terminal;
 .IP \(bu 3
 otherwise an interactive REPL is started.
 .PP
-A file (or stdin) may contain multiple statements; all of them are
-executed and their output concatenated.
+A file (or stdin) may contain multiple statements (with
+.BR \-\-sequential ).
+They execute in order; the
+.B final
+statement's result is what is returned \(em earlier statements execute
+for their effects (mounts, consults, writes), not their output.
 .SH OPTIONS
 .SS Input
 .TP

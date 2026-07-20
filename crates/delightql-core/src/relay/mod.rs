@@ -124,6 +124,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         self.hooks = hooks;
     }
 
+    /// Install the session-baseline danger overrides (CLI `--danger`).
+    /// Specs arrive already validated (`parse_cli_danger_spec` refuses
+    /// unknown gates and non-CLI-overridable ones); each query's pipeline
+    /// re-validates as defense in depth. This field was write-never until
+    /// 2026-07-17 — the CLI flag was dead wiring (outside-eyes F2).
+    pub fn set_danger_overrides(&mut self, specs: Vec<pipeline::ast_unresolved::DangerSpec>) {
+        self.danger_overrides = specs;
+    }
+
     /// Handle a Reset control operation: close all open handles and reinit the system.
     pub fn handle_reset(&mut self) -> Result<(), crate::error::DelightQLError> {
         for (_frontend, backend) in self.handles.drain() {

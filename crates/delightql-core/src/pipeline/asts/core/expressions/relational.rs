@@ -369,7 +369,7 @@ pub enum Relation<Phase = Unresolved> {
     },
     /// Consulted view expansion: view body inlined as a subquery.
     /// Holds a full Query (not just RelationalExpression) to support CTEs in view definitions.
-    /// Created by the resolver when expanding `consult!`/`engage!` view references.
+    /// Created by the resolver when expanding `consult!`/`enlist!` view references.
     #[lispy("relation:consulted-view")]
     ConsultedView {
         identifier: QualifiedName,

@@ -11,7 +11,7 @@
 //!
 //! - `builder/` — `Builder<P>` (the single type), state machine, name generator
 //! - `descend` — recursive descent dispatcher (`descend`, `descend_as_final`)
-//! - `dml` — DML terminal operators (DELETE, UPDATE, INSERT, KEEP)
+//! - `dml` — DML terminal operators (DELETE, UPDATE, INSERT)
 //! - `relational` — `r_lower_*` handlers (relational algebra → builder ops)
 //! - `scalar` — `s_lower_*` handlers (AST scalar expressions → SQL expressions)
 //!

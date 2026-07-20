@@ -74,7 +74,7 @@ pub struct BinCartridgeMetadata {
     /// (e.g., "std::prelude", "std::string")
     pub namespace_path: String,
 
-    /// Whether this cartridge is universal (available without explicit borrow)
+    /// Whether this cartridge is universal (available without explicit enlist!)
     pub is_universal: bool,
 
     /// Language for this cartridge (always Rust for bin cartridges in practice)
@@ -252,13 +252,11 @@ pub trait EffectExecutable: BinEntity {
     /// (EFFECT-ALGEBRA; higher-order.md's scalar lifting) — never N
     /// separate calls.
     ///
-    /// The default covers the scalar case (a one-row lift delegates to
-    /// `execute`), preserves the empty-input no-op (an empty lifted
-    /// argument performs nothing and answers the empty relation — the
-    /// open 0-row question is deferred, status quo kept deliberately),
-    /// and REFUSES a multi-row lift with not-yet (the E1a precedent)
-    /// until the entity opts into true setwise semantics by overriding.
-    /// `doc!` is the first override.
+    /// The default delegates a one-row lift to `execute`; EVERY other
+    /// shape — empty included — refuses with the same not-yet (pipe is
+    /// application: an empty relation reaches the callee once, never a
+    /// silent no-op) until the entity opts into true setwise semantics
+    /// by overriding. `doc!` is the first override.
     fn execute_lifted(
         &self,
         rows: &[Vec<DomainExpression>],

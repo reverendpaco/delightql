@@ -4,8 +4,7 @@
 //! (`resolution_namespace = Some(ns)`), not just through namespaces
 //! enlisted into main.
 //!
-//! Bug pinned here (bugs/sigma-rule-guard-under-consulted-scope/ANALYSIS.md,
-//! IMPLEMENTATION-PLAN §4.2): a same-file SIGMA-PREDICATE rule
+//! Bug pinned here (IMPLEMENTATION-PLAN §4.2): a same-file SIGMA-PREDICATE rule
 //! (`tiny(col) :- col < 2`, entity_type 9) used as a guard inside an effect
 //! body — `…, +tiny(amount) |> …` — died at SQL generation with
 //! "Unknown predicate rewrite: 'tiny'". `lookup_enlisted_sigma`

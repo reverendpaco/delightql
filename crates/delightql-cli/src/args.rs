@@ -14,10 +14,14 @@ use std::path::PathBuf;
     disable_help_subcommand = true,
     after_help = "EXAMPLES:\n  \
 dql query --db app.db 'users(*), age > 30'\n  \
+dql query --db app.db 'users(_, name, age)'          # positional pattern: one slot per column, _ discards\n  \
+dql query --db app.db 'users(uid, name, _), orders(_, uid, total) |> %(name ~> sum:(total) as spent)'\n  \
 echo 'users(*) ~> count:(*)' | dql query --db app.db\n  \
 dql query --db app.db --to sql -f raw 'users(*)'\n  \
 dql explain semantic/cast\n\n\
-Depth lives in the man pages: man dql, man dql-query."
+The pipe is |> (feeds a relation into %()/#()/+() operators); ~> is the\n\
+aggregate separator, not the pipe. A shared bare variable (uid above) IS\n\
+the join. Depth lives in the man pages: man dql, man dql-query."
 )]
 pub struct CliArgs {
     /// Subcommand to execute (if omitted and no flags, starts REPL)
@@ -223,7 +227,7 @@ pub enum Command {
         action: TargetCommand,
     },
 
-    /// Start relay protocol server on a Unix socket
+    /// Start the internal relay-protocol server on a Unix socket (no compatibility promise; see man dql-server)
     Server {
         /// Unix socket path (default: /tmp/dql-{pid}.sock)
         #[arg(long)]

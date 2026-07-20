@@ -1,0 +1,11 @@
+book: fixture
+title: Emitter Invariants
+frontmatter: |
+  ---
+  title: Emitter Invariants
+  ---
+spine:
+  - root.md:
+      - child.md:
+          - nested/grandchild.md
+      - plain.md

@@ -9,7 +9,8 @@
 //! Recursively walks a directory tree, discovers `.dql` files, and consults
 //! each one into a namespace derived from the directory structure.
 //!
-//! Returns a multi-row result table: one row per file consulted.
+//! Returns a single-row receipt whose `returned` interior lists the
+//! consulted files (one interior row per file).
 
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,

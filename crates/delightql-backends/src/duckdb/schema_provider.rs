@@ -11,7 +11,7 @@ use duckdb::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// SQLite-specific implementation of SchemaProvider
+/// DuckDB implementation of SchemaProvider
 pub struct DuckDBSchemaProvider {
     connection: Arc<Mutex<Connection>>,
 }

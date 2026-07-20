@@ -151,8 +151,7 @@ fn has_cycle_dfs(
 /// reference to an EARLIER CTE is harmless (backward references trigger
 /// neither check); a reference to a LATER CTE is illegal under left-to-right
 /// scoping and is rejected regardless — closing the hole can only sharpen the
-/// diagnostic on an already-rejected query, never flip accept/reject
-/// (epic1/REPORT-INDUCTIVE-D-RISK-CANDIDATES.md, W6).
+/// diagnostic on an already-rejected query, never flip accept/reject.
 fn extract_table_references(expr: &ast_unresolved::RelationalExpression) -> Vec<String> {
     let mut collector = TableRefCollector { refs: Vec::new() };
     walk_visit_relational(&mut collector, expr)

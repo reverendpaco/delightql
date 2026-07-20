@@ -51,8 +51,7 @@ pub fn execute_query(
     no_headers: bool,
 ) -> Result<Option<ResultMetadata>> {
     // The session's one backend is created by the mount! below, not by a
-    // pre-opened manager — so build the handle straight from the factories
-    // (bugs/duplicate-fatboy-spawn-one-shot).
+    // pre-opened manager — so build the handle straight from the factories.
     let mut handle = crate::connection::open_handle()?;
 
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;

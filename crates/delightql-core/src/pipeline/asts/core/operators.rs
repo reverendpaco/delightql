@@ -356,10 +356,7 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
     /// (insert!/update!/delete! keep their dedicated machinery) and from
     /// `DirectiveTerminal` (the one-paren pipe form).
     ///
-    /// Unresolved-only: the effect transformer (Epic 3) consumes it; until
-    /// then the resolver refuses it with a clean not-yet-implemented error
-    /// (pinned by the effects ball, util--40_returning_other, red until
-    /// Epic 3).
+    /// Unresolved-only: the effect transformer consumes it.
     #[lispy("unary_relational_operator:directive_pipe_invocation")]
     #[phase_convert(unreachable)]
     DirectivePipeInvocation {

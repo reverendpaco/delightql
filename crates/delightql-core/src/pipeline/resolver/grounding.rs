@@ -1731,6 +1731,36 @@ fn wrap_query_with_pipe(
     }
 }
 
+/// R-3 (CALLER-PATTERN-SEAM-PLAN.md, RULED 2026-07-17): the trailing
+/// access group on a parameterized-rule call is ordinary argumentative
+/// access over the declared heading — uniform with plain-rule calls and
+/// with directive receipt access. The binding is not built yet
+/// (bugs/param-rule-access-inert): before this refusal the pattern was
+/// silently IGNORED — the full heading leaked under its own names,
+/// "bound" names never existed, and a unification join on one
+/// cross-joined without error. Refuse-first until the binding lands
+/// through the scoped-subset road; glob access stays
+/// payload-transparent.
+pub(super) fn refuse_positional_ho_access(
+    function: &str,
+    access: &ast_unresolved::DomainSpec,
+) -> Result<()> {
+    if matches!(access, ast_unresolved::DomainSpec::Positional(_)) {
+        return Err(DelightQLError::validation_error_categorized(
+            "resolution/ho_access/not_yet",
+            format!(
+                "'{function}' is a parameterized rule: its trailing access \
+                 pattern is ordinary argumentative access over the declared \
+                 heading (exact arity; `_` discards; names bind and rename) \
+                 — but that binding is not built yet. Use glob access and \
+                 narrow with a pipe: {function}(…)(*) |> (columns)"
+            ),
+            "parameterized-rule access binding not yet",
+        ));
+    }
+    Ok(())
+}
+
 /// Split first-parens DomainSpec into table bindings and scalar DomainSpec.
 ///
 /// For each position in `entity.params`:

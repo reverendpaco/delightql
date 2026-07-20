@@ -68,6 +68,17 @@ pub trait DqlHandle: Send {
     fn bind_owned_bytes(&mut self, _name: &str, _bytes: Vec<u8>) -> Result<(), String> {
         Err("bind_owned_bytes is not supported by this host".to_string())
     }
+
+    /// Set the handle's session-baseline danger overrides (CLI `--danger`).
+    /// Every session and relay created afterward inherits them. Specs must
+    /// be pre-validated via `danger_gates::parse_cli_danger_spec` — hosts
+    /// pass only what that parser accepted. Default: unsupported.
+    fn set_danger_overrides(
+        &mut self,
+        _specs: Vec<crate::pipeline::ast_unresolved::DangerSpec>,
+    ) -> Result<(), String> {
+        Err("danger overrides are not supported by this host".to_string())
+    }
 }
 
 /// A DQL session for query/fetch/close operations.

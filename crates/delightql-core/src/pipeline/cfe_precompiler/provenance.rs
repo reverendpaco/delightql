@@ -10,12 +10,11 @@
 // delegating every other descent to `walk_transform_*` reaches EVERY domain edge
 // by construction — Filter/Join conditions, EXISTS/IN subqueries, AND the pipe
 // operator expressions, Case arms, string templates, curly members, metadata
-// tree groups, and arrays that the former SIMPLIFIED hand-rolled walk dropped
-// (INDUCTIVE-INVENTORY §2a W10). The walk is now complete over the recursive
+// tree groups, and arrays that the former SIMPLIFIED hand-rolled walk dropped.
+// The walk is now complete over the recursive
 // domain type: no `..` hides a recursive field.
 //
-// Behavior-preserving in expectation: Phase D (epic1/REPORT-INDUCTIVE-D-RISK-
-// CANDIDATES.md, W10) proved the previously-dropped positions are gated at
+// Behavior-preserving in expectation: the previously-dropped positions are gated at
 // RESOLUTION for every parameter kind (regular/context/implicit) before this
 // refined-phase fixup runs, and implicit-context CFEs never rely on provenance
 // at all — so reaching those extra positions sets provenance on Lvars no

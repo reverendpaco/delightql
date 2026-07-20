@@ -17,7 +17,7 @@ pub struct EntityInfo {
     /// None for CTEs, built-ins, and entities where bootstrap doesn't provide a canonical name.
     pub canonical_name: Option<SqlIdentifier>,
     /// The namespace where this entity was found during resolution.
-    /// For engaged tables resolved as unqualified names, this carries the
+    /// For enlisted tables resolved as unqualified names, this carries the
     /// discovered namespace so the transformer can emit schema-qualified SQL.
     pub resolved_namespace: Option<NamespacePath>,
     /// Physical backend schema name for SQL generation (e.g., "_c" for logical namespace "c").

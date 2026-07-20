@@ -4,7 +4,7 @@
 # BOUNDARY NOTE: this file ships with the public impl repo (see
 # export.toml / export-mission.md). Tasks here may only reference paths
 # that exist in the public tree. Tasks touching private paths
-# (new_test_suite/, scripts/, lightweight_webserver/, lua/, config/, …)
+# (new_test_suite/, scripts/, hosts/wasm-demo/, devtools/, …)
 # or personal machine paths live in mise.local.toml (committed, never
 # exported, read automatically by mise).
 

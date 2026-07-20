@@ -150,7 +150,8 @@ pub fn activate_entities_from_cartridge(
 ///            exposed_namespace, grounding, liminal_receipt (the curated
 ///            `namespace` entity is registered separately in system.rs,
 ///            public columns only — it carries an internal mount link)
-/// - sys::execution: compilation, stack
+/// - sys::execution: compilation, stack, effect_plan, effect_guard,
+///                    effect_requirement, effect_run
 /// - sys::targeting: dialect_render, dialect_form_rule, dialect_capability
 /// - sys::connections: connection_type_enum (the curated `connection` entity is
 ///                     registered separately in system.rs, safe columns only)

@@ -101,7 +101,7 @@ impl<'a> Formatter<'a> {
         Ok(())
     }
 
-    /// Format pseudo-predicate call (import!, engage!, part!, etc.)
+    /// Format pseudo-predicate call (mount!, enlist!, delist!, etc.)
     pub(super) fn format_pseudo_predicate_call(&mut self, node: &Node) -> Result<()> {
         // Get the predicate name (with ! suffix)
         if let Some(name_node) = node.child_by_field_name("name") {

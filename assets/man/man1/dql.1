@@ -112,7 +112,14 @@ writes every embedded troff page into
 With no name, list the books embedded in this binary. With a name, mount
 the CLI-owned book database as
 .IR cli::book
-and emit that ordered book as Markdown. The initial book is
+and emit that ordered book as Markdown. With
+.BI \-\-export\-images " DIR"
+(default
+.IR images/ )
+the bundle's images are also written into
+.I DIR
+so the emitted markdown's relative references resolve for pandoc.
+The initial book is
 .BR reference :
 .EX
 $ dql book reference > reference.md
@@ -260,6 +267,11 @@ still wins.
 .I ~/.local/share/delightql/fatboys/<version>
 The adapter store, one directory per dql version.
 .SH EXAMPLES
+For more:
+.EX
+$ dql man examples
+.EE
+.PP
 Query an SQLite file:
 .PP
 .EX

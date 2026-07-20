@@ -309,7 +309,8 @@ pub fn run_dql_query(dql: &str, session: &mut dyn DqlSession) -> Result<QueryRes
 ///
 /// When `sequential` is true, multi-query input is split client-side via
 /// `split_queries()`. Each query is sent as a separate `session.query()`
-/// call and all results are displayed. Without `sequential`, multi-query
+/// call; earlier statements run for their effects and only the FINAL
+/// statement's result is displayed/returned. Without `sequential`, multi-query
 /// input is rejected by the relay per the protocol contract.
 pub fn execute_query(
     source_code: &str,
@@ -398,12 +399,28 @@ fn execute_single_query(
                 row_count: raw_rows.len(),
             }));
         }
-        Some(Stage::Hash) | Some(Stage::TotalHash) | Some(Stage::Fingerprint) => {
+        Some(stage @ (Stage::Hash | Stage::TotalHash | Stage::Fingerprint)) => {
             let results = fetch_all(session, source_code)?;
             let fingerprint =
                 crate::util::fingerprint::ResultFingerprint::from_results_only(&results)
                     .map_err(|e| anyhow::anyhow!("Failed to generate fingerprint: {}", e))?;
-            println!("{}", fingerprint.data_hash);
+            // Three DISTINCT contracts (man dql-query): hash = data only;
+            // totalhash = schema+data (column names participate); fingerprint
+            // = the structured JSON. All three used to print data_hash, so
+            // totalhash could not see a column rename and fingerprint emitted
+            // a bare digest (codex F-6/F-7 — found by holding the outputs
+            // against the manual).
+            match stage {
+                Stage::Hash => println!("{}", fingerprint.data_hash),
+                Stage::TotalHash => println!("{}", fingerprint.result_hash),
+                Stage::Fingerprint => println!(
+                    "{}",
+                    fingerprint
+                        .to_json_string()
+                        .map_err(|e| anyhow::anyhow!("Failed to render fingerprint: {}", e))?
+                ),
+                _ => unreachable!(),
+            }
             return Ok(Some(ResultMetadata {
                 columns: results.columns,
                 row_count: results.row_count,

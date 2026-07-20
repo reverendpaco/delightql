@@ -31,6 +31,10 @@ pub(crate) struct DqlHandleImpl {
     handler_factory: Box<dyn Fn() -> Box<dyn Handler + Send> + Send + Sync>,
     /// Taken on first session/relay creation, then recreated via handler_factory.
     initial_backend: Option<Box<dyn Handler + Send>>,
+    /// Session-baseline danger overrides (CLI --danger), inherited by every
+    /// session/relay created from this handle. Pre-validated by
+    /// danger_gates::parse_cli_danger_spec.
+    danger_overrides: Vec<crate::pipeline::ast_unresolved::DangerSpec>,
 }
 
 /// Concrete session implementation. Not visible outside this crate.
@@ -164,6 +168,7 @@ impl api::DqlHandle for DqlHandleImpl {
         let backend_session = make_backend_session(backend)?;
 
         let mut relay = RelayParty::new(&mut self.system, backend_session);
+        relay.set_danger_overrides(self.danger_overrides.clone());
         if hooks.on_ship.is_some() {
             relay.set_hooks(crate::relay::RelayHooks {
                 on_ship: hooks.on_ship,
@@ -199,7 +204,8 @@ impl api::DqlHandle for DqlHandleImpl {
         };
 
         let backend_session = make_backend_session(backend)?;
-        let relay = RelayParty::new(&mut self.system, backend_session);
+        let mut relay = RelayParty::new(&mut self.system, backend_session);
+        relay.set_danger_overrides(self.danger_overrides.clone());
         Ok(Box::new(relay))
     }
 
@@ -211,6 +217,14 @@ impl api::DqlHandle for DqlHandleImpl {
         self.system
             .bind_static_bytes(name, bytes)
             .map_err(|e| e.to_string())
+    }
+
+    fn set_danger_overrides(
+        &mut self,
+        specs: Vec<crate::pipeline::ast_unresolved::DangerSpec>,
+    ) -> Result<(), String> {
+        self.danger_overrides = specs;
+        Ok(())
     }
 
     fn bind_owned_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), String> {
@@ -285,5 +299,6 @@ pub fn open(
         system: Box::new(system),
         handler_factory: created.handler_factory,
         initial_backend: Some(created.handler),
+        danger_overrides: Vec::new(),
     }))
 }

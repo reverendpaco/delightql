@@ -8,11 +8,14 @@
 //!
 //! ## Behavior
 //!
-//! 1. Reads companion definitions (^)(+)($) from source library namespace
+//! 1. Reads companion definitions (`schema()`, `imprinting()`, …) from
+//!    the source library's `_internal` namespace
 //! 2. Generates CREATE TABLE SQL via the DDL pipeline
 //! 3. Executes DDL against the target data namespace's database
 //! 4. If entity has a `:=` body (CTAS), populates via INSERT INTO ... SELECT
-//! 5. Returns a multi-row status table
+//! 5. Returns the single-row receipt (success, operation,
+//!    source_namespace, target_namespace, returned ⟦entity, status⟧),
+//!    one interior row per manifest entity
 
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,

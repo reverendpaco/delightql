@@ -40,7 +40,7 @@ pub enum ResolutionResult {
 ///
 /// `resolution_namespace` overrides the default "main" scope for unqualified
 /// entity lookup. Used during DDL view body resolution so that DDL-local
-/// engages are visible without polluting main scope.
+/// enlists are visible without polluting main scope.
 pub fn resolve_entity_with_alias(
     name: &str,
     alias: Option<&str>,

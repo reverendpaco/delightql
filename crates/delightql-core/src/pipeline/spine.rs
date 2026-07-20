@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! The two EARNED source-spine helpers (INDUCTIVE-TRAVERSAL-PLAN §2 R-I2;
-//! INDUCTIVE-INVENTORY §4).
+//! The two EARNED source-spine helpers (INDUCTIVE-TRAVERSAL-PLAN §2 R-I2).
 //!
 //! A *source-spine* walk inspects only the OUTER relation/pipeline that
 //! determines a property — base relation, top-level operator, routing — and

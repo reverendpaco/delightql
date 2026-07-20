@@ -3,21 +3,9 @@
 // pattern_resolver.rs - Unified pattern resolution to prevent duplicate code paths
 // This is the single entry point for ALL pattern types (Glob, GlobWithUsing, Positional, etc.)
 //
-// INTEGRATION STATUS: Phase 2 Complete - Architecture implemented but not yet wired in
-//
-// TO INTEGRATE (Phase 3):
-// 1. In resolve_relation_with_registry, replace preserve_domain_spec() calls with:
-//    - Create PatternResolver instance
-//    - Call resolve_pattern() to get PatternResult
-//    - Use PatternResult to:
-//      a) Set output columns in BubbledState
-//      b) Apply WHERE constraints as Filter expressions
-//      c) Store JOIN conditions for later application
-//
-// 2. In JOIN resolution, check for PatternResult.using_columns and apply them
-//
-// This architecture is ready for positional patterns - when they're added to the
-// grammar and builder, they'll automatically flow through this single unified path.
+// This is the LIVE entry point: `resolve_pattern()` serves resolver_fold,
+// relation_resolver, and grounding for every pattern kind — positional
+// patterns (full-arity destructuring) included.
 
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::{walk_transform_boolean, walk_transform_domain, AstTransform};

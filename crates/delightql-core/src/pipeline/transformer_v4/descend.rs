@@ -142,7 +142,6 @@ pub(super) fn descend_as_query(
         }
 
         // IntersectCorresponding: descend operands, then lower.
-        // The actual r_lower_intersect_corresponding handler will be added separately.
         ast_addressed::RelationalExpression::IntersectCorresponding {
             operands,
             correlation,

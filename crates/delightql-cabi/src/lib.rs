@@ -667,19 +667,22 @@ fn find_first_error(node: &tree_sitter::Node, source: &str) -> String {
 mod tests {
     use super::*;
     use std::ffi::CString;
-    use std::path::PathBuf;
-
-    /// Resolve a workspace-relative path to absolute.
-    fn workspace_path(rel: &str) -> PathBuf {
-        // CARGO_MANIFEST_DIR = .../crates/delightql-cabi
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest.join("../..").join(rel).canonicalize().unwrap()
-    }
 
     #[test]
     fn round_trip_open_query_fetch_close_destroy() {
-        let abs = workspace_path("test_suite/side-effect-free/fixtures/core/core.db");
-        let db_path = CString::new(abs.to_str().unwrap()).unwrap();
+        // Self-contained fixture (the retired test_suite/ tree once served
+        // this; sqlite-relay's tests were burned by the same dependency and
+        // made the same move).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roundtrip.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (user_id INTEGER, name TEXT, age INTEGER);
+             INSERT INTO users VALUES (1, 'ada', 36), (2, 'alan', 41);",
+        )
+        .unwrap();
+        drop(conn);
+        let db_path = CString::new(path.to_str().unwrap()).unwrap();
 
         unsafe {
             let mut err: *mut c_char = std::ptr::null_mut();
@@ -728,11 +731,17 @@ mod tests {
     }
 
     #[test]
-    fn open_empty_db_succeeds() {
+    fn open_schemaless_valid_db_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        // Create an empty SQLite database file so mount! finds it.
-        rusqlite::Connection::open(&path).unwrap();
+        // A VALID SQLite database with no tables. A bare rusqlite open
+        // leaves a 0-byte file, which mount! REFUSES since the nullmount
+        // ruling (2026-07-12: mount! is attach-only and rejects
+        // missing/empty/invalid files) — write the header so the file is
+        // a real database, the same way mount_new! provisions one.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        drop(conn);
         let db_path = CString::new(path.to_str().unwrap()).unwrap();
 
         unsafe {
@@ -741,9 +750,27 @@ mod tests {
             if h.is_null() {
                 let msg = CStr::from_ptr(err).to_string_lossy().to_string();
                 dql_free_string(err);
-                panic!("dql_open failed on empty db: {}", msg);
+                panic!("dql_open failed on valid schemaless db: {}", msg);
             }
             dql_destroy(h);
+        }
+    }
+
+    #[test]
+    fn open_zero_byte_file_refuses() {
+        // The nullmount ruling, pinned at the C-ABI boundary: a 0-byte
+        // file is not a database and mount! (via dql_open) refuses it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.db");
+        rusqlite::Connection::open(&path).unwrap();
+        let db_path = CString::new(path.to_str().unwrap()).unwrap();
+
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let h = dql_open(db_path.as_ptr(), &mut err);
+            assert!(h.is_null(), "0-byte file must refuse to mount");
+            assert!(!err.is_null());
+            dql_free_string(err);
         }
     }
 

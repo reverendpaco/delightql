@@ -89,6 +89,110 @@ pub fn is_cli_overridable(uri: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse a CLI `--danger hierarchy=STATE` argument into a validated
+/// `DangerSpec`. Every failure is a loud teaching error — the flag was
+/// silently dropped for its whole life (outside-eyes F2; the `--danger`
+/// arg was parsed by clap and never read), so the contract now is:
+/// a `--danger` that cannot take effect refuses, never no-ops.
+pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
+    let (hierarchy, state_text) = input.split_once('=').ok_or_else(|| {
+        crate::error::DelightQLError::validation_error(
+            format!(
+                "--danger takes hierarchy=STATE (e.g. cardinality/cartesian=ON), got '{input}'"
+            ),
+            "parse_cli_danger_spec",
+        )
+    })?;
+    let uri = canonical_danger_uri(hierarchy.trim());
+
+    if !KNOWN_DANGERS.iter().any(|(known, _, _)| *known == uri) {
+        return Err(crate::error::DelightQLError::validation_error(
+            format!(
+                "unknown danger '{}'. Known dangers: {}",
+                hierarchy.trim(),
+                known_danger_hierarchies().join(", ")
+            ),
+            "parse_cli_danger_spec",
+        ));
+    }
+
+    if !is_cli_overridable(&uri) {
+        return Err(crate::error::DelightQLError::validation_error(
+            format!(
+                "danger '{}' cannot be opened from the CLI: it changes what the \
+                 query MEANS, so it must be visible in the query text — spell it \
+                 inline: (~~danger://{} ON~~)",
+                hierarchy.trim(),
+                hierarchy.trim(),
+            ),
+            "parse_cli_danger_spec",
+        ));
+    }
+
+    let state = match state_text.trim().to_ascii_uppercase().as_str() {
+        "ON" => DangerState::On,
+        "OFF" => DangerState::Off,
+        "ALLOW" => DangerState::Allow,
+        other => match other.parse::<u8>() {
+            Ok(n @ 1..=9) => DangerState::Severity(n),
+            _ => {
+                return Err(crate::error::DelightQLError::validation_error(
+                    format!(
+                        "--danger state must be ON, OFF, ALLOW, or a severity 1-9, \
+                         got '{state_text}'"
+                    ),
+                    "parse_cli_danger_spec",
+                ))
+            }
+        },
+    };
+
+    Ok(DangerSpec {
+        uri,
+        state,
+        source_location: None,
+    })
+}
+
+#[cfg(test)]
+mod cli_danger_spec_tests {
+    use super::*;
+
+    #[test]
+    fn overridable_gate_parses() {
+        let spec = parse_cli_danger_spec("cardinality/cartesian=ON").unwrap();
+        assert_eq!(spec.uri, "delightql-danger://cardinality/cartesian");
+        assert_eq!(spec.state, DangerState::On);
+    }
+
+    // outside-eyes F2: this refusal used to be a silent no-op.
+    #[test]
+    fn non_overridable_gate_refuses_with_inline_teaching() {
+        let err = parse_cli_danger_spec("cardinality/nulljoin=ON").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("inline"), "must teach the inline spelling: {msg}");
+        assert!(msg.contains("(~~danger://cardinality/nulljoin ON~~)"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_gate_lists_known_hierarchies() {
+        let err = parse_cli_danger_spec("cardinality/typo=ON").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cardinality/cartesian"), "{msg}");
+    }
+
+    #[test]
+    fn bad_state_refuses() {
+        let err = parse_cli_danger_spec("cardinality/cartesian=MAYBE").unwrap_err();
+        assert!(err.to_string().contains("ON, OFF, ALLOW"), "{}", err);
+    }
+
+    #[test]
+    fn missing_equals_refuses() {
+        assert!(parse_cli_danger_spec("cardinality/cartesian").is_err());
+    }
+}
+
 impl Default for DangerGateMap {
     fn default() -> Self {
         Self::with_defaults()

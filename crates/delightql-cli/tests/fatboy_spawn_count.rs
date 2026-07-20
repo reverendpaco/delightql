@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! One backend per one-shot fatboy `--db` query — the spawn-count pin for
-//! bugs/duplicate-fatboy-spawn-one-shot.
+//! One backend per one-shot fatboy `--db` query — the spawn-count pin.
 //!
 //! The bug: a file/URI-backed one-shot `dql query --db <fatboy>` used to
 //! spawn the foreign-engine child TWICE — once eagerly by make_connection

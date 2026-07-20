@@ -189,8 +189,7 @@ fn worker_loop(
     disconnected_since: Arc<AtomicU64>,
 ) {
     // The session's backend is created by the mount! below (if any); the
-    // handle itself comes straight from the factories, no pre-opened manager
-    // (bugs/duplicate-fatboy-spawn-one-shot).
+    // handle itself comes straight from the factories, no pre-opened manager.
     let mut handle = match crate::connection::open_handle() {
         Ok(h) => h,
         Err(e) => {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["grammar_dql", "tools/fn-lengths"]
+exclude = ["grammar_dql", "devtools/fn-lengths"]
 # delightql-duckdb is NOT a default member: cargo's per-invocation
 # feature unification would otherwise link libduckdb (backends/duckdb)
 # into every binary built alongside it — including dql itself, which

@@ -122,8 +122,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
     /// relation-shaped answers: physical/mounted tables (`DatabaseEntity`),
     /// consulted views, consulted facts. Query-local CTEs and built-in
     /// functions are deliberately NOT accepted — guards on those keep
-    /// today's behavior. Pinned by enlisted_guard_classification_tests
-    /// (bugs/enlisted-guard-predicate-rewrite).
+    /// today's behavior. Pinned by enlisted_guard_classification_tests.
     fn functor_is_relation_entity(&mut self, functor: &str) -> bool {
         use crate::resolution::{resolve_entity_with_alias, ResolutionResult};
         matches!(
@@ -1225,10 +1224,12 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             ref first_parens_spec,
             ref arguments,
             ref namespace,
+            ref domain_spec,
             grounding: ref invocation_grounding,
             ..
         } = pipe_expr.operator
         {
+            super::grounding::refuse_positional_ho_access(function, domain_spec)?;
             // Look up the HO view entity.
             // When namespace is explicit (e.g., std::json.tg_keys), use
             // lookup_entity with the FQ namespace — same as the non-piped
@@ -2498,8 +2499,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 // same-named enlisted sigma silently shadowed the scope's
                 // own rule. Sigma stays FIRST in the classification order
                 // (before the table probes and the bin fall-through).
-                // Pinned by sigma_guard_scope_tests
-                // (bugs/sigma-rule-guard-under-consulted-scope).
+                // Pinned by sigma_guard_scope_tests.
                 // STRICT definition independence (Phase 7 stage 2,
                 // owner-ratified): inside a definition the sigma lookup is
                 // scoped to the OWNING namespace — itself + its own edges —
@@ -2535,8 +2535,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                 // an ENLISTED mount — or on a consulted rule visible only in
                 // the Some(ns) scope — fell through to the bin-rewrite path
                 // and died at SQL generation ("Unknown predicate rewrite").
-                // Pinned by enlisted_guard_classification_tests
-                // (bugs/enlisted-guard-predicate-rewrite).
+                // Pinned by enlisted_guard_classification_tests.
                 if self.registry.database.lookup_table(&functor).is_some()
                     || self
                         .registry

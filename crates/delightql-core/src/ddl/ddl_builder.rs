@@ -16,7 +16,7 @@ use crate::pipeline::asts::ddl::{
 };
 use crate::pipeline::cst::CstNode;
 // truncate_for_display is char-boundary safe; a local byte-index variant
-// here panicked on multi-byte text (bugs/run-non-ascii-panic, pinned by
+// here panicked on multi-byte text (pinned by
 // no_definition_error_truncation_is_char_boundary_safe).
 use crate::pipeline::parser::{parse_ddl, truncate_for_display};
 use tree_sitter::Tree;
@@ -312,41 +312,66 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
             let params = params_nodes
                 .iter()
                 .filter(|p| p.kind() == "identifier" || p.kind() == "function_param")
-                .map(|p| {
+                .map(|p| -> Result<FunctionParam> {
                     if p.kind() == "function_param" {
                         let param_name_node = p.field("param_name");
                         if let Some(name_node) = param_name_node {
                             let name = name_node.text().to_string();
                             // Callable param: f:() — has param_name but no guard, text contains :(
                             let callable = p.field("guard").is_none() && p.text().contains(":(");
-                            let guard = p.field("guard").and_then(|g| {
-                                let bs = g.raw_node().start_byte();
-                                let be = g.raw_node().end_byte();
-                                let guard_text = &source[bs..be];
-                                body_parser::parse_guard_expression(guard_text).ok()
-                            });
-                            FunctionParam {
+                            // A guard the CST carries must survive into the AST.
+                            // Swallowing the re-parse failure here (`.ok()`)
+                            // manufactured UNGUARDED clauses from guarded source,
+                            // and the failure resurfaced as the semantically
+                            // unrelated unguarded_multiplicity teaching — accusing
+                            // the author of the opposite of their mistake.
+                            let guard = match p.field("guard") {
+                                Some(g) => {
+                                    let bs = g.raw_node().start_byte();
+                                    let be = g.raw_node().end_byte();
+                                    let guard_text = &source[bs..be];
+                                    Some(
+                                        body_parser::parse_guard_expression(guard_text).map_err(
+                                            |_| {
+                                                DelightQLError::validation_error_categorized(
+                                                    "ddl/head/guard_unparsed",
+                                                    format!(
+                                                        "the guard '{guard_text}' was written but \
+                                                         cannot be read back as an expression: in \
+                                                         assertion mode, bare infix arithmetic and \
+                                                         `%` collide with the sigil operators — \
+                                                         parenthesize the arithmetic, e.g. \
+                                                         `(n % 2) = 0` rather than `n % 2 = 0`",
+                                                    ),
+                                                    "guard failed to parse",
+                                                )
+                                            },
+                                        )?,
+                                    )
+                                }
+                                None => None,
+                            };
+                            Ok(FunctionParam {
                                 name,
                                 guard,
                                 callable,
-                            }
+                            })
                         } else {
-                            let name = p.text().to_string();
-                            FunctionParam {
-                                name,
+                            Ok(FunctionParam {
+                                name: p.text().to_string(),
                                 guard: None,
                                 callable: false,
-                            }
+                            })
                         }
                     } else {
-                        FunctionParam {
+                        Ok(FunctionParam {
                             name: p.text().to_string(),
                             guard: None,
                             callable: false,
-                        }
+                        })
                     }
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             DdlHead::Function {
                 params,
                 context_mode,
@@ -981,7 +1006,7 @@ mod tests {
         assert!(build_ddl_file(ok).is_ok());
     }
 
-    /// Pins bugs/run-non-ascii-panic sibling: the "No definition found"
+    /// Pins the non-ASCII slicing panic's sibling: the "No definition found"
     /// message truncated the source at byte 60 without a char-boundary
     /// check, panicking on multi-byte content.
     #[test]

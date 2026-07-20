@@ -12,9 +12,11 @@
 //! 2. Mutate system state (open connections, register namespaces, etc.)
 //! 3. Return result tables that replace them in the AST
 //!
-//! ## Supported Pseudo-Predicates (MVP)
+//! ## Dispatch
 //!
-//! - `mount!(db_path, namespace)` - Opens a database connection and registers a namespace
+//! Directives dispatch through the descriptor registry (`descriptor(name)`,
+//! `DirectiveRealization`, renamed-directive teaching) — the supported set
+//! is the registry's, never a list maintained here.
 //!
 //! ## Architecture
 //!
@@ -1011,9 +1013,24 @@ fn execute_pseudo_predicate(
                 }
             }
         }
-        DelightQLError::database_error(
-            format!("Unknown pseudo-predicate: {}", name),
-            "Pseudo-predicate not found in registry. Make sure it's registered in a bin cartridge.",
+        // The old text here ("register it in a bin cartridge") pointed end
+        // users at a compiler-internal mechanism — and it convinced two
+        // independent evaluators that USER effect rules were unimplemented
+        // (outside-eyes F14/codex F-10: a false negative about a shipped,
+        // load-bearing feature). Whether a user effect rule may be demanded
+        // directly at the prompt is an open ruling (R-2); until then, teach
+        // the road that works.
+        DelightQLError::validation_error_categorized(
+            "directive/unknown",
+            format!(
+                "Unknown directive '{bare}!'. If this is YOUR effect rule from a \
+                 consulted file, it does not run as a prompt invocation — effect \
+                 rules execute inside a run: consult! the file, then \
+                 run_namespace!(<ns>)(*), or run!(\"<file>\")(*) directly. \
+                 Otherwise, check the spelling against the built-in directives \
+                 (EFFECT-ALGEBRA §3)."
+            ),
+            "unknown directive",
         )
     })?;
     // Registry borrow ends here, but Arc keeps entity alive

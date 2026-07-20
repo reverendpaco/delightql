@@ -2,8 +2,8 @@
 // Copyright 2026 Daniel Eklund
 // visitor.rs - Generic AST visitor pattern for SQL optimizer passes
 //
-// This module provides a reusable visitor pattern that eliminates ~450 lines
-// of duplicated AST traversal code across cleanup, restructure, and advanced passes.
+// This module provides the reusable visitor pattern the optimizer passes
+// (today: cleanup) share for AST traversal.
 //
 // The pattern:
 // 1. Define a QueryTransformer trait with methods for each transformation

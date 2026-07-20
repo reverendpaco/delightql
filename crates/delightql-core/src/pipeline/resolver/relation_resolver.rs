@@ -1475,16 +1475,20 @@ pub(super) fn r_resolve_unknown(
     } else {
         // In normal mode, error out for unknown tables
         let (table_name, context) = if !identifier.namespace_path.is_empty() {
-            // Construct namespace path string using :: separator (DelightQL format)
-            let ns_parts: Vec<_> = identifier
-                .namespace_path
-                .iter_reversed()
-                .map(|i| i.name.as_str())
-                .collect();
-            let ns_str = ns_parts.join("::");
+            // Construct namespace path string using :: separator (DelightQL
+            // format). NOTE: storage order, not iter_reversed — the old
+            // context string used iter_reversed and rendered multi-segment
+            // paths BACKWARDS (sys::meta as "meta::sys"), invisibly, because
+            // the context field is never displayed.
+            let ns_str = super::grounding::namespace_path_to_fq(&identifier.namespace_path);
+            // Report the FULL path the user wrote, never the bare leaf: the
+            // leaf-only "Table not found: orders" for `sales.orders(*)`
+            // hid the actual mistake (an under-qualified namespace) and sent
+            // readers hunting for a missing TABLE (outside-eyes F5 — it
+            // manufactured a false "mount! is broken" diagnosis).
             (
-                identifier.name.to_string(),
-                format!("Entity '{}' not found in namespace '{}'. Possible causes: namespace not resolved, entity not activated, or missing backend schema configuration.", identifier.name, ns_str)
+                format!("{}.{}", ns_str, identifier.name),
+                format!("Entity '{}' not found in namespace '{}'. The namespace prefix as written did not resolve — check it against your mounts (sys::ns.namespace(*) lists them; a mount under 'data::{}' is reached as 'data::{}.{}'). Other causes: entity not activated, or missing backend schema configuration.", identifier.name, ns_str, ns_str, ns_str, identifier.name)
             )
         } else {
             (
@@ -1958,7 +1962,7 @@ pub(super) fn resolve_anonymous(
 
 /// Resolve a TVF (Table-Valued Function) variant.
 ///
-/// Handles HO view expansion (grounded, namespace-qualified, and unqualified via engage!),
+/// Handles HO view expansion (grounded, namespace-qualified, and unqualified via enlist!),
 /// as well as normal TVF resolution with schema lookup.
 pub(super) fn resolve_tvf(
     rel: ast_unresolved::Relation,
@@ -1995,6 +1999,7 @@ pub(super) fn resolve_tvf(
                 .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
                 if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
+                    super::grounding::refuse_positional_ho_access(&function, &domain_spec)?;
                     let (table_bindings, scalar_spec, _pipe_idx) =
                         super::grounding::split_ho_first_parens(
                             &first_parens_spec,
@@ -2034,6 +2039,7 @@ pub(super) fn resolve_tvf(
                 .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
                 if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
+                    super::grounding::refuse_positional_ho_access(&function, &domain_spec)?;
                     let ho_grounding = ast_unresolved::GroundedPath {
                         data_ns: ast_unresolved::NamespacePath::empty(),
                         grounded_ns: vec![ns.clone()],
@@ -2070,7 +2076,7 @@ pub(super) fn resolve_tvf(
         }
     }
 
-    // Fallback: unqualified HO view via engage!
+    // Fallback: unqualified HO view via enlist!
     if grounding.is_none() {
         if let Some(entity) = registry
             .consult
@@ -2088,6 +2094,7 @@ pub(super) fn resolve_tvf(
                 grounded_ns: vec![entity_ns],
             };
 
+            super::grounding::refuse_positional_ho_access(&function, &domain_spec)?;
             let (table_bindings, scalar_spec, _pipe_idx) = super::grounding::split_ho_first_parens(
                 &first_parens_spec,
                 &entity,
