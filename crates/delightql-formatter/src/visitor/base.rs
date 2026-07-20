@@ -14,6 +14,8 @@ impl<'a> Formatter<'a> {
                 "tvf_call" => self.format_tvf_call(&child)?,
                 "anonymous_table" => self.format_anonymous_table(&child)?,
                 "pseudo_predicate_call" => self.format_pseudo_predicate_call(&child)?,
+                "inline_directive_table" => self.write_commas_tight(&child),
+                "catalog_functor" => self.write_commas_tight(&child),
                 _ => self.flag_unhandled(&child),
             }
         }
@@ -26,7 +28,7 @@ impl<'a> Formatter<'a> {
         if let Some(namespace_node) = node.child_by_field_name("namespace_path") {
             let namespace = self.node_text(&namespace_node).to_string();
             self.output.write(&namespace);
-            self.output.write(".");
+            self.write_namespace_separator(node);
         }
 
         // Get table name using field name
@@ -40,6 +42,11 @@ impl<'a> Formatter<'a> {
         // Outer join marker: table?(*)  — field name 'outer' in grammar
         if node.child_by_field_name("outer").is_some() {
             self.output.write("?");
+        }
+
+        // DML mutation-target marker: table!!(*)
+        if node.child_by_field_name("mutation_target").is_some() {
+            self.output.write("!!");
         }
 
         // Check if there's an inner-relation continuation (SNEAKY-PARENTHESES)
@@ -65,10 +72,7 @@ impl<'a> Formatter<'a> {
 
         // Handle table alias if present — read name from CST field
         if let Some(alias_node) = self.find_child(node, "table_alias") {
-            if let Some(name_node) = alias_node.child_by_field_name("name") {
-                self.output.write(" as ");
-                self.output.write(&self.node_text(&name_node).to_string());
-            }
+            self.write_table_alias(&alias_node);
         }
 
         Ok(())
@@ -76,33 +80,31 @@ impl<'a> Formatter<'a> {
 
     /// Format column specification (no spaces after commas)
     pub(super) fn format_column_spec(&mut self, node: &Node) -> Result<()> {
-        let text = self.node_text(node);
-        // Remove all spaces after commas for positional functors
-        let formatted = text.replace(", ", ",");
-        self.output.write(&formatted);
+        self.write_commas_tight(node);
         Ok(())
     }
 
-    /// Format anonymous table
+    /// Format anonymous table (no spaces after commas)
     pub(super) fn format_anonymous_table(&mut self, node: &Node) -> Result<()> {
-        // For now, just output as-is with no spaces after commas
-        let text = self.node_text(node);
-        let formatted = text.replace(", ", ",");
-        self.output.write(&formatted);
+        self.write_commas_tight(node);
         Ok(())
     }
 
-    /// Format TVF call
+    /// Format TVF call (no spaces after commas)
     pub(super) fn format_tvf_call(&mut self, node: &Node) -> Result<()> {
-        let text = self.node_text(node).to_string();
-        // No spaces after commas in TVF calls
-        let formatted = text.replace(", ", ",");
-        self.output.write(&formatted);
+        self.write_commas_tight(node);
         Ok(())
     }
 
     /// Format pseudo-predicate call (mount!, enlist!, delist!, etc.)
     pub(super) fn format_pseudo_predicate_call(&mut self, node: &Node) -> Result<()> {
+        // Namespace-qualified form: std::prelude.enlist!(…)
+        if let Some(ns_node) = node.child_by_field_name("namespace_path") {
+            let ns = self.node_text(&ns_node).to_string();
+            self.output.write(&ns);
+            self.write_namespace_separator(node);
+        }
+
         // Get the predicate name (with ! suffix)
         if let Some(name_node) = node.child_by_field_name("name") {
             let name = self.node_text(&name_node).to_string();
@@ -117,10 +119,8 @@ impl<'a> Formatter<'a> {
         // call form and must echo it, not drop it)
         self.output.write("(");
         if let Some(args_node) = node.child_by_field_name("arguments") {
-            let args_text = self.node_text(&args_node).to_string();
             // No spaces after commas (consistent with TVF calls)
-            let formatted = args_text.replace(", ", ",");
-            self.output.write(&formatted);
+            self.write_commas_tight(&args_node);
         } else if let Some(cont_node) = node.child_by_field_name("continuation") {
             let cont_text = self.node_text(&cont_node).to_string();
             self.output.write(&cont_text);
@@ -129,10 +129,7 @@ impl<'a> Formatter<'a> {
 
         // Handle alias if present — read name from CST field
         if let Some(alias_node) = self.find_child(node, "table_alias") {
-            if let Some(name_node) = alias_node.child_by_field_name("name") {
-                self.output.write(" as ");
-                self.output.write(&self.node_text(&name_node).to_string());
-            }
+            self.write_table_alias(&alias_node);
         }
 
         Ok(())

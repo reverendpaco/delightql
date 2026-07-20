@@ -26,7 +26,8 @@ impl<'a> Formatter<'a> {
                 "case_arm" => {
                     if !first_arm {
                         self.output.write("; ");
-                        self.output.newline_with_indent(base_indent + 3); // Add 3 to align with first arm
+                        self.output
+                            .newline_with_indent(base_indent + self.config.case_arm_indent);
                     }
                     self.format_case_arm(&child, base_indent)?;
                     first_arm = false;
@@ -34,7 +35,8 @@ impl<'a> Formatter<'a> {
                 "case_default" => {
                     if !first_arm {
                         self.output.write("; ");
-                        self.output.newline_with_indent(base_indent + 3); // Add 3 to align with first arm
+                        self.output
+                            .newline_with_indent(base_indent + self.config.case_arm_indent);
                     }
                     self.format_case_default(&child)?;
                     first_arm = false;

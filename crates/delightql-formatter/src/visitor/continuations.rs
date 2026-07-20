@@ -11,17 +11,25 @@ impl<'a> Formatter<'a> {
         // Check operator type
         let has_comma = self.find_child(node, "comma_operator").is_some();
 
-        // Check for any set operator (union, intersect, etc.)
-        let has_set_operator = self.find_child(node, "union_all_operator").is_some()
-            || self.find_child(node, "smart_union_all").is_some()
+        // Check for any inline binary operator (unions, ER joins):
+        // spelled ` op ` with the right side formatted normally.
+        let has_set_operator = self.find_child(node, "smart_union_all").is_some()
             || self.find_child(node, "union_all_positional").is_some()
             || self.find_child(node, "union_corresponding").is_some()
-            || self.find_child(node, "minus_corresponding").is_some();
+            || self.find_child(node, "minus_corresponding").is_some()
+            || self.find_child(node, "er_join_operator").is_some()
+            || self.find_child(node, "er_transitive_join_operator").is_some();
 
         if has_comma {
             self.format_comma_continuation(node)?;
         } else if has_set_operator {
             self.format_set_operator(node)?;
+        } else if let Some(op) = node.child_by_field_name("operator") {
+            // Unknown operator family — flag it rather than silently
+            // dropping the operator and its right side.
+            self.flag_unhandled(&op);
+        } else {
+            self.flag_unhandled(node);
         }
 
         Ok(())
@@ -29,20 +37,55 @@ impl<'a> Formatter<'a> {
 
     /// Format comma continuations with adaptive breaking
     pub(super) fn format_comma_continuation(&mut self, node: &Node) -> Result<()> {
-        // For adaptive breaking, check just this comma item's length
-        // First, find the continuation_expression child to get its text
-        let mut this_item_text = String::new();
+        // For adaptive breaking, measure just this comma item — by
+        // trial-formatting it, so the measure matches what will be
+        // emitted (source text spacing differs and is not pass-stable)
+        let mut this_item_len = 0;
         for child in node.children(&mut node.walk()) {
             if child.kind() == "continuation_expression" {
-                // Get the text of just this item (before any further commas)
-                this_item_text = self.get_single_continuation_item_text(&child);
+                if let Some(base) = self.find_child(&child, "continuation_base") {
+                    this_item_len =
+                        self.measure_formatted(|this| this.format_continuation_base(&base));
+                } else {
+                    this_item_len = self.get_single_continuation_item_text(&child).len();
+                }
                 break;
             }
         }
 
-        // Check if adding ", " plus this item would exceed the limit
-        let would_exceed = self.output.current_line_length() + 2 + this_item_text.len()
-            > self.config.continuation_length;
+        // Check if adding ", " plus this item would exceed the limit.
+        // "each": every clause takes its own line regardless of fit.
+        // "cascade": a group decision — the first comma of a query
+        // measures the whole remaining chain (this node's subtree);
+        // if it fits the width the entire chain joins, otherwise
+        // every clause breaks. The subtree measure is CST-derived,
+        // so the decision is pass-stable.
+        let would_exceed = match self.config.comma_clause_break {
+            crate::rules::ClauseBreak::Each => true,
+            crate::rules::ClauseBreak::Cascade => {
+                if self.comma_chain_broken.is_none() {
+                    // Probe the JOINED rendering of the whole chain by
+                    // trial-formatting it with the decision forced to
+                    // "join" — a measure that depends only on the CST
+                    // and config, so it is identical on every pass.
+                    // (compact_tokens is NOT pass-stable here: it
+                    // keeps source gap-existence, which is layout.)
+                    self.comma_chain_broken = Some(false);
+                    let pipe_saved = self.pipe_chain_broken;
+                    let probe = *node;
+                    let chain = self.measure_formatted(|this| this.format_binary_operator(&probe));
+                    self.pipe_chain_broken = pipe_saved;
+                    let fits = self.output.current_line_length() + chain
+                        <= self.config.pipe_break_width;
+                    self.comma_chain_broken = Some(!fits);
+                }
+                self.comma_chain_broken == Some(true)
+            }
+            crate::rules::ClauseBreak::Fit => {
+                self.output.current_line_length() + 2 + this_item_len
+                    > self.config.continuation_length
+            }
+        };
 
         // Only break if we would exceed AND we're not already at the beginning of a line
         if would_exceed && self.output.current_line_length() > self.config.continuation_indent {
@@ -71,11 +114,12 @@ impl<'a> Formatter<'a> {
         let mut operator_text = None;
         for child in node.children(&mut node.walk()) {
             match child.kind() {
-                "union_all_operator"
-                | "smart_union_all"
+                "smart_union_all"
                 | "union_all_positional"
                 | "union_corresponding"
-                | "minus_corresponding" => {
+                | "minus_corresponding"
+                | "er_join_operator"
+                | "er_transitive_join_operator" => {
                     operator_text = Some(self.node_text(&child).to_string());
                     break;
                 }
@@ -97,6 +141,16 @@ impl<'a> Formatter<'a> {
                 "relational_continuation" => {
                     // Handle further continuations (more unions, etc.)
                     self.format_relational_continuation(&child)?;
+                }
+                // The operator itself — already written above
+                "smart_union_all" | "union_all_positional" | "union_corresponding"
+                | "minus_corresponding" | "er_join_operator" | "er_transitive_join_operator" => {}
+                // A line comment needs its newline back or following
+                // tokens would be swallowed into it
+                "comment" => {
+                    self.output.write("  ");
+                    self.format_comment(&child)?;
+                    self.output.newline();
                 }
                 _ => self.flag_unhandled(&child),
             }
@@ -231,6 +285,7 @@ impl<'a> Formatter<'a> {
             match child.kind() {
                 "comparison" => self.format_comparison(&child)?,
                 "in_predicate" => self.format_in_predicate(&child)?,
+                "in_relational_predicate" => self.write_commas_tight(&child),
                 "inner_exists" => self.format_exists_expression(&child)?,
                 "sigma_call" => {
                     let text = self.node_text(&child).to_string();
@@ -278,9 +333,16 @@ impl<'a> Formatter<'a> {
             let text = self.node_text(&value).to_string();
             self.output.write(&text);
         }
-        if let Some(op) = node.child_by_field_name("operator") {
+        // The operator field holds ONE token for `in` but TWO for
+        // `not in` (each word is its own not_in_op). Echo the source
+        // span covering all of them — this also preserves the case
+        // spelling (`NOT IN` stays `NOT IN`).
+        let mut cursor = node.walk();
+        let ops: Vec<Node> = node.children_by_field_name("operator", &mut cursor).collect();
+        if let (Some(first), Some(last)) = (ops.first(), ops.last()) {
             self.output.write(" ");
-            self.output.write(&self.node_text(&op).to_string());
+            let span = &self.source[first.start_byte()..last.end_byte()];
+            self.output.write(&span.to_string());
             self.output.write(" ");
         }
         self.output.write("(");
@@ -304,7 +366,7 @@ impl<'a> Formatter<'a> {
         if let Some(ns_node) = node.child_by_field_name("namespace_path") {
             let ns_text = self.node_text(&ns_node).to_string();
             self.output.write(&ns_text);
-            self.output.write(".");
+            self.write_namespace_separator(node);
         }
 
         // Write table name
@@ -325,10 +387,7 @@ impl<'a> Formatter<'a> {
 
         // Handle alias if present
         if let Some(alias_node) = self.find_child(node, "table_alias") {
-            if let Some(name_node) = alias_node.child_by_field_name("name") {
-                self.output.write(" as ");
-                self.output.write(&self.node_text(&name_node).to_string());
-            }
+            self.write_table_alias(&alias_node);
         }
 
         Ok(())

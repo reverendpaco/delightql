@@ -141,11 +141,18 @@ pub enum Command {
         /// Source code or file path (if omitted, reads from stdin)
         source: Option<String>,
 
+        /// Style bundle from sys::format.bundle (e.g. "book"); a
+        /// .dql-format file still overrides individual knobs
+        #[arg(long)]
+        style: Option<String>,
+
         /// Use colored output (always, auto, never)
         #[arg(long, default_value = "auto")]
         color: ColorMode,
 
-        /// Exit 1 if input is not already formatted (for CI enforcement)
+        /// Print nothing; exit 0 if already formatted, 1 if not,
+        /// 2 if the formatter cannot determine (parse error, unhandled
+        /// construct). For CI enforcement.
         #[arg(long)]
         fail_if_not_formatted: bool,
 

@@ -9,6 +9,10 @@ impl<'a> Formatter<'a> {
     /// Format generalized projection [...] or (...)
     pub(super) fn format_generalized_projection(&mut self, node: &Node) -> Result<()> {
         let text = self.node_text(node).to_string();
+        // Break decisions measure the compact (CST-stable) width, not
+        // the raw text: raw text length includes newlines a previous
+        // pass inserted, which flips decisions between passes.
+        let compact_width = self.compact_tokens(node).len();
 
         // Determine if it's brackets or parentheses by checking child node kind
         let mut has_paren = false;
@@ -58,7 +62,7 @@ impl<'a> Formatter<'a> {
                             if !first {
                                 self.output.write(",");
                                 // Check if we need line break
-                                if text.len() > self.config.projection_length {
+                                if compact_width > self.config.projection_length {
                                     self.output.newline_with_indent(indent);
                                 } else {
                                     self.output.write(" ");
@@ -105,7 +109,7 @@ impl<'a> Formatter<'a> {
                                 } else if list_child.kind() == "domain_expression" {
                                     if !first || !list_first {
                                         self.output.write(",");
-                                        if text.len() > self.config.projection_length {
+                                        if compact_width > self.config.projection_length {
                                             self.output.newline_with_indent(indent);
                                         } else {
                                             self.output.write(" ");
@@ -127,34 +131,30 @@ impl<'a> Formatter<'a> {
 
             self.output.write(close);
         }
-        // Fall back to simple text output for other cases
-        else if text.len() > self.config.projection_length {
-            self.format_long_projection_list(&text, open, close);
-        } else {
+        // Fall back to verbatim text output for other cases
+        else {
             self.output.write(&text);
         }
         Ok(())
     }
 
-    /// Format long projection-style list
-    pub(super) fn format_long_projection_list(&mut self, text: &str, open: &str, close: &str) {
+    /// Format a delimited list one item per line, splitting on the list
+    /// node's own comma tokens — a textual split would cut inside
+    /// nested calls and string literals. `list_node` is the node whose
+    /// DIRECT children are the items and their `,` separators.
+    pub(super) fn format_long_list(&mut self, list_node: &Node, open: &str, close: &str) {
         self.output.write(open);
-
-        // Calculate indent before processing items
         let indent = self.output.current_line_length();
-
-        // Extract content between brackets/parens
-        let content = text.trim_start_matches(open).trim_end_matches(close);
-        let items: Vec<&str> = content.split(',').collect();
-
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
+        let mut cursor = list_node.walk();
+        for child in list_node.children(&mut cursor) {
+            if child.kind() == "," {
                 self.output.write(",");
                 self.output.newline_with_indent(indent);
+            } else {
+                let text = self.compact_tokens(&child);
+                self.output.write(&text);
             }
-            self.output.write(item.trim());
         }
-
         self.output.write(close);
     }
 
@@ -186,15 +186,22 @@ impl<'a> Formatter<'a> {
 
     /// Format grouping with parentheses %(...)
     pub(super) fn format_grouping_paren(&mut self, node: &Node) -> Result<()> {
-        let text = self.node_text(node).to_string();
+        // A line comment forbids single-lining and itemized relayout
+        // alike — everything re-joined after it would be swallowed by
+        // the comment. Echo the group verbatim, original layout kept.
+        if self.find_child_recursive(node, "comment").is_some() {
+            let text = self.node_text(node).to_string();
+            self.output.write(&text);
+            return Ok(());
+        }
+
+        // Token-safe compaction: a whitespace collapse on raw text
+        // would rewrite string literal interiors.
+        let compacted = self.compact_tokens(node);
 
         // Check if it has the aggregation arrow by looking for the CST node
-        let has_aggregation = self.find_child_recursive(node, "aggregation_arrow").is_some();
+        let has_aggregation = self.find_child(node, "aggregation_arrow").is_some();
         if has_aggregation {
-            // For aggregations, compact the whitespace before checking length
-            let compacted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-
-            // Check total length of compacted version
             if compacted.len() > self.config.projection_length {
                 self.format_long_aggregation(node)?;
             } else {
@@ -203,10 +210,14 @@ impl<'a> Formatter<'a> {
             }
         } else {
             // Simple grouping without aggregation
-            if text.len() > self.config.projection_length {
-                self.format_long_projection_list(&text, "(", ")");
+            if compacted.len() > self.config.projection_length {
+                if let Some(list) = self.find_child(node, "domain_expression_list") {
+                    self.format_long_list(&list, "(", ")");
+                } else {
+                    self.output.write(&compacted);
+                }
             } else {
-                self.output.write(&text);
+                self.output.write(&compacted);
             }
         }
         Ok(())
@@ -214,130 +225,90 @@ impl<'a> Formatter<'a> {
 
     /// Format grouping with brackets %[...]
     pub(super) fn format_grouping_bracket(&mut self, node: &Node) -> Result<()> {
-        let text = self.node_text(node).to_string();
+        let compacted = self.compact_tokens(node);
 
-        if text.len() > self.config.projection_length {
-            self.format_long_projection_list(&text, "[", "]");
+        if compacted.len() > self.config.projection_length {
+            if let Some(list) = self.find_child(node, "domain_expression_list") {
+                self.format_long_list(&list, "[", "]");
+            } else {
+                self.output.write(&compacted);
+            }
         } else {
-            self.output.write(&text);
+            self.output.write(&compacted);
         }
         Ok(())
     }
 
     /// Format long aggregation with ~> operator
     pub(super) fn format_long_aggregation(&mut self, node: &Node) -> Result<()> {
+        // grouping_paren: '(' reducing_by? aggregation_arrow reducing_on ')'
+        // reducing_by holds domain_expressions; reducing_on holds
+        // reduction_items (each carries its own alias, delegate, etc.,
+        // so items are echoed whole via token-safe compaction).
         self.output.write("(");
-
-        // Calculate indent before iteration
         let current_indent = self.output.current_line_length();
 
-        // Collect reducing_by, reducing_on, and arbitrary fields, plus operator text
-        let mut reducing_by_fields = Vec::new();
-        let mut reducing_on_fields = Vec::new();
-        let mut arbitrary_fields = Vec::new();
-        let mut aggregation_arrow_text = None;
-        let mut arbitrary_separator_text = None;
-        let mut found_arrow = false;
-        let mut found_arbitrary_separator = false;
+        let mut by_items: Vec<String> = Vec::new();
+        if let Some(by) = node.child_by_field_name("reducing_by") {
+            let mut c = by.walk();
+            for item in by.children(&mut c) {
+                if item.is_named() {
+                    by_items.push(self.compact_tokens(&item));
+                }
+            }
+        }
+        let mut on_items: Vec<String> = Vec::new();
+        if let Some(on) = node.child_by_field_name("reducing_on") {
+            let mut c = on.walk();
+            for item in on.children(&mut c) {
+                if item.is_named() {
+                    on_items.push(self.compact_tokens(&item));
+                }
+            }
+        }
+
+        // Any named child outside the three known parts means a
+        // construct this layout takes no position on — flag it rather
+        // than silently dropping its tokens.
         let mut cursor = node.walk();
-
         for child in node.children(&mut cursor) {
-            let child_text = self.node_text(&child);
+            if child.is_named()
+                && !matches!(
+                    child.kind(),
+                    "domain_expression_list" | "aggregation_arrow" | "reduction_item_list"
+                )
+            {
+                self.flag_unhandled(&child);
+            }
+        }
 
-            if child.kind() == "aggregation_arrow" {
-                found_arrow = true;
-                aggregation_arrow_text = Some(child_text.to_string());
-            } else if child.kind() == "arbitrary_separator" {
-                found_arbitrary_separator = true;
-                arbitrary_separator_text = Some(child_text.to_string());
-            } else if child.kind() == "domain_expression_list" {
-                // Collect all expressions in this list
-                let mut expr_cursor = child.walk();
-                for expr in child.children(&mut expr_cursor) {
-                    if expr.kind() == "domain_expression" {
-                        let expr_text = self.node_text(&expr).to_string();
-                        if found_arbitrary_separator {
-                            arbitrary_fields.push(expr_text);
-                        } else if !found_arrow {
-                            reducing_by_fields.push(expr_text);
-                        } else {
-                            reducing_on_fields.push(expr_text);
-                        }
+        let arrow = self
+            .find_child(node, "aggregation_arrow")
+            .map(|a| self.node_text(&a).to_string())
+            .unwrap_or_else(|| "~>".to_string());
+
+        let write_items = |this: &mut Self, items: &[String]| {
+            let one_line = items.join(", ");
+            if one_line.len() <= this.config.projection_length {
+                this.output.write(&one_line);
+            } else {
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        this.output.write(",");
+                        this.output.newline_with_indent(current_indent);
                     }
+                    this.output.write(item);
                 }
             }
-        }
+        };
 
-        // Check if reducing_by fields fit on one line
-        let reducing_by_str = reducing_by_fields.join(", ");
-        let reducing_by_one_line = reducing_by_str.len() <= self.config.projection_length;
-
-        // Check if reducing_on fields fit on one line
-        let reducing_on_str = reducing_on_fields.join(", ");
-        let reducing_on_one_line = reducing_on_str.len() <= self.config.projection_length;
-
-        // Format reducing_by fields
-        if reducing_by_one_line {
-            self.output.write(&reducing_by_str);
-        } else {
-            // Break into multiple lines
-            for (i, field) in reducing_by_fields.iter().enumerate() {
-                if i > 0 {
-                    self.output.write(",");
-                    self.output.newline_with_indent(current_indent);
-                }
-                self.output.write(field);
-            }
-        }
-
+        write_items(self, &by_items);
         // Arrow goes on new line with extra indent
         self.output
             .newline_with_indent(current_indent + self.config.aggregation_arrow_indent);
-        // Write the actual arrow operator from CST (e.g., "~>")
-        if let Some(arrow) = &aggregation_arrow_text {
-            self.output.write(arrow);
-        }
+        self.output.write(&arrow);
         self.output.newline_with_indent(current_indent);
-
-        // Format reducing_on fields
-        if reducing_on_one_line {
-            self.output.write(&reducing_on_str);
-        } else {
-            // Break into multiple lines
-            for (i, field) in reducing_on_fields.iter().enumerate() {
-                if i > 0 {
-                    self.output.write(",");
-                    self.output.newline_with_indent(current_indent);
-                }
-                self.output.write(field);
-            }
-        }
-
-        // Format arbitrary fields if present
-        if !arbitrary_fields.is_empty() {
-            // Write the actual separator operator from CST (e.g., "~?")
-            if let Some(sep) = &arbitrary_separator_text {
-                self.output.write(" ");
-                self.output.write(sep);
-                self.output.write(" ");
-            }
-
-            let arbitrary_str = arbitrary_fields.join(", ");
-            let arbitrary_one_line = arbitrary_str.len() <= self.config.projection_length;
-
-            if arbitrary_one_line {
-                self.output.write(&arbitrary_str);
-            } else {
-                // Break into multiple lines
-                for (i, field) in arbitrary_fields.iter().enumerate() {
-                    if i > 0 {
-                        self.output.write(",");
-                        self.output.newline_with_indent(current_indent);
-                    }
-                    self.output.write(field);
-                }
-            }
-        }
+        write_items(self, &on_items);
 
         self.output.write(")");
         Ok(())
@@ -384,7 +355,11 @@ impl<'a> Formatter<'a> {
         let text = self.node_text(node).to_string();
 
         if text.len() > self.config.projection_length {
-            self.format_long_projection_list(&text, "*(", ")");
+            if let Some(list) = self.find_child(node, "rename_list") {
+                self.format_long_list(&list, "*(", ")");
+            } else {
+                self.output.write(&text);
+            }
         } else {
             self.output.write(&text);
         }
@@ -448,6 +423,15 @@ impl<'a> Formatter<'a> {
                 } else {
                     ("(", ")")
                 };
+
+                // An if-only filter (`cols | pred`) shares the parens;
+                // the itemized layout below doesn't place it, so echo
+                // the whole column node token-safely instead.
+                if cols.child_by_field_name("filter_condition").is_some() {
+                    let text = self.compact_tokens(&cols);
+                    self.output.write(&text);
+                    return Ok(());
+                }
 
                 // Find and format the domain_expression_list inside
                 if let Some(list_node) = self.find_child(&cols, "domain_expression_list") {

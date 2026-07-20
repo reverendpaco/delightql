@@ -3,11 +3,157 @@
 use tree_sitter::Node;
 
 use super::core::Formatter;
+use crate::builder::OutputBuilder;
+
+/// Collect a node's leaf tokens in document order (comments included).
+fn collect_leaves<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    if node.child_count() == 0 {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_leaves(child, out);
+    }
+}
 
 impl<'a> Formatter<'a> {
     /// Helper: Find child node by kind
     pub(super) fn find_child(&self, node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
         node.children(&mut node.walk()).find(|n| n.kind() == kind)
+    }
+
+    /// Trial-format into a scratch buffer and return the widest line.
+    /// Line-break decisions must measure what the formatter WILL emit,
+    /// not the source text: emitted spacing differs from the source's,
+    /// and a source-dependent measure flips decisions between passes.
+    /// This measure depends only on the CST, which the token-stream
+    /// law keeps invariant — so decisions are pass-stable.
+    pub(super) fn measure_formatted<F>(&mut self, f: F) -> usize
+    where
+        F: FnOnce(&mut Self) -> anyhow::Result<()>,
+    {
+        let saved = std::mem::replace(&mut self.output, OutputBuilder::new());
+        let _ = f(self);
+        let probe = std::mem::replace(&mut self.output, saved);
+        probe.build().lines().map(|l| l.len()).max().unwrap_or(0)
+    }
+
+    /// Write a table_alias (` as name`). The keyword is a hidden token
+    /// living between the alias node's start and the name; echo it
+    /// from the source to keep its spelling (as/AS/…).
+    pub(super) fn write_table_alias(&mut self, alias_node: &Node) {
+        if let Some(name) = alias_node.child_by_field_name("name") {
+            let kw = self.source[alias_node.start_byte()..name.start_byte()]
+                .trim()
+                .to_string();
+            self.output.write(" ");
+            if kw.is_empty() {
+                self.output.write("as");
+            } else {
+                self.output.write(&kw);
+            }
+            self.output.write(" ");
+            let name_text = self.node_text(&name).to_string();
+            self.output.write(&name_text);
+        }
+    }
+
+    /// Write the namespace–table separator as spelled in the source:
+    /// the passthrough `/` is its own named node; plain `.` is not.
+    pub(super) fn write_namespace_separator(&mut self, node: &Node) {
+        let mut cursor = node.walk();
+        let sep = node
+            .children(&mut cursor)
+            .find(|n| n.kind() == "passthrough_separator");
+        match sep {
+            Some(s) => {
+                let text = self.node_text(&s).to_string();
+                self.output.write(&text);
+            }
+            None => self.output.write("."),
+        }
+    }
+
+    /// Compact a node to one line, token-safely: token texts verbatim,
+    /// each inter-token gap collapsed to a single space (none before
+    /// closing/separator punctuation or after openers). Interiors of
+    /// tokens — string literals — are untouched, and a gap is never
+    /// invented where the source has none, so `token.immediate`
+    /// boundaries survive.
+    pub(super) fn compact_tokens(&self, node: &Node) -> String {
+        let mut leaves = Vec::new();
+        collect_leaves(*node, &mut leaves);
+        let mut out = String::new();
+        let mut prev_end: Option<usize> = None;
+        for leaf in leaves {
+            let text = &self.source[leaf.byte_range()];
+            if let Some(pe) = prev_end {
+                let gap = &self.source[pe..leaf.start_byte()];
+                // A gap can carry HIDDEN tokens (the alias keyword
+                // `as`, the tree-group inducer `:~>`); those must
+                // survive, and with their original ADJACENCY — an
+                // immediate token padded away from its host re-lexes
+                // as something else.
+                let hidden = gap.split_whitespace().collect::<Vec<_>>().join(" ");
+                if hidden.is_empty() {
+                    let tight = matches!(text, "," | ";" | ")" | "]")
+                        || out.ends_with('(')
+                        || out.ends_with('[');
+                    if !gap.is_empty() && !tight {
+                        out.push(' ');
+                    }
+                } else {
+                    if gap.starts_with(char::is_whitespace) {
+                        out.push(' ');
+                    }
+                    out.push_str(&hidden);
+                    if gap.ends_with(char::is_whitespace) {
+                        out.push(' ');
+                    }
+                }
+            }
+            out.push_str(text);
+            prev_end = Some(leaf.end_byte());
+        }
+        out
+    }
+
+    /// Echo a node's tokens verbatim, normalizing the whitespace
+    /// around comma tokens to the comma_join_args policy: tight
+    /// `a,b`, oxford `a, b`, loose `a , b`. Works on the token
+    /// stream, not the text — a textual replace reaches inside
+    /// string literals.
+    pub(super) fn write_commas_tight(&mut self, node: &Node) {
+        use crate::rules::CommaJoin;
+        let policy = self.config.comma_join_args;
+        let mut leaves = Vec::new();
+        collect_leaves(*node, &mut leaves);
+        let mut out = String::new();
+        let mut prev_end: Option<usize> = None;
+        for leaf in leaves {
+            let text = &self.source[leaf.byte_range()];
+            if let Some(pe) = prev_end {
+                let gap = &self.source[pe..leaf.start_byte()];
+                if !gap.trim().is_empty() {
+                    // A gap carrying HIDDEN tokens (e.g. the alias
+                    // keyword `as`) must survive, comma or not.
+                    out.push_str(gap);
+                } else if out.ends_with(',') {
+                    match policy {
+                        CommaJoin::Tight => {}
+                        CommaJoin::Oxford | CommaJoin::Loose => out.push(' '),
+                    }
+                } else if text == "," && policy == CommaJoin::Loose {
+                    out.push(' ');
+                } else if !(text == ",") {
+                    out.push_str(gap);
+                }
+            }
+            out.push_str(text);
+            prev_end = Some(leaf.end_byte());
+        }
+        self.output.write(&out);
     }
 
     /// Recursively find a child node with a specific kind
@@ -64,8 +210,11 @@ impl<'a> Formatter<'a> {
 
         for child in node.children(&mut node.walk()) {
             if child.kind() == "continuation_base" {
-                // This is just the table/predicate part, without further continuations
-                return self.node_text(&child).to_string();
+                // This is just the table/predicate part, without
+                // further continuations. Compacted, not raw: the raw
+                // text's newlines/indent vary between passes, and a
+                // layout-dependent measure breaks idempotence.
+                return self.compact_tokens(&child);
             }
         }
 

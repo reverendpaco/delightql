@@ -21,8 +21,14 @@ pub struct Formatter<'a> {
     /// to the original input.
     pub(crate) hit_unknown: bool,
     /// The kind of the FIRST unrecognized named node, so pass-through can
-    /// name what blocked it (PLAN.md #3A).
+    /// name what blocked it.
     pub(crate) unknown_kind: Option<String>,
+    /// Under pipe_break=fit, set once a pipe in the current query's
+    /// chain breaks — later pipes then cascade onto their own lines.
+    pub(super) pipe_chain_broken: bool,
+    /// Under comma_clause_break=cascade, the query's one group
+    /// decision: None until the first comma measures the chain.
+    pub(super) comma_chain_broken: Option<bool>,
 }
 
 impl<'a> Formatter<'a> {
@@ -35,6 +41,8 @@ impl<'a> Formatter<'a> {
             base_indent: 0,
             hit_unknown: false,
             unknown_kind: None,
+            pipe_chain_broken: false,
+            comma_chain_broken: None,
         }
     }
 
@@ -52,6 +60,15 @@ impl<'a> Formatter<'a> {
     /// Anonymous tokens (punctuation, keywords) are expected to be skipped.
     pub(super) fn flag_unhandled(&mut self, node: &Node) {
         if node.is_named() {
+            if std::env::var_os("DQL_FMT_DEBUG").is_some() {
+                let mut chain = node.kind().to_string();
+                let mut cur = *node;
+                while let Some(p) = cur.parent() {
+                    chain = format!("{} > {}", p.kind(), chain);
+                    cur = p;
+                }
+                eprintln!("flag_unhandled: {chain}");
+            }
             if !self.hit_unknown {
                 self.unknown_kind = Some(node.kind().to_string());
             }
@@ -65,7 +82,19 @@ impl<'a> Formatter<'a> {
             "source_file" => {
                 // Process all children including comments
                 let children = self.children_with_comments(node);
+                let mut prev_end: Option<usize> = None;
                 for child in children {
+                    // Blank lines between top-level items are the
+                    // author's grouping; preserve one when asked.
+                    if self.config.blank_lines == crate::rules::BlankLines::Preserve {
+                        if let Some(pe) = prev_end {
+                            let gap = &self.source[pe..child.start_byte()];
+                            if gap.matches('\n').count() >= 2 {
+                                self.output.blank_line();
+                            }
+                        }
+                    }
+                    prev_end = Some(child.end_byte());
                     match child.kind() {
                         "comment" => {
                             self.format_comment(&child)?;
@@ -104,6 +133,9 @@ impl<'a> Formatter<'a> {
 
     /// Format a query node
     pub(super) fn format_query(&mut self, node: &Node) -> Result<()> {
+        // Each query starts fresh chains for the cascade rules.
+        self.pipe_chain_broken = false;
+        self.comma_chain_broken = None;
         let children = self.children_with_comments(node);
         for child in children {
             match child.kind() {
@@ -127,6 +159,24 @@ impl<'a> Formatter<'a> {
                 }
                 "cfe_definition" => {
                     self.format_cfe_definition(&child)?;
+                }
+                // ER context line (`under mfg:`) — echoed; inline
+                // keeps its query on the same line
+                "er_context_directive" => {
+                    let text = self.node_text(&child).to_string();
+                    self.output.write(&text);
+                    if self.config.under_context_placement == crate::rules::Placement::OwnLine {
+                        self.output.newline();
+                    } else {
+                        self.output.write(" ");
+                    }
+                }
+                // Inline DDL block — the body has its own layout;
+                // echo it verbatim, newlines and all
+                "ddl_annotation" => {
+                    let text = self.node_text(&child).to_string();
+                    self.output.write(&text);
+                    self.output.newline();
                 }
                 _ => self.flag_unhandled(&child),
             }

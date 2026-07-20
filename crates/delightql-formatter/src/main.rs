@@ -14,7 +14,9 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Exit 1 if input is not already formatted (for CI enforcement)
+    /// Print nothing; exit 0 if already formatted, 1 if not,
+    /// 2 if the formatter cannot determine (parse error, unhandled
+    /// construct). For CI enforcement.
     #[arg(long)]
     fail_if_not_formatted: bool,
 }
@@ -37,18 +39,58 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("Must provide source code, file path, or pipe input to format");
     };
 
-    // Load config
-    let config = delightql_formatter::load_config(args.config.as_deref());
+    // Load config. An explicitly named file must exist AND read —
+    // missing, permission-denied, and non-UTF-8 all refuse; only the
+    // implicitly discovered .dql-format may be quietly absent.
+    if let Some(ref p) = args.config {
+        if let Err(e) = std::fs::read_to_string(p) {
+            anyhow::bail!("--config {}: {e}", p.display());
+        }
+    }
+    let (config, warnings) = delightql_formatter::load_config_report(args.config.as_deref());
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
 
     // Get language
     let language = delightql_formatter::language();
 
     // Format
-    let formatted = delightql_formatter::format(&source, &language, &config)?;
+    let outcome = delightql_formatter::format_outcome(&source, &language, &config)?;
+
+    // Pass-through is safe but loud; "cannot determine" exits 2 so CI
+    // can tell a formatter gap (2) from needs-formatting (1).
+    if let delightql_formatter::FormatOutcome::PassedThrough { ref reason, .. } = outcome {
+        use delightql_formatter::PassReason;
+        match reason {
+            PassReason::ParseError => {
+                eprintln!("warning: input does not parse; returned unchanged");
+                // No formatted form of unparseable input exists —
+                // "cannot determine" in both modes.
+                if !args.fail_if_not_formatted {
+                    print!("{}", outcome.text());
+                }
+                std::process::exit(2);
+            }
+            PassReason::UnhandledNode(kind) => eprintln!(
+                "warning: formatter does not yet handle node '{kind}'; \
+                 input returned unchanged"
+            ),
+            PassReason::TokenStreamChanged(detail) => eprintln!(
+                "warning: formatting would have changed the token stream \
+                 ({detail}); input returned unchanged"
+            ),
+        }
+        if args.fail_if_not_formatted {
+            std::process::exit(2);
+        }
+    }
+    let formatted = outcome.text();
 
     if args.fail_if_not_formatted {
-        // Exit 1 if input differs from formatted output
-        if source != formatted {
+        // A missing final newline alone is forgiven — SOURCE may be a
+        // literal command-line string, which naturally has none.
+        if source != formatted && format!("{source}\n") != formatted {
             std::process::exit(1);
         }
     } else {

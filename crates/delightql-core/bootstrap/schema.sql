@@ -788,3 +788,48 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('diagnostic', 'autoload/consult_failed', 'An autoload module parsed but failed to register.', 'The module parsed, but consulting it (registering its rules/entities) failed — typically a rule references a relation or namespace that does not exist. Check the referenced names in the module against what is available at load time. The finding''s detail carries the consult error.'),
     ('diagnostic', 'catalog', 'Integrity of the entity catalog.', 'The catalog provider (dql selftest) checks that the compiler''s own system tables are properly placed in the catalog. Members: catalog/orphaned_entity.'),
     ('diagnostic', 'catalog/orphaned_entity', 'A system table has no namespace address.', 'A physical system table exists (and is queryable by direct name via the schema fallback) but has no activated_entity row, so it lives in no sys:: namespace and is invisible to the namespace-organized views (sys::util.tables_as_d2, catalog enumeration). Doctrine: everything the compiler or runtime uses should be dogfood-exposed — there are no intentional hidden internals. Fix: activate the table into its namespace (import/activation.rs + import/namespace.rs), as sys::targeting did for the dialect_* tables.');
+
+-- ----------------------------------------------------------------------------
+-- sys::format — the formatter's style bundles as burned rows.
+-- AUTHORED-AS-DATA: the 'book' row IS the frozen default style; the
+-- delightql-cli weld asserts it never drifts from the formatter's
+-- FormatConfig::default(), and the column set never drifts from the
+-- formatter's knob registry (rules::KNOBS). NULL in a non-book row
+-- means "inherit from book". Every column governs WHITESPACE only —
+-- no bundle can change a token. Resolution order at `dql format`:
+-- code defaults, then the selected bundle row, then .dql-format.
+-- Addressed as sys::format.bundle(*) (registered in system.rs
+-- alongside the other sys tables).
+-- ----------------------------------------------------------------------------
+CREATE TABLE bundle (
+    bundle                     TEXT NOT NULL PRIMARY KEY,
+    projection_length          INTEGER,
+    continuation_length        INTEGER,
+    pipe_indent                INTEGER,
+    continuation_indent        INTEGER,
+    map_cover_extra_indent     INTEGER,
+    aggregation_arrow_indent   INTEGER,
+    cte_indent                 INTEGER,
+    cte_columnar_padding       INTEGER,
+    curly_member_indent        INTEGER,
+    curly_inducer_indent       INTEGER,
+    case_arm_indent            INTEGER,
+    pipe_break_width           INTEGER,
+    member_landing_pad         INTEGER,
+    pipe_break                 TEXT,
+    comma_clause_break         TEXT,
+    comma_join_args            TEXT,
+    brace_padding              TEXT,
+    member_landing             TEXT,
+    closer_placement           TEXT,
+    tree_inducer_break         TEXT,
+    member_value_break         TEXT,
+    annotation_placement       TEXT,
+    under_context_placement    TEXT,
+    blank_lines                TEXT,
+    cte_style                  TEXT,
+    curly_opening_brace_inline INTEGER
+);
+
+INSERT INTO bundle (bundle, projection_length, continuation_length, pipe_indent, continuation_indent, map_cover_extra_indent, aggregation_arrow_indent, cte_indent, cte_columnar_padding, curly_member_indent, curly_inducer_indent, case_arm_indent, pipe_break_width, member_landing_pad, pipe_break, comma_clause_break, comma_join_args, brace_padding, member_landing, closer_placement, tree_inducer_break, member_value_break, annotation_placement, under_context_placement, blank_lines, cte_style, curly_opening_brace_inline)
+VALUES ('book', 72, 40, 2, 2, 4, 2, 3, 7, 5, 3, 3, 80, 2, 'fit', 'cascade', 'oxford', 'none', 'offset', 'own_line', 'always', 'always', 'inline', 'inline', 'preserve', 'subordinate', 0);

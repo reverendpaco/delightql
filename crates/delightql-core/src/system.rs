@@ -384,6 +384,134 @@ fn register_sys_identifier_table(bootstrap_conn: &Connection, bootstrap_conn_id:
     Ok(())
 }
 
+/// Register the burned formatter style-bundle table as
+/// `sys::format.bundle`. The physical table and its 'book' row live in
+/// bootstrap/schema.sql; the column list here mirrors the formatter's
+/// knob registry plus the leading `bundle` key. Its own cartridge so
+/// bulk activation cannot leak it into bare `sys`.
+fn register_sys_format_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64) -> Result<()> {
+    bootstrap_conn
+        .execute(
+            "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+             VALUES (?1, ?2, 'sys://format', NULL, 1, ?3, 0)",
+            rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to create sys::format cartridge: {}", e),
+                e.to_string(),
+            )
+        })?;
+    let format_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
+
+    let format_ns_id: i32 = bootstrap_conn
+        .query_row(
+            "SELECT id FROM namespace WHERE fq_name = 'sys::format'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to query sys::format namespace: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO entity (name, type, cartridge_id) VALUES ('bundle', 10, ?1)",
+            rusqlite::params![format_cartridge_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to insert sys::format.bundle entity: {}", e),
+                e.to_string(),
+            )
+        })?;
+    let entity_id = bootstrap_conn.last_insert_rowid() as i32;
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO entity_clause (entity_id, ordinal, definition)
+             VALUES (?1, 1, '-- formatter style bundles (book row = frozen defaults)')",
+            rusqlite::params![entity_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to insert sys::format.bundle clause: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    let columns: &[(&str, &str, bool)] = &[
+        ("bundle", "TEXT", false),
+        ("projection_length", "INTEGER", true),
+        ("continuation_length", "INTEGER", true),
+        ("pipe_indent", "INTEGER", true),
+        ("continuation_indent", "INTEGER", true),
+        ("map_cover_extra_indent", "INTEGER", true),
+        ("aggregation_arrow_indent", "INTEGER", true),
+        ("cte_indent", "INTEGER", true),
+        ("cte_columnar_padding", "INTEGER", true),
+        ("curly_member_indent", "INTEGER", true),
+        ("curly_inducer_indent", "INTEGER", true),
+        ("case_arm_indent", "INTEGER", true),
+        ("pipe_break_width", "INTEGER", true),
+        ("member_landing_pad", "INTEGER", true),
+        ("pipe_break", "TEXT", true),
+        ("comma_clause_break", "TEXT", true),
+        ("comma_join_args", "TEXT", true),
+        ("brace_padding", "TEXT", true),
+        ("member_landing", "TEXT", true),
+        ("closer_placement", "TEXT", true),
+        ("tree_inducer_break", "TEXT", true),
+        ("member_value_break", "TEXT", true),
+        ("annotation_placement", "TEXT", true),
+        ("under_context_placement", "TEXT", true),
+        ("blank_lines", "TEXT", true),
+        ("cte_style", "TEXT", true),
+        ("curly_opening_brace_inline", "INTEGER", true),
+    ];
+    for (position, (col_name, data_type, nullable)) in columns.iter().enumerate() {
+        bootstrap_conn
+            .execute(
+                "INSERT INTO entity_attribute
+                 (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
+                 VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
+                rusqlite::params![
+                    entity_id,
+                    col_name,
+                    data_type,
+                    (position + 1) as i32,
+                    *nullable
+                ],
+            )
+            .map_err(|e| {
+                DelightQLError::database_error(
+                    format!(
+                        "Failed to insert sys::format.bundle column '{}': {}",
+                        col_name, e
+                    ),
+                    e.to_string(),
+                )
+            })?;
+    }
+
+    bootstrap_conn
+        .execute(
+            "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![entity_id, format_ns_id, format_cartridge_id],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to activate sys::format.bundle: {}", e),
+                e.to_string(),
+            )
+        })?;
+
+    Ok(())
+}
+
 /// Register the CURATED `connection` entity in sys::connections.
 ///
 /// Register the `connection` entity in sys::connections as an explicit column
@@ -3457,6 +3585,10 @@ impl DelightQLSystem {
         // activation above cannot leak it into bare `sys`.
         register_sys_identifier_table(&bootstrap_conn, bootstrap_conn_id)?;
 
+        // sys::format: the burned formatter style-bundle table (book row
+        // = frozen defaults).
+        register_sys_format_table(&bootstrap_conn, bootstrap_conn_id)?;
+
         // sys::connections: the curated safe-subset `connection` entity
         // (non-secret columns only). Own cartridge so the bulk activation
         // above cannot leak it into bare `sys`.
@@ -4364,6 +4496,9 @@ impl DelightQLSystem {
             )
         })?;
 
+        // sys::format: burned formatter style bundles (mirrors the
+        // primary bootstrap path).
+        register_sys_format_table(&bootstrap_conn, bootstrap_conn_id)?;
         // sys::connections: curated safe-subset `connection` entity, own
         // cartridge (mirrors the primary bootstrap path).
         register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;

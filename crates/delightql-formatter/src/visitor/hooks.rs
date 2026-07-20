@@ -68,12 +68,16 @@ impl<'a> Formatter<'a> {
         Ok(())
     }
 
-    /// Format emit annotation: (~~emit[:name] [body] ~~)
+    /// Format emit annotation: (~~emit[:name|://uri] [body] ~~)
     fn format_emit_annotation(&mut self, node: &Node) -> Result<()> {
         self.output.write(" (~~emit");
         if let Some(name_node) = node.child_by_field_name("emit_name") {
             self.output.write(":");
             self.output.write(&self.node_text(&name_node).to_string());
+        }
+        if let Some(uri_node) = node.child_by_field_name("emit_uri") {
+            self.output.write("://");
+            self.output.write(&self.node_text(&uri_node).to_string());
         }
         if let Some(body_node) = node.child_by_field_name("emit_body") {
             self.format_relational_continuation(&body_node)?;

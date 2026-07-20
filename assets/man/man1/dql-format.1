@@ -1,4 +1,4 @@
-.TH DQL-FORMAT 1 "2026-07-05" "dql 0.1.0" "DelightQL Manual"
+.TH DQL-FORMAT 1 "2026-07-19" "dql 0.1.0" "DelightQL Manual"
 .SH NAME
 dql-format \- format/prettify DelightQL source
 .SH SYNOPSIS
@@ -14,8 +14,17 @@ itself is treated as source. If
 .I SOURCE
 is omitted, stdin is read.
 .PP
-Unparseable input is refused (exit 1, "Parse error in input query").
+The formatter changes whitespace and nothing else: the output is
+token-for-token identical to the input, comments included, and ends
+with a final newline. Input that does not parse cleanly is passed
+through unchanged with a warning on stderr, and the exit status is 2
+(see EXIT STATUS).
 .SH OPTIONS
+.TP
+.BI \-\-style " BUNDLE"
+Apply a named style bundle from the
+.B sys::format.bundle
+system table (see CONFIGURATION). An unknown bundle name refuses.
 .TP
 .BI \-\-color " WHEN"
 Colored output:
@@ -27,29 +36,72 @@ or
 .BR never .
 .TP
 .B \-\-fail\-if\-not\-formatted
-Print nothing; exit 1 if the input is not already formatted, 0 if it
-is, 2 if the formatter cannot verify the input (see PASS-THROUGH).
-For CI enforcement.
+Print nothing; exit 0 if the input is already formatted, 1 if it is
+not, 2 if the formatter cannot determine (parse error or pass-through,
+see EXIT STATUS). A missing final newline alone does not count as
+unformatted, so a literal command-line
+.I SOURCE
+is not penalized. For CI enforcement.
 .TP
 .BI \-\-highlights " FILE"
 Path to a highlights.scm file.
 .TP
 .BI \-\-theme " FILE"
 Path to a theme file.
+.SH CONFIGURATION
+Layout knobs resolve in three layers, later layers overriding
+earlier: the frozen defaults (the
+.B book
+style), then the bundle selected with
+.BR \-\-style ,
+then a
+.B .dql-format
+file in the working directory overriding individual knobs. Every knob
+governs whitespace only \(em no configuration can change a token.
+.PP
+The knob inventory is itself queryable data: the
+.B sys::format.bundle
+system table carries one row per named style, with one column per
+knob; the
+.B book
+row is the frozen default style. NULL in a bundle column means the
+knob is inherited from the defaults. List the styles and knobs with
+.EX
+$ dql query 'sys::format.bundle(*)'
+.EE
+.PP
+A
+.B .dql-format
+line naming an unknown knob, or an unparsable value, is warned about
+on stderr \(em a typo'd key never silently does nothing.
 .SH EXIT STATUS
-0 on success (or already formatted); 1 on parse error or, with
+The tri-state of the tool-formatter lineage (gofmt, rustfmt):
+.TP
+.B 0
+success; with
 .BR \-\-fail\-if\-not\-formatted ,
-on unformatted input; 2, with
+the input is already formatted.
+.TP
+.B 1
+with
 .BR \-\-fail\-if\-not\-formatted ,
-when the formatter passed the input through unverified.
+the input is not formatted (reformatting would change it).
+.TP
+.B 2
+cannot determine: the input does not parse (both modes), or the
+formatter passed it through unverified (with
+.BR \-\-fail\-if\-not\-formatted ;
+see PASS-THROUGH).
 .SH PASS-THROUGH
 Constructs the formatter does not yet handle are passed through
 byte-for-byte rather than risk corrupting code \(em but loudly: a
 warning on stderr names the first unhandled construct
 (\(dqformatter does not yet handle node 'pipe_operator'\(dq), and
 .B \-\-fail\-if\-not\-formatted
-exits 2 (\(dqcannot verify\(dq), never 0, so a CI gate can
-distinguish a formatter gap from verified-formatted code.
+exits 2 (\(dqcannot determine\(dq), never 0, so a CI gate can
+distinguish a formatter gap from verified-formatted code. The same
+applies when the formatter discards its own work because the output's
+token stream diverged from the input's.
 .SH EXAMPLES
 .EX
 $ dql format 'a(*),b(*),a.id=b.id'
@@ -65,8 +117,7 @@ group-pipes
 and anonymous tables
 .RB ( _(1,2;3,4) )
 currently pass through (loudly \(em see PASS-THROUGH) instead of
-being formatted. Coverage work is tracked as
-bugs/cli-surface-2026-07-05/PLAN.md #3B.
+being formatted.
 .SH SEE ALSO
 .BR dql (1),
 .BR dql-query (1)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 mod builder;
+pub mod registry;
 pub mod rules;
 mod visitor;
 
@@ -8,7 +9,7 @@ use anyhow::Result;
 use std::path::Path;
 use tree_sitter::{Language, Parser};
 
-pub use rules::{CteStyle, FormatConfig};
+pub use rules::{CteStyle, FormatConfig, Knob, KNOBS};
 pub use visitor::Formatter;
 
 /// Get the bundled tree-sitter Language for DQL.
@@ -21,42 +22,21 @@ pub fn language() -> Language {
     unsafe { tree_sitter_delightql_v2() }
 }
 
-/// Check if tree has bang operator error pattern (pseudo-predicates or not expressions)
-/// Tree-sitter creates ERROR nodes with "not_exists" for `!` but still successfully parses
-fn has_bang_operator_error_pattern(tree: &tree_sitter::Tree, source: &str) -> bool {
-    fn check_node(node: tree_sitter::Node, _source: &[u8]) -> (bool, bool) {
-        let mut has_error_with_not_exists = false;
-        let mut has_successful_bang_node = false;
-
-        // Check if this node is an ERROR containing "not_exists"
-        if node.is_error() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "not_exists" {
-                    has_error_with_not_exists = true;
-                    break;
-                }
-            }
-        }
-
-        // Check if this is a successful not_expression or pseudo_predicate_call
-        if node.kind() == "not_expression" || node.kind() == "pseudo_predicate_call" {
-            has_successful_bang_node = true;
-        }
-
-        // Recurse into children
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            let (child_error, child_success) = check_node(child, _source);
-            has_error_with_not_exists = has_error_with_not_exists || child_error;
-            has_successful_bang_node = has_successful_bang_node || child_success;
-        }
-
-        (has_error_with_not_exists, has_successful_bang_node)
-    }
-
-    let (has_error, has_success) = check_node(tree.root_node(), source.as_bytes());
-    has_error && has_success
+/// Why the formatter returned the input unchanged instead of formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PassReason {
+    /// The input does not parse cleanly. The formatter formats only
+    /// what it can fully read; recovery trees are not a formatting
+    /// substrate.
+    ParseError,
+    /// The visitor met a named node kind it takes no position on yet;
+    /// the string names the first such kind.
+    UnhandledNode(String),
+    /// The formatted output's token stream diverged from the input's —
+    /// the reflow crossed a whitespace-sensitive boundary or the
+    /// visitor dropped/rewrote a token. The string describes the first
+    /// diverging token.
+    TokenStreamChanged(String),
 }
 
 /// What `format_outcome` actually did — the safety fallbacks (return the
@@ -65,15 +45,12 @@ fn has_bang_operator_error_pattern(tree: &tree_sitter::Tree, source: &str) -> bo
 /// formatted" from "formatter gave up" blesses unformatted code.
 #[derive(Debug)]
 pub enum FormatOutcome {
-    /// The visitor handled everything and the result re-parses.
+    /// The visitor handled everything and the output is token-stream
+    /// identical to the input (same (kind, text) sequence, comments
+    /// included). Always ends with a final newline.
     Formatted(String),
-    /// Input returned byte-for-byte unchanged. `node_kind` names the
-    /// first construct the visitor doesn't handle; `None` means the
-    /// formatted text re-parsed worse than the input did (level-1 bail).
-    PassedThrough {
-        source: String,
-        node_kind: Option<String>,
-    },
+    /// Input returned byte-for-byte unchanged; `reason` says why.
+    PassedThrough { source: String, reason: PassReason },
 }
 
 impl FormatOutcome {
@@ -117,10 +94,14 @@ pub fn format_outcome(
         .parse(source, None)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse query"))?;
 
-    // Check for parse errors
-    // Allow errors if they match the known bang operator pattern (! in pseudo-predicates and not expressions)
-    if tree.root_node().has_error() && !has_bang_operator_error_pattern(&tree, source) {
-        return Err(anyhow::anyhow!("Parse error in input query"));
+    // Error-free parses only: a recovery tree's shape is unstable
+    // across grammar regenerations, so formatting one risks silent
+    // corruption. Pass through instead.
+    if tree.root_node().has_error() {
+        return Ok(FormatOutcome::PassedThrough {
+            source: source.to_string(),
+            reason: PassReason::ParseError,
+        });
     }
 
     // Create formatter and visit the tree
@@ -130,106 +111,188 @@ pub fn format_outcome(
     // Level 2: If the visitor hit an unrecognized named node, the output
     // may be incomplete — bail to the original input, naming the node.
     if formatter.hit_unknown {
-        let node_kind = formatter.unknown_kind.clone();
+        let node_kind = formatter.unknown_kind.clone().unwrap_or_default();
         return Ok(FormatOutcome::PassedThrough {
             source: source.to_string(),
-            node_kind,
+            reason: PassReason::UnhandledNode(node_kind),
         });
     }
 
-    let formatted = formatter.output();
+    let mut formatted = formatter.output();
 
-    // Level 1: Re-parse the formatted output.  If formatting introduced
-    // parse errors that weren't in the original, return the original.
-    let reparse_tree = parser
-        .parse(&formatted, None)
-        .ok_or_else(|| anyhow::anyhow!("Failed to re-parse formatted output"))?;
+    // Level 1: token-stream identity. The parser is deterministic, so
+    // an identical (kind, text) leaf sequence — comments included —
+    // implies an identical CST: the formatter changed whitespace and
+    // nothing else. This also covers token.immediate boundaries (the
+    // metadata colon, CTE label necks), where whitespace placement
+    // changes the token stream itself.
+    let reparse_tree = match parser.parse(&formatted, None) {
+        Some(t) => t,
+        None => {
+            return Ok(FormatOutcome::PassedThrough {
+                source: source.to_string(),
+                reason: PassReason::TokenStreamChanged(
+                    "formatted output failed to parse at all".to_string(),
+                ),
+            });
+        }
+    };
 
-    let original_has_error = tree.root_node().has_error();
-    let formatted_has_error = reparse_tree.root_node().has_error();
-
-    if formatted_has_error && !original_has_error {
-        // Formatting broke something — return original unchanged
+    if let Some(divergence) = first_token_divergence(&tree, source, &reparse_tree, &formatted) {
+        // The discarded output is otherwise invisible; surface it for
+        // visitor debugging on request.
+        if std::env::var_os("DQL_FMT_DEBUG").is_some() {
+            eprintln!("--- discarded formatted output ---\n{formatted}\n---");
+        }
         return Ok(FormatOutcome::PassedThrough {
             source: source.to_string(),
-            node_kind: None,
+            reason: PassReason::TokenStreamChanged(divergence),
         });
+    }
+
+    // Canonical form ends with a final newline, like the peer
+    // formatters — check mode byte-compares against POSIX files.
+    if !formatted.ends_with('\n') {
+        formatted.push('\n');
     }
 
     Ok(FormatOutcome::Formatted(formatted))
 }
 
-/// Load format configuration from a .dql-format file.
-/// If path is None, searches the current working directory.
-pub fn load_config(path: Option<&Path>) -> FormatConfig {
+/// Collect the leaf tokens of a parse tree in document order as
+/// (kind, text) pairs. Leaves include anonymous tokens and comments.
+/// Hidden tokens (e.g. the alias keyword `as`) have NO node in the
+/// tree — they live in the gaps between leaves — so each non-blank
+/// gap word is emitted as a ("hidden", word) pseudo-token. Without
+/// this, dropping a hidden token would be invisible to the stream
+/// comparison whenever the result still parses.
+fn collect_leaf_tokens<'s>(
+    node: tree_sitter::Node,
+    source: &'s str,
+    prev_end: &mut usize,
+    out: &mut Vec<(&'static str, &'s str)>,
+) {
+    if node.child_count() == 0 {
+        let start = node.start_byte();
+        if start > *prev_end {
+            for word in source[*prev_end..start].split_whitespace() {
+                out.push(("hidden", word));
+            }
+        }
+        out.push((node.kind(), &source[node.byte_range()]));
+        *prev_end = node.end_byte();
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_leaf_tokens(child, source, prev_end, out);
+    }
+}
+
+/// Compare the leaf token streams of two parses; `None` means identical.
+/// `Some` describes the first diverging token for the diagnostic.
+fn first_token_divergence(
+    original: &tree_sitter::Tree,
+    original_src: &str,
+    formatted: &tree_sitter::Tree,
+    formatted_src: &str,
+) -> Option<String> {
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    collect_leaf_tokens(original.root_node(), original_src, &mut 0, &mut a);
+    collect_leaf_tokens(formatted.root_node(), formatted_src, &mut 0, &mut b);
+
+    for (i, (ta, tb)) in a.iter().zip(b.iter()).enumerate() {
+        if ta != tb {
+            return Some(format!(
+                "token {}: input has {} {:?}, output has {} {:?}",
+                i + 1,
+                ta.0,
+                ta.1,
+                tb.0,
+                tb.1
+            ));
+        }
+    }
+    match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => {
+            let t = &a[b.len()];
+            Some(format!(
+                "output is missing input's token {}: {} {:?}",
+                b.len() + 1,
+                t.0,
+                t.1
+            ))
+        }
+        std::cmp::Ordering::Less => {
+            let t = &b[a.len()];
+            Some(format!(
+                "output has extra token {}: {} {:?}",
+                a.len() + 1,
+                t.0,
+                t.1
+            ))
+        }
+    }
+}
+
+/// Overlay a .dql-format file onto an existing config, applying each
+/// key through the knob registry. If path is None, searches the
+/// current working directory. Returns a warning per line that named
+/// an unknown knob or an unparsable value — a typo'd key must not
+/// silently do nothing.
+pub fn apply_config_file(config: &mut FormatConfig, path: Option<&Path>) -> Vec<String> {
     use std::fs;
 
-    let mut config = FormatConfig::default();
+    let mut warnings = Vec::new();
 
-    // Determine file path
     let file_path = match path {
         Some(p) => p.to_path_buf(),
         None => std::path::PathBuf::from(".dql-format"),
     };
 
-    // Try to read .dql-format file
-    if let Ok(contents) = fs::read_to_string(&file_path) {
-        for line in contents.lines() {
-            // Skip comments and empty lines
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Parse key=value pairs
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim();
-
-                // Try to parse as number first
-                if let Ok(num) = value.parse::<usize>() {
-                    match key {
-                        "pipe_indent" => config.pipe_indent = num,
-                        "continuation_indent" => config.continuation_indent = num,
-                        "projection_length" => config.projection_length = num,
-                        "continuation_length" => config.continuation_length = num,
-                        "map_cover_extra_indent" => config.map_cover_extra_indent = num,
-                        "aggregation_arrow_indent" => config.aggregation_arrow_indent = num,
-                        "cte_indent" => config.cte_indent = num,
-                        "cte_columnar_padding" => config.cte_columnar_padding = num,
-                        "curly_member_indent" => config.curly_member_indent = num,
-                        "curly_inducer_indent" => config.curly_inducer_indent = num,
-                        _ => {} // Ignore unknown keys
+    match fs::read_to_string(&file_path) {
+        Ok(contents) => {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                match line.split_once('=') {
+                    Some((key, value)) => {
+                        if let Err(e) = config.apply(key.trim(), value.trim()) {
+                            warnings.push(format!("{}: {e}", file_path.display()));
+                        }
                     }
-                } else {
-                    // Try to parse special string values
-                    match key {
-                        "cte_style" => {
-                            config.cte_style = match value {
-                                "subordinate" => CteStyle::Subordinate,
-                                "centric" => CteStyle::Centric,
-                                "columnar" => CteStyle::Columnar,
-                                "traditional" => CteStyle::Traditional,
-                                _ => config.cte_style, // Keep default if unknown
-                            };
-                        }
-                        // Support old cte_centric for backward compatibility
-                        "cte_centric" => {
-                            if value == "true" || value == "1" || value == "yes" {
-                                config.cte_style = CteStyle::Centric;
-                            }
-                        }
-                        // Boolean options
-                        "curly_opening_brace_inline" => {
-                            config.curly_opening_brace_inline =
-                                value == "true" || value == "1" || value == "yes";
-                        }
-                        _ => {} // Ignore unknown keys
-                    }
+                    None => warnings.push(format!(
+                        "{}: not a key=value line: '{line}'",
+                        file_path.display()
+                    )),
                 }
             }
         }
+        // Absence is the one quiet case (implicit discovery); a file
+        // that EXISTS but cannot be read or decoded must not silently
+        // become "no configuration".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warnings.push(format!("{}: unreadable: {e}", file_path.display())),
     }
 
-    config
+    warnings
+}
+
+/// Load format configuration from a .dql-format file over the frozen
+/// defaults, reporting warnings.
+pub fn load_config_report(path: Option<&Path>) -> (FormatConfig, Vec<String>) {
+    let mut config = FormatConfig::default();
+    let warnings = apply_config_file(&mut config, path);
+    (config, warnings)
+}
+
+/// Load format configuration from a .dql-format file, discarding
+/// warnings. Callers with a user-facing channel should use
+/// [`load_config_report`].
+pub fn load_config(path: Option<&Path>) -> FormatConfig {
+    load_config_report(path).0
 }

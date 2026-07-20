@@ -401,6 +401,62 @@ mod tests {
     use std::fs;
     use tempfile::NamedTempFile;
 
+    /// The weld between the formatter's knob registry and the burned
+    /// sys::format.bundle table: same column set, and the 'book' row
+    /// carries exactly FormatConfig::default()'s values. A knob added
+    /// on either side goes red here until the other side follows.
+    #[cfg(feature = "formatter")]
+    #[test]
+    fn sys_format_bundle_welds_to_knob_registry() {
+        let cli_path = get_cli_path();
+        let out = std::process::Command::new(&cli_path)
+            .args([
+                "query",
+                "sys::format.bundle(*), bundle = \"book\"",
+                "-f",
+                "csv",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "querying sys::format.bundle failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines();
+        let header: Vec<&str> = lines.next().expect("header row").split(',').collect();
+        let book: Vec<&str> = lines.next().expect("book row").split(',').collect();
+
+        let mut expected_cols = vec!["bundle"];
+        expected_cols.extend(delightql_formatter::KNOBS.iter().map(|k| k.name));
+        let mut sorted_header = header.clone();
+        sorted_header.sort_unstable();
+        let mut sorted_expected = expected_cols.clone();
+        sorted_expected.sort_unstable();
+        assert_eq!(
+            sorted_header, sorted_expected,
+            "sys::format.bundle columns must equal the knob registry (plus 'bundle')"
+        );
+
+        let defaults = delightql_formatter::FormatConfig::default();
+        for (col, value) in header.iter().zip(book.iter()) {
+            if *col == "bundle" {
+                assert_eq!(*value, "book");
+                continue;
+            }
+            let knob = delightql_formatter::KNOBS
+                .iter()
+                .find(|k| k.name == *col)
+                .expect("column checked above");
+            assert_eq!(
+                *value,
+                (knob.get)(&defaults),
+                "burned 'book' value for {col} drifted from FormatConfig::default()"
+            );
+        }
+    }
+
     fn get_cli_path() -> std::path::PathBuf {
         // When running tests, we need to ensure the binary is built
         // Use escargot to get the path to the binary
@@ -533,17 +589,24 @@ mod tests {
         assert_eq!(out.status.code(), Some(1), "bogus DQL_DIALECT must refuse");
         assert!(String::from_utf8_lossy(&out.stderr).contains("unknown DQL_DIALECT"));
 
-        // #3A: formatter pass-through is loud, and the CI gate cannot
-        // bless what it could not verify (rc=2, distinct from rc=1
-        // needs-formatting and rc=0 verified-formatted).
-        let out = run(&["format", "users(*),age>30|>(id)"]);
-        assert!(out.status.success());
+        // #3A: "cannot determine" is loud and the CI gate cannot bless
+        // it (rc=2, distinct from rc=1 needs-formatting and rc=0
+        // verified-formatted). Corpus coverage is total, so no fixture
+        // construct pass-throughs anymore; unparseable input exercises
+        // the same contract in both modes.
+        let out = run(&["format", "users(("]);
+        assert_eq!(out.status.code(), Some(2), "parse error must exit 2 in plain mode");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("does not yet handle"),
+            String::from_utf8_lossy(&out.stderr).contains("does not parse"),
             "pass-through must warn on stderr"
         );
-        let out = run(&["format", "--fail-if-not-formatted", "users(*),age>30|>(id)"]);
-        assert_eq!(out.status.code(), Some(2), "gate must exit 2 on pass-through");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "users((",
+            "unparseable input passes through unchanged"
+        );
+        let out = run(&["format", "--fail-if-not-formatted", "users(("]);
+        assert_eq!(out.status.code(), Some(2), "gate must exit 2 on parse error");
         let out = run(&["format", "--fail-if-not-formatted", "a(*),b(*),a.id=b.id"]);
         assert_eq!(out.status.code(), Some(1), "unformatted input exits 1");
         let out = run(&["format", "--fail-if-not-formatted", "a(*), b(*), a.id = b.id"]);

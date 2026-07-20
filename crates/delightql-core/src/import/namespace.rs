@@ -311,6 +311,16 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             source_path: None,
             writable: true,
         },
+        NamespaceSpec {
+            id: 18,
+            name: "format".into(),
+            pid: Some(2),
+            fq_name: "sys::format".into(),
+            kind: "system".into(),
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: false,
+        },
     ];
 
     create_namespace_hierarchy(conn, &specs)

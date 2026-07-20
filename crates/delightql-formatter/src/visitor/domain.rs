@@ -8,8 +8,23 @@ use super::core::Formatter;
 impl<'a> Formatter<'a> {
     /// Format a domain expression
     pub(super) fn format_domain_expression(&mut self, node: &Node) -> Result<()> {
+        // The alias keyword is a hidden token, absent from the CST:
+        // `expr as name` parses as (expr, alias: name) with `as` only
+        // in the source gap. Without echoing that gap the walk glues
+        // expression and alias into one token.
+        let alias_id = node.child_by_field_name("alias").map(|a| a.id());
+        let mut prev_end: Option<usize> = None;
         // First format the main expression content
         for child in node.children(&mut node.walk()) {
+            if Some(child.id()) == alias_id {
+                let gap = prev_end
+                    .map(|pe| self.source[pe..child.start_byte()].trim().to_string())
+                    .unwrap_or_else(|| "as".to_string());
+                self.output.write(" ");
+                self.output.write(&gap);
+                self.output.write(" ");
+            }
+            prev_end = Some(child.end_byte());
             match child.kind() {
                 // Handle binary expressions (arithmetic)
                 "binary_expression" => {
@@ -115,6 +130,17 @@ impl<'a> Formatter<'a> {
                     let text = self.node_text(&child).to_string();
                     self.output.write(&text);
                 }
+                // Verbatim leaf-ish expressions
+                "string_template" | "citation" | "value_placeholder" | "sparse_fill" => {
+                    let text = self.node_text(&child).to_string();
+                    self.output.write(&text);
+                }
+                // Scalar-subquery variants — interior layout echoed
+                // whole, like format_scalar_subquery's continuation
+                "anonymous_scalar_subquery" | "ho_scalar_subquery" => {
+                    let text = self.node_text(&child).to_string();
+                    self.output.write(&text);
+                }
                 // Handle scalar subqueries
                 "scalar_subquery" => {
                     self.format_scalar_subquery(&child)?;
@@ -132,13 +158,6 @@ impl<'a> Formatter<'a> {
                 }
                 _ => self.flag_unhandled(&child),
             }
-        }
-
-        // Then check for alias field
-        if let Some(alias) = node.child_by_field_name("alias") {
-            self.output.write(" as ");
-            let text = self.node_text(&alias).to_string();
-            self.output.write(&text);
         }
 
         Ok(())
@@ -210,10 +229,13 @@ impl<'a> Formatter<'a> {
             .children_by_field_name("transform", &mut cursor)
             .collect();
 
-        // Count pipe operators
+        // Count pipe operators — both directions (`/->` and `/->>`)
         let mut pipe_operators = Vec::new();
         for child in node.children(&mut node.walk()) {
-            if child.kind() == "functional_pipe_operator" {
+            if matches!(
+                child.kind(),
+                "functional_pipe_operator" | "reverse_pipe_operator"
+            ) {
                 pipe_operators.push(child);
             }
         }
@@ -348,11 +370,11 @@ impl<'a> Formatter<'a> {
 
     /// Format scalar subquery: table:(, condition ~> aggregation)
     pub(super) fn format_scalar_subquery(&mut self, node: &Node) -> Result<()> {
-        // Write schema.table if present
-        if let Some(schema) = node.child_by_field_name("schema") {
-            let schema_text = self.node_text(&schema).to_string();
-            self.output.write(&schema_text);
-            self.output.write(".");
+        // Write namespace.table (or namespace/table) if present
+        if let Some(ns) = node.child_by_field_name("namespace_path") {
+            let ns_text = self.node_text(&ns).to_string();
+            self.output.write(&ns_text);
+            self.write_namespace_separator(node);
         }
 
         // Write table name
@@ -411,8 +433,30 @@ impl<'a> Formatter<'a> {
 
     /// Format curly function (INTERIOR-RECORD): {field1, "key": value, ...}
     pub(super) fn format_curly_function(&mut self, node: &Node) -> Result<()> {
-        // Check if this should be formatted multi-line (contains group inducers)
-        let should_multiline = self.curly_has_group_inducers(node);
+        // Multi-line when it contains group inducers — but under
+        // tree_inducer_break=fit, only when the whole group doesn't
+        // fit the width from the current column.
+        let mut should_multiline = self.curly_has_group_inducers(node);
+        if should_multiline && self.config.tree_inducer_break == crate::rules::BreakMode::Fit {
+            // Trial-format the inline rendering for a pass-stable width.
+            let probe = *node;
+            let inline_width = self.measure_formatted(|this| {
+                this.output.write("{");
+                this.write_brace_pad();
+                for child in probe.children(&mut probe.walk()) {
+                    if child.kind() == "curly_function_members" {
+                        this.format_curly_function_members_inline(&child)?;
+                        break;
+                    }
+                }
+                this.write_brace_pad();
+                this.output.write("}");
+                Ok(())
+            });
+            if self.output.current_line_length() + inline_width <= self.config.pipe_break_width {
+                should_multiline = false;
+            }
+        }
 
         if should_multiline {
             // Multi-line format with nested reductions
@@ -420,6 +464,7 @@ impl<'a> Formatter<'a> {
         } else {
             // Inline format
             self.output.write("{");
+            self.write_brace_pad();
 
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "curly_function_members" {
@@ -428,8 +473,16 @@ impl<'a> Formatter<'a> {
                 }
             }
 
+            self.write_brace_pad();
             self.output.write("}");
             Ok(())
+        }
+    }
+
+    /// Interior brace padding per the brace_padding knob.
+    fn write_brace_pad(&mut self) {
+        if self.config.brace_padding == crate::rules::Padding::Space {
+            self.output.write(" ");
         }
     }
 
@@ -455,20 +508,39 @@ impl<'a> Formatter<'a> {
 
     /// Format curly function in multi-line mode
     fn format_curly_function_multiline(&mut self, node: &Node) -> Result<()> {
+        let brace_col = self.output.current_line_length();
         self.output.write("{");
 
         // Get current indent for the opening brace
         let base_indent = self.output.current_line_length();
+        self.write_brace_pad();
+
+        // Member landing: fixed offset from the post-brace column, or
+        // ALIGNED to the brace column plus a pad — the geometry that
+        // makes members share a column with the first member on the
+        // brace line ("the indentation is the schema").
+        let member_indent = match self.config.member_landing {
+            crate::rules::Landing::Offset => base_indent + self.config.curly_member_indent,
+            crate::rules::Landing::Align => brace_col + self.config.member_landing_pad,
+        };
 
         for child in node.children(&mut node.walk()) {
             if child.kind() == "curly_function_members" {
-                self.format_curly_function_members_multiline(&child, base_indent)?;
+                self.format_curly_function_members_multiline(&child, member_indent)?;
                 break;
             }
         }
 
-        // Closing brace at base indent
-        self.output.newline_with_indent(base_indent);
+        // Closing brace: trailing rides the last member's line;
+        // own_line drops to the post-brace column.
+        match self.config.closer_placement {
+            crate::rules::CloserPlacement::Trailing => {
+                self.write_brace_pad();
+            }
+            crate::rules::CloserPlacement::OwnLine => {
+                self.output.newline_with_indent(base_indent);
+            }
+        }
         self.output.write("}");
         Ok(())
     }
@@ -490,13 +562,14 @@ impl<'a> Formatter<'a> {
         Ok(())
     }
 
-    /// Format members of a curly function (multi-line mode)
+    /// Format members of a curly function (multi-line mode).
+    /// `member_indent` is the landing column (already resolved from
+    /// the member_landing geometry by the caller).
     fn format_curly_function_members_multiline(
         &mut self,
         node: &Node,
-        base_indent: usize,
+        member_indent: usize,
     ) -> Result<()> {
-        let member_indent = base_indent + self.config.curly_member_indent;
         let mut first = true;
 
         for child in node.children(&mut node.walk()) {
@@ -504,7 +577,10 @@ impl<'a> Formatter<'a> {
                 if first {
                     // First member: check if opening brace should be inline
                     if self.config.curly_opening_brace_inline {
-                        self.output.write(" ");
+                        // brace_padding=space already supplied the gap
+                        if self.config.brace_padding == crate::rules::Padding::None {
+                            self.output.write(" ");
+                        }
                     } else {
                         self.output.newline_with_indent(member_indent);
                     }
@@ -513,7 +589,23 @@ impl<'a> Formatter<'a> {
                     self.output.write(",");
                     self.output.newline_with_indent(member_indent);
                 }
-                self.format_curly_function_member_multiline(&child, member_indent)?;
+                // Under member_value_break=fit, a member that renders
+                // inline within the width stays inline even though
+                // the group broke. Trial-format for a pass-stable
+                // width.
+                let inline_member = self.config.member_value_break == crate::rules::BreakMode::Fit
+                    && {
+                        let probe = child;
+                        let w = self.measure_formatted(|this| {
+                            this.format_curly_function_member_inline(&probe)
+                        });
+                        self.output.current_line_length() + w <= self.config.pipe_break_width
+                    };
+                if inline_member {
+                    self.format_curly_function_member_inline(&child)?;
+                } else {
+                    self.format_curly_function_member_multiline(&child, member_indent)?;
+                }
                 first = false;
             }
         }
@@ -642,13 +734,24 @@ impl<'a> Formatter<'a> {
     /// Format metadata-oriented tree group: column:~> {...}
     pub(super) fn format_metadata_tree_group(&mut self, node: &Node) -> Result<()> {
         // Get the key (lvar)
-        if let Some(key) = node.child_by_field_name("key") {
-            let key_text = self.node_text(&key).to_string();
+        let key = node.child_by_field_name("key");
+        if let Some(ref key) = key {
+            let key_text = self.node_text(key).to_string();
             self.output.write(&key_text);
         }
 
-        // Write :~> with no space before it
-        self.output.write(":~> ");
+        // The inducer is a hidden token with more than one spelling
+        // (`:~>`, `: ~>`, the namespace-allusion `::`); echo it from
+        // the source gap rather than canonicalize it.
+        let body = node
+            .children(&mut node.walk())
+            .find(|c| matches!(c.kind(), "curly_function" | "bracket_function"));
+        let inducer = match (&key, &body) {
+            (Some(k), Some(b)) => self.source[k.end_byte()..b.start_byte()].trim().to_string(),
+            _ => ":~>".to_string(),
+        };
+        self.output.write(&inducer);
+        self.output.write(" ");
 
         // Format the curly or bracket function that follows
         for child in node.children(&mut node.walk()) {

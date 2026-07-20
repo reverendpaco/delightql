@@ -1097,6 +1097,7 @@ dependencies = [
  "anyhow",
  "cc",
  "clap 4.5.49",
+ "serde_json",
  "tree-sitter-c2rust",
 ]
 
