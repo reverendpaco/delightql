@@ -128,6 +128,10 @@ impl<'a> CstNode<'a> {
     }
 
     /// Get the underlying tree-sitter node (escape hatch for advanced usage)
+    pub fn parent(&self) -> Option<CstNode<'a>> {
+        self.node.parent().map(|n| CstNode::new(n, self.source))
+    }
+
     pub fn raw_node(&self) -> &Node<'a> {
         &self.node
     }

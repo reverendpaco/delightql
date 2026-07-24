@@ -222,9 +222,27 @@ fn resolve_lvar(
     // whether validation must be deferred for an unknown/correlated scope: if
     // `p` is known, `p.c` must be checked against p's columns specifically.
     let qualifier_is_bound = qualifier.as_ref().is_some_and(|qual| {
-        qualifier_scope.iter().any(|col| match col.qualifier() {
-            ast_resolved::TableName::Named(table) => table == qual,
-            ast_resolved::TableName::Fresh => qual == "_",
+        qualifier_scope.iter().any(|col| {
+            let current = match col.qualifier() {
+                ast_resolved::TableName::Named(table) => table == qual,
+                ast_resolved::TableName::Fresh => qual == "_",
+            };
+            // The answering channel (the lvar law): a column that crossed
+            // a pipe/entity boundary answers to access_name, and a
+            // qualified-glob export answers to its full-name spelling.
+            let answers = col
+                .access_name
+                .as_ref()
+                .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), qual));
+            let full_name = col
+                .name()
+                .split('|')
+                .next()
+                .is_some_and(|b| {
+                    b.strip_prefix(qual.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+                });
+            current || answers || full_name
         })
     });
     if !in_correlation
@@ -302,12 +320,28 @@ fn resolve_lvar(
         let has_qualifier =
             qualifier.is_some() && qualifier.as_ref().unwrap() != "_" && !available.is_empty();
 
+        // A qualifier that ANSWERS (the lvar law: access_name, or a
+        // qualified-glob export's full-name spelling) is not stale — it
+        // resolves through the ordinary qualified road.
+        let qualifier_answers = has_qualifier
+            && available.iter().any(|col| {
+                let qual = qualifier.as_ref().expect("has_qualifier");
+                col.access_name
+                    .as_ref()
+                    .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), qual))
+                    || col.name().split('|').next().is_some_and(|b| {
+                        b.strip_prefix(qual.as_str())
+                            .is_some_and(|rest| rest.starts_with('.'))
+                    })
+            });
+
         let all_fresh = has_qualifier
+            && !qualifier_answers
             && available
                 .iter()
                 .all(|col| matches!(col.qualifier(), ast_resolved::TableName::Fresh));
 
-        let mixed_stale = if has_qualifier && !all_fresh {
+        let mixed_stale = if has_qualifier && !qualifier_answers && !all_fresh {
             let has_named = available
                 .iter()
                 .any(|col| matches!(col.qualifier(), ast_resolved::TableName::Named(_)));
@@ -392,7 +426,38 @@ fn resolve_lvar(
 
             for result in results {
                 match result {
-                    UnificationResult::Resolved(_) => {
+                    UnificationResult::Resolved(col) => {
+                        // ANSWERING match (the lvar law): the reference
+                        // matched a column whose CURRENT qualifier is not
+                        // the written one — it answered via access_name or
+                        // its full-name spelling. Re-spell the reference to
+                        // the column's own identity (the written spelling
+                        // names no SQL scope and would emit dangling); the
+                        // written name survives as the output alias.
+                        if let Some(q) = qualifier.as_ref() {
+                            let current_matches = matches!(
+                                col.qualifier(),
+                                ast_resolved::TableName::Named(t)
+                                    if delightql_types::SqlIdentifier::str_eq(t.as_str(), q)
+                            );
+                            if !current_matches {
+                                let out_alias = alias
+                                    .clone()
+                                    .unwrap_or_else(|| name.clone());
+                                return Ok(ast_resolved::DomainExpression::Lvar {
+                                    name: col.name().into(),
+                                    qualifier: match col.qualifier() {
+                                        ast_resolved::TableName::Named(t) => {
+                                            Some(t.as_str().into())
+                                        }
+                                        ast_resolved::TableName::Fresh => None,
+                                    },
+                                    namespace_path,
+                                    alias: Some(out_alias.into()),
+                                    provenance: ast_resolved::PhaseBox::phantom(),
+                                });
+                            }
+                        }
                         break;
                     }
                     UnificationResult::Unresolved(col_name) => {

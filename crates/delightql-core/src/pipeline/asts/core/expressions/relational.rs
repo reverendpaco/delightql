@@ -74,21 +74,34 @@ pub enum RelationalExpression<Phase = Unresolved> {
         cpr_schema: PhaseBox<CprSchema, Phase>,
     },
 
-    /// ER-context join chain: A(*) & B(*) & C(*)
+    /// ER-context join chain: A(*) &(::ctx) B(*) &(::ctx) C(*)
     /// Unresolved-only — resolver expands into standard Joins.
     #[lispy("er_join_chain")]
     #[phase_convert(unreachable)]
     ErJoinChain {
         /// Relations in the chain, left-to-right. Always >= 2 elements.
         relations: Vec<Relation<Phase>>,
+        /// Canonical selection spellings, parallel to `relations`: the
+        /// written term with the alias OUTSIDE (the lvar law governs
+        /// exports; these govern selection), canonicalized at build.
+        term_spellings: Vec<String>,
+        /// Per-operator context symbols, one per `&` (length =
+        /// relations - 1). None = the removed bare-operator dialect,
+        /// refused at resolve with the symbol-form teaching.
+        contexts: Vec<Option<String>>,
     },
-    /// ER-context transitive join: A(*) && B(*)
+    /// ER-context transitive join: A(*) &&(::ctx) B(*)
     /// Unresolved-only — resolver expands via graph path-finding.
     #[lispy("er_transitive_join")]
     #[phase_convert(unreachable)]
     ErTransitiveJoin {
         left: Box<RelationalExpression<Phase>>,
         right: Box<RelationalExpression<Phase>>,
+        /// Canonical endpoint spellings (selection keys).
+        left_spelling: String,
+        right_spelling: String,
+        /// The operator's context symbol; None = removed bare dialect.
+        context: Option<String>,
     },
 }
 
@@ -153,12 +166,27 @@ impl<Phase: Clone> RelationalExpression<Phase> {
                 min_multiplicity: *min_multiplicity,
                 cpr_schema: cpr_schema.clone(),
             },
-            Self::ErJoinChain { relations } => Self::ErJoinChain {
+            Self::ErJoinChain {
+                relations,
+                term_spellings,
+                contexts,
+            } => Self::ErJoinChain {
                 relations: relations.clone(),
+                term_spellings: term_spellings.clone(),
+                contexts: contexts.clone(),
             },
-            Self::ErTransitiveJoin { left, right } => Self::ErTransitiveJoin {
+            Self::ErTransitiveJoin {
+                left,
+                right,
+                left_spelling,
+                right_spelling,
+                context,
+            } => Self::ErTransitiveJoin {
                 left: left.clone(),
                 right: right.clone(),
+                left_spelling: left_spelling.clone(),
+                right_spelling: right_spelling.clone(),
+                context: context.clone(),
             },
         }
     }

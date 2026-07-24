@@ -175,12 +175,16 @@ CREATE TABLE ho_param_ground_value (
     PRIMARY KEY (ho_param_id, clause_ordinal)
 );
 
--- ER-context rule metadata: stores table pair and context for ER-join rules
-CREATE TABLE er_rule (
+-- Edge catalog (GROUNDING-AND-MENTION.md "Persistence"): each row is a
+-- declared ER edge — the context symbol and the two ground terms as
+-- NAKED canonical spellings (inside a catalog everything is data; the
+-- :`…` wrapper is code syntax and would be noise). Rows are DERIVED
+-- from consulted declarations — re-emitted at consult, never migrated.
+CREATE TABLE join_edge (
     id INTEGER PRIMARY KEY,
     entity_id INTEGER NOT NULL,
-    left_table TEXT NOT NULL,
-    right_table TEXT NOT NULL,
+    left_spelling TEXT NOT NULL,
+    right_spelling TEXT NOT NULL,
     context_name TEXT NOT NULL,
     clause_ordinal INTEGER NOT NULL,
     FOREIGN KEY (entity_id) REFERENCES entity(id)

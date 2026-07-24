@@ -679,31 +679,16 @@ pub(super) fn parse_namespace_qualification(
             Ok((ns, None))
         }
         "grounded_namespace" => {
-            // Children are: ns_or_id, ^, ns_or_id, ^, ns_or_id, ...
-            // First non-^ child is the data namespace, rest are grounded namespaces
-            let ns_children: Vec<CstNode> = ns_node
-                .children()
-                .filter(|c| c.kind() == "namespace_path" || c.kind() == "identifier")
-                .collect();
-
-            if ns_children.len() < 2 {
-                return Err(DelightQLError::parse_error(
-                    "Grounded namespace requires at least data_ns^lib_ns",
-                ));
-            }
-
-            let data_ns = parse_single_ns(ns_children[0].clone())?;
-            let grounded_ns: Vec<NamespacePath> = ns_children[1..]
-                .iter()
-                .map(|c| parse_single_ns(c.clone()))
-                .collect::<Result<_>>()?;
-
-            Ok((
-                data_ns.clone(),
-                Some(GroundedPath {
-                    data_ns,
-                    grounded_ns,
-                }),
+            // The query-position `^` spelling is REMOVED: grounding is
+            // an effect, not a per-reference decoration. The grammar
+            // still recognizes the shape so the refusal can teach.
+            Err(DelightQLError::validation_error_categorized(
+                "grounding/jit_removed",
+                format!(
+                    "this form was removed — '{}' grounds a namespace per reference, and grounding is an effect: ground the namespace first",
+                    ns_node.text()
+                ),
+                "ground!(\"data_ns\", \"lib_ns\", \"grounded_ns\") then address grounded_ns.entity(...), or enlist!(\"grounded_ns\") for unqualified access",
             ))
         }
         other => panic!("catch-all hit in builder_v2/relations.rs parse_namespace_path: unexpected node kind {:?}", other),

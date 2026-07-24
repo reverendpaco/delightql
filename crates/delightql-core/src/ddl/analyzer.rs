@@ -116,12 +116,12 @@ fn walk_relational(expr: &RelationalExpression, refs: &mut Vec<ExtractedReferenc
                 walk_relational(operand, refs);
             }
         }
-        RelationalExpression::ErJoinChain { relations } => {
+        RelationalExpression::ErJoinChain { relations, .. } => {
             for rel in relations {
                 walk_relation(rel, refs);
             }
         }
-        RelationalExpression::ErTransitiveJoin { left, right } => {
+        RelationalExpression::ErTransitiveJoin { left, right, .. } => {
             walk_relational(left, refs);
             walk_relational(right, refs);
         }

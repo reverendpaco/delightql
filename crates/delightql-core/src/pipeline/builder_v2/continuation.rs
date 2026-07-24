@@ -129,22 +129,38 @@ fn handle_continuation_inner(
                             features,
                         ),
                         "er_join_operator" => {
-                            // & creates ER-context direct join
-                            // Right side is a base_expression (table_access, etc.)
+                            // & creates ER-context direct join. The context
+                            // symbol rides on the operator; each operand's
+                            // TERM spelling (alias outside) is canonicalized
+                            // here — selection is by spelling, exports by
+                            // access mode, and the two never touch.
+                            let context = er_operator_context(&operator);
                             let right_relation = parse_base_as_relation(right, features)?;
+                            let right_spelling = er_term_spelling(&right)?;
 
                             // Flatten: if cpr is already an ErJoinChain, append; otherwise create new chain
-                            let mut chain = match cpr {
-                                RelationalExpression::ErJoinChain { relations } => relations,
+                            let (mut chain, mut spellings, mut contexts) = match cpr {
+                                RelationalExpression::ErJoinChain {
+                                    relations,
+                                    term_spellings,
+                                    contexts,
+                                } => (relations, term_spellings, contexts),
                                 _ => {
                                     // Left must be a single relation for ErJoinChain
                                     let left_relation = extract_relation_from_expr(cpr)?;
-                                    vec![left_relation]
+                                    let left_spelling = er_left_term_spelling(&op_expr)?;
+                                    (vec![left_relation], vec![left_spelling], vec![])
                                 }
                             };
                             chain.push(right_relation);
+                            spellings.push(right_spelling);
+                            contexts.push(context);
 
-                            let er_join = RelationalExpression::ErJoinChain { relations: chain };
+                            let er_join = RelationalExpression::ErJoinChain {
+                                relations: chain,
+                                term_spellings: spellings,
+                                contexts,
+                            };
 
                             // Check for continuation after the chain
                             if let Some(cont) = op_expr.find_child("relational_continuation") {
@@ -154,12 +170,20 @@ fn handle_continuation_inner(
                             }
                         }
                         "er_transitive_join_operator" => {
-                            // && creates ER-context transitive join
+                            // && creates ER-context transitive join; the
+                            // context and both endpoint spellings ride on
+                            // the node, same law as `&`.
+                            let context = er_operator_context(&operator);
                             let right_relation = parse_base_as_relation(right, features)?;
+                            let right_spelling = er_term_spelling(&right)?;
+                            let left_spelling = er_left_term_spelling(&op_expr)?;
 
                             let er_trans = RelationalExpression::ErTransitiveJoin {
                                 left: Box::new(cpr),
                                 right: Box::new(RelationalExpression::Relation(right_relation)),
+                                left_spelling,
+                                right_spelling,
+                                context,
                             };
 
                             // Check for continuation
@@ -677,6 +701,69 @@ fn parse_base_as_relation(node: CstNode, features: &mut FeatureCollector) -> Res
             child.kind()
         ))),
     }
+}
+
+/// The context symbol on an ER operator (`&(::normal)`), stripped of its
+/// `::` sigil. None = the removed bare-operator dialect (refused at
+/// resolve with the symbol-form teaching).
+fn er_operator_context(operator: &CstNode) -> Option<String> {
+    operator.field("context").map(|sym| {
+        let t = sym.text();
+        t.strip_prefix("::").unwrap_or(t).to_string()
+    })
+}
+
+/// Canonical spelling of an ER operand's TERM: the `table_access` text
+/// with the alias cut away (the alias is OUTSIDE the term — the lvar law
+/// governs exports, spelling governs selection), run through the term
+/// canonicalizer so the match key and the stored key cannot drift.
+fn er_term_spelling(base: &CstNode) -> Result<String> {
+    let Some(ta) = base.find_child("table_access") else {
+        return Err(DelightQLError::validation_error_categorized(
+            "grounding/er/operand_term",
+            format!(
+                "an ER operand is a relation-access term such as people(*) — got '{}'",
+                base.text().trim()
+            ),
+            "edges are selected by their terms' canonical spellings",
+        ));
+    };
+    let full = ta.text();
+    let base = ta.raw_node().start_byte();
+    let mut term_text = match ta.find_child("table_alias") {
+        Some(alias) => full[..alias.raw_node().start_byte() - base].trim_end().to_string(),
+        None => full.trim().to_string(),
+    };
+    // The outer marker (`orders_t?(*)`) is access mode, not term: like
+    // the alias, it stays outside selection — the edge is matched by
+    // the naked term, the join mode rides the relation.
+    if let Some(outer) = ta.field("outer") {
+        let start = outer.raw_node().start_byte() - base;
+        let end = outer.raw_node().end_byte() - base;
+        if end <= term_text.len() {
+            term_text.replace_range(start..end, "");
+        }
+    }
+    crate::term_spec::canonicalize_term(&term_text)
+}
+
+/// The LEFT operand of the first ER operator in a chain: the CST left
+/// sibling of the operator expression (the built AST no longer carries
+/// source text, so the spelling is read from the tree — parent is the
+/// relational_continuation, grandparent holds the base_expression).
+fn er_left_term_spelling(op_expr: &CstNode) -> Result<String> {
+    let base = op_expr
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|gp| gp.find_child("base_expression"));
+    let Some(base) = base else {
+        return Err(DelightQLError::validation_error_categorized(
+            "grounding/er/operand_term",
+            "the left ER operand is not a relation-access term".to_string(),
+            "edges are selected by their terms' canonical spellings",
+        ));
+    };
+    er_term_spelling(&base)
 }
 
 /// Extract a Relation from a RelationalExpression that wraps a single Relation.

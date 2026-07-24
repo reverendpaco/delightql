@@ -485,9 +485,20 @@ module.exports = grammar({
       )
     ),
 
-    // ER-join operators
-    er_join_operator: $ => '&',
-    er_transitive_join_operator: $ => '&&',
+    // ER-join operators. The context rides ON the operator as a symbol:
+    // `&(::normal)` / `&&(::normal)` — token.immediate('(') so the
+    // context form needs `&(` with no space, and `& (expr)` keeps its
+    // ordinary reading. The bare operators still parse: the builder
+    // refuses them with the teaching naming the symbol form (the old
+    // `under context:` dialect is removed, not forgotten).
+    er_join_operator: $ => seq(
+      '&',
+      optional(seq(token.immediate('('), field('context', $.symbol), ')')),
+    ),
+    er_transitive_join_operator: $ => seq(
+      '&&',
+      optional(seq(token.immediate('('), field('context', $.symbol), ')')),
+    ),
     
     // Comma operator for natural join/cross product
     comma_operator: $ => $._comma,

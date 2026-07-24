@@ -125,8 +125,10 @@ pub enum DdlHead {
     Fact,
     /// ER-context rule: `left&right(*) within context :- body`
     ErRule {
-        left_table: String,
-        right_table: String,
+        /// Canonical term spellings (GROUNDING-AND-MENTION.md): the
+        /// selection keys and the stored keys are the same bytes.
+        left_spelling: String,
+        right_spelling: String,
         context: String,
     },
 }

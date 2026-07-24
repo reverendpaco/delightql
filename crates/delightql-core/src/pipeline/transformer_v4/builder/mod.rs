@@ -66,6 +66,7 @@ pub struct QualifiedColumn {
 }
 
 pub(in crate::pipeline) use names::NameGenerator;
+pub(in crate::pipeline::transformer_v4) use names::ScopeName;
 pub(in crate::pipeline::transformer_v4) use state::{col_name, col_qualifier, table_name_sql};
 use state::{BuilderState, ScopeEntry};
 
@@ -342,14 +343,14 @@ impl Builder<Unprojected> {
     /// (the resolver decided them).
     pub(in crate::pipeline::transformer_v4) fn from_table(
         table: TableExpression,
-        scope_name: TableName,
+        scope_name: ScopeName,
         columns: Vec<ColumnMetadata>,
         names: NameGenerator,
     ) -> Self {
         Self {
             state: BuilderState::Table {
                 table,
-                scope: ScopeEntry::new(scope_name, columns),
+                scope: ScopeEntry::new(scope_name.into_table_name(), columns),
             },
             names,
             accumulated_ctes: Vec::new(),
@@ -364,14 +365,14 @@ impl Builder<Unprojected> {
     /// further operations (filter, projection) will wrap it as a subquery.
     pub(in crate::pipeline::transformer_v4) fn from_frozen(
         query: QueryExpression,
-        scope_name: TableName,
+        scope_name: ScopeName,
         columns: Vec<ColumnMetadata>,
         names: NameGenerator,
     ) -> Self {
         Self {
             state: BuilderState::Frozen {
                 query,
-                scope: ScopeEntry::new(scope_name, columns),
+                scope: ScopeEntry::new(scope_name.into_table_name(), columns),
             },
             names,
             accumulated_ctes: Vec::new(),
@@ -439,7 +440,7 @@ impl Builder<Unprojected> {
             if l_name == r_name {
                 if let TableExpression::Table { alias, .. } = &mut right.table {
                     if alias.is_none() {
-                        let fresh = left.names.next_table_name("t");
+                        let fresh: TableName = left.names.fresh("t").into();
                         let alias_str = table_name_sql(&fresh).to_string();
                         // Requalify right columns to the new alias scope
                         let old_scope = ScopeEntry::new(fresh.clone(), right.columns);
@@ -475,8 +476,8 @@ impl Builder<Unprojected> {
         let names = left.names;
         let mut ctes = left.ctes;
         ctes.extend(right.ctes);
-        let join_scope_name = names.next_table_name("join");
-        let scope = ScopeEntry::new(join_scope_name, columns);
+        let join_scope_name = names.fresh("join");
+        let scope = ScopeEntry::new(join_scope_name.into(), columns);
         Self {
             state: BuilderState::Segment {
                 from: vec![join_expr],
@@ -616,8 +617,8 @@ impl Builder<Unprojected> {
             acc_ctes.extend(operand.ctes);
         }
 
-        let join_scope_name = names.next_table_name("join");
-        let scope = ScopeEntry::new(join_scope_name, acc_columns);
+        let join_scope_name = names.fresh("join");
+        let scope = ScopeEntry::new(join_scope_name.into(), acc_columns);
         Self {
             state: BuilderState::Segment {
                 from: vec![acc_table],
@@ -651,7 +652,7 @@ impl Builder<Unprojected> {
                 let input_columns = input_scope.columns.clone();
                 let items = disambiguate_aliases(items);
                 // Set the projection and generate a new scope name.
-                let new_scope_name = self.names.next_table_name("t");
+                let new_scope_name: TableName = self.names.fresh("t").into();
                 // Atomic: derive columns AND write aliases back to items.
                 let (items, output_columns) =
                     derive_columns_from_items(items, &new_scope_name, &input_columns);
@@ -699,7 +700,7 @@ impl Builder<Unprojected> {
                 select_items.extend(spec.aggregates);
 
                 // Atomic: derive columns AND write aliases back to items.
-                let new_scope_name = self.names.next_table_name("t");
+                let new_scope_name: TableName = self.names.fresh("t").into();
                 let (select_items, output_columns) =
                     derive_columns_from_items(select_items, &new_scope_name, &input_columns);
 
@@ -956,8 +957,8 @@ impl Builder<Unprojected> {
 
         let source_columns: Vec<ColumnMetadata> = self.columns().to_vec();
         let names_fork = self.names().fork();
-        let source_alias = names_fork.next_table_name("t");
-        let tvf_alias = names_fork.next_table_name(tvf_prefix);
+        let source_alias: TableName = names_fork.fresh("t").into();
+        let tvf_alias: TableName = names_fork.fresh(tvf_prefix).into();
 
         let source_query = self.project_all()?.to_sql()?;
         let source_alias_str = table_name_sql(&source_alias).to_string();
@@ -1090,7 +1091,12 @@ impl Builder<Unprojected> {
             })
             .collect();
 
-        Ok(Builder::from_query(query, scope_name, columns, names_fork))
+        Ok(Builder::from_query(
+            query,
+            ScopeName::Resolved(scope_name),
+            columns,
+            names_fork,
+        ))
     }
 }
 
@@ -1105,14 +1111,14 @@ impl Builder<Projected> {
     /// or after external construction (set operations, recursive CTEs).
     pub(in crate::pipeline::transformer_v4) fn from_query(
         query: QueryExpression,
-        scope_name: TableName,
+        scope_name: ScopeName,
         columns: Vec<ColumnMetadata>,
         names: NameGenerator,
     ) -> Self {
         Self {
             state: BuilderState::Frozen {
                 query,
-                scope: ScopeEntry::new(scope_name, columns),
+                scope: ScopeEntry::new(scope_name.into_table_name(), columns),
             },
             names,
             accumulated_ctes: Vec::new(),
@@ -1132,7 +1138,7 @@ impl Builder<Projected> {
                 ..
             } => {
                 let input_columns = input_scope.columns.clone();
-                let new_scope_name = self.names.next_table_name("t");
+                let new_scope_name: TableName = self.names.fresh("t").into();
                 let (items, output_columns) =
                     derive_columns_from_items(items, &new_scope_name, &input_columns);
                 let select = select.set_select(items);
@@ -1195,7 +1201,7 @@ impl Builder<Projected> {
                 ..
             } => {
                 let input_columns = input_scope.columns.clone();
-                let new_scope_name = wrapped.names.next_table_name("t");
+                let new_scope_name: TableName = wrapped.names.fresh("t").into();
 
                 // Start with Star + window column
                 let items = vec![SelectItem::Star, window_item];
@@ -1281,14 +1287,12 @@ impl Builder<Projected> {
             if !reachable {
                 let scope_clone = scope.clone();
                 let source_query = self.state.materialize()?;
-                let source_name = self.names.next_name("cte");
+                let source_name = self.names.fresh("cte");
                 self.accumulated_ctes
-                    .push(Cte::new(source_name.clone(), source_query));
+                    .push(Cte::new(source_name.to_string(), source_query));
 
-                let source_scope =
-                    TableName::Named(delightql_types::SqlIdentifier::from(source_name.as_str()));
-                let requalified = scope_clone.requalified(source_scope);
-                let cte_table = TableExpression::table(&source_name);
+                let requalified = scope_clone.requalified(source_name.clone().into());
+                let cte_table = TableExpression::table(source_name.as_str());
                 self.state = BuilderState::Select {
                     select: SelectBuilder::new()
                         .from_tables(vec![cte_table])
@@ -1308,7 +1312,7 @@ impl Builder<Projected> {
         let cte_body = body(&input)?;
 
         // Generate a CTE name
-        let cte_name = self.names.next_name("cte");
+        let cte_name = self.names.fresh("cte").to_string();
         let cte_scope = TableName::Named(delightql_types::SqlIdentifier::from(cte_name.as_str()));
 
         let output_columns = build_cte_output_columns(
@@ -1413,8 +1417,8 @@ impl Builder<Projected> {
         };
 
         // Output scope: use left's columns with a new generated name
-        let set_scope_name = self.names.next_table_name("set");
-        let output_scope = left_scope.requalified(set_scope_name);
+        let set_scope_name = self.names.fresh("set");
+        let output_scope = left_scope.requalified(set_scope_name.into());
 
         Ok(Self {
             state: BuilderState::Frozen {
@@ -1548,6 +1552,57 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
     });
 
     if let (Some(col), None) = (historical.next(), historical.next()) {
+        return Some(QualifiedColumn {
+            name: col_name(col).to_string(),
+            qualifier: col_qualifier(col).map(|s| s.to_string()),
+            has_interior_schema: col.interior_schema.is_some(),
+        });
+    }
+
+    // Tier 2b: renamed-column reference through its source relation.
+    // A rename severs the (name, qualifier) pair tier 2 walks:
+    // `*(id as oid)` leaves frames (id, o) below and (oid, t_N) above —
+    // no frame says (oid, o), yet `o.oid` is how a caller names "the
+    // column now called oid that came from o". Match on CURRENT name
+    // plus the requested qualifier appearing anywhere in the stack,
+    // uniqueness-guarded like every other stack walk here.
+    let mut renamed = columns.iter().filter(|c| {
+        delightql_types::SqlIdentifier::str_eq(col_name(c), col_name_str)
+            && c.info.identity_stack().iter().any(|id| match &id.table_qualifier {
+                TableName::Named(s) => *s == table,
+                TableName::Fresh => false,
+            })
+    });
+
+    if let (Some(col), None) = (renamed.next(), renamed.next()) {
+        return Some(QualifiedColumn {
+            name: col_name(col).to_string(),
+            qualifier: col_qualifier(col).map(|s| s.to_string()),
+            has_interior_schema: col.interior_schema.is_some(),
+        });
+    }
+
+    // Tier 2c: the ANSWERING channel (the lvar law). A column that
+    // crossed a pipe/entity boundary answers to `access_name`, and a
+    // qualified-glob export answers to its full-name spelling
+    // ("users_t.name|2|"). Match the requested (qualifier, name) against
+    // either; uniqueness-guarded like every stack walk here.
+    let mut answering = columns.iter().filter(|c| {
+        let answers_qual = c
+            .access_name
+            .as_ref()
+            .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), table));
+        if !answers_qual {
+            return false;
+        }
+        let base = col_name(c).split('|').next().unwrap_or_else(|| col_name(c));
+        delightql_types::SqlIdentifier::str_eq(col_name(c), col_name_str)
+            || base
+                .strip_prefix(table)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|n| delightql_types::SqlIdentifier::str_eq(n, col_name_str))
+    });
+    if let (Some(col), None) = (answering.next(), answering.next()) {
         return Some(QualifiedColumn {
             name: col_name(col).to_string(),
             qualifier: col_qualifier(col).map(|s| s.to_string()),
@@ -1752,7 +1807,7 @@ impl BuilderState {
                 // Only generate fresh names for anonymous scopes.
                 let alias = match &scope.name {
                     TableName::Named(_) => scope.name.clone(),
-                    _ => names.next_table_name("t"),
+                    _ => names.fresh("t").into(),
                 };
                 let new_scope = scope.requalified_with_disambiguation(alias);
                 let alias_str = table_name_sql(&new_scope.name).to_string();

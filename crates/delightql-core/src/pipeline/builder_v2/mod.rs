@@ -348,13 +348,23 @@ fn parse_query_node(query_node: CstNode, features: &mut FeatureCollector) -> Res
         };
     }
 
-    // Wrap with ER-context directive if present (outermost wrapper)
+    // The `under context:` prefix dialect is REMOVED (GROUNDING-AND-
+    // MENTION.md): the context is a symbol riding ON the ER operator,
+    // not a statement-scoped wrapper. The shape still parses so the
+    // refusal can teach, echoing the context the user wrote.
     if let Some(ctx_node) = query_node.find_child("er_context_directive") {
         let context = parse_er_context_spec(ctx_node)?;
-        query = Query::WithErContext {
-            context,
-            query: Box::new(query),
-        };
+        return Err(DelightQLError::validation_error_categorized(
+            "grounding/er/under_removed",
+            format!(
+                "the `under {ctx}:` prefix is removed — write the context as a \
+                 symbol: &&(::{ctx}) for the transitive walk, &(::{ctx}) for a \
+                 direct edge",
+                ctx = context.context_name,
+            ),
+            "contexts are symbols on the operator; the edge set per context is \
+             finite and declared",
+        ));
     }
 
     Ok(query)
@@ -585,6 +595,64 @@ fn parse_cte_binding(cte_node: CstNode, features: &mut FeatureCollector) -> Resu
 
     let expression = parse_expression(rel_expr_node, features)?;
     let name = name_node.text().to_string();
+
+    // Definition-style named head: `name(a, b) : body`. The head WINS:
+    // it is an ordered projection of the body's heading — desugared to
+    // exactly `body |> (a, b)`, so an absent name refuses and the
+    // head's order is the output order, the same law `:-` heads obey.
+    // Heads list NAMES: the shared column_spec grammar admits literals,
+    // calls, aliases, and placeholders in projection positions, but a
+    // head that computes, renames, or discards is not a head — those
+    // refuse toward the body spelling. Glob heads (`name(*)`) and the
+    // labeling shorthand (`body : name`) pass the heading through.
+    let expression = match cte_node.field("columns") {
+        Some(columns_node) => {
+            let mut head_names = Vec::new();
+            if let Some(list_node) = columns_node.find_child("column_list") {
+                for item in list_node.children() {
+                    if item.kind() != "column_spec_item" {
+                        continue;
+                    }
+                    let is_plain_name = item.field_text("alias").is_none()
+                        && !item.has_child("placeholder")
+                        && item.find_child("scalar_subquery").is_none()
+                        && item.find_child("function_call").is_none()
+                        && item.find_child("literal").is_none()
+                        && item.find_child("parenthesized_expression").is_none();
+                    let id = if is_plain_name {
+                        item.find_child("identifier")
+                    } else {
+                        None
+                    };
+                    let Some(id) = id else {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "cte/head/names_only",
+                            format!(
+                                "a CTE head lists column names — '{}' is not a name",
+                                item.text()
+                            ),
+                            "compute, rename, or filter in the body, then name the \
+                             result: name(cols) : body |> (expr as col)",
+                        ));
+                    };
+                    head_names.push(
+                        DomainExpression::lvar_builder(crate::pipeline::cst::unstrop_identifier(
+                            id.text(),
+                        ))
+                        .build(),
+                    );
+                }
+            }
+            if head_names.is_empty() {
+                expression
+            } else {
+                RelationalExpression::pipe_builder(expression)
+                    .with_projection(head_names)
+                    .build()
+            }
+        }
+        None => expression,
+    };
 
     // Effect-CTE label (EFFECT-ALGEBRA R4): `expression : name!` — the CST's
     // effect_marker field. REPORT-2.1 note 1: the builder used to DROP this
@@ -866,73 +934,49 @@ mod effect_builder_tests {
         parse_query(&tree, source).expect_err("builder must refuse the source")
     }
 
-    /// Surface-to-AST losslessness pin: the grammar's grounded namespace is
-    /// a two-part semantic value. SigmaCall does not yet carry GroundedPath,
-    /// so accepting it would necessarily discard information.
+    /// The query-position `^` spelling is removed: grounding is an
+    /// effect, never a per-reference decoration. Every position that
+    /// still parses the shape refuses with the removal teaching —
+    /// sigma citations included.
     #[test]
-    fn grounded_sigma_citation_refuses_instead_of_dropping_grounding() {
+    fn grounded_sigma_citation_refuses_with_removal_teaching() {
         let error = build_error("_(v @ 1), +data::x^lib::y.h(v)");
         assert_eq!(
             error.error_uri(),
-            "delightql-error://semantic/sigma/grounding_unsupported"
+            "delightql-error://semantic/grounding/jit_removed"
         );
     }
 
-    /// Complete semantic-value pin for ordinary relation qualification. Both
-    /// halves of `data^library` must survive; keeping only the first namespace
-    /// produces a valid-looking AST with the wrong meaning.
+    /// Relation position: the removed form refuses instead of building
+    /// a grounded relation.
     #[test]
-    fn grounded_relation_preserves_data_and_library_namespaces() {
-        let query = build("data::warehouse^lib::reports.orders(*)");
-        let Query::Relational(RelationalExpression::Relation(Relation::Ground {
-            identifier,
-            ..
-        })) = query
-        else {
-            panic!("expected a grounded relation");
-        };
-        assert_eq!(identifier.namespace_path.fq_string(), "data::warehouse");
-        let grounding = identifier.grounding.expect("grounding must be preserved");
-        assert_eq!(grounding.data_ns.fq_string(), "data::warehouse");
-        assert_eq!(grounding.grounded_ns.len(), 1);
-        assert_eq!(grounding.grounded_ns[0].fq_string(), "lib::reports");
+    fn grounded_relation_refuses_with_removal_teaching() {
+        let error = build_error("data::warehouse^lib::reports.orders(*)");
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://semantic/grounding/jit_removed"
+        );
     }
 
-    /// The piped HO syntax used to parse the same grounded namespace and then
-    /// discard its `GroundedPath`. It now carries the complete value to the
-    /// common HO expansion door.
+    /// Piped HO position: the removed form refuses at the same
+    /// chokepoint every other position routes through.
     #[test]
     #[stacksafe::stacksafe]
-    fn grounded_piped_ho_preserves_grounding() {
-        let query = build("orders(*) |> data::warehouse^lib::reports.decorate(*)");
-        let Query::Relational(RelationalExpression::Pipe(pipe)) = query else {
-            panic!("expected a pipe");
-        };
-        let UnaryRelationalOperator::HoViewApplication {
-            ref namespace,
-            ref grounding,
-            ..
-        } = pipe.operator
-        else {
-            panic!("expected a piped HO invocation");
-        };
+    fn grounded_piped_ho_refuses_with_removal_teaching() {
+        let error = build_error("orders(*) |> data::warehouse^lib::reports.decorate(*)");
         assert_eq!(
-            namespace.as_ref().expect("data namespace").fq_string(),
-            "data::warehouse"
+            error.error_uri(),
+            "delightql-error://semantic/grounding/jit_removed"
         );
-        let grounding = grounding.as_ref().expect("grounding must be preserved");
-        assert_eq!(grounding.data_ns.fq_string(), "data::warehouse");
-        assert_eq!(grounding.grounded_ns[0].fq_string(), "lib::reports");
     }
 
-    /// Function ASTs do not yet model grounding. As with sigma citations, an
-    /// explicit refusal is lossless; accepting and truncating is not.
+    /// Scalar-function position: same removal, same teaching.
     #[test]
-    fn grounded_scalar_function_refuses_instead_of_dropping_grounding() {
+    fn grounded_scalar_function_refuses_with_removal_teaching() {
         let error = build_error("_(x @ data::warehouse^lib::reports.f:(1))");
         assert_eq!(
             error.error_uri(),
-            "delightql-error://semantic/function/grounding_unsupported"
+            "delightql-error://semantic/grounding/jit_removed"
         );
     }
 

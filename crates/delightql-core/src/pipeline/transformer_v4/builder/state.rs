@@ -410,8 +410,8 @@ impl BuilderState {
 
     /// Wrap the current state as a subquery in FROM with a generated alias.
     pub(super) fn wrap_as_subquery(self, names: &NameGenerator) -> Result<Self> {
-        let alias = names.next_table_name("t");
-        self.wrap_as_subquery_named(alias, names)
+        let alias = names.fresh("t");
+        self.wrap_as_subquery_named(alias.into(), names)
     }
 
     /// Wrap the current state as a subquery in FROM with a specific alias.

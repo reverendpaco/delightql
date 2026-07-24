@@ -6622,30 +6622,30 @@ impl DelightQLSystem {
                 Self::write_ho_params_to_bootstrap(bootstrap_conn, entity_id, &positions)?;
             }
 
-            // For ER-rules, write metadata to er_rule table
-            // Each clause may have a different context, so iterate all clauses.
-            // Use enumerate() so clause_ordinal (1-indexed) matches entity_clause.ordinal.
+            // For edges, write the selection keys to join_edge: the two
+            // ground terms as NAKED canonical spellings plus the context
+            // symbol — the match key and the stored key are the same
+            // bytes. Alphabetical pair ordering makes lookup symmetric.
             for (idx, ddl_def) in ddl_defs.iter().enumerate() {
                 if let crate::pipeline::asts::ddl::DdlHead::ErRule {
-                    ref left_table,
-                    ref right_table,
+                    ref left_spelling,
+                    ref right_spelling,
                     ref context,
                 } = ddl_def.head
                 {
-                    // Canonical ordering: alphabetical pair
-                    let (left, right) = if left_table <= right_table {
-                        (left_table.as_str(), right_table.as_str())
+                    let (left, right) = if left_spelling <= right_spelling {
+                        (left_spelling.as_str(), right_spelling.as_str())
                     } else {
-                        (right_table.as_str(), left_table.as_str())
+                        (right_spelling.as_str(), left_spelling.as_str())
                     };
                     bootstrap_conn
                         .execute(
-                            "INSERT INTO er_rule (entity_id, left_table, right_table, context_name, clause_ordinal) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            "INSERT INTO join_edge (entity_id, left_spelling, right_spelling, context_name, clause_ordinal) VALUES (?1, ?2, ?3, ?4, ?5)",
                             rusqlite::params![entity_id, left, right, context, (idx + 1) as i32],
                         )
                         .map_err(|e| {
                             DelightQLError::database_error_with_source(
-                                "Failed to insert er_rule",
+                                "Failed to insert join_edge",
                                 e.to_string(),
                                 Box::new(e),
                             )
@@ -6851,11 +6851,11 @@ impl DelightQLSystem {
             let mut collision_stmt = bootstrap_conn
                 .prepare(
                     "SELECT DISTINCT new_er.context_name, existing_ns.fq_name
-                     FROM er_rule new_er
+                     FROM join_edge new_er
                      JOIN entity new_e ON new_e.id = new_er.entity_id
                      JOIN activated_entity new_ae ON new_ae.entity_id = new_e.id
                         AND new_ae.namespace_id = ?1
-                     JOIN er_rule existing_er ON existing_er.context_name = new_er.context_name
+                     JOIN join_edge existing_er ON existing_er.context_name = new_er.context_name
                      JOIN entity existing_e ON existing_e.id = existing_er.entity_id
                      JOIN activated_entity existing_ae ON existing_ae.entity_id = existing_e.id
                      JOIN namespace existing_ns ON existing_ns.id = existing_ae.namespace_id
@@ -7564,11 +7564,11 @@ impl DelightQLSystem {
                     [cartridge_id],
                 ).map_err(|e| DelightQLError::database_error("Failed to delete ho_param", e.to_string()))?;
 
-                // er_rule
+                // join_edge
                 bootstrap_conn.execute(
-                    "DELETE FROM er_rule WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
+                    "DELETE FROM join_edge WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete er_rule", e.to_string()))?;
+                ).map_err(|e| DelightQLError::database_error("Failed to delete join_edge", e.to_string()))?;
 
                 // referenced_entity
                 bootstrap_conn.execute(
@@ -8210,7 +8210,7 @@ impl DelightQLSystem {
     }
 
     /// Deep-copy all sub-tables for an entity (clause, attribute, referenced,
-    /// ho_param+columns, er_rule, interior_entity+attributes).
+    /// ho_param+columns, join_edge, interior_entity+attributes).
     fn copy_entity_subtables(
         conn: &Connection,
         old_entity_id: i32,
@@ -8299,14 +8299,14 @@ impl DelightQLSystem {
             }
         }
 
-        // er_rule
+        // join_edge
         conn.execute(
-            "INSERT INTO er_rule (entity_id, left_table, right_table, context_name, clause_ordinal)
-             SELECT ?1, left_table, right_table, context_name, clause_ordinal
-             FROM er_rule WHERE entity_id = ?2",
+            "INSERT INTO join_edge (entity_id, left_spelling, right_spelling, context_name, clause_ordinal)
+             SELECT ?1, left_spelling, right_spelling, context_name, clause_ordinal
+             FROM join_edge WHERE entity_id = ?2",
             rusqlite::params![new_entity_id, old_entity_id],
         )
-        .map_err(|e| DelightQLError::database_error("Failed to copy er_rule", e.to_string()))?;
+        .map_err(|e| DelightQLError::database_error("Failed to copy join_edge", e.to_string()))?;
 
         // interior_entity + interior_entity_attribute (FK chain)
         {
@@ -8347,7 +8347,7 @@ impl DelightQLSystem {
 
     /// Delete all entity sub-tables and the cartridge row for a single cartridge.
     /// FK-safe deletion order: interior_entity_attribute, interior_entity,
-    /// ho_param_ground_value, ho_param_column, entity_resolution, ho_param, er_rule,
+    /// ho_param_ground_value, ho_param_column, entity_resolution, ho_param, join_edge,
     /// referenced_entity, entity_attribute, entity_clause, activated_entity, entity, cartridge.
     fn clear_cartridge_entities(bootstrap_conn: &Connection, cartridge_id: i64) -> Result<()> {
         bootstrap_conn
@@ -8405,9 +8405,9 @@ impl DelightQLSystem {
         ).map_err(|e| DelightQLError::database_error("Failed to delete ho_param", e.to_string()))?;
 
         bootstrap_conn.execute(
-            "DELETE FROM er_rule WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
+            "DELETE FROM join_edge WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete er_rule", e.to_string()))?;
+        ).map_err(|e| DelightQLError::database_error("Failed to delete join_edge", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM referenced_entity WHERE containing_entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
@@ -8496,9 +8496,9 @@ impl DelightQLSystem {
             })?;
 
         bootstrap_conn
-            .execute("DELETE FROM er_rule WHERE entity_id = ?1", [entity_id])
+            .execute("DELETE FROM join_edge WHERE entity_id = ?1", [entity_id])
             .map_err(|e| {
-                DelightQLError::database_error("Failed to delete er_rule", e.to_string())
+                DelightQLError::database_error("Failed to delete join_edge", e.to_string())
             })?;
 
         bootstrap_conn

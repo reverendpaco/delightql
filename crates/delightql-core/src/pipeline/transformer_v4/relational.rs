@@ -43,7 +43,7 @@ use crate::pipeline::pipe_chain::PipeSegment;
 use crate::pipeline::sql_ast_v3::TableExpression;
 
 use super::builder::{col_name, col_qualifier, table_name_sql};
-use super::builder::{Builder, NameGenerator, Projected, Qualify, Unprojected};
+use super::builder::{Builder, NameGenerator, Projected, Qualify, ScopeName, Unprojected};
 use super::scalar;
 use super::tree_group;
 use super::TransformCtx;
@@ -453,7 +453,7 @@ fn r_lower_tvf(
 
     Ok(Builder::from_table(
         table_expr,
-        scope_name,
+        ScopeName::Resolved(scope_name),
         columns,
         names.fork(),
     ))
@@ -560,7 +560,7 @@ fn r_lower_anonymous(
 
     Ok(Builder::from_frozen(
         query,
-        scope_name,
+        ScopeName::Resolved(scope_name),
         columns,
         names.fork(),
     ))
@@ -640,7 +640,7 @@ fn r_lower_inner_relation(
     let table_expr = TableExpression::subquery(query, alias_str);
     Ok(Builder::from_table(
         table_expr,
-        scope_name,
+        ScopeName::Resolved(scope_name),
         cpr_columns,
         names.fork(),
     ))
@@ -702,7 +702,7 @@ fn r_lower_consulted_view(
     let table_expr = TableExpression::subquery(body_sql, &derived_alias);
     Ok(Builder::from_table(
         table_expr,
-        scope_name,
+        ScopeName::Resolved(scope_name),
         cpr_columns,
         names.fork(),
     ))
@@ -739,7 +739,7 @@ fn r_lower_positional_relation(
             let columns = columns_from_cpr_schema(cpr_schema.get(), &scope_name);
             return Ok(Builder::from_table(
                 table_expr,
-                scope_name,
+                ScopeName::Resolved(scope_name),
                 columns,
                 names.fork(),
             ));
@@ -797,7 +797,7 @@ fn r_lower_positional_relation(
     let query = QueryExpression::Select(Box::new(stmt));
     Ok(Builder::from_frozen(
         query,
-        scope_name,
+        ScopeName::Resolved(scope_name),
         scope_columns,
         names.fork(),
     ))
@@ -864,7 +864,7 @@ pub(super) fn r_lower_relation(
 
             Ok(Builder::from_table(
                 table_expr,
-                scope_name,
+                ScopeName::Resolved(scope_name),
                 columns,
                 names.fork(),
             ))
@@ -1524,8 +1524,8 @@ fn r_lower_melt_join(
     });
     let source_query = left.add_projection(items)?.to_sql()?;
 
-    let source_alias_str = table_name_sql(&names.next_table_name("t")).to_string();
-    let je_alias_str = table_name_sql(&names.next_table_name("_je")).to_string();
+    let source_alias_str = names.fresh("t").to_string();
+    let je_alias_str = names.fresh("_je").to_string();
 
     // 3. Build outer SELECT: passthrough left columns + json_extract per melt column.
     let sq = ColumnQualifier::table(&source_alias_str);
@@ -1610,7 +1610,7 @@ fn r_lower_melt_join(
 
     Builder::from_query(
         QueryExpression::Select(Box::new(select)),
-        scope_name,
+        ScopeName::Resolved(scope_name),
         columns,
         names.fork(),
     )
@@ -1934,7 +1934,7 @@ fn r_lower_union_corresponding(
         let op_query = op.to_sql()?;
 
         // Wrap operand as subquery so we can SELECT specific columns from it.
-        let op_alias = names.next_name("ucorr");
+        let op_alias = names.fresh("ucorr").to_string();
         let items: Vec<SelectItem> = output_col_names
             .iter()
             .map(|out_name| {
@@ -1992,10 +1992,10 @@ fn r_lower_union_corresponding(
         .unwrap();
 
     // Build output scope from cpr_schema.
-    let scope_name = names.next_table_name("ucorr_out");
-    let output_cols = columns_from_cpr_schema(cpr_schema.get(), &scope_name);
+    let scope_name = names.fresh("ucorr_out");
+    let output_cols = columns_from_cpr_schema(cpr_schema.get(), &scope_name.clone().into());
 
-    Builder::from_frozen(combined, scope_name, output_cols, names).project_all()
+    Builder::from_frozen(combined, scope_name.into(), output_cols, names).project_all()
 }
 
 // ---------------------------------------------------------------------------
@@ -2359,7 +2359,7 @@ fn r_lower_n_way_delegate_join(
     let fresh_source = |suffix: &str| {
         Builder::from_frozen(
             src.clone(),
-            names.next_table_name(suffix),
+            names.fresh(suffix).into(),
             cols.clone(),
             names.clone(),
         )
@@ -3448,7 +3448,7 @@ pub(super) fn r_lower_meta_ize(
     }
 
     // Output schema: the meta-ize output columns
-    let scope_name = TableName::Named(SqlIdentifier::from("_meta"));
+    let scope_name = builder.names().fresh("_meta");
     let output_col_names: Vec<&str> = vec!["scope", "column_name", "ordinal"];
 
     // Build inline UNION ALL of single-row SELECTs instead of VALUES
@@ -3510,7 +3510,7 @@ pub(super) fn r_lower_meta_ize(
             // name-as-data vocabulary owned by no source table — their
             // qualifier is Fresh so a second application (composition:
             // X(^^) ≡ X(^)^) reports scope "_" like any derived
-            // relation. "_meta" survives only as the SQL alias.
+            // relation. The minted scope survives only as the SQL alias.
             ColumnMetadata::new(
                 ColumnProvenance::from_column(*name),
                 TableName::Fresh,
@@ -3521,7 +3521,7 @@ pub(super) fn r_lower_meta_ize(
 
     Ok(Builder::from_query(
         query,
-        scope_name,
+        scope_name.into(),
         columns,
         builder.names().fork(),
     ))
@@ -3564,16 +3564,16 @@ pub(super) fn r_lower_witness(
         })?;
 
     let query = QueryExpression::Select(Box::new(select));
-    let scope_name = TableName::Named(SqlIdentifier::from("_witness"));
-    // Honest Fresh: "met" is the compiler-generated EXISTS result; "_witness" is a
-    // synthetic scope, not a source table.
+    let scope_name = names_fork.fresh("_witness");
+    // Honest Fresh: "met" is the compiler-generated EXISTS result; the
+    // scope is a synthetic mint, not a source table.
     let columns = vec![ColumnMetadata::new(
         ColumnProvenance::from_column("met"),
-        scope_name.clone(),
+        scope_name.clone().into(),
         Some(0),
     )];
 
-    Ok(Builder::from_query(query, scope_name, columns, names_fork))
+    Ok(Builder::from_query(query, scope_name.into(), columns, names_fork))
 }
 
 /// Lower the signed witness: postfix `+-`.
@@ -3708,7 +3708,8 @@ pub(super) fn r_lower_signed_witness(
         .map_err(err)?;
 
     let query = QueryExpression::Select(Box::new(select));
-    let scope_name = TableName::Named(SqlIdentifier::from("_witness"));
+    let scope_name = names_fork.fresh("_witness");
+    let scope_qualifier: TableName = scope_name.clone().into();
     // Honest Fresh: the carried names are re-scoped under the wrap; "met"
     // is the compiler-generated presence flag, not a source column.
     let columns: Vec<ColumnMetadata> = source_names
@@ -3718,13 +3719,13 @@ pub(super) fn r_lower_signed_witness(
         .map(|(i, name)| {
             ColumnMetadata::new(
                 ColumnProvenance::from_column(name.clone()),
-                scope_name.clone(),
+                scope_qualifier.clone(),
                 Some(i),
             )
         })
         .collect();
 
-    Ok(Builder::from_query(query, scope_name, columns, names_fork))
+    Ok(Builder::from_query(query, scope_name.into(), columns, names_fork))
 }
 
 /// Lower reposition: `|> *[col as pos]`.
@@ -3762,6 +3763,14 @@ pub(super) fn r_lower_narrowing_destructure(
 
     let output_columns = cpr_output_columns(cpr_schema.get());
 
+    // Narrowing iterates an ARRAY. Do not lax-wrap a top-level object
+    // into a one-element array here (json_type = 'object' →
+    // json_array(j)): the object case already has its spelling — pathing,
+    // `(j:{.a})` — and the coercion would both duplicate it under the
+    // wrong operator and convert an upstream shape bug (object arriving
+    // where an array was promised) into a plausible one-row answer.
+    // Non-array inputs are an open ruling; the standing red
+    // brace_narrowing_single_object holds the door.
     builder.expand_with_json_each(
         &column,
         "_narrow",
@@ -4445,7 +4454,7 @@ pub(super) fn r_lower_intersect_corresponding(
     let mut op_queries = Vec::new();
     for op in &operands {
         op_columns.push(op.scope_columns());
-        op_aliases.push(names.next_name("isect"));
+        op_aliases.push(names.fresh("isect"));
     }
     for op in operands {
         op_queries.push(op.to_sql()?);
@@ -4455,7 +4464,7 @@ pub(super) fn r_lower_intersect_corresponding(
     let alias_map: Vec<(Option<String>, String)> = user_aliases
         .into_iter()
         .zip(op_aliases.iter())
-        .map(|(user, alias)| (user, alias.clone()))
+        .map(|(user, alias)| (user, alias.to_string()))
         .collect();
 
     // Dispatch: min_multiplicity → bag intersection (ROW_NUMBER JOIN)
@@ -4489,10 +4498,10 @@ pub(super) fn r_lower_intersect_corresponding(
 
             // Build inner EXISTS subquery using Builder.
             // The scope name must match the alias used in rewrite_correlation_qualifiers.
-            let inner_scope = TableName::Named(SqlIdentifier::from(op_aliases[j].as_str()));
+            let inner_scope = op_aliases[j].clone();
             let inner = Builder::from_frozen(
                 op_queries[j].clone(),
-                inner_scope,
+                inner_scope.into(),
                 op_columns[j].clone(),
                 names.clone(),
             )
@@ -4505,10 +4514,10 @@ pub(super) fn r_lower_intersect_corresponding(
 
         // Build outer operand using Builder.
         // The scope name must match the alias used in rewrite_correlation_qualifiers.
-        let outer_scope = TableName::Named(SqlIdentifier::from(op_aliases[i].as_str()));
+        let outer_scope = op_aliases[i].clone();
         let mut outer = Builder::from_frozen(
             op_queries[i].clone(),
-            outer_scope,
+            outer_scope.into(),
             op_columns[i].clone(),
             names.clone(),
         );
@@ -4558,19 +4567,19 @@ fn r_lower_intersect_min_multiplicity(
     let right_cols: Vec<String> = col_pairs.iter().map(|(_, r)| r.clone()).collect();
 
     // Rebuild operand Builders from frozen queries, then add ROW_NUMBER
-    let left_scope = names.next_table_name("isect");
+    let left_scope = names.fresh("isect");
     let left_builder = Builder::from_frozen(
         op_queries.remove(0),
-        left_scope,
+        left_scope.into(),
         op_columns[0].clone(),
         names.clone(),
     )
     .project_all()?;
 
-    let right_scope = names.next_table_name("isect");
+    let right_scope = names.fresh("isect");
     let right_builder = Builder::from_frozen(
         op_queries.remove(0),
-        right_scope,
+        right_scope.into(),
         op_columns[1].clone(),
         names.clone(),
     )

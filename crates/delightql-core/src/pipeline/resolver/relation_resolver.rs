@@ -441,6 +441,7 @@ pub(super) fn resolve_ground(
                         base_expr,
                         &body_schema,
                         effective_name,
+                        &view_name,
                         outer_context,
                     )?;
                     return Ok((final_expr, final_bubbled));
@@ -515,6 +516,7 @@ pub(super) fn resolve_ground(
                         base_expr,
                         &body_schema,
                         &effective_name,
+                        &view_name,
                         outer_context,
                     )?;
                     return Ok((final_expr, final_bubbled));
@@ -1240,6 +1242,7 @@ pub(super) fn r_resolve_consulted_view(
                 base_expr,
                 &body_schema,
                 &effective_name,
+                &view_name,
                 outer_context,
             )?;
             return Ok((final_expr, final_bubbled));
@@ -1430,6 +1433,7 @@ pub(super) fn r_resolve_consulted_view(
             base_expr,
             &body_schema,
             &effective_name,
+            &view_name,
             outer_context,
         )?;
         Ok((final_expr, final_bubbled))
@@ -1504,6 +1508,7 @@ pub(super) fn r_resolve_consulted_fact(
             base_expr,
             &body_schema,
             effective_name,
+            &fact_name,
             outer_context,
         )?;
         Ok((final_expr, final_bubbled))
@@ -1622,6 +1627,57 @@ fn infer_anon_column_types(rows: &[ast_resolved::Row]) -> Vec<Option<String>> {
             unified.map(str::to_string)
         })
         .collect()
+}
+
+/// Loud where knowable: narrowing (`|> .col{...}`) iterates an ARRAY,
+/// and when the narrowed column is an anonymous-table column whose
+/// every row is a literal OBJECT constructor, the mistake is provable
+/// at resolve time — the expansion would walk the object's MEMBERS and
+/// return silent all-NULL rows. Refuse naming both remedies. Data-borne
+/// values (real columns, mixed or non-literal rows) pass through; their
+/// non-array behavior is an open ruling.
+pub(super) fn refuse_knowable_object_narrowing(
+    column: &str,
+    source: &ast_resolved::RelationalExpression,
+) -> Result<()> {
+    let ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::Anonymous {
+        rows,
+        cpr_schema,
+        ..
+    }) = source
+    else {
+        return Ok(());
+    };
+    let ast_resolved::CprSchema::Resolved(cols) = cpr_schema.get() else {
+        return Ok(());
+    };
+    let Some(idx) = cols
+        .iter()
+        .position(|c| delightql_types::SqlIdentifier::str_eq(c.name(), column))
+    else {
+        return Ok(());
+    };
+    let every_row_is_object = !rows.is_empty()
+        && rows.iter().all(|r| {
+            matches!(
+                r.values.get(idx),
+                Some(ast_resolved::DomainExpression::Function(
+                    ast_resolved::FunctionExpression::Curly { .. }
+                ))
+            )
+        });
+    if every_row_is_object {
+        return Err(DelightQLError::validation_error_categorized(
+            "narrowing/object_literal",
+            format!(
+                "narrowing iterates an array — every row of '{column}' is a single \
+                 object. Path into the object instead: ({column}:{{.field}}), or \
+                 spell the one-element sequence: [{{...}}]."
+            ),
+            "brace narrowing",
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve an Anonymous relation variant (inline table with rows/headers).
@@ -2083,6 +2139,22 @@ pub(super) fn resolve_anonymous(
 
 /// Resolve a TVF (Table-Valued Function) variant.
 ///
+/// The data world a pre-grounded namespace is bound to, as a path.
+/// Namespaces created by ground! carry default_data_ns; anything else
+/// answers None and grounds against the empty path.
+fn pre_grounded_data_ns(
+    registry: &crate::resolution::EntityRegistry,
+    namespace_fq: &str,
+) -> Option<ast_unresolved::NamespacePath> {
+    registry
+        .consult
+        .get_namespace_default_data_ns(namespace_fq)
+        .and_then(|data_ns_fq| {
+            let parts: Vec<String> = data_ns_fq.split("::").map(|s| s.to_string()).collect();
+            ast_unresolved::NamespacePath::from_parts(parts).ok()
+        })
+}
+
 /// Handles HO view expansion (grounded, namespace-qualified, and unqualified via enlist!),
 /// as well as normal TVF resolution with schema lookup.
 pub(super) fn resolve_tvf(
@@ -2120,7 +2192,6 @@ pub(super) fn resolve_tvf(
                 .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
                 if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
-                    super::grounding::refuse_positional_ho_access(&function, &domain_spec)?;
                     let (table_bindings, scalar_spec, _pipe_idx) =
                         super::grounding::split_ho_first_parens(
                             &first_parens_spec,
@@ -2136,6 +2207,7 @@ pub(super) fn resolve_tvf(
                         &function,
                         &entity,
                         &scalar_spec,
+                        &domain_spec,
                         table_bindings,
                         None,
                         join_input.take(),
@@ -2160,9 +2232,14 @@ pub(super) fn resolve_tvf(
                 .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
                 if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
                 {
-                    super::grounding::refuse_positional_ho_access(&function, &domain_spec)?;
+                    // A pre-grounded namespace (created by ground!)
+                    // carries its bound data world in default_data_ns —
+                    // the same lookup the plain consulted-view path
+                    // makes. Without it, the view body's unqualified
+                    // table references resolve against nothing.
+                    let data_ns = pre_grounded_data_ns(registry, &fq);
                     let ho_grounding = ast_unresolved::GroundedPath {
-                        data_ns: ast_unresolved::NamespacePath::empty(),
+                        data_ns: data_ns.clone().unwrap_or_else(ast_unresolved::NamespacePath::empty),
                         grounded_ns: vec![ns.clone()],
                     };
 
@@ -2182,10 +2259,11 @@ pub(super) fn resolve_tvf(
                         &function,
                         &entity,
                         &scalar_spec,
+                        &domain_spec,
                         table_bindings,
                         None,
                         join_input.take(),
-                        None,
+                        data_ns.is_some().then_some(&ho_grounding.data_ns),
                         &ho_grounding,
                         registry,
                         outer_context,
@@ -2210,12 +2288,14 @@ pub(super) fn resolve_tvf(
                     format!("{:?}", e),
                 )
             })?;
+            // An enlisted namespace can be pre-grounded too — same
+            // default_data_ns lookup as the qualified path above.
+            let data_ns = pre_grounded_data_ns(registry, &entity.namespace);
             let ho_grounding = ast_unresolved::GroundedPath {
-                data_ns: ast_unresolved::NamespacePath::empty(),
+                data_ns: data_ns.clone().unwrap_or_else(ast_unresolved::NamespacePath::empty),
                 grounded_ns: vec![entity_ns],
             };
 
-            super::grounding::refuse_positional_ho_access(&function, &domain_spec)?;
             let (table_bindings, scalar_spec, _pipe_idx) = super::grounding::split_ho_first_parens(
                 &first_parens_spec,
                 &entity,
@@ -2230,10 +2310,11 @@ pub(super) fn resolve_tvf(
                 &function,
                 &entity,
                 &scalar_spec,
+                &domain_spec,
                 table_bindings,
                 None,
                 join_input.take(),
-                None,
+                data_ns.is_some().then_some(&ho_grounding.data_ns),
                 &ho_grounding,
                 registry,
                 outer_context,
@@ -2702,7 +2783,208 @@ fn validate_scalar_spec_mixed_ground(
 /// 5. Deactivate namespace-local enlists
 /// 6. ho_view_query_to_relational() → ConsultedView + BubbledState
 /// 7. apply_call_site_pattern(scalar_spec, resolved_expr, schema, ...) for scalar filtering
+/// 8. apply_ho_access_pattern(access_spec, ...) binds the trailing access group
 pub(super) fn expand_ho_view(
+    function: &str,
+    entity: &crate::resolution::registry::ConsultedEntity,
+    scalar_spec: &ast_unresolved::DomainSpec,
+    access_spec: &ast_unresolved::DomainSpec,
+    table_bindings: crate::pipeline::query_features::HoParamBindings,
+    pipe_source: Option<ast_unresolved::RelationalExpression>,
+    join_input: Option<ast_unresolved::RelationalExpression>,
+    data_ns: Option<&ast_unresolved::NamespacePath>,
+    grounding: &ast_unresolved::GroundedPath,
+    registry: &mut crate::resolution::EntityRegistry,
+    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    config: &ResolutionConfig,
+    user_alias: Option<SqlIdentifier>,
+) -> Result<(
+    ast_resolved::RelationalExpression,
+    super::BubbledState,
+    bool,
+)> {
+    let (expr, bubbled, absorbed_join_input) = expand_ho_view_body(
+        function,
+        entity,
+        scalar_spec,
+        table_bindings,
+        pipe_source,
+        join_input,
+        data_ns,
+        grounding,
+        registry,
+        outer_context,
+        config,
+        user_alias.clone(),
+    )?;
+    let (expr, bubbled) =
+        apply_ho_access_pattern(access_spec, expr, bubbled, function, &user_alias)?;
+    Ok((expr, bubbled, absorbed_join_input))
+}
+
+/// The trailing access group on a parameterized-rule call is ordinary
+/// argumentative access over the declared heading — uniform with plain
+/// rules and receipt access (ruling R-3). The declared heading is the
+/// expansion's visible columns; hygienic carriers (injected scalar
+/// discriminators, param labels) are not part of it and pass through
+/// hidden. WHERE constraints use unqualified column references because
+/// HO ConsultedViews get CTE-wrapped and a qualifier would be wrong.
+fn apply_ho_access_pattern(
+    access_spec: &ast_unresolved::DomainSpec,
+    expr: ast_resolved::RelationalExpression,
+    bubbled: super::BubbledState,
+    function: &str,
+    user_alias: &Option<SqlIdentifier>,
+) -> Result<(
+    ast_resolved::RelationalExpression,
+    super::BubbledState,
+)> {
+    let ast_unresolved::DomainSpec::Positional(pattern_exprs) = access_spec else {
+        // Glob access stays payload-transparent.
+        return Ok((expr, bubbled));
+    };
+
+    let body_schema = super::helpers::extraction::extract_cpr_schema(&expr)?;
+    let ast_resolved::CprSchema::Resolved(schema_cols) = &body_schema else {
+        return Err(DelightQLError::validation_error(
+            format!(
+                "Cannot apply positional access to '{}': schema not resolved",
+                function
+            ),
+            "Pattern application".to_string(),
+        ));
+    };
+
+    let visible_count = schema_cols
+        .iter()
+        .filter(|c| !c.needs_hygienic_alias)
+        .count();
+    if pattern_exprs.len() != visible_count {
+        return Err(DelightQLError::validation_error(
+            format!(
+                "Positional pattern incomplete - rule '{}' has {} columns but pattern specifies {} elements",
+                function, visible_count, pattern_exprs.len()
+            ),
+            "Positional pattern validation".to_string(),
+        ));
+    }
+
+    let mut where_constraints = Vec::new();
+    let mut output_columns = Vec::new();
+    // First column bound by each bare name: a later repeat of the same
+    // name is one variable bound twice — an equality, not a second
+    // binding (mirrors PatternResolver's SelfUnify).
+    let mut first_col_of: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let unqualified_ref = |name: &str| ast_resolved::DomainExpression::Lvar {
+        name: name.into(),
+        qualifier: None,
+        namespace_path: ast_resolved::NamespacePath::empty(),
+        alias: None,
+        provenance: ast_resolved::PhaseBox::phantom(),
+    };
+
+    let mut pattern_iter = pattern_exprs.iter();
+    for col in schema_cols {
+        if col.needs_hygienic_alias {
+            output_columns.push(col.clone());
+            continue;
+        }
+        let pat = pattern_iter
+            .next()
+            .expect("arity checked above: one pattern element per visible column");
+        let source_name = col.name().to_string();
+        match pat {
+            ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
+                let mut hidden = col.clone();
+                hidden.needs_hygienic_alias = true;
+                output_columns.push(hidden);
+            }
+            ast_unresolved::DomainExpression::Lvar {
+                name,
+                qualifier: None,
+                ..
+            } => {
+                if let Some(first_source) = first_col_of.get(name.as_str()) {
+                    // One variable bound twice is self-unification: a
+                    // within-row selection bit where null is a VALUE — a
+                    // both-null row instances the pattern, matching
+                    // create_self_unification_condition. SQL `=` here
+                    // silently drops both-null rows. The column stays
+                    // visible under its original name, as consulted
+                    // plain-rule access keeps it (the base-table road
+                    // hides its duplicate — the heading question across
+                    // those roads is open and not decided here).
+                    where_constraints.push(ast_resolved::BooleanExpression::Comparison {
+                        operator: "null_safe_eq".to_string(),
+                        left: Box::new(unqualified_ref(first_source)),
+                        right: Box::new(unqualified_ref(&source_name)),
+                    });
+                    output_columns.push(col.clone());
+                } else {
+                    first_col_of.insert(name.to_string(), source_name);
+                    let mut renamed = col.clone();
+                    renamed.info = renamed.info.with_alias(name.to_string());
+                    renamed.needs_sql_rename = true;
+                    output_columns.push(renamed);
+                }
+            }
+            ast_unresolved::DomainExpression::Literal { value, .. } => {
+                // Literal → WHERE constraint; the column stays visible —
+                // the filtered value is part of the logical result, the
+                // consulted-view rule.
+                where_constraints.push(ast_resolved::BooleanExpression::Comparison {
+                    operator: "traditional_eq".to_string(),
+                    left: Box::new(unqualified_ref(&source_name)),
+                    right: Box::new(ast_resolved::DomainExpression::Literal {
+                        value: value.clone(),
+                        alias: None,
+                    }),
+                });
+                output_columns.push(col.clone());
+            }
+            other => {
+                return Err(DelightQLError::validation_error_categorized(
+                    "resolution/ho_access/pattern_shape",
+                    format!(
+                        "'{function}' access pattern position for column '{source_name}': \
+                         only bare names, `_`, and literals bind on a parameterized-rule \
+                         access pattern for now. Got: {other:?}. Bind the column to a name \
+                         and constrain it with an explicit predicate instead."
+                    ),
+                    "parameterized-rule access pattern",
+                ));
+            }
+        }
+    }
+
+    let mut expr = expr;
+    update_relation_cpr_schema(&mut expr, &output_columns);
+
+    if !where_constraints.is_empty() {
+        let combined = combine_where_constraints(where_constraints);
+        expr = ast_resolved::RelationalExpression::Filter {
+            source: Box::new(expr),
+            condition: ast_resolved::SigmaCondition::Predicate(combined),
+            origin: ast_resolved::FilterOrigin::PositionalLiteral {
+                source_table: function.to_string(),
+            },
+            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
+                output_columns.clone(),
+            )),
+        };
+    }
+
+    let final_bubbled = super::BubbledState::resolved(output_columns);
+    let final_bubbled = if let Some(alias) = user_alias {
+        relabel_bubbled_with_alias(final_bubbled, alias)
+    } else {
+        final_bubbled
+    };
+    Ok((expr, final_bubbled))
+}
+
+fn expand_ho_view_body(
     function: &str,
     entity: &crate::resolution::registry::ConsultedEntity,
     scalar_spec: &ast_unresolved::DomainSpec,
@@ -2750,6 +3032,11 @@ pub(super) fn expand_ho_view(
         function,
         pipe_source.is_some() || outer_context.is_some(),
     )?;
+
+    // A provable miss is an error, not an empty relation: a call-site
+    // literal at a PureGround position matching no clause head refuses
+    // with the declared spellings.
+    super::grounding::refuse_provable_ground_miss(function, scalar_spec, &positions)?;
 
     // Build pipe source CTE if piped
     let pipe_source_cte = pipe_source.map(|source| ("_ho_pipe_src".to_string(), source));
@@ -3192,6 +3479,7 @@ fn apply_call_site_pattern(
     expr: ast_resolved::RelationalExpression,
     body_schema: &ast_resolved::CprSchema,
     entity_name: &str,
+    display_name: &str,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     // Get base columns and relabel with entity_name so WHERE constraints
@@ -3226,6 +3514,25 @@ fn apply_call_site_pattern(
             ));
         }
     };
+
+    // Exact arity, same as base tables: a short pattern must never bind
+    // a prefix and silently drop the tail. Hygienic carriers are not
+    // part of the declared heading.
+    if let ast_unresolved::DomainSpec::Positional(patterns) = domain_spec {
+        let visible = base_cols
+            .iter()
+            .filter(|c| !c.needs_hygienic_alias)
+            .count();
+        if patterns.len() != visible {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "Positional pattern incomplete - rule '{}' has {} columns but pattern specifies {} elements",
+                    display_name, visible, patterns.len()
+                ),
+                "Positional pattern validation".to_string(),
+            ));
+        }
+    }
 
     let pattern_resolver = PatternResolver::new();
     let join_context = outer_context.map(JoinContext::from);

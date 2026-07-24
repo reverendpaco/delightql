@@ -178,7 +178,10 @@ impl QueryTransformer for CollapseTransformer {
             builder = builder.where_clause(merged);
         }
 
-        // Rewrite GROUP BY
+        // Rewrite GROUP BY. A bare literal must not land in GROUP BY
+        // position — SQL reads a bare integer there as a column ORDINAL,
+        // so a key that inlines to a constant would silently regroup (or
+        // error out of range). Keep the boundary instead.
         if let Some(gb) = stmt.group_by() {
             let mut exprs = gb.to_vec();
             for (alias, col_map) in &rewrites {
@@ -187,6 +190,9 @@ impl QueryTransformer for CollapseTransformer {
                     .map(|e| rewrite_expr(&e, alias, col_map))
                     .collect();
                 exprs = r.unwrap_or_default();
+            }
+            if exprs.iter().any(lands_as_ordinal) {
+                return Ok(None);
             }
             if !exprs.is_empty() {
                 builder = builder.group_by(exprs);
@@ -205,7 +211,8 @@ impl QueryTransformer for CollapseTransformer {
             builder = builder.having(h);
         }
 
-        // Rewrite ORDER BY
+        // Rewrite ORDER BY. Same ordinal hazard as GROUP BY: `ORDER BY 42`
+        // is a position, not a constant.
         if let Some(order_by) = stmt.order_by() {
             for term in order_by {
                 let mut e = term.expr().clone();
@@ -214,6 +221,9 @@ impl QueryTransformer for CollapseTransformer {
                         Some(r) => r,
                         None => return Ok(None),
                     };
+                }
+                if lands_as_ordinal(&e) {
+                    return Ok(None);
                 }
                 builder = builder.order_by(OrderTerm::new(e, term.direction().cloned()));
             }
@@ -556,6 +566,20 @@ fn rewrite_table_refs(
 }
 
 /// Check if a SELECT is a trivial `SELECT * ... ` with no other clauses
+/// True when SQL would read the expression in GROUP BY / ORDER BY
+/// position as a column ORDINAL rather than a constant. Parentheses are
+/// transparent to that reading — SQLite treats `GROUP BY (42)` exactly
+/// like `GROUP BY 42` — so the test strips them before matching. Any
+/// literal bails conservatively: bailing the collapse is always
+/// semantics-preserving, in every dialect.
+fn lands_as_ordinal(expr: &DomainExpression) -> bool {
+    match expr {
+        DomainExpression::Literal(_) => true,
+        DomainExpression::Parens(inner) => lands_as_ordinal(inner),
+        _ => false,
+    }
+}
+
 fn is_trivial_star_wrapper(stmt: &SelectStatement) -> bool {
     let list = stmt.select_list();
     list.len() == 1
@@ -730,14 +754,22 @@ fn try_collapse(
         builder = builder.where_clause(w);
     }
 
-    // Rewrite GROUP BY through column map
+    // Rewrite GROUP BY through column map. A bare literal must not land
+    // in GROUP BY position — SQL reads a bare integer there as a column
+    // ORDINAL, so a key that folds to a constant would silently regroup
+    // (or error out of range). Keep the boundary instead.
     if let Some(gb) = outer.group_by() {
         let rewritten_gb: Option<Vec<_>> = gb
             .iter()
             .map(|expr| rewrite_expr(expr, subquery_alias, &inner_col_map))
             .collect();
         match rewritten_gb {
-            Some(exprs) => builder = builder.group_by(exprs),
+            Some(exprs) => {
+                if exprs.iter().any(lands_as_ordinal) {
+                    return Ok(None);
+                }
+                builder = builder.group_by(exprs)
+            }
             None => return Ok(None),
         }
     }
@@ -750,11 +782,16 @@ fn try_collapse(
         }
     }
 
-    // Rewrite ORDER BY through column map
+    // Rewrite ORDER BY through column map. Same ordinal hazard as
+    // GROUP BY: `ORDER BY 42` is a position, not a constant — a column
+    // whose value folds to a literal must keep the boundary.
     if let Some(order_by) = outer.order_by() {
         for term in order_by {
             match rewrite_expr(term.expr(), subquery_alias, &inner_col_map) {
                 Some(rewritten_expr) => {
+                    if lands_as_ordinal(&rewritten_expr) {
+                        return Ok(None);
+                    }
                     builder =
                         builder.order_by(OrderTerm::new(rewritten_expr, term.direction().cloned()));
                 }

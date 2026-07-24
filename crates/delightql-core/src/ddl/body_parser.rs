@@ -287,12 +287,12 @@ fn remap_relexpr_qualifiers(
                 remap_relexpr_qualifiers(op, remap);
             }
         }
-        RelationalExpression::ErJoinChain { relations } => {
+        RelationalExpression::ErJoinChain { relations, .. } => {
             for rel in relations {
                 remap_relation_qualifiers(rel, remap);
             }
         }
-        RelationalExpression::ErTransitiveJoin { left, right } => {
+        RelationalExpression::ErTransitiveJoin { left, right, .. } => {
             remap_relexpr_qualifiers(left, remap);
             remap_relexpr_qualifiers(right, remap);
         }

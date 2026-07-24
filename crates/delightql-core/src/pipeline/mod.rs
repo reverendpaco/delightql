@@ -65,6 +65,7 @@ pub mod cfe_substitution; // CFE parameter substitution (shared between transfor
 pub mod precedence; // Operator precedence helpers for infix expressions
 pub mod sql_optimizer;
 pub mod sql_rewriter;
+pub mod sql_self_check; // Post-lowering name-binding verification (the transpiler's L1)
 pub mod transformer_v4; // Phase 4: AST → SQL AST (PRODUCTION)
                         // Note: generator v1 and generator_v2 referenced below no longer exist in the codebase.
                         // Only generator_v3 remains as the production SQL string generator.
@@ -1073,7 +1074,9 @@ fn lower_statement(
 ) -> Result<sql_ast_v3::SqlStatement> {
     let expanded = sql_rewriter::rewrite(statement, dialect)?;
     let cleaned = sql_optimizer::optimize(expanded, level)?;
-    sql_rewriter::legalize(cleaned, dialect)
+    let legal = sql_rewriter::legalize(cleaned, dialect)?;
+    sql_self_check::check(&legal)?;
+    Ok(legal)
 }
 
 /// Generate SQL string from a single addressed relational expression

@@ -226,13 +226,33 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 cpr_schema: _,
             } => self.r_resolve_set_op(operator, operands, correlation, outer_context, grounding),
 
-            ast_unresolved::RelationalExpression::ErJoinChain { relations } => {
-                self.r_resolve_er_join_chain(relations, outer_context, grounding)
-            }
+            ast_unresolved::RelationalExpression::ErJoinChain {
+                relations,
+                term_spellings,
+                contexts,
+            } => self.r_resolve_er_join_chain(
+                relations,
+                term_spellings,
+                contexts,
+                outer_context,
+                grounding,
+            ),
 
-            ast_unresolved::RelationalExpression::ErTransitiveJoin { left, right } => {
-                self.r_resolve_er_transitive(*left, *right, outer_context, grounding)
-            }
+            ast_unresolved::RelationalExpression::ErTransitiveJoin {
+                left,
+                right,
+                left_spelling,
+                right_spelling,
+                context,
+            } => self.r_resolve_er_transitive(
+                *left,
+                *right,
+                left_spelling,
+                right_spelling,
+                context,
+                outer_context,
+                grounding,
+            ),
 
             ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => {
                 unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
@@ -245,24 +265,21 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
     fn r_resolve_er_join_chain(
         &mut self,
         relations: Vec<ast_unresolved::Relation>,
+        term_spellings: Vec<String>,
+        contexts: Vec<Option<String>>,
         outer_context: Option<&[ast_resolved::ColumnMetadata]>,
         grounding: Option<&ast_unresolved::GroundedPath>,
     ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-        let context = self.config.er_context.as_ref().ok_or_else(|| {
-            DelightQLError::validation_error(
-                "ER-join operator & requires an 'under context:' directive",
-                "Missing ER-context",
-            )
-        })?;
+        let context = super::er_chain_context(&contexts)?;
 
         Ok(super::expand_er_join_chain(
             relations,
-            context,
+            &term_spellings,
+            &context,
             self.registry,
             outer_context,
             &self.config,
             grounding,
-            None,
             None,
         )?)
     }
@@ -271,20 +288,20 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
         &mut self,
         left: ast_unresolved::RelationalExpression,
         right: ast_unresolved::RelationalExpression,
+        left_spelling: String,
+        right_spelling: String,
+        context: Option<String>,
         outer_context: Option<&[ast_resolved::ColumnMetadata]>,
         grounding: Option<&ast_unresolved::GroundedPath>,
     ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-        let context = self.config.er_context.as_ref().ok_or_else(|| {
-            DelightQLError::validation_error(
-                "ER-transitive-join operator && requires an 'under context:' directive",
-                "Missing ER-context",
-            )
-        })?;
+        let context = super::er_chain_context(std::slice::from_ref(&context))?;
 
         Ok(super::expand_er_transitive_join(
             left,
             right,
-            context,
+            &left_spelling,
+            &right_spelling,
+            &context,
             self.registry,
             outer_context,
             &self.config,
@@ -1294,7 +1311,6 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             ..
         } = pipe_expr.operator
         {
-            super::grounding::refuse_positional_ho_access(function, domain_spec)?;
             // Look up the HO view entity.
             // When namespace is explicit (e.g., std::json.tg_keys), use
             // lookup_entity with the FQ namespace — same as the non-piped
@@ -1409,6 +1425,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                 function,
                 &entity,
                 &scalar_spec,
+                domain_spec,
                 table_bindings,
                 Some(pipe_expr.source),
                 None, // no join_input for pipes
@@ -1527,6 +1544,18 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
 
         // Iterate pipe segments bottom-up (innermost operator first)
         for operator in segments {
+            // Narrowing a knowable object literal is a provable mistake —
+            // refuse while the anon source is still in hand.
+            if let ast_unresolved::UnaryRelationalOperator::NarrowingDestructure {
+                column, ..
+            } = &operator
+            {
+                super::relation_resolver::refuse_knowable_object_narrowing(
+                    column,
+                    &resolved_source,
+                )?;
+            }
+
             // Check for unresolved columns before pipe (scope barrier)
             if !source_bubbled.i_need.is_empty() {
                 let first_unresolved = &source_bubbled.i_need[0];

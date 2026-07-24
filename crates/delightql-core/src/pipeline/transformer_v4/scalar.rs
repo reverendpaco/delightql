@@ -294,10 +294,7 @@ pub(super) fn s_lower_boolean(
                     "the left side of `in` must match the relation's width",
                 ));
             }
-            let wrap_alias = match names.next_table_name("_memb") {
-                crate::pipeline::asts::core::TableName::Named(id) => id.as_str().to_string(),
-                crate::pipeline::asts::core::TableName::Fresh => "_memb".to_string(),
-            };
+            let wrap_alias = names.fresh("_memb").to_string();
             let conds: Vec<SqlDomainExpr> = cols
                 .iter()
                 .zip(probes)

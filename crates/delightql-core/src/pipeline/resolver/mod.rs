@@ -1078,6 +1078,192 @@ fn resolve_relational_expression_with_pipe_cfes(
 // ============================================================================
 
 /// Extract the table name from an unresolved Relation.
+/// The context for an ER expression, from its operator symbols. A bare
+/// operator (the removed `under` dialect's spelling) refuses with the
+/// symbol-form teaching; a chain names ONE context.
+pub(crate) fn er_chain_context(
+    contexts: &[Option<String>],
+) -> Result<ast_unresolved::ErContextSpec> {
+    let mut named = contexts.iter().flatten();
+    let first = named.next();
+    if first.is_none() || contexts.iter().any(|c| c.is_none()) {
+        return Err(DelightQLError::validation_error_categorized(
+            "grounding/er/bare_operator",
+            "the ER operators take their context as a symbol on the operator: \
+             &(::your_context) for a direct edge, &&(::your_context) for the \
+             transitive walk"
+                .to_string(),
+            "contexts are symbols; the edge set per context is finite and declared",
+        ));
+    }
+    let first = first.expect("checked above");
+    if let Some(other) = named.find(|c| *c != first) {
+        return Err(DelightQLError::validation_error_categorized(
+            "grounding/er/mixed_contexts",
+            format!(
+                "one chain, one context — this chain names both ::{first} and ::{other}"
+            ),
+            "split the chain, or declare the edges in one context",
+        ));
+    }
+    Ok(ast_unresolved::ErContextSpec {
+        namespace: None,
+        context_name: first.clone(),
+    })
+}
+
+/// The edge-selection failure, in two teachings: an unknown context is
+/// its own error (the edge set per context is finite and declared); a
+/// known context without the requested pair enumerates what IS declared.
+fn er_edge_miss_error(
+    registry: &crate::resolution::EntityRegistry,
+    context_name: &str,
+    left_spelling: &str,
+    right_spelling: &str,
+) -> DelightQLError {
+    let known = registry
+        .consult
+        .er_context_known(context_name)
+        .unwrap_or(false);
+    if !known {
+        let contexts = registry.consult.list_er_contexts().unwrap_or_default();
+        let listing = if contexts.is_empty() {
+            "no contexts have declared edges in the enlisted scope".to_string()
+        } else {
+            format!(
+                "contexts with declared edges: {}",
+                contexts
+                    .iter()
+                    .map(|c| format!("::{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return DelightQLError::validation_error_categorized(
+            "grounding/er/unknown_context",
+            format!("unknown context '::{context_name}' — {listing}"),
+            "a context exists exactly where an edge declares it",
+        );
+    }
+    let edges = registry
+        .consult
+        .lookup_er_rules_in_context(context_name)
+        .unwrap_or_default();
+    let listing = edges
+        .iter()
+        .map(|(l, r, _)| format!("{l} & {r}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    DelightQLError::validation_error_categorized(
+        "grounding/er/edge_miss",
+        format!(
+            "no edge declared for {left_spelling} & {right_spelling} in \
+             '::{context_name}' — a term selects an edge by its exact canonical \
+             spelling, and emptiness by absent declaration is an error, not a \
+             result. Declared edges: {listing}"
+        ),
+        "restriction is downstream: select a declared edge, then filter its \
+         relation",
+    )
+}
+
+/// The endpoint's (table name, user alias) — the alias is OUTSIDE the
+/// term: selection used the spelling, exports answer to the alias.
+fn er_endpoint(rel: &ast_unresolved::Relation) -> (String, Option<delightql_types::SqlIdentifier>) {
+    match rel {
+        ast_unresolved::Relation::Ground {
+            identifier, alias, ..
+        } => (identifier.name.to_string(), alias.clone()),
+        _ => (String::new(), None),
+    }
+}
+
+/// Endpoints only (`&&`): intermediate hops are entity boundaries and
+/// contribute nothing to the schema — the result is the two endpoint
+/// terms' exports. Built as a qualified-glob projection over the
+/// combined body; `er_stamp_endpoint_access_names` then restores the
+/// answering channel (the lvar law's access_name) so the caller's
+/// qualified references (`suppliers.name`) still resolve post-pipe.
+fn er_endpoints_projection(
+    query: ast_unresolved::Query,
+    left_name: &str,
+    right_name: &str,
+) -> ast_unresolved::Query {
+    use crate::pipeline::asts::core::expressions::ProjectionExpr;
+    let glob = |name: &str| {
+        ast_unresolved::DomainExpression::Projection(ProjectionExpr::Glob {
+            qualifier: Some(name.into()),
+            namespace_path: ast_unresolved::NamespacePath::empty(),
+        })
+    };
+    match query {
+        ast_unresolved::Query::Relational(expr) => ast_unresolved::Query::Relational(
+            ast_unresolved::RelationalExpression::pipe_builder(expr)
+                .with_projection(vec![glob(left_name), glob(right_name)])
+                .build(),
+        ),
+        other => other,
+    }
+}
+
+/// After the endpoints-only projection resolves, each output column
+/// ANSWERS TO its endpoint's name: the identity stack's most recent
+/// endpoint qualifier becomes access_name, so exports follow the lvar
+/// law across the pipe boundary.
+fn er_stamp_endpoint_access_names(
+    bubbled: &mut BubbledState,
+    left_name: &str,
+    right_name: &str,
+) {
+    let endpoint_of = |col: &ast_resolved::ColumnMetadata| -> Option<String> {
+        // Current qualifier first, then the identity stack.
+        if let ast_resolved::TableName::Named(n) = col.qualifier() {
+            let n = n.to_string();
+            if delightql_types::SqlIdentifier::str_eq(&n, left_name)
+                || delightql_types::SqlIdentifier::str_eq(&n, right_name)
+            {
+                return Some(n);
+            }
+        }
+        for frame in col.info.identity_stack().iter().rev() {
+            if let ast_resolved::TableName::Named(n) = &frame.table_qualifier {
+                let n = n.to_string();
+                if delightql_types::SqlIdentifier::str_eq(&n, left_name)
+                    || delightql_types::SqlIdentifier::str_eq(&n, right_name)
+                {
+                    return Some(n);
+                }
+            }
+            // The pipe barrier stamps Fresh as the frame qualifier and
+            // records where the column CAME FROM in the context.
+            if let ast_resolved::IdentityContext::PipeBarrier {
+                previous_table: ast_resolved::TableName::Named(n),
+                ..
+            } = &frame.context
+            {
+                let n = n.to_string();
+                if delightql_types::SqlIdentifier::str_eq(&n, left_name)
+                    || delightql_types::SqlIdentifier::str_eq(&n, right_name)
+                {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    };
+    for col in bubbled
+        .i_provide
+        .iter_mut()
+        .chain(bubbled.qualifier_scope.iter_mut())
+    {
+        if col.access_name.is_none() {
+            if let Some(name) = endpoint_of(col) {
+                col.access_name = Some(name.into());
+            }
+        }
+    }
+}
+
 fn er_table_name(rel: &ast_unresolved::Relation) -> Result<String> {
     match rel {
         ast_unresolved::Relation::Ground { identifier, .. } => Ok(identifier.name.to_string()),
@@ -1100,33 +1286,37 @@ fn er_table_name(rel: &ast_unresolved::Relation) -> Result<String> {
 /// each pair's body independently.
 fn expand_er_join_chain(
     relations: Vec<ast_unresolved::Relation>,
+    spellings: &[String],
     context: &ast_unresolved::ErContextSpec,
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
-    _left_endpoint_alias: Option<delightql_types::SqlIdentifier>,
-    _right_endpoint_alias: Option<delightql_types::SqlIdentifier>,
+    endpoints_only: Option<(String, String)>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    if relations.len() < 2 {
+    if relations.len() < 2 || spellings.len() != relations.len() {
         return Err(DelightQLError::validation_error(
             "ER-join chain requires at least two relations",
             "Invalid ER-join chain",
         ));
     }
 
-    // If no resolution_namespace is set, use enlisted-scope ER-rule lookup only.
-    // ER-rules from non-enlisted namespaces are NOT visible at the call site —
-    // the caller must enlist!() the namespace to access its ER-rules.
+    // The alias is OUTSIDE the term: selection used the spellings;
+    // exports answer to the endpoint aliases, threaded after resolution.
+    let (left_endpoint_name, left_endpoint_alias) = er_endpoint(&relations[0]);
+    let (right_endpoint_name, right_endpoint_alias) =
+        er_endpoint(relations.last().expect("len checked"));
+
+    // If no resolution_namespace is set, use enlisted-scope edge lookup only.
+    // Edges from non-enlisted namespaces are NOT visible at the call site —
+    // the caller must enlist!() the namespace that declares them.
     // (When resolution_namespace IS set, lookup_er_rule_for_namespace handles scoping.)
     let effective_config: std::borrow::Cow<'_, ResolutionConfig>;
     if config.resolution_namespace.is_none() {
-        let first_left = er_table_name(&relations[0])?;
-        let first_right = er_table_name(&relations[1])?;
         let engaged_rule =
             registry
                 .consult
-                .lookup_er_rule(&context.context_name, &first_left, &first_right)?;
+                .lookup_er_rule(&context.context_name, &spellings[0], &spellings[1])?;
         if let Some(rule) = engaged_rule {
             effective_config = std::borrow::Cow::Owned(ResolutionConfig {
                 resolution_namespace: Some(rule.namespace.clone()),
@@ -1142,18 +1332,31 @@ fn expand_er_join_chain(
 
     // For the simple pair case (A & B), just expand the single rule body
     if relations.len() == 2 {
-        let left_name = er_table_name(&relations[0])?;
-        let right_name = er_table_name(&relations[1])?;
-
-        return expand_single_er_pair(
-            &left_name,
-            &right_name,
+        let (resolved_expr, mut bubbled) = expand_single_er_pair(
+            &spellings[0],
+            &spellings[1],
             context,
             registry,
             outer_context,
             config,
             grounding,
+            endpoints_only.clone(),
+        )?;
+        if let Some((l, r)) = &endpoints_only {
+            er_stamp_endpoint_access_names(&mut bubbled, l, r);
+        }
+        let (resolved_expr, bubbled) = er_thread_endpoint_aliases(
+            resolved_expr,
+            bubbled,
+            (&left_endpoint_name, &left_endpoint_alias),
+            (&right_endpoint_name, &right_endpoint_alias),
         );
+        let resolved_expr = if endpoints_only.is_some() {
+            er_sync_pipe_schema(resolved_expr, &bubbled)
+        } else {
+            resolved_expr
+        };
+        return Ok((resolved_expr, bubbled));
     }
 
     // For chains (A & B & C & ...), combine all pair bodies into one expression.
@@ -1167,8 +1370,8 @@ fn expand_er_join_chain(
     let mut seen_table_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..relations.len() - 1 {
-        let left_name = er_table_name(&relations[i])?;
-        let right_name = er_table_name(&relations[i + 1])?;
+        let left_name = spellings[i].clone();
+        let right_name = spellings[i + 1].clone();
 
         let body_query = parse_er_rule_body(
             &left_name,
@@ -1217,31 +1420,28 @@ fn expand_er_join_chain(
     // Add self-aliases and resolve through the pipeline (same path as single-pair)
     let combined_query =
         add_self_aliases_to_query(ast_unresolved::Query::Relational(combined_expr));
+    // `&&`: intermediate hops are entity boundaries — endpoints only.
+    let combined_query = match &endpoints_only {
+        Some((l, r)) => er_endpoints_projection(combined_query, l, r),
+        None => combined_query,
+    };
 
     // Determine effective grounding (same logic as expand_single_er_pair)
     // Use the first pair's rule to determine the namespace for grounding.
-    let first_left = er_table_name(&relations[0])?;
-    let first_right = er_table_name(&relations[1])?;
     let first_rule = if let Some(ns) = &config.resolution_namespace {
         registry.consult.lookup_er_rule_for_namespace(
             &context.context_name,
-            &first_left,
-            &first_right,
+            &spellings[0],
+            &spellings[1],
             ns,
         )?
     } else {
         registry
             .consult
-            .lookup_er_rule(&context.context_name, &first_left, &first_right)?
+            .lookup_er_rule(&context.context_name, &spellings[0], &spellings[1])?
     }
     .ok_or_else(|| {
-        DelightQLError::validation_error(
-            format!(
-                "No ER-rule for ({}, {}) in context '{}'",
-                first_left, first_right, context.context_name
-            ),
-            "Missing ER-rule",
-        )
+        er_edge_miss_error(registry, &context.context_name, &spellings[0], &spellings[1])
     })?;
     let rule_ns = first_rule.namespace.clone();
     let auto_grounding = registry
@@ -1277,7 +1477,24 @@ fn expand_er_join_chain(
     })?;
 
     match resolved_query {
-        ast_resolved::Query::Relational(expr) => Ok((expr, body_bubbled)),
+        ast_resolved::Query::Relational(expr) => {
+            let mut body_bubbled = body_bubbled;
+            if let Some((l, r)) = &endpoints_only {
+                er_stamp_endpoint_access_names(&mut body_bubbled, l, r);
+            }
+            let (expr, body_bubbled) = er_thread_endpoint_aliases(
+                expr,
+                body_bubbled,
+                (&left_endpoint_name, &left_endpoint_alias),
+                (&right_endpoint_name, &right_endpoint_alias),
+            );
+            let expr = if endpoints_only.is_some() {
+                er_sync_pipe_schema(expr, &body_bubbled)
+            } else {
+                expr
+            };
+            Ok((expr, body_bubbled))
+        }
         _ => Err(DelightQLError::validation_error(
             format!(
                 "ER-chain body in context '{}' resolved to a non-relational query",
@@ -1286,6 +1503,45 @@ fn expand_er_join_chain(
             "Invalid ER-chain body",
         )),
     }
+}
+
+/// The transformer reads the pipe node's OWN schema, not the bubbled
+/// state — after stamping and alias-threading, the endpoints-only
+/// pipe's schema syncs from the threaded columns so both agree.
+fn er_sync_pipe_schema(
+    expr: ast_resolved::RelationalExpression,
+    bubbled: &BubbledState,
+) -> ast_resolved::RelationalExpression {
+    match expr {
+        ast_resolved::RelationalExpression::Pipe(pipe) => {
+            let mut inner = (*pipe).into_inner();
+            inner.cpr_schema = ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
+                bubbled.i_provide.clone(),
+            ));
+            ast_resolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(inner)))
+        }
+        other => other,
+    }
+}
+
+/// Rename endpoint tables to their user aliases throughout a resolved
+/// ER result (exports answer to the alias; selection already happened
+/// by spelling).
+fn er_thread_endpoint_aliases(
+    mut expr: ast_resolved::RelationalExpression,
+    mut bubbled: BubbledState,
+    left: (&str, &Option<delightql_types::SqlIdentifier>),
+    right: (&str, &Option<delightql_types::SqlIdentifier>),
+) -> (ast_resolved::RelationalExpression, BubbledState) {
+    if let (name, Some(alias)) = left {
+        expr = rename_in_resolved_expr(expr, name, alias);
+        rename_bubbled_columns(&mut bubbled, name, alias);
+    }
+    if let (name, Some(alias)) = right {
+        expr = rename_in_resolved_expr(expr, name, alias);
+        rename_bubbled_columns(&mut bubbled, name, alias);
+    }
+    (expr, bubbled)
 }
 
 /// Flatten an unresolved relational expression into a list of relations and conditions.
@@ -1393,15 +1649,7 @@ fn parse_er_rule_body(
             .consult
             .lookup_er_rule(&context.context_name, left_name, right_name)?
     }
-    .ok_or_else(|| {
-        DelightQLError::validation_error(
-            format!(
-                "No ER-rule for ({}, {}) in context '{}'",
-                left_name, right_name, context.context_name
-            ),
-            "Missing ER-rule",
-        )
-    })?;
+    .ok_or_else(|| er_edge_miss_error(registry, &context.context_name, left_name, right_name))?;
 
     let rule_ns = rule.namespace.clone();
 
@@ -1460,6 +1708,7 @@ fn expand_single_er_pair(
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
+    endpoints_only: Option<(String, String)>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     // Parse the rule body into an unresolved AST
     let query = parse_er_rule_body(
@@ -1475,6 +1724,12 @@ fn expand_single_er_pair(
     // Without this, ConsultedView expansion assigns auto-generated aliases (t0, t1...)
     // which break qualified references like `users_t.id` in the body's predicates.
     let query = add_self_aliases_to_query(query);
+    // `&&` over a directly-declared edge: endpoints only, same law.
+    let query = match &endpoints_only {
+        Some((l, r)) => er_endpoints_projection(query, l, r),
+        None => query,
+    };
+
 
     // Determine effective grounding for resolution
     let rule = if let Some(ns) = &config.resolution_namespace {
@@ -1489,15 +1744,7 @@ fn expand_single_er_pair(
             .consult
             .lookup_er_rule(&context.context_name, left_name, right_name)?
     }
-    .ok_or_else(|| {
-        DelightQLError::validation_error(
-            format!(
-                "No ER-rule for ({}, {}) in context '{}'",
-                left_name, right_name, context.context_name
-            ),
-            "Missing ER-rule",
-        )
-    })?;
+    .ok_or_else(|| er_edge_miss_error(registry, &context.context_name, left_name, right_name))?;
     let rule_ns = rule.namespace.clone();
     let auto_grounding = registry
         .consult
@@ -1629,6 +1876,8 @@ fn add_self_alias_to_relation(rel: ast_unresolved::Relation) -> ast_unresolved::
 fn expand_er_transitive_join(
     left: ast_unresolved::RelationalExpression,
     right: ast_unresolved::RelationalExpression,
+    left_spelling: &str,
+    right_spelling: &str,
     context: &ast_unresolved::ErContextSpec,
     registry: &mut crate::resolution::EntityRegistry,
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
@@ -1702,14 +1951,11 @@ fn expand_er_transitive_join(
             .consult
             .lookup_er_rules_in_context(&context.context_name)?;
         if r.is_empty() {
-            return Err(DelightQLError::validation_error(
-                format!(
-                    "No ER-rules found in context '{}'. \
-                     Make sure you have enlisted the namespace that defines the rules, \
-                     or use qualified access (ns.view(*)).",
-                    context.context_name,
-                ),
-                "Empty ER-context",
+            return Err(er_edge_miss_error(
+                registry,
+                &context.context_name,
+                left_spelling,
+                right_spelling,
             ));
         }
         // Check for cross-namespace ambiguity
@@ -1739,12 +1985,11 @@ fn expand_er_transitive_join(
     };
 
     if rules.is_empty() {
-        return Err(DelightQLError::validation_error(
-            format!(
-                "No ER-rules found in context '{}'. Define rules with `A&B(*) within {} :- ...`",
-                context.context_name, context.context_name,
-            ),
-            "Empty ER-context",
+        return Err(er_edge_miss_error(
+            registry,
+            &context.context_name,
+            left_spelling,
+            right_spelling,
         ));
     }
 
@@ -1761,57 +2006,62 @@ fn expand_er_transitive_join(
             .push(left_t.clone());
     }
 
-    // BFS to find path from left_name to right_name
-    let path = bfs_path(&adjacency, &left_name, &right_name)?;
+    // BFS over SPELLINGS: the graph's nodes are canonical spellings —
+    // an endpoint participates exactly when its written spelling is a
+    // declared edge term.
+    let path = bfs_path(&adjacency, left_spelling, right_spelling)?;
 
-    // Convert path to relations and expand as ErJoinChain
+    // Convert the spelling path to chain relations. Endpoints keep the
+    // caller's relations (alias threading); interior hops are entity
+    // boundaries whose Relation is only a carrier — the pair bodies
+    // supply the real joined relations. A hop's table name is its
+    // spelling's functor head.
     let chain_relations: Vec<ast_unresolved::Relation> = path
         .iter()
-        .map(|table_name| ast_unresolved::Relation::Ground {
-            identifier: ast_unresolved::QualifiedName {
-                namespace_path: ast_unresolved::NamespacePath::empty(),
-                name: table_name.clone().into(),
-                grounding: None,
-            },
-            canonical_name: ast_unresolved::PhaseBox::phantom(),
-            backend_schema: ast_unresolved::PhaseBox::phantom(),
-            domain_spec: ast_unresolved::DomainSpec::Glob,
-            alias: None,
-            outer: false,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: ast_unresolved::PhaseBox::phantom(),
-            hygienic_injections: Vec::new(),
+        .enumerate()
+        .map(|(i, spelling)| {
+            if i == 0 {
+                if let ast_unresolved::RelationalExpression::Relation(rel) = &left {
+                    return rel.clone();
+                }
+            }
+            if i == path.len() - 1 {
+                if let ast_unresolved::RelationalExpression::Relation(rel) = &right {
+                    return rel.clone();
+                }
+            }
+            let head = spelling.split('(').next().unwrap_or(spelling).trim();
+            ast_unresolved::Relation::Ground {
+                identifier: ast_unresolved::QualifiedName {
+                    namespace_path: ast_unresolved::NamespacePath::empty(),
+                    name: head.into(),
+                    grounding: None,
+                },
+                canonical_name: ast_unresolved::PhaseBox::phantom(),
+                backend_schema: ast_unresolved::PhaseBox::phantom(),
+                domain_spec: ast_unresolved::DomainSpec::Glob,
+                alias: None,
+                outer: false,
+                mutation_target: false,
+                passthrough: false,
+                cpr_schema: ast_unresolved::PhaseBox::phantom(),
+                hygienic_injections: Vec::new(),
+            }
         })
         .collect();
 
-    let (resolved_expr, bubbled) = expand_er_join_chain(
+    // Endpoints only: intermediate hops contribute nothing to the
+    // schema. Alias threading happens inside expand_er_join_chain.
+    expand_er_join_chain(
         chain_relations,
+        &path,
         context,
         registry,
         outer_context,
         &effective_config,
         grounding,
-        None,
-        None,
-    )?;
-
-    // Thread user aliases from the original endpoints onto the resolved result.
-    // We rename the table alias AND all qualifier references in the resolved AST
-    // so that `users_t(*) as u` becomes `users_t AS u` with all `users_t.col`
-    // references rewritten to `u.col`.
-    let mut resolved_expr = resolved_expr;
-    let mut bubbled = bubbled;
-    if let Some(ref la) = left_alias {
-        resolved_expr = rename_in_resolved_expr(resolved_expr, &left_name, la);
-        rename_bubbled_columns(&mut bubbled, &left_name, la);
-    }
-    if let Some(ref ra) = right_alias {
-        resolved_expr = rename_in_resolved_expr(resolved_expr, &right_name, ra);
-        rename_bubbled_columns(&mut bubbled, &right_name, ra);
-    }
-
-    Ok((resolved_expr, bubbled))
+        Some((left_name.clone(), right_name.clone())),
+    )
 }
 
 /// Rename a table's alias and all qualifier references throughout a resolved
@@ -2003,7 +2253,32 @@ fn rename_bubbled_columns(
     old_name: &str,
     new_name: &delightql_types::SqlIdentifier,
 ) {
+    // The answering channel renames with the table: access_name and
+    // full-name spellings ("users_t.name|2|") answer to the alias after
+    // an endpoint rename, or qualified refs through it die.
+    let rename_answering = |col: &mut ast_resolved::ColumnMetadata| {
+        if col
+            .access_name
+            .as_ref()
+            .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), old_name))
+        {
+            col.access_name = Some(new_name.clone());
+        }
+        // Full-name spellings rename with the endpoint: a column named
+        // "users_t.name|2|" answers to "u.name" after `as u` — the
+        // unify full-name tier matches the NEW spelling, so the
+        // reference rewrites to the real column instead of riding
+        // through unvalidated and dying at the transformer.
+        let name = col.name().to_string();
+        if let Some(rest) = name.strip_prefix(&format!("{}.", old_name)) {
+            col.info = col
+                .info
+                .clone()
+                .with_alias(format!("{}.{}", new_name, rest));
+        }
+    };
     for col in &mut bubbled.i_provide {
+        rename_answering(col);
         if let ast_resolved::TableName::Named(tn) = col.qualifier() {
             if tn == old_name {
                 let prev = tn.to_string();
@@ -2019,6 +2294,7 @@ fn rename_bubbled_columns(
         }
     }
     for col in &mut bubbled.qualifier_scope {
+        rename_answering(col);
         if let ast_resolved::TableName::Named(tn) = col.qualifier() {
             if tn == old_name {
                 let prev = tn.to_string();

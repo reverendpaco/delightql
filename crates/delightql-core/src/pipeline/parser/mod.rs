@@ -899,24 +899,18 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
     // Get the CST node type - this tells us if it's a function or view
     let cst_node_type = node.kind();
 
-    // ER-rules use left_table&right_table as their composite name
+    // Edges use their canonical head as the composite name
     let name = if cst_node_type == "er_rule_definition" {
-        let left = node
-            .field("left_table")
-            .ok_or_else(|| DelightQLError::parse_error("ER-rule missing left_table field"))?
-            .text()
-            .to_string();
-        let right = node
-            .field("right_table")
-            .ok_or_else(|| DelightQLError::parse_error("ER-rule missing right_table field"))?
-            .text()
-            .to_string();
-        // Canonical ordering: alphabetical
-        if left <= right {
-            format!("{}&{}", left, right)
-        } else {
-            format!("{}&{}", right, left)
-        }
+        return Err(DelightQLError::validation_error_categorized(
+            "grounding/er/within_removed",
+            "the `A & B(*) within ctx` dialect is removed — declare the edge as \
+             A(*) &(::ctx) B(*) :- body"
+                .to_string(),
+            "an edge declaration is a ground-instance clause: both terms and \
+             the context ground on mentions the infix form inserts",
+        ));
+    } else if cst_node_type == "er_edge_definition" {
+        crate::ddl::ddl_builder::er_edge_name(node)?
     } else if cst_node_type == "effect_rule_definition" {
         // Effect rules carry the `!` in their stored name (the invocation
         // spelling and the BinPseudoPredicate convention: "consult!").
@@ -1083,8 +1077,8 @@ fn extract_definition(node: &CstNode, source: &str) -> Result<Definition> {
                 source_range: (start, end),
             });
         }
-        "er_rule_definition" => {
-            // ER-rule: no params (left/right table names already in entity name)
+        "er_rule_definition" | "er_edge_definition" => {
+            // Edge: no params (the canonical head is the entity name)
             (DefinitionType::ErRule, Vec::new())
         }
         "effect_rule_definition" => {

@@ -301,12 +301,12 @@ pub fn walk_visit_relational<P, F: AstVisit<P> + ?Sized>(
             }
             child!(walk_visit_boolean(v, correlation));
         }
-        RelationalExpression::ErJoinChain { relations } => {
+        RelationalExpression::ErJoinChain { relations, .. } => {
             for r in relations {
                 child!(walk_visit_relation(v, r));
             }
         }
-        RelationalExpression::ErTransitiveJoin { left, right } => {
+        RelationalExpression::ErTransitiveJoin { left, right, .. } => {
             child!(walk_visit_relational(v, left));
             child!(walk_visit_relational(v, right));
         }

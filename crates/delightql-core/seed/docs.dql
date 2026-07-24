@@ -2,7 +2,7 @@ _(target, doc ----
   "sys::entities.entity",                      "A catalog entity: a table, view, function, or other named relation known to the engine." ;
   "sys::entities.entity_attribute",            "A column belonging to an entity, with its declared type and ordinal position." ;
   "sys::entities.entity_clause",               "One clause of an entity's definition; multi-clause entities (disjunctive functions, facts) have several." ;
-  "sys::entities.er_rule",                      "An entity-relationship rule linking entities for join inference." ;
+  "sys::entities.join_edge",                    "A declared ER edge: the context symbol and the two ground terms as naked canonical spellings; derived from consulted edge declarations." ;
   "sys::entities::ho.ho_param",                 "A parameter of a higher-order entity (a parameterized table or function)." ;
   "sys::entities::interior.interior_entity",    "An interior relation nested within a parent entity — a tree-group column, e.g. from `~> {...}`." ;
   "sys::ns.namespace",                          "A namespace: a named scope that groups activated entities under a fully-qualified path." ;

@@ -18,6 +18,17 @@ module.exports = grammar(dqlGrammar, {
   name: 'delightql_rules',
 
   conflicts: ($, previous) => previous.concat([
+    // er_edge_definition: `name(*) &(::ctx) …` shares its prefix with a
+    // view head `name(*) :-` and with expression glob/qualify reads —
+    // GLR forks; the token after ')' decides ('&(' vs neck vs operator).
+    [$.qualify_operator, $.glob, $.view_definition],
+    [$.column_spec_item, $.view_head_item],
+    [$.lvar, $.column_spec_item],
+    [$.lvar, $.column_spec_item, $.view_head_item],
+    [$.lvar, $.column_header_item, $.column_spec_item, $.ho_param, $.view_head_item, $.sigma_definition],
+    [$.lvar, $.column_spec_item, $.ho_param, $.view_head_item, $.sigma_definition],
+    [$.domain_expression, $.column_header_item, $.column_spec_item],
+    [$.domain_expression, $.column_spec_item],
     // liminal_relation_statement (Phase 1A): insert!(audit_log(*)) shares its
     // prefix with an effect-rule head's ho_param (insert!(audit_log(*)) :- …).
     // GLR forks; the presence or absence of a following neck decides.
@@ -230,6 +241,7 @@ module.exports = grammar(dqlGrammar, {
       $.ho_view_definition,
       $.argumentative_view_definition,
       $.view_definition,
+      $.er_edge_definition,   // table_access & ( — before er_rule (identifier &)
       $.er_rule_definition,
     ),
 
@@ -492,8 +504,8 @@ module.exports = grammar(dqlGrammar, {
     ),
 
     // ER-rule definition: left_table & right_table(*) within context neck body
-    // After the first identifier, '&' uniquely identifies ER-rule
-    // (all other definitions expect '(' or ':(').
+    // REMOVED dialect — still parses so the builder can refuse with the
+    // teaching naming the edge-declaration form below.
     er_rule_definition: $ => seq(
       field('left_table', $.identifier),
       '&',
@@ -501,6 +513,24 @@ module.exports = grammar(dqlGrammar, {
       '(', '*', ')',
       'within',
       field('context', $.identifier),
+      field('neck', $.definition_neck),
+      optional(field('doc', $.annotation_body)),
+      field('body', $.query),
+    ),
+
+    // ER EDGE declaration (GROUNDING-AND-MENTION.md): a ground-instance
+    // clause wearing operator fixity — both terms and the context ground
+    // on mentions the surface form inserts:
+    //   people(*) &(::normal) orders(*) :- BODY
+    // token.immediate('(') after '&': the context form is spelled `&(`
+    // with no space, leaving `& ` to the removed dialect's teaching.
+    er_edge_definition: $ => seq(
+      field('left_term', $.table_access),
+      '&',
+      token.immediate('('),
+      field('context', $.symbol),
+      ')',
+      field('right_term', $.table_access),
       field('neck', $.definition_neck),
       optional(field('doc', $.annotation_body)),
       field('body', $.query),

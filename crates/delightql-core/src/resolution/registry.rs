@@ -1825,10 +1825,10 @@ impl ConsultRegistry {
              JOIN activated_entity ae ON ae.entity_id = e.id
              JOIN namespace n ON n.id = ae.namespace_id{ns_join_cond}
              {extra_joins}
-             JOIN er_rule er ON er.entity_id = e.id
+             JOIN join_edge er ON er.entity_id = e.id
              JOIN entity_clause ec ON ec.entity_id = e.id AND ec.ordinal = er.clause_ordinal
              WHERE er.context_name = ?1
-               AND er.left_table = ?2 AND er.right_table = ?3
+               AND er.left_spelling = ?2 AND er.right_spelling = ?3
                AND e.type = ?4"
         );
 
@@ -1924,12 +1924,12 @@ impl ConsultRegistry {
 
         let sql = format!(
             "SELECT e.name, e.type, ec.definition, n.fq_name,
-                    er.left_table, er.right_table
+                    er.left_spelling, er.right_spelling
              FROM entity e
              JOIN activated_entity ae ON ae.entity_id = e.id
              JOIN namespace n ON n.id = ae.namespace_id{ns_join_cond}
              {extra_joins}
-             JOIN er_rule er ON er.entity_id = e.id
+             JOIN join_edge er ON er.entity_id = e.id
              JOIN entity_clause ec ON ec.entity_id = e.id AND ec.ordinal = er.clause_ordinal
              WHERE er.context_name = ?1
                AND e.type = ?2"
@@ -1983,6 +1983,58 @@ impl ConsultRegistry {
                 },
             )
             .collect())
+    }
+
+    /// Is any edge declared in this context (enlisted scope)? The edge
+    /// set per context is finite and declared, so an unknown context is
+    /// a hard error at first use, never an empty result.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn er_context_known(&self, context: &str) -> std::result::Result<bool, DelightQLError> {
+        Ok(!self.query_er_rules_multi(context, ErRuleScope::Enlisted)?.is_empty())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn er_context_known(&self, _context: &str) -> std::result::Result<bool, DelightQLError> {
+        Ok(false)
+    }
+
+    /// All contexts with at least one declared edge (enlisted scope) —
+    /// the unknown-context teaching enumerates these.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn list_er_contexts(&self) -> std::result::Result<Vec<String>, DelightQLError> {
+        let Some(system) = self.system else {
+            return Ok(Vec::new());
+        };
+        let system_ref = unsafe { &*system };
+        let bootstrap = system_ref.get_bootstrap_connection();
+        let conn = bootstrap.lock().map_err(|e| {
+            DelightQLError::database_error("Failed to acquire bootstrap lock", format!("{}", e))
+        })?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT er.context_name
+                 FROM join_edge er
+                 JOIN activated_entity ae ON ae.entity_id = er.entity_id
+                 JOIN namespace n ON n.id = ae.namespace_id
+                 JOIN enlisted_namespace en ON en.from_namespace_id = n.id
+                 ORDER BY er.context_name",
+            )
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to prepare context listing", e.to_string())
+            })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                DelightQLError::database_error("Failed to list contexts", e.to_string())
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn list_er_contexts(&self) -> std::result::Result<Vec<String>, DelightQLError> {
+        Ok(Vec::new())
     }
 
     /// Query the default_data_ns for a namespace (set by ground!).

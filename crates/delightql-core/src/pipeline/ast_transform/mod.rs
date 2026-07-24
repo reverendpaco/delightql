@@ -1290,16 +1290,31 @@ pub fn walk_transform_relational<P, Q, F: AstTransform<P, Q> + ?Sized>(
             correlation: correlation.try_map_correlation(|c| t.transform_boolean(c))?,
             cpr_schema: cpr_schema.rephase(),
         }),
-        RelationalExpression::ErJoinChain { relations } => Ok(RelationalExpression::ErJoinChain {
+        RelationalExpression::ErJoinChain {
+            relations,
+            term_spellings,
+            contexts,
+        } => Ok(RelationalExpression::ErJoinChain {
             relations: relations
                 .into_iter()
                 .map(|r| Ok(t.transform_relation_action(r)?.into_inner()))
                 .collect::<Result<Vec<_>>>()?,
+            term_spellings,
+            contexts,
         }),
-        RelationalExpression::ErTransitiveJoin { left, right } => {
+        RelationalExpression::ErTransitiveJoin {
+            left,
+            right,
+            left_spelling,
+            right_spelling,
+            context,
+        } => {
             Ok(RelationalExpression::ErTransitiveJoin {
                 left: Box::new(t.transform_relational_action(*left)?.into_inner()),
                 right: Box::new(t.transform_relational_action(*right)?.into_inner()),
+                left_spelling,
+                right_spelling,
+                context,
             })
         }
         RelationalExpression::IntersectCorresponding {

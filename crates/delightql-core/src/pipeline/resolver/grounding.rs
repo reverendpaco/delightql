@@ -120,6 +120,22 @@ fn lookup_borrowed_context_aware_function(
     }
 }
 
+/// The data world a pre-grounded namespace binds (default_data_ns, set
+/// by ground!), as a path — the fallback when no query-level grounding
+/// supplies one, so an entity enlisted or borrowed FROM a pre-grounded
+/// namespace still resolves its table holes against its bound world.
+pub(super) fn pre_grounded_data_ns_path(
+    consult: &ConsultRegistry,
+    namespace_fq: &str,
+) -> Option<ast_unresolved::NamespacePath> {
+    consult
+        .get_namespace_default_data_ns(namespace_fq)
+        .and_then(|fq| {
+            let parts: Vec<String> = fq.split("::").map(|s| s.to_string()).collect();
+            ast_unresolved::NamespacePath::from_parts(parts).ok()
+        })
+}
+
 /// Convert a consulted entity (type=1 or type=3) into a CfeDefinition for
 /// precompilation.
 ///
@@ -282,6 +298,10 @@ fn discover_nested_cfes_inner(
                             let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
                             if let Some(ns) = data_ns {
                                 cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
+                            } else if let Some(ns) =
+                                pre_grounded_data_ns_path(consult, &entity.namespace)
+                            {
+                                cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, &ns);
                             }
                             // Recurse into this entity's body
                             discover_nested_cfes_inner(
@@ -413,6 +433,10 @@ impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
                         let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
                         if let Some(ns) = self.data_ns {
                             cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
+                        } else if let Some(ns) =
+                            pre_grounded_data_ns_path(self.consult, &entity.namespace)
+                        {
+                            cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, &ns);
                         }
                         if !self
                             .collected_ccafe_cfes
@@ -591,6 +615,10 @@ impl BorrowedInliner<'_> {
                 let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
                 if let Some(ns) = self.data_ns {
                     cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
+                } else if let Some(ns) =
+                    pre_grounded_data_ns_path(self.consult, &entity.namespace)
+                {
+                    cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, &ns);
                 }
                 if !self
                     .collected_ccafe_cfes
@@ -1578,30 +1606,56 @@ pub(crate) fn build_ho_position_analysis_from_heads(
 /// - MixedGround positions: canonical name from Scalar (free-variable) clauses
 /// - PureGround positions: DDL param name
 ///
+/// At a MixedGround position a FREE clause must export the position
+/// column too, carrying the CALLER's literal (its own substituted
+/// value) — otherwise the union pads the column NULL and the
+/// call-site filter (`x = 'a' AND y = 'c'`) kills every clause: the
+/// whole entity silently empties. Only literal caller values inject;
+/// an outer-context lvar keeps today's behavior (it cannot resolve
+/// inside the clause body).
+///
 /// If `output_head` is Some, also applies the argumentative output projection.
 pub(super) fn inject_scalar_columns(
     query: ast_unresolved::Query,
     clause_params: &[HoParam],
     positions: &[HoPositionInfo],
     output_head: Option<&[ViewHeadItem]>,
+    caller_scalar_params: &std::collections::HashMap<String, ast_unresolved::DomainExpression>,
 ) -> ast_unresolved::Query {
     use crate::pipeline::asts::core::{ContainmentSemantic, UnaryRelationalOperator};
 
     // Collect ground scalar injections: (column_name, literal_value)
     let mut ground_injections: Vec<(String, String)> = Vec::new();
+    // And free-position injections at MixedGround positions:
+    // (column_name, the caller's literal).
+    let mut free_injections: Vec<(String, crate::pipeline::asts::core::LiteralValue)> = Vec::new();
     for pos_info in positions {
         if let Some(clause_param) = clause_params.get(pos_info.position) {
-            if let crate::pipeline::asts::ddl::HoParamKind::GroundScalar(ref clause_val) =
-                clause_param.kind
-            {
-                if let Some(name) = pos_info.column_name.clone() {
-                    ground_injections.push((name, clause_val.clone()));
+            match &clause_param.kind {
+                crate::pipeline::asts::ddl::HoParamKind::GroundScalar(clause_val) => {
+                    if let Some(name) = pos_info.column_name.clone() {
+                        ground_injections.push((name, clause_val.clone()));
+                    }
                 }
+                crate::pipeline::asts::ddl::HoParamKind::Scalar
+                    if pos_info.ground_mode
+                        == crate::pipeline::asts::ddl::HoGroundMode::MixedGround =>
+                {
+                    if let (Some(name), Some(ast_unresolved::DomainExpression::Literal {
+                        value, ..
+                    })) = (
+                        pos_info.column_name.clone(),
+                        caller_scalar_params.get(&clause_param.name),
+                    ) {
+                        free_injections.push((name, value.clone()));
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    if ground_injections.is_empty() && output_head.is_none() {
+    if ground_injections.is_empty() && free_injections.is_empty() && output_head.is_none() {
         return query;
     }
 
@@ -1615,6 +1669,12 @@ pub(super) fn inject_scalar_columns(
             let literal = parse_literal_value(literal_val);
             embed_exprs.push(ast_unresolved::DomainExpression::Literal {
                 value: literal,
+                alias: Some(col_name.clone().into()),
+            });
+        }
+        for (col_name, literal) in &free_injections {
+            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
+                value: literal.clone(),
                 alias: Some(col_name.clone().into()),
             });
         }
@@ -1653,6 +1713,12 @@ pub(super) fn inject_scalar_columns(
                 alias: Some(col_name.clone().into()),
             });
         }
+        for (col_name, literal) in &free_injections {
+            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
+                value: literal.clone(),
+                alias: Some(col_name.clone().into()),
+            });
+        }
     }
 
     let operator = UnaryRelationalOperator::General {
@@ -1668,6 +1734,141 @@ pub(super) fn inject_scalar_columns(
 /// `` :`people(*)` ``) into a LiteralValue. Mention ground values
 /// arrive already canonical (the DDL extractor canonicalizes at
 /// consult time), so the wrapper is stripped, never re-parsed.
+/// A provable miss is an error, not an empty relation
+/// (GROUNDING-AND-MENTION.md): a knowable ground argument — a literal
+/// written at the call site — at a position every clause grounds
+/// (PureGround), matching no clause head, is emptiness by absent
+/// DECLARATION. The catalog proves it, so refuse with the declared
+/// spellings instead of emitting a provably-empty query. A free
+/// clause at the position (MixedGround) makes every call satisfiable
+/// — no refusal can fire there; a data-borne argument (lvar,
+/// expression) keeps relational semantics and misses to empty.
+pub(super) fn refuse_provable_ground_miss(
+    function: &str,
+    scalar_spec: &ast_unresolved::DomainSpec,
+    positions: &[HoPositionInfo],
+) -> Result<()> {
+    use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
+
+    let ast_unresolved::DomainSpec::Positional(exprs) = scalar_spec else {
+        return Ok(());
+    };
+    let scalar_positions: Vec<&HoPositionInfo> = positions
+        .iter()
+        .filter(|p| matches!(p.column_kind, HoColumnKind::Scalar))
+        .collect();
+    for (idx, pos) in scalar_positions.iter().enumerate() {
+        if pos.ground_mode != HoGroundMode::PureGround {
+            continue;
+        }
+        let Some(ast_unresolved::DomainExpression::Literal { value, .. }) = exprs.get(idx)
+        else {
+            continue;
+        };
+        let any_match = pos
+            .ground_values
+            .iter()
+            .any(|(_, clause_val)| ground_literals_equal(&parse_literal_value(clause_val), value));
+        if !any_match {
+            let mut spellings: Vec<&str> = pos
+                .ground_values
+                .iter()
+                .map(|(_, s)| s.as_str())
+                .collect();
+            spellings.dedup();
+            return Err(DelightQLError::validation_error_categorized(
+                "grounding/head/provable_miss",
+                format!(
+                    "no clause of '{function}' grounds on '{arg}' at parameter {n} — \
+                     emptiness by absent declaration is an error, not a result. \
+                     Declared spellings: {list}. A data-borne value (a column, not \
+                     a literal) misses to empty instead.",
+                    arg = render_ground_literal(value),
+                    n = pos.position + 1,
+                    list = spellings.join(", "),
+                ),
+                "ground-head selection",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Equality for ground-head selection at compile time. Same-variant
+/// byte equality; numbers compare by EXACT decimal value (the SQL
+/// comparison the selection lowers to treats 5 and 5.0 as equal, and
+/// distinguishes adjacent integers above 2^53 that any f64 road would
+/// merge — a merged pair here passes the provable-miss check and then
+/// misses in SQL, the silent empty the law forbids); differing
+/// variants never match (an untyped injected column compares TEXT vs
+/// INTEGER by type ordering, never equal).
+fn ground_literals_equal(
+    a: &crate::pipeline::asts::core::LiteralValue,
+    b: &crate::pipeline::asts::core::LiteralValue,
+) -> bool {
+    use crate::pipeline::asts::core::LiteralValue::*;
+    match (a, b) {
+        (Number(x), Number(y)) => match (normalize_number(x), normalize_number(y)) {
+            (Some(p), Some(q)) => p == q,
+            _ => x == y,
+        },
+        _ => a == b,
+    }
+}
+
+/// Exact decimal value of a numeric spelling, as (sign, significant
+/// digits, exponent) with value = sign × 0.<digits> × 10^exp; zero is
+/// (0, "", 0). Arbitrary precision — no float on the road — so every
+/// distinct value normalizes distinctly and every equal value ("12",
+/// "12.0", "1.2e1") normalizes identically. None for spellings that
+/// are not plain decimal/exponent numbers.
+fn normalize_number(s: &str) -> Option<(i8, String, i64)> {
+    let s = s.trim();
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'-' => (-1i8, &s[1..]),
+        b'+' => (1, &s[1..]),
+        _ => (1, s),
+    };
+    let (mantissa, exp10) = match rest.find(['e', 'E']) {
+        Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (int_part, frac_part) = match mantissa.find('.') {
+        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits: String = int_part.chars().chain(frac_part.chars()).collect();
+    let mut exp = int_part.len() as i64 + exp10;
+    let stripped = digits.trim_start_matches('0');
+    exp -= (digits.len() - stripped.len()) as i64;
+    let stripped = stripped.trim_end_matches('0');
+    if stripped.is_empty() {
+        return Some((0, String::new(), 0));
+    }
+    Some((sign, stripped.to_string(), exp))
+}
+
+/// The call-site spelling of a ground literal, for teaching messages.
+fn render_ground_literal(v: &crate::pipeline::asts::core::LiteralValue) -> String {
+    use crate::pipeline::asts::core::LiteralValue::*;
+    match v {
+        Symbol(s) => format!("::{s}"),
+        Mention(m) => format!(":`{m}`"),
+        String(s) => format!("\"{s}\""),
+        Number(n) => n.clone(),
+        Boolean(b) => b.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 fn parse_literal_value(s: &str) -> crate::pipeline::asts::core::LiteralValue {
     use crate::pipeline::asts::core::LiteralValue;
 
@@ -1735,33 +1936,6 @@ fn wrap_query_with_pipe(
         }
         other => other, // Other query forms pass through unchanged
     }
-}
-
-/// The trailing access group on a parameterized-rule call is ordinary
-/// argumentative access over the declared heading — uniform with
-/// plain-rule calls and with directive receipt access. The binding is
-/// not built yet, so positional access REFUSES rather than accepts:
-/// silent acceptance leaks the full heading under its own names, the
-/// "bound" names never exist, and a unification join on one
-/// cross-joins without error. Glob access stays payload-transparent.
-pub(super) fn refuse_positional_ho_access(
-    function: &str,
-    access: &ast_unresolved::DomainSpec,
-) -> Result<()> {
-    if matches!(access, ast_unresolved::DomainSpec::Positional(_)) {
-        return Err(DelightQLError::validation_error_categorized(
-            "resolution/ho_access/not_yet",
-            format!(
-                "'{function}' is a parameterized rule: its trailing access \
-                 pattern is ordinary argumentative access over the declared \
-                 heading (exact arity; `_` discards; names bind and rename) \
-                 — but that binding is not built yet. Use glob access and \
-                 narrow with a pipe: {function}(…)(*) |> (columns)"
-            ),
-            "parameterized-rule access binding not yet",
-        ));
-    }
-    Ok(())
 }
 
 /// Split first-parens DomainSpec into table bindings and scalar DomainSpec.
@@ -2063,16 +2237,29 @@ pub(super) fn split_ho_first_parens(
                 // Argumentative table param: either a table ref (Lvar) or scalar lift
                 match expr {
                     ast_unresolved::DomainExpression::Lvar { name, .. } => {
-                        // Table reference — bind by name, register for arity check
-                        bindings
-                            .table_params
-                            .insert(param.name.clone(), name.to_string());
-                        bindings.argumentative_table_refs.push((
-                            param.name.clone(),
-                            name.to_string(),
-                            columns.len(),
-                            columns.clone(),
-                        ));
+                        // Table reference. Same inline-or-carrier decision as
+                        // the Glob kind: a query-local CTE or physical table
+                        // binds by name (the remap machinery reads its schema
+                        // directly); anything else — an enlisted rule, an
+                        // aliased or scoped reference — rides a Caller
+                        // carrier, where the body's own positional access
+                        // supplies the arity check and column binding that
+                        // the by-name remap cannot (it looks the name up as
+                        // CTE-or-table and a consulted rule misses both).
+                        if plain_arg_may_inline(name.as_str(), registry, caller_scope) {
+                            bindings
+                                .table_params
+                                .insert(param.name.clone(), name.to_string());
+                            bindings.argumentative_table_refs.push((
+                                param.name.clone(),
+                                name.to_string(),
+                                columns.len(),
+                                columns.clone(),
+                            ));
+                        } else {
+                            let rel = bare_glob_reference(name.as_str());
+                            bind_glob_carrier(&mut bindings, &param.name, rel, aliases);
+                        }
                         expr_idx += 1;
                         group_idx += 1;
                     }
@@ -2762,7 +2949,13 @@ pub(super) fn build_squished_relation(
                 } else {
                     q
                 };
-                inject_scalar_columns(q, &clause_params, &positions, output_head)
+                inject_scalar_columns(
+                    q,
+                    &clause_params,
+                    &positions,
+                    output_head,
+                    &table_bindings.scalar_params,
+                )
             };
             let clause_query = if let Some(dns) = data_ns {
                 patch_data_ns_query(clause_query, dns, &local_cte_names)
@@ -2779,7 +2972,10 @@ pub(super) fn build_squished_relation(
             )?;
         }
     } else {
-        // Single clause
+        // Single clause — cannot be MixedGround (mixing needs two
+        // clauses), so the caller-scalar snapshot is only signature
+        // parity.
+        let caller_scalar_params = table_bindings.scalar_params.clone();
         let clause_query = {
             let q = crate::ddl::body_parser::parse_view_body_with_bindings(
                 &entity.definition,
@@ -2811,7 +3007,13 @@ pub(super) fn build_squished_relation(
                 } else {
                     q
                 };
-                inject_scalar_columns(q, &clause_params, &positions, output_head)
+                inject_scalar_columns(
+                    q,
+                    &clause_params,
+                    &positions,
+                    output_head,
+                    &caller_scalar_params,
+                )
             } else {
                 q
             }
@@ -3397,5 +3599,49 @@ mod head_as_naming_tests {
         // `"VIP" as tag` turns the abstention into an offer -> named -> ok.
         let c1 = vec![ground_as("\"VIP\"", "tag"), free("first_name")];
         assert!(validate_ground_position_naming("tagged", &[&c1]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod ground_number_equality_tests {
+    use super::normalize_number;
+
+    fn eq(a: &str, b: &str) -> bool {
+        normalize_number(a) == normalize_number(b) && normalize_number(a).is_some()
+    }
+
+    #[test]
+    fn equal_values_across_spellings() {
+        assert!(eq("12", "12.0"));
+        assert!(eq("12", "1.2e1"));
+        assert!(eq("0.5", "5e-1"));
+        assert!(eq("0", "-0"));
+        assert!(eq("0", "0.000"));
+        assert!(eq("-3.25", "-32.5e-1"));
+        assert!(eq("042", "42"));
+    }
+
+    #[test]
+    fn adjacent_integers_beyond_f64_stay_distinct() {
+        // 2^53 and 2^53 + 1: identical as f64, distinct as integers.
+        assert!(!eq("9007199254740992", "9007199254740993"));
+        assert!(!eq("-9007199254740992", "-9007199254740993"));
+        // And the honest positive control at the same magnitude.
+        assert!(eq("9007199254740993", "9007199254740993.0"));
+    }
+
+    #[test]
+    fn sign_and_magnitude_matter() {
+        assert!(!eq("1", "-1"));
+        assert!(!eq("10", "1"));
+        assert!(!eq("0.1", "0.01"));
+    }
+
+    #[test]
+    fn non_numeric_spellings_do_not_normalize() {
+        assert!(normalize_number("abc").is_none());
+        assert!(normalize_number("").is_none());
+        assert!(normalize_number("1.2.3").is_none());
+        assert!(normalize_number("1e").is_none());
     }
 }

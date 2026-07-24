@@ -256,21 +256,9 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
     let cst_node_type = node.kind();
 
     let name = if cst_node_type == "er_rule_definition" {
-        let left = node
-            .field("left_table")
-            .ok_or_else(|| DelightQLError::parse_error("ER-rule missing left_table field"))?
-            .text()
-            .to_string();
-        let right = node
-            .field("right_table")
-            .ok_or_else(|| DelightQLError::parse_error("ER-rule missing right_table field"))?
-            .text()
-            .to_string();
-        if left <= right {
-            format!("{}&{}", left, right)
-        } else {
-            format!("{}&{}", right, left)
-        }
+        return Err(er_within_removed(node));
+    } else if cst_node_type == "er_edge_definition" {
+        er_edge_name(node)?
     } else if cst_node_type == "effect_rule_definition" {
         // Effect rules carry the `!` in their stored name (EFFECT-ALGEBRA §1;
         // matches the BinPseudoPredicate convention, e.g. "consult!").
@@ -508,16 +496,13 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
             }
         }
         "er_rule_definition" => {
-            let left = node.field("left_table").unwrap().text().to_string();
-            let right = node.field("right_table").unwrap().text().to_string();
-            let context = node
-                .field("context")
-                .ok_or_else(|| DelightQLError::parse_error("ER-rule missing context field"))?
-                .text()
-                .to_string();
+            return Err(er_within_removed(node));
+        }
+        "er_edge_definition" => {
+            let (left_spelling, right_spelling, context) = er_edge_parts(node)?;
             DdlHead::ErRule {
-                left_table: left,
-                right_table: right,
+                left_spelling,
+                right_spelling,
                 context,
             }
         }
@@ -671,6 +656,7 @@ pub fn build_ddl_definition(node: &CstNode, source: &str) -> Result<DdlDefinitio
         | "argumentative_view_definition"
         | "ho_view_definition"
         | "er_rule_definition"
+        | "er_edge_definition"
         | "effect_rule_definition" => BodyKind::Relational,
         _ => unreachable!("handled by extract_name_and_head"),
     };
@@ -795,6 +781,7 @@ pub fn build_ddl_head(source: &str) -> Result<(String, DdlHead)> {
             | "fact_definition"
             | "named_case_definition"
             | "er_rule_definition"
+            | "er_edge_definition"
             | "effect_rule_definition" => {
                 return extract_name_and_head(&child, source);
             }
@@ -847,6 +834,7 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
             | "fact_definition"
             | "named_case_definition"
             | "er_rule_definition"
+            | "er_edge_definition"
             | "effect_rule_definition" => {
                 definitions.push(build_ddl_definition(&child, source)?);
             }
@@ -1477,4 +1465,62 @@ mod tests {
         let defs = build_ddl_file(source).unwrap();
         assert!(defs[0].doc.is_none());
     }
+}
+
+/// The removed `A & B(*) within ctx` ER dialect: still parses so this
+/// teaching can fire.
+fn er_within_removed(node: &CstNode) -> DelightQLError {
+    let l = node.field("left_table").map(|n| n.text().to_string()).unwrap_or_default();
+    let r = node.field("right_table").map(|n| n.text().to_string()).unwrap_or_default();
+    let c = node.field("context").map(|n| n.text().to_string()).unwrap_or_default();
+    DelightQLError::validation_error_categorized(
+        "grounding/er/within_removed",
+        format!(
+            "the `{l} & {r}(*) within {c}` dialect is removed — declare the edge \
+             as {l}(*) &(::{c}) {r}(*) :- body"
+        ),
+        "an edge declaration is a ground-instance clause: both terms and the \
+         context ground on mentions the infix form inserts",
+    )
+}
+
+/// The edge-declaration head: both terms canonicalized (match key and
+/// stored key are the same bytes), the context symbol stripped of its
+/// sigil. Declaration-side terms are naked — an alias inside a term is
+/// a contradiction (the alias is call-site export vocabulary).
+fn er_edge_parts(node: &CstNode) -> Result<(String, String, String)> {
+    let term_of = |field: &str| -> Result<String> {
+        let t = node
+            .field(field)
+            .ok_or_else(|| DelightQLError::parse_error("edge declaration missing term"))?;
+        if t.find_child("table_alias").is_some() {
+            return Err(DelightQLError::validation_error_categorized(
+                "grounding/er/alias_in_declaration",
+                format!("an edge term carries no alias — '{}'", t.text().trim()),
+                "the alias is outside the term: callers write `people(*) as p & …`; \
+                 declarations name the term itself",
+            ));
+        }
+        crate::term_spec::canonicalize_term(t.text().trim())
+    };
+    let left = term_of("left_term")?;
+    let right = term_of("right_term")?;
+    let context_node = node
+        .field("context")
+        .ok_or_else(|| DelightQLError::parse_error("edge declaration missing context"))?;
+    let context = context_node
+        .text()
+        .strip_prefix("::")
+        .unwrap_or(context_node.text())
+        .to_string();
+    Ok((left, right, context))
+}
+
+/// Entity name of an edge: its canonical head. Spelling-distinct edges
+/// over the same tables are distinct entities; byte-identical duplicate
+/// declarations merge into one entity and refuse at lookup as ambiguous.
+pub(crate) fn er_edge_name(node: &CstNode) -> Result<String> {
+    let (l, r, c) = er_edge_parts(node)?;
+    let (a, b) = if l <= r { (l, r) } else { (r, l) };
+    Ok(format!("{a} &(::{c}) {b}"))
 }

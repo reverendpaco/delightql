@@ -221,6 +221,17 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
             qualifier,
             schema: _,
         } => {
+            // FULL-NAME identity first (the lvar law): a qualified glob
+            // exports its lvars under qualified full names, positionally
+            // suffixed when duplicated ("suppliers.name|2|"). A reference
+            // `suppliers.name` matches that column by its full spelling.
+            if let Some(qual) = qualifier {
+                let base = col.name().split('|').next().unwrap_or(col.name());
+                let full = format!("{}.{}", qual, name);
+                if delightql_types::SqlIdentifier::str_eq(base, &full) {
+                    return true;
+                }
+            }
             // Check column name (using effective name for matching)
             if !delightql_types::SqlIdentifier::str_eq(col.name(), name) {
                 return false;
@@ -234,16 +245,25 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
                         return false;
                     }
                 } else {
-                    // Regular qualifier - must match table name
+                    // Regular qualifier — the current table name, or the
+                    // ANSWERING name: a column that crossed an entity/pipe
+                    // boundary keeps a synthetic SQL qualifier for hygiene
+                    // and answers to `access_name` instead (the lvar law).
+                    let answers = col
+                        .access_name
+                        .as_ref()
+                        .map(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), qual))
+                        .unwrap_or(false);
                     match col.qualifier() {
                         TableName::Named(table_name) => {
-                            if table_name != qual {
+                            if table_name != qual && !answers {
                                 return false;
                             }
                         }
                         TableName::Fresh => {
-                            // Anonymous tables can't be qualified with regular names
-                            return false;
+                            if !answers {
+                                return false;
+                            }
                         }
                     }
                 }

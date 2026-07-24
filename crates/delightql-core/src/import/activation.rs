@@ -203,7 +203,7 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         ("dialect_capability", 12),
         // sys::entities (namespace_id = 4) — entity-detail that isn't ho/interior
         ("entity_clause", 4),
-        ("er_rule", 4),
+        ("join_edge", 4),
         // sys::entities::ho (namespace_id = 15)
         ("ho_param", 15),
         ("ho_param_column", 15),

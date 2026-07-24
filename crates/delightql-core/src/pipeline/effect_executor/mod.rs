@@ -242,20 +242,31 @@ fn execute_effects_in_expression(
                 cpr_schema,
             })
         }
-        RelationalExpression::ErJoinChain { relations } => Ok(
-            RelationalExpression::ErJoinChain {
-                relations: relations
-                    .into_iter()
-                    .map(|r| execute_effects_in_relation(r, ctes, system))
-                    .collect::<Result<Vec<_>>>()?,
-            },
-        ),
-        RelationalExpression::ErTransitiveJoin { left, right } => Ok(
-            RelationalExpression::ErTransitiveJoin {
-                left: Box::new(execute_effects_in_expression(*left, ctes, system)?),
-                right: Box::new(execute_effects_in_expression(*right, ctes, system)?),
-            },
-        ),
+        RelationalExpression::ErJoinChain {
+            relations,
+            term_spellings,
+            contexts,
+        } => Ok(RelationalExpression::ErJoinChain {
+            relations: relations
+                .into_iter()
+                .map(|r| execute_effects_in_relation(r, ctes, system))
+                .collect::<Result<Vec<_>>>()?,
+            term_spellings,
+            contexts,
+        }),
+        RelationalExpression::ErTransitiveJoin {
+            left,
+            right,
+            left_spelling,
+            right_spelling,
+            context,
+        } => Ok(RelationalExpression::ErTransitiveJoin {
+            left: Box::new(execute_effects_in_expression(*left, ctes, system)?),
+            right: Box::new(execute_effects_in_expression(*right, ctes, system)?),
+            left_spelling,
+            right_spelling,
+            context,
+        }),
         RelationalExpression::IntersectCorresponding { .. } => {
             unreachable!("IntersectCorresponding does not exist in the unresolved phase")
         }
