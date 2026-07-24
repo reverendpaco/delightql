@@ -33,7 +33,15 @@ pub fn handle_jstruct_command(
     }
 
     // Create temp db with table j(j TEXT)
-    let temp_path = std::env::temp_dir().join(format!("dql_jstruct_{}.db", std::process::id()));
+    // A pid alone is not unique: sandboxed/containerized runs give
+    // concurrent processes the same pid in their own namespaces, and
+    // the shared temp dir then collides deterministically. tempfile
+    // creates the name atomically (O_EXCL) under the OS.
+    let temp_file = tempfile::Builder::new()
+        .prefix("dql_jstruct_")
+        .suffix(".db")
+        .tempfile()?;
+    let temp_path = temp_file.path().to_path_buf();
     {
         let conn = Connection::open(&temp_path)?;
         conn.execute("CREATE TABLE j (j TEXT)", [])?;

@@ -331,8 +331,7 @@ impl PatternResolver {
             // full-name identity). A bare declaration answers to no
             // access name: the source boundary's stamp does not ride
             // through the caller's own binding.
-            output_col.declared_bare = true;
-            output_col.access_name = None;
+            output_col.declare_bare();
             if sel.output_name != source_col.name() {
                 // Column is being renamed — mark as user-named since the user
                 // explicitly chose this name in a positional binding like table(x, y)
@@ -426,7 +425,7 @@ impl PatternResolver {
                     // the full-name match — collision refuses only when
                     // no declared partner exists.
                     let declared_partner = ctx.left_columns.iter().find(|col| {
-                        col.declared_bare
+                        col.declared_bare()
                             && delightql_types::SqlIdentifier::str_eq(
                                 col.name(),
                                 &sel.output_name,

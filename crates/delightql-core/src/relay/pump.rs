@@ -37,7 +37,7 @@ fn connection_error(msg: String) -> ServerTerm {
     ServerTerm::Error {
         kind: ErrorKind::Connection,
         identity: b"delightql-error://runtime/execution".to_vec(),
-        message: msg.into_bytes(),
+        message: crate::relay::teach_runtime_message(msg).into_bytes(),
     }
 }
 

@@ -117,6 +117,28 @@ fn identifier_quoting_spellings() {
     assert_eq!(render(SqlDialect::SqlServer), "[order]");
 }
 
+#[test]
+fn identifier_escaping_own_closing_delimiter() {
+    // Identifier bytes come from DATA (a pivot key becomes a column
+    // name), so each target's closing delimiter must double inside its
+    // own quoting — otherwise data rewrites the SQL token stream. A
+    // foreign target's delimiter is ordinary data and passes through.
+    // The pack pairs ident.quoted with ident.escape; the writer refuses
+    // a template without an escape row.
+    let render = |d, name: &str| {
+        seeded_generator(d)
+            .render_expression(&DomainExpression::column(name))
+            .unwrap()
+    };
+    assert_eq!(render(SqlDialect::SQLite, "a\"b"), "\"a\"\"b\"");
+    assert_eq!(render(SqlDialect::PostgreSQL, "a\"b"), "\"a\"\"b\"");
+    assert_eq!(render(SqlDialect::DuckDB, "a\"b"), "\"a\"\"b\"");
+    assert_eq!(render(SqlDialect::MySQL, "a`b"), "`a``b`");
+    assert_eq!(render(SqlDialect::SqlServer, "a]b"), "[a]]b]");
+    assert_eq!(render(SqlDialect::MySQL, "a]\"b"), "`a]\"b`");
+    assert_eq!(render(SqlDialect::SqlServer, "a`\"b"), "[a`\"b]");
+}
+
 fn fn_call(name: &str, args: Vec<DomainExpression>) -> DomainExpression {
     DomainExpression::Function {
         name: name.to_string(),
@@ -435,9 +457,14 @@ fn internal_json_each_array_spells_canonically_off_postgres() {
     let stmt = tvf_join_stmt(crate::pipeline::naming::INTERNAL_JSON_EACH_ARRAY);
     for dialect in [SqlDialect::SQLite, SqlDialect::DuckDB] {
         let sql = seeded_generator(dialect).generate_statement(&stmt).unwrap();
+        // The sequence guard (JSON-SUBSTRATE.md): a non-array or
+        // malformed value becomes a NULL interior — zero rows.
         assert!(
-            sql.contains("json_each(t_1.j) AS _narrow_2"),
-            "expected canonical json_each spelling on {dialect:?}, got: {sql}"
+            sql.contains(
+                "json_each(CASE WHEN json_valid(t_1.j) AND json_type(t_1.j) = 'array' \
+                 THEN t_1.j END) AS _narrow_2"
+            ),
+            "expected guarded canonical json_each spelling on {dialect:?}, got: {sql}"
         );
         assert!(!sql.contains("__dql"), "internal name leaked ({dialect:?}): {sql}");
     }
@@ -456,7 +483,8 @@ fn internal_json_each_array_becomes_lateral_on_postgres() {
     assert!(
         sql.contains(
             "LEFT JOIN LATERAL (SELECT e.ordinality - 1 AS key, e.value AS value \
-             FROM jsonb_array_elements(CAST(t_1.j AS jsonb)) WITH ORDINALITY AS e) \
+             FROM jsonb_array_elements(CASE WHEN jsonb_typeof(CAST(t_1.j AS jsonb)) = 'array' \
+             THEN CAST(t_1.j AS jsonb) END) WITH ORDINALITY AS e) \
              AS _narrow_2 ON TRUE"
         ),
         "got: {sql}"

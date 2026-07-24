@@ -106,6 +106,16 @@ pub(crate) trait Qualify {
     /// `None` if it doesn't — genuinely not found in this scope.
     fn try_qualify_with_table(&self, col_name: &str, table: &str) -> Option<QualifiedColumn>;
 
+    /// Tier 1 only: a column whose CURRENT name and CURRENT qualifier both
+    /// match. Chained scopes stratify on this — a current exact match in
+    /// ANY scope of a chain outranks every historical tier in every scope
+    /// (a join operand's identity stack must never outrank a column that
+    /// actually EXISTS on the other side; fresh-eyes F-009). Default: no
+    /// exact tier (scopes without direct column access).
+    fn try_qualify_with_table_exact(&self, _col_name: &str, _table: &str) -> Option<QualifiedColumn> {
+        None
+    }
+
     /// Snapshot this scope's columns for use as an outer scope.
     ///
     /// Called at scalar subquery entry points to capture the enclosing
@@ -1014,7 +1024,7 @@ impl Builder<Unprojected> {
             sb = sb.and_where(DomainExpression::RawSql(format!(
                 "json_extract({}.value, '$.{}') = '{}'",
                 tvf_alias_str,
-                schema_name,
+                crate::pipeline::naming::jpath_segment(schema_name),
                 value.replace('\'', "''")
             )));
         }
@@ -1518,23 +1528,31 @@ pub(in crate::pipeline::transformer_v4) fn qualify_in_columns(
 ///
 /// Tier 1: exact (name, qualifier) match
 /// Tier 2: identity stack walk for (table, name) pair
+/// Tier 1 alone: CURRENT name and CURRENT qualifier both match.
+pub(in crate::pipeline::transformer_v4) fn try_qualify_exact_in_columns(
+    col_name_str: &str,
+    table: &str,
+    columns: &[ColumnMetadata],
+) -> Option<QualifiedColumn> {
+    let found = columns.iter().find(|c| {
+        delightql_types::SqlIdentifier::str_eq(col_name(c), col_name_str)
+            && delightql_types::SqlIdentifier::opt_str_eq(col_qualifier(c), Some(table))
+    });
+    found.map(|col| QualifiedColumn {
+        name: col_name(col).to_string(),
+        qualifier: col_qualifier(col).map(|s| s.to_string()),
+        has_interior_schema: col.interior_schema.is_some(),
+    })
+}
+
 pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
     col_name_str: &str,
     table: &str,
     columns: &[ColumnMetadata],
 ) -> Option<QualifiedColumn> {
     // Tier 1: exact match — column name AND current qualifier both match.
-    let found = columns.iter().find(|c| {
-        delightql_types::SqlIdentifier::str_eq(col_name(c), col_name_str)
-            && delightql_types::SqlIdentifier::opt_str_eq(col_qualifier(c), Some(table))
-    });
-
-    if let Some(col) = found {
-        return Some(QualifiedColumn {
-            name: col_name(col).to_string(),
-            qualifier: col_qualifier(col).map(|s| s.to_string()),
-            has_interior_schema: col.interior_schema.is_some(),
-        });
+    if let Some(qc) = try_qualify_exact_in_columns(col_name_str, table, columns) {
+        return Some(qc);
     }
 
     // Tier 2: identity stack walk. Uniqueness-guarded like every other
@@ -1589,8 +1607,7 @@ pub(in crate::pipeline::transformer_v4) fn try_qualify_with_table_in_columns(
     // either; uniqueness-guarded like every stack walk here.
     let mut answering = columns.iter().filter(|c| {
         let answers_qual = c
-            .access_name
-            .as_ref()
+            .access_name()
             .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), table));
         if !answers_qual {
             return false;
@@ -1704,6 +1721,10 @@ impl Qualify for JoinOperand {
         qualify_in_columns(col_name_str, &self.columns, "<join operand>")
     }
 
+    fn try_qualify_with_table_exact(&self, col_name_str: &str, table: &str) -> Option<QualifiedColumn> {
+        try_qualify_exact_in_columns(col_name_str, table, &self.columns)
+    }
+
     fn try_qualify_with_table(&self, col_name_str: &str, table: &str) -> Option<QualifiedColumn> {
         if table == "_" {
             // Try unambiguous lookup first; fall through to Tier 3 if ambiguous.
@@ -1771,9 +1792,22 @@ impl Qualify for ChainedQualify<'_> {
     }
 
     fn try_qualify_with_table(&self, col_name: &str, table: &str) -> Option<QualifiedColumn> {
+        // Stratified: a CURRENT exact match in EITHER scope outranks every
+        // historical tier in either scope — a join operand's identity
+        // stack must never outrank a column that actually exists on the
+        // other side (fresh-eyes F-009: the recursive frontier's
+        // (id, employees) frame beat the real employees.id).
         self.inner
-            .try_qualify_with_table(col_name, table)
+            .try_qualify_with_table_exact(col_name, table)
+            .or_else(|| self.outer.try_qualify_with_table_exact(col_name, table))
+            .or_else(|| self.inner.try_qualify_with_table(col_name, table))
             .or_else(|| self.outer.try_qualify_with_table(col_name, table))
+    }
+
+    fn try_qualify_with_table_exact(&self, col_name: &str, table: &str) -> Option<QualifiedColumn> {
+        self.inner
+            .try_qualify_with_table_exact(col_name, table)
+            .or_else(|| self.outer.try_qualify_with_table_exact(col_name, table))
     }
 }
 

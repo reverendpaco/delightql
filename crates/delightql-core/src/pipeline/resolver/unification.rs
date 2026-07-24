@@ -250,8 +250,7 @@ fn matches_column(col: &ColumnMetadata, reference: &ColumnReference) -> bool {
                     // boundary keeps a synthetic SQL qualifier for hygiene
                     // and answers to `access_name` instead (the lvar law).
                     let answers = col
-                        .access_name
-                        .as_ref()
+                        .access_name()
                         .map(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), qual))
                         .unwrap_or(false);
                     match col.qualifier() {

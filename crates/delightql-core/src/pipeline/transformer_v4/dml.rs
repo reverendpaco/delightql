@@ -267,13 +267,22 @@ fn build_exists_match(
 
 /// Extract column names from a resolved CprSchema.
 fn columns_from_schema(schema: &CprSchema) -> Vec<String> {
+    // Hygienic columns (dispatch labels like `_label_N`, literal
+    // carriers) never cross the effect-source boundary: the source
+    // SELECT already hides them, and a DML column list naming one asks
+    // the target table for a column that exists nowhere.
     match schema {
-        CprSchema::Resolved(cols) => cols.iter().map(|c| c.name().to_string()).collect(),
+        CprSchema::Resolved(cols) => cols
+            .iter()
+            .filter(|c| !c.needs_hygienic_alias)
+            .map(|c| c.name().to_string())
+            .collect(),
         CprSchema::Unresolved(cols) => cols.iter().map(|c| c.name().to_string()).collect(),
         CprSchema::Failed {
             resolved_columns, ..
         } => resolved_columns
             .iter()
+            .filter(|c| !c.needs_hygienic_alias)
             .map(|c| c.name().to_string())
             .collect(),
         CprSchema::Unknown => Vec::new(),

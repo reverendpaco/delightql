@@ -353,7 +353,7 @@ impl SqlParty {
                     return ServerTerm::Error {
                         kind: ErrorKind::Connection,
                         identity: b"delightql-error://runtime/execution".to_vec(),
-                        message: msg.into_bytes(),
+                        message: delightql_types::teach_runtime_message(msg).into_bytes(),
                     };
                 }
                 Err(_) => {

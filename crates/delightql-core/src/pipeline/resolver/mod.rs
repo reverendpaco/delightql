@@ -1186,8 +1186,7 @@ fn er_endpoint(rel: &ast_unresolved::Relation) -> (String, Option<delightql_type
 /// qualified references (`suppliers.name`) still resolve post-pipe.
 fn er_endpoints_projection(
     query: ast_unresolved::Query,
-    left_name: &str,
-    right_name: &str,
+    published: &[String],
 ) -> ast_unresolved::Query {
     use crate::pipeline::asts::core::expressions::ProjectionExpr;
     let glob = |name: &str| {
@@ -1199,7 +1198,7 @@ fn er_endpoints_projection(
     match query {
         ast_unresolved::Query::Relational(expr) => ast_unresolved::Query::Relational(
             ast_unresolved::RelationalExpression::pipe_builder(expr)
-                .with_projection(vec![glob(left_name), glob(right_name)])
+                .with_projection(published.iter().map(|n| glob(n)).collect())
                 .build(),
         ),
         other => other,
@@ -1210,27 +1209,21 @@ fn er_endpoints_projection(
 /// ANSWERS TO its endpoint's name: the identity stack's most recent
 /// endpoint qualifier becomes access_name, so exports follow the lvar
 /// law across the pipe boundary.
-fn er_stamp_endpoint_access_names(
-    bubbled: &mut BubbledState,
-    left_name: &str,
-    right_name: &str,
-) {
+fn er_stamp_endpoint_access_names(bubbled: &mut BubbledState, published: &[String]) {
+    let is_published =
+        |n: &str| published.iter().any(|p| delightql_types::SqlIdentifier::str_eq(n, p));
     let endpoint_of = |col: &ast_resolved::ColumnMetadata| -> Option<String> {
         // Current qualifier first, then the identity stack.
         if let ast_resolved::TableName::Named(n) = col.qualifier() {
             let n = n.to_string();
-            if delightql_types::SqlIdentifier::str_eq(&n, left_name)
-                || delightql_types::SqlIdentifier::str_eq(&n, right_name)
-            {
+            if is_published(&n) {
                 return Some(n);
             }
         }
         for frame in col.info.identity_stack().iter().rev() {
             if let ast_resolved::TableName::Named(n) = &frame.table_qualifier {
                 let n = n.to_string();
-                if delightql_types::SqlIdentifier::str_eq(&n, left_name)
-                    || delightql_types::SqlIdentifier::str_eq(&n, right_name)
-                {
+                if is_published(&n) {
                     return Some(n);
                 }
             }
@@ -1242,9 +1235,7 @@ fn er_stamp_endpoint_access_names(
             } = &frame.context
             {
                 let n = n.to_string();
-                if delightql_types::SqlIdentifier::str_eq(&n, left_name)
-                    || delightql_types::SqlIdentifier::str_eq(&n, right_name)
-                {
+                if is_published(&n) {
                     return Some(n);
                 }
             }
@@ -1256,10 +1247,8 @@ fn er_stamp_endpoint_access_names(
         .iter_mut()
         .chain(bubbled.qualifier_scope.iter_mut())
     {
-        if col.access_name.is_none() {
-            if let Some(name) = endpoint_of(col) {
-                col.access_name = Some(name.into());
-            }
+        if let Some(name) = endpoint_of(col) {
+            col.answer_if_silent(name.into());
         }
     }
 }
@@ -1292,13 +1281,42 @@ fn expand_er_join_chain(
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
-    endpoints_only: Option<(String, String)>,
+    endpoints_only: Option<Vec<String>>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     if relations.len() < 2 || spellings.len() != relations.len() {
         return Err(DelightQLError::validation_error(
             "ER-join chain requires at least two relations",
             "Invalid ER-join chain",
         ));
+    }
+
+    // A self-pair edge publishes the same table twice: every column name
+    // collides with its twin, the endpoint globs bind one operand twice,
+    // and the rows come back silently self-paired. Refuse until the
+    // boundary can mask the two sides apart.
+    if let Some(published) = &endpoints_only {
+        let mut seen: Vec<&String> = Vec::new();
+        for name in published {
+            if seen
+                .iter()
+                .any(|s| delightql_types::SqlIdentifier::str_eq(s, name))
+            {
+                return Err(DelightQLError::validation_error_categorized(
+                    "grounding/er/self_pair",
+                    format!(
+                        "the edge publishes '{name}' at two endpoints — a \
+                         self-pair edge's sides share every column name and \
+                         cannot yet be masked apart, so the pairs would come \
+                         back silently self-joined. Spell one side as a \
+                         renamed rule view (boss(*) :- employees(*)) and \
+                         declare the edge over the distinct terms"
+                    ),
+                    "an edge's published schema is schema(A) + schema(B); \
+                     the two sides must be distinguishable",
+                ));
+            }
+            seen.push(name);
+        }
     }
 
     // The alias is OUTSIDE the term: selection used the spellings;
@@ -1342,8 +1360,8 @@ fn expand_er_join_chain(
             grounding,
             endpoints_only.clone(),
         )?;
-        if let Some((l, r)) = &endpoints_only {
-            er_stamp_endpoint_access_names(&mut bubbled, l, r);
+        if let Some(published) = &endpoints_only {
+            er_stamp_endpoint_access_names(&mut bubbled, published);
         }
         let (resolved_expr, bubbled) = er_thread_endpoint_aliases(
             resolved_expr,
@@ -1395,15 +1413,44 @@ fn expand_er_join_chain(
         };
 
         // Flatten the body into relations and conditions
-        let (body_rels, body_conds) = flatten_unresolved_body(body_expr);
+        let pair_desc = format!(
+            "{left_name} & {right_name} in '::{}'",
+            context.context_name
+        );
+        let (body_rels, body_conds) = flatten_unresolved_body(body_expr, &pair_desc)?;
 
-        // Add relations, deduplicating by table name
+        // Merge relations. Adjacent bodies share EXACTLY their common
+        // endpoint (this body's left term, introduced by the previous
+        // body): that one occurrence deduplicates, once. Any OTHER
+        // repeat — a self-join inside a body, a helper relation used by
+        // two bodies, a cyclic chain revisiting an endpoint — cannot be
+        // aliased apart during composition, and dropping it silently
+        // rewrites the join, so it refuses.
+        // The spelling carries the term shape ("components(*)"); the
+        // shared occurrence is keyed by the endpoint's TABLE name.
+        let shared_table = er_endpoint(&relations[i]).0;
+        let mut shared_endpoint_budget = if i > 0 { 1usize } else { 0 };
         for rel in body_rels {
             if let Ok(name) = er_table_name(&rel) {
-                if seen_table_names.insert(name) {
+                if seen_table_names.insert(name.clone()) {
                     all_relations.push(rel);
+                } else if shared_endpoint_budget > 0 && name == shared_table {
+                    shared_endpoint_budget -= 1;
+                } else {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "grounding/er/chain_shared_repeat",
+                        format!(
+                            "composing the chain repeats relation '{name}' beyond \
+                             the shared endpoint — the edge body for {pair_desc} \
+                             reintroduces it after an earlier body (or the same \
+                             body) already did. Adjacent edge bodies share only \
+                             their common endpoint; other repeats cannot be \
+                             aliased apart during composition. Restructure the \
+                             bodies, or call the edges directly with &"
+                        ),
+                        "a chain merges adjacent bodies on their shared endpoint only",
+                    ));
                 }
-                // If already seen, skip this relation (it's the shared intermediate)
             } else {
                 // Non-Ground relation — keep it unconditionally
                 all_relations.push(rel);
@@ -1415,14 +1462,14 @@ fn expand_er_join_chain(
     }
 
     // Rebuild a single unresolved expression from the combined parts
-    let combined_expr = rebuild_flat_expression(all_relations, all_conditions);
+    let combined_expr = rebuild_flat_expression(all_relations, all_conditions)?;
 
     // Add self-aliases and resolve through the pipeline (same path as single-pair)
     let combined_query =
         add_self_aliases_to_query(ast_unresolved::Query::Relational(combined_expr));
     // `&&`: intermediate hops are entity boundaries — endpoints only.
     let combined_query = match &endpoints_only {
-        Some((l, r)) => er_endpoints_projection(combined_query, l, r),
+        Some(published) => er_endpoints_projection(combined_query, published),
         None => combined_query,
     };
 
@@ -1467,6 +1514,30 @@ fn expand_er_join_chain(
         effective_grounding,
     )
     .map_err(|e| {
+        // Same pair-schema teaching as the single-pair road: an endpoint
+        // glob that matches nothing is a pair-set violation, not a bare
+        // glob miss.
+        let msg = e.to_string();
+        if endpoints_only.is_some() && msg.contains("matched no columns") {
+            let missing = msg
+                .split('\'')
+                .nth(1)
+                .unwrap_or("an endpoint")
+                .trim_end_matches(".*");
+            return DelightQLError::validation_error_categorized(
+                "grounding/er/pair_schema",
+                format!(
+                    "the composed chain in '::{}' does not publish '{missing}' — \
+                     an edge is a PAIR-SET and the chain's published schema is \
+                     its written terms' columns; a body renamed or projected \
+                     that endpoint away. Rename and narrow at the call site, \
+                     after selection, not inside the edge",
+                    context.context_name
+                ),
+                "the published schema of an edge is schema(A) + schema(B); \
+                 the boundary exports those columns and hides the rest",
+            );
+        }
         DelightQLError::database_error(
             format!(
                 "Error resolving ER-chain body in context '{}': {}",
@@ -1479,8 +1550,8 @@ fn expand_er_join_chain(
     match resolved_query {
         ast_resolved::Query::Relational(expr) => {
             let mut body_bubbled = body_bubbled;
-            if let Some((l, r)) = &endpoints_only {
-                er_stamp_endpoint_access_names(&mut body_bubbled, l, r);
+            if let Some(published) = &endpoints_only {
+                er_stamp_endpoint_access_names(&mut body_bubbled, published);
             }
             let (expr, body_bubbled) = er_thread_endpoint_aliases(
                 expr,
@@ -1544,49 +1615,284 @@ fn er_thread_endpoint_aliases(
     (expr, bubbled)
 }
 
+/// `&&` composes RELATIONS, not syntax (GROUNDING-AND-MENTION): each hop
+/// of the walked path resolves WHOLE through the ordinary direct-edge
+/// road (its body free per the pair-set ruling, its boundary export
+/// publishing schema(X) + schema(Y)), the hops join on the shared
+/// endpoint's full heading (null-safe, row identity by value), and the
+/// result publishes the outer endpoints only. Bodies never merge, so
+/// nothing is flattened, restricted, or deduplicated.
+fn compose_er_chain_relational(
+    path: &[String],
+    hop_tables: &[String],
+    context: &ast_unresolved::ErContextSpec,
+    registry: &mut crate::resolution::EntityRegistry,
+    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    config: &ResolutionConfig,
+    grounding: Option<&ast_unresolved::GroundedPath>,
+) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+    use ast_resolved::RelationalExpression as RE;
+
+    // A column's underlying identity for cross-hop pairing: the endpoint
+    // it answers to, plus its base name within that endpoint — the
+    // spelling with the collision suffix (|N|) and the endpoint's own
+    // prefix stripped. Two hops may number the same column differently,
+    // but the base name under one endpoint is unique and stable.
+    let endpoint_key = |col: &ast_resolved::ColumnMetadata, table: &str| -> String {
+        let base = col.name().split('|').next().unwrap_or(col.name());
+        base.strip_prefix(&format!("{table}."))
+            .unwrap_or(base)
+            .to_string()
+    };
+    let belongs_to = |col: &ast_resolved::ColumnMetadata, table: &str| -> bool {
+        col.access_name()
+            .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), table))
+    };
+
+    let mut composed: Option<RE> = None;
+    let mut all_columns: Vec<ast_resolved::ColumnMetadata> = Vec::new();
+    let mut prev_hop_alias = String::new();
+    let mut conditions: Vec<ast_resolved::BooleanExpression> = Vec::new();
+
+    for i in 0..path.len() - 1 {
+        let hop_alias = format!("_er_hop_{i}");
+        let (hop_expr, mut hop_bubbled) = expand_single_er_pair(
+            &path[i],
+            &path[i + 1],
+            context,
+            registry,
+            outer_context,
+            config,
+            grounding,
+            Some(vec![hop_tables[i].clone(), hop_tables[i + 1].clone()]),
+        )?;
+        // The answering channel is the pairing key: stamp each hop's
+        // columns with their endpoint names (the len==2 road's caller
+        // does this; here we are the caller).
+        er_stamp_endpoint_access_names(
+            &mut hop_bubbled,
+            &[hop_tables[i].clone(), hop_tables[i + 1].clone()],
+        );
+
+        // Wrap the hop as an aliased derived table so its columns are
+        // addressable hop-distinctly (the shared endpoint's columns
+        // exist in BOTH adjacent hops; only the hop alias tells them
+        // apart).
+        let hop_schema = ast_resolved::CprSchema::Resolved(hop_bubbled.i_provide.clone());
+        let hop_rel = RE::Relation(ast_resolved::Relation::InnerRelation {
+            pattern: ast_resolved::InnerRelationPattern::UncorrelatedDerivedTable {
+                identifier: ast_resolved::QualifiedName {
+                    namespace_path: ast_resolved::NamespacePath::empty(),
+                    name: hop_alias.clone().into(),
+                    grounding: None,
+                },
+                subquery: Box::new(hop_expr),
+                is_consulted_view: false,
+            },
+            alias: Some(hop_alias.clone().into()),
+            outer: false,
+            cpr_schema: ast_resolved::PhaseBox::new(hop_schema),
+        });
+
+        let mut hop_columns = hop_bubbled.i_provide.clone();
+        for col in &mut hop_columns {
+            let prev = match col.qualifier() {
+                ast_resolved::TableName::Named(t) => t.to_string(),
+                ast_resolved::TableName::Fresh => "_".to_string(),
+            };
+            col.push_scope(
+                ast_resolved::TableName::Named(hop_alias.clone().into()),
+                ast_resolved::IdentityContext::SubqueryAlias {
+                    alias: hop_alias.clone(),
+                    previous_context: prev,
+                    resolver_id: None,
+                },
+            );
+        }
+
+        if let Some(acc) = composed.take() {
+            // Join to the accumulated chain on the shared endpoint's
+            // full heading — every column of hop_tables[i], null-safe.
+            let shared = &hop_tables[i];
+            for right_col in hop_columns.iter().filter(|c| belongs_to(c, shared)) {
+                let rb = endpoint_key(right_col, shared);
+                let left_col = all_columns
+                    .iter()
+                    .filter(|c| belongs_to(c, shared))
+                    .find(|c| {
+                        delightql_types::SqlIdentifier::str_eq(&endpoint_key(c, shared), &rb)
+                    })
+                    .ok_or_else(|| {
+                        DelightQLError::validation_error(
+                            format!(
+                                "ER chain composition cannot pair shared-endpoint \
+                                 column '{rb}' of '{shared}' between hops — this \
+                                 is a dql bug (both hops publish the endpoint's \
+                                 pair schema by construction)",
+                            ),
+                            "Invalid ER-chain composition",
+                        )
+                    })?;
+                let lvar = |name: &str, qual: &str| {
+                    Box::new(ast_resolved::DomainExpression::Lvar {
+                        name: name.into(),
+                        qualifier: Some(qual.into()),
+                        namespace_path: ast_resolved::NamespacePath::empty(),
+                        alias: None,
+                        provenance: ast_resolved::PhaseBox::phantom(),
+                    })
+                };
+                conditions.push(ast_resolved::BooleanExpression::Comparison {
+                    operator: "null_safe_eq".to_string(),
+                    left: lvar(left_col.name(), &prev_hop_alias),
+                    right: lvar(right_col.name(), &hop_alias),
+                });
+            }
+            composed = Some(RE::Join {
+                left: Box::new(acc),
+                right: Box::new(hop_rel),
+                join_condition: None,
+                join_type: None,
+                cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
+                    Vec::new(),
+                )),
+            });
+        } else {
+            composed = Some(hop_rel);
+        }
+        all_columns.extend(hop_columns);
+        prev_hop_alias = hop_alias;
+    }
+
+    let mut expr = composed.expect("path has at least two spellings");
+    for cond in conditions {
+        expr = RE::Filter {
+            source: Box::new(expr),
+            condition: ast_resolved::SigmaCondition::Predicate(cond),
+            origin: crate::pipeline::asts::core::FilterOrigin::Generated,
+            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
+                Vec::new(),
+            )),
+        };
+    }
+
+    // Publish the outer endpoints only (R-c): the first hop's left
+    // term's columns and the last hop's right term's columns.
+    let first_table = &hop_tables[0];
+    let last_table = hop_tables.last().expect("nonempty");
+    let last_alias = prev_hop_alias;
+    let kept: Vec<(ast_resolved::ColumnMetadata, String)> = all_columns
+        .iter()
+        .filter_map(|c| {
+            let qual = match c.qualifier() {
+                ast_resolved::TableName::Named(t) => t.to_string(),
+                ast_resolved::TableName::Fresh => return None,
+            };
+            if qual == "_er_hop_0" && belongs_to(c, first_table) {
+                Some((c.clone(), qual))
+            } else if qual == *last_alias && belongs_to(c, last_table) {
+                Some((c.clone(), qual))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let projection: Vec<ast_resolved::DomainExpression> = kept
+        .iter()
+        .map(|(col, qual)| ast_resolved::DomainExpression::Lvar {
+            name: col.name().into(),
+            qualifier: Some(qual.as_str().into()),
+            namespace_path: ast_resolved::NamespacePath::empty(),
+            alias: None,
+            provenance: ast_resolved::PhaseBox::phantom(),
+        })
+        .collect();
+    let published: Vec<ast_resolved::ColumnMetadata> =
+        kept.into_iter().map(|(c, _)| c).collect();
+
+    let pipe = ast_resolved::PipeExpression {
+        source: expr,
+        operator: ast_resolved::UnaryRelationalOperator::General {
+            containment_semantic:
+                crate::pipeline::asts::core::ContainmentSemantic::Parenthesis,
+            expressions: projection,
+        },
+        cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
+            published.clone(),
+        )),
+    };
+    let expr = RE::Pipe(Box::new(stacksafe::StackSafe::new(pipe)));
+
+    Ok((expr, BubbledState::resolved(published)))
+}
+
 /// Flatten an unresolved relational expression into a list of relations and conditions.
 /// Walks the Join/Filter tree and collects all leaf Relation nodes and all Filter conditions.
+/// Transitive composition (&&) merges edge bodies BEFORE resolution, so a
+/// body that carries anything beyond join/filter normal form — a pipe
+/// stage, a set operation, a nested edge call — cannot be merged without
+/// discarding its semantics; it refuses instead (dropped semantics or a
+/// downstream panic is not an admissible fallback).
 fn flatten_unresolved_body(
     expr: ast_unresolved::RelationalExpression,
-) -> (
+    pair_desc: &str,
+) -> Result<(
     Vec<ast_unresolved::Relation>,
     Vec<ast_unresolved::SigmaCondition>,
-) {
+)> {
     let mut relations = Vec::new();
     let mut conditions = Vec::new();
-    flatten_unresolved_body_inner(expr, &mut relations, &mut conditions);
-    (relations, conditions)
+    flatten_unresolved_body_inner(expr, &mut relations, &mut conditions, pair_desc)?;
+    Ok((relations, conditions))
 }
 
 fn flatten_unresolved_body_inner(
     expr: ast_unresolved::RelationalExpression,
     relations: &mut Vec<ast_unresolved::Relation>,
     conditions: &mut Vec<ast_unresolved::SigmaCondition>,
-) {
+    pair_desc: &str,
+) -> Result<()> {
     match expr {
         ast_unresolved::RelationalExpression::Relation(rel) => {
             relations.push(rel);
+            Ok(())
         }
         ast_unresolved::RelationalExpression::Join { left, right, .. } => {
-            flatten_unresolved_body_inner(*left, relations, conditions);
-            flatten_unresolved_body_inner(*right, relations, conditions);
+            flatten_unresolved_body_inner(*left, relations, conditions, pair_desc)?;
+            flatten_unresolved_body_inner(*right, relations, conditions, pair_desc)
         }
         ast_unresolved::RelationalExpression::Filter {
             source, condition, ..
         } => {
-            flatten_unresolved_body_inner(*source, relations, conditions);
+            flatten_unresolved_body_inner(*source, relations, conditions, pair_desc)?;
             conditions.push(condition);
+            Ok(())
         }
-        // Other variants shouldn't appear in ER-rule bodies
         other => {
-            // Wrap as a single relation? No — ER-rule bodies are restricted to
-            // joins + filters. If we get here, it's a validation failure that
-            // should have been caught earlier. For robustness, treat as a relation
-            // with a single synthetic wrapper — but this shouldn't happen in practice.
-            log::warn!(
-                "Unexpected expression variant in ER-rule body during flattening: {:?}",
-                other
-            );
+            let what = match &other {
+                ast_unresolved::RelationalExpression::Pipe(_) => "a pipe stage (|>)",
+                ast_unresolved::RelationalExpression::SetOperation { .. }
+                | ast_unresolved::RelationalExpression::IntersectCorresponding { .. } => {
+                    "a set operation"
+                }
+                ast_unresolved::RelationalExpression::ErJoinChain { .. }
+                | ast_unresolved::RelationalExpression::ErTransitiveJoin { .. } => {
+                    "a nested edge call"
+                }
+                _ => "an operator beyond relations, joins, and conditions",
+            };
+            Err(DelightQLError::validation_error_categorized(
+                "grounding/er/chain_normal_form",
+                format!(
+                    "the edge body for {pair_desc} carries {what} — a transitive \
+                     chain (&&) merges its edge bodies into one join before \
+                     resolution, so each body must be join/filter normal form: \
+                     relations and conditions only. Restructure the edge body, \
+                     or call the edge directly with &"
+                ),
+                "transitive composition is structural: bodies merge before resolution",
+            ))
         }
     }
 }
@@ -1597,13 +1903,19 @@ fn flatten_unresolved_body_inner(
 fn rebuild_flat_expression(
     relations: Vec<ast_unresolved::Relation>,
     conditions: Vec<ast_unresolved::SigmaCondition>,
-) -> ast_unresolved::RelationalExpression {
+) -> Result<ast_unresolved::RelationalExpression> {
     // Build left-deep join tree from relations
     let mut iter = relations.into_iter();
-    let mut expr = ast_unresolved::RelationalExpression::Relation(
-        iter.next()
-            .expect("ER chain must have at least one relation"),
-    );
+    let mut expr = ast_unresolved::RelationalExpression::Relation(iter.next().ok_or_else(
+        || {
+            DelightQLError::validation_error(
+                "ER chain composed to zero relations — the normal-form and \
+                 shared-endpoint refusals should have caught this earlier; \
+                 this is a dql bug",
+                "Invalid ER-join chain",
+            )
+        },
+    )?);
     for rel in iter {
         expr = ast_unresolved::RelationalExpression::Join {
             left: Box::new(expr),
@@ -1624,7 +1936,7 @@ fn rebuild_flat_expression(
         };
     }
 
-    expr
+    Ok(expr)
 }
 
 /// Look up an ER-rule for a pair and parse its body into an unresolved Query.
@@ -1708,7 +2020,7 @@ fn expand_single_er_pair(
     outer_context: Option<&[ast_resolved::ColumnMetadata]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
-    endpoints_only: Option<(String, String)>,
+    endpoints_only: Option<Vec<String>>,
 ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
     // Parse the rule body into an unresolved AST
     let query = parse_er_rule_body(
@@ -1726,7 +2038,7 @@ fn expand_single_er_pair(
     let query = add_self_aliases_to_query(query);
     // `&&` over a directly-declared edge: endpoints only, same law.
     let query = match &endpoints_only {
-        Some((l, r)) => er_endpoints_projection(query, l, r),
+        Some(published) => er_endpoints_projection(query, published),
         None => query,
     };
 
@@ -1767,6 +2079,36 @@ fn expand_single_er_pair(
     let (resolved_query, body_bubbled) =
         resolve_query_inline(query, registry, outer_context, config, effective_grounding).map_err(
             |e| {
+                // The boundary export IS the pair-schema proof: the
+                // endpoint globs locate each published term's columns in
+                // the body's final heading. A glob that matches nothing
+                // means the body renamed or projected an endpoint away —
+                // a pair-set violation, taught as such, not as a bare
+                // glob miss.
+                let msg = e.to_string();
+                if endpoints_only.is_some() && msg.contains("matched no columns") {
+                    let missing = msg
+                        .split('\'')
+                        .nth(1)
+                        .unwrap_or("an endpoint")
+                        .trim_end_matches(".*");
+                    return DelightQLError::validation_error_categorized(
+                        "grounding/er/pair_schema",
+                        format!(
+                            "the edge body for ({left_name}, {right_name}) in \
+                             '::{}' does not publish '{missing}' — an edge is a \
+                             PAIR-SET: its body may derive the pairs freely \
+                             (filter, helper joins, computed keys, aggregates) \
+                             but its final heading must carry both endpoints' \
+                             columns; they are the edge's published schema. \
+                             Rename and narrow at the call site, after \
+                             selection, not inside the edge",
+                            context.context_name
+                        ),
+                        "the published schema of an edge is schema(A) + schema(B); \
+                         the boundary exports those columns and hides the rest",
+                    );
+                }
                 DelightQLError::database_error(
                     format!(
                         "Error resolving ER-rule body for ({}, {}) in context '{}': {}",
@@ -2051,7 +2393,44 @@ fn expand_er_transitive_join(
         .collect();
 
     // Endpoints only: intermediate hops contribute nothing to the
-    // schema. Alias threading happens inside expand_er_join_chain.
+    // schema.
+    if path.len() > 2 {
+        // Relational composition: each hop resolves whole, hops join on
+        // the shared endpoint's heading, outer endpoints publish.
+        let hop_tables: Vec<String> = path
+            .iter()
+            .map(|spelling| {
+                spelling
+                    .split('(')
+                    .next()
+                    .unwrap_or(spelling)
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        let (expr, mut bubbled) = compose_er_chain_relational(
+            &path,
+            &hop_tables,
+            context,
+            registry,
+            outer_context,
+            &effective_config,
+            grounding,
+        )?;
+        er_stamp_endpoint_access_names(
+            &mut bubbled,
+            &[left_name.clone(), right_name.clone()],
+        );
+        let (expr, bubbled) = er_thread_endpoint_aliases(
+            expr,
+            bubbled,
+            (&left_name, &left_alias),
+            (&right_name, &right_alias),
+        );
+        let expr = er_sync_pipe_schema(expr, &bubbled);
+        return Ok((expr, bubbled));
+    }
+    // Adjacent pair: the direct road, endpoints only.
     expand_er_join_chain(
         chain_relations,
         &path,
@@ -2060,7 +2439,7 @@ fn expand_er_transitive_join(
         outer_context,
         &effective_config,
         grounding,
-        Some((left_name.clone(), right_name.clone())),
+        Some(vec![left_name.clone(), right_name.clone()]),
     )
 }
 
@@ -2257,13 +2636,7 @@ fn rename_bubbled_columns(
     // full-name spellings ("users_t.name|2|") answer to the alias after
     // an endpoint rename, or qualified refs through it die.
     let rename_answering = |col: &mut ast_resolved::ColumnMetadata| {
-        if col
-            .access_name
-            .as_ref()
-            .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), old_name))
-        {
-            col.access_name = Some(new_name.clone());
-        }
+        col.rename_answering_from(old_name, new_name);
         // Full-name spellings rename with the endpoint: a column named
         // "users_t.name|2|" answers to "u.name" after `as u` — the
         // unify full-name tier matches the NEW spelling, so the

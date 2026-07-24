@@ -68,8 +68,7 @@ fn access_boundary_export(
     let export = match body_schema.clone() {
         ast_resolved::CprSchema::Resolved(mut cols) => {
             for col in &mut cols {
-                col.declared_bare = false;
-                col.access_name = Some(access_name.clone());
+                col.export_answering_to(access_name.clone());
             }
             ast_resolved::CprSchema::Resolved(cols)
         }
@@ -392,14 +391,18 @@ pub(super) fn resolve_ground(
                     )
                 })?;
 
-                let (resolved_body, body_bubbled) =
+                // Sealed like every rule body — see the view road below.
+                let saved_ctes = registry.query_local.ctes.clone();
+                let resolve_result =
                     super::resolve_relational_expression_with_registry(
                         expanded,
                         registry,
-                        outer_context,
+                        None,
                         config,
                         Some(grounding),
-                    )
+                    );
+                registry.query_local.ctes = saved_ctes;
+                let (resolved_body, body_bubbled) = resolve_result
                     .map_err(|e| {
                         DelightQLError::database_error(
                             format!(
@@ -446,7 +449,12 @@ pub(super) fn resolve_ground(
                     )?;
                     return Ok((final_expr, final_bubbled));
                 } else {
-                    let body_bubbled = relabel_bubbled_with_alias(body_bubbled, effective_name);
+                    // The lvar law: the columns answer to the ACCESS name — the
+                    // user's alias, or the bare entity name of an unaliased access.
+                    let __access = alias
+                        .clone()
+                        .unwrap_or_else(|| view_name.clone().into());
+                    let body_bubbled = relabel_bubbled_with_alias(body_bubbled, effective_name, BoundaryAnswering::AnswersTo(__access));
                     return Ok((base_expr, body_bubbled));
                 }
             } else {
@@ -467,14 +475,23 @@ pub(super) fn resolve_ground(
                         )
                     })?;
 
-                let (resolved_query, body_bubbled) = super::resolve_query_inline(
+                // A rule body is SEALED: its meaning cannot depend on the
+                // call site's scope. Passing the caller's columns here let
+                // a body's own positional rebind be captured as an outer
+                // correlation when the caller had same-named columns — the
+                // rebind silently vanished and the body resolved as a
+                // glob. Correlation into a subquery is the call-site
+                // condition's business, never the body's.
+                let saved_ctes = registry.query_local.ctes.clone();
+                let resolve_result = super::resolve_query_inline(
                     query,
                     registry,
-                    outer_context,
+                    None,
                     config,
                     Some(grounding),
-                )
-                .map_err(|e| {
+                );
+                registry.query_local.ctes = saved_ctes;
+                let (resolved_query, body_bubbled) = resolve_result.map_err(|e| {
                     DelightQLError::database_error(
                         format!(
                             "Error while resolving view '{}' (from namespace '{}'): {}",
@@ -521,7 +538,12 @@ pub(super) fn resolve_ground(
                     )?;
                     return Ok((final_expr, final_bubbled));
                 } else {
-                    let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name);
+                    // The lvar law: the columns answer to the ACCESS name — the
+                    // user's alias, or the bare entity name of an unaliased access.
+                    let __access = alias
+                        .clone()
+                        .unwrap_or_else(|| view_name.clone().into());
+                    let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name, BoundaryAnswering::AnswersTo(__access));
                     return Ok((base_expr, body_bubbled));
                 }
             }
@@ -997,8 +1019,7 @@ pub(super) fn r_resolve_cte(
                             ast_resolved::TableName::Named(access.clone().into()),
                             col.table_position,
                         );
-                        out.declared_bare = false;
-                        out.access_name = Some(access.clone());
+                        out.export_answering_to(access.clone());
                         out
                     } else {
                         let mut c = col.clone();
@@ -1198,8 +1219,18 @@ pub(super) fn r_resolve_consulted_view(
                 )
             })?;
 
-        let (resolved_query, body_bubbled) =
-            super::resolve_query_inline(query, registry, outer_context, config, Some(grounding))
+        // A rule body is SEALED: its meaning cannot depend on the call
+        // site's scope. With the caller's columns in reach, a body's own
+        // positional rebind was captured as an outer correlation whenever
+        // the caller had same-named columns — the rebind silently
+        // vanished and the body resolved as a glob. Correlation into a
+        // subquery is the call-site condition's business, never the
+        // body's.
+        let saved_ctes = registry.query_local.ctes.clone();
+        let resolve_result =
+            super::resolve_query_inline(query, registry, None, config, Some(grounding));
+        registry.query_local.ctes = saved_ctes;
+        let (resolved_query, body_bubbled) = resolve_result
                 .map_err(|e| {
                     DelightQLError::database_error(
                         format!(
@@ -1247,7 +1278,12 @@ pub(super) fn r_resolve_consulted_view(
             )?;
             return Ok((final_expr, final_bubbled));
         } else {
-            let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name);
+            // The lvar law: the columns answer to the ACCESS name — the
+            // user's alias, or the bare entity name of an unaliased access.
+            let __access = alias
+                .clone()
+                .unwrap_or_else(|| view_name.clone().into());
+            let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name, BoundaryAnswering::AnswersTo(__access));
             return Ok((base_expr, body_bubbled));
         }
     }
@@ -1351,8 +1387,15 @@ pub(super) fn r_resolve_consulted_view(
     // qualifier alias resolves through its OWN namespace_local_alias
     // rows, never the caller's session set).
 
-    let resolve_result =
-        super::resolve_query_inline(query, registry, outer_context, &body_config, None);
+    // Sealed like every rule body (see the pre-grounded branch above):
+    // the caller's scope must never reach a body's binding positions.
+    // Body-INTERNAL CTE registrations (a recursive rule registers itself
+    // so its self-reference resolves) are scoped to this expansion: a
+    // sibling clause's later reference must re-expand the view whole,
+    // not resolve against a WITH that only exists inside this branch.
+    let saved_ctes = registry.query_local.ctes.clone();
+    let resolve_result = super::resolve_query_inline(query, registry, None, &body_config, None);
+    registry.query_local.ctes = saved_ctes;
 
 
     let (resolved_query, body_bubbled) = resolve_result.map_err(|e| {
@@ -1438,7 +1481,12 @@ pub(super) fn r_resolve_consulted_view(
         )?;
         Ok((final_expr, final_bubbled))
     } else {
-        let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name);
+        // The lvar law: the columns answer to the ACCESS name — the
+        // user's alias, or the bare entity name of an unaliased access.
+        let __access = alias
+            .clone()
+            .unwrap_or_else(|| view_name.clone().into());
+        let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name, BoundaryAnswering::AnswersTo(__access));
         Ok((base_expr, body_bubbled))
     }
 }
@@ -1513,7 +1561,12 @@ pub(super) fn r_resolve_consulted_fact(
         )?;
         Ok((final_expr, final_bubbled))
     } else {
-        let body_bubbled = relabel_bubbled_with_alias(body_bubbled, effective_name);
+        // The lvar law: the columns answer to the ACCESS name — the
+        // user's alias, or the bare entity name of an unaliased access.
+        let __access = alias
+            .clone()
+            .unwrap_or_else(|| fact_name.clone().into());
+        let body_bubbled = relabel_bubbled_with_alias(body_bubbled, effective_name, BoundaryAnswering::AnswersTo(__access));
         Ok((base_expr, body_bubbled))
     }
 }
@@ -1862,9 +1915,11 @@ pub(super) fn resolve_anonymous(
                         true, // Explicit headers are user-provided names
                     )
                     .with_declared_type(inferred_types.get(idx).cloned().flatten());
-                    header_col.declared_bare = true;
-                    if let Some(alias_name) = &relation_alias {
-                        header_col.access_name = Some(alias_name.clone());
+                    match &relation_alias {
+                        Some(alias_name) => {
+                            header_col.declare_bare_answering(alias_name.clone())
+                        }
+                        None => header_col.declare_bare(),
                     }
                     columns.push(header_col);
                 }
@@ -2624,7 +2679,7 @@ pub(super) fn ho_view_query_to_relational(
     match resolved_query {
         ast_resolved::Query::Relational(expr) => {
             if let Some(ref alias) = user_alias {
-                let bubbled = relabel_bubbled_with_alias(bubbled, alias);
+                let bubbled = relabel_bubbled_with_alias(bubbled, alias, BoundaryAnswering::Silent);
                 Ok((expr, bubbled))
             } else {
                 Ok((expr, bubbled))
@@ -2634,7 +2689,12 @@ pub(super) fn ho_view_query_to_relational(
             let body_schema =
                 super::helpers::extraction::extract_cpr_schema_from_query(&query_with_ctes)?;
             let (alias, resolver_id) = compute_effective_alias(&user_alias, &config.alias_counter);
-            let bubbled = relabel_bubbled_with_alias(bubbled, &alias);
+            // The lvar law: the columns answer to the ACCESS name — the
+            // user's alias, or the bare entity name of an unaliased access.
+            let __access = user_alias
+                .clone()
+                .unwrap_or_else(|| view_name.to_string().clone().into());
+            let bubbled = relabel_bubbled_with_alias(bubbled, &alias, BoundaryAnswering::AnswersTo(__access));
             let scoped = ast_resolved::ScopedSchema::bind(body_schema, alias.clone(), resolver_id);
             Ok((
                 ast_resolved::RelationalExpression::Relation(
@@ -2655,9 +2715,27 @@ pub(super) fn ho_view_query_to_relational(
     }
 }
 
+/// How columns crossing a relabel boundary are ADDRESSED afterwards.
+/// Every crossing must say — there is no default, so a new road cannot
+/// forget the question the way the existing silent roads did.
+pub(super) enum BoundaryAnswering {
+    /// The columns answer to this surface name (the user's alias or
+    /// the bare entity name) in addition to the pushed SQL qualifier.
+    #[allow(dead_code)]
+    AnswersTo(SqlIdentifier),
+    /// No answering channel: only the pushed qualifier (often a
+    /// synthetic `_rN`) reaches presence, so surface-name-qualified
+    /// references refuse. This is the known gap on the consulted-view
+    /// roads — unaliased `pv(*), pv.a == 1` refuses while
+    /// `pv(*) as p, p.a == 1` works. Kept until the presence-tier fix
+    /// lands; do not choose it for a NEW road without a ruling.
+    Silent,
+}
+
 pub(super) fn relabel_bubbled_with_alias(
     bubbled: super::BubbledState,
     effective_name: &str,
+    answering: BoundaryAnswering,
 ) -> super::BubbledState {
     let relabeled: Vec<ast_resolved::ColumnMetadata> = bubbled
         .i_provide
@@ -2675,6 +2753,12 @@ pub(super) fn relabel_bubbled_with_alias(
                     resolver_id: None,
                 },
             );
+            match &answering {
+                BoundaryAnswering::AnswersTo(access) => {
+                    col.export_answering_to(access.clone())
+                }
+                BoundaryAnswering::Silent => {}
+            }
             col
         })
         .collect();
@@ -2977,7 +3061,7 @@ fn apply_ho_access_pattern(
 
     let final_bubbled = super::BubbledState::resolved(output_columns);
     let final_bubbled = if let Some(alias) = user_alias {
-        relabel_bubbled_with_alias(final_bubbled, alias)
+        relabel_bubbled_with_alias(final_bubbled, alias, BoundaryAnswering::Silent)
     } else {
         final_bubbled
     };
@@ -3362,7 +3446,7 @@ fn expand_ho_view_body(
     // bubbled lexical state; rebuilding that state after applying scalar
     // arguments must not silently discard the alias.
     let final_bubbled = if let Some(alias) = user_alias {
-        relabel_bubbled_with_alias(final_bubbled, &alias)
+        relabel_bubbled_with_alias(final_bubbled, &alias, BoundaryAnswering::Silent)
     } else {
         final_bubbled
     };

@@ -463,8 +463,94 @@ fn validate_cte(cte: &mut Cte) -> Result<()> {
         return Ok(());
     }
     let name = cte.name().to_string();
+    unwrap_transparent_members(cte.query_mut(), &name);
     validate_branches(cte.query_mut(), &name)
 }
+
+/// A member of the shape `SELECT t.a AS a, t.b AS b FROM (inner) AS t` —
+/// a pure reprojection of the inner's own outputs, same names, same
+/// order, nothing else — is the inner member wearing a wrapper (the
+/// effect road's assembly wraps members the plain road emits directly;
+/// the optimizer would collapse the wrapper, but it runs AFTER this
+/// validation). Judging the wrapped shape as N4 burial refuses a legal
+/// linear recursion, so unwrap before judging — like the LIMIT
+/// legalization, this turns the one legal buried shape into a direct
+/// reference.
+fn unwrap_transparent_members(q: &mut QueryExpression, cte_name: &str) {
+    match q {
+        QueryExpression::SetOperation { left, right, .. } => {
+            unwrap_transparent_members(left, cte_name);
+            unwrap_transparent_members(right, cte_name);
+        }
+        QueryExpression::Select(select) => {
+            let Some(from) = select.from() else { return };
+            let [TableExpression::Subquery { query: inner, alias }] = from else {
+                return;
+            };
+            if select.where_clause().is_some()
+                || select.group_by().is_some()
+                || select.having().is_some()
+                || select.is_distinct()
+                || select.limit().is_some()
+                || select.order_by().is_some()
+            {
+                return;
+            }
+            let QueryExpression::Select(inner_select) = &(**inner).clone().into_inner() else {
+                return;
+            };
+            // Only unwrap when the wrapper actually hides a self-reference.
+            if scoped_reference_count(&QueryExpression::Select(inner_select.clone()), cte_name)
+                == 0
+            {
+                return;
+            }
+            // Outer must reproject the inner's outputs exactly: bare
+            // `t.name AS name` items matching the inner's aliases in order.
+            let inner_names: Vec<&str> = inner_select
+                .select_list()
+                .iter()
+                .map(|item| match item {
+                    SelectItem::Expression {
+                        alias: Some(a), ..
+                    } => a.as_str(),
+                    _ => "",
+                })
+                .collect();
+            if inner_names.iter().any(|n| n.is_empty()) {
+                return;
+            }
+            let wrapper_alias = alias.clone();
+            let outer_matches = select.select_list().len() == inner_names.len()
+                && select.select_list().iter().zip(inner_names.iter()).all(
+                    |(item, want)| match item {
+                        SelectItem::Expression {
+                            expr: DomainExpression::Column { name, qualifier },
+                            alias,
+                        } => {
+                            name == want
+                                && alias.as_deref().map(|a| a == *want).unwrap_or(true)
+                                && qualifier
+                                    .as_ref()
+                                    .map(|q| match q.parts() {
+                                        crate::pipeline::sql_ast_v3::QualifierParts::Table(
+                                            t,
+                                        ) => t == &wrapper_alias,
+                                        _ => false,
+                                    })
+                                    .unwrap_or(true)
+                        }
+                        _ => false,
+                    },
+                );
+            if outer_matches {
+                *q = QueryExpression::Select(inner_select.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
 
 #[stacksafe::stacksafe]
 fn validate_branches(q: &mut QueryExpression, cte_name: &str) -> Result<()> {
@@ -512,6 +598,10 @@ fn validate_member(q: &mut QueryExpression, cte_name: &str) -> Result<()> {
     // N4 — self-reference buried in a subquery (semi/anti-join, IN, scalar,
     // or a derived table): the rule would need the accumulated set.
     if total > direct {
+        log::debug!(
+            "N4 firing: cte={cte_name} total={total} direct={direct} member={:#?}",
+            q
+        );
         return Err(recursion_error(
             "self_subquery",
             format!(

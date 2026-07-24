@@ -272,6 +272,14 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
     ) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
         let context = super::er_chain_context(&contexts)?;
 
+        // The published schema is the pair schema (GROUNDING-AND-MENTION):
+        // a direct call publishes its WRITTEN terms' exports — helpers and
+        // computed body columns never cross the entity boundary.
+        let published: Vec<String> = relations
+            .iter()
+            .map(|rel| super::er_endpoint(rel).0)
+            .collect();
+
         Ok(super::expand_er_join_chain(
             relations,
             &term_spellings,
@@ -280,7 +288,7 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
             outer_context,
             &self.config,
             grounding,
-            None,
+            Some(published),
         )?)
     }
 
@@ -869,9 +877,18 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             let resolved_expr =
                                 ast_resolved::RelationalExpression::Relation(resolved_relation);
 
-                            // Get bubbled state
-                            let bubbled =
+                            // Get bubbled state. As on the single-relation
+                            // road: a pattern controls what the relation
+                            // CONTRIBUTES, but its source columns remain
+                            // addressable while the surrounding expression is
+                            // formed — `employees.id` after
+                            // `employees(zid, _, zmid)` resolves through the
+                            // source scope (a following pipe stays the
+                            // barrier). Without this, the history tier was
+                            // dead in join scopes while alive everywhere else.
+                            let mut bubbled =
                                 BubbledState::resolved(pattern_result.output_columns.clone());
+                            bubbled.qualifier_scope.extend(table_schema.clone());
 
                             // Generate USING condition if there are unification columns
                             let join_cond = if let Some(using_cols) = pattern_result.using_columns {

@@ -305,3 +305,13 @@ mod tests {
         assert_eq!(generate_function_column_name(&regular_func, 0), "my_func_1");
     }
 }
+
+/// A DATA key spliced into a JSON path is quoted and escaped — never
+/// raw. A dot, bracket, or quote in a key is content, not path
+/// structure (jpath injection is the same disease as SQL injection,
+/// aimed at the packet substrate). Verified accepted by SQLite:
+/// `$."a.b"`, `$."a[0]"`, `$."he\"llo"`.
+pub fn jpath_segment(key: &str) -> String {
+    format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
+}
+

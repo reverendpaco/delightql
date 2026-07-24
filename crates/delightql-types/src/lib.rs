@@ -37,3 +37,19 @@ pub use introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity
 pub use namespace::{NamespaceItem, NamespacePath};
 pub use factory::{ConnectionComponents, ConnectionFactory};
 pub use schema::{ColumnInfo, DatabaseSchema};
+
+/// Backend runtime messages with a known DQL-side remedy get the
+/// teaching appended — the backend speaks its own vocabulary; the
+/// remedy is ours. (Runtime is the honest enforcement point for
+/// value-shape failures: declared types are affinity, not truth.)
+pub fn teach_runtime_message(msg: String) -> String {
+    if msg.contains("JSON cannot hold BLOB") {
+        return format!(
+            "{msg} — melt and tree packets carry values through JSON, which \
+             cannot hold BLOBs; encode the value explicitly (hex:(col)) or \
+             exclude the column"
+        );
+    }
+    msg
+}
+

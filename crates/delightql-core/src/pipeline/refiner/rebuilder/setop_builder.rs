@@ -66,6 +66,8 @@ pub(super) fn rebuild_setop_segment(
         // Expand any GlobCorrelation predicates using operand schemas
         let all_fic_predicates =
             expand_glob_correlations(all_fic_predicates, &operand_table_groups)?;
+        let all_fic_predicates =
+            qualify_correlation_by_arm(all_fic_predicates, &operand_table_groups)?;
 
         // Assume all operators are the same type (they should be for ; syntax)
         let (setop, _) = extract_setop_operator(&analyzed.operators[0], 0)?;
@@ -135,6 +137,8 @@ pub(super) fn rebuild_setop_segment(
             .collect();
         // Expand any GlobCorrelation predicates using operand schemas
         let fic_predicates = expand_glob_correlations(fic_predicates, &operand_table_groups)?;
+        let fic_predicates =
+            qualify_correlation_by_arm(fic_predicates, &operand_table_groups)?;
 
         // Handle set operation semantics
         let (final_operator, final_operands) = match setop {
@@ -585,6 +589,194 @@ pub(super) fn extract_setop_operator(
         )),
         _ => Err(DelightQLError::parse_error("Expected set operator")),
     }
+}
+
+
+/// Correlation refs address the OPERANDS' OWN HEADINGS (set-operators
+/// doctrine: pads are output-shape artifacts, not addressable). Rewrite
+/// every lvar's qualifier to the canonical arm marker `__dql_arm_K` of
+/// the operand that OWNS it, determined against the PRE-PAD per-arm
+/// schemas — so the transformer maps refs to arm subqueries exactly,
+/// never by order of appearance, and a bare ref can never bind
+/// ambiently to a counter-arm's NULL pad.
+fn qualify_correlation_by_arm(
+    predicates: Vec<refined::BooleanExpression>,
+    operand_table_groups: &[Vec<FlatTable>],
+) -> Result<Vec<refined::BooleanExpression>> {
+    // Which arm owns a qualifier: a table named/aliased Q, or a column
+    // answering to Q, lives in that arm.
+    let arm_of_qualifier = |q: &str| -> Option<usize> {
+        operand_table_groups.iter().position(|group| {
+            group.iter().any(|t| {
+                t.alias.as_deref().is_some_and(|a| {
+                    delightql_types::SqlIdentifier::str_eq(a, q)
+                }) || delightql_types::SqlIdentifier::str_eq(t.identifier.name.as_str(), q)
+                    || t.canonical_name
+                        .as_ref()
+                        .is_some_and(|c| delightql_types::SqlIdentifier::str_eq(c.as_str(), q))
+                    || match &t.schema {
+                        resolved::CprSchema::Resolved(cols) => cols.iter().any(|c| {
+                            c.access_name()
+                                .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), q))
+                        }),
+                        _ => false,
+                    }
+            })
+        })
+    };
+    // Which arms carry a column of this name (pre-pad).
+    let arms_of_name = |n: &str| -> Vec<usize> {
+        let base = n.split('|').next().unwrap_or(n);
+        operand_table_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                group.iter().any(|t| match &t.schema {
+                    resolved::CprSchema::Resolved(cols) => cols.iter().any(|c| {
+                        let cb = c.name().split('|').next().unwrap_or(c.name());
+                        delightql_types::SqlIdentifier::str_eq(cb, base)
+                    }),
+                    _ => false,
+                })
+            })
+            .map(|(k, _)| k)
+            .collect()
+    };
+
+    fn walk(
+        expr: refined::BooleanExpression,
+        rewrite: &mut dyn FnMut(refined::DomainExpression) -> Result<refined::DomainExpression>,
+    ) -> Result<refined::BooleanExpression> {
+        Ok(match expr {
+            refined::BooleanExpression::Comparison {
+                operator,
+                left,
+                right,
+            } => refined::BooleanExpression::Comparison {
+                operator,
+                left: Box::new(rewrite(*left)?),
+                right: Box::new(rewrite(*right)?),
+            },
+            refined::BooleanExpression::And { left, right } => refined::BooleanExpression::And {
+                left: Box::new(walk(*left, rewrite)?),
+                right: Box::new(walk(*right, rewrite)?),
+            },
+            refined::BooleanExpression::Or { left, right } => refined::BooleanExpression::Or {
+                left: Box::new(walk(*left, rewrite)?),
+                right: Box::new(walk(*right, rewrite)?),
+            },
+            other => other,
+        })
+    }
+
+    fn walk_domain(
+        expr: refined::DomainExpression,
+        rewrite: &mut dyn FnMut(refined::DomainExpression) -> Result<refined::DomainExpression>,
+    ) -> Result<refined::DomainExpression> {
+        Ok(match expr {
+            lvar @ refined::DomainExpression::Lvar { .. } => rewrite(lvar)?,
+            refined::DomainExpression::Parenthesized { inner, alias } => {
+                refined::DomainExpression::Parenthesized {
+                    inner: Box::new(walk_domain(*inner, rewrite)?),
+                    alias,
+                }
+            }
+            refined::DomainExpression::Function(func) => {
+                refined::DomainExpression::Function(match func {
+                    refined::FunctionExpression::Infix {
+                        operator,
+                        left,
+                        right,
+                        alias,
+                    } => refined::FunctionExpression::Infix {
+                        operator,
+                        left: Box::new(walk_domain(*left, rewrite)?),
+                        right: Box::new(walk_domain(*right, rewrite)?),
+                        alias,
+                    },
+                    other => other,
+                })
+            }
+            other => other,
+        })
+    }
+
+    predicates
+        .into_iter()
+        .map(|pred| {
+            walk(pred, &mut |top| walk_domain(top, &mut |expr| match expr {
+                refined::DomainExpression::Lvar {
+                    name,
+                    qualifier,
+                    namespace_path,
+                    alias,
+                    provenance,
+                } => {
+                    let arm = match &qualifier {
+                        Some(q) => arm_of_qualifier(q.as_str()).ok_or_else(|| {
+                            DelightQLError::validation_error_categorized(
+                                "resolution/setop/correlation_owner",
+                                format!(
+                                    "the set-operation correlation references \
+                                     '{}.{}', but no operand answers to '{}' — \
+                                     a correlation addresses the operands' own \
+                                     headings (pads are output shape, not \
+                                     addressable)",
+                                    q.as_str(),
+                                    name.as_str(),
+                                    q.as_str()
+                                ),
+                                "qualify correlation references by an operand's \
+                                 name or alias",
+                            )
+                        })?,
+                        None => {
+                            let owners = arms_of_name(name.as_str());
+                            match owners.len() {
+                                1 => owners[0],
+                                0 => {
+                                    return Err(DelightQLError::validation_error_categorized(
+                                        "resolution/setop/correlation_owner",
+                                        format!(
+                                            "the set-operation correlation references \
+                                             '{}', but no operand's heading carries \
+                                             it — a correlation addresses the \
+                                             operands' own headings (pads are output \
+                                             shape, not addressable)",
+                                            name.as_str()
+                                        ),
+                                        "name a column an operand actually has",
+                                    ))
+                                }
+                                _ => {
+                                    return Err(DelightQLError::validation_error_categorized(
+                                        "resolution/setop/correlation_owner",
+                                        format!(
+                                            "the bare correlation reference '{}' is \
+                                             carried by more than one operand — \
+                                             qualify it by the operand's name or \
+                                             alias to say which side it addresses",
+                                            name.as_str()
+                                        ),
+                                        "a correlation ref binds one operand's \
+                                         heading; shared names need a qualifier",
+                                    ))
+                                }
+                            }
+                        }
+                    };
+                    Ok(refined::DomainExpression::Lvar {
+                        name,
+                        qualifier: Some(format!("__dql_arm_{arm}").as_str().into()),
+                        namespace_path,
+                        alias,
+                        provenance,
+                    })
+                }
+                other => Ok(other),
+            }))
+        })
+        .collect()
 }
 
 /// Expand GlobCorrelation predicates using operand schemas.

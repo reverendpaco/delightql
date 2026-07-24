@@ -161,7 +161,26 @@ fn format_with_library(
         use delightql_formatter::PassReason;
         match reason {
             PassReason::ParseError => {
-                eprintln!("warning: input does not parse; returned unchanged");
+                // A rules/DDL library is not a formatter bug in the
+                // input — it is a formatter limitation. Say which.
+                extern "C" {
+                    fn tree_sitter_delightql_rules() -> tree_sitter::Language;
+                }
+                let rules_language = unsafe { tree_sitter_delightql_rules() };
+                let mut parser = tree_sitter::Parser::new();
+                let is_rules_file = parser.set_language(&rules_language).is_ok()
+                    && parser
+                        .parse(&input, None)
+                        .is_some_and(|tree| !tree.root_node().has_error());
+                if is_rules_file {
+                    eprintln!(
+                        "warning: this is a rules/DDL library — `dql format` \
+                         speaks the query grammar only and cannot format rule \
+                         definitions yet; returned unchanged"
+                    );
+                } else {
+                    eprintln!("warning: input does not parse; returned unchanged");
+                }
                 // A parse error is "cannot determine" in BOTH modes —
                 // there is no formatted form of unparseable input.
                 if !fail_if_not_formatted {

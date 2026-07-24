@@ -3114,7 +3114,11 @@ fn build_pivot_outer_select(
                         .get(col_idx)
                         .map(|c| col_name(c).to_string())
                         .unwrap_or_else(|| pivot_value.to_lowercase());
-                    let path = format!("$.{}.{}", pivot_value, val_name);
+                    let path = format!(
+                        "$.{}.{}",
+                        crate::pipeline::naming::jpath_segment(pivot_value),
+                        crate::pipeline::naming::jpath_segment(&val_name),
+                    );
                     // Provenance: compiler-internal packet read — the value
                     // came from a typed column and may be compared
                     // numerically downstream, so it must stay NATIVE json
@@ -4440,12 +4444,7 @@ pub(super) fn r_lower_intersect_corresponding(
 
     let names = ctx.names.clone();
 
-    // Step 1: Extract user aliases from the correlation expression.
-    // The correlation has qualifiers like "first", "second" — these map
-    // to operands in order.
-    let user_aliases = extract_correlation_qualifiers(&correlation);
-
-    // Step 2: Materialize each operand and record its info.
+    // Step 1: Materialize each operand and record its info.
     // We need the QueryExpression and columns for each operand. Each operand's
     // query may be used multiple times (as both outer and inner), so we
     // materialize up front and clone as needed.
@@ -4460,11 +4459,15 @@ pub(super) fn r_lower_intersect_corresponding(
         op_queries.push(op.to_sql()?);
     }
 
-    // Build alias map: user_alias → subquery_alias (positional)
-    let alias_map: Vec<(Option<String>, String)> = user_aliases
-        .into_iter()
-        .zip(op_aliases.iter())
-        .map(|(user, alias)| (user, alias.to_string()))
+    // Step 2: Correlation refs arrive qualified with canonical arm
+    // markers (`__dql_arm_K`, stamped by the refiner from PRE-PAD
+    // ownership), so the map is exact by index — never by order of
+    // appearance, which mis-bound refs (and left bare refs to bind
+    // ambiently against a counter-arm's NULL pad).
+    let alias_map: Vec<(Option<String>, String)> = op_aliases
+        .iter()
+        .enumerate()
+        .map(|(k, alias)| (Some(format!("__dql_arm_{k}")), alias.to_string()))
         .collect();
 
     // Dispatch: min_multiplicity → bag intersection (ROW_NUMBER JOIN)

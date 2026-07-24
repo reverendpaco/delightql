@@ -15,14 +15,37 @@ pub fn write_identifier(
         // template ('`{0}`' for mysql, '[{0}]' for sqlserver).
         match pack.render(dialect.family_name(), "ident.quoted") {
             Some(rule) => {
+                // A positional template cannot be responsible for escaping:
+                // identifier bytes come from DATA (pivot keys become column
+                // names), so the delimiter that closes the quoted token must
+                // be doubled BEFORE interpolation. The pack pairs every
+                // `ident.quoted` with `ident.escape` (the character to
+                // double); a pack that omits it refuses loudly here rather
+                // than let data rewrite the SQL token stream.
+                let escape = pack
+                    .render(dialect.family_name(), "ident.escape")
+                    .ok_or_else(|| {
+                        GeneratorError::Error(format!(
+                            "dialect pack for '{}' carries ident.quoted without \
+                             ident.escape — identifier escaping would be skipped",
+                            dialect.family_name()
+                        ))
+                    })?
+                    .template()
+                    .map_err(GeneratorError::Error)?;
+                let doubled = format!("{escape}{escape}");
+                let escaped = ident.replace(escape, &doubled);
                 let template = rule.template().map_err(GeneratorError::Error)?;
                 let quoted =
-                    apply_template(template, &[ident]).map_err(GeneratorError::Error)?;
+                    apply_template(template, &[&escaped]).map_err(GeneratorError::Error)?;
                 sql.push_str(&quoted);
             }
             None => {
+                // Embedded quotes DOUBLE inside a quoted identifier — a
+                // data-derived name (a pivot key becoming a column) must
+                // never break out of its delimiters.
                 sql.push('"');
-                sql.push_str(ident);
+                sql.push_str(&ident.replace('"', "\"\""));
                 sql.push('"');
             }
         }
@@ -372,5 +395,53 @@ mod tests {
         assert!(needs_quoting("with-dash"));
         assert!(needs_quoting("123start"));
         assert!(needs_quoting(""));
+    }
+
+    fn seeded_pack() -> DialectPack {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::bootstrap::initialize_bootstrap_db(&conn).unwrap();
+        DialectPack::load(&conn).unwrap()
+    }
+
+    fn quoted(ident: &str, dialect: SqlDialect, pack: &DialectPack) -> String {
+        let mut sql = String::new();
+        write_identifier(&mut sql, ident, dialect, pack).unwrap();
+        sql
+    }
+
+    // An identifier containing its target's own closing delimiter must
+    // never terminate the quoted token: pivot column names come from
+    // DATA VALUES, so an unescaped delimiter lets data rewrite the SQL
+    // token stream (injection, not just breakage).
+    #[test]
+    fn each_dialect_escapes_its_own_closing_delimiter() {
+        let pack = seeded_pack();
+        // Standard family: embedded double quotes double.
+        for d in [
+            SqlDialect::SQLite,
+            SqlDialect::PostgreSQL,
+            SqlDialect::DuckDB,
+        ] {
+            assert_eq!(quoted("a\"b", d, &pack), "\"a\"\"b\"");
+        }
+        // MySQL backticks: embedded backtick doubles inside `...`.
+        assert_eq!(quoted("a`b", SqlDialect::MySQL, &pack), "`a``b`");
+        // SQL Server brackets: embedded closing bracket doubles; the
+        // opening bracket needs no escape (QUOTENAME semantics).
+        assert_eq!(quoted("a]b", SqlDialect::SqlServer, &pack), "[a]]b]");
+        assert_eq!(quoted("a[b", SqlDialect::SqlServer, &pack), "[a[b]");
+    }
+
+    // Cross-delimiter characters are data, not structure, on dialects
+    // where they are not the delimiter.
+    #[test]
+    fn foreign_delimiters_pass_through_unescaped() {
+        let pack = seeded_pack();
+        assert_eq!(quoted("a]b", SqlDialect::MySQL, &pack), "`a]b`");
+        assert_eq!(quoted("a`b", SqlDialect::SqlServer, &pack), "[a`b]");
+        assert_eq!(quoted("a`]b", SqlDialect::SQLite, &pack), "\"a`]b\"");
+        // The standard family's quote is data inside brackets/backticks.
+        assert_eq!(quoted("a\"b", SqlDialect::MySQL, &pack), "`a\"b`");
+        assert_eq!(quoted("a\"b", SqlDialect::SqlServer, &pack), "[a\"b]");
     }
 }

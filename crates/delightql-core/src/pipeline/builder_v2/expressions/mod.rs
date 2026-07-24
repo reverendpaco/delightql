@@ -220,7 +220,7 @@ pub(super) fn parse_expression(
         // Mention in either spelling normally arrives INSIDE a
         // `literal` node (the ground-literal category); these arms
         // cover any production still emitting the bare token.
-        "symbol" => Ok(literals::build_symbol(node.text())),
+        "symbol" => literals::build_symbol(node.text()),
         "delimited_mention" => literals::build_mention(node.text()),
         "piped_expression" => pipes::parse_piped_expression(node),
         "case_expression" => case_and_subqueries::parse_case_expression(node),

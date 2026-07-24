@@ -796,7 +796,7 @@ pub(super) fn resolve_interior_drill_down(
         // argumentative access — a positional alias here participates
         // in full-name-identity unification.
         if positional_aliases.is_some() {
-            col.declared_bare = true;
+            col.declare_bare();
         }
         // If this interior column has its own nested interior, mark it
         if def.child_interior.is_some() {

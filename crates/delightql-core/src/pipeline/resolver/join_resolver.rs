@@ -27,8 +27,7 @@ fn qualified_header_matches(
             if delightql_types::SqlIdentifier::str_eq(t.as_str(), q.as_str())
     );
     let access = col
-        .access_name
-        .as_ref()
+        .access_name()
         .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), q.as_str()));
     sql_qualifier || access
 }
@@ -85,8 +84,8 @@ pub(super) fn detect_anonymous_table_unification(
                 ..
             } => {
                 let declared = left_columns.iter().any(|col| {
-                    col.declared_bare
-                        && col.access_name.is_none()
+                    col.declared_bare()
+                        && col.access_name().is_none()
                         && delightql_types::SqlIdentifier::str_eq(col.name(), name)
                 });
                 if declared {
@@ -193,8 +192,8 @@ pub(super) fn aliased_anon_would_unify(
                 ..
             } => {
                 let declared = left_columns.iter().any(|col| {
-                    col.declared_bare
-                        && col.access_name.is_none()
+                    col.declared_bare()
+                        && col.access_name().is_none()
                         && delightql_types::SqlIdentifier::str_eq(col.name(), name)
                 });
                 if declared {
@@ -349,7 +348,7 @@ pub(super) fn build_anon_membership(
                 let bound = left_columns.iter().find(|col| match qualifier {
                     Some(q) => qualified_header_matches(col, name, q),
                     None => {
-                        col.declared_bare
+                        col.declared_bare()
                             && delightql_types::SqlIdentifier::str_eq(col.name(), name)
                     }
                 });

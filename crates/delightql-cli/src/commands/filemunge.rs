@@ -192,7 +192,15 @@ pub fn handle_filemunge_command(
         .map(|pair| parse_table_spec(&pair[0], &pair[1]))
         .collect::<Result<_>>()?;
 
-    let temp_path = std::env::temp_dir().join(format!("dql_filemunge_{}.db", std::process::id()));
+    // A pid alone is not unique: sandboxed/containerized runs give
+    // concurrent processes the same pid in their own namespaces, and
+    // the shared temp dir then collides deterministically. tempfile
+    // creates the name atomically (O_EXCL) under the OS.
+    let temp_file = tempfile::Builder::new()
+        .prefix("dql_filemunge_")
+        .suffix(".db")
+        .tempfile()?;
+    let temp_path = temp_file.path().to_path_buf();
 
     {
         let conn = Connection::open(&temp_path)?;

@@ -1972,7 +1972,13 @@ module.exports = grammar({
     // Symbol: a self-valued name. Leading '::' only — the namespace
     // separator is token.immediate after an identifier, so the two
     // never compete for the same '::'.
-    symbol: $ => token(seq('::', /[a-zA-Z_][a-zA-Z0-9_]*/)),
+    // The light mention spelling. RULED 2026-07-23 (extent rule): an
+    // optional functor extent follows the identifier — ::people(*),
+    // ::varchar(20), ::people(, age >= 30) — written as a strict prefix
+    // of the future type-term grammar (::ident(balanced)). The token
+    // regex carries TWO nesting levels; a deeper interior belongs to
+    // the delimited spelling :`term`, which subparses properly.
+    symbol: $ => token(seq('::', /[a-zA-Z_][a-zA-Z0-9_]*/, optional(/\(([^()]|\([^()]*\))*\)/))),
 
     // Delimited mention: :`term` — a reference literal, the delimited
     // spelling of mention (symbol is the light spelling). The interior

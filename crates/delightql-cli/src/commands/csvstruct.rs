@@ -74,7 +74,15 @@ pub fn handle_csvstruct_command(
     let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
     let insert_sql = format!("INSERT INTO c VALUES ({})", placeholders.join(", "));
 
-    let temp_path = std::env::temp_dir().join(format!("dql_csvstruct_{}.db", std::process::id()));
+    // A pid alone is not unique: sandboxed/containerized runs give
+    // concurrent processes the same pid in their own namespaces, and
+    // the shared temp dir then collides deterministically. tempfile
+    // creates the name atomically (O_EXCL) under the OS.
+    let temp_file = tempfile::Builder::new()
+        .prefix("dql_csvstruct_")
+        .suffix(".db")
+        .tempfile()?;
+    let temp_path = temp_file.path().to_path_buf();
     {
         let conn = Connection::open(&temp_path)?;
         conn.execute(&create_sql, [])?;

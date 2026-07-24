@@ -142,7 +142,7 @@ pub(in crate::pipeline::builder_v2) fn parse_literal(node: CstNode) -> Result<Do
             Ok(DomainExpression::literal_builder(LiteralValue::Boolean(value)).build())
         }
         "null_literal" => Ok(DomainExpression::literal_builder(LiteralValue::Null).build()),
-        "symbol" => Ok(build_symbol(child.text())),
+        "symbol" => build_symbol(child.text()),
         "delimited_mention" => build_mention(child.text()),
         _ => Err(DelightQLError::parse_error("Unknown literal type")),
     }
@@ -150,9 +150,18 @@ pub(in crate::pipeline::builder_v2) fn parse_literal(node: CstNode) -> Result<Do
 
 /// Symbol: ::active — a self-valued name; carries "::active".
 /// Stores the bare name (no `::`).
-pub(in crate::pipeline::builder_v2) fn build_symbol(text: &str) -> DomainExpression {
+pub(in crate::pipeline::builder_v2) fn build_symbol(text: &str) -> Result<DomainExpression> {
     let name = text.trim_start_matches("::").to_string();
-    DomainExpression::literal_builder(LiteralValue::Symbol(name)).build()
+    // The extent rule (RULED 2026-07-23): a functor extent makes the
+    // light spelling a MENTION of the term — ::people(*) and
+    // :`people(*)` are two spellings of one thing, so both canonicalize
+    // and carry LiteralValue::Mention; grounding equality follows by
+    // construction. A bare ::name stays a Symbol.
+    if name.contains('(') {
+        let canonical = crate::term_spec::canonicalize_term(&name)?;
+        return Ok(DomainExpression::literal_builder(LiteralValue::Mention(canonical)).build());
+    }
+    Ok(DomainExpression::literal_builder(LiteralValue::Symbol(name)).build())
 }
 
 /// Delimited mention: :`term` — capture-then-subparse. The interior

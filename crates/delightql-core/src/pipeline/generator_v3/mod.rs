@@ -748,6 +748,29 @@ impl SqlGenerator {
                 // so they never leak into emitted SQL. A template body renders
                 // the whole FROM item (minus alias); a bare-NAME body renames
                 // the call. The alias is appended by code either way.
+                // Sequence positions guard for sequence-ness (own-or-contain
+                // ruling): a data-borne non-array or malformed value becomes
+                // a NULL interior and takes the null-interior road (zero
+                // rows) instead of leaking the backend's polymorphic
+                // iteration as phantom rows (an object iterates its pairs, a
+                // scalar yields an atom row). Compiler-built packets are
+                // always arrays — the guard is inert for them. Template
+                // dialects own their guard inside the template body.
+                let guarded_args: Vec<String> = if function
+                    == crate::pipeline::naming::INTERNAL_JSON_EACH_ARRAY
+                {
+                    rendered_args
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "CASE WHEN json_valid({t}) AND json_type({t}) = 'array' THEN {t} END"
+                            )
+                        })
+                        .collect()
+                } else {
+                    rendered_args.clone()
+                };
+
                 let tvf_key = format!("tvf.{}", function.to_ascii_lowercase());
                 let rule = self
                     .config
@@ -766,7 +789,7 @@ impl SqlGenerator {
                                     })?;
                             sql.push_str(&applied);
                         } else {
-                            self.write_tvf_call(sql, schema.as_deref(), body, &rendered_args);
+                            self.write_tvf_call(sql, schema.as_deref(), body, &guarded_args);
                         }
                     }
                     Some(rule) => {
@@ -779,7 +802,7 @@ impl SqlGenerator {
                         let canonical_name =
                             crate::pipeline::naming::internal_fn_canonical(function)
                                 .unwrap_or(function);
-                        self.write_tvf_call(sql, schema.as_deref(), canonical_name, &rendered_args);
+                        self.write_tvf_call(sql, schema.as_deref(), canonical_name, &guarded_args);
                     }
                 }
 

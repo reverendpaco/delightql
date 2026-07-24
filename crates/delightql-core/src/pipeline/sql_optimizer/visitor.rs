@@ -47,6 +47,18 @@ pub trait QueryTransformer {
         Ok(None)
     }
 
+    /// The walker is DESCENDING into the expressions of a SELECT whose
+    /// FROM exposes these table names: any subquery met inside them can
+    /// correlate against these names (they are its enclosing scope).
+    /// Default: ignore. A pass that must distinguish "reference to an
+    /// enclosing scope" from "reference to a name I might expose" keeps
+    /// a stack from these calls.
+    fn enter_expr_scope(&mut self, _names: &[String]) {}
+
+    /// The walker finished the expressions of the SELECT that pushed the
+    /// matching `enter_expr_scope`.
+    fn exit_expr_scope(&mut self) {}
+
     /// Transform a domain expression (WHERE, HAVING, JOIN ON conditions, etc.)
     ///
     /// This is called after recursively processing nested expressions.
@@ -158,19 +170,27 @@ fn transform_select<T: QueryTransformer>(
         None
     };
 
-    // Recursively transform WHERE clause
+    // Recursively transform WHERE and HAVING under this statement's
+    // expression scope: subqueries inside them can correlate against
+    // this FROM's exposed names.
+    let scope_names: Vec<String> = transformed_from
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .flat_map(exposed_table_names)
+        .collect();
+    transformer.enter_expr_scope(&scope_names);
     let transformed_where = if let Some(expr) = where_clause {
         Some(transform_domain_expr(expr, transformer)?)
     } else {
         None
     };
-
-    // Recursively transform HAVING clause
     let transformed_having = if let Some(expr) = having {
         Some(transform_domain_expr(expr, transformer)?)
     } else {
         None
     };
+    transformer.exit_expr_scope();
 
     // Rebuild the SELECT statement with transformed parts
     let mut builder = SelectStatement::builder();
@@ -386,4 +406,26 @@ fn transform_domain_expr<T: QueryTransformer>(
         Some(transformed) => Ok(transformed),
         None => Ok(processed),
     }
+}
+
+/// The table names a FROM item exposes into its statement's scope:
+/// bare tables by alias-or-name, aliased subqueries by alias, join
+/// trees recursively.
+pub(super) fn exposed_table_names(table: &TableExpression) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(table: &TableExpression, out: &mut Vec<String>) {
+        match table {
+            TableExpression::Table { name, alias, .. } => {
+                out.push(alias.as_deref().unwrap_or(name).to_string());
+            }
+            TableExpression::Subquery { alias, .. } => out.push(alias.clone()),
+            TableExpression::Join { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            _ => {}
+        }
+    }
+    walk(table, &mut out);
+    out
 }

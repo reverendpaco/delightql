@@ -231,8 +231,7 @@ fn resolve_lvar(
             // a pipe/entity boundary answers to access_name, and a
             // qualified-glob export answers to its full-name spelling.
             let answers = col
-                .access_name
-                .as_ref()
+                .access_name()
                 .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), qual));
             let full_name = col
                 .name()
@@ -326,8 +325,7 @@ fn resolve_lvar(
         let qualifier_answers = has_qualifier
             && available.iter().any(|col| {
                 let qual = qualifier.as_ref().expect("has_qualifier");
-                col.access_name
-                    .as_ref()
+                col.access_name()
                     .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), qual))
                     || col.name().split('|').next().is_some_and(|b| {
                         b.strip_prefix(qual.as_str())
@@ -427,6 +425,51 @@ fn resolve_lvar(
             for result in results {
                 match result {
                     UnificationResult::Resolved(col) => {
+                        // SOURCE-SCOPE match: the reference matched a column
+                        // that only the qualifier scope carries — the
+                        // relation's pattern rebound it away from the output.
+                        // Re-spell to the OUTPUT column that carries it (the
+                        // one whose provenance original is this source
+                        // column), so the reference leaves resolution in the
+                        // current spelling and no downstream tier ever
+                        // arbitrates between this rebind and some other
+                        // relation's history of the same source name. This
+                        // is also what makes a same-clause rebind outrank a
+                        // cross-derivation frame: the rebind wins HERE, by
+                        // being current.
+                        if let Some(q) = qualifier.as_ref() {
+                            let in_output = available.iter().any(|c| {
+                                delightql_types::SqlIdentifier::str_eq(c.name(), col.name())
+                            });
+                            if !in_output {
+                                let carriers: Vec<&ast_resolved::ColumnMetadata> = available
+                                    .iter()
+                                    .filter(|c| {
+                                        c.info.original_name()
+                                            == Some(&col.name().to_string())
+                                            && matches!(
+                                                c.qualifier(),
+                                                ast_resolved::TableName::Named(t)
+                                                    if delightql_types::SqlIdentifier::str_eq(
+                                                        t.as_str(),
+                                                        q
+                                                    )
+                                            )
+                                    })
+                                    .collect();
+                                if let [carrier] = carriers.as_slice() {
+                                    let out_alias =
+                                        alias.clone().unwrap_or_else(|| name.clone());
+                                    return Ok(ast_resolved::DomainExpression::Lvar {
+                                        name: carrier.name().into(),
+                                        qualifier: qualifier.map(|s| s.into()),
+                                        namespace_path,
+                                        alias: Some(out_alias.into()),
+                                        provenance: ast_resolved::PhaseBox::phantom(),
+                                    });
+                                }
+                            }
+                        }
                         // ANSWERING match (the lvar law): the reference
                         // matched a column whose CURRENT qualifier is not
                         // the written one — it answered via access_name or
@@ -461,6 +504,22 @@ fn resolve_lvar(
                         break;
                     }
                     UnificationResult::Unresolved(col_name) => {
+                        log::debug!(
+                            "UNRESOLVED '{}': qual={:?} bound={} qscope=[{}] avail=[{}]",
+                            col_name,
+                            qualifier,
+                            qualifier_is_bound,
+                            qualifier_scope
+                                .iter()
+                                .map(|c| format!("{}/{:?}", c.name(), c.qualifier()))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            available
+                                .iter()
+                                .map(|c| c.name().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
                         return Err(DelightQLError::column_not_found_error(
                             col_name,
                             "in domain expression",

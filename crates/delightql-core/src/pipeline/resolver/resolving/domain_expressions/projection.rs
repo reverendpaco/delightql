@@ -12,17 +12,79 @@ fn expand_glob(
     available: &[ast_resolved::ColumnMetadata],
 ) -> Result<Vec<ast_resolved::DomainExpression>> {
     if let Some(qual) = qualifier {
-        Ok(available
+        let tier1: Vec<&ast_resolved::ColumnMetadata> = available
             .iter()
             .filter(
                 |col| matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == &qual),
             )
-            .map(|col| ast_resolved::DomainExpression::Lvar {
-                name: col.name().into(),
-                qualifier: Some(qual.clone().into()),
-                namespace_path: NamespacePath::empty(),
-                alias: None,
-                provenance: ast_resolved::PhaseBox::phantom(),
+            .collect();
+        if !tier1.is_empty() {
+            return Ok(tier1
+                .into_iter()
+                .map(|col| ast_resolved::DomainExpression::Lvar {
+                    name: col.name().into(),
+                    qualifier: Some(qual.clone().into()),
+                    namespace_path: NamespacePath::empty(),
+                    alias: None,
+                    provenance: ast_resolved::PhaseBox::phantom(),
+                })
+                .collect());
+        }
+        // Answering tiers (the lvar law): a column that crossed a
+        // pipe/entity boundary keeps a synthetic or laundered SQL
+        // qualifier and answers to `access_name`, to its full-name
+        // spelling ("products.id|1|"), or through its identity stack
+        // (a PipeBarrier frame recording where it came from). A
+        // qualified glob is a qualified reference, so it matches by
+        // the same tiers; the expanded lvar keeps the column's CURRENT
+        // address so downstream binding is exact. These tiers run only
+        // when NO current qualifier matches, so history can never
+        // outrank presence.
+        Ok(available
+            .iter()
+            .filter(|col| {
+                let answers = col
+                    .access_name()
+                    .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), &qual));
+                let full_name = col.name().split('|').next().is_some_and(|base| {
+                    base.strip_prefix(qual.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+                });
+                // The stack tier follows LAUNDERING, never renaming: it
+                // matches only when the column was BORN in the asked
+                // qualifier's table under its CURRENT name (the
+                // OriginalTable birth frame). Rename sites stamp the new
+                // name with the source qualifier on later frames, so any
+                // broader frame match would follow renames — a renamed
+                // column is a different published name and stays out of
+                // the glob.
+                let current_base = col.name().split('|').next().unwrap_or("");
+                let stack = col.info.identity_stack().iter().any(|frame| {
+                    delightql_types::SqlIdentifier::str_eq(frame.name.as_str(), current_base)
+                        && matches!(
+                            &frame.context,
+                            ast_resolved::IdentityContext::OriginalTable {
+                                table: ast_resolved::TableName::Named(n),
+                                ..
+                            } if delightql_types::SqlIdentifier::str_eq(n.as_str(), &qual)
+                        )
+                });
+                answers || full_name || stack
+            })
+            .map(|col| {
+                let current_qual = match col.qualifier() {
+                    ast_resolved::TableName::Named(t) if !t.as_str().is_empty() => {
+                        Some(t.clone())
+                    }
+                    _ => None,
+                };
+                ast_resolved::DomainExpression::Lvar {
+                    name: col.name().into(),
+                    qualifier: current_qual,
+                    namespace_path: NamespacePath::empty(),
+                    alias: None,
+                    provenance: ast_resolved::PhaseBox::phantom(),
+                }
             })
             .collect())
     } else {

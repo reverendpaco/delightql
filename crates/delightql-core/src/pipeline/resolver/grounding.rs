@@ -1802,6 +1802,21 @@ pub(super) fn refuse_provable_ground_miss(
 /// misses in SQL, the silent empty the law forbids); differing
 /// variants never match (an untyped injected column compares TEXT vs
 /// INTEGER by type ordering, never equal).
+/// R8's strict-landing refusal: the pipe binds position 1, and
+/// something else occupies it.
+fn er_r8_first_param_refusal(entity: &str, first_param: &str) -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "resolution/ho/pipe_landing",
+        format!(
+            "the pipe lands at the first parameter of '{entity}', and '{first_param}' \
+             occupies it — write @ at the parameter that receives the pipe: \
+             {entity}(…, @)"
+        ),
+        "R8, strict: a piped relation lands at the first formal parameter, or at \
+         exactly one explicit @ — never search, never displace",
+    )
+}
+
 fn ground_literals_equal(
     a: &crate::pipeline::asts::core::LiteralValue,
     b: &crate::pipeline::asts::core::LiteralValue,
@@ -1973,11 +1988,13 @@ pub(super) fn split_ho_first_parens(
             let mut bindings = HoParamBindings::default();
             let mut pipe_target_idx = None;
             if pipe_source.is_some() && !entity.params.is_empty() {
-                // Find the first table-value parameter (Glob or Argumentative)
-                let first_table_param = entity.params.iter().enumerate().find(|(_, p)| {
+                // R8, STRICT (ratified 2026-07-23): the pipe lands at the
+                // FIRST formal parameter — never a search for a table
+                // parameter elsewhere. A scalar first parameter refuses
+                // toward the explicit spelling.
+                if !entity.params.iter().any(|p| {
                     matches!(p.kind, HoParamKind::Glob | HoParamKind::Argumentative(_))
-                });
-                if first_table_param.is_none() {
+                }) {
                     return Err(DelightQLError::validation_error(
                         format!(
                             "Higher-order view '{}' has no table-value parameter to receive pipe input \
@@ -1987,6 +2004,12 @@ pub(super) fn split_ho_first_parens(
                         "A piped HO view must have at least one table-value parameter (e.g. T(*)) \
                          as the target for the pipe input",
                     ));
+                }
+                if !matches!(
+                    entity.params[0].kind,
+                    HoParamKind::Glob | HoParamKind::Argumentative(_)
+                ) {
+                    return Err(er_r8_first_param_refusal(&entity.name, &entity.params[0].name));
                 }
                 pipe_target_idx = Some(0);
                 let first_param = &entity.params[0];
@@ -2048,15 +2071,57 @@ pub(super) fn split_ho_first_parens(
 
     // Check if any expression is @. If piped with no @, the first table param
     // gets the pipe source implicitly — we must skip it in the expr-matching loop.
-    let has_at = exprs
+    let at_count = exprs
         .iter()
-        .any(|e| matches!(e, ast_unresolved::DomainExpression::ValuePlaceholder { .. }));
+        .filter(|e| matches!(e, ast_unresolved::DomainExpression::ValuePlaceholder { .. }))
+        .count();
+    if pipe_source.is_some() && at_count > 1 {
+        return Err(DelightQLError::validation_error_categorized(
+            "resolution/ho/pipe_landing",
+            format!(
+                "one pipe, one landing — the call to '{}' writes {} placeholders; \
+                 exactly one @ names the parameter that receives the pipe",
+                entity.name, at_count
+            ),
+            "R8: a piped relation lands at the first formal parameter, or at \
+             exactly one explicit @",
+        ));
+    }
+    let has_at = at_count > 0;
     let implicit_pipe_target = pipe_source.is_some() && !has_at;
 
+    // R8, STRICT (ratified 2026-07-23): the implicit landing is the
+    // FIRST formal parameter, period — a supplied/scalar first parameter
+    // refuses toward the explicit @ spelling; the landing never searches
+    // and never displaces.
+    if implicit_pipe_target
+        && !entity.params.is_empty()
+        && !matches!(
+            entity.params[0].kind,
+            HoParamKind::Glob | HoParamKind::Argumentative(_)
+        )
+    {
+        if !entity.params.iter().any(|p| {
+            matches!(p.kind, HoParamKind::Glob | HoParamKind::Argumentative(_))
+        }) {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "Higher-order view '{}' has no table-value parameter to receive pipe input \
+                     (all parameters are scalar)",
+                    entity.name
+                ),
+                "A piped HO view must have at least one table-value parameter (e.g. T(*)) \
+                 as the target for the pipe input",
+            ));
+        }
+        return Err(er_r8_first_param_refusal(&entity.name, &entity.params[0].name));
+    }
+
     for (param_idx, param) in entity.params.iter().enumerate() {
-        // Implicit pipe target: first table param gets pipe source, skip it
+        // Implicit pipe target (R8): the first parameter, no other.
         if implicit_pipe_target
             && pipe_target_idx.is_none()
+            && param_idx == 0
             && matches!(
                 param.kind,
                 HoParamKind::Glob | HoParamKind::Argumentative(_)
@@ -2110,6 +2175,39 @@ pub(super) fn split_ho_first_parens(
             expr,
             ast_unresolved::DomainExpression::ValuePlaceholder { .. }
         ) {
+            // R8 names the LANDING; only a table-valued parameter can
+            // receive a relation. An @ at a scalar parameter would bind
+            // the pipe nowhere — the carrier CTE emits but nothing
+            // references it, the relation silently vanishes — so the
+            // shape refuses instead.
+            if !matches!(
+                param.kind,
+                HoParamKind::Glob | HoParamKind::Argumentative(_)
+            ) {
+                return Err(DelightQLError::validation_error_categorized(
+                    "resolution/ho/pipe_landing",
+                    format!(
+                        "@ lands the piped relation at '{}', but '{}' is a scalar \
+                         parameter of '{}' — a relation can land only at a table \
+                         parameter (T(*) or T(cols)). Supply the scalar and write \
+                         @ at a table parameter",
+                        param.name, param.name, entity.name
+                    ),
+                    "R8: @ names the table parameter that receives the pipe",
+                ));
+            }
+            if pipe_source.is_none() {
+                return Err(DelightQLError::validation_error_categorized(
+                    "resolution/ho/pipe_landing",
+                    format!(
+                        "the call to '{}' writes @ but nothing is piped into it — \
+                         @ names the landing of a piped relation; supply the \
+                         argument directly, or pipe a relation in with |>",
+                        entity.name
+                    ),
+                    "R8: @ has meaning only when a relation is piped into the call",
+                ));
+            }
             pipe_target_idx = Some(param_idx);
             if pipe_source.is_some() {
                 let cte_name = "_ho_pipe_src".to_string();

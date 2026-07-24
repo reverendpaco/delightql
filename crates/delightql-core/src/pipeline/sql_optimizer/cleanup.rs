@@ -27,13 +27,28 @@ use crate::pipeline::sql_ast_v3::{
 use super::visitor::{apply_transformer, QueryTransformer};
 
 pub(super) fn pass_cleanup(stmt: SqlStatement) -> Result<SqlStatement> {
-    let mut transformer = CollapseTransformer;
+    let mut transformer = CollapseTransformer {
+        enclosing_scopes: Vec::new(),
+    };
     apply_transformer(stmt, &mut transformer)
 }
 
-struct CollapseTransformer;
+struct CollapseTransformer {
+    /// FROM-exposed names of the statements the walker is currently
+    /// inside the EXPRESSIONS of — the enclosing scopes a subquery met
+    /// here can correlate against. Drives the capture barrier.
+    enclosing_scopes: Vec<Vec<String>>,
+}
 
 impl QueryTransformer for CollapseTransformer {
+    fn enter_expr_scope(&mut self, names: &[String]) {
+        self.enclosing_scopes.push(names.to_vec());
+    }
+
+    fn exit_expr_scope(&mut self) {
+        self.enclosing_scopes.pop();
+    }
+
     fn transform_query(&mut self, query: QueryExpression) -> Result<Option<QueryExpression>> {
         let QueryExpression::Select(ref select_stmt) = query else {
             return Ok(None);
@@ -51,7 +66,15 @@ impl QueryTransformer for CollapseTransformer {
                     alias,
                 } => {
                     let inner_query = (**inner_q).clone().into_inner();
-                    if let Some(collapsed) = try_collapse(select_stmt, &inner_query, alias)? {
+                    let enclosing: Vec<String> = self
+                        .enclosing_scopes
+                        .iter()
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    if let Some(collapsed) =
+                        try_collapse(select_stmt, &inner_query, alias, &enclosing)?
+                    {
                         return Ok(Some(collapsed));
                     }
                 }
@@ -81,10 +104,11 @@ impl QueryTransformer for CollapseTransformer {
         let mut extra_wheres: Vec<DomainExpression> = Vec::new();
         let mut new_from = Vec::new();
         let mut any_inlined = false;
+        let mut claimed: Vec<String> = Vec::new();
 
         for table in from {
             let (new_table, did_inline) =
-                scan_and_inline(table, &stmt, &mut rewrites, &mut extra_wheres)?;
+                scan_and_inline(table, &stmt, &mut rewrites, &mut extra_wheres, &mut claimed)?;
             new_from.push(new_table);
             if did_inline {
                 any_inlined = true;
@@ -250,8 +274,9 @@ fn scan_and_inline(
     outer: &SelectStatement,
     rewrites: &mut Vec<(String, std::collections::HashMap<String, ColDef>)>,
     extra_wheres: &mut Vec<DomainExpression>,
+    claimed: &mut Vec<String>,
 ) -> Result<(TableExpression, bool)> {
-    scan_and_inline_inner(table, outer, rewrites, extra_wheres, false)
+    scan_and_inline_inner(table, outer, rewrites, extra_wheres, claimed, false)
 }
 
 fn scan_and_inline_inner(
@@ -259,6 +284,7 @@ fn scan_and_inline_inner(
     outer: &SelectStatement,
     rewrites: &mut Vec<(String, std::collections::HashMap<String, ColDef>)>,
     extra_wheres: &mut Vec<DomainExpression>,
+    claimed: &mut Vec<String>,
     inside_join: bool,
 ) -> Result<(TableExpression, bool)> {
     match table {
@@ -375,10 +401,38 @@ fn scan_and_inline_inner(
             }
             let effective_map = col_map;
 
+            // ── Collision barrier ──
+            // Inlining exposes the inner table's name into the owning
+            // statement's scope. If a SIBLING FROM item (or an earlier
+            // inline in this same pass) already exposes that name — the
+            // classic shape is a view of `employees` joined next to
+            // `employees` itself — the collapse would put two operands
+            // under one SQL qualifier (`FROM employees INNER JOIN
+            // employees`) and every reference goes ambiguous. Keep the
+            // aliased subquery; the boundary is load-bearing.
+            let mut sibling_names: Vec<String> = Vec::new();
+            if let Some(from) = outer.from() {
+                for t in from {
+                    for n in super::visitor::exposed_table_names(t) {
+                        if n != *alias {
+                            sibling_names.push(n);
+                        }
+                    }
+                }
+            }
+            if sibling_names
+                .iter()
+                .chain(claimed.iter())
+                .any(|n| n == &inner_table_name)
+            {
+                return Ok((table.clone(), false));
+            }
+
             // Inline: record rewrite, capture inner WHERE, return bare table
             if let Some(w) = inner.where_clause() {
                 extra_wheres.push(w.clone());
             }
+            claimed.push(inner_table_name.clone());
             rewrites.push((alias.clone(), effective_map));
             Ok((inner_from[0].clone(), true))
         }
@@ -398,8 +452,8 @@ fn scan_and_inline_inner(
                 return Ok((table.clone(), false));
             }
 
-            let (new_left, l) = scan_and_inline_inner(left, outer, rewrites, extra_wheres, true)?;
-            let (new_right, r) = scan_and_inline_inner(right, outer, rewrites, extra_wheres, true)?;
+            let (new_left, l) = scan_and_inline_inner(left, outer, rewrites, extra_wheres, claimed, true)?;
+            let (new_right, r) = scan_and_inline_inner(right, outer, rewrites, extra_wheres, claimed, true)?;
 
             if l || r {
                 Ok((
@@ -626,6 +680,7 @@ fn try_collapse(
     outer: &SelectStatement,
     inner_query: &QueryExpression,
     subquery_alias: &str,
+    enclosing_scopes: &[String],
 ) -> Result<Option<QueryExpression>> {
     // Inner must be a plain SELECT (not set-op, not CTE, not VALUES)
     let QueryExpression::Select(ref inner_box) = inner_query else {
@@ -674,6 +729,47 @@ fn try_collapse(
     // those scopes, so bail.
     if outer_has_correlated_refs_to(outer, subquery_alias) {
         return Ok(None);
+    }
+
+    // ── Capture barrier ──
+    // Collapsing exposes the inner FROM's table names into the outer's
+    // scope. If one of those names ALSO names an ENCLOSING statement's
+    // scope and the outer references it, that reference is correlated
+    // OUT today and would be captured by the exposure — the classic
+    // shape is a rule inlined over `employees` inside a scalar subquery
+    // whose enclosing query also reads `employees`. Only enclosing-
+    // scope names can be captured: an outer reference to a name no
+    // enclosing scope carries is an anticipatory reference to the very
+    // exposure this collapse performs (the delegate lowering does
+    // this), and collapsing is what makes it valid. Bail only on the
+    // former.
+    if let Some(inner_from) = inner.from() {
+        let mut exposed: Vec<String> = Vec::new();
+        for t in inner_from {
+            collect_exposed_table_names(t, &mut exposed);
+        }
+        for name in &exposed {
+            if name == subquery_alias {
+                continue;
+            }
+            if !enclosing_scopes.iter().any(|s| s == name) {
+                continue;
+            }
+            let referenced = outer
+                .select_list()
+                .iter()
+                .any(|item| match item {
+                    SelectItem::Expression { expr, .. } => expr_references_alias(expr, name),
+                    _ => false,
+                })
+                || outer
+                    .where_clause()
+                    .is_some_and(|w| expr_references_alias(w, name))
+                || outer.having().is_some_and(|h| expr_references_alias(h, name));
+            if referenced {
+                return Ok(None);
+            }
+        }
     }
 
     // ── Bail if the outer SELECT list has unqualified columns not in the map ──
@@ -968,6 +1064,23 @@ fn expr_contains_window(expr: &DomainExpression) -> bool {
 /// Check if the outer SELECT's WHERE, HAVING, or SELECT list contains
 /// subqueries (EXISTS, IN subquery, scalar subquery) that reference
 /// the subquery alias we're about to remove.
+/// The table names a FROM item would expose into the enclosing scope if
+/// its subquery boundary were removed: bare tables by alias-or-name,
+/// aliased subqueries by alias, join trees recursively.
+fn collect_exposed_table_names(table: &TableExpression, out: &mut Vec<String>) {
+    match table {
+        TableExpression::Table { name, alias, .. } => {
+            out.push(alias.as_deref().unwrap_or(name).to_string());
+        }
+        TableExpression::Subquery { alias, .. } => out.push(alias.clone()),
+        TableExpression::Join { left, right, .. } => {
+            collect_exposed_table_names(left, out);
+            collect_exposed_table_names(right, out);
+        }
+        _ => {}
+    }
+}
+
 fn outer_has_correlated_refs_to(outer: &SelectStatement, alias: &str) -> bool {
     // Check SELECT list
     for item in outer.select_list() {

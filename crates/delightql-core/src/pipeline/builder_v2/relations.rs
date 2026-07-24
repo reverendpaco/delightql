@@ -511,7 +511,7 @@ pub(super) fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<D
             // Mention grounds a call-site position by its canonical
             // encoding — same builders as every other mention site.
             "symbol" => {
-                return Ok(super::expressions::literals::build_symbol(child.text()));
+                return super::expressions::literals::build_symbol(child.text());
             }
             "delimited_mention" => {
                 return super::expressions::literals::build_mention(child.text());

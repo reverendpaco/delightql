@@ -365,14 +365,22 @@ pub struct ColumnMetadata {
     /// is by full-name identity: bare headers unify only with
     /// declared-bare partners; glob columns are reachable only by
     /// qualification.
+    ///
+    /// PRIVATE with `access_name`: the pair is the column's ADDRESSING
+    /// MODE and moves only through the law methods below
+    /// (`export_answering_to`, `declare_bare`, `declare_bare_answering`,
+    /// `answer_if_silent`, `rename_answering_from`). A road that pokes
+    /// one half without the other creates a column that is addressable
+    /// by no tier or by two — the silent-misbind disease.
     #[serde(skip_serializing_if = "is_false", default)]
-    pub declared_bare: bool,
+    declared_bare: bool,
     /// The name this column ANSWERS TO for full-name unification when
     /// it crossed an entity boundary: the user's alias, or the bare
     /// entity name of an unaliased access. The SQL qualifier stays
     /// synthetic for hygiene; the law matches against this instead.
+    /// Private — see `declared_bare`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub access_name: Option<SqlIdentifier>,
+    access_name: Option<SqlIdentifier>,
     /// Whether this column needs hygienic aliasing (for literal/expression constraints)
     /// When true, the transformer should use __dql_literal_N alias and hide from output
     #[serde(skip_serializing_if = "is_false", default)]
@@ -445,6 +453,71 @@ impl ColumnMetadata {
     pub fn with_nullable(mut self, nullable: Option<bool>) -> Self {
         self.nullable = nullable;
         self
+    }
+
+    // ------------------------------------------------------------------
+    // Addressing mode: (declared_bare, access_name) as one law object.
+    // Every scope-boundary crossing must state how the column is
+    // addressed afterwards; these are the only spellings.
+    // ------------------------------------------------------------------
+
+    /// Whether the column's full name is a user-declared bare lvar.
+    pub fn declared_bare(&self) -> bool {
+        self.declared_bare
+    }
+
+    /// The name the column answers to across an entity boundary.
+    pub fn access_name(&self) -> Option<&SqlIdentifier> {
+        self.access_name.as_ref()
+    }
+
+    /// Entity-boundary export: the column crosses out of a consulted
+    /// view/fact and henceforth answers to the caller-facing name (the
+    /// user's alias, or the bare entity name). Nothing bare leaks
+    /// through the boundary — declared_bare belongs to the caller's own
+    /// argumentative bindings.
+    pub fn export_answering_to(&mut self, access: SqlIdentifier) {
+        self.declared_bare = false;
+        self.access_name = Some(access);
+    }
+
+    /// Argumentative declaration: the caller binds this column as a
+    /// bare lvar (positional pattern, anonymous header, drill binding).
+    /// A bare declaration answers to no access name — the source
+    /// boundary's stamp does not ride through the caller's own binding.
+    pub fn declare_bare(&mut self) {
+        self.declared_bare = true;
+        self.access_name = None;
+    }
+
+    /// Argumentative declaration under a relation alias: bare for
+    /// full-name unification, but also answering to the alias so
+    /// alias-qualified references reach it.
+    pub fn declare_bare_answering(&mut self, alias: SqlIdentifier) {
+        self.declared_bare = true;
+        self.access_name = Some(alias);
+    }
+
+    /// Endpoint stamping: claim the answering channel only if no
+    /// boundary has claimed it yet (ER endpoints stamp outermost-wins).
+    pub fn answer_if_silent(&mut self, access: SqlIdentifier) {
+        if self.access_name.is_none() {
+            self.access_name = Some(access);
+        }
+    }
+
+    /// Endpoint rename: re-point an existing answering channel when the
+    /// boundary itself is renamed (`as u`); a channel answering to a
+    /// different name is left alone. Returns whether it re-pointed.
+    pub fn rename_answering_from(&mut self, old: &str, new: &SqlIdentifier) -> bool {
+        let hit = self
+            .access_name
+            .as_ref()
+            .is_some_and(|a| SqlIdentifier::str_eq(a.as_str(), old));
+        if hit {
+            self.access_name = Some(new.clone());
+        }
+        hit
     }
 
     /// Fresh identity, conserved value facts. Identity (provenance, scope,

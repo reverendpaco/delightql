@@ -330,7 +330,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 Err(e) => ServerTerm::Error {
                     kind: ErrorKind::Connection,
                     identity: b"delightql-error://runtime/execution".to_vec(),
-                    message: e.message.into_bytes(),
+                    message: teach_runtime_message(e.message).into_bytes(),
                 },
             }
         } else {
@@ -352,7 +352,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 Err(msg) => ServerTerm::Error {
                     kind: ErrorKind::Connection,
                     identity: b"delightql-error://runtime/execution".to_vec(),
-                    message: msg.into_bytes(),
+                    message: teach_runtime_message(msg).into_bytes(),
                 },
             }
         }
@@ -639,7 +639,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     return ServerTerm::Error {
                                         kind: ErrorKind::Connection,
                                         identity: b"delightql-error://runtime/execution".to_vec(),
-                                        message: e.message.into_bytes(),
+                                        message: teach_runtime_message(e.message).into_bytes(),
                                     };
                                 }
                             }
@@ -663,7 +663,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     return ServerTerm::Error {
                                         kind: ErrorKind::Connection,
                                         identity: b"delightql-error://runtime/execution".to_vec(),
-                                        message: msg.into_bytes(),
+                                        message: teach_runtime_message(msg).into_bytes(),
                                     };
                                 }
                             }
@@ -676,7 +676,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                             return ServerTerm::Error {
                                 kind: ErrorKind::Connection,
                                 identity: b"delightql-error://runtime/execution".to_vec(),
-                                message: msg.into_bytes(),
+                                message: teach_runtime_message(msg).into_bytes(),
                             };
                         }
                     }
@@ -980,7 +980,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             Err(e) => ServerTerm::Error {
                 kind: ErrorKind::Connection,
                 identity: b"delightql-error://runtime/execution".to_vec(),
-                message: e.message.into_bytes(),
+                message: teach_runtime_message(e.message).into_bytes(),
             },
         }
     }
@@ -1030,7 +1030,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 Err(e) => ServerTerm::Error {
                     kind: ErrorKind::Connection,
                     identity: b"delightql-error://runtime/execution".to_vec(),
-                    message: e.message.into_bytes(),
+                    message: teach_runtime_message(e.message).into_bytes(),
                 },
             },
             None => ServerTerm::Error {
@@ -1329,3 +1329,6 @@ impl<'a, T: Transport> Handler for RelayParty<'a, T> {
         }
     }
 }
+
+pub(crate) use delightql_types::teach_runtime_message;
+
