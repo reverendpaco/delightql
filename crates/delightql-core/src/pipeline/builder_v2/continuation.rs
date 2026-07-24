@@ -858,6 +858,9 @@ fn extract_danger_from_annotation(
     // Canonicalize (annotation carries the bare hierarchy) and validate
     // against the known-gate registry — unknown gates fail LOUD.
     let uri = crate::pipeline::danger_gates::canonical_danger_uri(&uri);
+    if let Some(teaching) = crate::pipeline::danger_gates::removed_danger_teaching(&uri) {
+        return Err(DelightQLError::parse_error(teaching.to_string()));
+    }
     if crate::pipeline::danger_gates::known_danger_hierarchies()
         .iter()
         .all(|known| uri != crate::pipeline::danger_gates::canonical_danger_uri(known))

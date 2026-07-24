@@ -1141,6 +1141,7 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
             alias,
             outer,
             exists_mode,
+            negated,
             qua_target,
             cpr_schema,
         } => Ok(Relation::Anonymous {
@@ -1159,6 +1160,7 @@ pub fn walk_transform_relation<P, Q, F: AstTransform<P, Q> + ?Sized>(
             alias,
             outer,
             exists_mode,
+            negated,
             qua_target,
             cpr_schema: cpr_schema.rephase(),
         }),

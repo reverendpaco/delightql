@@ -359,6 +359,20 @@ pub struct ColumnMetadata {
     pub table_position: Option<usize>,
     /// Whether this column has a user-provided name (vs generated)
     pub has_user_name: bool,
+    /// Whether this column's FULL NAME is a bare lvar the user DECLARED
+    /// (positional binding, an anonymous-table header) as opposed to a
+    /// glob-exported column, whose full name is qualified. Unification
+    /// is by full-name identity: bare headers unify only with
+    /// declared-bare partners; glob columns are reachable only by
+    /// qualification.
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub declared_bare: bool,
+    /// The name this column ANSWERS TO for full-name unification when
+    /// it crossed an entity boundary: the user's alias, or the bare
+    /// entity name of an unaliased access. The SQL qualifier stays
+    /// synthetic for hygiene; the law matches against this instead.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub access_name: Option<SqlIdentifier>,
     /// Whether this column needs hygienic aliasing (for literal/expression constraints)
     /// When true, the transformer should use __dql_literal_N alias and hide from output
     #[serde(skip_serializing_if = "is_false", default)]
@@ -400,7 +414,7 @@ pub struct ColumnMetadata {
 }
 
 // Helper for serde skip_serializing_if
-fn is_false(b: &bool) -> bool {
+pub(crate) fn is_false(b: &bool) -> bool {
     !b
 }
 
@@ -416,6 +430,8 @@ impl ColumnMetadata {
             table_name,
             table_position,
             has_user_name: true, // Default to true for backward compatibility
+            declared_bare: false,
+            access_name: None,
             needs_hygienic_alias: false,
             needs_sql_rename: false,
             interior_schema: None,
@@ -510,6 +526,8 @@ impl ColumnMetadata {
             table_name,
             table_position,
             has_user_name,
+            declared_bare: false,
+            access_name: None,
             needs_hygienic_alias: false,
             needs_sql_rename: false,
             interior_schema: None,

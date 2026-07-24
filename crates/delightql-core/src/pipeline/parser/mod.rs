@@ -23,6 +23,13 @@ extern "C" {
     fn tree_sitter_delightql_ddl() -> Language;
 }
 
+/// The DQL tree-sitter Language handle, for in-crate consumers that
+/// drive an external engine over the same grammar (the term
+/// canonicalizer hands it to the format engine).
+pub(crate) fn dql_language() -> Language {
+    unsafe { tree_sitter_delightql_v2() }
+}
+
 /// Create a fresh parser and parse the source
 ///
 /// In WASM, we create a completely new parser for each parse to avoid memory corruption.
@@ -217,6 +224,30 @@ fn create_ddl_error(tree: &Tree, source: &str) -> DelightQLError {
             let display = truncate_for_display(child.text(), 80);
 
             let pos = child.raw_node().start_position();
+
+            // Structural head grounding is a RESERVED rung of the
+            // grounding ladder: a `{...}` pattern in a definition head
+            // (before the neck) must teach, never emit a bare garbled
+            // error. Heads ground on what has a literal spelling —
+            // bare names bind; literals and mentions ground.
+            let text = child.text();
+            let head_extent = text.find(':').unwrap_or(text.len());
+            if text[..head_extent].contains("{.") {
+                return DelightQLError::ParseError {
+                    message: format!(
+                        "DDL parse error at line {}:{}: structural head grounding is reserved — \
+                         a head parameter grounds on what has a literal spelling (a scalar \
+                         literal, or a mention: ::name, :`term`), and bare names bind; the \
+                         structural pattern rung ({{.name}}) is reserved for a future ruling. \
+                         In '{}'",
+                        pos.row + 1,
+                        pos.column + 1,
+                        display,
+                    ),
+                    source: None,
+                    subcategory: Some(crate::uri_registry::subcat::PARSE_DDL),
+                };
+            }
             return DelightQLError::ParseError {
                 message: format!(
                     "DDL parse error at line {}:{}: syntax error in '{}'. \

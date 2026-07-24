@@ -136,6 +136,7 @@ fn core_receipt_result(
         alias: alias.map(|s| s.into()),
         outer: false,
         exists_mode: false,
+            negated: false,
         qua_target: None,
         cpr_schema: PhaseBox::phantom(),
     }
@@ -271,6 +272,7 @@ fn receipt_with_interiors(
             alias: None,
             outer: false,
             exists_mode: false,
+            negated: false,
             qua_target: None,
             cpr_schema: PhaseBox::phantom(),
         }

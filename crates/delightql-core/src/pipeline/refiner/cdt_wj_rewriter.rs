@@ -41,6 +41,64 @@ type OrderingSpec = crate::pipeline::asts::core::OrderingSpec<resolved::Resolved
 /// Synthetic column name for the row_number() window output.
 const RN_COLUMN: &str = "__dql_rn";
 
+/// Flatten one correlation filter through `and` into its conjunct
+/// comparisons, PROVING each conjunct is an equality. Anything not
+/// provable refuses: non-equality comparisons (each outer row would see
+/// a different candidate set), `or`/`not` (no single child group per
+/// outer row), and every unrecognized predicate form. The flattened
+/// list is what partition-key extraction consumes, so compound
+/// equalities partition identically to comma-separated ones.
+fn prove_equality_conjunction(
+    f: &BooleanExpression,
+    out: &mut Vec<BooleanExpression>,
+) -> Result<()> {
+    match f {
+        BooleanExpression::And { left, right } => {
+            prove_equality_conjunction(left, out)?;
+            prove_equality_conjunction(right, out)
+        }
+        BooleanExpression::Comparison { operator, .. }
+            if matches!(
+                operator.as_str(),
+                "null_safe_eq" | "traditional_eq" | "eq" | "="
+            ) =>
+        {
+            out.push(f.clone());
+            Ok(())
+        }
+        BooleanExpression::Comparison { operator, .. } => {
+            let spelled = match operator.as_str() {
+                "less_than" => "<",
+                "less_than_eq" => "<=",
+                "greater_than" => ">",
+                "greater_than_eq" => ">=",
+                "traditional_ne" | "null_safe_ne" => "!=",
+                other => other,
+            };
+            Err(crate::error::DelightQLError::validation_error_categorized(
+                "interior/topn/noneq_correlation",
+                format!(
+                    "interior top-N requires equality correlation: '{}' makes each outer row see a different candidate set, and the pre-ranked lowering would rank the wrong population",
+                    spelled
+                ),
+                "join normally and rank explicitly: ... |> (..., row_number:(<~ %(outer identity), #(ordering)) as rnk), rnk <= N",
+            ))
+        }
+        other => Err(crate::error::DelightQLError::validation_error_categorized(
+            "interior/topn/noneq_correlation",
+            format!(
+                "interior top-N requires equality correlation, provable as a conjunction of equalities — this correlation contains {}",
+                match other {
+                    BooleanExpression::Or { .. } => "an `or`",
+                    BooleanExpression::Not { .. } => "a `not`",
+                    _ => "a predicate form the pre-ranked lowering cannot prove sound",
+                }
+            ),
+            "join normally and rank explicitly: ... |> (..., row_number:(<~ %(outer identity), #(ordering)) as rnk), rnk <= N",
+        )),
+    }
+}
+
 /// Rewrite a (correlated, has-limit) subquery into a CDT-SJ-shaped subquery.
 ///
 /// Walks the subquery, captures the limit value and order_by specs, removes
@@ -58,37 +116,31 @@ pub fn rewrite_window_join_subquery(
     table_identifier: &resolved::QualifiedName,
 ) -> Result<(RelationalExpression, Vec<(String, String)>)> {
     // This lowering pre-ranks per correlation-key group and joins AFTER —
-    // sound only when every correlation is an equality, because then each
-    // outer row sees exactly one child group and per-group top-N equals
-    // per-outer-row top-N. Under a non-equality correlation the visible
-    // candidate set differs per outer row, and pre-ranking filters the
-    // WRONG population (top-N per child identity — a phantom-row bug).
-    // Refuse until a lateral lowering ranks post-join.
+    // sound only when the correlation is a CONJUNCTION OF EQUALITIES,
+    // because then each outer row sees exactly one child group and
+    // per-group top-N equals per-outer-row top-N. Acceptance is by
+    // PROOF, default-deny: the filters flatten through `and` into
+    // conjunct comparisons, every conjunct must be an equality, and
+    // `or`/`not`/any unrecognized predicate form refuses. Detection of
+    // known-bad shapes is not enough — an `and`-compound once slipped a
+    // top-level-only check and emitted an UNPARTITIONED ranking,
+    // wronger than the phantom-row bug this guards against.
+    let mut flat_conjuncts: Vec<BooleanExpression> = Vec::new();
     for f in correlation_filters {
-        if let BooleanExpression::Comparison { operator, .. } = f {
-            if !matches!(
-                operator.as_str(),
-                "null_safe_eq" | "traditional_eq" | "eq" | "="
-            ) {
-                let spelled = match operator.as_str() {
-                    "less_than" => "<",
-                    "less_than_eq" => "<=",
-                    "greater_than" => ">",
-                    "greater_than_eq" => ">=",
-                    "traditional_ne" | "null_safe_ne" => "!=",
-                    other => other,
-                };
-                return Err(crate::error::DelightQLError::validation_error_categorized(
-                    "interior/topn/noneq_correlation",
-                    format!(
-                        "interior top-N requires equality correlation: '{}' makes each outer row see a different candidate set, and the pre-ranked lowering would rank the wrong population",
-                        spelled
-                    ),
-                    "join normally and rank explicitly: ... |> (..., row_number:(<~ %(outer identity), #(ordering)) as rnk), rnk <= N",
-                ));
-            }
-        }
+        prove_equality_conjunction(f, &mut flat_conjuncts)?;
     }
+    let correlation_filters: &[BooleanExpression] = &flat_conjuncts;
+
+    // The second half of the proof, BEFORE any rewriting: every proved
+    // equality conjunct must contribute exactly one directly
+    // representable partition key, or the whole rewrite refuses —
+    // extraction that silently skips a conjunct emits an unpartitioned
+    // (or under-partitioned) ranking, the same silent-wrong-answer
+    // family the flattening guard above closes.
+    let original_partition_columns = correlation_filters
+        .iter()
+        .map(|f| super::correlation_analyzer::prove_partition_key(f, table_identifier))
+        .collect::<Result<Vec<String>>>()?;
 
     // Capture limit value and the inner expression (without the TupleOrdinal filter).
     let (subquery_no_limit, limit_value) = strip_limit(subquery)?;
@@ -105,13 +157,9 @@ pub fn rewrite_window_join_subquery(
         table_identifier,
     )?;
 
-    // Determine partition_by column names. If a correlation column was
-    // hygienic-injected, use the synthetic alias; otherwise the original
-    // name (because no projection stripped it).
-    let original_partition_columns = super::correlation_analyzer::extract_correlation_column_names(
-        correlation_filters,
-        table_identifier,
-    );
+    // Map partition keys through hygienic injection: if a correlation
+    // column was injected, the synthetic alias is used; otherwise the
+    // original name (because no projection stripped it).
     let injection_lookup: std::collections::HashMap<&str, &str> = injections
         .iter()
         .map(|(orig, hyg)| (orig.as_str(), hyg.as_str()))

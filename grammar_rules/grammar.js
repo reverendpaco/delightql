@@ -24,6 +24,11 @@ module.exports = grammar(dqlGrammar, {
     [$.qualify_operator, $.ho_param],
     [$.column_spec_item, $.ho_param],
 
+    // Ground membership probe in anon headers vs DDL head params: a
+    // number after identifier( could be any of these. GLR forks.
+    [$.ground_header, $.ho_param, $.literal, $.view_head_item],
+    [$.ground_header, $.literal, $.view_head_item],
+
     // DDL definition rules create new ambiguities with inherited DQL rules
 
     // Effect-rule heads (EFFECT-ALGEBRA §1): name!(*) — the * after name!( could
@@ -329,8 +334,9 @@ module.exports = grammar(dqlGrammar, {
           field('columns', sep1($._comma, $.identifier)), ')'),
       // Scalar parameter (or legacy bare table name): n
       field('param_name', $.identifier),
-      // Ground scalar literal: "value" or 42
-      field('ground_value', choice($.string_literal, $.number_literal)),
+      // Ground scalar literal: "value" or 42 — or a mention, which
+      // grounds on its canonical encoding: ::fast, :`people(*)`
+      field('ground_value', choice($.string_literal, $.number_literal, $.symbol, $.delimited_mention)),
     ),
 
     // Argumentative view definition: name(items) neck [docs] query
@@ -354,13 +360,16 @@ module.exports = grammar(dqlGrammar, {
     // See book/design/clause-head-catechism.md §II (remedy 2).
     view_head_item: $ => choice(
       seq(
-        field('supply', choice($.identifier, $.string_literal, $.number_literal)),
+        field('supply', choice($.identifier, $.string_literal, $.number_literal, $.symbol, $.delimited_mention)),
         $._as,
         field('label', $.identifier),
       ),
       $.identifier,
       $.string_literal,
       $.number_literal,
+      // Mention grounds a head item by its canonical encoding.
+      $.symbol,
+      $.delimited_mention,
     ),
 
     // Sigma predicate definition: name(params) neck [docs] domain_expression

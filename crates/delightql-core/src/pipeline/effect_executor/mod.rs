@@ -1309,6 +1309,7 @@ fn apply_receipt_access(
         alias,
         outer,
         exists_mode,
+        negated,
         qua_target,
         ..
     } = relation
@@ -1364,6 +1365,7 @@ fn apply_receipt_access(
         alias,
         outer,
         exists_mode,
+        negated,
         qua_target,
         cpr_schema: PhaseBox::phantom(),
     })

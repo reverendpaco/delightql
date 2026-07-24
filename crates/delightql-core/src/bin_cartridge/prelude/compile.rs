@@ -141,6 +141,7 @@ impl EffectExecutable for CompilePredicate {
                 alias: None,
                 outer: false,
                 exists_mode: false,
+            negated: false,
                 qua_target: None,
                 cpr_schema: PhaseBox::phantom(),
             };
@@ -200,6 +201,7 @@ impl EffectExecutable for CompilePredicate {
             alias: alias.map(|s| s.into()),
             outer: false,
             exists_mode: false,
+            negated: false,
             qua_target: None,
             cpr_schema: PhaseBox::phantom(),
         }))
@@ -313,6 +315,7 @@ fn build_compile_result(
         alias: alias.map(|s| s.into()),
         outer: false,
         exists_mode: false,
+            negated: false,
         qua_target: None,
         cpr_schema: PhaseBox::phantom(),
     }

@@ -237,6 +237,7 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Relat
             alias: None,
             outer: false,
             exists_mode: false,
+            negated: false,
             qua_target: None,
             cpr_schema: PhaseBox::phantom(),
         };
@@ -279,6 +280,7 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Relat
             alias: None,
             outer: false,
             exists_mode: false,
+            negated: false,
             qua_target: None,
             cpr_schema: PhaseBox::phantom(),
         };

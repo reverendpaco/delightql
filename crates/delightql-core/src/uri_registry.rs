@@ -271,8 +271,10 @@ mod tests {
         for (kind, hierarchy, _, _) in burned_rows() {
             match kind {
                 UriKind::Danger => assert!(
-                    danger_gates::known_danger_hierarchies().contains(&hierarchy.as_str()),
-                    "identifier row documents unknown danger {}",
+                    danger_gates::known_danger_hierarchies().contains(&hierarchy.as_str())
+                        || danger_gates::removed_danger_teaching(&hierarchy).is_some(),
+                    "identifier row documents unknown danger {} \
+(a documented danger is either registered or tombstoned)",
                     hierarchy
                 ),
                 UriKind::Config => assert!(

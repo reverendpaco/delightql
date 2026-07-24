@@ -131,7 +131,8 @@ impl<'a> Formatter<'a> {
                     self.output.write(&text);
                 }
                 // Verbatim leaf-ish expressions
-                "string_template" | "citation" | "value_placeholder" | "sparse_fill" => {
+                "string_template" | "citation" | "value_placeholder" | "sparse_fill"
+                | "symbol" | "delimited_mention" => {
                     let text = self.node_text(&child).to_string();
                     self.output.write(&text);
                 }

@@ -1664,13 +1664,20 @@ pub(super) fn inject_scalar_columns(
     wrap_query_with_pipe(query, operator)
 }
 
-/// Parse a literal value string (e.g., `"young"` or `42`) into a LiteralValue.
+/// Parse a literal value string (e.g., `"young"`, `42`, `::fast`, or
+/// `` :`people(*)` ``) into a LiteralValue. Mention ground values
+/// arrive already canonical (the DDL extractor canonicalizes at
+/// consult time), so the wrapper is stripped, never re-parsed.
 fn parse_literal_value(s: &str) -> crate::pipeline::asts::core::LiteralValue {
     use crate::pipeline::asts::core::LiteralValue;
 
     if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
         // Quoted string — strip quotes
         LiteralValue::String(s[1..s.len() - 1].to_string())
+    } else if let Some(name) = s.strip_prefix("::") {
+        LiteralValue::Symbol(name.to_string())
+    } else if s.starts_with(":`") && s.ends_with('`') && s.len() > 3 {
+        LiteralValue::Mention(s[2..s.len() - 1].to_string())
     } else if s.parse::<f64>().is_ok() {
         LiteralValue::Number(s.to_string())
     } else if s == "true" || s == "false" {

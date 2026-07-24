@@ -19,7 +19,7 @@ use delightql_protocol::{
 use rusqlite;
 
 use crate::{
-    pipeline::{self, builder_v2, compiled_query, resolver::ResolutionConfig, verdict, Pipeline},
+    pipeline::{self, builder_v2, resolver::ResolutionConfig, verdict, Pipeline},
     system::DelightQLSystem,
 };
 
@@ -47,8 +47,6 @@ mod pump_tests;
 /// If no hook is set, the relay handles the effect internally (assertions
 /// become protocol errors).
 pub struct RelayHooks {
-    /// Args: (stream_name, columns, rows).
-
     /// Called for each assertion verdict (pass or fail).
     pub on_verdict: Option<Box<dyn FnMut(&verdict::Verdict)>>,
 
@@ -60,7 +58,7 @@ pub struct RelayHooks {
     /// mid-run result sets ride the hook side channel; the FINAL shipped
     /// statement is the run's one wire response and never passes through
     /// here). Args: (columns, rows). If unset, non-final shipped sets are
-    /// executed and discarded — the same contract as an unset `on_emit`.
+    /// executed and discarded.
     /// Delivery order pinned by
     /// `pump_tests::non_final_shipped_deliver_via_on_ship_in_order`.
     pub on_ship: Option<Box<dyn FnMut(&[String], &[Vec<String>])>>,

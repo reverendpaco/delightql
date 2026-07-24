@@ -84,83 +84,16 @@ pub(super) fn process_single_join(
         return Err(DelightQLError::parse_error("Not enough tables for join"));
     }
 
-    // EPOCH 3: Check if right table is an anonymous table with exists_mode=true
-    // If so, convert JOIN to Filter with InnerExists instead
+    // Witness anonymous tables (+_/\+_) never reach the refiner: the
+    // resolver routes membership shapes to a Filter and refuses the
+    // rest. An exists_mode anon table here is a pipeline invariant
+    // violation, not a case to lower.
     let right_table_flat = &analyzed.tables[table_idx];
     if let Some(ref anon_data) = right_table_flat.anonymous_data {
-        if anon_data.exists_mode {
-            // EPOCH 3: EXISTS-mode anonymous table in JOIN position
-            // Transform: users(*), +_(status @ "active"; "pending")
-            // From:      JOIN (anonymous table)
-            // To:        Filter with InnerExists predicate
-
-            log::debug!("EPOCH 3: Converting exists_mode=true anonymous table from JOIN to Filter");
-
-            let new_table_idx = table_idx + 1;
-
-            // EPOCH 7: Check if this is the inverted IN pattern (simple case)
-            // Pattern: +_(literal @ col1; col2; col3)
-            // Can be transformed directly to: literal IN (col1, col2, col3)
-            if is_inverted_in_pattern(anon_data, &right_table_flat.correlation_refs) {
-                log::debug!(
-                    "EPOCH 7: Detected inverted IN pattern - using simplified IN predicate"
-                );
-
-                // Build IN predicate directly
-                let in_predicate = build_in_predicate_from_inverted_pattern(
-                    anon_data,
-                    &right_table_flat.correlation_refs,
-                )?;
-
-                let filter_expr = refined::RelationalExpression::Filter {
-                    source: Box::new(result),
-                    condition: refined::SigmaCondition::Predicate(in_predicate),
-                    origin: resolved::FilterOrigin::UserWritten,
-                    cpr_schema: refined::PhaseBox::new(right_table_flat.schema.clone())
-                        .into_refined(),
-                };
-
-                return Ok((filter_expr, new_table_idx));
-            }
-
-            // Fallback: Build the anonymous table as a relation (general EXISTS)
-            let anon_relation =
-                refined::RelationalExpression::Relation(refined::Relation::Anonymous {
-                    column_headers: anon_data
-                        .column_headers
-                        .as_ref()
-                        .map(|headers| headers.iter().map(|e| e.clone().into()).collect()),
-                    rows: anon_data.rows.iter().map(|r| r.clone().into()).collect(),
-                    alias: right_table_flat.alias.clone().map(|s| s.into()),
-                    outer: right_table_flat.outer,
-                    exists_mode: true,
-                    qua_target: None,
-                    cpr_schema: refined::PhaseBox::new(right_table_flat.schema.clone())
-                        .into_refined(),
-                });
-
-            // Wrap result in a Filter with InnerExists
-            let filter_expr = refined::RelationalExpression::Filter {
-                source: Box::new(result),
-                condition: refined::SigmaCondition::Predicate(
-                    refined::BooleanExpression::InnerExists {
-                        exists: true,
-                        identifier: QualifiedName {
-                            namespace_path: NamespacePath::empty(),
-                            name: "_".into(),
-                            grounding: None,
-                        },
-                        subquery: Box::new(anon_relation),
-                        alias: None,
-                        using_columns: vec![],
-                    },
-                ),
-                origin: resolved::FilterOrigin::UserWritten,
-                cpr_schema: refined::PhaseBox::new(right_table_flat.schema.clone()).into_refined(),
-            };
-
-            return Ok((filter_expr, new_table_idx));
-        }
+        assert!(
+            !anon_data.exists_mode,
+            "witness anonymous table survived to the refiner: membership routing must consume it"
+        );
     }
 
     let right_table = table_to_refined(&analyzed.tables[table_idx], op_predicates)?;
@@ -339,76 +272,6 @@ pub(super) fn create_using_condition(using_cols: &[String]) -> refined::BooleanE
     }
 }
 
-/// EPOCH 7: Detect if anonymous table matches the inverted IN pattern
-/// Pattern: +_(literal @ col1; col2; col3)
-/// - Header must be a single literal (the value to search for)
-/// - Data rows must be simple column references (one per row)
-/// - correlation_refs indicates column references were detected
-fn is_inverted_in_pattern(
-    anon_data: &super::super::flattener::AnonymousTableData,
-    correlation_refs: &[super::super::flattener::CorrelationRef],
-) -> bool {
-    use crate::pipeline::asts::resolved;
-
-    // Must have correlation refs (detected in Analyze phase)
-    if correlation_refs.is_empty() {
-        return false;
-    }
-
-    // Header must be exactly one literal
-    let has_single_literal_header = anon_data.column_headers.as_ref().is_some_and(|headers| {
-        headers.len() == 1 && matches!(headers[0], resolved::DomainExpression::Literal { .. })
-    });
-
-    if !has_single_literal_header {
-        return false;
-    }
-
-    // All data rows must be simple single-column refs (one value per row)
-    let all_rows_simple = anon_data.rows.iter().all(|row| {
-        row.values.len() == 1 && matches!(row.values[0], resolved::DomainExpression::Lvar { .. })
-    });
-
-    has_single_literal_header && all_rows_simple
-}
-
-/// EPOCH 7: Build an IN predicate from inverted pattern
-/// Transforms: +_("electronics" @ description; name)
-/// Into: BooleanExpression::In { value: "electronics", set: [description, name], negated: false }
-fn build_in_predicate_from_inverted_pattern(
-    anon_data: &super::super::flattener::AnonymousTableData,
-    _correlation_refs: &[super::super::flattener::CorrelationRef],
-) -> crate::error::Result<refined::BooleanExpression> {
-    use crate::error::DelightQLError;
-    use crate::pipeline::asts::refined;
-
-    // Extract the literal value from header (already validated)
-    let header_literal = anon_data
-        .column_headers
-        .as_ref()
-        .and_then(|h| h.first())
-        .ok_or_else(|| DelightQLError::parse_error("Expected header in inverted IN pattern"))?;
-
-    // Convert header to refined phase
-    let search_value = header_literal.clone().into();
-
-    // Extract column names from data rows
-    let column_set: Vec<refined::DomainExpression> = anon_data
-        .rows
-        .iter()
-        .map(|row| row.values[0].clone().into())
-        .collect();
-
-    // Create IN predicate
-    // Note: This creates the structure that will later be desugared back to anonymous table,
-    // but the transformer can recognize this pattern and generate proper SQL
-    Ok(refined::BooleanExpression::In {
-        value: Box::new(search_value),
-        set: column_set,
-        negated: false,
-    })
-}
-
 /// Validate that outer join markers have explicit join conditions
 ///
 /// Rule: Standalone table cannot have outer join marker (nothing to join to)
@@ -508,10 +371,12 @@ fn validate_outer_join_markers(
 
 /// Rewrite `null_safe_eq` → `traditional_eq` in join conditions.
 ///
-/// In join position, null-safe equality (`IS NOT DISTINCT FROM`) risks cartesian
-/// explosion when NULL values match. DQL's `=` compiles to traditional SQL `=`
-/// in ON clauses by default. The danger gate `delightql-danger://cardinality/nulljoin` can
-/// opt back into INDF (this function does not yet consult the gate).
+/// In join position, equality is CORRESPONDENCE: null never matches, because
+/// null-matching ON clauses multiply the null groups AND assert a
+/// correspondence between absences. There is deliberately no gate back into
+/// INDF here — a null that is meant to match is a value wearing null's
+/// clothes; the spelling is a named key (coalesce into a marker), never a
+/// mode switch.
 fn downgrade_null_safe_eq(expr: refined::BooleanExpression) -> refined::BooleanExpression {
     match expr {
         refined::BooleanExpression::Comparison {

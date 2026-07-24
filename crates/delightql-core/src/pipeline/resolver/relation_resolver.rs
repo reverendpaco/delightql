@@ -42,6 +42,42 @@ fn compute_effective_alias(
     }
 }
 
+/// The access-boundary export for a consulted view/fact. A view's
+/// lvars are a function of how it is CALLED, not how its body spelled
+/// them: the columns ANSWER TO the access name (the user's alias, or
+/// the bare view name) for full-name unification, and export nothing
+/// bare — declared_bare belongs to the caller's own argumentative
+/// bindings; it never leaks through the entity boundary. The SQL
+/// alias stays synthetic (hygiene: self-joins need distinct aliases),
+/// so the access name rides the metadata, not the alias.
+fn access_boundary_export(
+    alias: &Option<SqlIdentifier>,
+    entity_name: &str,
+    body_schema: &ast_resolved::CprSchema,
+    alias_counter: &super::ResolverAliasCounter,
+) -> (
+    SqlIdentifier,
+    Option<crate::pipeline::asts::core::provenance::ResolverId>,
+    ast_resolved::CprSchema,
+) {
+    let (effective, resolver_id) = compute_effective_alias(alias, alias_counter);
+    let access_name: SqlIdentifier = match alias.clone() {
+        Some(a) => a,
+        None => entity_name.into(),
+    };
+    let export = match body_schema.clone() {
+        ast_resolved::CprSchema::Resolved(mut cols) => {
+            for col in &mut cols {
+                col.declared_bare = false;
+                col.access_name = Some(access_name.clone());
+            }
+            ast_resolved::CprSchema::Resolved(cols)
+        }
+        other => other,
+    };
+    (effective, resolver_id, export)
+}
+
 /// Derive a DomainSpec from ho_arguments (replaces the former `first_parens_spec` field).
 /// Table arguments → Lvar with the table name.
 /// Scalar arguments → the domain expression directly.
@@ -449,13 +485,13 @@ pub(super) fn resolve_ground(
 
                 let body_schema =
                     super::helpers::extraction::extract_cpr_schema_from_query(&resolved_query)?;
-                let (effective_alias, resolver_id) =
-                    compute_effective_alias(&alias, &config.alias_counter);
+                let (effective_alias, resolver_id, export_schema) =
+                    access_boundary_export(&alias, &view_name, &body_schema, &config.alias_counter);
 
                 let effective_name = effective_alias.to_string();
 
                 let scoped = ast_resolved::ScopedSchema::bind(
-                    body_schema.clone(),
+                    export_schema,
                     effective_alias.clone(),
                     resolver_id,
                 );
@@ -922,31 +958,68 @@ pub(super) fn r_resolve_cte(
     let EntityDefinition::RelationSchema(cte_schema) = entity_info.definition;
     match &cte_schema {
         ast_resolved::CprSchema::Resolved(cols) => {
-            // Apply alias if present
-            let base_cols = if let Some(alias_name) = &alias {
-                cols.iter()
-                    .map(|col| {
-                        let mut new_col = col.clone();
-                        // Push SubqueryAlias so the provenance stack
-                        // carries the alias for qualifier resolution
-                        let prev = match col.qualifier() {
-                            ast_resolved::TableName::Named(t) => t.to_string(),
-                            ast_resolved::TableName::Fresh => "_".to_string(),
-                        };
-                        new_col.push_scope(
-                            ast_resolved::TableName::Named(alias_name.clone().into()),
-                            ast_resolved::IdentityContext::SubqueryAlias {
-                                alias: alias_name.to_string(),
-                                previous_context: prev,
-                                resolver_id: None,
-                            },
+            // The consult of a USER-DEFINED CTE is an access boundary,
+            // same regime as a consulted view: the caller reaches the
+            // EXPORTED heading, which answers to the access name (the
+            // user's alias, or the CTE name) — bare declarations never
+            // leak through, and the export re-roots so a body-internal
+            // column spelling cannot reach the SQL (it breaks when the
+            // CTE head renames). Compiler-generated CTEs (HO expansion,
+            // pipe materialization) are the caller-pattern seam's
+            // channel: the seam names their positional columns through
+            // the identity stack, so they keep their identity untouched
+            // — the boundary law for seam shapes lands with the seam
+            // rework, not by breaking it. Argumentative access still
+            // declares its own bare lvars either way: the pattern
+            // resolver re-declares on selection.
+            let access: SqlIdentifier = alias.clone().unwrap_or_else(|| identifier.name.clone());
+            let base_cols: Vec<ast_resolved::ColumnMetadata> = cols
+                .iter()
+                .map(|col| {
+                    let user_defined = matches!(
+                        col.info.identity_stack().first().map(|i| &i.context),
+                        Some(ast_resolved::IdentityContext::CteRegistration {
+                            origin: ast_resolved::CteOrigin::UserDefined,
+                            ..
+                        })
+                    );
+                    if user_defined {
+                        let prov = ast_resolved::ColumnProvenance::from_table_column(
+                            col.name().to_string(),
+                            ast_resolved::TableName::Named(access.clone().into()),
+                            ast_resolved::QualificationSource::None,
                         );
-                        new_col
-                    })
-                    .collect()
-            } else {
-                cols.clone()
-            };
+                        let mut out = ast_resolved::ColumnMetadata::carrying(
+                            col,
+                            prov,
+                            ast_resolved::TableName::Named(access.clone().into()),
+                            col.table_position,
+                        );
+                        out.declared_bare = false;
+                        out.access_name = Some(access.clone());
+                        out
+                    } else {
+                        let mut c = col.clone();
+                        if let Some(alias_name) = &alias {
+                            // Push SubqueryAlias so the provenance stack
+                            // carries the alias for qualifier resolution
+                            let prev = match col.qualifier() {
+                                ast_resolved::TableName::Named(t) => t.to_string(),
+                                ast_resolved::TableName::Fresh => "_".to_string(),
+                            };
+                            c.push_scope(
+                                ast_resolved::TableName::Named(alias_name.clone().into()),
+                                ast_resolved::IdentityContext::SubqueryAlias {
+                                    alias: alias_name.to_string(),
+                                    previous_context: prev,
+                                    resolver_id: None,
+                                },
+                            );
+                        }
+                        c
+                    }
+                })
+                .collect();
 
             // Use PatternResolver for column selection
             let (mut final_expr, state) = apply_pattern_resolver(
@@ -1138,12 +1211,13 @@ pub(super) fn r_resolve_consulted_view(
         let body_schema =
             super::helpers::extraction::extract_cpr_schema_from_query(&resolved_query)?;
 
-        let (effective_alias, resolver_id) = compute_effective_alias(&alias, &config.alias_counter);
+        let (effective_alias, resolver_id, export_schema) =
+            access_boundary_export(&alias, &view_name, &body_schema, &config.alias_counter);
 
         let effective_name = effective_alias.to_string();
 
         let scoped = ast_resolved::ScopedSchema::bind(
-            body_schema.clone(),
+            export_schema,
             effective_alias.clone(),
             resolver_id,
         );
@@ -1330,12 +1404,13 @@ pub(super) fn r_resolve_consulted_view(
         bubbled
     };
 
-    let (effective_alias, resolver_id) = compute_effective_alias(&alias, &config.alias_counter);
+    let (effective_alias, resolver_id, export_schema) =
+        access_boundary_export(&alias, &view_name, &body_schema, &config.alias_counter);
 
     let effective_name = effective_alias.to_string();
 
     let scoped =
-        ast_resolved::ScopedSchema::bind(body_schema.clone(), effective_alias.clone(), resolver_id);
+        ast_resolved::ScopedSchema::bind(export_schema, effective_alias.clone(), resolver_id);
 
     let base_expr =
         ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::ConsultedView {
@@ -1525,7 +1600,9 @@ fn infer_anon_column_types(rows: &[ast_resolved::Row]) -> Vec<Option<String>> {
                 };
                 let cell = match value {
                     ast_resolved::LiteralValue::Null => continue,
-                    ast_resolved::LiteralValue::String(_) => "TEXT",
+                    ast_resolved::LiteralValue::String(_)
+                    | ast_resolved::LiteralValue::Symbol(_)
+                    | ast_resolved::LiteralValue::Mention(_) => "TEXT",
                     ast_resolved::LiteralValue::Number(n) => {
                         if n.contains(['.', 'e', 'E']) {
                             "REAL"
@@ -1561,6 +1638,7 @@ pub(super) fn resolve_anonymous(
         alias: relation_alias,
         outer,
         exists_mode,
+        negated,
         qua_target,
         cpr_schema: _,
     } = rel
@@ -1626,6 +1704,36 @@ pub(super) fn resolve_anonymous(
 
     let resolved_rows = resolved_rows?;
 
+    // An lvar cannot appear both in a header and in the data rows of
+    // the same anonymous table (lvars.md): the header is the probe,
+    // a row lvar is a candidate — the same name in both makes the
+    // membership vacuously true, and in the relational forms it
+    // collides the declaration with the reference.
+    if let Some(headers) = &column_headers {
+        for header in headers {
+            let ast_unresolved::DomainExpression::Lvar { name, .. } = header else {
+                continue;
+            };
+            let repeated = resolved_rows.iter().any(|row| {
+                row.values.iter().any(|cell| {
+                    matches!(cell,
+                        ast_resolved::DomainExpression::Lvar { name: cell_name, .. }
+                            if delightql_types::SqlIdentifier::str_eq(cell_name.as_str(), name))
+                })
+            });
+            if repeated {
+                return Err(crate::error::DelightQLError::validation_error_categorized(
+                    "resolution/anon/header_row_lvar",
+                    format!(
+                        "lvar '{}' appears both as a header and in the data rows of the same anonymous table",
+                        name
+                    ),
+                    "the header is the probe and a row lvar is a candidate — probing a column against itself is vacuously true; drop the self-candidate or rename the header",
+                ));
+            }
+        }
+    }
+
     // Literal-grid type inference: the rows are the columns' declaration.
     let inferred_types = infer_anon_column_types(&resolved_rows);
 
@@ -1681,15 +1789,28 @@ pub(super) fn resolve_anonymous(
                     if let Some(alias_str) = &alias {
                         prov = prov.with_alias(alias_str.clone());
                     }
-                    columns.push(
-                        ast_resolved::ColumnMetadata::new_with_name_flag(
-                            prov,
-                            table_name,
-                            Some(idx + 1),
-                            true, // Explicit headers are user-provided names
-                        )
-                        .with_declared_type(inferred_types.get(idx).cloned().flatten()),
-                    );
+                    // An anon-table header DECLARES a bare lvar — the
+                    // other declarer besides positional binding; both
+                    // participate in full-name-identity unification.
+                    // An alias adds an ACCESS NAME: the export answers
+                    // to it (x.city), and the anon-header scans treat
+                    // an access-named column as non-bare — same regime
+                    // as a glob export. declared_bare itself stays,
+                    // because the caller-pattern seam routes DDL facts
+                    // and param carriers through this construction and
+                    // names their columns through bare declarations.
+                    let mut header_col = ast_resolved::ColumnMetadata::new_with_name_flag(
+                        prov,
+                        table_name,
+                        Some(idx + 1),
+                        true, // Explicit headers are user-provided names
+                    )
+                    .with_declared_type(inferred_types.get(idx).cloned().flatten());
+                    header_col.declared_bare = true;
+                    if let Some(alias_name) = &relation_alias {
+                        header_col.access_name = Some(alias_name.clone());
+                    }
+                    columns.push(header_col);
                 }
                 _ => {
                     // Preserve all other expression types (functions, literals, etc.)
@@ -1940,6 +2061,7 @@ pub(super) fn resolve_anonymous(
         alias: relation_alias,
         outer,
         exists_mode,
+        negated,
         qua_target: None,
         cpr_schema: ast_resolved::PhaseBox::new(resolved_schema.clone()),
     };
@@ -3284,6 +3406,7 @@ fn expand_fact_body(
             alias: Some(fact_name.into()),
             outer: false,
             exists_mode: false,
+            negated: false,
             qua_target: None,
             cpr_schema: PhaseBox::phantom(),
         },

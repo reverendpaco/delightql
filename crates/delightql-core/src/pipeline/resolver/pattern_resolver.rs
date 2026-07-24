@@ -325,6 +325,14 @@ impl PatternResolver {
 
             // Create output column with potential rename
             let mut output_col = source_col.clone();
+            // Argumentative access DECLARES its names as bare lvars —
+            // renamed or not — unlike glob access, whose columns keep
+            // qualified full names (the lvar law: unification is by
+            // full-name identity). A bare declaration answers to no
+            // access name: the source boundary's stamp does not ride
+            // through the caller's own binding.
+            output_col.declared_bare = true;
+            output_col.access_name = None;
             if sel.output_name != source_col.name() {
                 // Column is being renamed — mark as user-named since the user
                 // explicitly chose this name in a positional binding like table(x, y)
@@ -370,8 +378,17 @@ impl PatternResolver {
                         // (hygienic, like a literal-constrained slot) so
                         // the WHERE can reference it, and stays out of the
                         // final heading.
+                        //
+                        // NULL-SAFE: self-unification is a per-row
+                        // selection bit — no
+                        // multiplication is possible — so null is a VALUE
+                        // here and a both-null row instances the pattern
+                        // (the "which rows agree, including both-absent"
+                        // diagnostic). Cross-RELATION unification stays
+                        // three-valued: there null matching manufactures
+                        // pairings.
                         let first_col = &table_schema[first_position];
-                        where_constraints.push(create_unification_condition(
+                        where_constraints.push(create_self_unification_condition(
                             first_col, source_col, table_name,
                         ));
                         output_col.needs_hygienic_alias = true;
@@ -393,15 +410,44 @@ impl PatternResolver {
                 output_columns.push(output_col);
             }
 
-            // Check for implicit unification (same column name in join)
+            // Implicit unification is by FULL-NAME identity (the lvar
+            // law): this positional binding declares a bare lvar, and it
+            // unifies only with a left partner that is ALSO declared
+            // bare. A glob column's full name is qualified — a bare
+            // name merely colliding with one refuses: silent
+            // unification taught a false scope model (and made meaning
+            // depend on comma order — the reversed order cross-joins),
+            // silent coexistence would duplicate the heading.
             if let Some(ctx) = join_context {
-                if ctx.has_column(&sel.output_name) && !using_columns.contains(&sel.output_name) {
-                    // This column exists on the left - create unification
-                    if let Some(left_col) = ctx.find_column(&sel.output_name) {
+                if !using_columns.contains(&sel.output_name) {
+                    // The scope may hold BOTH a declared bare lvar and a
+                    // same-named glob column (e.g. a drill binding beside
+                    // its catalog's own column): the declared partner is
+                    // the full-name match — collision refuses only when
+                    // no declared partner exists.
+                    let declared_partner = ctx.left_columns.iter().find(|col| {
+                        col.declared_bare
+                            && delightql_types::SqlIdentifier::str_eq(
+                                col.name(),
+                                &sel.output_name,
+                            )
+                    });
+                    if let Some(left_col) = declared_partner {
                         join_conditions.push(create_unification_condition(
                             left_col, source_col, table_name,
                         ));
                         using_columns.push(sel.output_name.clone());
+                    } else if ctx.find_column(&sel.output_name).is_some() {
+                        {
+                            return Err(crate::error::DelightQLError::validation_error_categorized(
+                                "resolution/lvar/glob_collision",
+                                format!(
+                                    "positional lvar '{}' collides with a wildcard column of the same name: a glob exports its lvars under QUALIFIED names, so bare '{}' is not it",
+                                    sel.output_name, sel.output_name
+                                ),
+                                "rename the positional binding, or access the other relation argumentatively to declare the shared lvar",
+                            ));
+                        }
                     }
                 }
             }
@@ -485,6 +531,26 @@ fn create_literal_constraint(
         operator: "traditional_eq".to_string(),
         left: Box::new(col_ref),
         right: Box::new(literal),
+    }
+}
+
+/// Null-safe twin of [`create_unification_condition`], for WITHIN-ROW
+/// self-unification only (a selection bit; null is a value). The
+/// cross-relation helper below stays three-valued — correspondence.
+fn create_self_unification_condition(
+    left_col: &ast_resolved::ColumnMetadata,
+    right_col: &ast_resolved::ColumnMetadata,
+    right_table: &str,
+) -> ast_resolved::BooleanExpression {
+    match create_unification_condition(left_col, right_col, right_table) {
+        ast_resolved::BooleanExpression::Comparison { left, right, .. } => {
+            ast_resolved::BooleanExpression::Comparison {
+                operator: "null_safe_eq".to_string(),
+                left,
+                right,
+            }
+        }
+        other => other,
     }
 }
 

@@ -101,6 +101,122 @@ pub fn is_correlation_predicate(pred: &resolved::BooleanExpression) -> bool {
     qualifiers.len() >= 2 || (qualifiers.len() == 1 && has_unqualified_lvar)
 }
 
+/// The top-N partition-proof contract: convert ONE proved correlation
+/// equality into the partition key it contributes, or refuse. Sound
+/// pre-ranking requires each conjunct to pin a whole partition group
+/// per outer row, which holds exactly when one side is a plain interior
+/// column (the key) and the other side provably references only the
+/// outer scope (constant per outer row). A wrapped interior key has no
+/// directly representable partition column; an interior reference on
+/// the non-key side narrows the candidate set within a group after
+/// ranking. Both refuse, default-deny — the alternative is a plausible
+/// ranking over the wrong population (an unpartitioned or
+/// mispartitioned row_number()).
+pub fn prove_partition_key(
+    filter: &resolved::BooleanExpression,
+    table_identifier: &resolved::QualifiedName,
+) -> Result<String> {
+    use crate::error::DelightQLError;
+
+    let resolved::BooleanExpression::Comparison { left, right, .. } = filter else {
+        unreachable!("prove_equality_conjunction flattens correlation filters to comparisons")
+    };
+
+    let topn_hint = "join normally and rank explicitly: ... |> (..., row_number:(<~ %(outer identity), #(ordering)) as rnk), rnk <= N";
+
+    let (key, flank) = match (
+        interior_key_column(left, table_identifier),
+        interior_key_column(right, table_identifier),
+    ) {
+        (Some(key), None) => (key, right),
+        (None, Some(key)) => (key, left),
+        (Some(_), Some(_)) => {
+            return Err(DelightQLError::validation_error_categorized(
+                "interior/topn/unprovable_partition",
+                "interior top-N requires the non-key side of each correlation equality to reference only the outer scope: both sides of this equality read the interior relation".to_string(),
+                topn_hint,
+            ))
+        }
+        (None, None) => {
+            return Err(DelightQLError::validation_error_categorized(
+                "interior/topn/unprovable_partition",
+                "interior top-N requires each correlation equality to name a plain interior column on one side: here the interior key is wrapped in an expression, so no partition key is directly representable and the pre-ranked lowering would rank the wrong population".to_string(),
+                topn_hint,
+            ))
+        }
+    };
+
+    if !provably_outer_only(flank, table_identifier) {
+        return Err(DelightQLError::validation_error_categorized(
+            "interior/topn/unprovable_partition",
+            "interior top-N requires the non-key side of each correlation equality to reference only the outer scope: an interior reference there narrows the candidate set within a partition group, and the pre-ranked lowering would rank rows the join predicate then discards".to_string(),
+            topn_hint,
+        ));
+    }
+
+    Ok(key)
+}
+
+/// A directly representable interior partition key: a bare Lvar whose
+/// qualifier names the interior relation, or an unqualified Lvar (the
+/// correlation model reads unqualified lvars as interior — the same
+/// reading `is_correlation_predicate` classifies by). Anything wrapped
+/// (functions, parentheses) is not directly representable: None.
+fn interior_key_column(
+    expr: &resolved::DomainExpression,
+    table_identifier: &resolved::QualifiedName,
+) -> Option<String> {
+    if let resolved::DomainExpression::Lvar {
+        name, qualifier, ..
+    } = expr
+    {
+        match qualifier {
+            Some(q) if super::flattener::could_be_inner_alias(q, &table_identifier.name) => {
+                Some(name.to_string())
+            }
+            None => Some(name.to_string()),
+            Some(_) => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Default-deny purity check for the non-key side of a correlation
+/// equality: true only for shapes PROVABLY constant per outer row —
+/// outer-qualified lvars, literals, and plain function/parenthesis
+/// composition over those. Unqualified lvars read the interior; any
+/// shape this match does not affirmatively admit (case expressions,
+/// windows, subqueries, ...) is unproven and answers false.
+fn provably_outer_only(
+    expr: &resolved::DomainExpression,
+    table_identifier: &resolved::QualifiedName,
+) -> bool {
+    match expr {
+        resolved::DomainExpression::Lvar { qualifier, .. } => match qualifier {
+            Some(q) => !super::flattener::could_be_inner_alias(q, &table_identifier.name),
+            None => false,
+        },
+        resolved::DomainExpression::Literal { .. } => true,
+        resolved::DomainExpression::Parenthesized { inner, .. } => {
+            provably_outer_only(inner, table_identifier)
+        }
+        resolved::DomainExpression::Function(func) => match func {
+            resolved::FunctionExpression::Regular { arguments, .. }
+            | resolved::FunctionExpression::Curried { arguments, .. }
+            | resolved::FunctionExpression::Bracket { arguments, .. } => arguments
+                .iter()
+                .all(|arg| provably_outer_only(arg, table_identifier)),
+            resolved::FunctionExpression::Infix { left, right, .. } => {
+                provably_outer_only(left, table_identifier)
+                    && provably_outer_only(right, table_identifier)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Extract correlation column names from correlation filters
 pub fn extract_correlation_column_names(
     filters: &[resolved::BooleanExpression],
@@ -110,10 +226,9 @@ pub fn extract_correlation_column_names(
 
     for filter in filters {
         if let resolved::BooleanExpression::Comparison { left, right, .. } = filter {
-            if let Some(col) = extract_column_name_if_matches_table(left, table_identifier) {
+            if let Some(col) = interior_key_column(left, table_identifier) {
                 columns.push(col);
-            } else if let Some(col) = extract_column_name_if_matches_table(right, table_identifier)
-            {
+            } else if let Some(col) = interior_key_column(right, table_identifier) {
                 columns.push(col);
             }
         }
@@ -275,20 +390,3 @@ fn collect_case_arm_qualifiers(arm: &resolved::CaseArm, out: &mut HashSet<String
     }
 }
 
-/// Extract column name from domain expression if it matches the given table
-fn extract_column_name_if_matches_table(
-    expr: &resolved::DomainExpression,
-    table_identifier: &resolved::QualifiedName,
-) -> Option<String> {
-    if let resolved::DomainExpression::Lvar {
-        name, qualifier, ..
-    } = expr
-    {
-        if let Some(q) = qualifier {
-            if super::flattener::could_be_inner_alias(q, &table_identifier.name) {
-                return Some(name.to_string());
-            }
-        }
-    }
-    None
-}

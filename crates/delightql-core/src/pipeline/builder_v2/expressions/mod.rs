@@ -217,6 +217,11 @@ pub(super) fn parse_expression(
                 FunctionExpression::function_builder(name).build()
             ))
         }
+        // Mention in either spelling normally arrives INSIDE a
+        // `literal` node (the ground-literal category); these arms
+        // cover any production still emitting the bare token.
+        "symbol" => Ok(literals::build_symbol(node.text())),
+        "delimited_mention" => literals::build_mention(node.text()),
         "piped_expression" => pipes::parse_piped_expression(node),
         "case_expression" => case_and_subqueries::parse_case_expression(node),
         "anonymous_scalar_subquery" => case_and_subqueries::parse_anonymous_scalar_subquery(node, features),

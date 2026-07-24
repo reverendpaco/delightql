@@ -77,6 +77,10 @@ module.exports = grammar({
     // [$.table_access, $.pseudo_predicate_argument_list],  // unnecessary per tree-sitter
     // Anonymous table in DML pipe: data_rows vs sparse_fill inside anonymous_table
     [$.data_rows, $.sparse_fill],
+    // Ground membership probe vs data literal: _("MA" ... could open a
+    // ground header (inverted In) or a headerless data row. GLR forks;
+    // the @ separator disambiguates.
+    [$.literal, $.ground_header],
     // Namespace-qualified function call vs scalar subquery vs HO scalar subquery:
     // all share ns.identifier:( prefix. Disambiguation via content inside parens.
     [$.function_call, $.scalar_subquery, $.ho_scalar_subquery],
@@ -357,12 +361,11 @@ module.exports = grammar({
       '~~)'
     ),
 
-    // Emit annotation: (~~emit:name ~~) or (~~emit:name , predicate ~~)
-    // Fan-out: the relation at this point is forked and optionally
-    // filtered by the body continuation. The host routes the resulting
-    // rows to a named sink (file, socket, stderr).
-    // Inline URI form: (~~emit://file/a/csv/out.csv ~~) — same ://path convention
-    // as error/danger/option annotations.
+    // Emit annotation: (~~emit:name ~~) or (~~emit://uri/path ~~).
+    // RESERVED, not implemented: the grammar recognizes the form so the
+    // builder can refuse with teaching (row fan-out belongs to the
+    // effect algebra — stdout!, sink!). No surface advertises emit;
+    // this production exists to make guessing it loud.
     // prec(1) ensures this wins over the generic annotation when the name is "emit".
     emit_annotation: $ => prec(1, seq(
       '(~~emit',
@@ -690,6 +693,8 @@ module.exports = grammar({
         $.pivot_expression,     // Pivot: score of subject
         $.sparse_fill,          // Sparse fill: _(col @ val) in sparse anonymous table rows
         $.citation              // Citation: :nl, :tab (zero-arity call via :name)
+        // Mention (::active, :`people(*)`) lives in $.literal — the
+        // ground-literal category — never beside it here.
         // PATH FIRST-CLASS: path_literal removed from domain_expression to avoid conflict
         // Paths only available via specific rules: curly_function_member, function arguments
       ),
@@ -731,7 +736,8 @@ module.exports = grammar({
         $.ho_scalar_subquery,  // HO scalar subquery: ho_view:(table_args)(, corr ~> agg)
         $.metadata_tree_group,  // EPOCH 4: Metadata tree groups allowed in destructuring
         $.array_destructure_pattern,  // ARRAY DESTRUCTURING: Allow [.0, .1, .2] after ~=
-        $.citation                    // Citation: :nl, :tab (zero-arity call via :name)
+        $.citation,                   // Citation: :nl, :tab (zero-arity call via :name)
+        // Mention lives in $.literal (the ground-literal category).
         // PATH FIRST-CLASS: path_literal removed to avoid conflict with curly_function_member
       ),
       optional(seq($._as, field('alias', $.identifier)))
@@ -1554,7 +1560,14 @@ module.exports = grammar({
       $.number_literal,   // Then general numbers
       $.string_literal,
       $.boolean_literal,
-      $.null_literal
+      $.null_literal,
+      // Mention is a ground literal in both spellings: a self-valued
+      // datum valid wherever a scalar literal grounds. Category
+      // membership here — never a per-production placement — is what
+      // keeps every literal position a future mention-grounding
+      // position.
+      $.symbol,           // Light spelling: ::active
+      $.delimited_mention // Delimited spelling: :`people(*)`
     ),
 
     // Hexadecimal literal: 0x0A or 0x0a (case insensitive)
@@ -1736,6 +1749,8 @@ module.exports = grammar({
     tvf_argument: $ => choice(
       $.string_literal,
       $.number_literal,          // Numeric arguments (e.g., HO view: above_balance(1000)(*))
+      $.symbol,                  // Mention, light spelling: speed(::fast, "z")(*)
+      $.delimited_mention,       // Mention, delimited spelling: edge(:`people(*)`, "z")(*)
       $.table_access,            // Functor args: users(*), ns.table(*)
       $.namespace_path,          // Bare namespace args: run_namespace!(lib::etl)(*) (REPORT-1.5 F2)
       $.identifier,              // Scalar args: bare name, literal value
@@ -1844,8 +1859,25 @@ module.exports = grammar({
     ),
 
     // A column header optionally marked as sparse with ?
+    // A ground header is a membership probe (inverted In):
+    // +_("MA" @ birth_state; death_state) asks "MA" ∈ {rows}.
+    // Strings and numbers only — null/true/false stay identifiers
+    // here so keyword-named columns keep parsing as headers.
+    ground_header: $ => choice(
+      $.hex_literal,
+      $.octal_literal,
+      $.integer_literal,
+      $.number_literal,
+      $.string_literal,
+      // Mention grounds a header like any literal: the probe asks
+      // whether these bytes are among the values in scope. Keyword
+      // literals (null/true/false) stay identifiers here, but `::`
+      // and :` can never spell a column name, so no collision.
+      $.symbol,
+      $.delimited_mention,
+    ),
     column_header_item: $ => seq(
-      choice($.identifier, $.qualified_column, $.function_call),
+      choice($.identifier, $.qualified_column, $.function_call, alias($.ground_header, $.literal)),
       optional(alias('?', $.sparse_marker)),
     ),
     
@@ -1925,6 +1957,20 @@ module.exports = grammar({
       ':',
       field('name', $.identifier),
     ),
+
+    // Symbol: a self-valued name. Leading '::' only — the namespace
+    // separator is token.immediate after an identifier, so the two
+    // never compete for the same '::'.
+    symbol: $ => token(seq('::', /[a-zA-Z_][a-zA-Z0-9_]*/)),
+
+    // Delimited mention: :`term` — a reference literal, the delimited
+    // spelling of mention (symbol is the light spelling). The interior
+    // is captured raw as one token and subparsed as a term by the
+    // compiler (capture-then-subparse). One character after the colon
+    // disambiguates the quote family: '`' is mention; the single token
+    // outlasts citation's bare ':' wherever both are valid, so
+    // citation no longer captures a stropped name here.
+    delimited_mention: $ => token(seq(':', '`', /[^`]*/, '`')),
 
     // String template with interpolation: :"Hello {name}" or :"""multi "line" template"""
     string_template: $ => choice(

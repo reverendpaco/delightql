@@ -326,6 +326,10 @@ pub enum Relation<Phase = Unresolved> {
         outer: bool,
         /// EXISTS mode: true = +_(...) (filtering/semi-join), false = _(...) (cartesian/melt)
         exists_mode: bool,
+        /// Anti-membership: \+_(...) — the probe must NOT be a member.
+        /// Only meaningful when exists_mode is true.
+        #[serde(skip_serializing_if = "crate::pipeline::asts::core::metadata::is_false", default)]
+        negated: bool,
         /// Schema conformance target: `_(cols @ data) qua target_table`
         /// Only present in Unresolved phase; resolver consumes it and sets to None.
         #[serde(skip_serializing_if = "Option::is_none", default)]

@@ -46,6 +46,29 @@ pub fn generate_literal(
         LiteralValue::Null => {
             spell(sql, "lit.null", "NULL")?;
         }
+        // A symbol is byte-identical to its spelling at execution:
+        // ::active emits the string literal '::active'.
+        LiteralValue::Symbol(name) => {
+            sql.push_str("'::");
+            sql.push_str(name);
+            sql.push('\'');
+        }
+        // A mention is byte-identical to its encoding at execution,
+        // marker included: :`people(*)` emits the string literal
+        // ':`people(*)`'. The canonical interior may itself contain
+        // quotes (a term can hold string literals), so it escapes
+        // like any string.
+        LiteralValue::Mention(canonical) => {
+            sql.push_str("':`");
+            for ch in canonical.chars() {
+                if ch == '\'' {
+                    sql.push_str("''");
+                } else {
+                    sql.push(ch);
+                }
+            }
+            sql.push_str("`'");
+        }
     }
     Ok(())
 }

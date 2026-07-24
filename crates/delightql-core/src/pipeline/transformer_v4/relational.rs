@@ -472,6 +472,10 @@ fn lower_tvf_argument(
             LiteralValue::Number(n) => TvfArgument::NumberLiteral(n),
             LiteralValue::Boolean(b) => TvfArgument::Identifier(b.to_string()),
             LiteralValue::Null => TvfArgument::Identifier("NULL".to_string()),
+            LiteralValue::Symbol(name) => TvfArgument::StringLiteral(format!("::{}", name)),
+            LiteralValue::Mention(canonical) => {
+                TvfArgument::StringLiteral(format!(":`{}`", canonical))
+            }
         },
         ast_addressed::DomainExpression::Lvar {
             name,
@@ -2776,19 +2780,24 @@ fn classify_pivot_groups(
                 pivot_key,
                 pivot_values,
             } => {
-                let key_name = pivot_key_group_name(pivot_key);
+                let structural = pivot_key_structural_id(pivot_key);
                 let val_name =
                     extract_pivot_lvar_name(value_column).unwrap_or_else(|| "value".to_string());
 
-                if let Some(&idx) = key_to_group.get(&key_name) {
+                if let Some(&idx) = key_to_group.get(&structural) {
                     pivot_groups[idx]
                         .value_columns
                         .push((val_name, value_column.as_ref().clone()));
                 } else {
                     let idx = pivot_groups.len();
-                    key_to_group.insert(key_name.clone(), idx);
+                    // The alias: a bare-lvar key keeps its column name; a
+                    // derived key gets an index-allocated name —
+                    // collision-free by construction.
+                    let alias = extract_pivot_lvar_name(pivot_key)
+                        .unwrap_or_else(|| format!("_pivot_key_{}", idx));
+                    key_to_group.insert(structural, idx);
                     pivot_groups.push(PivotGroup {
-                        pivot_key_name: key_name,
+                        pivot_key_name: alias,
                         pivot_key_expr: pivot_key.as_ref().clone(),
                         value_columns: vec![(val_name, value_column.as_ref().clone())],
                     });
@@ -3095,10 +3104,10 @@ fn build_pivot_outer_select(
                 pivot_key,
                 pivot_values,
             } => {
-                let key_name = pivot_key_group_name(pivot_key);
+                let structural = pivot_key_structural_id(pivot_key);
                 let val_name =
                     extract_pivot_lvar_name(value_column).unwrap_or_else(|| "value".to_string());
-                let group_idx = key_to_group[&key_name];
+                let group_idx = key_to_group[&structural];
 
                 for pivot_value in pivot_values {
                     let alias = output_columns
@@ -3171,19 +3180,13 @@ fn strip_sql_qualifiers(
     }
 }
 
-/// The group name for a pivot key. A bare lvar keys by its column name;
-/// a DERIVED key (format string, expression) gets a deterministic
-/// synthesized name — hashed from the expression so classify and the
-/// outer select agree, and so two DIFFERENT derived keys never merge
-/// into one group (a shared placeholder name would).
-fn pivot_key_group_name(pivot_key: &ast_addressed::DomainExpression) -> String {
-    extract_pivot_lvar_name(pivot_key).unwrap_or_else(|| {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        format!("{:?}", pivot_key).hash(&mut h);
-        format!("_pivot_key_{:08x}", h.finish() as u32)
-    })
+/// The structural identity of a pivot key: what decides whether two
+/// PivotOf clauses share a group. FULL structural equality — never a
+/// truncated hash, which could collide and silently MERGE two distinct
+/// derived keys into one group (a semantic change, not a naming one).
+/// The SQL alias is allocated separately, per group index.
+fn pivot_key_structural_id(pivot_key: &ast_addressed::DomainExpression) -> String {
+    extract_pivot_lvar_name(pivot_key).unwrap_or_else(|| format!("{:?}", pivot_key))
 }
 
 /// Extract the base name from an Lvar (for pivot key/value column names).
@@ -3419,9 +3422,10 @@ pub(super) fn r_lower_embed_map(
 /// Lower meta-ize: `|> ^` — one application; `^^` arrives here as two
 /// stacked pipes (composition), never as a distinct operator.
 ///
-/// Synthesizes a VALUES relation from the source's column metadata.
-/// - `^`  → columns: scope, column_name, ordinal
-/// - `^^` → columns: scope, column_name, ordinal, data_type, nullable
+/// Synthesizes a VALUES relation from the source's column metadata:
+/// columns are always (scope, column_name, ordinal) — meta-ize is
+/// shape-only. A detailed variant with declared types is a tempting
+/// regression: declaration echoes misreport derived columns.
 pub(super) fn r_lower_meta_ize(
     builder: Builder<Unprojected>,
     cpr_schema: &PhaseBox<CprSchema, Addressed>,

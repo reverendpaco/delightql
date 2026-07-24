@@ -388,7 +388,7 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
         }
         "view_definition" => DdlHead::View,
         "argumentative_view_definition" => {
-            let items = extract_view_head_items(node);
+            let items = extract_view_head_items(node)?;
             DdlHead::ArgumentativeView { items }
         }
         "ho_view_definition" => {
@@ -404,13 +404,13 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                     if p.kind() == "ho_param" {
                         extract_ho_param(p)
                     } else {
-                        HoParam {
+                        Ok(HoParam {
                             name: crate::pipeline::cst::unstrop(p.text()),
                             kind: HoParamKind::Scalar,
-                        }
+                        })
                     }
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             // Check for argumentative output head: (name, type) vs (*)
             let output_head_nodes = node.children_by_field("output_head");
             let output_head = if output_head_nodes.is_empty() {
@@ -420,7 +420,7 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                     .iter()
                     .filter(|n| n.kind() == "view_head_item")
                     .map(|n| extract_single_view_head_item(n))
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 // Head-`as` labels are NOT yet wired through the HO output
                 // machinery (`inject_scalar_columns` would silently ignore
                 // them — the `_ground` naming path, clause-head-catechism
@@ -480,13 +480,13 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                     if p.kind() == "ho_param" {
                         extract_ho_param(p)
                     } else {
-                        HoParam {
+                        Ok(HoParam {
                             name: crate::pipeline::cst::unstrop(p.text()),
                             kind: HoParamKind::Scalar,
-                        }
+                        })
                     }
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let output_head_nodes = node.children_by_field("output_head");
             let output_head = if output_head_nodes.is_empty() {
                 None
@@ -495,7 +495,7 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                     .iter()
                     .filter(|n| n.kind() == "view_head_item")
                     .map(|n| extract_single_view_head_item(n))
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 if items.is_empty() {
                     None
                 } else {
@@ -531,13 +531,13 @@ fn extract_name_and_head(node: &CstNode, source: &str) -> Result<(String, DdlHea
                     if p.kind() == "ho_param" {
                         extract_ho_param(p)
                     } else {
-                        HoParam {
+                        Ok(HoParam {
                             name: p.text().to_string(),
                             kind: HoParamKind::Scalar,
-                        }
+                        })
                     }
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             // Extract column_headers from second parens as output_head (if present)
             let output_head = node
                 .find_child("column_headers")
@@ -882,16 +882,26 @@ fn build_ddl_definitions_from_tree(tree: &Tree, source: &str) -> Result<Vec<DdlD
 /// Determines the kind by inspecting the node structure:
 /// - Has `*` child → Glob: `T(*)`
 /// - Has `columns` field → Argumentative: `T(x, y)`
-/// - Has `ground_value` field → GroundScalar: `"value"` or `42`
+/// - Has `ground_value` field → GroundScalar: `"value"`, `42`,
+///   `::fast`, or `` :`people(*)` ``
 /// - Just `param_name` → Scalar: `n`
-fn extract_ho_param(node: &CstNode) -> HoParam {
-    // Check for ground value first: "value" or 42
+fn extract_ho_param(node: &CstNode) -> Result<HoParam> {
+    // Check for ground value first: "value" or 42 — or a mention,
+    // which grounds on its canonical encoding: the stored text IS the
+    // match key, so a delimited interior canonicalizes HERE, at
+    // consult time, and a bad interior refuses here too.
     if let Some(ground_node) = node.field("ground_value") {
-        let text = ground_node.text().to_string();
-        return HoParam {
+        let text = match ground_node.kind() {
+            "delimited_mention" => format!(
+                ":`{}`",
+                crate::term_spec::mention_interior_from_token(ground_node.text())?
+            ),
+            _ => ground_node.text().to_string(),
+        };
+        return Ok(HoParam {
             name: text.clone(),
             kind: HoParamKind::GroundScalar(text),
-        };
+        });
     }
 
     let name = node
@@ -904,10 +914,10 @@ fn extract_ho_param(node: &CstNode) -> HoParam {
         .all_children()
         .any(|c| c.kind() == "*" || c.text() == "*");
     if has_star {
-        return HoParam {
+        return Ok(HoParam {
             name,
             kind: HoParamKind::Glob,
-        };
+        });
     }
 
     // Check for argumentative: T(x, y) — has `columns` field
@@ -918,21 +928,21 @@ fn extract_ho_param(node: &CstNode) -> HoParam {
         .map(|c| c.text().to_string())
         .collect();
     if !columns.is_empty() {
-        return HoParam {
+        return Ok(HoParam {
             name,
             kind: HoParamKind::Argumentative(columns),
-        };
+        });
     }
 
     // Bare identifier → Scalar
-    HoParam {
+    Ok(HoParam {
         name,
         kind: HoParamKind::Scalar,
-    }
+    })
 }
 
 /// Extract view head items from an `argumentative_view_definition` CST node.
-fn extract_view_head_items(node: &CstNode) -> Vec<ViewHeadItem> {
+fn extract_view_head_items(node: &CstNode) -> Result<Vec<ViewHeadItem>> {
     let head_items_nodes = node.children_by_field("head_items");
     head_items_nodes
         .iter()
@@ -946,13 +956,22 @@ fn extract_view_head_items(node: &CstNode) -> Vec<ViewHeadItem> {
 /// Handles both the bare form (`identifier` / literal) and the `as`-labeled form
 /// (`supply as label`): the `label` field, when present, is the position's naming
 /// offer per the defining-head `as` rule (clause-head-catechism §II).
-fn extract_single_view_head_item(node: &CstNode) -> ViewHeadItem {
+fn extract_single_view_head_item(node: &CstNode) -> Result<ViewHeadItem> {
     // `as`-labeled form carries a `label` field; the supply is under `supply`.
     let label = node.field("label").map(|n| n.text().to_string());
     let supply = node.field("supply").unwrap_or_else(|| node.child(0).unwrap_or(*node));
-    match supply.kind() {
-        "string_literal" | "number_literal" => ViewHeadItem::Ground {
+    Ok(match supply.kind() {
+        "string_literal" | "number_literal" | "symbol" => ViewHeadItem::Ground {
             literal: supply.text().to_string(),
+            label,
+        },
+        // A mention grounds on its canonical encoding: canonicalize
+        // at consult time, refuse a bad interior here.
+        "delimited_mention" => ViewHeadItem::Ground {
+            literal: format!(
+                ":`{}`",
+                crate::term_spec::mention_interior_from_token(supply.text())?
+            ),
             label,
         },
         // identifier (or any other) → free variable
@@ -960,7 +979,7 @@ fn extract_single_view_head_item(node: &CstNode) -> ViewHeadItem {
             name: supply.text().to_string(),
             label,
         },
-    }
+    })
 }
 
 /// Extract DDL neck type from a CST neck node.

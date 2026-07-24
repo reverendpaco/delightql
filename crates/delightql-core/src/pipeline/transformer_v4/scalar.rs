@@ -258,39 +258,129 @@ pub(super) fn s_lower_boolean(
             exists, subquery, ..
         } => s_lower_inner_exists(exists, *subquery, qualify, ctx),
 
+        // Membership lowers through the existence machinery, never SQL
+        // IN/NOT IN: EXISTS over the subquery with a null-safe
+        // probe-to-column correspondence. A null probe finds a null
+        // member; a null on the right cannot empty `not in`.
         ast_addressed::BooleanExpression::InRelational {
             value,
             subquery,
             negated,
             ..
         } => {
-            let lhs = s_lower_expression(*value, qualify, ctx)?;
+            let probes = split_tuple(*value)
+                .into_iter()
+                .map(|p| s_lower_expression(p, qualify, ctx))
+                .collect::<Result<Vec<_>>>()?;
             let inner_ctx = ctx.with_outer_scope(qualify.scope_columns());
             let names = &inner_ctx.names;
             let inner_builder = super::descend::descend_as_query(*subquery, names, &inner_ctx)?;
             let query = inner_builder.to_sql()?;
-            Ok(SqlPredicate::new(SqlDomainExpr::InSubquery {
-                expr: Box::new(lhs),
-                not: negated,
-                query: Box::new(query),
+            let cols = membership_output_columns(&query).ok_or_else(|| {
+                DelightQLError::validation_error_categorized(
+                    "transform/membership/columns",
+                    "membership subquery has no addressable output columns".to_string(),
+                    "project named columns on the right of `in`",
+                )
+            })?;
+            if cols.len() != probes.len() {
+                return Err(DelightQLError::validation_error_categorized(
+                    "semantic/membership/arity",
+                    format!(
+                        "membership probe has {} value(s) but the relation produces {} column(s)",
+                        probes.len(),
+                        cols.len()
+                    ),
+                    "the left side of `in` must match the relation's width",
+                ));
+            }
+            let wrap_alias = match names.next_table_name("_memb") {
+                crate::pipeline::asts::core::TableName::Named(id) => id.as_str().to_string(),
+                crate::pipeline::asts::core::TableName::Fresh => "_memb".to_string(),
+            };
+            let conds: Vec<SqlDomainExpr> = cols
+                .iter()
+                .zip(probes)
+                .map(|(col, probe)| {
+                    SqlDomainExpr::with_qualifier(
+                        ColumnQualifier::table(wrap_alias.clone()),
+                        col.as_str(),
+                    )
+                    .is_not_distinct_from(probe)
+                })
+                .collect();
+            let where_expr = if conds.len() == 1 {
+                conds.into_iter().next().expect("one condition")
+            } else {
+                SqlDomainExpr::and(conds)
+            };
+            let select = sql_ast_v3::SelectStatement::builder()
+                .select(SelectItem::expression(SqlDomainExpr::literal(
+                    LiteralValue::Number("1".to_string()),
+                )))
+                .from_subquery(query, wrap_alias)
+                .where_clause(where_expr)
+                .build()
+                .map_err(|e| DelightQLError::ParseError {
+                    message: format!("membership EXISTS wrapper: {}", e),
+                    source: None,
+                    subcategory: None,
+                })?;
+            let exists_query = sql_ast_v3::QueryExpression::Select(Box::new(select));
+            Ok(SqlPredicate::new(if negated {
+                SqlDomainExpr::not_exists(exists_query)
+            } else {
+                SqlDomainExpr::exists(exists_query)
             }))
         }
 
+        // Literal membership is the same doctrine without a subquery:
+        // OR over candidates of (AND over components of) IS NOT
+        // DISTINCT FROM. The chain is two-valued, so negation is safe.
         ast_addressed::BooleanExpression::In {
             value,
             set,
             negated,
         } => {
-            let lhs = s_lower_expression(*value, qualify, ctx)?;
-            let values = set
+            let probes = split_tuple(*value)
                 .into_iter()
-                .map(|v| s_lower_expression(v, qualify, ctx))
+                .map(|p| s_lower_expression(p, qualify, ctx))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(SqlPredicate::new(SqlDomainExpr::InList {
-                expr: Box::new(lhs),
-                not: negated,
-                values,
-            }))
+            let mut member_terms: Vec<SqlDomainExpr> = Vec::with_capacity(set.len());
+            for member in set {
+                let elems = split_tuple(member);
+                if elems.len() != probes.len() {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "semantic/membership/arity",
+                        format!(
+                            "membership candidate has {} value(s) but the probe has {}",
+                            elems.len(),
+                            probes.len()
+                        ),
+                        "every candidate must match the probe's width",
+                    ));
+                }
+                let pairs: Vec<SqlDomainExpr> = elems
+                    .into_iter()
+                    .map(|e| s_lower_expression(e, qualify, ctx))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .zip(probes.iter().cloned())
+                    .map(|(candidate, probe)| probe.is_not_distinct_from(candidate))
+                    .collect();
+                member_terms.push(if pairs.len() == 1 {
+                    pairs.into_iter().next().expect("one pair")
+                } else {
+                    SqlDomainExpr::and(pairs)
+                });
+            }
+            let membership = match member_terms.len() {
+                0 => SqlDomainExpr::literal(LiteralValue::Boolean(false)),
+                1 => member_terms.into_iter().next().expect("one term"),
+                _ => SqlDomainExpr::or(member_terms),
+            };
+            let pred = SqlPredicate::new(SqlDomainExpr::Parens(Box::new(membership)));
+            Ok(if negated { pred.not() } else { pred })
         }
 
         ast_addressed::BooleanExpression::Sigma { condition } => {
@@ -368,6 +458,44 @@ fn s_lower_inner_exists(
         SqlDomainExpr::not_exists(query)
     };
     Ok(SqlPredicate::new(expr))
+}
+
+/// Split a tuple probe into its components; a non-tuple is a 1-tuple.
+fn split_tuple(
+    expr: ast_addressed::DomainExpression,
+) -> Vec<ast_addressed::DomainExpression> {
+    match expr {
+        ast_addressed::DomainExpression::Tuple { elements, .. } => elements,
+        other => vec![other],
+    }
+}
+
+/// The output column names a membership EXISTS wrapper can address on
+/// a subquery. `None` when any column is anonymous (bare star or an
+/// unaliased non-column expression).
+fn membership_output_columns(query: &sql_ast_v3::QueryExpression) -> Option<Vec<String>> {
+    match query {
+        sql_ast_v3::QueryExpression::Select(select) => select
+            .select_list()
+            .iter()
+            .map(|item| match item {
+                SelectItem::Expression {
+                    alias: Some(alias), ..
+                } => Some(alias.clone()),
+                SelectItem::Expression {
+                    expr: SqlDomainExpr::Column { name, .. },
+                    alias: None,
+                } => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
+        // Set operations take their heading from the first operand.
+        sql_ast_v3::QueryExpression::SetOperation { left, .. } => {
+            membership_output_columns(left)
+        }
+        sql_ast_v3::QueryExpression::WithCte { query, .. } => membership_output_columns(query),
+        sql_ast_v3::QueryExpression::Values { .. } => None,
+    }
 }
 
 /// Map a DQL comparison operator string to a SQL `BinaryOperator`.
@@ -1226,7 +1354,14 @@ fn s_lower_case_with_operand(
 ) -> Result<SqlDomainExpr> {
     use crate::pipeline::asts::core::expressions::CaseArm;
 
-    let mut case_expr: Option<SqlDomainExpr> = operand;
+    // Simple match is EXACT SUGAR for the searched form with null-safe
+    // comparisons: each simple arm lowers to `WHEN subject IS NOT
+    // DISTINCT FROM value`, so a null literal arm FIRES on a null
+    // subject (a match arm is a bit-question; null is a value there).
+    // SQL's simple `CASE x WHEN v` compares three-valued and makes a
+    // null arm dead code — that form is deliberately never emitted.
+    let mut subject: Option<SqlDomainExpr> = operand;
+    let case_expr: Option<SqlDomainExpr> = None;
     let mut when_clauses: Vec<WhenClause> = Vec::new();
     let mut else_clause: Option<SqlDomainExpr> = None;
 
@@ -1238,16 +1373,22 @@ fn s_lower_case_with_operand(
                 result,
             } => {
                 // All Simple arms share the same test_expr
-                if case_expr.is_none() {
-                    case_expr = Some(s_lower_expression(*test_expr, qualify, ctx)?);
+                if subject.is_none() {
+                    subject = Some(s_lower_expression(*test_expr, qualify, ctx)?);
                 }
-                let when = s_lower_literal(&value)?;
+                let subj = subject.clone().expect("subject set above");
+                let when = subj.is_not_distinct_from(s_lower_literal(&value)?);
                 let then = s_lower_expression(*result, qualify, ctx)?;
                 when_clauses.push(WhenClause::new(when, then));
             }
             CaseArm::CurriedSimple { value, result } => {
                 // CurriedSimple: operand is @ (supplied via `operand` param)
-                let when = s_lower_literal(&value)?;
+                let subj = subject.clone().ok_or_else(|| DelightQLError::ParseError {
+                    message: "curried simple CASE arm without an operand".to_string(),
+                    source: None,
+                    subcategory: None,
+                })?;
+                let when = subj.is_not_distinct_from(s_lower_literal(&value)?);
                 let then = s_lower_expression(*result, qualify, ctx)?;
                 when_clauses.push(WhenClause::new(when, then));
             }

@@ -792,6 +792,12 @@ pub(super) fn resolve_interior_drill_down(
             ast_resolved::TableName::Named(column.clone().into()),
             Some(output_columns.len() + idx + 1),
         );
+        // Argumentative drill binding DECLARES bare lvars, like every
+        // argumentative access — a positional alias here participates
+        // in full-name-identity unification.
+        if positional_aliases.is_some() {
+            col.declared_bare = true;
+        }
         // If this interior column has its own nested interior, mark it
         if def.child_interior.is_some() {
             col.interior_schema = def.child_interior.clone();

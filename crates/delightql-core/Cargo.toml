@@ -10,6 +10,7 @@ repository.workspace = true
 delightql-types = { path = "../delightql-types" }
 delightql-macros = { path = "../delightql-macros" }
 delightql-protocol = { path = "../delightql-protocol" }
+delightql-formatter = { path = "../delightql-formatter", default-features = false }
 # Workspace dependencies
 tree-sitter.workspace = true
 serde.workspace = true

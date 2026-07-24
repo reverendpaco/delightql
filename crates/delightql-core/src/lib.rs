@@ -13,6 +13,7 @@ pub(crate) mod namespace;
 pub(crate) mod pipeline;
 pub(crate) mod resolution;
 pub mod session_cwd;
+pub mod term_spec;
 pub(crate) mod seed_manifest;
 pub(crate) mod sexp_formatter;
 pub(crate) mod stdlib_manifest;

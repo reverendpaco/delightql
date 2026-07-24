@@ -870,6 +870,7 @@ fn remap_argumentative_lvar_names(query: &mut Query, remap: &HashMap<String, (St
             alias: None,
             outer: false,
             exists_mode: false,
+            negated: false,
             qua_target: None,
             cpr_schema: crate::pipeline::asts::unresolved::PhaseBox::phantom(),
         })),
@@ -881,6 +882,7 @@ fn remap_argumentative_lvar_names(query: &mut Query, remap: &HashMap<String, (St
             alias: None,
             outer: false,
             exists_mode: false,
+            negated: false,
             qua_target: None,
             cpr_schema: crate::pipeline::asts::unresolved::PhaseBox::phantom(),
         }))

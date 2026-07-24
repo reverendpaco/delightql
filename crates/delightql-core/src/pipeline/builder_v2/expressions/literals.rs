@@ -142,8 +142,27 @@ pub(in crate::pipeline::builder_v2) fn parse_literal(node: CstNode) -> Result<Do
             Ok(DomainExpression::literal_builder(LiteralValue::Boolean(value)).build())
         }
         "null_literal" => Ok(DomainExpression::literal_builder(LiteralValue::Null).build()),
+        "symbol" => Ok(build_symbol(child.text())),
+        "delimited_mention" => build_mention(child.text()),
         _ => Err(DelightQLError::parse_error("Unknown literal type")),
     }
+}
+
+/// Symbol: ::active — a self-valued name; carries "::active".
+/// Stores the bare name (no `::`).
+pub(in crate::pipeline::builder_v2) fn build_symbol(text: &str) -> DomainExpression {
+    let name = text.trim_start_matches("::").to_string();
+    DomainExpression::literal_builder(LiteralValue::Symbol(name)).build()
+}
+
+/// Delimited mention: :`term` — capture-then-subparse. The interior
+/// must be a term; it is canonicalized at build time (the shared
+/// token helper carries the identifier-interior refusal), so the
+/// literal carries the canonical spelling and two mentions of one
+/// term are equal by construction.
+pub(in crate::pipeline::builder_v2) fn build_mention(text: &str) -> Result<DomainExpression> {
+    let canonical = crate::term_spec::mention_interior_from_token(text)?;
+    Ok(DomainExpression::literal_builder(LiteralValue::Mention(canonical)).build())
 }
 
 pub(in crate::pipeline::builder_v2) fn parse_column_ordinal(

@@ -18,7 +18,6 @@ use super::asts::core::{DangerSpec, DangerState};
 /// Guardrail dangers (execution policy) may be overridden from the CLI.
 const KNOWN_DANGERS: &[(&str, DangerState, bool)] = &[
     //                                          default           cli_overridable
-    ("delightql-danger://cardinality/nulljoin", DangerState::Off, false),
     ("delightql-danger://cardinality/cartesian", DangerState::Off, true),
     ("delightql-danger://termination/unbounded", DangerState::Off, true),
     ("delightql-danger://semantics/min_multiplicity", DangerState::Off, false), // semantic — inline-only
@@ -71,6 +70,20 @@ pub fn canonical_danger_uri(input: &str) -> String {
     }
 }
 
+/// Gates REMOVED by ruling. Guessing one teaches the replacement —
+/// never a silent no-op, and never a bare "unknown".
+pub fn removed_danger_teaching(uri: &str) -> Option<&'static str> {
+    match uri.trim_start_matches(DANGER_URI_SCHEME) {
+        // Null never corresponds in a join: a null that is meant to
+        // match is a value wearing null's clothes. There is no gate
+        // back into null-matching ON clauses; name the value instead.
+        "cardinality/nulljoin" => Some(
+            "the cardinality/nulljoin gate was removed: null never corresponds in a join. A null that is meant to match is a value wearing null's clothes — name it and join on the named key, e.g. +(coalesce:(k, \"unassigned\") as k_key) on both sides, then k_key = k_key",
+        ),
+        _ => None,
+    }
+}
+
 /// Bare hierarchies of all known dangers (for teaching errors).
 pub fn known_danger_hierarchies() -> Vec<&'static str> {
     KNOWN_DANGERS
@@ -104,6 +117,12 @@ pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
     })?;
     let uri = canonical_danger_uri(hierarchy.trim());
 
+    if let Some(teaching) = removed_danger_teaching(&uri) {
+        return Err(crate::error::DelightQLError::validation_error(
+            teaching.to_string(),
+            "parse_cli_danger_spec",
+        ));
+    }
     if !KNOWN_DANGERS.iter().any(|(known, _, _)| *known == uri) {
         return Err(crate::error::DelightQLError::validation_error(
             format!(
@@ -168,10 +187,20 @@ mod cli_danger_spec_tests {
     // the tempting regression.
     #[test]
     fn non_overridable_gate_refuses_with_inline_teaching() {
-        let err = parse_cli_danger_spec("cardinality/nulljoin=ON").unwrap_err();
+        let err = parse_cli_danger_spec("semantics/min_multiplicity=ON").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("inline"), "must teach the inline spelling: {msg}");
-        assert!(msg.contains("(~~danger://cardinality/nulljoin ON~~)"), "{msg}");
+        assert!(
+            msg.contains("(~~danger://semantics/min_multiplicity ON~~)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn removed_nulljoin_gate_teaches_the_named_value_pattern() {
+        let err = parse_cli_danger_spec("cardinality/nulljoin=ON").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("null never corresponds in a join"), "{msg}");
     }
 
     #[test]

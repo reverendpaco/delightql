@@ -508,6 +508,14 @@ pub(super) fn parse_tvf_argument_as_domain_expression(node: CstNode) -> Result<D
                 ))
                 .build());
             }
+            // Mention grounds a call-site position by its canonical
+            // encoding — same builders as every other mention site.
+            "symbol" => {
+                return Ok(super::expressions::literals::build_symbol(child.text()));
+            }
+            "delimited_mention" => {
+                return super::expressions::literals::build_mention(child.text());
+            }
             "identifier" => {
                 return Ok(
                     DomainExpression::lvar_builder(crate::pipeline::cst::unstrop(child.text()))
@@ -893,13 +901,11 @@ pub(super) fn parse_anonymous_table(
 ) -> Result<Relation> {
     let outer = node.has_child("outer_marker");
 
-    // Check for exists_marker prefix (+_() or \+_())
-    let exists_mode = if let Some(exists_marker_node) = node.find_child("exists_marker") {
-        let marker_text = exists_marker_node.text();
-        marker_text == "+" || marker_text == "\\+"
-    } else {
-        false
-    };
+    // The grammar aliases the open tokens: +_( → exists_anon_open,
+    // \+_( → not_exists_anon_open. The marker IS the open token —
+    // there is no separate exists_marker child.
+    let negated = node.has_child("not_exists_anon_open");
+    let exists_mode = negated || node.has_child("exists_anon_open");
 
     // Check for qua target: _(cols @ data) qua target_table
     let qua_target = node
@@ -939,6 +945,9 @@ pub(super) fn parse_anonymous_table(
                         super::expressions::parse_expression(qc_node, &mut FeatureCollector::new())?
                     } else if let Some(fc_node) = child.find_child("function_call") {
                         parse_function_call(fc_node)?
+                    } else if let Some(lit_node) = child.find_child("literal") {
+                        // Ground header: a membership probe (inverted In)
+                        super::expressions::parse_expression(lit_node, &mut FeatureCollector::new())?
                     } else {
                         continue; // Skip unknown children
                     };
@@ -1041,12 +1050,34 @@ pub(super) fn parse_anonymous_table(
         }
     }
 
+    // `_()` parses as one row holding a single empty-name lvar. There
+    // is no empty anonymous table: it silently fabricated a 1×1
+    // empty-string relation, and it is not the union identity either —
+    // that is the empty relation OF THE MATCHING SCHEMA, whose typed
+    // spelling (`_(cols @)`) is reserved.
+    let is_empty_anon = column_headers.is_none()
+        && rows.len() == 1
+        && rows[0].values.len() == 1
+        && matches!(
+            &rows[0].values[0],
+            DomainExpression::Lvar { name, .. } if name.as_str().is_empty()
+        );
+    if is_empty_anon {
+        return Err(DelightQLError::parse_error_categorized(
+            "anon/empty",
+            "there is no empty anonymous table: `_()` names no relation. \
+The union identity is the empty relation of the matching schema; its typed \
+spelling (`_(cols @)`) is reserved and not yet available",
+        ));
+    }
+
     Ok(Relation::Anonymous {
         column_headers,
         rows,
         alias: alias.map(|s| s.into()),
         outer,
         exists_mode,
+        negated,
         qua_target,
         cpr_schema: PhaseBox::phantom(),
     })

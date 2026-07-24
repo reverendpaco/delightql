@@ -162,6 +162,7 @@ pub fn parse_queries(
                 alias: None,
                 outer: false,
                 exists_mode: false,
+            negated: false,
                 qua_target: None,
                 cpr_schema: PhaseBox::phantom(),
             }));
@@ -265,6 +266,7 @@ pub fn parse_repl_input(
                 alias: None,
                 outer: false,
                 exists_mode: false,
+            negated: false,
                 qua_target: None,
                 cpr_schema: PhaseBox::phantom(),
             }));

@@ -10,6 +10,19 @@ pub enum LiteralValue {
     Number(String),
     Boolean(bool),
     Null,
+    /// A self-valued name: `::active` carries the string "::active".
+    /// Identity and typo-safety are compile-time properties; at
+    /// execution it is byte-identical to that string. Stores the bare
+    /// name (no `::`).
+    Symbol(String),
+    /// A delimited mention: `` :`people(*)` `` — the other spelling of
+    /// mention (Symbol is the light spelling). Stores the CANONICAL
+    /// interior (the term canonicalizer runs at build time), so two
+    /// mentions of one term are equal as values by construction. At
+    /// execution it is byte-identical to its encoding, marker
+    /// included: the string `` :`people(*)` ``. Naked spellings are
+    /// catalog storage, never the value position.
+    Mention(String),
 }
 
 impl std::fmt::Display for LiteralValue {
@@ -19,6 +32,8 @@ impl std::fmt::Display for LiteralValue {
             LiteralValue::Number(n) => write!(f, "{}", n),
             LiteralValue::Boolean(b) => write!(f, "{}", b),
             LiteralValue::Null => write!(f, "null"),
+            LiteralValue::Symbol(name) => write!(f, "::{}", name),
+            LiteralValue::Mention(canonical) => write!(f, ":`{}`", canonical),
         }
     }
 }

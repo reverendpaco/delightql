@@ -434,6 +434,7 @@ pub(super) fn flatten_relation(
             cpr_schema,
             outer,
             exists_mode,
+            negated: _,
         } => {
             log::debug!(
                 "Flattening anonymous table with {} headers",

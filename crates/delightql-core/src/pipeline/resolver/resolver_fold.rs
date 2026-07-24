@@ -909,7 +909,13 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             (resolved, bubbled, join_cond, vec![])
                         }
                     }
-                    ast_unresolved::Relation::Anonymous { column_headers, .. } => {
+                    ast_unresolved::Relation::Anonymous {
+                        column_headers,
+                        exists_mode,
+                        negated,
+                        alias: anon_alias,
+                        ..
+                    } => {
                         // Handle anonymous table unification
                         let (resolved, bubbled) = self.resolve_child(
                             right.clone(),
@@ -925,16 +931,58 @@ impl<'reg, 'db> ResolverFold<'reg, 'db> {
                             other => panic!("catch-all hit in mod.rs resolve_relational_expression (anonymous table right_columns): {:?}", other),
                         };
 
-                        // Check for unification opportunities based on column names
+                        // Check for unification opportunities based on column
+                        // names. An ALIASED anon table is a closed relation —
+                        // its headers declare under the alias, so they neither
+                        // unify bare nor collide; the refusal-free probe only
+                        // detects membership shape (which refuses the alias).
+                        // Witness markers keep the full scan: they demand
+                        // membership shape outright.
                         let anon_join_condition = if let Some(headers) = column_headers {
-                            super::detect_anonymous_table_unification(
-                                headers,
-                                &left_columns,
-                                &right_columns,
-                            )?
+                            if anon_alias.is_some() && !exists_mode {
+                                super::join_resolver::aliased_anon_would_unify(
+                                    headers,
+                                    &left_columns,
+                                )
+                            } else {
+                                super::detect_anonymous_table_unification(
+                                    headers,
+                                    &left_columns,
+                                    &right_columns,
+                                )?
+                            }
                         } else {
                             None
                         };
+
+                        // Membership routing. An anonymous table whose every
+                        // header is a probe — a ground literal, or an lvar
+                        // that unifies with a column in scope — is not a
+                        // relation but a membership test: the probe tuple
+                        // must (or, under \+, must not) match one of the
+                        // rows. The witness forms (+_, \+_) demand this
+                        // shape; the plain comma form takes it whenever
+                        // every column unifies, because multi-row
+                        // unification is membership — a duplicate row
+                        // cannot multiply outer rows, and a null component
+                        // is a value the probe can match.
+                        if let Some(membership) = super::join_resolver::build_anon_membership(
+                            column_headers.as_deref(),
+                            &anon_join_condition,
+                            &left_columns,
+                            &resolved,
+                            *exists_mode,
+                            *negated,
+                            anon_alias.as_ref(),
+                        )? {
+                            let filter = ast_resolved::RelationalExpression::Filter {
+                                source: Box::new(resolved_left),
+                                condition: ast_resolved::SigmaCondition::Predicate(membership),
+                                origin: ast_resolved::FilterOrigin::UserWritten,
+                                cpr_schema: ast_resolved::PhaseBox::new(left_schema.clone()),
+                            };
+                            return Ok((filter, left_bubbled));
+                        }
 
                         (resolved, bubbled, anon_join_condition, vec![])
                     }
@@ -2176,19 +2224,33 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                     let mut args = arguments.into_iter();
                     let value_arg = args.next().expect("len checked");
                     let type_arg = args.next().expect("len checked");
+                    // The type is a closed-set tag — a SYMBOL. A bare
+                    // name here is use (an lvar), and reading its
+                    // spelling as data would recover mention from use.
                     let type_name = match &type_arg {
-                        ast_unresolved::DomainExpression::Lvar {
-                            name: atom,
-                            qualifier: None,
-                            namespace_path,
+                        ast_unresolved::DomainExpression::Literal {
+                            value: crate::pipeline::asts::core::literals::LiteralValue::Symbol(s),
                             ..
-                        } if namespace_path.is_empty() => atom.as_ref().to_string(),
+                        } => s.clone(),
+                        ast_unresolved::DomainExpression::Lvar {
+                            qualifier: None, ..
+                        } => {
+                            return Err(DelightQLError::validation_error_categorized(
+                                "cast",
+                                format!(
+                                    "cast: a bare name is use; the type is a tag — write \
+                                     cast:(x, ::integer). Types: {}",
+                                    CAST_TYPES.join("|")
+                                ),
+                                "cast resolution",
+                            ));
+                        }
                         ast_unresolved::DomainExpression::Literal { .. } => {
                             return Err(DelightQLError::validation_error_categorized(
                                 "cast",
                                 format!(
-                                    "cast: takes a bare type name, not a string — write \
-                                     cast:(x, integer). Types: {}",
+                                    "cast: takes a type symbol, not a string — write \
+                                     cast:(x, ::integer). Types: {}",
                                     CAST_TYPES.join("|")
                                 ),
                                 "cast resolution",
@@ -2198,7 +2260,7 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                             return Err(DelightQLError::validation_error_categorized(
                                 "cast",
                                 format!(
-                                    "cast: second argument must be a bare type name. \
+                                    "cast: second argument must be a type symbol. \
                                      Types: {}",
                                     CAST_TYPES.join("|")
                                 ),

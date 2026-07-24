@@ -87,10 +87,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// - Assertions abort the run on failure exactly as `handle_query` does
     ///   today — same verdict hooks, same error identity and message shape
     ///   (`assertion_failure_mid_plan_aborts_and_rolls_back`).
-    /// - Emit entries deliver through `on_emit` and TOLERATE execution
-    ///   errors exactly as today (error-hook verdict, run continues) — an
-    ///   emit failure is not an abort, so it also never triggers a rollback
-    ///   (`emit_error_is_tolerated_and_run_continues`).
     /// - Shipped result sets, per the Epic-3 protocol ruling: non-final
     ///   `ShippedStatement`s deliver live through `on_ship` in execution
     ///   order; the FINAL one is the run's return value. It streams through

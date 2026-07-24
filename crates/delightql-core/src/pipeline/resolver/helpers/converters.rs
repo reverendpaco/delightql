@@ -45,6 +45,8 @@ pub(in super::super) fn convert_literal_value(
         ast_unresolved::LiteralValue::Number(n) => ast_resolved::LiteralValue::Number(n),
         ast_unresolved::LiteralValue::Boolean(b) => ast_resolved::LiteralValue::Boolean(b),
         ast_unresolved::LiteralValue::Null => ast_resolved::LiteralValue::Null,
+        ast_unresolved::LiteralValue::Symbol(s) => ast_resolved::LiteralValue::Symbol(s),
+        ast_unresolved::LiteralValue::Mention(s) => ast_resolved::LiteralValue::Mention(s),
     }
 }
 

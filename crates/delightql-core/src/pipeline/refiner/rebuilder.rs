@@ -473,7 +473,8 @@ fn build_anonymous_relation(
         rows: anon_data.rows.iter().map(|r| r.clone().into()).collect(),
         alias: alias.clone().map(|s| s.into()),
         outer,
-        exists_mode: anon_data.exists_mode, // EPOCH 3: Preserve EXISTS mode flag
+        exists_mode: anon_data.exists_mode,
+        negated: false,
         qua_target: None,
         cpr_schema: schema_box,
     })
