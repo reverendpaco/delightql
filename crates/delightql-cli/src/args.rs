@@ -101,10 +101,6 @@ pub enum Command {
         #[arg(long, short = 'q')]
         quiet: bool,
 
-        /// Unsupported: use consult!() in DQL source instead
-        #[arg(long = "consult")]
-        consult_files: Vec<PathBuf>,
-
         /// Attach external database
         #[arg(long = "attach")]
         attach: Vec<String>,
@@ -122,10 +118,6 @@ pub enum Command {
         /// Execute multiple queries sequentially (for files with multiple queries)
         #[arg(long)]
         sequential: bool,
-
-        /// Bind a named emit stream to a file sink (name=path); repeatable
-        #[arg(long = "sink")]
-        sinks: Vec<String>,
 
         /// Open a danger gate (hierarchy=STATE, e.g. cardinality/cartesian=ON); repeatable
         #[arg(long = "danger")]
@@ -445,5 +437,27 @@ impl DebugOptions {
         }
 
         opts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consult_flag_is_removed() {
+        // --consult was retired: consult!() in DQL source is the one
+        // spelling. The flag must not quietly return as an alias.
+        let parsed = CliArgs::try_parse_from(["dql", "query", "--consult", "x.dql", "users(*)"]);
+        assert!(parsed.is_err(), "--consult must be an unknown flag");
+    }
+
+    #[test]
+    fn sink_flag_is_removed() {
+        // Emit is a silent reserve: no CLI surface may advertise or
+        // accept a sink binding. Row fan-out belongs to the effect
+        // algebra (stdout!, sink!) when it lands.
+        let parsed = CliArgs::try_parse_from(["dql", "query", "--sink", "a=b.csv", "users(*)"]);
+        assert!(parsed.is_err(), "--sink must be an unknown flag");
     }
 }

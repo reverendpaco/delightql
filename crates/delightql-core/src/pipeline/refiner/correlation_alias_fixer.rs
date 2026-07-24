@@ -32,6 +32,8 @@ pub fn fix_correlation_aliases(
     Ok(result)
 }
 
+
+
 // =============================================================================
 // CorrelationAliasFold — AstTransform<Resolved, Resolved>
 // =============================================================================
@@ -73,15 +75,7 @@ impl AstTransform<Resolved, Resolved> for CorrelationAliasFold {
                     identifier.name
                 );
 
-                // Detect HO substitution: identifier name differs from actual inner table name.
-                // When HO-substituted, qualifiers in the condition likely refer to the outer
-                // table, not the inner one, so disable the short-alias heuristic.
-                let inner_name = extract_base_relation_name(&subquery);
-                let allow_short = inner_name
-                    .as_deref()
-                    .map_or(true, |n| &identifier.name == n);
-
-                let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
+                let inferred_alias = infer_table_alias(&identifier.name, &subquery);
                 let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
 
                 // Return directly — do NOT recurse into subquery (separate scope)
@@ -107,13 +101,7 @@ impl AstTransform<Resolved, Resolved> for CorrelationAliasFold {
                 alias,
                 using_columns,
             } => {
-                // Detect HO substitution: identifier name differs from actual inner table name.
-                let inner_name = extract_base_relation_name(&subquery);
-                let allow_short = inner_name
-                    .as_deref()
-                    .map_or(true, |n| &identifier.name == n);
-
-                let inferred_alias = infer_table_alias(&identifier.name, &subquery, allow_short);
+                let inferred_alias = infer_table_alias(&identifier.name, &subquery);
                 let fixed_subquery = apply_alias_to_base_relation(*subquery, inferred_alias);
 
                 // Return directly — do NOT recurse into subquery (separate scope)
@@ -132,22 +120,23 @@ impl AstTransform<Resolved, Resolved> for CorrelationAliasFold {
 
 /// Infer the table alias from qualified references in the subquery.
 ///
-/// `allow_short_alias`: when true, PRIORITY 2 (short-qualifier heuristic) is enabled.
-/// Set to false for HO-substituted subqueries where qualifiers may refer to the
-/// outer table, not the inner one.
+/// Explicit always wins: the ONLY inference is the inner table's own
+/// name used as a qualifier (`orders:(, orders.id = u.id)`). There is
+/// deliberately no shorthand guess — a former ≤3-char-qualifier
+/// heuristic captured resolvable names (declared aliases, short table
+/// names) as the inner alias, silently breaking correlation; an
+/// undeclared qualifier already refuses at resolution.
 fn infer_table_alias(
     table_name: &str,
     subquery: &resolved::RelationalExpression,
-    allow_short_alias: bool,
 ) -> Option<String> {
     let mut qualifiers = Vec::new();
     extract_qualifiers_from_relational_in_scope(subquery, &mut qualifiers);
 
     log::debug!(
-        "infer_table_alias for table '{}': found qualifiers: {:?}, allow_short_alias: {}",
+        "infer_table_alias for table '{}': found qualifiers: {:?}",
         table_name,
-        qualifiers,
-        allow_short_alias
+        qualifiers
     );
 
     // PRIORITY 1: If table name itself is used as qualifier, use that
@@ -158,22 +147,6 @@ fn infer_table_alias(
             table_name
         );
         return Some(table_name.to_string());
-    }
-
-    // PRIORITY 2: Look for short qualifiers that could be aliases
-    // Only if table name itself is NOT used.
-    // Disabled for HO-substituted subqueries where short qualifiers (like 't')
-    // typically refer to the outer table's alias, not the inner table.
-    if allow_short_alias {
-        for qualifier in &qualifiers {
-            if qualifier != table_name
-                && qualifier.len() <= 3
-                && qualifier.chars().all(|c| c.is_alphanumeric())
-            {
-                log::debug!("infer_table_alias: using alias '{}'", qualifier);
-                return Some(qualifier.clone());
-            }
-        }
     }
 
     log::debug!(
@@ -468,7 +441,7 @@ fn extract_qualifiers_from_operator(
         resolved::UnaryRelationalOperator::TupleOrdering { .. }
         | resolved::UnaryRelationalOperator::ProjectOut { .. }
         | resolved::UnaryRelationalOperator::RenameCover { .. }
-        | resolved::UnaryRelationalOperator::MetaIze { .. }
+        | resolved::UnaryRelationalOperator::MetaIze
         | resolved::UnaryRelationalOperator::Witness { .. }
         | resolved::UnaryRelationalOperator::Qualify
         | resolved::UnaryRelationalOperator::Using { .. }

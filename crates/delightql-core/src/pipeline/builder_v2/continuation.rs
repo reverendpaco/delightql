@@ -45,9 +45,7 @@ fn handle_continuation_inner(
                 if let Some(assertion) = extract_assertion_from_annotation(child, &cpr, features)? {
                     features.add_assertion(assertion);
                 }
-                if let Some(emit) = extract_emit_from_annotation(child, &cpr, features)? {
-                    features.add_emit(emit);
-                }
+                refuse_emit_annotation(child)?;
                 if let Some(danger) = extract_danger_from_annotation(child)? {
                     features.add_danger(danger);
                 }
@@ -791,51 +789,25 @@ fn extract_assertion_from_annotation(
     }))
 }
 
-/// Check if an annotation CST node is an emit annotation, and if so,
-/// parse it into an EmitSpec. Returns None for non-emit annotations.
-fn extract_emit_from_annotation(
-    meta_node: CstNode,
-    cpr: &RelationalExpression,
-    features: &mut FeatureCollector,
-) -> Result<Option<crate::pipeline::asts::core::EmitSpec>> {
-    // annotation → annotation_body → emit_annotation
+/// Emit is a silent reserve: no surface advertises it, and guessing the
+/// syntax gets this refusal rather than a silent no-op. Row fan-out is
+/// the effect algebra's territory (stdout!, sink!) when it lands; until
+/// then the annotation parses (the grammar keeps the form) and refuses
+/// here, before any feature collection.
+fn refuse_emit_annotation(meta_node: CstNode) -> Result<()> {
     let ann_body = match meta_node.find_child("annotation_body") {
         Some(b) => b,
-        None => return Ok(None),
+        None => return Ok(()),
     };
-    let emit_ann = match ann_body.find_child("emit_annotation") {
-        Some(a) => a,
-        None => return Ok(None),
-    };
-
-    // Emit destination: either ://uri (inline) or :identifier (named stream).
-    // Inline URIs get prefixed with "//" to reconstruct the full protocol URI.
-    let name = if let Some(uri_text) = emit_ann.field_text("emit_uri") {
-        format!("//{}", uri_text)
-    } else {
-        emit_ann
-            .field_text("emit_name")
-            .unwrap_or_else(|| "default".to_string())
-    };
-
-    // Fork: if the emit has a body (predicate continuation), apply it to
-    // the CPR. Otherwise, capture the full relation unchanged.
-    let emit_expr = if let Some(emit_body) = emit_ann.field("emit_body") {
-        handle_continuation(emit_body, cpr.clone(), features)?
-    } else {
-        cpr.clone()
-    };
-
-    let source_location = Some((
-        emit_ann.raw_node().start_byte(),
-        emit_ann.raw_node().end_byte(),
-    ));
-
-    Ok(Some(crate::pipeline::asts::core::EmitSpec {
-        name,
-        body: emit_expr,
-        source_location,
-    }))
+    if ann_body.find_child("emit_annotation").is_some() {
+        return Err(DelightQLError::validation_error_categorized(
+            "annotation/emit/reserved",
+            "emit annotations are reserved: row fan-out belongs to the \
+             effect algebra (stdout!, sink!) and is not yet implemented",
+            "remove the (~~emit ...~~) annotation",
+        ));
+    }
+    Ok(())
 }
 
 /// Extract a danger gate spec from an annotation.

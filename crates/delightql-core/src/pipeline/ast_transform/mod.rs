@@ -988,9 +988,7 @@ pub fn walk_transform_operator<P, Q, F: AstTransform<P, Q> + ?Sized>(
             domain_spec: t.transform_domain_spec(domain_spec)?,
         }),
         // Leaf operators — no recursive children, phase-agnostic
-        UnaryRelationalOperator::MetaIze { detailed } => {
-            Ok(UnaryRelationalOperator::MetaIze { detailed })
-        }
+        UnaryRelationalOperator::MetaIze => Ok(UnaryRelationalOperator::MetaIze),
         UnaryRelationalOperator::Witness { exists } => {
             Ok(UnaryRelationalOperator::Witness { exists })
         }

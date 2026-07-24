@@ -67,19 +67,6 @@ pub struct AssertionSpec {
 /// sink. The main pipeline continues unchanged; the emit body is compiled
 /// independently to a separate SQL query that the host executes and routes.
 ///
-/// Created by the builder when it encounters `(~~emit:name ... ~~)` in the CST.
-/// If the emit has a body (`, predicate`), the forked relation is filtered.
-/// If no body, the full relation at that point is captured.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EmitSpec {
-    /// Instance name from `(~~emit:name ~~)`.
-    pub name: String,
-    /// The forked sub-query (optionally filtered by the emit body).
-    pub body: RelationalExpression<Unresolved>,
-    /// Source location for error reporting (byte start, byte end).
-    pub source_location: Option<(usize, usize)>,
-}
-
 // ============================================================================
 // Danger Gate Types
 // ============================================================================

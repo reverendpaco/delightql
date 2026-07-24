@@ -53,11 +53,6 @@ means stdin.
 Execute multiple queries sequentially (for files with multiple
 queries).
 .TP
-.BI \-\-consult " FILE"
-Unsupported \(em refuses with a pointer: use
-.B consult!()
-in the DQL source instead, which also works in files and the REPL.
-.TP
 .BI \-\-attach " ATTACH"
 Attach an external database.
 .SS Compilation
@@ -208,10 +203,6 @@ to start the REPL on a fresh database (see
 .TP
 .BI \-\-debug " OPTS"
 Debug options, comma-separated.
-.TP
-.BI \-\-sink " NAME=PATH"
-Bind a named emit stream to a file sink. Unbound streams fall back to
-RS-prefixed records on stderr. May be repeated.
 .TP
 .BI \-\-danger " HIERARCHY=STATE"
 Open a danger gate for this session. STATE is ON, OFF, ALLOW, or 1\-9.

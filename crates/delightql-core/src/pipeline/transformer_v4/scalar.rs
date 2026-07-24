@@ -675,6 +675,16 @@ fn wrap_conditioned_on(
                                 }
                                 _ => arg,
                             };
+                            // `*` is count's special whole-row argument, not
+                            // a scalar a CASE branch can return — count rows
+                            // via a literal 1 instead: count(CASE WHEN cond
+                            // THEN 1 END) counts exactly the matching rows.
+                            let inner = match inner {
+                                SqlDomainExpr::Star => SqlDomainExpr::literal(
+                                    ast_addressed::LiteralValue::Number("1".to_string()),
+                                ),
+                                other => other,
+                            };
                             SqlDomainExpr::Case {
                                 expr: None,
                                 when_clauses: vec![WhenClause::new(cond_sql.clone(), inner)],

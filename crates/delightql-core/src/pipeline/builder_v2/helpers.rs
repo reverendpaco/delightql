@@ -155,3 +155,25 @@ pub(super) fn apply_alias_to_expression(expr: &mut DomainExpression, alias: Opti
         }
     }
 }
+
+#[cfg(test)]
+mod red_pins {
+    // RED pin (book-contract harvest 2026-07-23, sigma-as-column.md:38
+    // adjudication): a parenthesized comma-tuple in column position —
+    // `(age > 30 , city = "x") as t` — reaches the alias catch-all and
+    // PANICS. The contract (sigils refuse in column position; use
+    // and/or keywords) must refuse with teaching, not crash: the
+    // builder must be total over every tree the parser produces.
+    #[test]
+    fn comma_tuple_in_column_position_errs_without_panic() {
+        let src = r#"people(*) |> +( (age > 30 , city = "Boston") as t )"#;
+        let tree = crate::pipeline::parser::parse(src).expect("parses");
+        let result = std::panic::catch_unwind(|| {
+            crate::pipeline::builder_v2::parse_query(&tree, src)
+        });
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "must be a graceful Err, not a panic (and not Ok)"
+        );
+    }
+}

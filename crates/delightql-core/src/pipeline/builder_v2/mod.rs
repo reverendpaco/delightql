@@ -35,12 +35,11 @@ pub fn parse_query(
     Query,
     HashSet<QueryFeature>,
     Vec<AssertionSpec>,
-    Vec<EmitSpec>,
     Vec<DangerSpec>,
     Vec<OptionSpec>,
     Vec<InlineDdlSpec>,
 )> {
-    let (queries, features, assertions, emits, dangers, options, ddl_blocks) =
+    let (queries, features, assertions, dangers, options, ddl_blocks) =
         parse_queries(tree, source)?;
 
     if queries.is_empty() {
@@ -59,7 +58,6 @@ pub fn parse_query(
         queries.into_iter().next().unwrap(),
         features,
         assertions,
-        emits,
         dangers,
         options,
         ddl_blocks,
@@ -78,7 +76,6 @@ pub fn parse_query_with_bindings(
     Query,
     HashSet<QueryFeature>,
     Vec<AssertionSpec>,
-    Vec<EmitSpec>,
     Vec<DangerSpec>,
     Vec<OptionSpec>,
     Vec<InlineDdlSpec>,
@@ -96,7 +93,6 @@ pub fn parse_query_with_bindings(
     let query = parse_query_node(query_node, &mut features)?;
 
     let assertions = features.take_assertions();
-    let emits = features.take_emits();
     let dangers = features.take_dangers();
     let options = features.take_options();
     let ddl_blocks = features.take_ddl_blocks();
@@ -104,7 +100,6 @@ pub fn parse_query_with_bindings(
         query,
         features.into_features(),
         assertions,
-        emits,
         dangers,
         options,
         ddl_blocks,
@@ -124,7 +119,6 @@ pub fn parse_queries(
     Vec<Query>,
     HashSet<QueryFeature>,
     Vec<AssertionSpec>,
-    Vec<EmitSpec>,
     Vec<DangerSpec>,
     Vec<OptionSpec>,
     Vec<InlineDdlSpec>,
@@ -177,7 +171,6 @@ pub fn parse_queries(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
                 ddl_blocks,
             ));
         }
@@ -191,7 +184,6 @@ pub fn parse_queries(
     }
 
     let assertions = features.take_assertions();
-    let emits = features.take_emits();
     let dangers = features.take_dangers();
     let options = features.take_options();
     let ddl_blocks = features.take_ddl_blocks();
@@ -199,7 +191,6 @@ pub fn parse_queries(
         queries,
         features.into_features(),
         assertions,
-        emits,
         dangers,
         options,
         ddl_blocks,
@@ -220,7 +211,6 @@ pub fn parse_repl_input(
     Query,
     HashSet<QueryFeature>,
     Vec<AssertionSpec>,
-    Vec<EmitSpec>,
     Vec<DangerSpec>,
     Vec<OptionSpec>,
     Vec<InlineDdlSpec>,
@@ -234,16 +224,14 @@ pub fn parse_repl_input(
     if let Some(repl_cmd) = root.find_child("repl_command") {
         let query = parse_repl_command(repl_cmd, &mut features)?;
         let assertions = features.take_assertions();
-        let emits = features.take_emits();
-        let dangers = features.take_dangers();
+            let dangers = features.take_dangers();
         let options = features.take_options();
         let ddl_blocks = features.take_ddl_blocks();
         return Ok((
             query,
             features.into_features(),
             assertions,
-            emits,
-            dangers,
+                dangers,
             options,
             ddl_blocks,
         ));
@@ -286,7 +274,6 @@ pub fn parse_repl_input(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
                 ddl_blocks,
             ));
         }
@@ -295,7 +282,6 @@ pub fn parse_repl_input(
 
     let query = parse_query_node(query_node.unwrap(), &mut features)?;
     let assertions = features.take_assertions();
-    let emits = features.take_emits();
     let dangers = features.take_dangers();
     let options = features.take_options();
     let ddl_blocks = features.take_ddl_blocks();
@@ -303,7 +289,6 @@ pub fn parse_repl_input(
         query,
         features.into_features(),
         assertions,
-        emits,
         dangers,
         options,
         ddl_blocks,
@@ -869,7 +854,7 @@ mod effect_builder_tests {
 
     fn build(source: &str) -> Query {
         let tree = parse(source).expect("source parses");
-        let (query, _f, _a, _e, _d, _o, _b) =
+        let (query, _f, _a, _d, _o, _b) =
             parse_query(&tree, source).expect("builder constructs the query");
         query
     }

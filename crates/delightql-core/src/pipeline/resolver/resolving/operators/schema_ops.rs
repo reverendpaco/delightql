@@ -426,11 +426,11 @@ pub(super) fn resolve_signed_witness(
     ))
 }
 
-/// Resolve the MetaIze operator (^ or ^^)
+/// Resolve the MetaIze operator (^)
 ///
-/// MetaIze reifies the input relation's schema as queryable data.
-/// - `^` returns basic schema: scope, column_name, ordinal
-/// - `^^` returns detailed schema: scope, column_name, ordinal, data_type, nullable
+/// MetaIze reifies the input relation's schema as queryable data with
+/// the fixed heading (scope, column_name, ordinal). `^^` never reaches
+/// here as one operator: the builder stacks two applications.
 ///
 /// The `scope` column shows which table owns each column:
 /// - `users(*), products(*) ^` → scope is "users" or "products"
@@ -439,7 +439,6 @@ pub(super) fn resolve_signed_witness(
 /// This is compile-time schema synthesis - the output is a virtual relation
 /// containing one row per column of the input relation.
 pub(super) fn resolve_meta_ize(
-    detailed: bool,
     _available: &[ast_resolved::ColumnMetadata],
 ) -> Result<(
     ast_resolved::UnaryRelationalOperator,
@@ -457,26 +456,13 @@ pub(super) fn resolve_meta_ize(
     }
 
     // Build output schema - these are the columns of the meta relation
-    let output_columns = if detailed {
-        // Detailed schema (??) includes: scope, column_name, ordinal, data_type, nullable
-        vec![
-            make_meta_column("scope", 1),
-            make_meta_column("column_name", 2),
-            make_meta_column("ordinal", 3),
-            make_meta_column("data_type", 4),
-            make_meta_column("nullable", 5),
-        ]
-    } else {
-        // Basic schema (?) includes: scope, column_name, ordinal
-        vec![
-            make_meta_column("scope", 1),
-            make_meta_column("column_name", 2),
-            make_meta_column("ordinal", 3),
-        ]
-    };
+    let output_columns = vec![
+        make_meta_column("scope", 1),
+        make_meta_column("column_name", 2),
+        make_meta_column("ordinal", 3),
+    ];
 
-    // The resolved operator preserves the detailed flag for emitting
-    let resolved_op = ast_resolved::UnaryRelationalOperator::MetaIze { detailed };
+    let resolved_op = ast_resolved::UnaryRelationalOperator::MetaIze;
 
     Ok((resolved_op, output_columns))
 }

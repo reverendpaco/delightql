@@ -13,16 +13,6 @@
 //! degenerate plan (see `From<CompiledQuery> for CompiledPlan`); the effect
 //! transformer (Epic 3) is what will produce multi-entry plans.
 
-/// A named SQL stream compiled from an `(~~emit:name ... ~~)` hook.
-#[derive(Debug, Clone)]
-pub struct EmitStream {
-    /// Instance name from `(~~emit:name ~~)`.
-    pub name: String,
-    /// The filtered SQL query to execute.
-    pub sql: String,
-    /// Source location in the original DQL (byte start, byte end).
-    pub _source_location: Option<(usize, usize)>,
-}
 
 /// Whether the compiled SQL is a query (returns rows) or a DML statement (returns affected count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +28,6 @@ pub enum SqlKind {
 /// The host receives this and decides how to execute each piece:
 /// - Primary SQL goes to the main result display (stdout, table pane, etc.)
 /// - Assertion SQL is evaluated for boolean verdicts
-/// - Emit streams are routed to sinks (`--sink` flag, stderr, TUI panes, etc.)
 #[derive(Debug, Clone)]
 pub struct CompiledQuery {
     /// The primary SQL query.
@@ -47,8 +36,6 @@ pub struct CompiledQuery {
     pub _kind: SqlKind,
     /// Assertion SQLs (boolean queries). Each is `(sql, source_location)`.
     pub assertion_sqls: Vec<(String, Option<(usize, usize)>)>,
-    /// Named emit streams (filtered SQL variants).
-    pub emit_streams: Vec<EmitStream>,
     /// Connection ID for routing (which backend to execute on).
     pub connection_id: Option<i64>,
 }
@@ -103,8 +90,6 @@ impl PlanStatement {
 ///   result must ship without inspecting SQL text.
 /// - `Assertion` — execute, read the first value as a boolean verdict,
 ///   abort the run on failure (today's assertion behavior, made an entry).
-/// - `Emit` — execute, route the result set to the named sink (today's
-///   emit-stream behavior, made an entry).
 /// - `BeginTransaction` / `CommitTransaction` — the bracket, as ordinary
 ///   list positions so the planner can EXPRESS placement invariants:
 ///   scratch shells go BEFORE `BeginTransaction` (invariant §5.6), and "no
@@ -122,13 +107,6 @@ pub enum PlanEntry {
     ShippedStatement(PlanStatement),
     /// Execute; first value is a pass/fail verdict; failure aborts the run.
     Assertion {
-        statement: PlanStatement,
-        /// Source location in the original DQL (byte start, byte end).
-        source_location: Option<(usize, usize)>,
-    },
-    /// Execute; result set routes to the named emit sink.
-    Emit {
-        name: String,
         statement: PlanStatement,
         /// Source location in the original DQL (byte start, byte end).
         source_location: Option<(usize, usize)>,
@@ -198,13 +176,6 @@ pub enum EffectAction {
         statement: PlanStatement,
         source_location: Option<(usize, usize)>,
     },
-    /// A statement-level EMIT stream (side-channel rows via the on_emit
-    /// hook; notify-never-abort, today's emit contract).
-    Emit {
-        name: String,
-        statement: PlanStatement,
-        source_location: Option<(usize, usize)>,
-    },
     /// DML occurrence: statement + adjacent receipt machinery.
     Dml(Vec<PlanStatement>),
     /// DDL occurrence: replace/holder drops + CREATE + receipt.
@@ -242,7 +213,6 @@ pub enum EffectAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectStepKind {
     Assertion,
-    Emit,
     Dml,
     Ddl,
     Exit,
@@ -259,7 +229,6 @@ impl EffectAction {
     pub fn kind(&self) -> EffectStepKind {
         match self {
             EffectAction::Assertion { .. } => EffectStepKind::Assertion,
-            EffectAction::Emit { .. } => EffectStepKind::Emit,
             EffectAction::Dml(_) => EffectStepKind::Dml,
             EffectAction::Ddl(_) => EffectStepKind::Ddl,
             EffectAction::Exit(_) => EffectStepKind::Exit,
@@ -287,7 +256,6 @@ impl EffectAction {
             }
             EffectAction::Begin { .. } | EffectAction::Commit { .. } => &[],
             EffectAction::Assertion { statement, .. } => std::slice::from_ref(statement),
-            EffectAction::Emit { statement, .. } => std::slice::from_ref(statement),
         }
     }
 
@@ -331,7 +299,7 @@ impl EffectStepKind {
     /// step_kind ∈ effect|return|control, action_kind ∈ dml|ddl|sql|host.
     pub fn projection_kinds(self) -> (&'static str, &'static str) {
         match self {
-            EffectStepKind::Assertion | EffectStepKind::Emit => ("control", "sql"),
+            EffectStepKind::Assertion => ("control", "sql"),
             EffectStepKind::Dml => ("effect", "dml"),
             EffectStepKind::Ddl => ("effect", "ddl"),
             EffectStepKind::Exit => ("effect", "sql"),
@@ -405,17 +373,6 @@ impl TypedEffectPlan {
                     source_location,
                 } => {
                     out.push(PlanEntry::Assertion {
-                        statement: statement.clone(),
-                        source_location: *source_location,
-                    });
-                }
-                EffectAction::Emit {
-                    name,
-                    statement,
-                    source_location,
-                } => {
-                    out.push(PlanEntry::Emit {
-                        name: name.clone(),
                         statement: statement.clone(),
                         source_location: *source_location,
                     });
@@ -497,7 +454,7 @@ impl From<CompiledQuery> for CompiledPlan {
     /// `degenerate_entry_order_mirrors_relay` and
     /// `degenerate_plain_query_is_one_shipped_entry`.
     fn from(q: CompiledQuery) -> Self {
-        let mut entries = Vec::with_capacity(q.assertion_sqls.len() + q.emit_streams.len() + 1);
+        let mut entries = Vec::with_capacity(q.assertion_sqls.len() + 1);
         for (sql, source_location) in q.assertion_sqls {
             entries.push(PlanEntry::Assertion {
                 statement: PlanStatement {
@@ -506,17 +463,6 @@ impl From<CompiledQuery> for CompiledPlan {
                     comment: None,
                 },
                 source_location,
-            });
-        }
-        for emit in q.emit_streams {
-            entries.push(PlanEntry::Emit {
-                name: emit.name,
-                statement: PlanStatement {
-                    sql: emit.sql,
-                    connection_id: q.connection_id,
-                    comment: None,
-                },
-                source_location: emit._source_location,
             });
         }
         entries.push(PlanEntry::ShippedStatement(PlanStatement {
@@ -571,9 +517,6 @@ fn render_entry(entry: &PlanEntry) -> String {
         PlanEntry::ShippedStatement(st) => render_statement(&["[ship]".to_string()], st),
         PlanEntry::Assertion { statement, .. } => {
             render_statement(&["[assert]".to_string()], statement)
-        }
-        PlanEntry::Emit { name, statement, .. } => {
-            render_statement(&[format!("[emit {}]", name)], statement)
         }
         PlanEntry::BeginTransaction {
             connection_id,
@@ -642,7 +585,6 @@ mod tests {
             primary_sql: primary.to_string(),
             _kind: SqlKind::Query,
             assertion_sqls: vec![],
-            emit_streams: vec![],
             connection_id,
         }
     }
@@ -668,7 +610,7 @@ mod tests {
 
     #[test]
     fn degenerate_entry_order_mirrors_relay() {
-        // Relay handle_query order: assertions, then emits, then primary.
+        // Relay handle_query order: assertions, then primary.
         let q = CompiledQuery {
             primary_sql: "SELECT * FROM t".to_string(),
             _kind: SqlKind::Query,
@@ -676,15 +618,10 @@ mod tests {
                 ("SELECT count(*) > 0 FROM t".to_string(), Some((5, 9))),
                 ("SELECT 1".to_string(), None),
             ],
-            emit_streams: vec![EmitStream {
-                name: "audit".to_string(),
-                sql: "SELECT * FROM t WHERE flagged".to_string(),
-                _source_location: Some((10, 20)),
-            }],
             connection_id: Some(7),
         };
         let plan: CompiledPlan = q.into();
-        assert_eq!(plan.entries.len(), 4);
+        assert_eq!(plan.entries.len(), 3);
         match &plan.entries[0] {
             PlanEntry::Assertion {
                 statement,
@@ -698,20 +635,11 @@ mod tests {
         }
         assert!(matches!(&plan.entries[1], PlanEntry::Assertion { .. }));
         match &plan.entries[2] {
-            PlanEntry::Emit {
-                name, statement, ..
-            } => {
-                assert_eq!(name, "audit");
-                assert_eq!(statement.connection_id, Some(7));
-            }
-            other => panic!("entry 2: expected Emit, got {:?}", other),
-        }
-        match &plan.entries[3] {
             PlanEntry::ShippedStatement(st) => {
                 assert_eq!(st.sql, "SELECT * FROM t");
                 assert_eq!(st.connection_id, Some(7));
             }
-            other => panic!("entry 3: expected ShippedStatement, got {:?}", other),
+            other => panic!("entry 2: expected ShippedStatement, got {:?}", other),
         }
     }
 
@@ -833,16 +761,11 @@ COMMIT;";
     }
 
     #[test]
-    fn render_tags_assert_emit_and_connection() {
+    fn render_tags_assert_and_connection() {
         let plan = CompiledPlan {
             entries: vec![
                 PlanEntry::Assertion {
                     statement: PlanStatement::bare("SELECT count(*) = 3 FROM t"),
-                    source_location: None,
-                },
-                PlanEntry::Emit {
-                    name: "audit".to_string(),
-                    statement: PlanStatement::bare("SELECT * FROM t WHERE flagged"),
                     source_location: None,
                 },
                 PlanEntry::ShippedStatement(PlanStatement {
@@ -858,9 +781,6 @@ COMMIT;";
         let expected = "\
 -- [assert]
 SELECT count(*) = 3 FROM t;
-
--- [emit audit]
-SELECT * FROM t WHERE flagged;
 
 -- [ship] [conn 4]
 SELECT * FROM t;";

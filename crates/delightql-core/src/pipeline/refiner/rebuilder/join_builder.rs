@@ -171,22 +171,57 @@ pub(super) fn process_single_join(
     let join_predicates = op_predicates.remove(&op_ref).unwrap_or_default();
 
     // Build join condition
-    let join_condition = build_join_condition(using_columns, join_predicates)?;
+    let (join_condition, leftover_conditions) =
+        build_join_condition(using_columns, join_predicates)?;
 
     // Determine join type
     let join_type = determine_join_type(analyzed, table_idx);
 
+    if !leftover_conditions.is_empty() && join_type != JoinType::Inner {
+        return Err(crate::error::DelightQLError::validation_error_categorized(
+            "join/using/extra_condition",
+            "a USING-style join with an additional multi-relation condition \
+is not expressible for an outer join: USING has no ON clause to carry it, \
+and WHERE placement would change which rows match",
+            "write the join fully explicitly: replace .(cols) with equality \
+predicates alongside the extra condition",
+        ));
+    }
+
     // Build the join with proper schema
     let join_expr = create_join(result, right_table, join_condition, Some(join_type));
+
+    // Inner join: the leftovers filter the joined rows — WHERE placement
+    // is exactly equivalent to ON for an inner join.
+    let join_expr = if leftover_conditions.is_empty() {
+        join_expr
+    } else {
+        let schema = match &join_expr {
+            refined::RelationalExpression::Join { cpr_schema, .. } => cpr_schema.get().clone(),
+            _ => unreachable!("create_join returns Join"),
+        };
+        refined::RelationalExpression::Filter {
+            source: Box::new(join_expr),
+            condition: refined::SigmaCondition::Predicate(combine_predicates_with_and(
+                leftover_conditions,
+            )),
+            origin: resolved::FilterOrigin::UserWritten,
+            cpr_schema: refined::PhaseBox::new(schema).into_refined(),
+        }
+    };
 
     Ok((join_expr, new_table_idx))
 }
 
 /// Build join condition from USING columns and predicates
+/// Returns (join condition, leftovers). When USING wins the join slot,
+/// FJC predicates cannot ride the ON clause — they are RETURNED, never
+/// dropped: the caller places them as WHERE (inner join) or refuses
+/// (outer join, where placement changes match semantics).
 pub(super) fn build_join_condition(
     using_columns: &Option<Vec<String>>,
     join_predicates: Vec<AnalyzedPredicate>,
-) -> Result<Option<refined::BooleanExpression>> {
+) -> Result<(Option<refined::BooleanExpression>, Vec<refined::BooleanExpression>)> {
     let mut join_conditions = Vec::new();
     let mut using_columns_collected = Vec::new();
 
@@ -230,11 +265,11 @@ pub(super) fn build_join_condition(
     };
 
     Ok(if let Some(using) = using_condition {
-        Some(using)
+        (Some(using), join_conditions)
     } else if !join_conditions.is_empty() {
-        Some(combine_predicates_with_and(join_conditions))
+        (Some(combine_predicates_with_and(join_conditions)), Vec::new())
     } else {
-        None
+        (None, Vec::new())
     })
 }
 

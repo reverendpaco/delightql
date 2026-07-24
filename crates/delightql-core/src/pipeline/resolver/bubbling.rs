@@ -314,8 +314,8 @@ pub(super) fn bubble_unary_operator(
             ))
         }
         // MetaIze has no expressions to bubble - schema synthesis happens at resolution time
-        ast_unresolved::UnaryRelationalOperator::MetaIze { detailed } => Ok((
-            ast_unresolved::UnaryRelationalOperator::MetaIze { detailed },
+        ast_unresolved::UnaryRelationalOperator::MetaIze => Ok((
+            ast_unresolved::UnaryRelationalOperator::MetaIze,
             BubbledState::empty(),
         )),
         // Witness has no expressions to bubble - existence check happens at SQL level

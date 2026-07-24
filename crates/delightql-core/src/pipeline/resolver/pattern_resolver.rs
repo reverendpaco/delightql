@@ -48,6 +48,12 @@ pub enum PatternConstraint {
     Reference(QualifiedColumnRef),
     /// Column should be skipped (placeholder _)
     Skip,
+    /// Repeated positional lvar: this slot must equal the slot of the
+    /// FIRST occurrence of the same name (Datalog self-unification —
+    /// `people(shared, _, shared, _)` filters id = age). The name binds
+    /// once, at the first slot; this slot contributes only the
+    /// equality.
+    SelfUnify { first_position: usize },
     /// Complex expression constraint
     Expression(Box<ast_unresolved::DomainExpression>),
 }
@@ -166,6 +172,11 @@ impl PatternResolver {
         table_schema: &[ast_resolved::ColumnMetadata],
     ) -> Result<Vec<ColumnSelection>> {
         let mut selections = Vec::new();
+        // First slot of each bare lvar name: a later repeat of the same
+        // name is one variable bound twice — an equality, not a second
+        // binding (and never a silent `name_2` dedup downstream).
+        let mut first_slot_of: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         for (idx, expr) in exprs.iter().enumerate() {
             if idx >= table_schema.len() {
@@ -195,8 +206,19 @@ impl PatternResolver {
                                 column: name.to_string(),
                             })),
                         });
+                    } else if let Some(&first) = first_slot_of.get(name.as_str()) {
+                        // Repeated bare lvar: self-unification with the
+                        // first occurrence's column.
+                        selections.push(ColumnSelection {
+                            source_position: idx,
+                            output_name: table_schema[idx].name().to_string(),
+                            constraint: Some(PatternConstraint::SelfUnify {
+                                first_position: first,
+                            }),
+                        });
                     } else {
                         // Simple name - rename the column
+                        first_slot_of.insert(name.to_string(), idx);
                         selections.push(ColumnSelection {
                             source_position: idx,
                             output_name: name.to_string(),
@@ -339,6 +361,21 @@ impl PatternResolver {
 
                     PatternConstraint::Skip => {
                         // Already handled above
+                    }
+
+                    PatternConstraint::SelfUnify { first_position } => {
+                        // WHERE first_col = this_col, both on this table.
+                        // The name binds at the first slot; this slot's
+                        // column rides hidden through the inner projection
+                        // (hygienic, like a literal-constrained slot) so
+                        // the WHERE can reference it, and stays out of the
+                        // final heading.
+                        let first_col = &table_schema[first_position];
+                        where_constraints.push(create_unification_condition(
+                            first_col, source_col, table_name,
+                        ));
+                        output_col.needs_hygienic_alias = true;
+                        output_columns.push(output_col);
                     }
 
                     PatternConstraint::Expression(expr) => {

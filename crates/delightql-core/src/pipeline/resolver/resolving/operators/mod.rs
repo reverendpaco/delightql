@@ -107,8 +107,8 @@ pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
             containment_semantic,
             available,
         ),
-        ast_unresolved::UnaryRelationalOperator::MetaIze { detailed } => {
-            schema_ops::resolve_meta_ize(detailed, available)
+        ast_unresolved::UnaryRelationalOperator::MetaIze => {
+            schema_ops::resolve_meta_ize(available)
         }
         ast_unresolved::UnaryRelationalOperator::Witness { exists } => {
             schema_ops::resolve_witness(exists, available)

@@ -913,8 +913,8 @@ fn assertion_abort_skips_later_entries_without_bracket() {
 }
 
 /// Non-final shipped sets deliver through on_ship in execution order with
-/// their own data; emit entries go to on_emit, never to on_ship; the final
-/// shipped set is the response, never a hook call.
+/// their own data; the final shipped set is the response, never a hook
+/// call.
 #[test]
 fn non_final_shipped_deliver_via_on_ship_in_order() {
     let conn = shared_sqlite();
@@ -926,18 +926,13 @@ fn non_final_shipped_deliver_via_on_ship_in_order() {
     let mut relay = relay_over(&mut system, Arc::clone(&conn));
 
     let ships = Arc::new(Mutex::new(Vec::<(Vec<String>, Vec<Vec<String>>)>::new()));
-    let emits = Arc::new(Mutex::new(Vec::<String>::new()));
     let ships_in_hook = Arc::clone(&ships);
-    let emits_in_hook = Arc::clone(&emits);
     relay.set_hooks(RelayHooks {
         on_ship: Some(Box::new(move |cols, rows| {
             ships_in_hook
                 .lock()
                 .unwrap()
                 .push((cols.to_vec(), rows.to_vec()));
-        })),
-        on_emit: Some(Box::new(move |name, _cols, _rows| {
-            emits_in_hook.lock().unwrap().push(name.to_string());
         })),
         ..RelayHooks::default()
     });
@@ -946,11 +941,6 @@ fn non_final_shipped_deliver_via_on_ship_in_order() {
         bare("INSERT INTO t VALUES ('one')"),
         ship("SELECT v AS first_ship FROM t"), // stdout! #1: sees one row
         bare("INSERT INTO t VALUES ('two')"),
-        PlanEntry::Emit {
-            name: "audit".to_string(),
-            statement: PlanStatement::bare("SELECT v FROM t"),
-            source_location: None,
-        },
         ship("SELECT count(*) AS second_ship FROM t"), // stdout! #2: sees two
         ship("SELECT count(*) AS final_ship FROM t"),  // the return value
     ]);
@@ -966,11 +956,6 @@ fn non_final_shipped_deliver_via_on_ship_in_order() {
     assert_eq!(seen[1].0, vec!["second_ship"]);
     assert_eq!(seen[1].1, vec![vec!["2".to_string()]]);
 
-    assert_eq!(
-        *emits.lock().unwrap(),
-        vec!["audit".to_string()],
-        "emit entries keep their own channel"
-    );
 }
 
 /// The final shipped statement streams through the backend session (the
@@ -1045,47 +1030,6 @@ fn final_ship_before_trailing_entries_is_buffered() {
         "the trailing COMMIT must have executed before the response returned"
     );
     assert_eq!(count_rows(&conn, "t"), 1);
-}
-
-/// Emit execution errors keep today's contract: error-hook verdict, run
-/// continues, no abort, no rollback.
-#[test]
-fn emit_error_is_tolerated_and_run_continues() {
-    let conn = shared_sqlite();
-    let mut system = fresh_system();
-    let mut relay = relay_over(&mut system, Arc::clone(&conn));
-
-    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
-    let errors_in_hook = Arc::clone(&errors);
-    relay.set_hooks(RelayHooks {
-        on_error_hook: Some(Box::new(move |v| {
-            errors_in_hook
-                .lock()
-                .unwrap()
-                .push(v.identity.body_text.clone());
-        })),
-        ..RelayHooks::default()
-    });
-
-    let p = plan(vec![
-        PlanEntry::Emit {
-            name: "broken".to_string(),
-            statement: PlanStatement::bare("SELECT v FROM no_such_emit_table"),
-            source_location: None,
-        },
-        ship("SELECT 1 AS survived"),
-    ]);
-    let resp = relay.handle_plan(&p);
-    let (_cols, rows) = fetch_all(&mut relay, resp);
-    assert_eq!(rows, vec![vec!["1".to_string()]], "the run must continue past a failed emit");
-
-    let seen = errors.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert!(
-        seen[0].contains("Emit 'broken' execution failed"),
-        "got: {}",
-        seen[0]
-    );
 }
 
 /// A plan with no shipped entry at all answers with the empty header — the

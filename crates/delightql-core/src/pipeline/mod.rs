@@ -133,10 +133,6 @@ pub(crate) struct Pipeline<'a> {
     assertion_specs: Vec<ast_unresolved::AssertionSpec>,
     assertion_sqls: Vec<(String, Option<(usize, usize)>)>,
 
-    // Emit streams (compiled from inline (~~emit:name ... ~~) hooks)
-    emit_specs: Vec<ast_unresolved::EmitSpec>,
-    emit_sqls: Vec<compiled_query::EmitStream>,
-
     // Danger gate specs (per-query overrides from (~~danger://uri STATE~~) hooks)
     danger_specs: Vec<ast_unresolved::DangerSpec>,
 
@@ -227,8 +223,6 @@ impl<'a> Pipeline<'a> {
             sql_kind: compiled_query::SqlKind::Query,
             assertion_specs: Vec::new(),
             assertion_sqls: Vec::new(),
-            emit_specs: Vec::new(),
-            emit_sqls: Vec::new(),
             danger_specs: Vec::new(),
             cli_danger_overrides: Vec::new(),
             option_specs: Vec::new(),
@@ -360,7 +354,6 @@ impl<'a> Pipeline<'a> {
             primary_sql: self.sql_string.clone().unwrap_or_default(),
             _kind: self.sql_kind,
             assertion_sqls: self.assertion_sqls.clone(),
-            emit_streams: self.emit_sqls.clone(),
             connection_id: self.connection_id,
         })
     }
@@ -493,7 +486,7 @@ impl<'a> Pipeline<'a> {
         }
 
         // For REPL mode, use REPL-aware parsers; otherwise use standard parsers
-        let (query, features, assertions, emits, dangers, options, ddl_blocks) = if self.is_repl {
+        let (query, features, assertions, dangers, options, ddl_blocks) = if self.is_repl {
             // REPL mode: Use parse_repl and parse_repl_input
             let tree = parser::parse_repl(&self.query_text).map_err(|e| {
                 self.record_delightql_error(&e);
@@ -543,7 +536,6 @@ impl<'a> Pipeline<'a> {
         self.query_unresolved = Some(query);
         self.query_features = Some(features);
         self.assertion_specs = assertions;
-        self.emit_specs = emits;
         self.danger_specs = dangers;
         self.option_specs = options;
         self.ddl_blocks = ddl_blocks;
@@ -1028,80 +1020,6 @@ impl<'a> Pipeline<'a> {
             self.assertion_sqls = compiled;
         }
 
-        // Compile emit bodies to SQL
-        if !self.emit_specs.is_empty() {
-            let schema = self.system.get_schema()?;
-            let bin_registry = self.system.bin_registry();
-            let specs = std::mem::take(&mut self.emit_specs);
-            let mut compiled_emits = Vec::with_capacity(specs.len());
-
-            for spec in &specs {
-                let emit_query = ast_unresolved::Query::Relational(spec.body.clone());
-
-                let resolved_result = resolver::resolve_query(
-                    emit_query,
-                    schema,
-                    Some(self.system),
-                    &self.resolution_config,
-                )
-                .map_err(|e| {
-                    self.record_delightql_error(&e);
-                    e
-                })?;
-
-                let mut emit_danger_gates = danger_gates::DangerGateMap::with_defaults();
-                emit_danger_gates.apply_overrides(&self.cli_danger_overrides);
-                emit_danger_gates.apply_overrides(&self.danger_specs);
-
-                // Emit streams use the same danger gates as the main query
-                let refined = refiner::refine_query_with_gates(
-                    resolved_result.query,
-                    emit_danger_gates.clone(),
-                )
-                .map_err(|e| {
-                    self.record_delightql_error(&e);
-                    e
-                })?;
-                let addressed = addresser::address_query(refined).map_err(|e| {
-                    self.record_delightql_error(&e);
-                    e
-                })?;
-                let emit_ctx = transformer_v4::TransformCtx {
-                    cfes: vec![],
-                    names: transformer_v4::builder::NameGenerator::new(),
-                    outer_columns: vec![],
-                    danger_gates: emit_danger_gates,
-                };
-                let sql_ast = transformer_v4::transform(addressed, &emit_ctx).map_err(|e| {
-                    self.record_delightql_error(&e);
-                    e
-                })?;
-
-                let optimized = lower_statement(sql_ast, dialect, self.sql_optimization_level)
-                    .map_err(|e| {
-                        self.record_delightql_error(&e);
-                        e
-                    })?;
-
-                let generator = generator_v3::SqlGenerator::new()
-                    .with_dialect(dialect)
-                    .with_bin_registry(bin_registry.clone())
-                    .with_dialect_pack(dialect_pack.clone());
-                let emit_sql = generator
-                    .generate_statement(&optimized)
-                    .map_err(|e| e.into_delightql_error("Emit SQL generation error"))?;
-
-                compiled_emits.push(compiled_query::EmitStream {
-                    name: spec.name.clone(),
-                    sql: emit_sql,
-                    _source_location: spec.source_location,
-                });
-            }
-
-            self.emit_specs = specs;
-            self.emit_sqls = compiled_emits;
-        }
-
         Ok(self.sql_string.as_ref().unwrap())
     }
 }
@@ -1124,7 +1042,7 @@ fn query_has_meta_ize(query: &ast_resolved::Query) -> bool {
         source_spine(expr).any(|step| {
             matches!(
                 step,
-                SpineStep::Pipe(ast_resolved::UnaryRelationalOperator::MetaIze { .. })
+                SpineStep::Pipe(ast_resolved::UnaryRelationalOperator::MetaIze)
             )
         })
     }
@@ -1290,7 +1208,7 @@ pub(crate) fn compile_source_to_sql(
     let tree = parser::parse(source)?;
 
     // Phase 1: CST → Query (supports CTEs)
-    let (query, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
+    let (query, _features, _assertions, _dangers, _options, _ddl_blocks) =
         builder_v2::parse_query(&tree, source)?;
 
     // Phase 2: Query → AST(resolved) (with CTE support, no namespace resolution)

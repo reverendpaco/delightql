@@ -43,13 +43,11 @@ mod pump_tests;
 
 /// Hooks for non-relational side effects during query execution.
 ///
-/// The CLI wires these to print verdicts, route emit streams to sinks, etc.
+/// The CLI wires these to print verdicts, ship result sets, etc.
 /// If no hook is set, the relay handles the effect internally (assertions
-/// become protocol errors, emits are silently executed).
+/// become protocol errors).
 pub struct RelayHooks {
-    /// Called for each emit stream after execution.
     /// Args: (stream_name, columns, rows).
-    pub on_emit: Option<Box<dyn FnMut(&str, &[String], &[Vec<String>])>>,
 
     /// Called for each assertion verdict (pass or fail).
     pub on_verdict: Option<Box<dyn FnMut(&verdict::Verdict)>>,
@@ -71,7 +69,6 @@ pub struct RelayHooks {
 impl Default for RelayHooks {
     fn default() -> Self {
         Self {
-            on_emit: None,
             on_verdict: None,
             on_error_hook: None,
             on_ship: None,
@@ -116,7 +113,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         }
     }
 
-    /// Install the side-channel hooks (emit sinks, verdicts, shipped sets).
+    /// Install the side-channel hooks (verdicts, shipped sets).
     /// Production caller: `open.rs::session_with_hooks` (the Epic-3.3 hook
     /// threading — the CLI's console sink for `stdout!` rides through it);
     /// also exercised by `relay/pump_tests.rs`.
@@ -238,8 +235,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             }
         };
 
-        // Capture emit streams, assertion data, and connection routing before evaluating
-        let emit_streams: Vec<compiled_query::EmitStream> = compiled.emit_streams.clone();
+        // Capture assertion data and connection routing before evaluating
         let assertion_sqls = compiled.assertion_sqls.clone();
         let connection_id = compiled.connection_id;
         let primary_sql = compiled.primary_sql.clone();
@@ -303,35 +299,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         message: format!("Assertion {} execution error: {}", i + 1, msg)
                             .into_bytes(),
                     };
-                }
-            }
-        }
-
-        // Execute emit streams on the routed connection
-        for emit in &emit_streams {
-            match self.execute_sql_routed(&emit.sql, connection_id) {
-                Ok((columns, rows)) => {
-                    if let Some(ref mut hook) = self.hooks.on_emit {
-                        hook(&emit.name, &columns, &rows);
-                    }
-                }
-                Err(msg) => {
-                    if let Some(ref mut hook) = self.hooks.on_error_hook {
-                        let v = verdict::Verdict {
-                            outcome: verdict::VerdictOutcome::Fail,
-                            identity: verdict::VerdictIdentity {
-                                _name: Some(emit.name.clone()),
-                                _source_location: None,
-                                body_text: format!(
-                                    "Emit '{}' execution failed: {}",
-                                    emit.name, msg
-                                ),
-                            },
-                            detail: Some(msg),
-                            _intent: None,
-                        };
-                        hook(&v);
-                    }
                 }
             }
         }
@@ -637,35 +604,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     )
                                     .into_bytes(),
                                 };
-                            }
-                        }
-                    }
-
-                    // Execute emit streams
-                    for emit in &compiled.emit_streams {
-                        match self.execute_sql_routed(&emit.sql, connection_id) {
-                            Ok((columns, rows)) => {
-                                if let Some(ref mut hook) = self.hooks.on_emit {
-                                    hook(&emit.name, &columns, &rows);
-                                }
-                            }
-                            Err(msg) => {
-                                if let Some(ref mut hook) = self.hooks.on_error_hook {
-                                    let v = verdict::Verdict {
-                                        outcome: verdict::VerdictOutcome::Fail,
-                                        identity: verdict::VerdictIdentity {
-                                            _name: Some(emit.name.clone()),
-                                            _source_location: None,
-                                            body_text: format!(
-                                                "Emit '{}' execution failed: {}",
-                                                emit.name, msg
-                                            ),
-                                        },
-                                        detail: Some(msg),
-                                        _intent: None,
-                                    };
-                                    hook(&v);
-                                }
                             }
                         }
                     }
@@ -1215,7 +1153,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         connection_id: Option<i64>,
     ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
         match connection_id.unwrap_or(2) {
-            2 => self.execute_emit_through_protocol(sql),
+            2 => self.execute_eager_through_protocol(sql),
             1 => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -1263,7 +1201,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     }
 
     /// Execute SQL through the backend protocol and return (columns, rows).
-    fn execute_emit_through_protocol(
+    fn execute_eager_through_protocol(
         &mut self,
         sql: &str,
     ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {

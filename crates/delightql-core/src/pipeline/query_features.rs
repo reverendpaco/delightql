@@ -179,7 +179,6 @@ impl HoParamBindings {
 pub struct FeatureCollector {
     features: HashSet<QueryFeature>,
     assertions: Vec<crate::pipeline::asts::core::AssertionSpec>,
-    emits: Vec<crate::pipeline::asts::core::EmitSpec>,
     dangers: Vec<crate::pipeline::asts::core::DangerSpec>,
     options: Vec<crate::pipeline::asts::core::OptionSpec>,
     ddl_blocks: Vec<crate::pipeline::asts::core::InlineDdlSpec>,
@@ -191,7 +190,6 @@ impl FeatureCollector {
         Self {
             features: HashSet::new(),
             assertions: Vec::new(),
-            emits: Vec::new(),
             dangers: Vec::new(),
             options: Vec::new(),
             ddl_blocks: Vec::new(),
@@ -224,16 +222,6 @@ impl FeatureCollector {
     /// Take collected assertions (leaves the internal vec empty)
     pub fn take_assertions(&mut self) -> Vec<crate::pipeline::asts::core::AssertionSpec> {
         std::mem::take(&mut self.assertions)
-    }
-
-    /// Add an emit spec collected during continuation processing
-    pub fn add_emit(&mut self, spec: crate::pipeline::asts::core::EmitSpec) {
-        self.emits.push(spec);
-    }
-
-    /// Take collected emits (leaves the internal vec empty)
-    pub fn take_emits(&mut self) -> Vec<crate::pipeline::asts::core::EmitSpec> {
-        std::mem::take(&mut self.emits)
     }
 
     /// Add a danger spec collected during continuation processing

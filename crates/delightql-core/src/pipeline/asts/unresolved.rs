@@ -73,7 +73,7 @@ pub use crate::pipeline::asts::core::expressions::{
 pub use crate::pipeline::asts::core::metadata::{GroundedPath, NamespacePath};
 pub use crate::pipeline::asts::core::{
     AssertionPredicate, AssertionSpec, ColumnOrdinal, ColumnRange, ContainmentSemantic,
-    ContextMode, DangerSpec, DestructureMode, EmitSpec, InlineDdlSpec, LiteralValue, OptionSpec,
+    ContextMode, DangerSpec, DestructureMode, InlineDdlSpec, LiteralValue, OptionSpec,
     OrderDirection, PhaseBox, PhaseBoxable, QualifiedName, SetOperator, TupleOrdinalClause,
     TupleOrdinalOperator, UsingColumn,
 };

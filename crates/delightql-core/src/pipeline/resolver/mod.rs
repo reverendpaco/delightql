@@ -2578,7 +2578,7 @@ fn classify_single_dml_op(op: &ast_unresolved::UnaryRelationalOperator) -> DmlPi
         ast_unresolved::UnaryRelationalOperator::MapCover { .. }
         | ast_unresolved::UnaryRelationalOperator::EmbedMapCover { .. }
         | ast_unresolved::UnaryRelationalOperator::Reposition { .. }
-        | ast_unresolved::UnaryRelationalOperator::MetaIze { .. }
+        | ast_unresolved::UnaryRelationalOperator::MetaIze
         | ast_unresolved::UnaryRelationalOperator::Witness { .. }
         | ast_unresolved::UnaryRelationalOperator::Qualify
         | ast_unresolved::UnaryRelationalOperator::Using { .. }

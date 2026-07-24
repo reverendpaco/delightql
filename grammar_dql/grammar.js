@@ -538,7 +538,8 @@ module.exports = grammar({
 
     // Meta-ize: reify schema as relation
     // ^ returns (colname, colposition, coltype)
-    // ^^ returns full DDL metadata (colname, colposition, coltype, nullable, default, pk, fk_table, fk_column)
+    // ^^ is two applications of ^ (composition — the shape of the shape);
+    // the builder stacks two MetaIze pipes for it. No detailed variant.
     meta_ize_operator: $ => choice('^^', '^'),  // ^^ first to avoid prefix match
 
     // Witness: reify existence as 1r1c relation (column: met)

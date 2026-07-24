@@ -58,7 +58,7 @@ fn fresh_empty_system() -> DelightQLSystem {
 /// Parse a single DQL query to its unresolved AST (phases 0–1 only).
 fn parse_single(source: &str) -> ast_unresolved::Query {
     let tree = parser::parse(source).expect("source should parse");
-    let (query, _features, _asserts, _emits, _dangers, _options, _ddl) =
+    let (query, _features, _asserts, _dangers, _options, _ddl) =
         builder_v2::parse_query(&tree, source).expect("source should build");
     query
 }

@@ -64,7 +64,6 @@ pub(super) enum EffectEntry {
         query: Box<Query>,
         /// Phase 10 slice b: statement annotations ride the typed program.
         assertions: Vec<crate::pipeline::asts::core::queries::AssertionSpec>,
-        emits: Vec<crate::pipeline::asts::core::queries::EmitSpec>,
     },
 }
 
@@ -85,7 +84,7 @@ pub(super) fn classify_effect_entry(dql: &str, allow_adhoc: bool) -> Option<Effe
         return None;
     }
     let tree = parser::parse(dql).ok()?;
-    let (mut queries, _features, assertions, emits, dangers, options, ddl_blocks) =
+    let (mut queries, _features, assertions, dangers, options, ddl_blocks) =
         builder_v2::parse_queries(&tree, dql).ok()?;
     // Phase 10 slice b (semantic routing): assertions and emits ride the
     // typed program as head steps — an annotated statement chooses the
@@ -100,18 +99,14 @@ pub(super) fn classify_effect_entry(dql: &str, allow_adhoc: bool) -> Option<Effe
     match classify_query(query) {
         Some(EffectEntry::AdhocBody { query, .. }) => {
             if allow_adhoc {
-                Some(EffectEntry::AdhocBody {
-                    query,
-                    assertions,
-                    emits,
-                })
+                Some(EffectEntry::AdhocBody { query, assertions })
             } else {
                 None
             }
         }
         // The run/entry forms take no statement annotations today; an
         // annotated run! keeps today's path rather than dropping them.
-        other if assertions.is_empty() && emits.is_empty() => other,
+        other if assertions.is_empty() => other,
         _ => None,
     }
 }
@@ -173,7 +168,6 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
                     Some(EffectEntry::AdhocBody {
                         query: Box::new(query),
                         assertions: Vec::new(),
-                        emits: Vec::new(),
                     })
                 }
                 UnaryRelationalOperator::DirectiveTerminal { name, .. } => {
@@ -185,7 +179,6 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
                             Some(EffectEntry::AdhocBody {
                                 query: Box::new(query),
                                 assertions: Vec::new(),
-                                emits: Vec::new(),
                             })
                         }
                         // Two-paren `run_namespace!(ns)(*)`: the builder
@@ -364,17 +357,12 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     }
                 }
             }
-            EffectEntry::AdhocBody {
-                query,
-                assertions,
-                emits,
-            } => {
+            EffectEntry::AdhocBody { query, assertions } => {
                 match effect_transformer::compile_query_plan_annotated(
                     self.system,
                     &query,
                     None,
                     &assertions,
-                    &emits,
                 ) {
                     Ok(plan) => self.play_plan(&plan),
                     Err(e) => error_term(&e),

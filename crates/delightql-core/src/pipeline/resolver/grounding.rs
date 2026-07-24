@@ -2072,6 +2072,27 @@ pub(super) fn split_ho_first_parens(
                     _ => {
                         // Scalar lift: consume rows of N exprs each and build anon table.
                         // Multiple rows arise from `;` separator: pivot_by("Maths";"Music").
+                        //
+                        // Explicit always wins: when scalar parameters FOLLOW the
+                        // lifted rows, the row/scalar split is genuinely ambiguous
+                        // and must be marked with `&` — it is never guessed. (The
+                        // guess formerly took exactly one row and let the rest fall
+                        // to the scalars, silently.)
+                        let later_scalar = entity.params[param_idx + 1..].iter().any(|p| {
+                            matches!(p.kind, HoParamKind::Scalar | HoParamKind::GroundScalar(_))
+                        });
+                        let has_boundary =
+                            argument_groups.map_or(false, |g| g.len() > group_idx + 1);
+                        if later_scalar && !has_boundary {
+                            return Err(DelightQLError::validation_error_categorized(
+                                "resolution/ho/lifted_boundary",
+                                format!(
+                                    "ambiguous lifted-relation boundary in '{}': inline rows for parameter '{}' are followed by scalar parameter(s), and the split cannot be guessed",
+                                    entity.name, param.name
+                                ),
+                                "mark where the rows end with & — e.g. f(\"a\", 1; \"b\", 2 & \"x\") — or pass a named relation instead of inline rows",
+                            ));
+                        }
                         let n_cols = columns.len();
                         let mut all_rows = Vec::new();
 

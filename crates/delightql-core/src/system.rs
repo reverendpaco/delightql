@@ -4694,7 +4694,7 @@ impl DelightQLSystem {
             )
         })?;
 
-        let (queries, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
+        let (queries, _features, _assertions, _dangers, _options, _ddl_blocks) =
             builder_v2::parse_queries(&tree, src).map_err(|e| {
                 DelightQLError::database_error(
                     format!("seed program failed to build AST: {}", e),
@@ -14026,7 +14026,7 @@ mod red5_w9_tree_group_tests {
 
     fn parse_one(dql: &str) -> crate::pipeline::asts::core::Query<crate::pipeline::asts::core::Unresolved> {
         let tree = crate::pipeline::parser::parse(dql).expect("parse");
-        let (mut queries, _f, _a, _e, _d, _o, _ddl) =
+        let (mut queries, _f, _a, _d, _o, _ddl) =
             crate::pipeline::builder_v2::parse_queries(&tree, dql).expect("build");
         assert_eq!(queries.len(), 1, "one statement expected");
         queries.pop().unwrap()

@@ -251,16 +251,17 @@ pub enum UnaryRelationalOperator<Phase = Unresolved> {
         #[serde(default)]
         grounding: Option<GroundedPath>,
     },
-    /// Meta-ize: ^ or ^^ - reifies relation schema as queryable data
+    /// Meta-ize: ^ - reifies relation schema as queryable data
+    /// with the fixed heading (scope, column_name, ordinal).
     ///
-    /// Single `^` returns basic column metadata (name, ordinal).
-    /// Double `^^` returns detailed schema (type, nullable, constraints).
+    /// `^^` is not a distinct operator: the builder lowers it as two
+    /// stacked applications of this one (the shape of the shape). A
+    /// detailed variant carrying declared types/nullability is a
+    /// tempting regression: meta-ize is shape-only, and declaration
+    /// echoes misreport derived columns.
     /// Compile-time only: resolved during schema synthesis, produces virtual relation.
     #[lispy("unary_relational_operator:meta_ize")]
-    MetaIze {
-        /// True for `^^` (detailed), false for `^` (basic)
-        detailed: bool,
-    },
+    MetaIze,
     /// Witness: + or \+ — reifies existence as 1-row, 1-column relation
     ///
     /// ExistsWitness (`+`): SELECT EXISTS(SELECT 1 FROM source) AS "met"

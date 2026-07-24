@@ -133,7 +133,7 @@ fn plan_sql(plan: &CompiledPlan) -> String {
 
 fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result<String> {
     let tree = parser::parse(source).expect("source should parse");
-    let (query, _features, _asserts, _emits, _dangers, _options, _ddl) =
+    let (query, _features, _asserts, _dangers, _options, _ddl) =
         builder_v2::parse_query(&tree, source).expect("source should build");
     let query: ast_unresolved::Query = query;
     let schema = system.get_schema()?;

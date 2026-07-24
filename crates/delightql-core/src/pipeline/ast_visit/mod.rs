@@ -510,7 +510,7 @@ pub fn walk_visit_operator<P, F: AstVisit<P> + ?Sized>(
             child!(walk_visit_domain_spec(v, domain_spec));
         }
         // Leaf operators — no recursive children.
-        UnaryRelationalOperator::MetaIze { .. }
+        UnaryRelationalOperator::MetaIze
         | UnaryRelationalOperator::Witness { .. }
         | UnaryRelationalOperator::Qualify
         | UnaryRelationalOperator::Using { .. }

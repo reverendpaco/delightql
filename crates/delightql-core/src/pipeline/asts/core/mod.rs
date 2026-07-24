@@ -28,7 +28,7 @@ pub use provenance::{
 };
 pub use queries::{
     AssertionPredicate, AssertionSpec, CfeDefinition, ContextMode, CteBinding, DangerSpec,
-    DangerState, EmitSpec, ErContextSpec, InlineDdlSpec, OptionSpec, OptionState,
+    DangerState, ErContextSpec, InlineDdlSpec, OptionSpec, OptionState,
     PrecompiledCfeDefinition, Query,
 };
 pub use specs::{

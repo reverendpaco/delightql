@@ -117,7 +117,6 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         format,
         no_headers,
         no_sanitize,
-        consult_files,
         attach,
         sequential,
         dangers,
@@ -139,10 +138,6 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
 
     if *no_sanitize {
         eprintln!("warning: output sanitization disabled, terminal injection possible");
-    }
-
-    if !consult_files.is_empty() {
-        anyhow::bail!("--consult flag not supported. Use consult!() in DQL source instead.");
     }
 
     // Build the connection manager. For a fatboy target this classifies the

@@ -2040,6 +2040,30 @@ impl<'reg, 'db> AstTransform<Unresolved, Resolved> for ResolverFold<'reg, 'db> {
                     &config,
                     None,
                 )?;
+                // Arity law: N tested expressions require exactly N produced
+                // columns — a mismatch is a compile-time refusal, never a
+                // backend "sub-select returns N columns" surprise.
+                let left_arity = match &resolved_value {
+                    ast_resolved::DomainExpression::Tuple { elements, .. } => elements.len(),
+                    _ => 1,
+                };
+                if let Ok(ast_resolved::CprSchema::Resolved(cols)) =
+                    super::extract_cpr_schema(&resolved_subquery)
+                {
+                    if cols.len() != left_arity {
+                        return Err(crate::error::DelightQLError::validation_error_categorized(
+                            "membership/arity",
+                            format!(
+                                "relational '{}' arity mismatch: the left side tests {} expression(s) but '{}' produces {} column(s)",
+                                if negated { "not in" } else { "in" },
+                                left_arity,
+                                identifier.name,
+                                cols.len()
+                            ),
+                            "project the relation to the tested width, e.g. R(|> (col))",
+                        ));
+                    }
+                }
                 Ok(ast_resolved::BooleanExpression::InRelational {
                     value: Box::new(resolved_value),
                     subquery: Box::new(resolved_subquery),

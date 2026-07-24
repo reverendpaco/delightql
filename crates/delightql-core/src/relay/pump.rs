@@ -284,20 +284,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         }
                     }
                 }
-                EffectAction::Emit {
-                    name, statement, ..
-                } => {
-                    match self.execute_sql_routed(&statement.sql, statement.connection_id) {
-                        Ok((columns, rows)) => {
-                            if let Some(ref mut hook) = self.hooks.on_emit {
-                                hook(name, &columns, &rows);
-                            }
-                        }
-                        Err(_msg) => {
-                            // Today's emit contract: notify, never abort.
-                        }
-                    }
-                }
                 EffectAction::Cleanup(stmts) => {
                     if exited {
                         trace[idx] = Some((
@@ -525,46 +511,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     }
                 }
 
-                PlanEntry::Emit {
-                    name, statement, ..
-                } => {
-                    match self.execute_sql_routed(&statement.sql, statement.connection_id) {
-                        Ok((columns, rows)) => {
-                            if let Some(ref mut hook) = self.hooks.on_emit {
-                                hook(name, &columns, &rows);
-                            }
-                        }
-                        Err(msg) => {
-                            // Exactly today's emit contract: notify, never
-                            // abort. NOTE (E-T5): on PG a failed SELECT
-                            // inside an open bracket DOES poison the
-                            // transaction (P1 H5) — this tolerance is safe
-                            // only because the effect transformer emits no
-                            // Emit entries at all (grep: zero
-                            // `PlanEntry::Emit` constructions there), so a
-                            // mid-bracket emit exists only in hand-built
-                            // plans on the SQLite test backend. If emits
-                            // ever become plan entries, a mid-bracket emit
-                            // failure must abort like a statement's.
-                            if let Some(ref mut hook) = self.hooks.on_error_hook {
-                                let v = verdict::Verdict {
-                                    outcome: verdict::VerdictOutcome::Fail,
-                                    identity: verdict::VerdictIdentity {
-                                        _name: Some(name.clone()),
-                                        _source_location: None,
-                                        body_text: format!(
-                                            "Emit '{}' execution failed: {}",
-                                            name, msg
-                                        ),
-                                    },
-                                    detail: Some(msg),
-                                    _intent: None,
-                                };
-                                hook(&v);
-                            }
-                        }
-                    }
-                }
             }
         }
 

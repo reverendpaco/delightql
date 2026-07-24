@@ -84,7 +84,7 @@ pub fn parse_function_body(source: &str) -> Result<DomainExpression> {
         )
     })?;
 
-    let (query, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
+    let (query, _features, _assertions, _dangers, _options, _ddl_blocks) =
         parse_query(&tree, &wrapped).map_err(|e| {
             DelightQLError::database_error(
                 format!(
@@ -116,7 +116,7 @@ pub fn parse_view_body(source: &str) -> Result<Query> {
         )
     })?;
 
-    let (query, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
+    let (query, _features, _assertions, _dangers, _options, _ddl_blocks) =
         parse_query(&tree, &body_source).map_err(|e| {
             // Preserve semantic validation errors (e.g., |identifier| in column ordinal)
             // so they propagate with their subcategory intact.
@@ -175,7 +175,7 @@ pub fn parse_view_body_with_bindings(source: &str, bindings: HoParamBindings) ->
     // Maps bare lvar names from definition (k, l) to actual column names (key, label).
     let arg_column_remap = bindings.argumentative_column_remap.clone();
 
-    let (mut query, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
+    let (mut query, _features, _assertions, _dangers, _options, _ddl_blocks) =
         parse_query_with_bindings(&tree, &body_source, bindings).map_err(|e| {
             DelightQLError::database_error(
                 format!("Failed to build AST for view body '{}': {}", body_source, e),
@@ -757,7 +757,7 @@ fn remap_operator_qualifiers(
         | UnaryRelationalOperator::DirectiveTerminal { .. }
         | UnaryRelationalOperator::SignedWitness
         | UnaryRelationalOperator::DirectivePipeInvocation { .. }
-        | UnaryRelationalOperator::MetaIze { .. }
+        | UnaryRelationalOperator::MetaIze
         | UnaryRelationalOperator::Witness { .. }
         | UnaryRelationalOperator::Qualify
         | UnaryRelationalOperator::Using { .. }
@@ -971,7 +971,7 @@ pub fn parse_guard_expression(guard_source: &str) -> Result<DomainExpression> {
         )
     })?;
 
-    let (query, _features, _assertions, _emits, _dangers, _options, _ddl_blocks) =
+    let (query, _features, _assertions, _dangers, _options, _ddl_blocks) =
         parse_query(&tree, &wrapped).map_err(|e| {
             DelightQLError::database_error(
                 format!(

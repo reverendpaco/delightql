@@ -1524,7 +1524,7 @@ fn world_system_with_engine_remote_and_id(
 /// Build the ad-hoc Query the relay entry would hand `compile_query_plan`.
 fn adhoc_query(dql: &str) -> Query {
     let tree = crate::pipeline::parser::parse(dql).expect("parse");
-    let (mut queries, _features, _assertions, _emits, _dangers, _options, _ddl) =
+    let (mut queries, _features, _assertions, _dangers, _options, _ddl) =
         crate::pipeline::builder_v2::parse_queries(&tree, dql).expect("build");
     assert_eq!(queries.len(), 1, "one statement expected");
     queries.pop().unwrap()
@@ -1576,9 +1576,7 @@ fn entry_connections(plan: &CompiledPlan) -> Vec<Option<i64>> {
         .iter()
         .map(|e| match e {
             PlanEntry::Statement(st) | PlanEntry::ShippedStatement(st) => st.connection_id,
-            PlanEntry::Assertion { statement, .. } | PlanEntry::Emit { statement, .. } => {
-                statement.connection_id
-            }
+            PlanEntry::Assertion { statement, .. } => statement.connection_id,
             PlanEntry::BeginTransaction { connection_id, .. }
             | PlanEntry::CommitTransaction { connection_id, .. } => *connection_id,
         })

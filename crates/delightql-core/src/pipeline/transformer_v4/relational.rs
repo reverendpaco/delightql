@@ -1754,9 +1754,7 @@ pub(super) fn r_lower_pipe(
                 ..
             } => r_lower_embed_map(current, function, selector, alias_template, ctx)?,
 
-            UnaryRelationalOperator::MetaIze { detailed } => {
-                r_lower_meta_ize(current, detailed, &cpr_schema, ctx)?
-            }
+            UnaryRelationalOperator::MetaIze => r_lower_meta_ize(current, &cpr_schema, ctx)?,
 
             UnaryRelationalOperator::Witness { exists } => r_lower_witness(current, exists, ctx)?,
 
@@ -2711,6 +2709,7 @@ fn r_lower_pivot(
             projected,
             &lowered.group_key_names,
             &pivot_groups,
+            &lowered.pivot_key_sqls,
             &lowered.value_col_sqls,
         )?;
     }
@@ -2777,8 +2776,7 @@ fn classify_pivot_groups(
                 pivot_key,
                 pivot_values,
             } => {
-                let key_name =
-                    extract_pivot_lvar_name(pivot_key).unwrap_or_else(|| "pivot_key".to_string());
+                let key_name = pivot_key_group_name(pivot_key);
                 let val_name =
                     extract_pivot_lvar_name(value_column).unwrap_or_else(|| "value".to_string());
 
@@ -2869,15 +2867,22 @@ fn push_preagg_cte(
     projected: Builder<Projected>,
     group_key_names: &[String],
     pivot_groups: &[PivotGroup],
+    pivot_key_sqls: &[crate::pipeline::sql_ast_v3::DomainExpression],
     value_col_sqls: &[Vec<crate::pipeline::sql_ast_v3::DomainExpression>],
 ) -> Result<Builder<Projected>> {
     use super::builder::CteBody;
     use crate::pipeline::sql_ast_v3::{DomainExpression as SqlDomainExpr, SelectItem};
 
     let preagg_gk_names: Vec<String> = group_key_names.to_vec();
-    let preagg_pk_names: Vec<String> = pivot_groups
+    // Each pivot key contributes (output name, defining expression). A
+    // bare-lvar key selects its column plainly; a DERIVED key (format
+    // string, expression) has no source column of its name — it must be
+    // SELECTED AS its group name and grouped by its expression, or the
+    // CTE groups by a column that does not exist.
+    let preagg_pks: Vec<(String, SqlDomainExpr)> = pivot_groups
         .iter()
-        .map(|g| g.pivot_key_name.clone())
+        .zip(pivot_key_sqls.iter())
+        .map(|(g, sql)| (g.pivot_key_name.clone(), strip_sql_qualifiers(sql)))
         .collect();
     let preagg_vals: Vec<Vec<SqlDomainExpr>> = value_col_sqls.to_vec();
 
@@ -2886,8 +2891,16 @@ fn push_preagg_cte(
         for n in &preagg_gk_names {
             items.push(SelectItem::expression(SqlDomainExpr::column(n)));
         }
-        for n in &preagg_pk_names {
-            items.push(SelectItem::expression(SqlDomainExpr::column(n)));
+        for (name, sql) in &preagg_pks {
+            let is_bare_column = matches!(
+                sql,
+                SqlDomainExpr::Column { name: cn, qualifier: None } if cn == name
+            );
+            if is_bare_column {
+                items.push(SelectItem::expression(SqlDomainExpr::column(name)));
+            } else {
+                items.push(SelectItem::expression_with_alias(sql.clone(), name));
+            }
         }
 
         let mut val_aliases = Vec::new();
@@ -2904,8 +2917,8 @@ fn push_preagg_cte(
         for n in &preagg_gk_names {
             group_by.push(SqlDomainExpr::column(n));
         }
-        for n in &preagg_pk_names {
-            group_by.push(SqlDomainExpr::column(n));
+        for (_, sql) in &preagg_pks {
+            group_by.push(sql.clone());
         }
 
         let from = table_name_sql(input.scope_name()).to_string();
@@ -2921,7 +2934,7 @@ fn push_preagg_cte(
             })?;
 
         let mut out = preagg_gk_names.clone();
-        out.extend(preagg_pk_names.clone());
+        out.extend(preagg_pks.iter().map(|(n, _)| n.clone()));
         out.extend(val_aliases);
         Ok(CteBody {
             query: crate::pipeline::sql_ast_v3::QueryExpression::Select(Box::new(query)),
@@ -2949,11 +2962,21 @@ fn push_prepivot_cte(
         .map(|n| SqlDomainExpr::column(n))
         .collect();
 
-    let pk_sqls: Vec<SqlDomainExpr> = lowered
-        .pivot_key_sqls
-        .iter()
-        .map(|sql| strip_sql_qualifiers(sql))
-        .collect();
+    // After a preagg CTE the key exists as an OUTPUT COLUMN under its
+    // group name (derived keys were aliased there); reference it by name.
+    // Without preagg the original expression lowers against the source.
+    let pk_sqls: Vec<SqlDomainExpr> = if needs_preagg {
+        pivot_groups
+            .iter()
+            .map(|g| SqlDomainExpr::column(&g.pivot_key_name))
+            .collect()
+    } else {
+        lowered
+            .pivot_key_sqls
+            .iter()
+            .map(|sql| strip_sql_qualifiers(sql))
+            .collect()
+    };
 
     let val_exprs: Vec<Vec<SqlDomainExpr>> = if needs_preagg {
         pivot_groups
@@ -3072,8 +3095,7 @@ fn build_pivot_outer_select(
                 pivot_key,
                 pivot_values,
             } => {
-                let key_name =
-                    extract_pivot_lvar_name(pivot_key).unwrap_or_else(|| "pivot_key".to_string());
+                let key_name = pivot_key_group_name(pivot_key);
                 let val_name =
                     extract_pivot_lvar_name(value_column).unwrap_or_else(|| "value".to_string());
                 let group_idx = key_to_group[&key_name];
@@ -3147,6 +3169,21 @@ fn strip_sql_qualifiers(
         SqlExpr::Parens(inner) => SqlExpr::Parens(Box::new(strip_sql_qualifiers(inner))),
         other => other.clone(),
     }
+}
+
+/// The group name for a pivot key. A bare lvar keys by its column name;
+/// a DERIVED key (format string, expression) gets a deterministic
+/// synthesized name — hashed from the expression so classify and the
+/// outer select agree, and so two DIFFERENT derived keys never merge
+/// into one group (a shared placeholder name would).
+fn pivot_key_group_name(pivot_key: &ast_addressed::DomainExpression) -> String {
+    extract_pivot_lvar_name(pivot_key).unwrap_or_else(|| {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        format!("{:?}", pivot_key).hash(&mut h);
+        format!("_pivot_key_{:08x}", h.finish() as u32)
+    })
 }
 
 /// Extract the base name from an Lvar (for pivot key/value column names).
@@ -3379,14 +3416,14 @@ pub(super) fn r_lower_embed_map(
     builder.add_projection(items)
 }
 
-/// Lower meta-ize: `|> ^` (basic) or `|> ^^` (detailed).
+/// Lower meta-ize: `|> ^` — one application; `^^` arrives here as two
+/// stacked pipes (composition), never as a distinct operator.
 ///
 /// Synthesizes a VALUES relation from the source's column metadata.
 /// - `^`  → columns: scope, column_name, ordinal
 /// - `^^` → columns: scope, column_name, ordinal, data_type, nullable
 pub(super) fn r_lower_meta_ize(
     builder: Builder<Unprojected>,
-    detailed: bool,
     cpr_schema: &PhaseBox<CprSchema, Addressed>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
@@ -3408,11 +3445,7 @@ pub(super) fn r_lower_meta_ize(
 
     // Output schema: the meta-ize output columns
     let scope_name = TableName::Named(SqlIdentifier::from("_meta"));
-    let output_col_names: Vec<&str> = if detailed {
-        vec!["scope", "column_name", "ordinal", "data_type", "nullable"]
-    } else {
-        vec!["scope", "column_name", "ordinal"]
-    };
+    let output_col_names: Vec<&str> = vec!["scope", "column_name", "ordinal"];
 
     // Build inline UNION ALL of single-row SELECTs instead of VALUES
     // (SQLite VALUES doesn't support column names, producing column1/column2/...)
@@ -3430,27 +3463,11 @@ pub(super) fn r_lower_meta_ize(
             TableName::Named(name) => name.to_string(),
             TableName::Fresh => "_".to_string(),
         };
-        let mut vals = vec![
+        vec![
             SqlDomainExpr::literal(ast_addressed::LiteralValue::String(scope)),
             SqlDomainExpr::literal(ast_addressed::LiteralValue::String(col_name)),
             SqlDomainExpr::literal(ast_addressed::LiteralValue::Number((idx + 1).to_string())),
-        ];
-        if detailed {
-            // The catalog's DECLARED type and nullability, carried from
-            // ColumnInfo through the registry. "unknown" is the honest
-            // answer for derived columns — never a guess. (Declarations
-            // are intent metadata; sqlite storage stays dynamic.)
-            vals.push(SqlDomainExpr::literal(ast_addressed::LiteralValue::String(
-                col.declared_type.clone().unwrap_or_else(|| "unknown".to_string()),
-            )));
-            vals.push(SqlDomainExpr::literal(ast_addressed::LiteralValue::String(
-                match col.nullable {
-                    Some(b) => b.to_string(),
-                    None => "unknown".to_string(),
-                },
-            )));
-        }
-        vals
+        ]
     };
 
     // First row: SELECT val AS scope, val AS column_name, val AS ordinal [, ...]
@@ -3485,11 +3502,14 @@ pub(super) fn r_lower_meta_ize(
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            // Honest Fresh: meta-ize output columns are a synthetic name-as-data
-            // vocabulary; scope_name is an internal scope, not a source table.
+            // Honest Fresh: meta-ize output columns are a synthetic
+            // name-as-data vocabulary owned by no source table — their
+            // qualifier is Fresh so a second application (composition:
+            // X(^^) ≡ X(^)^) reports scope "_" like any derived
+            // relation. "_meta" survives only as the SQL alias.
             ColumnMetadata::new(
                 ColumnProvenance::from_column(*name),
-                scope_name.clone(),
+                TableName::Fresh,
                 Some(i),
             )
         })

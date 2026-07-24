@@ -1258,7 +1258,19 @@ fn rewrite_expr(
                         qualifier: None,
                     })
                 } else if let Some(def) = col_map.get(name) {
-                    Some(def.expr.clone())
+                    // A substituted definition lands in an arbitrary
+                    // syntactic context; a bare operator expression must
+                    // keep its grouping (`age := x + 1` inside `age * 2`
+                    // is `(x + 1) * 2`, never `x + 1 * 2`). Self-
+                    // delimiting forms (columns, literals, calls, CASE)
+                    // need no wrap.
+                    Some(match &def.expr {
+                        e @ (DomainExpression::Binary { .. }
+                        | DomainExpression::Unary { .. }) => {
+                            DomainExpression::Parens(Box::new(e.clone()))
+                        }
+                        e => e.clone(),
+                    })
                 } else {
                     None
                 }

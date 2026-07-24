@@ -167,16 +167,24 @@ fn parse_unary_operator_core(
         let text = meta_node.text();
         match text {
             "^^" => {
+                // Two applications of ^ — composition, not a distinct
+                // operator: X(^^) ≡ X(^)^, the shape of the shape.
+                let once =
+                    RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
+                        source: input,
+                        operator: UnaryRelationalOperator::MetaIze,
+                        cpr_schema: PhaseBox::phantom(),
+                    })));
                 RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-                    source: input,
-                    operator: UnaryRelationalOperator::MetaIze { detailed: true },
+                    source: once,
+                    operator: UnaryRelationalOperator::MetaIze,
                     cpr_schema: PhaseBox::phantom(),
                 })))
             }
             "^" => {
                 RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
                     source: input,
-                    operator: UnaryRelationalOperator::MetaIze { detailed: false },
+                    operator: UnaryRelationalOperator::MetaIze,
                     cpr_schema: PhaseBox::phantom(),
                 })))
             }

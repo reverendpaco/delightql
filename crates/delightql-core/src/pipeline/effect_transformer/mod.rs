@@ -224,7 +224,7 @@ pub(crate) fn compile_query_plan(
     query: &Query,
     namespace: Option<&str>,
 ) -> Result<CompiledPlan> {
-    compile_query_plan_annotated(system, query, namespace, &[], &[])
+    compile_query_plan_annotated(system, query, namespace, &[])
 }
 
 /// Phase 10 slice b (semantic routing): annotated statements ride the
@@ -236,7 +236,6 @@ pub(crate) fn compile_query_plan_annotated(
     query: &Query,
     namespace: Option<&str>,
     assertions: &[crate::pipeline::asts::core::queries::AssertionSpec],
-    emits: &[crate::pipeline::asts::core::queries::EmitSpec],
 ) -> Result<CompiledPlan> {
     let body = effects::EffectBody::from_query(query)?;
     compile_with_settled_connection(
@@ -244,7 +243,6 @@ pub(crate) fn compile_query_plan_annotated(
         || PlanBuilder::new(system, namespace),
         |b| {
             b.pending_assertions = assertions.to_vec();
-            b.pending_emits = emits.to_vec();
             b.compile_top_body(body.clone())
         },
     )
@@ -510,7 +508,6 @@ struct PlanBuilder<'a> {
     /// Phase 10 slice b: annotation specs riding the typed program —
     /// compiled into Assertion/Emit steps at the head of the plan.
     pending_assertions: Vec<crate::pipeline::asts::core::queries::AssertionSpec>,
-    pending_emits: Vec<crate::pipeline::asts::core::queries::EmitSpec>,
 
     /// Scratch shells (receipt tables + exit flag): assembled BEFORE the
     /// transaction bracket (invariant §5.6).
@@ -583,7 +580,6 @@ impl<'a> PlanBuilder<'a> {
                 ..resolver::ResolutionConfig::default()
             },
             pending_assertions: Vec::new(),
-            pending_emits: Vec::new(),
             shells: Vec::new(),
             body: Vec::new(),
             notes: Vec::new(),
@@ -687,9 +683,7 @@ impl<'a> PlanBuilder<'a> {
         self.mark_step(compiled_query::EffectStepKind::Return, "return", None, armed)?;
         let entry_route = |e: &PlanEntry| match e {
             PlanEntry::Statement(st) | PlanEntry::ShippedStatement(st) => st.connection_id,
-            PlanEntry::Assertion { statement, .. } | PlanEntry::Emit { statement, .. } => {
-                statement.connection_id
-            }
+            PlanEntry::Assertion { statement, .. } => statement.connection_id,
             PlanEntry::BeginTransaction { connection_id, .. }
             | PlanEntry::CommitTransaction { connection_id, .. } => *connection_id,
         };
@@ -749,27 +743,6 @@ impl<'a> PlanBuilder<'a> {
                         sql: bool_sql,
                         connection_id: conn,
                         comment: Some("assertion".to_string()),
-                    },
-                    source_location: spec.source_location,
-                },
-            });
-        }
-        let pending_emits = std::mem::take(&mut self.pending_emits);
-        for (i, spec) in pending_emits.iter().enumerate() {
-            let text = self.compile_value_text(&spec.body)?;
-            let conn = self.route(text.connection_id)?;
-            steps.push(compiled_query::EffectStep {
-                occurrence: format!("emit#{}", i + 1),
-                operation: "emit".to_string(),
-                span: spec.source_location,
-                route: conn,
-                requirements: Vec::new(),
-                action: compiled_query::EffectAction::Emit {
-                    name: spec.name.clone(),
-                    statement: PlanStatement {
-                        sql: text.sql,
-                        connection_id: conn,
-                        comment: Some(format!("emit:{}", spec.name)),
                     },
                     source_location: spec.source_location,
                 },

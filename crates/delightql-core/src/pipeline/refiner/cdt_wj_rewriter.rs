@@ -57,6 +57,39 @@ pub fn rewrite_window_join_subquery(
     correlation_filters: &[BooleanExpression],
     table_identifier: &resolved::QualifiedName,
 ) -> Result<(RelationalExpression, Vec<(String, String)>)> {
+    // This lowering pre-ranks per correlation-key group and joins AFTER —
+    // sound only when every correlation is an equality, because then each
+    // outer row sees exactly one child group and per-group top-N equals
+    // per-outer-row top-N. Under a non-equality correlation the visible
+    // candidate set differs per outer row, and pre-ranking filters the
+    // WRONG population (top-N per child identity — a phantom-row bug).
+    // Refuse until a lateral lowering ranks post-join.
+    for f in correlation_filters {
+        if let BooleanExpression::Comparison { operator, .. } = f {
+            if !matches!(
+                operator.as_str(),
+                "null_safe_eq" | "traditional_eq" | "eq" | "="
+            ) {
+                let spelled = match operator.as_str() {
+                    "less_than" => "<",
+                    "less_than_eq" => "<=",
+                    "greater_than" => ">",
+                    "greater_than_eq" => ">=",
+                    "traditional_ne" | "null_safe_ne" => "!=",
+                    other => other,
+                };
+                return Err(crate::error::DelightQLError::validation_error_categorized(
+                    "interior/topn/noneq_correlation",
+                    format!(
+                        "interior top-N requires equality correlation: '{}' makes each outer row see a different candidate set, and the pre-ranked lowering would rank the wrong population",
+                        spelled
+                    ),
+                    "join normally and rank explicitly: ... |> (..., row_number:(<~ %(outer identity), #(ordering)) as rnk), rnk <= N",
+                ));
+            }
+        }
+    }
+
     // Capture limit value and the inner expression (without the TupleOrdinal filter).
     let (subquery_no_limit, limit_value) = strip_limit(subquery)?;
 
