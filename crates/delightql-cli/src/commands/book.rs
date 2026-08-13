@@ -25,23 +25,19 @@ pub fn handle_book(
     {
         let mut session = handle.session().map_err(|e| anyhow::anyhow!(e))?;
         // Default source: the embedded image, bound as "book" by
-        // open_handle and mounted via its locator (BYTES-SCHEME-DESIGN.md)
-        // — attach-class, read-only, zero-copy from rodata, no temp file.
+        // open_handle and mounted via its locator — attach-class,
+        // read-only, zero-copy from rodata, no temp file.
         //
         // --db <file>: a compliant bundle from disk instead — same mount
-        // spine, same schema-version gate, same output (BOOK-NEXT-GEN.md
-        // §8). This is the authoring loop (bundle, then render without
-        // recompiling) and the distribution story (a downloaded book is
-        // consumed through the same front door). The embedded path stays
-        // the shipping truth.
+        // spine, same schema-version gate, same output. This is the
+        // authoring loop (bundle, then render without recompiling) and
+        // the distribution story (a downloaded book is consumed through
+        // the same front door). The embedded path stays the shipping
+        // truth.
         let source = match db {
             None => "delightql-bytes://book".to_string(),
             Some(path) => {
-                anyhow::ensure!(
-                    path.exists(),
-                    "book database not found: {}",
-                    path.display()
-                );
+                anyhow::ensure!(path.exists(), "book database not found: {}", path.display());
                 let spelled = path.display().to_string();
                 anyhow::ensure!(
                     !spelled.contains('"'),
@@ -51,7 +47,7 @@ pub fn handle_book(
             }
         };
         crate::exec_ng::run_dql_query(
-            &format!("mount!(\"{source}\", \"{NAMESPACE}\")"),
+            &format!("mount!(\"{source}\", \"{NAMESPACE}\")(*)"),
             &mut *session,
         )?;
         crate::embedded_db::verify_bundle_schema_version(&mut *session, NAMESPACE)?;
@@ -83,12 +79,20 @@ pub fn handle_book(
             anyhow::bail!("no book named '{name}'\navailable: {}", names.join(", "));
         }
 
-        let meta = crate::exec_ng::fetch_all(
+        // Read as CELLS: a book with no frontmatter and a book whose
+        // frontmatter is the four characters `NULL` are different books,
+        // and only absence suppresses the leading block.
+        let (_meta_columns, meta_rows) = crate::exec_ng::fetch_all_raw(
             &mut *session,
             &format!("cli::book.book_meta(*), book_name = \"{name}\" |> (frontmatter)"),
         )?;
-        if let Some(frontmatter) = meta.rows.first().map(|row| row[0].as_str()) {
-            if frontmatter != "NULL" && !frontmatter.is_empty() {
+        if let Some(frontmatter) = meta_rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|cell| cell.as_deref())
+            .map(String::from_utf8_lossy)
+        {
+            if !frontmatter.is_empty() {
                 print!("{frontmatter}");
                 if !frontmatter.ends_with('\n') {
                     println!();
@@ -113,12 +117,12 @@ pub fn handle_book(
     Ok(())
 }
 
-/// BOOK-NEXT-GEN.md §10 sugar: materialize the bundle's images so the
-/// emitted markdown's relative `images/<name>` references resolve for
-/// pandoc/typst. The WHOLE pool, deliberately — filtering to the images a
-/// book references would mean scanning the prose, and a dangling
-/// reference already fails visibly at press time. Bytes travel through
-/// the query pipeline hex-spelled so binary formats survive rows-as-text.
+/// Materialize the bundle's images so the emitted markdown's relative
+/// `images/<name>` references resolve for pandoc/typst. The WHOLE pool,
+/// deliberately — filtering to the images a book references would mean
+/// scanning the prose, and a dangling reference already fails visibly
+/// at press time. Bytes travel through the query pipeline hex-spelled
+/// so binary formats survive rows-as-text.
 fn export_pool_images(session: &mut dyn DqlSession, dir: &std::path::Path) -> Result<()> {
     let rows = crate::exec_ng::fetch_all(
         session,
@@ -162,9 +166,8 @@ fn valid_book_name(name: &str) -> bool {
 /// A heading carries the shift marker when its trailing pandoc attribute
 /// block contains the `.dqlh` class. Pandoc allows ONE attribute block per
 /// heading, so ids and classes merge: `# Projection {#sec:x .dqlh}`.
-/// The marker is the author's contract (BOOK-NEXT-GEN.md §3) — the
-/// bundler never reads the prose; this emitter is the only machine that
-/// interprets it.
+/// The marker is the author's contract — the bundler never reads the
+/// prose; this emitter is the only machine that interprets it.
 fn has_dqlh_marker(line: &str) -> bool {
     let trimmed = line.trim_end();
     if !trimmed.ends_with('}') {
@@ -178,13 +181,12 @@ fn has_dqlh_marker(line: &str) -> bool {
         .any(|token| token == ".dqlh")
 }
 
-/// Serving-side code-awareness (BOOK-NEXT-GEN.md §8): 4+ leading spaces =
-/// literal (indented code); fences are tracked by char AND length, so a
-/// ``` quoted inside a ```` block cannot close it; 0-3 leading spaces =
-/// structural candidate. This is plumbing, not validation — it exists for
-/// the one case authoring responsibility cannot cover: a code block
-/// QUOTING a marked heading has no way to protect itself from a naive
-/// shifter.
+/// Serving-side code-awareness: 4+ leading spaces = literal (indented
+/// code); fences are tracked by char AND length, so a ``` quoted inside
+/// a ```` block cannot close it; 0-3 leading spaces = structural
+/// candidate. This is plumbing, not validation — it exists for the one
+/// case authoring responsibility cannot cover: a code block QUOTING a
+/// marked heading has no way to protect itself from a naive shifter.
 fn shift_headings(content: &str, shift: usize) -> String {
     if shift == 0 {
         return content.to_string();

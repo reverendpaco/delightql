@@ -51,11 +51,9 @@ impl BinEntity for ImprintPredicate {
                 },
             ],
             // The receipt heading is the DESCRIPTOR's declaration
-            // (Phase 6 slice 4): core + source/target namespace echoes +
+            // Core + source/target namespace echoes +
             // the `returned` tree of materialized entities.
-            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
-                "imprint",
-            )),
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("imprint")),
         }
     }
 
@@ -106,7 +104,7 @@ impl BinEntity for ImprintReplacePredicate {
                     _is_optional: false,
                 },
             ],
-            // Same declared heading as imprint! (Phase 6 slice 4); only
+            // Same declared heading as imprint!; only
             // the operation string differs.
             output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
                 "imprint_replace",
@@ -197,10 +195,7 @@ fn run_imprint(
 /// Extract a string literal value from a DomainExpression
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
         _ => Err(DelightQLError::database_error(
             format!("imprint!() {} must be a string literal", arg_name),
             "Invalid argument type",

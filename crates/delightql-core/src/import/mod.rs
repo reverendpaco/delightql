@@ -11,8 +11,6 @@
 // This module is used by:
 // - Bootstrap system (installing bootstrap://sys)
 // - User imports (mount!, consult!, etc.)
-//
-// See: documentation/design/ddl/SYS-NS-CARTRIDGE-ER-DESIGN.md
 
 pub mod activation;
 pub mod cartridge;

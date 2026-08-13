@@ -37,7 +37,7 @@ rm -rf /tmp/dql-repl
 description = "Build the binaries: dql, dql-test-ball-runner and dql-fmt"
 run = """
 set -e
-cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="bundled-parser"
+cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="cli"
 # Gate the build on self-diagnostics: a broken autoload (or other provider
 # failure) fails the build here rather than surfacing later as a misleading
 # `Table not found`. See DIAGNOSTICS-DESIGN.md.
@@ -47,14 +47,14 @@ cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="bundl
 [tasks.build-rust-bins-release-tiny]
 description = "Build the binaries: dql, dql-test-ball-runner and dql-fmt"
 run = """
-cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="bundled-parser" --profile release-tiny
+cargo build --bin dql --bin dql-test-ball-runner --bin dql-fmt --features="cli" --profile release-tiny
 """
 
 [tasks.build-nvim-ts]
-description = "Build treesitter dynlib for IDEs (run grammar generation first)"
+description = "Build the treesitter dynlib for editors (generate the grammar first)"
 run = """
-cd grammar_dql
-cc -o delightql_v2.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
+cd grammar
+cc -o delightql.so -I./src src/parser.c -shared -Os -lstdc++ -fPIC
 """
 
 # Env variables

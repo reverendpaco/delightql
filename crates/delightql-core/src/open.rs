@@ -235,6 +235,35 @@ impl api::DqlHandle for DqlHandleImpl {
             .bind_owned_bytes(name, bytes)
             .map_err(|e| e.to_string())
     }
+
+    fn session_health(&self) -> api::SessionHealthReport {
+        match self.system.health_incident() {
+            None => api::SessionHealthReport::Healthy,
+            Some((operation, message)) => api::SessionHealthReport::Quarantined {
+                operation: operation.to_string(),
+                message: message.to_string(),
+            },
+        }
+    }
+
+    fn recover_session(&mut self) -> Result<api::SessionRecovery, String> {
+        // The one reset authority: retries pending compensation first and
+        // clears the quarantine latch only after every rebuild step succeeds
+        // — the same road the protocol Reset control takes.
+        self.system.reinit_bootstrap().map_err(|e| e.to_string())?;
+        Ok(api::SessionRecovery {
+            rebuilt: "the session catalog: bootstrap metadata, system namespaces, \
+                      seed programs, and the health latch (cleared)"
+                .to_string(),
+            lost: "session-local state: mounts, consulted definitions, enlisted \
+                   namespaces, temporary objects, and the session's \
+                   assertions/danger/errors ledgers"
+                .to_string(),
+            retained: "the connected database itself — its tables and data are \
+                       untouched"
+                .to_string(),
+        })
+    }
 }
 
 impl DqlHandleImpl {
@@ -263,7 +292,7 @@ impl DqlHandleImpl {
 /// 5. The CLI sends `mount!("path", "main")` as its first query to populate "main"
 ///
 /// `mount_factory` is the types-level factory used by `mount!`/`import!`
-/// when the path is a URI scheme (`pipe://`, etc.). Embeddings that can
+/// when the path is a URI scheme (`delightql-siso://`, etc.). Embeddings that can
 /// mount URI-scheme databases pass `Some` (CLI, C-ABI); those that can't
 /// pass `None` (WASM) and URI mounts error with an actionable message.
 pub fn open(

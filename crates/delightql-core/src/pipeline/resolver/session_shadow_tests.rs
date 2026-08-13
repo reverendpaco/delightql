@@ -4,7 +4,7 @@
 //! semantics, UNQUALIFIED names only. The shadow is a resolution
 //! PREFERENCE, not a catalog edit:
 //!
-//! - `register_run_created_object` retires ONLY the run's own prior
+//! - created-object registration retires ONLY the run's own prior
 //!   registration (the `session://materialized` cartridge), never a
 //!   mount-introspected physical entity;
 //! - a bare `staged(*)` prefers the session-materialized temp;
@@ -19,10 +19,7 @@
 //! end-to-end through the dql binary.
 
 use super::{resolve_query_inline, ResolutionConfig};
-use crate::pipeline::{
-    addresser, ast_unresolved, builder_v2, danger_gates, generator_v3, parser, refiner,
-    transformer_v4,
-};
+use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
 use crate::resolution::EntityRegistry;
 use crate::system::DelightQLSystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
@@ -105,11 +102,11 @@ impl DatabaseConnection for RealSqliteConnection {
         }
     }
 
-    fn query_all_string_rows(
+    fn query_all_rows(
         &self,
         sql: &str,
         params: &[DbValue],
-    ) -> delightql_types::Result<(Vec<String>, Vec<Vec<String>>)> {
+    ) -> delightql_types::Result<(Vec<String>, Vec<Vec<DbValue>>)> {
         let conn = self.conn.lock().map_err(|e| {
             delightql_types::DelightQLError::connection_poison_error("poisoned", e.to_string())
         })?;
@@ -121,17 +118,18 @@ impl DatabaseConnection for RealSqliteConnection {
         })?;
         let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let n = cols.len();
-        let rows: Result<Vec<Vec<String>>, _> = stmt
+        let rows: Result<Vec<Vec<DbValue>>, _> = stmt
             .query_map(refs.as_slice(), |row| {
                 let mut out = Vec::with_capacity(n);
                 for i in 0..n {
-                    let v: rusqlite::types::Value = row.get(i)?;
-                    out.push(match v {
-                        rusqlite::types::Value::Null => "NULL".to_string(),
-                        rusqlite::types::Value::Integer(i) => i.to_string(),
-                        rusqlite::types::Value::Real(f) => f.to_string(),
-                        rusqlite::types::Value::Text(s) => s,
-                        rusqlite::types::Value::Blob(b) => format!("<blob {} bytes>", b.len()),
+                    out.push(match row.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => DbValue::Null,
+                        rusqlite::types::ValueRef::Integer(v) => DbValue::Integer(v),
+                        rusqlite::types::ValueRef::Real(f) => DbValue::Real(f),
+                        rusqlite::types::ValueRef::Text(s) => {
+                            DbValue::Text(String::from_utf8_lossy(s).to_string())
+                        }
+                        rusqlite::types::ValueRef::Blob(b) => DbValue::Blob(b.to_vec()),
                     });
                 }
                 Ok(out)
@@ -187,7 +185,7 @@ impl DatabaseIntrospector for MainIntrospector {
 
 /// (system, raw user connection, tempdir guard). The raw handle IS the
 /// system's user connection — temp tables created on it live in the temp
-/// schema `register_run_created_object`'s PRAGMA read-back sees.
+/// schema the created-object PRAGMA read-back sees.
 fn world() -> (
     DelightQLSystem,
     Arc<Mutex<rusqlite::Connection>>,
@@ -208,9 +206,8 @@ fn world() -> (
     let raw = Arc::new(Mutex::new(
         rusqlite::Connection::open(&db_path).expect("user open"),
     ));
-    let adapter: Arc<Mutex<dyn DatabaseConnection>> = Arc::new(Mutex::new(
-        RealSqliteConnection { conn: raw.clone() },
-    ));
+    let adapter: Arc<Mutex<dyn DatabaseConnection>> =
+        Arc::new(Mutex::new(RealSqliteConnection { conn: raw.clone() }));
     let mut system = DelightQLSystem::new(adapter, Box::new(MainIntrospector), "sqlite")
         .expect("system should build");
     system
@@ -219,10 +216,13 @@ fn world() -> (
     (system, raw, dir)
 }
 
-/// Create the temp table a `temp_table!(staged)` run would have created,
+/// Create the temp table a `temp_table!(staged(*))(*)` run would have created,
 /// then run the post-run registration tail exactly as relay/entry.rs's
 /// `play_plan` does.
-fn create_and_register_temp_staged(system: &mut DelightQLSystem, raw: &Arc<Mutex<rusqlite::Connection>>) {
+fn create_and_register_temp_staged(
+    system: &mut DelightQLSystem,
+    raw: &Arc<Mutex<rusqlite::Connection>>,
+) {
     raw.lock()
         .unwrap()
         .execute_batch(
@@ -231,9 +231,22 @@ fn create_and_register_temp_staged(system: &mut DelightQLSystem, raw: &Arc<Mutex
         )
         .expect("create temp staged");
     let registered = system
-        .register_run_created_object("staged", false, 2)
+        .register_run_created_objects_with(
+            &[crate::pipeline::compiled_query::PlanCreatedObject {
+                name: "staged".to_string(),
+                is_view: false,
+                connection_id: Some(2),
+            }],
+            &crate::system::RealCreatedObjectCatalog,
+        )
         .expect("registration should not error");
-    assert!(registered, "temp staged should read back and register");
+    assert!(
+        matches!(
+            registered.as_slice(),
+            [crate::external_effects::RegistrationOutcome::Registered]
+        ),
+        "temp staged should read back and register"
+    );
 }
 
 // ------------------------------------------------------------------
@@ -241,25 +254,30 @@ fn create_and_register_temp_staged(system: &mut DelightQLSystem, raw: &Arc<Mutex
 // ------------------------------------------------------------------
 
 fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result<String> {
-    let tree = parser::parse(source).expect("source should parse");
-    let (query, _features, _asserts, _dangers, _options, _ddl) =
-        builder_v2::parse_query(&tree, source).expect("source should build");
-    let query: ast_unresolved::Query = query;
+    let tree = crate::pipeline::parse::query_sequence(source).expect("source should parse");
+    let mut normalized =
+        crate::pipeline::parse::normalize_sequence(&tree).expect("source should normalize");
+    assert_eq!(normalized.queries.len(), 1, "one statement expected");
+    let query: ast_unresolved::Query = normalized.queries.remove(0).query;
     let schema = system.get_schema()?;
-    let mut registry = EntityRegistry::new_with_system(schema, system);
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let mut registry =
+        EntityRegistry::new_with_system(schema, system, std::rc::Rc::clone(&identities));
     let config = ResolutionConfig::default();
     let (resolved, _bubbled) = resolve_query_inline(query, &mut registry, None, &config, None)?;
     let gates = danger_gates::DangerGateMap::with_defaults();
-    let refined = refiner::refine_query_with_gates(resolved, gates.clone())?;
-    let addressed = addresser::address_query(refined)?;
-    let ctx = transformer_v4::TransformCtx {
-        cfes: vec![],
-        names: transformer_v4::builder::NameGenerator::new(),
+    let refined =
+        refiner::refine_query_with_gates(resolved, gates.clone(), std::rc::Rc::clone(&identities))?;
+    let ctx = transformer::TransformCtx {
+        identities: std::rc::Rc::clone(&identities),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&identities)),
         outer_columns: vec![],
         danger_gates: gates,
     };
-    let sql_ast = transformer_v4::transform(addressed, &ctx)?;
-    generator_v3::SqlGenerator::new()
+    let sql_ast = transformer::transform(refined, &ctx)?.without_obligations()?;
+    let names = generator::baptise_statements(&identities, &[&sql_ast])
+        .map_err(|e| e.into_delightql_error("session-shadow SQL naming failed"))?;
+    generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
         .map_err(|e| {
             crate::error::DelightQLError::validation_error(
@@ -273,7 +291,9 @@ fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result
 /// relay would route to) and return string rows.
 fn run_sql(raw: &Arc<Mutex<rusqlite::Connection>>, sql: &str) -> Vec<Vec<String>> {
     let conn = raw.lock().unwrap();
-    let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("SQL failed to prepare: {e}\n{sql}"));
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("SQL failed to prepare: {e}\n{sql}"));
     let n = stmt.column_count();
     stmt.query_map([], |row| {
         let mut out = Vec::with_capacity(n);
@@ -339,8 +359,8 @@ fn qualified_read_reaches_physical_after_same_name_temp() {
     let (mut system, raw, _dir) = world();
     create_and_register_temp_staged(&mut system, &raw);
 
-    let sql = compile_plain("main.staged(*)", &system)
-        .expect("qualified read should still compile");
+    let sql =
+        compile_plain("main.staged(*)", &system).expect("qualified read should still compile");
     let rows = run_sql(&raw, &sql);
     assert_eq!(
         rows,
@@ -376,7 +396,7 @@ fn bare_read_prefers_session_materialized_temp() {
 
 // ------------------------------------------------------------------
 // (c) A re-run's re-registration retires ITS OWN prior entry — the
-// fresh-scratch contract (REPORT-3.3 decision 6) survives the scoping.
+// fresh-scratch contract survives the scoping.
 // ------------------------------------------------------------------
 
 #[test]
@@ -386,9 +406,19 @@ fn reregistration_retires_prior_session_entry_only() {
     // A second run re-creates and re-registers (the F7 replace ruling makes
     // the CREATE side legal; here we exercise only the registration tail).
     let registered = system
-        .register_run_created_object("staged", false, 2)
+        .register_run_created_objects_with(
+            &[crate::pipeline::compiled_query::PlanCreatedObject {
+                name: "staged".to_string(),
+                is_view: false,
+                connection_id: Some(2),
+            }],
+            &crate::system::RealCreatedObjectCatalog,
+        )
         .expect("re-registration should not error");
-    assert!(registered);
+    assert!(matches!(
+        registered.as_slice(),
+        [crate::external_effects::RegistrationOutcome::Registered]
+    ));
 
     let (session, physical) = staged_entity_split(&system, "staged");
     assert_eq!(
@@ -410,7 +440,11 @@ fn reregistration_retires_prior_session_entry_only() {
 fn physical_registration_survives_temp_registration() {
     let (mut system, raw, _dir) = world();
     let before = staged_entity_split(&system, "staged");
-    assert_eq!(before, (0, 1), "fixture: exactly the mount-introspected entity");
+    assert_eq!(
+        before,
+        (0, 1),
+        "fixture: exactly the mount-introspected entity"
+    );
 
     create_and_register_temp_staged(&mut system, &raw);
 

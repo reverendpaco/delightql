@@ -47,7 +47,7 @@ impl BinEntity for MountPredicate {
                 },
             ],
             // The receipt heading is the DESCRIPTOR's declaration
-            // (Phase 6 slice 2): core + ruled §8 additions.
+            // Core + ruled §8 additions.
             output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("mount")),
         }
     }
@@ -112,10 +112,7 @@ impl EffectExecutable for MountPredicate {
 /// Extract a string literal value from a DomainExpression
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
         _ => Err(DelightQLError::database_error(
             format!("mount!() {} must be a string literal", arg_name),
             "Invalid argument type",

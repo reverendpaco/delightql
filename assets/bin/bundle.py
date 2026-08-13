@@ -13,6 +13,9 @@ The one producer behind the assets/ front door (BOOK-NEXT-GEN.md):
       markdown atoms + yml spines -> the DQLB book bundle (section 6)
   bundle.py man --man-dir man/man1 --output bundled/man.sqlite
       troff pages -> the DQLM man bundle
+  bundle.py editor --grammar-dir ../grammar ... --output bundled/editor.sqlite
+      authored grammar + editor queries + compiled parser -> the DQLE
+      editor-support bundle
 
 It refuses what breaks the book's links or the databases' shape; it never
 judges the prose. build.rs re-verifies compliance at the embedding seam —
@@ -26,6 +29,7 @@ sqlite library version), and an unchanged output file is left untouched.
 import argparse
 import hashlib
 import os
+import re
 import sqlite3
 import sys
 
@@ -33,6 +37,7 @@ import yaml
 
 BOOK_APPLICATION_ID = 0x4451_4C42  # "DQLB", mirrored in cli embedded_db.rs
 MAN_APPLICATION_ID = 0x4451_4C4D  # "DQLM", mirrored in cli embedded_db.rs
+EDITOR_APPLICATION_ID = 0x4451_4C45  # "DQLE", mirrored in cli embedded_db.rs
 SCHEMA_VERSION = 1
 
 BOOK_SCHEMA_SQL = f"""
@@ -88,6 +93,33 @@ CREATE TABLE man_page (
     troff TEXT NOT NULL,
     content_digest TEXT NOT NULL,
     PRIMARY KEY (name, section)
+);
+"""
+
+EDITOR_SCHEMA_SQL = f"""
+PRAGMA application_id = {EDITOR_APPLICATION_ID};
+PRAGMA user_version = {SCHEMA_VERSION};
+CREATE TABLE bundle_meta (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema_version INTEGER NOT NULL,
+    content_version TEXT NOT NULL,
+    source_digest TEXT NOT NULL
+);
+CREATE TABLE grammar_source (
+    path TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    content_digest TEXT NOT NULL
+);
+CREATE TABLE editor_query (
+    name TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    content_digest TEXT NOT NULL
+);
+CREATE TABLE parser_artifact (
+    target TEXT PRIMARY KEY,
+    abi_version INTEGER NOT NULL CHECK (abi_version >= 1),
+    content BLOB NOT NULL,
+    content_digest TEXT NOT NULL
 );
 """
 
@@ -392,6 +424,117 @@ def collect_man(man_dir):
     return pages, logical.hexdigest()
 
 
+# ── Editor support (grammar + queries + compiled parser) ─────────────────
+
+# The compiled parser must be a shared library for SOME platform; which
+# platform is recorded in parser_artifact.target and re-verified against
+# the cargo TARGET at the embedding seam.
+SHARED_LIB_MAGICS = (
+    b"\x7fELF",  # ELF
+    b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit
+    b"\xca\xfe\xba\xbe",  # Mach-O universal
+    b"MZ",  # PE/COFF
+)
+
+
+def parser_abi_version(parser_src):
+    """The tree-sitter ABI the artifact speaks, read from the generated
+    parser's LANGUAGE_VERSION define — the same source the .so was
+    compiled from. Editors check this before dlopen."""
+    try:
+        with open(parser_src, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(8192)
+    except OSError as e:
+        raise BundleError(f"{parser_src}: {e}")
+    m = re.search(r"^#define LANGUAGE_VERSION (\d+)$", head, re.MULTILINE)
+    if m is None:
+        raise err(parser_src, None, "no '#define LANGUAGE_VERSION' in header region")
+    return int(m.group(1))
+
+
+def collect_editor(grammar_dir, queries_dir, parser_so, parser_src, target):
+    """Three kinds of content, three identities: authored grammar files by
+    path, editor queries by convention name, the compiled parser by
+    platform target."""
+    logical = hashlib.sha256()
+
+    try:
+        top = sorted(os.listdir(grammar_dir))
+    except OSError as e:
+        raise BundleError(f"{grammar_dir}: {e}")
+    sources = []
+    for f in top:
+        full = os.path.join(grammar_dir, f)
+        if not os.path.isfile(full) or not f.endswith((".js", ".json")):
+            continue
+        with open(full, encoding="utf-8") as fh:
+            text = fh.read()
+        digest_field(logical, f.encode())
+        digest_field(logical, text.encode())
+        sources.append((f, text))
+    if "grammar.js" not in (path for path, _ in sources):
+        raise BundleError(f"{grammar_dir}: no grammar.js (not a tree-sitter grammar dir)")
+
+    try:
+        query_files = sorted(os.listdir(queries_dir))
+    except OSError as e:
+        raise BundleError(f"{queries_dir}: {e}")
+    queries = []
+    for f in query_files:
+        full = os.path.join(queries_dir, f)
+        if not os.path.isfile(full) or not f.endswith(".scm"):
+            continue
+        name = f[: -len(".scm")]
+        with open(full, encoding="utf-8") as fh:
+            text = fh.read()
+        digest_field(logical, name.encode())
+        digest_field(logical, text.encode())
+        queries.append((name, text))
+    if not queries:
+        raise BundleError(f"{queries_dir}: no .scm query files found")
+
+    try:
+        with open(parser_so, "rb") as fh:
+            so_bytes = fh.read()
+    except OSError as e:
+        raise BundleError(f"{parser_so}: {e}")
+    if not so_bytes.startswith(SHARED_LIB_MAGICS):
+        raise err(parser_so, None, "not a shared library (unrecognized magic bytes)")
+    abi = parser_abi_version(parser_src)
+    digest_field(logical, target.encode())
+    digest_field(logical, str(abi).encode())
+    digest_field(logical, so_bytes)
+    artifact = (target, abi, so_bytes)
+
+    return sources, queries, artifact, logical.hexdigest()
+
+
+def emit_editor(output, sources, queries, artifact, source_digest, content_version):
+    def populate(conn):
+        conn.executescript(EDITOR_SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO bundle_meta VALUES (1, ?, ?, ?)",
+            (SCHEMA_VERSION, content_version, source_digest),
+        )
+        for path, text in sources:
+            conn.execute(
+                "INSERT INTO grammar_source VALUES (?, ?, ?)",
+                (path, text, hashlib.sha256(text.encode()).hexdigest()),
+            )
+        for name, text in queries:
+            conn.execute(
+                "INSERT INTO editor_query VALUES (?, ?, ?)",
+                (name, text, hashlib.sha256(text.encode()).hexdigest()),
+            )
+        target, abi, so_bytes = artifact
+        conn.execute(
+            "INSERT INTO parser_artifact VALUES (?, ?, ?, ?)",
+            (target, abi, so_bytes, hashlib.sha256(so_bytes).hexdigest()),
+        )
+
+    return build_database(output, populate)
+
+
 def emit_man(output, pages, source_digest, content_version):
     def populate(conn):
         conn.executescript(MAN_SCHEMA_SQL)
@@ -415,7 +558,25 @@ def main():
     books_cmd.add_argument("--content", required=True, help="books/ directory")
     man_cmd = sub.add_parser("man", help="bundle the troff man pages")
     man_cmd.add_argument("--man-dir", required=True, help="man/man1 directory")
-    for p in (books_cmd, man_cmd):
+    editor_cmd = sub.add_parser(
+        "editor", help="bundle grammar + editor queries + compiled parser"
+    )
+    editor_cmd.add_argument(
+        "--grammar-dir", required=True, help="authored tree-sitter grammar directory"
+    )
+    editor_cmd.add_argument(
+        "--queries-dir", required=True, help="directory of .scm editor queries"
+    )
+    editor_cmd.add_argument(
+        "--parser-so", required=True, help="compiled parser shared library"
+    )
+    editor_cmd.add_argument(
+        "--parser-src", required=True, help="generated parser.c (ABI version source)"
+    )
+    editor_cmd.add_argument(
+        "--target", required=True, help="platform triple the parser was compiled for"
+    )
+    for p in (books_cmd, man_cmd, editor_cmd):
         p.add_argument("--output", required=True, help="sqlite file to emit")
         p.add_argument(
             "--content-version",
@@ -435,6 +596,21 @@ def main():
             summary = (
                 f"bundled {len(atoms)} atoms, {len(images)} images, "
                 f"{len(books)} books ({total} placements)"
+            )
+        elif args.command == "editor":
+            sources, queries, artifact, source_digest = collect_editor(
+                args.grammar_dir,
+                args.queries_dir,
+                args.parser_so,
+                args.parser_src,
+                args.target,
+            )
+            changed = emit_editor(
+                args.output, sources, queries, artifact, source_digest, args.content_version
+            )
+            summary = (
+                f"bundled {len(sources)} grammar files, {len(queries)} queries, "
+                f"parser for {artifact[0]} (abi {artifact[1]})"
             )
         else:
             pages, source_digest = collect_man(args.man_dir)

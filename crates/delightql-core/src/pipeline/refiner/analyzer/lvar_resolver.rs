@@ -4,54 +4,52 @@
 //
 // This module handles Lvar extraction and binding creation
 
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved;
-use crate::pipeline::asts::unresolved::NamespacePath;
 use crate::pipeline::refiner::flattener::{FlatOperatorKind, FlatSegment};
 use crate::pipeline::refiner::types::*;
 use std::collections::HashMap;
 
 /// Extract Lvar bindings from tables with positional patterns
-pub(super) fn extract_lvar_bindings(segment: &FlatSegment) -> HashMap<String, Vec<LvarBinding>> {
-    let mut lvar_map: HashMap<String, Vec<LvarBinding>> = HashMap::new();
+pub(super) fn extract_lvar_bindings(
+    segment: &FlatSegment,
+    identities: &crate::names::Registry,
+) -> HashMap<crate::names::Sym, Vec<LvarBinding>> {
+    let mut lvar_map: HashMap<crate::names::Sym, Vec<LvarBinding>> = HashMap::new();
 
     for table in &segment.tables {
-        let table_name = table
-            .alias
-            .clone()
-            .unwrap_or_else(|| table.identifier.name.to_string());
-
         // Extract Lvars from positional patterns
-        let lvars = extract_lvars_from_domain_spec(&table.domain_spec);
+        let lvars = extract_lvars_from_access(&table.access, identities);
 
         for (lvar_name, _position) in lvars {
-            lvar_map
-                .entry(lvar_name.clone())
-                .or_default()
-                .push(LvarBinding {
-                    table: table_name.clone(),
-                    operation_context: table.operation_context,
-                });
+            lvar_map.entry(lvar_name).or_default().push(LvarBinding {
+                table: table.identity,
+            });
         }
 
-        // Also extract Lvars from anonymous table headers for implicit unification
+        // Also extract Lvars from anonymous table headers for implicit
+        // unification. Only a BARE header takes part: qualification is part
+        // of an lvar's complete name, so an aliased table's `x.city` and a
+        // bare `city` are two names, and two names do not unify. Reading the
+        // published spelling alone sees one name where there are two, and
+        // merges relations that should cross.
         if let Some(ref anon_data) = table.anonymous_data {
-            if let Some(ref headers) = anon_data.column_headers {
-                for (_position, header) in headers.iter().enumerate() {
-                    // Only pure unqualified Lvars participate in implicit unification
-                    if let resolved::DomainExpression::Lvar {
-                        name,
-                        qualifier: None,
-                        ..
-                    } = header
-                    {
-                        // Anonymous tables use "_" as their internal alias for implicit unification
-                        lvar_map
-                            .entry(name.to_string())
-                            .or_default()
-                            .push(LvarBinding {
-                                table: table_name.clone(),
-                                operation_context: table.operation_context,
-                            });
+            if let Some(ref headers) = anon_data.body.header {
+                for header in headers.iter() {
+                    match header.term() {
+                        Some(resolved::DomainExpression::Reference(Reference::Named(
+                            NamedReference(ColumnOccurrence { column, .. }),
+                        ))) if identities.scope_of(column) == table.identity
+                            && identities.addressing(column) == crate::names::Addressing::Bare =>
+                        {
+                            if let Some(name) = identities.published_sym(column) {
+                                lvar_map.entry(name).or_default().push(LvarBinding {
+                                    table: table.identity,
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -61,115 +59,106 @@ pub(super) fn extract_lvar_bindings(segment: &FlatSegment) -> HashMap<String, Ve
     lvar_map
 }
 
-/// Extract Lvars from a domain spec (for positional patterns)
-fn extract_lvars_from_domain_spec(spec: &resolved::DomainSpec) -> Vec<(String, usize)> {
+/// Extract Lvars from a access (for positional patterns)
+fn extract_lvars_from_access(
+    spec: &resolved::Access,
+    identities: &crate::names::Registry,
+) -> Vec<(crate::names::Sym, usize)> {
     match spec {
-        resolved::DomainSpec::Positional(expressions) => {
+        resolved::Access::Slots(expressions) => {
             let mut lvars = Vec::new();
-            for (position, expr) in expressions.iter().enumerate() {
-                if let resolved::DomainExpression::Lvar {
-                    name,
-                    qualifier: _,
-                    namespace_path: _,
-                    alias: _,
-                    provenance: _,
-                } = expr
-                {
-                    lvars.push((name.to_string(), position));
+            for (position, slot) in expressions.iter().enumerate() {
+                // Both a slot that BOUND a name and a slot constrained by a
+                // qualified reference name a column of this relation, and
+                // both have always taken part in positional unification.
+                let column = match slot {
+                    resolved::Slot::Bind(column) => Some(*column),
+                    // A REUSE addresses a column by name; that is exactly the
+                    // slot that takes part in positional unification.
+                    resolved::Slot::Reuse(NamedReference(ColumnOccurrence { column, .. })) => {
+                        Some(*column)
+                    }
+                    resolved::Slot::Constraint(_) | resolved::Slot::Anon => None,
+                };
+                if let Some(column) = column {
+                    if let Some(name) = identities.published_sym(column) {
+                        lvars.push((name, position));
+                    }
                 }
             }
             lvars
         }
-        // Glob (*), GlobWithUsing (*.(cols)), Bare (.) — no positional lvar bindings.
-        // GlobWithUsing's columns are handled separately via the USING join mechanism.
-        resolved::DomainSpec::Glob
-        | resolved::DomainSpec::GlobWithUsing(_)
-        | resolved::DomainSpec::GlobWithUsingAll
-        | resolved::DomainSpec::Bare => Vec::new(),
+        // Glob (*), Dequalify (*.(cols)), Bare (.) — no positional lvar bindings.
+        // Dequalify's columns are handled separately via the USING join mechanism.
+        resolved::Access::All
+        | resolved::Access::Dequalify(_)
+        | resolved::Access::DequalifyAll
+        | resolved::Access::Unasked => Vec::new(),
     }
 }
 
-/// Create USING predicates from shared Lvars (positional unification)
-/// This makes implicit Prolog-style unification explicit
+/// Make positional unification's implicit correspondence explicit.
+///
+/// A shared lvar name across a join's two operands IS a correspondence, and
+/// it lands on the OPERATOR that directs it. As a synthetic predicate it put
+/// a non-truth into the predicate pool and gave the join's correspondence a
+/// second home.
 pub(super) fn create_lvar_using_predicates(
-    predicates: &mut Vec<AnalyzedPredicate>,
-    flat: &FlatSegment,
+    flat: &mut FlatSegment,
+    identities: &crate::names::Registry,
 ) {
     // Extract Lvar mappings first
-    let lvar_map = extract_lvar_bindings(flat);
+    let lvar_map = extract_lvar_bindings(flat, identities);
+    let anonymous = {
+        let spelling = identities.intern("_", false);
+        identities.canonical(spelling)
+    };
 
-    // Process each join operator
+    // Decide first, over the whole segment, then write. The decision reads
+    // each operator's operands and the operator's own correspondence slot,
+    // and those cannot be read and written in one pass.
+    let mut decided: Vec<(usize, Vec<crate::names::Sym>)> = Vec::new();
     for (op_idx, op) in flat.operators.iter().enumerate() {
-        if let FlatOperatorKind::Join { using_columns } = &op.kind {
-            // Skip if we already have USING from GlobWithUsing
-            if using_columns.is_some() {
+        let FlatOperatorKind::Join { correspondence } = &op.kind;
+        // A correspondence the dequalifying access already named wins.
+        if correspondence.is_some() {
+            continue;
+        }
+
+        // A pair of single-table operands is what positional unification
+        // names; anything wider is left alone.
+        let ([_left], [_right]) = (op.left_tables.as_slice(), op.right_tables.as_slice()) else {
+            continue;
+        };
+
+        // Find Lvars shared between left and right operands
+        let mut shared_lvars = Vec::new();
+        for (lvar_name, bindings) in &lvar_map {
+            // Skip anonymous variables
+            if *lvar_name == anonymous {
                 continue;
             }
-
-            // Find Lvars shared between left and right operands
-            let mut shared_lvars = Vec::new();
-
-            for (lvar_name, bindings) in &lvar_map {
-                // Skip anonymous variables
-                if lvar_name == "_" {
-                    continue;
-                }
-
-                // Check if Lvar appears in both left and right tables
-                let in_left = bindings.iter().any(|b| op.left_tables.contains(&b.table));
-                let in_right = bindings.iter().any(|b| op.right_tables.contains(&b.table));
-
-                if in_left && in_right {
-                    shared_lvars.push(lvar_name.clone());
-                }
-            }
-
-            // Create synthetic USING predicate if shared Lvars exist
-            if !shared_lvars.is_empty() {
-                log::debug!(
-                    "Creating USING predicate for join {} with shared Lvars: {:?}",
-                    op_idx,
-                    shared_lvars
-                );
-
-                // Sort for deterministic output
-                shared_lvars.sort();
-
-                let using_columns: Vec<resolved::UsingColumn> = shared_lvars
-                    .into_iter()
-                    .map(|name| {
-                        resolved::UsingColumn::Regular(resolved::QualifiedName {
-                            namespace_path: NamespacePath::empty(),
-                            name: name.into(),
-                            grounding: None,
-                        })
-                    })
-                    .collect();
-
-                // Determine the tables involved (for PredicateClass)
-                let left_table = op
-                    .left_tables
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "_unknown_left".to_string());
-                let right_table = op
-                    .right_tables
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "_unknown_right".to_string());
-
-                predicates.push(AnalyzedPredicate {
-                    class: PredicateClass::FJC {
-                        left: left_table,
-                        right: right_table,
-                    },
-                    expr: resolved::BooleanExpression::Using {
-                        columns: using_columns,
-                    },
-                    operator_ref: OperatorRef::Join { position: op_idx },
-                    origin: resolved::FilterOrigin::Generated,
-                });
+            let in_left = bindings.iter().any(|b| op.left_tables.contains(&b.table));
+            let in_right = bindings.iter().any(|b| op.right_tables.contains(&b.table));
+            if in_left && in_right {
+                shared_lvars.push(*lvar_name);
             }
         }
+        if shared_lvars.is_empty() {
+            continue;
+        }
+        // Sort for deterministic output
+        shared_lvars.sort();
+        log::debug!(
+            "Correspondence for join {} from shared Lvars: {:?}",
+            op_idx,
+            shared_lvars
+        );
+        decided.push((op_idx, shared_lvars));
+    }
+
+    for (op_idx, columns) in decided {
+        let FlatOperatorKind::Join { correspondence } = &mut flat.operators[op_idx].kind;
+        *correspondence = Some(resolved::Correspondence::new(columns));
     }
 }

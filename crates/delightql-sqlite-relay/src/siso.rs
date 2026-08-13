@@ -3,8 +3,8 @@
 // SisoParty — Back-End Seam (Generic DatabaseConnection)
 //
 // Backed by Arc<Mutex<dyn DatabaseConnection>>. Eager execution,
-// buffered fetch. No worker thread — query_all_string_rows loads the
-// entire result set, then fetch drains from a VecDeque.
+// buffered fetch. No worker thread — query_all_rows loads the entire
+// result set as typed values, then fetch drains from a VecDeque.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,7 @@ use delightql_types::DatabaseConnection;
 
 struct BufferedCursor {
     columns: Vec<String>,
-    rows: VecDeque<Vec<Option<String>>>,
+    rows: VecDeque<Vec<Cell>>,
 }
 
 // --- SisoParty ---
@@ -54,18 +54,22 @@ impl SisoParty {
 
         let conn = self.connection.lock().unwrap();
 
-        // Use query_all_nullable_rows to preserve NULL fidelity.
+        // The connection answers in its own value vocabulary; each value
+        // becomes a cell, so a null stays absent and a blob stays bytes.
         // If it returns empty columns, fall back to execute for DML.
-        let (columns, rows) = match conn.query_all_nullable_rows(&sql, &[]) {
-            Ok((cols, rows)) if !cols.is_empty() => {
-                (cols, VecDeque::from(rows))
-            }
+        let (columns, rows) = match conn.query_all_rows(&sql, &[]) {
+            Ok((cols, rows)) if !cols.is_empty() => (
+                cols,
+                rows.into_iter()
+                    .map(|row| row.into_iter().map(|v| v.into_wire_bytes()).collect())
+                    .collect(),
+            ),
             Ok(_) | Err(_) => {
                 // DML or not implemented — try execute
                 match conn.execute(&sql, &[]) {
                     Ok(affected) => {
                         let mut rows = VecDeque::new();
-                        rows.push_back(vec![Some(affected.to_string())]);
+                        rows.push_back(vec![Some(affected.to_string().into_bytes())]);
                         (vec!["affected_rows".to_string()], rows)
                     }
                     Err(e) => {
@@ -128,20 +132,13 @@ impl SisoParty {
             return ServerTerm::End;
         }
 
-        let rows: Vec<Vec<Option<String>>> = state.rows.drain(..n).collect();
+        let rows: Vec<Vec<Cell>> = state.rows.drain(..n).collect();
         let col_indices = resolve_projection(&projection, &state.columns);
 
         let cells: Vec<Vec<Cell>> = match orientation {
             Orientation::Rows => rows
                 .iter()
-                .map(|row| {
-                    col_indices
-                        .iter()
-                        .map(|&ci| {
-                            row[ci].as_ref().map(|s| s.as_bytes().to_vec())
-                        })
-                        .collect()
-                })
+                .map(|row| col_indices.iter().map(|&ci| row[ci].clone()).collect())
                 .collect(),
             Orientation::Columns => {
                 return ServerTerm::Error {

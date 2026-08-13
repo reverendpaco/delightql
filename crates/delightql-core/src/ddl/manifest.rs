@@ -137,11 +137,11 @@ impl delightql_types::schema::DatabaseSchema for EmptySchema {
         &self,
         _: Option<&str>,
         _: &str,
-    ) -> Option<Vec<delightql_types::schema::ColumnInfo>> {
-        None
+    ) -> delightql_types::Result<Option<Vec<delightql_types::schema::ColumnInfo>>> {
+        Ok(None)
     }
-    fn table_exists(&self, _: Option<&str>, _: &str) -> bool {
-        false
+    fn table_exists(&self, _: Option<&str>, _: &str) -> delightql_types::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -178,7 +178,7 @@ pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<Imp
 
     let mut rows = Vec::new();
     for clause_def in &clauses {
-        let body = extract_body(clause_def);
+        let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
             DelightQLError::database_error(
@@ -231,7 +231,7 @@ pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Resu
 
     let mut rows = Vec::new();
     for clause_def in &clauses {
-        let body = extract_body(clause_def);
+        let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
             DelightQLError::database_error(
@@ -272,7 +272,7 @@ pub fn read_constraints(
 
     let mut rows = Vec::new();
     for clause_def in &clauses {
-        let body = extract_body(clause_def);
+        let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
             DelightQLError::database_error(
@@ -317,7 +317,7 @@ pub fn read_defaults(
 
     let mut rows = Vec::new();
     for clause_def in &clauses {
-        let body = extract_body(clause_def);
+        let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
             DelightQLError::database_error(
@@ -460,26 +460,19 @@ fn strip_dql_quotes(s: &str) -> &str {
 /// Read entity_clause definitions for an HO entity, matched by ground value
 /// on position 0.
 ///
-/// Ground values in `ho_param_ground_value` are stored as DQL string literals
-/// with surrounding double quotes (e.g., `"products"`). We try matching both
-/// the raw value and the quoted form.
+/// The probe is an entity NAME, so it is looked up under the one stored
+/// ground spelling a string value has — `LiteralValue::stored_ground` — and
+/// nothing else. A second accepted spelling here would be a decoder the
+/// encoder does not have.
 fn read_ho_clauses_by_ground_value(
     conn: &Connection,
     namespace_id: i32,
     ho_entity_name: &str,
     ground_value: &str,
 ) -> Result<Vec<String>> {
-    // Try quoted form: ground_value "products" matches DB value "\"products\""
-    let quoted = format!("\"{}\"", ground_value);
-    let try_values = [ground_value, &quoted];
-
-    for gv in &try_values {
-        let result = read_ho_clauses_by_ground_value_exact(conn, namespace_id, ho_entity_name, gv)?;
-        if !result.is_empty() {
-            return Ok(result);
-        }
-    }
-    Ok(Vec::new())
+    let stored =
+        crate::pipeline::asts::core::LiteralValue::String(ground_value.to_string()).stored_ground();
+    read_ho_clauses_by_ground_value_exact(conn, namespace_id, ho_entity_name, &stored)
 }
 
 fn read_ho_clauses_by_ground_value_exact(
@@ -538,17 +531,6 @@ fn read_ho_clauses_by_ground_value_exact(
         })
 }
 
-/// Extract body text from a full definition string.
-///
-/// `"schema("products")(name, type) :- _(name, type ...)"` → `"_(name, type ...)"`
-fn extract_body(full_source: &str) -> String {
-    if let Some(pos) = full_source.find(":-") {
-        full_source[pos + 2..].trim().to_string()
-    } else {
-        full_source.trim().to_string()
-    }
-}
-
 /// Compile an anonymous table body to SQL via the DQL pipeline.
 fn compile_body(body: &str) -> Result<String> {
     crate::pipeline::compile_source_to_sql(body, &EmptySchema)
@@ -556,7 +538,7 @@ fn compile_body(body: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    //! Manifest-read validation (review finding 9 / M5). The imprinting()
+    //! Manifest-read validation. The imprinting()
     //! materialization/extent columns and entity names are validated the moment
     //! they leave the bootstrap DB, so a typo can never silently pick the wrong
     //! materialization/extent or inject an unescaped identifier downstream.
@@ -564,15 +546,24 @@ mod tests {
 
     #[test]
     fn materialization_parses_known() {
-        assert_eq!(Materialization::parse("table").unwrap(), Materialization::Table);
-        assert_eq!(Materialization::parse("view").unwrap(), Materialization::View);
+        assert_eq!(
+            Materialization::parse("table").unwrap(),
+            Materialization::Table
+        );
+        assert_eq!(
+            Materialization::parse("view").unwrap(),
+            Materialization::View
+        );
     }
 
     #[test]
     fn materialization_rejects_typo() {
-        // Pre-fix: "veiw" != "view" silently fell through to a table.
+        // A plain String comparison lets "veiw" fall through to a table.
         let err = Materialization::parse("veiw").unwrap_err();
-        assert_eq!(err.error_uri(), "delightql-error://imprint/manifest/materialization");
+        assert_eq!(
+            err.error_uri(),
+            "delightql-error://imprint/manifest/materialization"
+        );
         assert!(err.to_string().contains("veiw"), "{}", err);
     }
 
@@ -584,7 +575,7 @@ mod tests {
 
     #[test]
     fn extent_rejects_typo() {
-        // Pre-fix: extent == "temporary" only, so "temp" silently meant permanent.
+        // Comparing only against "temporary" makes "temp" mean permanent.
         let err = Extent::parse("temp").unwrap_err();
         assert_eq!(err.error_uri(), "delightql-error://imprint/manifest/extent");
         assert!(err.to_string().contains("temp"), "{}", err);
@@ -599,6 +590,9 @@ mod tests {
     fn entity_name_rejects_embedded_quote() {
         // Reachable via a triple-quoted DQL literal `"""a"b"""` → strip → a"b.
         let err = validate_entity_name("a\"b").unwrap_err();
-        assert_eq!(err.error_uri(), "delightql-error://imprint/manifest/entity_name");
+        assert_eq!(
+            err.error_uri(),
+            "delightql-error://imprint/manifest/entity_name"
+        );
     }
 }

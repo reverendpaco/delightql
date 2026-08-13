@@ -5,22 +5,23 @@
 //! The images are produced at build time (see `build.rs`), embedded via
 //! `include_bytes!`, bound as `delightql-bytes://` names at
 //! `connection::open_handle`, and mounted through the ordinary DQL
-//! `mount!` path (BYTES-SCHEME-DESIGN.md). Byte-level validation happens
+//! `mount!` path. Byte-level validation happens
 //! in the producers and again at bind time (core validates every bound
 //! image in a scratch connection); the runtime check that remains is the
 //! semantic one below, run through DQL against the mounted namespace.
 //! No temp files: static images attach zero-copy from rodata, and the
-//! runtime-built surface image attaches from SQLite-owned memory
-//! (MOUNT-SPINE-PLAN.md Phase 3).
+//! runtime-built surface image attaches from SQLite-owned memory.
 
 pub const BOOK_APPLICATION_ID: i64 = 0x4451_4c42; // DQLB
 pub const MAN_APPLICATION_ID: i64 = 0x4451_4c4d; // DQLM
+pub const EDITOR_APPLICATION_ID: i64 = 0x4451_4c45; // DQLE
 pub const SCHEMA_VERSION: i64 = 1;
 
 pub const BOOK_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/book.sqlite"));
 pub const MAN_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/man.sqlite"));
+pub const EDITOR_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/editor.sqlite"));
 
-/// Post-mount contract check (BYTES-SCHEME-DESIGN.md, review R3): the
+/// Post-mount contract check: the
 /// mounted bundle's `bundle_meta.schema_version` must be the version this
 /// binary's subcommand consumes. Runs through DQL against the mounted
 /// namespace — the cheap, semantic runtime check that survives now that
@@ -62,7 +63,12 @@ mod tests {
     fn embedded_databases_have_distinct_identities() {
         assert_eq!(image_pragma(BOOK_BYTES, "application_id"), BOOK_APPLICATION_ID);
         assert_eq!(image_pragma(MAN_BYTES, "application_id"), MAN_APPLICATION_ID);
+        assert_eq!(
+            image_pragma(EDITOR_BYTES, "application_id"),
+            EDITOR_APPLICATION_ID
+        );
         assert_eq!(image_pragma(BOOK_BYTES, "user_version"), SCHEMA_VERSION);
         assert_eq!(image_pragma(MAN_BYTES, "user_version"), SCHEMA_VERSION);
+        assert_eq!(image_pragma(EDITOR_BYTES, "user_version"), SCHEMA_VERSION);
     }
 }

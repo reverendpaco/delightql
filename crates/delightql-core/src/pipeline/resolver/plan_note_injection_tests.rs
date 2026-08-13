@@ -1,29 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Epic 3.0b probe: plan-note schema injection via the query-local registry.
+//! Plan-note schema injection via the query-local registry.
 //!
-//! QUESTION (IMPLEMENTATION-ARCHITECTURE.md §7, REPORT-1.6 probe 3): can the
-//! compiler resolve a query against the schema of a table that does not
-//! exist in ANY catalog, by injecting the table's inferred schema into the
-//! resolver's query-local registry? This is what the effect transformer
-//! (Epic 3.1) must do to compile statement N+1 against `temp_table!` targets
-//! statement N will create — schemas inferred from text, never by executing.
+//! QUESTION: can the compiler resolve a query against the schema of a
+//! table that does not exist in ANY catalog, by injecting the table's
+//! inferred schema into the resolver's query-local registry? This is what
+//! the effect transformer must do to compile statement N+1 against
+//! `temp_table!` targets statement N will create — schemas inferred from
+//! text, never by executing.
 //!
-//! These tests are the pinning artifact for that guarantee. They use only
-//! existing APIs: `QueryLocalRegistry::register_cte` (the injection),
-//! `resolve_query_inline` (the resolver door that accepts a pre-populated
-//! registry), and the ordinary refine/address/transform/generate chain.
-//! Zero production code was changed for this probe.
+//! These tests pin that guarantee through the materialized-relation registry,
+//! the resolver door that accepts a pre-populated registry, and the ordinary
+//! refine/address/transform/generate chain.
 
 use super::{resolve_query_inline, ResolutionConfig};
-use crate::pipeline::asts::core::QualificationSource;
-use crate::pipeline::ast_resolved::{
-    ColumnMetadata, ColumnProvenance, CprSchema, TableName,
-};
-use crate::pipeline::{
-    addresser, ast_unresolved, builder_v2, danger_gates, generator_v3, parser, refiner,
-    transformer_v4,
-};
+use crate::pipeline::asts::core::AuthoredColumn;
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
 use crate::resolution::EntityRegistry;
 use crate::system::DelightQLSystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
@@ -57,34 +50,43 @@ fn fresh_empty_system() -> DelightQLSystem {
 
 /// Parse a single DQL query to its unresolved AST (phases 0–1 only).
 fn parse_single(source: &str) -> ast_unresolved::Query {
-    let tree = parser::parse(source).expect("source should parse");
-    let (query, _features, _asserts, _dangers, _options, _ddl) =
-        builder_v2::parse_query(&tree, source).expect("source should build");
-    query
+    let tree = crate::pipeline::parse::query_sequence(source).expect("source should parse");
+    let mut normalized =
+        crate::pipeline::parse::normalize_sequence(&tree).expect("source should normalize");
+    assert_eq!(normalized.queries.len(), 1, "one statement expected");
+    normalized.queries.remove(0).query
 }
 
-/// Build a plan note: the CprSchema the effect transformer would infer from
-/// the creating statement's text. Mirrors byte-for-byte what
+/// Build a plan note: the scope the effect transformer would infer from the
+/// creating statement's text. Mirrors byte-for-byte what
 /// `DatabaseRegistry::lookup_table` builds from a real catalog row
 /// (resolution/registry.rs:120–143), minus declared types (a CTAS target's
 /// types are whatever the SELECT produced).
-fn plan_note(table: &str, cols: &[&str]) -> CprSchema {
-    CprSchema::Resolved(
-        cols.iter()
-            .enumerate()
-            .map(|(idx, col)| {
-                ColumnMetadata::new(
-                    ColumnProvenance::from_table_column(
-                        *col,
-                        TableName::Named(table.to_string().into()),
-                        QualificationSource::None,
-                    ),
-                    TableName::Named(table.to_string().into()),
-                    Some(idx + 1),
-                )
-            })
-            .collect(),
-    )
+fn plan_note(
+    table: &str,
+    cols: &[&str],
+    identities: &crate::names::Registry,
+) -> crate::names::ScopeId {
+    let spelling = identities.intern(table, false);
+    let entity = identities.mint_entity(spelling);
+    let scope = identities.mint_scope(
+        crate::names::ScopeOrigin::BaseTable { entity },
+        crate::names::Hint::User(spelling),
+        None,
+    );
+    for (position, column) in cols.iter().enumerate() {
+        let spelling = identities.intern(column, false);
+        identities.mint_column(
+            scope,
+            crate::names::ColumnOrigin::Bound {
+                position: position as u32,
+            },
+            Some(spelling),
+            crate::names::Addressing::Published,
+            crate::names::ValueFacts::default(),
+        );
+    }
+    scope
 }
 
 /// Run phases 2–5 by hand over a pre-populated registry: the exact chain
@@ -94,30 +96,35 @@ fn plan_note(table: &str, cols: &[&str]) -> CprSchema {
 fn compile_with_notes(
     source: &str,
     system: &DelightQLSystem,
-    notes: &[(&str, CprSchema)],
+    notes: &[(&str, &[&str])],
 ) -> crate::error::Result<String> {
     let query = parse_single(source);
     let schema = system.get_schema()?;
-    let mut registry = EntityRegistry::new_with_system(schema, system);
-    for (name, note) in notes {
-        registry
-            .query_local
-            .register_cte(name.to_string(), note.clone());
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let mut registry =
+        EntityRegistry::new_with_system(schema, system, std::rc::Rc::clone(&identities));
+    for (name, columns) in notes {
+        registry.query_local.register_materialized_relation(
+            delightql_types::SqlIdentifier::new(*name),
+            plan_note(name, columns, &identities),
+        );
     }
     let config = ResolutionConfig::default();
     let (resolved, _bubbled) = resolve_query_inline(query, &mut registry, None, &config, None)?;
 
     let gates = danger_gates::DangerGateMap::with_defaults();
-    let refined = refiner::refine_query_with_gates(resolved, gates.clone())?;
-    let addressed = addresser::address_query(refined)?;
-    let ctx = transformer_v4::TransformCtx {
-        cfes: vec![],
-        names: transformer_v4::builder::NameGenerator::new(),
+    let refined =
+        refiner::refine_query_with_gates(resolved, gates.clone(), std::rc::Rc::clone(&identities))?;
+    let ctx = transformer::TransformCtx {
+        identities: std::rc::Rc::clone(&identities),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&identities)),
         outer_columns: vec![],
         danger_gates: gates,
     };
-    let sql_ast = transformer_v4::transform(addressed, &ctx)?;
-    generator_v3::SqlGenerator::new()
+    let sql_ast = transformer::transform(refined, &ctx)?.without_obligations()?;
+    let names = generator::baptise_statements(&identities, &[&sql_ast])
+        .map_err(|e| e.into_delightql_error("plan-note SQL naming failed"))?;
+    generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
         .map_err(|e| {
             crate::error::DelightQLError::validation_error(
@@ -140,20 +147,17 @@ fn bootstrap_existence_gate_refuses_unknown_table_without_note() {
     let err = compile_with_notes("plan_scratch(*), x > 0 |> (x)", &system, &[])
         .expect_err("a table in no catalog must be refused without a plan note");
     assert!(
-        matches!(
-            err,
-            crate::error::DelightQLError::TableNotFoundError { .. }
-        ),
+        matches!(err, crate::error::DelightQLError::TableNotFoundError { .. }),
         "expected TableNotFoundError, got: {err:?}"
     );
 }
 
 /// THE PROBE ANSWER — YES for unqualified references. A schema note for a
-/// table that exists in NO catalog, injected via
-/// `QueryLocalRegistry::register_cte` before resolution, lets the full
+/// table that exists in NO catalog, injected as a materialized relation before
+/// resolution, lets the full
 /// phase 2–5 chain compile `T(*), x > 0 |> (x)` to executable SQL:
-/// bare-identifier FROM, filter and projection intact, and — the REPORT-1.6
-/// open verification item — NO phantom WITH clause (the note came from the
+/// bare-identifier FROM, filter and projection intact, and NO phantom WITH
+/// clause (the note came from the
 /// registry, not from a `Query::WithCtes` binding, so the generator has no
 /// CTE to render).
 #[test]
@@ -162,7 +166,7 @@ fn injected_plan_note_compiles_nonexistent_table_to_sql() {
     let sql = compile_with_notes(
         "plan_scratch(*), x > 0 |> (x)",
         &system,
-        &[("plan_scratch", plan_note("plan_scratch", &["x", "y"]))],
+        &[("plan_scratch", &["x", "y"])],
     )
     .expect("an injected plan note must make the table resolvable");
 
@@ -186,6 +190,136 @@ fn injected_plan_note_compiles_nonexistent_table_to_sql() {
     );
 }
 
+/// Plan scratch has no character-bearing lookup road. A query-local string
+/// key cannot be used to recover a scratch identity; compiler statements
+/// carry a `GroundMention::Plan` instead.
+#[test]
+fn injected_string_key_cannot_resolve_plan_scratch() {
+    let system = fresh_empty_system();
+    let query = parse_single("logical_scratch(*)");
+    let schema = system.get_schema().expect("schema");
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let scratch = identities.mint_scope(
+        crate::names::ScopeOrigin::Scratch {
+            role: crate::names::ScratchRole::Snapshot,
+        },
+        crate::names::Hint::None,
+        None,
+    );
+    let column = identities.intern("x", false);
+    identities.mint_column(
+        scratch,
+        crate::names::ColumnOrigin::Bound { position: 0 },
+        Some(column),
+        crate::names::Addressing::Published,
+        crate::names::ValueFacts::default(),
+    );
+
+    let mut registry =
+        EntityRegistry::new_with_system(schema, &system, std::rc::Rc::clone(&identities));
+    registry.query_local.register_cte(
+        delightql_types::SqlIdentifier::new("logical_scratch"),
+        scratch,
+    );
+    let err = resolve_query_inline(
+        query,
+        &mut registry,
+        None,
+        &ResolutionConfig::default(),
+        None,
+    )
+    .expect_err("a string lookup must not recover plan scratch");
+    assert!(
+        format!("{err}").contains("scope identity"),
+        "the refusal should teach the structural road: {err}"
+    );
+}
+
+#[test]
+fn authored_access_wraps_the_exact_plan_scope() {
+    let system = fresh_empty_system();
+    let schema = system.get_schema().expect("schema");
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let scratch = identities.mint_scope(
+        crate::names::ScopeOrigin::Scratch {
+            role: crate::names::ScratchRole::Snapshot,
+        },
+        crate::names::Hint::None,
+        None,
+    );
+    let column = identities.intern("x", false);
+    identities.mint_column(
+        scratch,
+        crate::names::ColumnOrigin::Bound { position: 0 },
+        Some(column),
+        crate::names::Addressing::Published,
+        crate::names::ValueFacts::default(),
+    );
+    let query = ast_unresolved::Query::relational(ast_unresolved::Chain::read(
+        ast_unresolved::Relation::Ground {
+            mention: ast_unresolved::GroundMention::Plan {
+                scope: scratch,
+                authored_name: Some("valid".into()),
+                alias: Some("v".into()),
+            },
+            outer: false,
+            cpr_schema: (),
+        },
+        ast_unresolved::Access::from_terms(vec![ast_unresolved::DomainExpression::Reference(
+            Reference::Named(NamedReference(AuthoredColumn {
+                name: "renamed".into(),
+                qualifier: None,
+                namespace_path: ast_unresolved::NamespacePath::empty(),
+            })),
+        )]),
+        (),
+    ));
+    let mut registry =
+        EntityRegistry::new_with_system(schema, &system, std::rc::Rc::clone(&identities));
+    let (resolved, _bubbled) = resolve_query_inline(
+        query,
+        &mut registry,
+        None,
+        &ResolutionConfig::default(),
+        None,
+    )
+    .expect("an authored access should resolve over plan scratch");
+
+    let gates = danger_gates::DangerGateMap::with_defaults();
+    let refined =
+        refiner::refine_query_with_gates(resolved, gates.clone(), std::rc::Rc::clone(&identities))
+            .expect("the authored scratch access should refine");
+    let refined = refined;
+    let ctx = transformer::TransformCtx {
+        identities: std::rc::Rc::clone(&identities),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&identities)),
+        outer_columns: vec![],
+        danger_gates: gates,
+    };
+    let sql_ast = transformer::transform(refined, &ctx)
+        .expect("the access should lower to SQL AST")
+        .without_obligations()
+        .expect("a pure access carries no obligation");
+    let names = generator::baptise_statements(&identities, &[&sql_ast])
+        .expect("the access should baptise");
+    let sql = generator::SqlGenerator::new(&names)
+        .generate_statement(&sql_ast)
+        .expect("the access should render");
+
+    assert!(
+        sql.contains("FROM scratch_1"),
+        "the physical FROM must use the plan-scope identity: {sql}"
+    );
+    assert!(
+        sql.contains(" AS v") && !sql.contains("FROM v"),
+        "the authored alias belongs to the outer occurrence only: {sql}"
+    );
+    assert!(
+        sql.contains("renamed"),
+        "call-site pattern resolution stays on the outer occurrence: {sql}"
+    );
+}
+
 /// Column knowledge flows from the note: projecting a column the note does
 /// not declare is refused, proving resolution really consulted the injected
 /// schema (not a permissive passthrough).
@@ -195,7 +329,7 @@ fn injected_plan_note_supplies_real_column_knowledge() {
     let err = compile_with_notes(
         "plan_scratch(*) |> (no_such_column)",
         &system,
-        &[("plan_scratch", plan_note("plan_scratch", &["x", "y"]))],
+        &[("plan_scratch", &["x", "y"])],
     )
     .expect_err("a column absent from the note must not resolve");
     let msg = format!("{err}");
@@ -205,7 +339,7 @@ fn injected_plan_note_supplies_real_column_knowledge() {
     );
 }
 
-/// EDGE CASE pinned for 3.1: an injected note carries NO connection
+/// EDGE CASE: an injected note carries NO connection
 /// attribution. The CTE branch of `resolve_entity_with_alias`
 /// (resolution/resolver.rs:58–81) never calls `track_connection_id`, so a
 /// statement whose only relation is a plan note resolves with
@@ -217,10 +351,12 @@ fn injected_plan_note_carries_no_connection_attribution() {
     let system = fresh_empty_system();
     let query = parse_single("plan_scratch(*), x > 0 |> (x)");
     let schema = system.get_schema().expect("schema");
-    let mut registry = EntityRegistry::new_with_system(schema, &system);
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let mut registry =
+        EntityRegistry::new_with_system(schema, &system, std::rc::Rc::clone(&identities));
     registry.query_local.register_cte(
-        "plan_scratch".to_string(),
-        plan_note("plan_scratch", &["x", "y"]),
+        delightql_types::SqlIdentifier::new("plan_scratch"),
+        plan_note("plan_scratch", &["x", "y"], &identities),
     );
     let config = ResolutionConfig::default();
     resolve_query_inline(query, &mut registry, None, &config, None)
@@ -235,29 +371,25 @@ fn injected_plan_note_carries_no_connection_attribution() {
     );
 }
 
-/// DIVERGENCE pinned for 3.1: the qualified funnel
+/// DIVERGENCE: the qualified funnel
 /// (`lookup_table_with_namespace`, reached via the
 /// `!identifier.namespace_path.is_empty()` branch of relation resolution,
 /// relation_resolver.rs:511) never consults the query-local registry, so a
 /// namespace-qualified reference to a noted table is REFUSED. Plan notes
 /// work for BARE references only — fine for v0.1, where scratch temps are
-/// named by the walker itself and always referenced bare (REPORT-1.6
-/// strategy (a)); qualified references need bootstrap registration
-/// (strategy (b)).
+/// named by the walker itself and always referenced bare; qualified
+/// references need bootstrap registration instead.
 #[test]
 fn qualified_reference_bypasses_plan_notes_and_is_refused() {
     let system = fresh_empty_system();
     let err = compile_with_notes(
         "home.plan_scratch(*), x > 0 |> (x)",
         &system,
-        &[("plan_scratch", plan_note("plan_scratch", &["x", "y"]))],
+        &[("plan_scratch", &["x", "y"])],
     )
     .expect_err("qualified references must not see query-local notes");
     assert!(
-        matches!(
-            err,
-            crate::error::DelightQLError::TableNotFoundError { .. }
-        ),
+        matches!(err, crate::error::DelightQLError::TableNotFoundError { .. }),
         "expected TableNotFoundError on the qualified path, got: {err:?}"
     );
 }

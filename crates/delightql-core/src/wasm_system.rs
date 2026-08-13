@@ -58,20 +58,39 @@ struct ConnectionBackedSchema {
 }
 
 impl DatabaseSchema for ConnectionBackedSchema {
-    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Option<Vec<ColumnInfo>> {
+    fn get_table_columns(
+        &self,
+        schema: Option<&str>,
+        table_name: &str,
+    ) -> Result<Option<Vec<ColumnInfo>>> {
         let sql = match schema {
             Some(s) => format!("PRAGMA {}.table_info({})", s, table_name),
             None => format!("PRAGMA table_info({})", table_name),
         };
-        let conn = self.connection.lock().ok()?;
-        let (columns, rows) = conn.query_all_nullable_rows(&sql, &[]).ok()?;
+        let conn = self.connection.lock().map_err(|error| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire WASM schema connection",
+                error.to_string(),
+            )
+        })?;
+        let (columns, rows) = conn.query_all_rows(&sql, &[])?;
         if rows.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-        let name_idx = columns.iter().position(|c| c == "name")?;
-        let notnull_idx = columns.iter().position(|c| c == "notnull")?;
+        let name_idx = columns.iter().position(|c| c == "name").ok_or_else(|| {
+            DelightQLError::database_error(
+                "WASM schema metadata is malformed",
+                "missing required column 'name'",
+            )
+        })?;
+        let notnull_idx = columns.iter().position(|c| c == "notnull").ok_or_else(|| {
+            DelightQLError::database_error(
+                "WASM schema metadata is malformed",
+                "missing required column 'notnull'",
+            )
+        })?;
 
         let cols: Vec<ColumnInfo> = rows
             .iter()
@@ -79,12 +98,11 @@ impl DatabaseSchema for ConnectionBackedSchema {
             .map(|(pos, row)| {
                 let name = row
                     .get(name_idx)
-                    .and_then(|v| v.as_deref())
-                    .unwrap_or("")
-                    .to_string();
+                    .and_then(|v| v.as_wire_text())
+                    .unwrap_or_default();
                 let notnull = row
                     .get(notnull_idx)
-                    .and_then(|v| v.as_deref())
+                    .and_then(|v| v.as_wire_text())
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(0);
                 ColumnInfo {
@@ -98,10 +116,10 @@ impl DatabaseSchema for ConnectionBackedSchema {
             })
             .collect();
 
-        Some(cols)
+        Ok(Some(cols))
     }
 
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool {
+    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool> {
         let sql = match schema {
             Some(s) => format!(
                 "SELECT 1 FROM {}.sqlite_master WHERE type='table' AND name='{}'",
@@ -112,14 +130,14 @@ impl DatabaseSchema for ConnectionBackedSchema {
                 table_name
             ),
         };
-        let conn = match self.connection.lock() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        match conn.query_all_nullable_rows(&sql, &[]) {
-            Ok((_, rows)) => !rows.is_empty(),
-            Err(_) => false,
-        }
+        let conn = self.connection.lock().map_err(|error| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire WASM schema connection",
+                error.to_string(),
+            )
+        })?;
+        let (_, rows) = conn.query_all_rows(&sql, &[])?;
+        Ok(!rows.is_empty())
     }
 }
 
@@ -139,6 +157,12 @@ pub(crate) struct DelightQLSystem {
 
     /// Flag: is namespace resolver authoritative?
     pub namespace_authoritative: bool,
+
+    /// Shared relay health API. WASM has no native liminal effects today, but
+    /// it still carries the latch so protocol behavior does not diverge.
+    /// `None` = healthy; `Some((operation, message))` = quarantined, with the
+    /// incident retained for the typed host report.
+    session_incident: Option<(String, String)>,
 }
 
 impl DelightQLSystem {
@@ -167,6 +191,7 @@ impl DelightQLSystem {
             schema: Some(schema),
             bin_registry: Arc::new(bin_registry),
             namespace_authoritative: false,
+            session_incident: None,
         })
     }
 
@@ -221,7 +246,7 @@ impl DelightQLSystem {
         ))
     }
 
-    /// Byte bindings (`delightql-bytes://`, BYTES-SCHEME-DESIGN.md) — not
+    /// Byte bindings (`delightql-bytes://`, documentation/archived/2026-08-05/BYTES-SCHEME-DESIGN.md) — not
     /// supported in WASM: it cannot attach deserialized native SQLite
     /// schemas. The documented refusal, actually implemented.
     pub fn bind_static_bytes(&mut self, _name: &str, _bytes: &'static [u8]) -> Result<()> {
@@ -300,13 +325,13 @@ impl DelightQLSystem {
     }
 
     /// Consult file - not supported in WASM. Signature mirrors the native
-    /// `consult_file` (review qmqwqlms round 3, P2: the stub had drifted
-    /// to three parameters while native call sites supply five).
+    /// `consult_file`: a stub whose arity drifts from the native one is a
+    /// compile error waiting on the next WASM build, not on this one.
     pub fn consult_file(
         &mut self,
         _path: &str,
         _namespace: &str,
-        _ddl: crate::pipeline::parser::DDLFile,
+        _definitions: Vec<crate::pipeline::asts::ddl::ClauseDecl>,
         _liminal_receipts: &[LiminalReceipt],
         _post: Option<&ConsultPost<'_>>,
     ) -> Result<ConsultResult> {
@@ -331,6 +356,39 @@ impl DelightQLSystem {
     }
 
     pub(crate) fn rollback_liminal_external_effects(&mut self) {}
+
+    pub(crate) fn require_healthy(&self) -> Result<()> {
+        if self.session_incident.is_none() {
+            Ok(())
+        } else {
+            Err(DelightQLError::database_error_categorized(
+                "session_health/external_effect",
+                "the session is quarantined; reset or reconnect before issuing another query",
+                "external effect recovery is uncertain",
+            ))
+        }
+    }
+
+    pub(crate) fn quarantine_session(
+        &mut self,
+        operation: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        if self.session_incident.is_none() {
+            self.session_incident = Some((operation.into(), message.into()));
+        }
+    }
+
+    pub(crate) fn session_is_healthy(&self) -> bool {
+        self.session_incident.is_none()
+    }
+
+    /// The quarantine incident, if one is latched: (operation, message).
+    pub(crate) fn health_incident(&self) -> Option<(&str, &str)> {
+        self.session_incident
+            .as_ref()
+            .map(|(operation, message)| (operation.as_str(), message.as_str()))
+    }
 
     pub(crate) fn refuse_preexisting_namespace_mutation_in_program(
         &self,
@@ -406,6 +464,14 @@ impl DelightQLSystem {
         // WASM doesn't support unqualified entity resolution from bootstrap
         Ok(None)
     }
+
+    /// Publish the compilation's armed limits — nothing to publish into.
+    ///
+    /// WASM has no bootstrap catalog, so there is no `compiler_limit` row that
+    /// could go stale and nothing here to keep true. The guards are unaffected
+    /// either way: a compilation is bounded by the limits its own registry
+    /// armed, and neither guard reads a database.
+    pub(crate) fn publish_compiler_limits(&self, _armed: &crate::compiler_limits::ArmedLimits) {}
 
     /// Reinit bootstrap - not supported in WASM (no bootstrap database)
     pub fn reinit_bootstrap(&mut self) -> Result<()> {

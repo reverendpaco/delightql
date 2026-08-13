@@ -92,11 +92,11 @@ impl DatabaseConnection for SqliteConnection {
         Ok(conn.last_insert_rowid())
     }
 
-    /// `delightql-bytes://` mounts (BYTES-SCHEME-DESIGN.md): attach a fresh
-    /// in-memory schema and deserialize a static SQLite image into it,
-    /// read-only, referencing the `include_bytes!` buffer in place — zero
-    /// copies, zero disk. On deserialize failure the alias is detached so
-    /// nothing is left behind (spike Q5).
+    /// `delightql-bytes://` mounts attach a fresh in-memory schema and
+    /// deserialize a static SQLite image into it, read-only, referencing
+    /// the `include_bytes!` buffer in place — zero copies, zero disk. On
+    /// deserialize failure the alias is detached so nothing is left
+    /// behind.
     fn attach_static_bytes(&self, schema_alias: &str, bytes: &'static [u8]) -> DelightQLResult<()> {
         let mut conn = self.conn.lock().map_err(|e| {
             delightql_types::DelightQLError::connection_poison_error(
@@ -138,10 +138,10 @@ impl DatabaseConnection for SqliteConnection {
     /// database, and a READONLY deserialized member makes every such
     /// transaction on the connection fail with SQLITE_READONLY — which
     /// would break imprint! (and any other IMMEDIATE user) for the whole
-    /// session. The tempfile this replaces was writable at the SQLite
-    /// level too; the not-for-writing contract is the host's convention,
-    /// as it was then. (A delightql-level DML gate on bytes-mounted
-    /// namespaces is the recorded follow-up, with review R4.)
+    /// session. The not-for-writing contract on this schema is the
+    /// host's convention, not a SQLite-level guarantee. (A
+    /// delightql-level DML gate on bytes-mounted namespaces is the
+    /// recorded follow-up.)
     fn attach_bytes_copied(&self, schema_alias: &str, bytes: &[u8]) -> DelightQLResult<()> {
         let mut conn = self.conn.lock().map_err(|e| {
             delightql_types::DelightQLError::connection_poison_error(
@@ -223,11 +223,11 @@ impl DatabaseConnection for SqliteConnection {
         }
     }
 
-    fn query_all_string_rows(
+    fn query_all_rows(
         &self,
         sql: &str,
         params: &[DbValue],
-    ) -> DelightQLResult<(Vec<String>, Vec<Vec<String>>)> {
+    ) -> DelightQLResult<(Vec<String>, Vec<Vec<DbValue>>)> {
         let conn = self.conn.lock().map_err(|e| {
             delightql_types::DelightQLError::connection_poison_error(
                 "Connection mutex poisoned",
@@ -250,17 +250,9 @@ impl DatabaseConnection for SqliteConnection {
 
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
-                let mut values = Vec::new();
+                let mut values = Vec::with_capacity(column_names.len());
                 for idx in 0..column_names.len() {
-                    let val: rusqlite::types::Value = row.get(idx)?;
-                    let string_val = match val {
-                        rusqlite::types::Value::Null => "NULL".to_string(),
-                        rusqlite::types::Value::Integer(i) => i.to_string(),
-                        rusqlite::types::Value::Real(f) => f.to_string(),
-                        rusqlite::types::Value::Text(s) => s,
-                        rusqlite::types::Value::Blob(b) => format!("<blob {} bytes>", b.len()),
-                    };
-                    values.push(string_val);
+                    values.push(rusqlite_value_to_db_value(row.get_ref(idx)?));
                 }
                 Ok(values)
             })
@@ -278,60 +270,7 @@ impl DatabaseConnection for SqliteConnection {
         Ok((column_names, result_rows))
     }
 
-    fn query_all_nullable_rows(
-        &self,
-        sql: &str,
-        params: &[DbValue],
-    ) -> DelightQLResult<(Vec<String>, Vec<Vec<Option<String>>>)> {
-        let conn = self.conn.lock().map_err(|e| {
-            delightql_types::DelightQLError::connection_poison_error(
-                "Connection mutex poisoned",
-                e.to_string(),
-            )
-        })?;
 
-        let rusqlite_params: Vec<rusqlite::types::Value> =
-            params.iter().map(db_value_to_rusqlite).collect();
-        let params_refs: Vec<&dyn rusqlite::ToSql> = rusqlite_params
-            .iter()
-            .map(|v| v as &dyn rusqlite::ToSql)
-            .collect();
-
-        let mut stmt = conn.prepare(sql).map_err(|e| {
-            delightql_types::DelightQLError::database_error("Failed to prepare query", e.to_string())
-        })?;
-
-        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-
-        let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                let mut values = Vec::new();
-                for idx in 0..column_names.len() {
-                    let val: rusqlite::types::Value = row.get(idx)?;
-                    let opt_val = match val {
-                        rusqlite::types::Value::Null => None,
-                        rusqlite::types::Value::Integer(i) => Some(i.to_string()),
-                        rusqlite::types::Value::Real(f) => Some(f.to_string()),
-                        rusqlite::types::Value::Text(s) => Some(s),
-                        rusqlite::types::Value::Blob(b) => Some(format!("<blob {} bytes>", b.len())),
-                    };
-                    values.push(opt_val);
-                }
-                Ok(values)
-            })
-            .map_err(|e| {
-                delightql_types::DelightQLError::database_error("Query execution failed", e.to_string())
-            })?;
-
-        let mut result_rows = Vec::new();
-        for row_result in rows {
-            result_rows.push(row_result.map_err(|e| {
-                delightql_types::DelightQLError::database_error("Failed to fetch row", e.to_string())
-            })?);
-        }
-
-        Ok((column_names, result_rows))
-    }
 }
 
 // Note: DatabaseConnectionExt is automatically implemented for SqliteConnection

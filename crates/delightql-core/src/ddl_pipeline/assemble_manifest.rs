@@ -29,6 +29,25 @@ pub fn assemble_from_manifest(
         )));
     }
 
+    // Every constraint row is consumed below either as a column constraint or
+    // by the "_" table-level sentinel. Check the complete schema declaration
+    // first so an unwitnessed row cannot disappear between those two paths.
+    for cr in constraint_rows {
+        if cr.column != "_" && !schema_rows.iter().any(|sr| sr.name == cr.column) {
+            return Err(crate::DelightQLError::validation_error_categorized(
+                "imprint/manifest/constraint_column",
+                format!(
+                    "constraint '{}' for '{}' names unknown column '{}'",
+                    cr.constraint_name, table_name, cr.column
+                ),
+                format!(
+                    "declare '{}' in schema(\"{}\") or use \"_\" for a table-level constraint",
+                    cr.column, table_name
+                ),
+            ));
+        }
+    }
+
     let mut columns: Vec<ColumnDef<Unresolved>> = Vec::new();
     for sr in schema_rows {
         // Collect constraints for this column
@@ -48,10 +67,7 @@ pub fn assemble_from_manifest(
                     let base = builder::build_default(&dr.default_val)?;
                     match base {
                         DdlDefault::Value { expr } => {
-                            let kind = match gen_kind.to_lowercase().as_str() {
-                                "stored" => GeneratedKind::Stored,
-                                _ => GeneratedKind::Virtual,
-                            };
+                            let kind = GeneratedKind::parse(gen_kind)?;
                             Ok(DdlDefault::Generated { expr, kind })
                         }
                         other => Ok(other),
@@ -84,4 +100,32 @@ pub fn assemble_from_manifest(
         columns,
         table_constraints,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constraint_column_must_be_declared_by_the_schema() {
+        let schema = [SchemaRow {
+            name: "age".to_string(),
+            col_type: "INTEGER".to_string(),
+        }];
+        let constraints = [ConstraintRow {
+            column: "agee".to_string(),
+            constraint: "@ > 0".to_string(),
+            constraint_name: "ck_age_positive".to_string(),
+        }];
+
+        let error =
+            assemble_from_manifest("measurements", true, &schema, &constraints, &[]).unwrap_err();
+
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://imprint/manifest/constraint_column"
+        );
+        assert!(error.to_string().contains("ck_age_positive"));
+        assert!(error.to_string().contains("agee"));
+    }
 }

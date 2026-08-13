@@ -11,10 +11,10 @@
 //!   `OutputFormat::all_formats()`, `--dialect` from the family list
 //!   `is_known_dialect_family` accepts) — clap only exposes
 //!   possible-values for ValueEnum args;
-//! - class/grade (PORCELAIN-AND-PLUMBING.md): the declaration is a
-//!   design ruling, not introspectable. This module IS the
-//!   declaration-of-record for enumerable surfaces; the doc's
-//!   inventory table remains for the rest.
+//! - class/grade: the declaration is a design ruling, not
+//!   introspectable. This module IS the declaration-of-record for
+//!   enumerable surfaces; a separate inventory table covers
+//!   non-flag-shaped surfaces (RS framing, server socket line, …).
 //!
 //! Construction cadence is deliberately explicit: `connection::open_handle`
 //! calls `attach` synchronously, so this database is built and mounted once
@@ -136,7 +136,9 @@ fn walk_command(cmd: &clap::Command, parent: Option<&str>, surface: &mut Surface
 /// values from the same functions their parsers consult, classes per
 /// the ratified porcelain declaration.
 fn enrich_option_values(surface: &mut Surface) {
-    // -f formats: porcelain/plumbing per PORCELAIN-AND-PLUMBING.md §4.
+    // -f formats: table/box/list are porcelain (pretty at will); raw is
+    // frozen plumbing (byte-preservation exit); csv/tsv/json/jsonl are
+    // versioned plumbing (machine formats, additive-only changes).
     for fmt in crate::output_format::OutputFormat::all_formats() {
         let (class, grade) = match *fmt {
             "table" | "box" | "list" => (Some("porcelain"), None),
@@ -204,6 +206,13 @@ fn seed_envs(surface: &mut Surface) {
         (
             "DQL_FATBOY_DIR",
             "Hard-pins the adapter binary directory (only this directory is searched)",
+            None,
+        ),
+        (
+            "DQL_NAME_POLICY",
+            "How a name the compiler invented is spelled: 'poison' (default, \
+             drawn fresh each compilation) or 'canonical' (<mint:N>, for a \
+             contract lane); unknown values refuse",
             None,
         ),
         (
@@ -285,10 +294,9 @@ fn seed_dot_commands(surface: &mut Surface) {
 }
 
 /// Build the live surface as a serialized in-memory SQLite image — no
-/// tempfile, no disk (MOUNT-SPINE-PLAN.md Phase 3). The image is bound as
-/// owned bytes and mounted via `delightql-bytes://surface`, so the catalog
-/// records honest provenance (`bytes`, the locator) instead of a `/tmp`
-/// path.
+/// tempfile, no disk. The image is bound as owned bytes and mounted via
+/// `delightql-bytes://surface`, so the catalog records honest provenance
+/// (`bytes`, the locator) instead of a `/tmp` path.
 fn serialize_surface() -> Result<Vec<u8>> {
     let surface = build();
     let mut conn = rusqlite::Connection::open_in_memory()?;
@@ -404,7 +412,7 @@ pub fn attach(mut inner: Box<dyn DqlHandle>) -> Result<Box<dyn DqlHandle>> {
     {
         let mut session = inner.session().map_err(|e| anyhow::anyhow!(e))?;
         crate::exec_ng::run_dql_query(
-            "mount!(\"delightql-bytes://surface\", \"cli::surface\")",
+            "mount!(\"delightql-bytes://surface\", \"cli::surface\")(*)",
             &mut *session,
         )?;
     }

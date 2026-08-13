@@ -22,7 +22,7 @@ pub use db_adapter::DuckDBConnection;
 pub use executor::{ColumnInfo, DuckDBExecutor, PreparedStatement, QueryResult, TableSchema};
 pub use introspection::DuckDBIntrospector;
 pub use schema_provider::DuckDBSchemaProvider;
-pub use value::{SqlValue, TypedQueryResult};
+pub use value::SqlValue;
 
 // DynamicDuckDBSchema implementation for DatabaseSchema trait
 use delightql_types::{DelightQLError, Result};
@@ -44,8 +44,13 @@ impl DynamicDuckDBSchema {
 }
 
 impl DatabaseSchema for DynamicDuckDBSchema {
-    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Option<Vec<ResolverColumnInfo>> {
-        let conn = self.connection.lock().ok()?;
+    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Result<Option<Vec<ResolverColumnInfo>>> {
+        let conn = self.connection.lock().map_err(|error| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire DuckDB schema connection",
+                error.to_string(),
+            )
+        })?;
 
         // Build the query based on whether schema is specified
         let query = if let Some(schema_name) = schema {
@@ -66,7 +71,9 @@ impl DatabaseSchema for DynamicDuckDBSchema {
             )
         };
 
-        let mut stmt = conn.prepare(&query).ok()?;
+        let mut stmt = conn.prepare(&query).map_err(|error| {
+            DelightQLError::database_error("Failed to prepare DuckDB schema query", error.to_string())
+        })?;
         let columns = stmt
             .query_map([], |row| {
                 let name: String = row.get(0)?;
@@ -81,22 +88,28 @@ impl DatabaseSchema for DynamicDuckDBSchema {
                     declared_type: data_type.filter(|t| !t.is_empty()),
                 })
             })
-            .ok()?
+            .map_err(|error| {
+                DelightQLError::database_error("Failed to query DuckDB schema", error.to_string())
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .ok()?;
+            .map_err(|error| {
+                DelightQLError::database_error("Failed to read DuckDB schema", error.to_string())
+            })?;
 
         if columns.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(columns)
+            Ok(Some(columns))
         }
     }
 
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool {
-        let conn = match self.connection.lock() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
+    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool> {
+        let conn = self.connection.lock().map_err(|error| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire DuckDB schema connection",
+                error.to_string(),
+            )
+        })?;
 
         let query = if let Some(schema_name) = schema {
             format!(
@@ -114,6 +127,19 @@ impl DatabaseSchema for DynamicDuckDBSchema {
             )
         };
 
-        conn.query_row(&query, [], |_| Ok(true)).unwrap_or(false)
+        let mut stmt = conn.prepare(&query).map_err(|error| {
+            DelightQLError::database_error("Failed to prepare DuckDB schema query", error.to_string())
+        })?;
+        let mut rows = stmt.query_map([], |_| Ok(())).map_err(|error| {
+            DelightQLError::database_error("Failed to query DuckDB schema", error.to_string())
+        })?;
+        match rows.next() {
+            None => Ok(false),
+            Some(Ok(())) => Ok(true),
+            Some(Err(error)) => Err(DelightQLError::database_error(
+                "Failed to read DuckDB schema",
+                error.to_string(),
+            )),
+        }
     }
 }

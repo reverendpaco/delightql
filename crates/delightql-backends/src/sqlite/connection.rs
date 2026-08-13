@@ -161,11 +161,6 @@ impl SqliteConnectionManager {
         Arc::clone(&self.connection)
     }
 
-    /// Get a reference to the Arc<Mutex<Connection>> for backwards compatibility
-    pub fn get_connection(&self) -> &Arc<Mutex<Connection>> {
-        &self.connection
-    }
-
     /// Test if the connection is working
     pub fn test_connection(&self) -> Result<()> {
         let conn = self.connection.lock().map_err(|poison_err| {

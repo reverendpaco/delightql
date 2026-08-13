@@ -99,41 +99,29 @@ pub fn introspect_sqlite_database(
 /// # Returns
 /// * `Ok(Vec<DiscoveredAttribute>)` - List of columns with metadata
 /// * `Err(anyhow::Error)` - If PRAGMA query fails
-fn introspect_table_columns(
+pub(super) fn introspect_table_columns(
     conn: &Connection,
     schema: Option<&str>,
     table_name: &str,
 ) -> Result<Vec<DiscoveredAttribute>> {
     let mut attributes = Vec::new();
 
-    // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-    // For attached databases: PRAGMA schema_name.table_info(table_name)
-    let query = if let Some(s) = schema {
-        format!("PRAGMA {}.table_info({})", s, table_name)
-    } else {
-        format!("PRAGMA table_info({})", table_name)
-    };
-    let mut stmt = conn.prepare(&query)?;
-
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i32>(0)?,    // cid (column id)
-            row.get::<_, String>(1)?, // name
-            row.get::<_, String>(2)?, // type
-            row.get::<_, i32>(3)?,    // notnull (1=NOT NULL, 0=nullable)
-        ))
-    })?;
-
-    for result in rows {
-        let (position, name, data_type, notnull) = result?;
-
+    // rusqlite's pragma helper quotes both the schema identifier and table
+    // argument. This function is also used for an authored passthrough name,
+    // so constructing PRAGMA text from either string is not safe.
+    conn.pragma(schema, "table_info", table_name, |row| {
+        let position = row.get::<_, i32>(0)?;
+        let name = row.get::<_, String>(1)?;
+        let data_type = row.get::<_, String>(2)?;
+        let notnull = row.get::<_, i32>(3)?;
         attributes.push(DiscoveredAttribute {
             name: name.into(),
             data_type,
             position,
             is_nullable: notnull == 0, // notnull=0 means nullable
         });
-    }
+        Ok(())
+    })?;
 
     Ok(attributes)
 }

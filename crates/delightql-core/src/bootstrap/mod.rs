@@ -3,22 +3,21 @@
 // DelightQL Bootstrap Module
 //
 // This module implements the bootstrap initialization system for the DDL-LIGHT metadata
-// infrastructure. It handles Steps 1-2 of the bootstrap process (NON-REUSABLE):
+// infrastructure (NON-REUSABLE: runs once per session):
 // - Creating the _bootstrap SQLite database schema
 // - Inserting seed data for reference tables
-//
-// See: documentation/design/ddl/SYS-NS-CARTRIDGE-ER-DESIGN.md
 
 pub mod bin_sync;
+pub(crate) mod guard;
 pub mod introspect;
 
-// Re-export enums from standalone module for backward compatibility
 pub(crate) use crate::enums;
 pub(crate) use crate::enums::{ConnectionType, EntityType, Language, SourceType};
 
 // Re-export bin sync function for convenience
 pub use bin_sync::sync_bin_cartridges_to_bootstrap;
 
+use crate::error::DelightQLError;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
@@ -110,12 +109,12 @@ fn seed_enum_tables(conn: &Connection) -> Result<()> {
 
 /// Initialize the _bootstrap in-memory database
 ///
-/// This function implements Steps 1-2 of the bootstrap process:
-/// 1. Create all metadata tables and views (BOOTSTRAP_SCHEMA)
-/// 2. Insert seed data for reference tables (programmatically from Rust enums)
+/// This function:
+/// 1. Creates all metadata tables and views (BOOTSTRAP_SCHEMA)
+/// 2. Inserts seed data for reference tables (programmatically from Rust enums)
 ///
 /// These steps are NON-REUSABLE (run once per session).
-/// Steps 3-5 (cartridge installation, namespace creation, entity activation)
+/// Cartridge installation, namespace creation, and entity activation
 /// use the reusable cartridge/namespace logic and are NOT implemented here.
 ///
 /// # Arguments
@@ -247,4 +246,121 @@ mod tests {
             .unwrap();
         assert_eq!(connection_type_count, ConnectionType::ALL.len() as i32);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session-scoped tables
+//
+// The verdict tables a compilation writes into: assertions, dangers and
+// errors. They are session state, recreated on every `reinit_bootstrap`, and
+// have nothing to do with reading source.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Create the assertions table on the bootstrap connection.
+///
+/// This table records assertion verdicts for querying via sys.assertions(*).
+pub fn setup_assertions_table_on_bootstrap(
+    conn: &rusqlite::Connection,
+) -> crate::error::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS assertions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            source_file TEXT,
+            source_line INTEGER,
+            body TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            detail TEXT,
+            run_id TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| {
+        DelightQLError::database_error(
+            "Failed to create assertions table on bootstrap",
+            e.to_string(),
+        )
+    })?;
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Create the danger gates table on the bootstrap connection.
+///
+/// This table records the current state of each danger gate for querying via sys.danger(*).
+/// Seeded with known defaults (all OFF) at session start.
+pub fn setup_danger_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS danger (
+            uri TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            cli_overridable INTEGER NOT NULL DEFAULT 1,
+            description TEXT
+        )",
+        [],
+    )
+    .map_err(|e| {
+        DelightQLError::database_error("Failed to create danger table on bootstrap", e.to_string())
+    })?;
+
+    // Seed default rows for all known danger URIs
+    let defaults = [
+        (
+            "delightql-danger://cardinality/cartesian",
+            "OFF",
+            true,
+            "Unrestricted cartesian product",
+        ),
+        (
+            "delightql-danger://termination/unbounded",
+            "OFF",
+            true,
+            "Unbounded recursive query",
+        ),
+        (
+            "delightql-danger://semantics/min_multiplicity",
+            "OFF",
+            false,
+            "True INTERSECT ALL via ROW_NUMBER (min-multiplicity)",
+        ),
+    ];
+    for (uri, state, cli_overridable, description) in &defaults {
+        conn.execute(
+            "INSERT OR IGNORE INTO danger (uri, state, cli_overridable, description) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![uri, state, *cli_overridable as i32, description],
+        )
+        .map_err(|e| {
+            DelightQLError::database_error(
+                format!("Failed to seed danger row '{}': {}", uri, e),
+                e.to_string(),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Create the errors table on the bootstrap connection.
+///
+/// This is a per-session error log populated during pipeline execution.
+/// Each row records an error with its URI, message, and the query that caused it.
+pub fn setup_errors_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS errors (
+            id INTEGER PRIMARY KEY,
+            uri TEXT NOT NULL,
+            message TEXT NOT NULL,
+            query_text TEXT,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .map_err(|e| {
+        DelightQLError::database_error("Failed to create errors table on bootstrap", e.to_string())
+    })?;
+
+    Ok(())
 }

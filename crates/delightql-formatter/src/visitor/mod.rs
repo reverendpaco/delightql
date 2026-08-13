@@ -1,27 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-/// Tree visitor for formatting DelightQL queries
-///
-/// This module is organized into logical submodules:
-/// - core: Main Formatter struct and basic formatting logic
-/// - helpers: Utility methods for finding nodes and text manipulation
-/// - base: Base expressions (tables, TVF calls, anonymous tables)
-/// - domain: Domain expressions and arithmetic operations
-/// - pipes: Pipe operators and relational continuations
-/// - operations: Pipe operations (projections, filters, grouping, etc.)
-/// - continuations: Binary operators and comma continuations
-/// - case: CASE expression formatting
-/// - cte: CTE binding formatting
-mod base;
-mod case;
-mod continuations;
-mod core;
-mod cte;
-mod domain;
-mod helpers;
-mod hooks;
-mod operations;
-mod pipes;
+//! The typed visitor.
+//!
+//! Layout decisions read the typed CST — fields, generated supertype enums,
+//! authored spans — and never a node-kind string, a source regex, or a
+//! reparse. What the formatter takes no position on is ECHOED from the
+//! author's own tokens, which is why coverage is not a race against the
+//! grammar's size.
 
-// Re-export the main Formatter struct
-pub use core::Formatter;
+mod chain;
+mod core;
+mod lets;
+mod stage;
+mod verbatim;
+
+pub use core::{Branch, Formatter};

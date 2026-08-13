@@ -10,14 +10,10 @@
 // should use delightql-backends, which has its own independent implementation.
 // This separation ensures that runtime infrastructure and transpilation targets
 // remain distinct dependencies.
-//
-// See: documentation/design/ddl/SYS-NS-CARTRIDGE-ER-DESIGN.md
-// See: documentation/design/ddl/db-introspection-sequence.d2
 
 use anyhow::Result;
 use rusqlite::Connection;
 
-// Re-export types from delightql-types for backward compatibility
 pub use delightql_types::introspect::{
     DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity,
 };

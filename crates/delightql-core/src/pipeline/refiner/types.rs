@@ -2,9 +2,9 @@
 // Copyright 2026 Daniel Eklund
 // types.rs - Core types for the principled refiner
 //
-// Based on PRINCIPLED-RELOOK-AT-REFINER.md
-// These types enforce the classification system and laws
+// These types enforce the classification system and laws.
 
+use crate::names::ScopeId;
 use crate::pipeline::asts::resolved;
 use std::collections::HashSet;
 
@@ -13,13 +13,10 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, PartialEq)]
 pub enum PredicateClass {
     /// FJC - Join condition between two tables
-    FJC { left: String, right: String },
-
-    /// FIC - Intersect/correlation condition for set operations
-    FIC { left: String, right: String },
+    FJC { left: ScopeId, right: ScopeId },
 
     /// F - Regular filter on a single table
-    F { table: String },
+    F { table: ScopeId },
 
     /// Fx - Non-participating filter (1=1, #<2, etc)
     Fx,
@@ -35,13 +32,9 @@ pub enum ForbiddenReason {
     /// Example: (a UL b) J c FJC(c,a) is FORBIDDEN
     Law1UlFragmentJoin,
 
-    /// Law 3: Intersection needs proper qualification
-    /// Example: users_2022(*) ; users_2023(*), email = email (no qualification)
-    Law3ImproperQualification,
-
-    /// Law 6: PLF with ambiguous Lvar
-    /// Example: foo(a,b,c) || bar(a,y,z), a<10 (both have 'a')
-    Law6PlfRestriction,
+    /// The classifier cannot assign a predicate spanning three or more
+    /// independent scopes to a single lawful owner.
+    TooManyReferencedTables { count: usize },
 }
 
 /// An analyzed predicate with its classification
@@ -51,7 +44,7 @@ pub struct AnalyzedPredicate {
     pub class: PredicateClass,
 
     /// The original expression
-    pub expr: resolved::BooleanExpression,
+    pub expr: resolved::TruthExpression,
 
     /// Which operator this predicate modifies
     pub operator_ref: OperatorRef,
@@ -67,7 +60,7 @@ pub struct ScopePoint {
     pub position: usize,
 
     /// Tables in scope at this point
-    pub tables_in_scope: HashSet<String>,
+    pub tables_in_scope: HashSet<ScopeId>,
 }
 
 /// Reference to an operator in the flattened segment
@@ -75,12 +68,6 @@ pub struct ScopePoint {
 pub enum OperatorRef {
     /// References a join at position
     Join { position: usize },
-
-    /// References a set operation
-    SetOp {
-        position: usize,
-        operator: resolved::SetOperator,
-    },
 
     /// Top-level (Fx predicates)
     TopLevel,
@@ -90,20 +77,5 @@ pub enum OperatorRef {
 #[derive(Debug, Clone)]
 pub struct LvarBinding {
     /// Which table it comes from
-    pub table: String,
-    /// What kind of operation introduced this table (join vs setop)
-    pub operation_context: crate::pipeline::refiner::flattener::OperationContext,
-}
-
-/// Segment type determines rebuild semantics
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentType {
-    /// Tables should be joined with conditions as ON clauses
-    Join,
-
-    /// Tables should be unioned with correlations as Filter+InnerExists
-    SetOperation,
-
-    /// Mixed segment containing both joins and set operations
-    Mixed,
+    pub table: ScopeId,
 }

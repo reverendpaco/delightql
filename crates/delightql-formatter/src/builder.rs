@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-/// String building utilities for the formatter
+//! Line-aware output accumulation.
+//!
+//! Written text may itself carry newlines — an echoed region keeps the
+//! author's own line structure — so the builder splits on them rather than
+//! letting a multi-line string sit inside one logical line. Fit decisions read
+//! `current_line_length`, and a measure that counted three lines as one would
+//! break every one of them.
 
 pub struct OutputBuilder {
     lines: Vec<String>,
     current_line: String,
-    #[allow(dead_code)]
-    indent_level: usize,
-    #[allow(dead_code)]
-    line_count_at_mark: Option<usize>,
+}
+
+impl Default for OutputBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OutputBuilder {
@@ -16,59 +24,44 @@ impl OutputBuilder {
         Self {
             lines: Vec::new(),
             current_line: String::new(),
-            indent_level: 0,
-            line_count_at_mark: None,
         }
     }
 
-    /// Add text to the current line
+    /// Append text, honoring any newlines inside it.
     pub fn write(&mut self, text: &str) {
-        self.current_line.push_str(text);
+        let mut parts = text.split('\n');
+        if let Some(first) = parts.next() {
+            self.current_line.push_str(first);
+        }
+        for part in parts {
+            self.lines.push(std::mem::take(&mut self.current_line));
+            self.current_line.push_str(part);
+        }
     }
 
-    /// Start a new line with the current indentation
+    /// Start a new line. An empty current line is not a blank line — the
+    /// visitor asks for a break at positions that may already be at one.
     pub fn newline(&mut self) {
         if !self.current_line.is_empty() {
-            self.lines.push(self.current_line.clone());
-            self.current_line.clear();
+            self.lines.push(std::mem::take(&mut self.current_line));
         }
     }
 
-    /// Start a new line with specific indentation
     pub fn newline_with_indent(&mut self, spaces: usize) {
         self.newline();
         self.current_line = " ".repeat(spaces);
     }
 
-    /// Add a blank line
-    #[allow(dead_code)]
+    /// One empty line, kept even where `newline` would collapse it.
     pub fn blank_line(&mut self) {
         self.newline();
         self.lines.push(String::new());
     }
 
-    /// Get the length of the current line
     pub fn current_line_length(&self) -> usize {
         self.current_line.len()
     }
 
-    /// Mark the current position to check if newlines were added
-    #[allow(dead_code)]
-    pub fn mark_position(&mut self) {
-        self.line_count_at_mark = Some(self.lines.len());
-    }
-
-    /// Check if newlines were added since the mark
-    #[allow(dead_code)]
-    pub fn has_newlines_since_mark(&self) -> bool {
-        if let Some(mark) = self.line_count_at_mark {
-            self.lines.len() > mark
-        } else {
-            false
-        }
-    }
-
-    /// Build the final output string
     pub fn build(mut self) -> String {
         if !self.current_line.is_empty() {
             self.lines.push(self.current_line);

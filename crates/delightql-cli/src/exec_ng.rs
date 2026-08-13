@@ -21,6 +21,20 @@ pub struct ResultMetadata {
     pub row_count: usize,
 }
 
+/// One row of protocol cells as the console shows it.
+///
+/// A display boundary, and the only kind of place a cell's absence is
+/// allowed to become the four characters `NULL`: what is printed here has
+/// no reader that could mistake it for the value again.
+pub(crate) fn cells_to_display(row: &[Option<Vec<u8>>]) -> Vec<String> {
+    row.iter()
+        .map(|cell| match cell {
+            Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            None => "NULL".to_string(),
+        })
+        .collect()
+}
+
 /// Fetch ALL rows from a DQL session into QueryResults.
 pub(crate) fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<QueryResults> {
     let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -39,14 +53,7 @@ pub(crate) fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<Query
         }
 
         for row in &fr.rows {
-            all_rows.push(
-                row.iter()
-                    .map(|cell| match cell {
-                        Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                        None => "NULL".to_string(),
-                    })
-                    .collect(),
-            );
+            all_rows.push(cells_to_display(row));
         }
     }
 
@@ -63,8 +70,11 @@ pub(crate) fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<Query
 }
 
 /// Fetch ALL rows preserving raw protocol cells (no string coercion).
-/// Used by `--to bhash` to hash bytes directly.
-fn fetch_all_raw(
+/// Used by `--to bhash` to hash bytes directly, and by any caller that has
+/// to tell an absent value from a present one — a display rendering
+/// cannot answer that question.
+#[allow(clippy::type_complexity)]
+pub(crate) fn fetch_all_raw(
     session: &mut dyn DqlSession,
     dql: &str,
 ) -> Result<(Vec<String>, Vec<Vec<Option<Vec<u8>>>>)> {
@@ -121,18 +131,7 @@ fn display_results(
             break;
         }
 
-        let rows: Vec<Vec<String>> = fr
-            .rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|cell| match cell {
-                        Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                        None => "NULL".to_string(),
-                    })
-                    .collect()
-            })
-            .collect();
+        let rows: Vec<Vec<String>> = fr.rows.iter().map(|row| cells_to_display(row)).collect();
 
         let is_first_batch = total_rows == 0;
         total_rows += rows.len();
@@ -180,7 +179,7 @@ fn display_results(
 }
 
 /// Stream raw cell bytes to stdout (no text conversion, no formatting).
-/// `-f json` / `-f jsonl` — the typed emission path (PLAN.md #5).
+/// `-f json` / `-f jsonl` — the typed emission path.
 /// Reads the protocol's nullable cells and column descriptors directly:
 /// NULL is null (never the string "NULL"), numbers are unquoted when
 /// the column's declared type is numeric AND the text round-trips, and
@@ -254,8 +253,7 @@ fn display_results_json(
     })
 }
 
-/// `-f raw` — the byte-preservation doctrine's user-facing exit
-/// (PORCELAIN-AND-PLUMBING.md §7 knob 4): verbatim
+/// `-f raw` — the byte-preservation doctrine's user-facing exit: verbatim
 /// cell bytes, no separators ever (a separator would corrupt binary),
 /// NULL writes zero bytes, multi-row = byte-stream concatenation.
 /// Single column ONLY — multi-column concatenation ("1John2Jane") is
@@ -387,7 +385,6 @@ fn execute_single_query(
         Some(Stage::AstRefined) => Some("ast-refined"),
         Some(Stage::AstSql) => Some("ast-sql"),
         Some(Stage::Cst) => Some("cst"),
-        Some(Stage::RecursionDepth) => Some("recursion-depth"),
         _ => None,
     };
     if let Some(stage) = compile_stage {
@@ -408,8 +405,7 @@ fn execute_single_query(
         | Some(Stage::AstResolved)
         | Some(Stage::AstRefined)
         | Some(Stage::AstSql)
-        | Some(Stage::Cst)
-        | Some(Stage::RecursionDepth) => unreachable!("handled by display_compile_stage"),
+        | Some(Stage::Cst) => unreachable!("handled by display_compile_stage"),
         Some(Stage::ByteHash) => {
             let (columns, raw_rows) = fetch_all_raw(session, source_code)?;
             let bhash = crate::util::fingerprint::compute_byte_hash(&raw_rows);
@@ -426,10 +422,9 @@ fn execute_single_query(
                     .map_err(|e| anyhow::anyhow!("Failed to generate fingerprint: {}", e))?;
             // Three DISTINCT contracts (man dql-query): hash = data only;
             // totalhash = schema+data (column names participate); fingerprint
-            // = the structured JSON. All three used to print data_hash, so
-            // totalhash could not see a column rename and fingerprint emitted
-            // a bare digest (codex F-6/F-7 — found by holding the outputs
-            // against the manual).
+            // = the structured JSON. Collapsing them onto data_hash would
+            // make totalhash blind to a column rename and fingerprint emit
+            // a bare digest instead of the structured JSON its name promises.
             match stage {
                 Stage::Hash => println!("{}", fingerprint.data_hash),
                 Stage::TotalHash => println!("{}", fingerprint.result_hash),
@@ -483,8 +478,7 @@ fn compile_stage_dql(stage: &str, source: &str) -> String {
 
 /// Display a compile stage (`--to sql`, `--to ast-*`, …). A failed compile
 /// surfaces its error and exits non-zero — the inspection surface must
-/// never print a literal NULL where the user asked to see the compilation
-/// (RECURSION-CONTRACT.md B4).
+/// never print a literal NULL where the user asked to see the compilation.
 fn display_compile_stage(
     session: &mut dyn DqlSession,
     stage: &str,
@@ -503,10 +497,10 @@ fn display_compile_stage(
         .ok_or_else(|| anyhow::anyhow!("sys::execution.compile returned no rows"))?;
 
     if let Some(uri) = &row[1] {
-        // The full message rides alongside the URI (ALPHA-CLI-UX-WORRIES
-        // #4: this path used to print the URI and tell the user to re-run
-        // without --to for a message it already had — withholding, at
-        // exactly the moment the user asked the CLI to explain itself).
+        // The full message rides alongside the URI: printing only the URI
+        // and telling the user to re-run without --to would withhold the
+        // message this call already has, at exactly the moment the user
+        // asked the CLI to explain itself.
         let uri = String::from_utf8_lossy(uri);
         let message = row[2]
             .as_ref()

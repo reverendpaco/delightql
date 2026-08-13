@@ -1,1 +1,14 @@
 then(met) :- _(met@1)
+
+// The existence views. A row answers YES to the proposition; absence
+// answers NO — there is no `met = 0` row, because a false receipt that
+// still occupies a row would survive every conjunction it joins.
+// The witness produces a row either way, so the filter is what turns
+// its 0 into an absence.
+exists(T(*))(*) :- T(+), met = 1
+notexists(T(*))(*) :- T(\+), met = 1
+
+// `equals` is deliberately NOT here. A view built on the relational
+// minus pairs columns by name; the comparison `equals` lowers to pairs
+// them by position, and the two disagree wherever a heading repeats or
+// reorders names. It lands as a native binary predicate instead.

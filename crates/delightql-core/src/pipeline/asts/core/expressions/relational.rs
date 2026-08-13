@@ -1,273 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Relational expressions and base relations
-//! RelationalExpression, Relation, InnerRelationPattern
+//! Base relations and the derived-table patterns
+//! Relation, InnerRelationPattern
+//!
+//! A relation is a chain HEAD (`Grelex::Reference`). The operators that
+//! consume it live in `chain.rs`; nothing here nests a source.
 
-use super::super::metadata::{GroundedPath, NamespacePath};
-use super::super::{Addressed, CprSchema, JoinType, PhaseBox, Refined, Resolved, Row, Unresolved};
-use super::boolean::BooleanExpression;
-use super::domain::{DomainExpression, DomainSpec};
+use super::super::{Phase, Unresolved};
+use super::access::Access;
+use super::chain::{Chain, Continuation};
+use super::domain::DomainExpression;
+use super::functions::SealedCall;
 use super::helpers::QualifiedName;
-use super::metadata_types::SetOperator;
-use super::pipes::{PipeExpression, SigmaCondition};
-use crate::{lispy::ToLispy, PhaseConvert, ToLispy};
+use super::truth::TruthExpression;
+use crate::{lispy::ToLispy, ToLispy};
 use delightql_types::SqlIdentifier;
-use serde::{Deserialize, Serialize};
-
-use super::metadata_types::FilterOrigin;
-
-/// Any expression that produces a relation
-#[derive(Debug, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-#[phase_convert(only(Refined => Addressed))]
-pub enum RelationalExpression<Phase = Unresolved> {
-    /// Base relation (table/view or anonymous)
-    Relation(Relation<Phase>),
-    /// Direct join between relations
-    Join {
-        left: Box<RelationalExpression<Phase>>,
-        right: Box<RelationalExpression<Phase>>,
-        // Optional fields for resolved/refined phases
-        join_condition: Option<BooleanExpression<Phase>>,
-        join_type: Option<JoinType>,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
-    },
-    /// Filter/WHERE condition
-    Filter {
-        source: Box<RelationalExpression<Phase>>,
-        condition: SigmaCondition<Phase>,
-        origin: FilterOrigin,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
-    },
-    /// Pipe transformation
-    Pipe(Box<stacksafe::StackSafe<PipeExpression<Phase>>>),
-    /// Set operations (UNION, INTERSECT, etc.)
-    ///
-    /// SetOperation is a universal relational algebra operation that can appear in any phase:
-    /// - Unresolved: Created by parser from |;| syntax
-    /// - Resolved: Also created by resolver when merging duplicate CTEs
-    /// - Refined: Passed through or optimized (e.g., merging adjacent unions)
-    ///
-    /// This is NOT a phase-specific construct - it represents a fundamental relational
-    /// operation that can originate from syntax or be synthesized during compilation.
-    SetOperation {
-        operator: SetOperator,
-        operands: Vec<RelationalExpression<Phase>>,
-        // Correlation predicates for INTERSECT ON semantics (only settable in refiner)
-        correlation: PhaseBox<Option<BooleanExpression<Phase>>, Phase>,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
-    },
-    /// Intersection via bidirectional semijoin.
-    ///
-    /// Produced by the refiner when a SetOperation has correlation predicates.
-    /// Operands are already column-aligned (NULL-padded, reordered) by the refiner.
-    ///
-    /// Gate OFF (default): EXISTS-filtered halves UNIONed ALL (m+n copies).
-    /// Gate ON (min_multiplicity): ROW_NUMBER + equi-join (min(m,n) copies).
-    IntersectCorresponding {
-        /// The operands (already column-aligned by the refiner)
-        operands: Vec<RelationalExpression<Phase>>,
-        /// Per-column matching conditions (e.g., x.id IS NOT DISTINCT FROM y.id)
-        correlation: BooleanExpression<Phase>,
-        /// When true, use ROW_NUMBER + JOIN for min(m,n) multiplicity.
-        /// Set by the refiner when `danger://semantics/min_multiplicity` is ON.
-        min_multiplicity: bool,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
-    },
-
-    /// ER-context join chain: A(*) &(::ctx) B(*) &(::ctx) C(*)
-    /// Unresolved-only — resolver expands into standard Joins.
-    #[lispy("er_join_chain")]
-    #[phase_convert(unreachable)]
-    ErJoinChain {
-        /// Relations in the chain, left-to-right. Always >= 2 elements.
-        relations: Vec<Relation<Phase>>,
-        /// Canonical selection spellings, parallel to `relations`: the
-        /// written term with the alias OUTSIDE (the lvar law governs
-        /// exports; these govern selection), canonicalized at build.
-        term_spellings: Vec<String>,
-        /// Per-operator context symbols, one per `&` (length =
-        /// relations - 1). None = the removed bare-operator dialect,
-        /// refused at resolve with the symbol-form teaching.
-        contexts: Vec<Option<String>>,
-    },
-    /// ER-context transitive join: A(*) &&(::ctx) B(*)
-    /// Unresolved-only — resolver expands via graph path-finding.
-    #[lispy("er_transitive_join")]
-    #[phase_convert(unreachable)]
-    ErTransitiveJoin {
-        left: Box<RelationalExpression<Phase>>,
-        right: Box<RelationalExpression<Phase>>,
-        /// Canonical endpoint spellings (selection keys).
-        left_spelling: String,
-        right_spelling: String,
-        /// The operator's context symbol; None = removed bare dialect.
-        context: Option<String>,
-    },
-}
-
-// Manual Clone: uses #[stacksafe] to prevent stack overflow on deeply nested ASTs.
-// The derived Clone recurses through Box<RelationalExpression> → Pipe → source → ... which
-// overflows on spawned threads (8 MB default stack) with deep pipe chains.
-impl<Phase: Clone> Clone for RelationalExpression<Phase> {
-    #[stacksafe::stacksafe]
-    fn clone(&self) -> Self {
-        self.clone_fields()
-    }
-}
-
-impl<Phase: Clone> RelationalExpression<Phase> {
-    fn clone_fields(&self) -> Self {
-        match self {
-            Self::Relation(r) => Self::Relation(r.clone()),
-            Self::Join {
-                left,
-                right,
-                join_condition,
-                join_type,
-                cpr_schema,
-            } => Self::Join {
-                left: left.clone(),
-                right: right.clone(),
-                join_condition: join_condition.clone(),
-                join_type: join_type.clone(),
-                cpr_schema: cpr_schema.clone(),
-            },
-            Self::Filter {
-                source,
-                condition,
-                origin,
-                cpr_schema,
-            } => Self::Filter {
-                source: source.clone(),
-                condition: condition.clone(),
-                origin: origin.clone(),
-                cpr_schema: cpr_schema.clone(),
-            },
-            Self::Pipe(pipe) => Self::Pipe(pipe.clone()),
-            Self::SetOperation {
-                operator,
-                operands,
-                correlation,
-                cpr_schema,
-            } => Self::SetOperation {
-                operator: operator.clone(),
-                operands: operands.clone(),
-                correlation: correlation.clone(),
-                cpr_schema: cpr_schema.clone(),
-            },
-            Self::IntersectCorresponding {
-                operands,
-                correlation,
-                min_multiplicity,
-                cpr_schema,
-            } => Self::IntersectCorresponding {
-                operands: operands.clone(),
-                correlation: correlation.clone(),
-                min_multiplicity: *min_multiplicity,
-                cpr_schema: cpr_schema.clone(),
-            },
-            Self::ErJoinChain {
-                relations,
-                term_spellings,
-                contexts,
-            } => Self::ErJoinChain {
-                relations: relations.clone(),
-                term_spellings: term_spellings.clone(),
-                contexts: contexts.clone(),
-            },
-            Self::ErTransitiveJoin {
-                left,
-                right,
-                left_spelling,
-                right_spelling,
-                context,
-            } => Self::ErTransitiveJoin {
-                left: left.clone(),
-                right: right.clone(),
-                left_spelling: left_spelling.clone(),
-                right_spelling: right_spelling.clone(),
-                context: context.clone(),
-            },
-        }
-    }
-}
-
-// NOTE: No manual Drop impl needed. The Pipe variant wraps PipeExpression in StackSafe<T>,
-// which provides a #[stacksafe]-annotated Drop impl. This breaks the drop recursion chain
-// (Pipe → StackSafe<PipeExpression>.source → Pipe → ...) by inserting stacker::maybe_grow
-// at each level, preventing stack overflow during drop of deep pipe chains.
-
-// Phase conversion for RelationalExpression
-impl From<RelationalExpression<Resolved>> for RelationalExpression<Refined> {
-    #[stacksafe::stacksafe]
-    fn from(expr: RelationalExpression<Resolved>) -> RelationalExpression<Refined> {
-        match expr {
-            RelationalExpression::Relation(rel) => RelationalExpression::Relation(rel.into()),
-            RelationalExpression::Filter {
-                source,
-                condition,
-                origin,
-                cpr_schema,
-            } => RelationalExpression::Filter {
-                source: Box::new((*source).into()),
-                condition: condition.into(),
-                origin,
-                cpr_schema: cpr_schema.into(),
-            },
-            RelationalExpression::Join {
-                left,
-                right,
-                join_condition,
-                join_type,
-                cpr_schema,
-            } => RelationalExpression::Join {
-                left: Box::new((*left).into()),
-                right: Box::new((*right).into()),
-                join_condition: join_condition.map(Into::into),
-                join_type: Some(join_type.unwrap_or(JoinType::Inner)), // Ensure join_type is always Some
-                cpr_schema: cpr_schema.into(),
-            },
-            RelationalExpression::Pipe(pipe) => RelationalExpression::Pipe(Box::new(
-                stacksafe::StackSafe::new((*pipe).into_inner().into()),
-            )),
-            RelationalExpression::SetOperation {
-                operator,
-                operands,
-                correlation,
-                cpr_schema,
-            } => RelationalExpression::SetOperation {
-                operator,
-                operands: operands.into_iter().map(Into::into).collect(),
-                correlation: correlation.into(),
-                cpr_schema: cpr_schema.into(),
-            },
-            RelationalExpression::ErJoinChain { .. }
-            | RelationalExpression::ErTransitiveJoin { .. } => {
-                panic!(
-                    "INTERNAL ERROR: ER-join expression found in Resolved phase. \
-                     Must be consumed by resolver."
-                )
-            }
-            RelationalExpression::IntersectCorresponding { .. } => {
-                panic!(
-                    "INTERNAL ERROR: IntersectCorresponding found in Resolved phase. \
-                     Only produced by the refiner."
-                )
-            }
-        }
-    }
-}
 
 /// Semantic patterns for INNER-RELATION
 /// These capture the distinct compilation strategies for derived tables
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum InnerRelationPattern<Phase = Unresolved> {
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum InnerRelationPattern<P: Phase = Unresolved> {
     /// Indeterminate: Builder couldn't determine pattern yet
     /// Will be classified by refiner based on subquery structure
     #[lispy("pattern:indeterminate")]
     Indeterminate {
         identifier: QualifiedName,
-        subquery: Box<RelationalExpression<Phase>>,
+        subquery: Box<Chain<P>>,
     },
 
     /// UDT: Uncorrelated Derived Table
@@ -276,11 +34,10 @@ pub enum InnerRelationPattern<Phase = Unresolved> {
     #[lispy("pattern:udt")]
     UncorrelatedDerivedTable {
         identifier: QualifiedName,
-        subquery: Box<RelationalExpression<Phase>>,
+        subquery: Box<Chain<P>>,
         /// Whether this UDT wraps a consulted view (vs a regular table(|> pipeline)).
         /// When true and option://generation/rule/inlining/view is ON, the transformer
         /// lifts this to a CTE instead of inlining as a subquery.
-        #[serde(default)]
         is_consulted_view: bool,
     },
 
@@ -290,12 +47,8 @@ pub enum InnerRelationPattern<Phase = Unresolved> {
     #[lispy("pattern:cdt-sj")]
     CorrelatedScalarJoin {
         identifier: QualifiedName,
-        correlation_filters: Vec<BooleanExpression<Phase>>,
-        subquery: Box<RelationalExpression<Phase>>,
-        /// Hygienic column injections: (original_column_name, hygienic_alias)
-        /// Only present in Refined phase after rebuilder processes it
-        #[serde(skip_serializing_if = "Vec::is_empty", default)]
-        hygienic_injections: Vec<(String, String)>,
+        correlation_filters: Vec<TruthExpression<P>>,
+        subquery: Box<Chain<P>>,
     },
 
     /// CDT-GJ: Correlated Derived Table - Group Join
@@ -304,142 +57,266 @@ pub enum InnerRelationPattern<Phase = Unresolved> {
     #[lispy("pattern:cdt-gj")]
     CorrelatedGroupJoin {
         identifier: QualifiedName,
-        correlation_filters: Vec<BooleanExpression<Phase>>,
-        aggregations: Vec<DomainExpression<Phase>>,
-        subquery: Box<RelationalExpression<Phase>>,
-        /// Hygienic column injections: (original_column_name, hygienic_alias)
-        /// Only present in Refined phase after rebuilder processes it
-        #[serde(skip_serializing_if = "Vec::is_empty", default)]
-        hygienic_injections: Vec<(String, String)>,
+        correlation_filters: Vec<TruthExpression<P>>,
+        aggregations: Vec<DomainExpression<P>>,
+        subquery: Box<Chain<P>>,
     },
-
 }
 
-/// Base relations - sources of data
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum Relation<Phase = Unresolved> {
-    /// Named table/view: users(*), orders(id, total)
-    #[lispy("relation:ground")]
-    Ground {
+/// What an authored ground read SAYS about the relation it reads: how the
+/// author addressed it, and the marks written on the mention itself.
+///
+/// `!!` and the passthrough slash live here rather than on the relation
+/// because both are written ON the mention and both are read exactly where
+/// the mention resolves — the first onto the occurrence's mutation evidence,
+/// the second into the choice of lookup road. Neither survives that, so
+/// neither is a property of the resolved relation.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum GroundMention {
+    /// `users(*)`, `ns::orders(id, total)`, `ns/raw_table(*)` — a spelling
+    /// resolution has to look up.
+    #[lispy("mention:named")]
+    Named {
         identifier: QualifiedName,
-        /// Canonical entity name from bootstrap (what the DB stores).
-        /// Only accessible in Resolved/Refined phases via PhaseBox.
-        /// Used at SQL generation boundary; identifier.name (user-typed) used for error messages.
-        canonical_name: PhaseBox<Option<SqlIdentifier>, Phase>,
-        /// Physical backend schema name for SQL generation (e.g., "_c" for logical namespace "c").
-        /// Resolved by the registry from the logical namespace_path.
-        /// Only accessible in Resolved/Refined phases via PhaseBox.
-        backend_schema: PhaseBox<Option<String>, Phase>,
-        domain_spec: DomainSpec<Phase>,
         alias: Option<SqlIdentifier>,
-        outer: bool,
         /// DML mutation target marker: `!!` on source relation
         mutation_target: bool,
         /// Passthrough: skip entity catalog, use schema introspector directly.
         /// Syntax: `ns/raw_table(*)` — slash separates namespace from raw backend table name.
-        #[serde(default)]
         passthrough: bool,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
-        /// Hygienic column injections for positional literal/expression constraints
-        /// (original_column_name, hygienic_alias)
-        /// Populated by transformer when building positional patterns with constraints
-        #[serde(skip_serializing_if = "Vec::is_empty", default)]
-        hygienic_injections: Vec<(String, String)>,
     },
-    #[lispy("relation:anonymous")]
-    Anonymous {
-        column_headers: Option<Vec<DomainExpression<Phase>>>,
-        rows: Vec<Row<Phase>>,
+    /// A compiler-owned relation selected by identity before resolution.
+    /// Its heading is published on `scope` before the read resolves; no
+    /// character-bearing lookup key participates. This covers plan-lifetime
+    /// scratch and query-local higher-order carriers.
+    ///
+    /// It is a MENTION and not a relation of its own because what it names
+    /// is a ground read like any other — it differs only in what resolution
+    /// has to do to find it, which is nothing. Once resolution has run, the
+    /// two are the same relation, and one carrier says so.
+    #[lispy("mention:plan")]
+    Plan {
+        /// The compiler-owned physical or query-local relation.
+        scope: crate::names::ScopeId,
+        /// Authored relation vocabulary retained when a user-facing access
+        /// is redirected through plan scratch. `None` is a compiler-only
+        /// direct scratch read.
+        authored_name: Option<SqlIdentifier>,
         alias: Option<SqlIdentifier>,
+    },
+}
+
+impl GroundMention {
+    /// A written name with no alias and no marks — what a compiler-built
+    /// read of a user-visible relation says. The marks it fixes are not
+    /// overridable defaults, they are the shape: only the parser can mark a
+    /// mention, because only an author can write `!!` or the slash.
+    pub fn named(identifier: QualifiedName) -> Self {
+        GroundMention::Named {
+            identifier,
+            alias: None,
+            mutation_target: false,
+            passthrough: false,
+        }
+    }
+
+    /// The same, carrying the `as` the caller wrote.
+    pub fn aliased(identifier: QualifiedName, alias: Option<SqlIdentifier>) -> Self {
+        GroundMention::Named {
+            identifier,
+            alias,
+            mutation_target: false,
+            passthrough: false,
+        }
+    }
+
+    /// The spelling this mention addresses its relation by, when it
+    /// addresses one by spelling at all.
+    pub fn identifier(&self) -> Option<&QualifiedName> {
+        match self {
+            GroundMention::Named { identifier, .. } => Some(identifier),
+            GroundMention::Plan { .. } => None,
+        }
+    }
+
+    /// The `as` written on the mention, if any. Both alternatives can carry
+    /// one: a redirected plan read keeps the user's own alias.
+    pub fn alias(&self) -> Option<&SqlIdentifier> {
+        match self {
+            GroundMention::Named { alias, .. } | GroundMention::Plan { alias, .. } => {
+                alias.as_ref()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::super::super::metadata::NamespacePath;
+    use super::*;
+
+    fn name(text: &str) -> QualifiedName {
+        QualifiedName {
+            namespace_path: NamespacePath::empty(),
+            name: text.into(),
+        }
+    }
+
+    /// A scope only the registry can mint — the point of the plan mention is
+    /// that its lookup key is one of these and not characters.
+    fn scratch() -> crate::names::ScopeId {
+        crate::names::Registry::new(&[]).mint_scope(
+            crate::names::ScopeOrigin::AnonRelation,
+            crate::names::Hint::None,
+            None,
+        )
+    }
+
+    /// A plan read addresses its relation by identity, so there is no
+    /// spelling to hand back — and asking is how a caller learns that,
+    /// rather than by matching the alternative itself.
+    #[test]
+    fn only_a_named_mention_answers_with_a_spelling() {
+        assert_eq!(
+            GroundMention::named(name("users"))
+                .identifier()
+                .map(|q| q.name.to_string()),
+            Some("users".to_string())
+        );
+        assert!(GroundMention::Plan {
+            scope: scratch(),
+            authored_name: Some("valid".into()),
+            alias: None,
+        }
+        .identifier()
+        .is_none());
+    }
+
+    /// BOTH alternatives carry an alias: a user-facing access redirected
+    /// through plan scratch keeps the `as` its author wrote, and the
+    /// snapshot substitution relies on that.
+    #[test]
+    fn both_mentions_carry_the_authored_alias() {
+        assert_eq!(
+            GroundMention::aliased(name("users"), Some("u".into()))
+                .alias()
+                .map(ToString::to_string),
+            Some("u".to_string())
+        );
+        assert_eq!(
+            GroundMention::Plan {
+                scope: scratch(),
+                authored_name: Some("valid".into()),
+                alias: Some("v".into()),
+            }
+            .alias()
+            .map(ToString::to_string),
+            Some("v".to_string())
+        );
+    }
+}
+
+/// Base relations - sources of data
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum Relation<P: Phase = Unresolved> {
+    /// A ground read: `users(*)`, `orders(id, total)`.
+    ///
+    /// One carrier for the whole kind. Before resolution the mention says
+    /// how the relation was addressed; after it, the mention is spent and
+    /// `cpr_schema` is the only thing that answers for the relation — so a
+    /// resolved ground read cannot be re-decided from characters, and there
+    /// is no second variant for the post-resolution shape to drift into.
+    #[lispy("relation:ground")]
+    Ground {
+        mention: P::Mention,
         outer: bool,
-        /// EXISTS mode: true = +_(...) (filtering/semi-join), false = _(...) (cartesian/melt)
-        exists_mode: bool,
-        /// Anti-membership: \+_(...) — the probe must NOT be a member.
-        /// Only meaningful when exists_mode is true.
-        #[serde(skip_serializing_if = "crate::pipeline::asts::core::metadata::is_false", default)]
-        negated: bool,
-        /// Schema conformance target: `_(cols @ data) qua target_table`
-        /// Only present in Unresolved phase; resolver consumes it and sets to None.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        qua_target: Option<SqlIdentifier>,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
+        cpr_schema: P::Scope,
     },
-    /// Table-Valued Function: json_each(...), pragma_table_info(...)
-    /// Also used for higher-order view invocations: active_only(users)(*)
-    #[lispy("relation:tvf")]
-    TVF {
-        function: SqlIdentifier,
-        /// Structured &-separated groups from HO call site (when present).
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        argument_groups: Option<Vec<super::super::operators::HoCallGroup>>,
-        /// Rich HO argument list — single source of truth for TVF arguments.
-        /// Table args carry full relational expressions (preserving interior filters,
-        /// projections, pipes). Scalar args carry domain expressions.
-        #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
-        ho_arguments: Vec<super::super::operators::HoArgument<Phase>>,
-        domain_spec: DomainSpec<Phase>,
-        alias: Option<SqlIdentifier>,
-        /// Namespace qualification for namespace-qualified TVFs / HO view invocations
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        namespace: Option<NamespacePath>,
-        /// Physical backend schema name for SQL generation.
-        /// Resolved by the registry from the logical namespace.
-        backend_schema: PhaseBox<Option<String>, Phase>,
-        /// Grounding context for grounded HO view invocations (e.g., data::test^lib::ho.active_only)
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        grounding: Option<GroundedPath>,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
+    /// Every named relational callable, including TVFs and higher-order
+    /// applications, uses the same call payload as scalar positions.
+    ///
+    /// The relation it publishes is carried HERE, not on the call. A call
+    /// in scalar position publishes no relation, and the shared payload is
+    /// the same payload — so a field only one position can fill belongs to
+    /// that position, where the surrounding node already draws the
+    /// scalar/relational fence.
+    #[lispy("relation:functor_call")]
+    FunctorCall {
+        call: SealedCall<P>,
+        /// The name this relational read answers to. A callable relation is
+        /// named where it STANDS, exactly as a ground read is; call identity
+        /// is the same whether the site names its result or not.
+        ///
+        /// Spent at resolution, where the read's scope was minted answering
+        /// to it — so a resolved tree carries no relational alias beside the
+        /// scope that already answers for it.
+        alias: P::StageName,
+        cpr_schema: P::Scope,
     },
     /// INNER-RELATION (aka SNEAKY-PARENTHESES): table(|> pipeline) or table(, correlation |> pipeline)
     /// Derived tables with semantic pattern classification
     #[lispy("relation:inner")]
     InnerRelation {
-        pattern: InnerRelationPattern<Phase>,
+        pattern: InnerRelationPattern<P>,
+        /// A structural output occurrence allocated by an internal producer.
+        /// Authored inner relations leave this empty and resolve normally.
+        preminted_scope: Option<crate::names::ScopeId>,
         alias: Option<SqlIdentifier>,
         outer: bool,
-        cpr_schema: PhaseBox<CprSchema, Phase>,
+        cpr_schema: P::Scope,
     },
     /// Consulted view expansion: view body inlined as a subquery.
-    /// Holds a full Query (not just RelationalExpression) to support CTEs in view definitions.
+    /// Holds a full Query (not just a chain) to support CTEs in view definitions.
     /// Created by the resolver when expanding `consult!`/`enlist!` view references.
+    ///
+    /// The expansion IS where the authored view name is spent: `scoped` is
+    /// the boundary the body publishes, and every reference through the name
+    /// was already answered against it. A second carrier holding the
+    /// spelling beside that boundary is free to disagree with it.
     #[lispy("relation:consulted-view")]
     ConsultedView {
-        identifier: QualifiedName,
-        body: Box<super::super::Query<Phase>>,
-        scoped: PhaseBox<super::super::ScopedSchema, Phase>,
+        body: Box<super::super::Query<P>>,
+        scoped: P::Consulted,
         outer: bool,
     },
-    /// Pseudo-predicate: State-mutating relations with `!` suffix
-    /// Examples: import!("nba.db", "nba"), enlist!("std::string")
+}
+
+impl<P: Phase> Relation<P> {
+    /// Whether this relation is a MENTION: a read whose own access stands as
+    /// the first continuation of the chain it heads.
     ///
-    /// Pseudo-predicates execute at Phase 1.X (Effect Executor) and are replaced
-    /// with inline tables containing their return values before resolution.
-    ///
-    /// Key characteristics:
-    /// - Always have `!` suffix (e.g., "mount!", "enlist!")
-    /// - Execute with side effects (register namespaces, modify bootstrap state)
-    /// - Return relations (single row with operation metadata)
-    /// - Only exist in Unresolved phase (replaced before Resolved phase)
-    #[lispy("relation:pseudo-predicate")]
-    #[phase_convert(unreachable)]
-    PseudoPredicate {
-        /// Pseudo-predicate name (includes `!` suffix)
-        name: String,
-        /// Namespace qualification (empty = unqualified). Qualified access
-        /// (`std::prelude.enlist!(...)`) resolves through namespace-aware
-        /// registry identity (DIRECTIVE-CONVERGENCE-PLAN Phase 2).
-        namespace: Vec<String>,
-        /// Arguments (literal expressions in MVP, complex expressions in future)
-        arguments: Vec<DomainExpression<Phase>>,
-        /// Returned-relation access specification — the SECOND parentheses
-        /// of `name!(args)(spec)` (DIRECTIVE-CONVERGENCE-PLAN Phase 3:
-        /// first parens parameterize, second parens access the receipt;
-        /// never a synthetic anonymous input table). `Glob` for the bare
-        /// one-paren form.
-        access: DomainSpec<Phase>,
-        /// Optional alias for result table (enables dependency chains in Phase 2+)
-        alias: Option<String>,
-        /// Result schema (populated during effect execution)
-        cpr_schema: PhaseBox<CprSchema, Phase>,
-    },
+    /// A derived table and a consulted expansion spent their access where
+    /// they were built — the interior said what the read asks for — so an
+    /// access standing after one is a step on its result, not its read.
+    pub fn takes_an_access(&self) -> bool {
+        match self {
+            Relation::Ground { .. } | Relation::FunctorCall { .. } => true,
+            Relation::InnerRelation { .. } | Relation::ConsultedView { .. } => false,
+        }
+    }
+}
+
+/// The post-resolution phases: the mention is spent and the scope answers
+/// for the relation.
+impl<P: Phase<Mention = (), Scope = crate::names::ScopeId>> Relation<P> {
+    /// A ground relation as the resolver produces one: a scope, addressed by
+    /// nothing else.
+    pub fn ground(outer: bool, cpr_schema: crate::names::ScopeId) -> Self {
+        Relation::Ground {
+            mention: (),
+            outer,
+            cpr_schema,
+        }
+    }
+
+    /// A ground READ: the relation, and the access it was read under
+    /// standing where every consumer looks for it.
+    pub fn ground_read(
+        access: Access<P>,
+        outer: bool,
+        cpr_schema: crate::names::ScopeId,
+    ) -> Chain<P> {
+        Chain::relation(Relation::ground(outer, cpr_schema))
+            .then(Continuation::Access { access, cpr_schema })
+    }
 }

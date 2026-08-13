@@ -4,14 +4,15 @@ use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_unresolved;
 use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
-use crate::pipeline::asts::core::{Relation, Unresolved};
+use crate::pipeline::asts::core::{GroundMention, Relation, Unresolved};
+use delightql_types::SqlIdentifier;
 use std::collections::{HashMap, HashSet};
 
 /// Validates grouped CTE definitions (after merging duplicates)
 /// This operates on the logical structure that will actually be compiled
 pub fn validate_grouped_cte_dependencies(
-    cte_groups: &HashMap<String, Vec<ast_unresolved::CteBinding>>,
-    cte_order: &[String], // Order of first appearance for each unique name
+    cte_groups: &HashMap<SqlIdentifier, Vec<ast_unresolved::CteBinding>>,
+    cte_order: &[SqlIdentifier], // Order of first appearance for each unique name
 ) -> Result<()> {
     check_forward_references_grouped(cte_groups, cte_order)?;
     check_for_cycles_grouped(cte_groups, cte_order)?;
@@ -20,8 +21,8 @@ pub fn validate_grouped_cte_dependencies(
 
 /// Check that grouped CTEs don't reference CTEs defined later
 fn check_forward_references_grouped(
-    cte_groups: &HashMap<String, Vec<ast_unresolved::CteBinding>>,
-    cte_order: &[String],
+    cte_groups: &HashMap<SqlIdentifier, Vec<ast_unresolved::CteBinding>>,
+    cte_order: &[SqlIdentifier],
 ) -> Result<()> {
     let mut defined = HashSet::new();
 
@@ -63,11 +64,11 @@ fn check_forward_references_grouped(
 
 /// Check for circular dependencies between grouped CTEs
 fn check_for_cycles_grouped(
-    cte_groups: &HashMap<String, Vec<ast_unresolved::CteBinding>>,
-    cte_order: &[String],
+    cte_groups: &HashMap<SqlIdentifier, Vec<ast_unresolved::CteBinding>>,
+    cte_order: &[SqlIdentifier],
 ) -> Result<()> {
     // Build dependency graph from grouped CTEs
-    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut graph: HashMap<SqlIdentifier, Vec<SqlIdentifier>> = HashMap::new();
 
     for cte_name in cte_order {
         let group = &cte_groups[cte_name];
@@ -109,13 +110,13 @@ fn check_for_cycles_grouped(
 
 /// DFS cycle detection
 fn has_cycle_dfs(
-    graph: &HashMap<String, Vec<String>>,
-    node: &str,
-    visited: &mut HashSet<String>,
-    recursion_stack: &mut HashSet<String>,
+    graph: &HashMap<SqlIdentifier, Vec<SqlIdentifier>>,
+    node: &SqlIdentifier,
+    visited: &mut HashSet<SqlIdentifier>,
+    recursion_stack: &mut HashSet<SqlIdentifier>,
 ) -> Result<bool> {
-    visited.insert(node.to_string());
-    recursion_stack.insert(node.to_string());
+    visited.insert(node.clone());
+    recursion_stack.insert(node.clone());
 
     if let Some(dependencies) = graph.get(node) {
         for dep in dependencies {
@@ -152,7 +153,7 @@ fn has_cycle_dfs(
 /// neither check); a reference to a LATER CTE is illegal under left-to-right
 /// scoping and is rejected regardless — closing the hole can only sharpen the
 /// diagnostic on an already-rejected query, never flip accept/reject.
-fn extract_table_references(expr: &ast_unresolved::RelationalExpression) -> Vec<String> {
+fn extract_table_references(expr: &ast_unresolved::Chain) -> Vec<SqlIdentifier> {
     let mut collector = TableRefCollector { refs: Vec::new() };
     walk_visit_relational(&mut collector, expr)
         .expect("CTE table-reference collection is infallible (hooks never return Err)");
@@ -163,35 +164,41 @@ fn extract_table_references(expr: &ast_unresolved::RelationalExpression) -> Vec<
 /// `AstVisit` default walk supplies the complete structural descent; this only
 /// names the leaf positions that contribute a reference.
 struct TableRefCollector {
-    refs: Vec<String>,
+    refs: Vec<SqlIdentifier>,
 }
 
 impl AstVisit<Unresolved> for TableRefCollector {
     fn enter_relation(&mut self, rel: &Relation<Unresolved>) -> Result<Descent> {
         match rel {
-            Relation::Ground { identifier, .. } => {
-                self.refs.push(identifier.name.to_string());
+            Relation::Ground {
+                mention: GroundMention::Named { identifier, .. },
+                ..
+            } => {
+                self.refs.push(identifier.name.clone());
             }
+            // A plan read is addressed by identity: it can neither name a
+            // CTE nor be one, so it contributes no reference to order.
+            Relation::Ground {
+                mention: GroundMention::Plan { .. },
+                ..
+            } => {}
             // A pseudo-predicate must have been executed and replaced during
-            // Phase 1.X before resolution reaches CTE validation; its presence
+            // the effect executor before resolution reaches CTE validation; its presence
             // here is an internal invariant violation (loud, as before).
-            Relation::PseudoPredicate { .. } => panic!(
-                "INTERNAL ERROR: PseudoPredicate should not exist in this phase. \
-                 Pseudo-predicates are executed and replaced during Phase 1.X (Effect Executor)."
-            ),
             // Anonymous / TVF / ConsultedView contribute no ref of their own;
             // their recursive children (TVF table args, consulted-view bodies)
             // are reached by the default walk.
-            Relation::Anonymous { .. }
-            | Relation::TVF { .. }
-            | Relation::ConsultedView { .. } => {}
+            Relation::FunctorCall { .. } | Relation::ConsultedView { .. } => {}
             // InnerRelation's base identifier is contributed in enter_inner_relation.
             Relation::InnerRelation { .. } => {}
         }
         Ok(Descent::Continue)
     }
 
-    fn enter_inner_relation(&mut self, pattern: &InnerRelationPattern<Unresolved>) -> Result<Descent> {
+    fn enter_inner_relation(
+        &mut self,
+        pattern: &InnerRelationPattern<Unresolved>,
+    ) -> Result<Descent> {
         // The InnerRelation's base table name is itself a reference (matching
         // the former walker); its subquery is descended by the default walk.
         match pattern {
@@ -199,7 +206,7 @@ impl AstVisit<Unresolved> for TableRefCollector {
             | InnerRelationPattern::UncorrelatedDerivedTable { identifier, .. }
             | InnerRelationPattern::CorrelatedScalarJoin { identifier, .. }
             | InnerRelationPattern::CorrelatedGroupJoin { identifier, .. } => {
-                self.refs.push(identifier.name.to_string());
+                self.refs.push(identifier.name.clone());
             }
         }
         Ok(Descent::Continue)

@@ -2,10 +2,8 @@
 // Copyright 2026 Daniel Eklund
 //! Metadata structures for resolved and refined phases
 
-use super::ColumnProvenance;
-use crate::{lispy::ToLispy, ToLispy};
+use crate::lispy::ToLispy;
 use delightql_types::SqlIdentifier;
-use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
 // ============================================================================
@@ -48,7 +46,7 @@ use smallvec::{smallvec, SmallVec};
 /// // Display for errors
 /// println!("Table not found: {}", path.with_table("users"));  // "catalog.schema.users"
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NamespacePath {
     // Private: enforce invariants via constructors
     // SmallVec[2]: inline storage for 0-2 items (no allocation)
@@ -61,7 +59,7 @@ impl Default for NamespacePath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NamespaceItem {
     pub name: SqlIdentifier,
     // Future fields for late binding:
@@ -182,6 +180,14 @@ impl NamespacePath {
         })
     }
 
+    /// Rehydrate a persisted fully-qualified namespace through the same
+    /// validated path authority used by authored paths. Database metadata is
+    /// the only caller of this spelling-level boundary; compiler consumers
+    /// receive a typed path afterward.
+    pub fn from_fq_string(fq: &str) -> Result<Self, NamespaceError> {
+        Self::from_parts(fq.split("::").map(str::to_owned).collect())
+    }
+
     /// Get items as slice (read-only access)
     pub fn items(&self) -> &[NamespaceItem] {
         &self.items
@@ -244,7 +250,7 @@ impl NamespacePath {
 
     /// Convert to delightql_types::NamespacePath for use with DatabaseSchema trait
     ///
-    /// Phase 2: Core's rich NamespacePath needs to convert to the simplified
+    /// Core's rich NamespacePath needs to convert to the simplified
     /// types version when calling DatabaseSchema methods.
     pub fn to_types_namespace_path(&self) -> delightql_types::namespace::NamespacePath {
         let parts: Vec<String> = self
@@ -311,7 +317,7 @@ impl ToLispy for NamespaceItem {
 /// - `grounded_ns` = vec of NamespacePaths for libraries being grounded (e.g., "lib::math")
 ///
 /// Multiple groundings are supported: `data::test^lib::math^lib::extra`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroundedPath {
     /// The data namespace (provides concrete tables)
     pub data_ns: NamespacePath,
@@ -334,460 +340,75 @@ impl ToLispy for GroundedPath {
 // Metadata Structures (from resolver phase onward)
 // ============================================================================
 
-/// Table name - either named or anonymous (fresh)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-pub enum TableName {
-    Named(SqlIdentifier),
-    #[lispy("fresh")]
-    Fresh,
-}
-
-/// Column metadata with schema information.
+/// An arena column occurrence handle.
 ///
-/// The `table_name` field is private — access it via `qualifier()` and
-/// modify it via `set_qualifier()`. This ensures consistency with the
-/// identity stack in `info`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-#[lispy("c")]
+/// The compilation registry owns the occurrence's scope, spelling,
+/// addressing, provenance, and value facts.
+#[derive(Debug, Clone)]
 pub struct ColumnMetadata {
-    /// Core column identity and reference information
-    pub info: ColumnProvenance,
-    /// Current table qualifier — kept in sync with identity stack.
-    /// Use `qualifier()` to read and `set_qualifier()` to write.
-    table_name: TableName,
-    /// Position in the output
-    pub table_position: Option<usize>,
-    /// Whether this column has a user-provided name (vs generated)
-    pub has_user_name: bool,
-    /// Whether this column's FULL NAME is a bare lvar the user DECLARED
-    /// (positional binding, an anonymous-table header) as opposed to a
-    /// glob-exported column, whose full name is qualified. Unification
-    /// is by full-name identity: bare headers unify only with
-    /// declared-bare partners; glob columns are reachable only by
-    /// qualification.
-    ///
-    /// PRIVATE with `access_name`: the pair is the column's ADDRESSING
-    /// MODE and moves only through the law methods below
-    /// (`export_answering_to`, `declare_bare`, `declare_bare_answering`,
-    /// `answer_if_silent`, `rename_answering_from`). A road that pokes
-    /// one half without the other creates a column that is addressable
-    /// by no tier or by two — the silent-misbind disease.
-    #[serde(skip_serializing_if = "is_false", default)]
-    declared_bare: bool,
-    /// The name this column ANSWERS TO for full-name unification when
-    /// it crossed an entity boundary: the user's alias, or the bare
-    /// entity name of an unaliased access. The SQL qualifier stays
-    /// synthetic for hygiene; the law matches against this instead.
-    /// Private — see `declared_bare`.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    access_name: Option<SqlIdentifier>,
-    /// Whether this column needs hygienic aliasing (for literal/expression constraints)
-    /// When true, the transformer should use __dql_literal_N alias and hide from output
-    #[serde(skip_serializing_if = "is_false", default)]
-    pub needs_hygienic_alias: bool,
-    /// Whether this column was renamed by a call-site positional pattern (e.g. employee(eid, ename, dept))
-    /// and needs an explicit SELECT wrapper in the transformer. Distinguished from body-internal
-    /// renames which are already baked into the body SQL.
-    #[serde(skip_serializing_if = "is_false", default)]
-    pub needs_sql_rename: bool,
-    /// Interior relation schema for tree group columns.
-    /// When this column holds a JSON array produced by `~> {}`, this field
-    /// describes the columns of the interior relation for drill-down support.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub interior_schema: Option<Vec<crate::pipeline::asts::core::operators::InteriorColumnDef>>,
-    /// TAGGED-SUM marker (EFFECT-ALGEBRA §3): set when
-    /// a corresponding union merged arms whose DECLARED interior headings
-    /// for this column DIFFER. The union itself is legal (each row keeps
-    /// its own heading; `operation` is the tag); RELEASING the column is
-    /// the compile-time teaching error — narrow the ledger to arms that
-    /// agree first. The kept `interior_schema` is the first arm's, for
-    /// display only; drills must check this flag before trusting it.
-    #[serde(skip_serializing_if = "is_false", default)]
-    pub interior_schema_conflict: bool,
-    /// The column's DECLARED type from the catalog, when the column comes
-    /// from a physical table (registry lookup carries it forward from
-    /// ColumnInfo). None for derived/expression columns. Declarations lie
-    /// about sqlite storage — this is intent metadata; first consumer is
-    /// corresponding-union NULL-pad typing (a pad is typed by the column
-    /// it stands in for). The germ of resolved-AST type knowledge.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub declared_type: Option<String>,
-
-    /// The catalog's nullability for a physical-table column (registry
-    /// lookups carry it forward from ColumnInfo, ultimately PRAGMA
-    /// table_info's notnull). None when unknown (derived/expression
-    /// columns) — consumers report "unknown", never a guess.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub nullable: Option<bool>,
-}
-
-// Helper for serde skip_serializing_if
-pub(crate) fn is_false(b: &bool) -> bool {
-    !b
+    identity: crate::names::ColId,
 }
 
 impl ColumnMetadata {
-    /// Create new metadata from components
-    pub fn new(
-        info: ColumnProvenance,
-        table_name: TableName,
-        table_position: Option<usize>,
-    ) -> Self {
-        Self {
-            info,
-            table_name,
-            table_position,
-            has_user_name: true, // Default to true for backward compatibility
-            declared_bare: false,
-            access_name: None,
-            needs_hygienic_alias: false,
-            needs_sql_rename: false,
-            interior_schema: None,
-            interior_schema_conflict: false,
-            declared_type: None,
-            nullable: None,
-        }
+    pub fn new(identity: crate::names::ColId) -> Self {
+        Self { identity }
     }
 
-    /// Attach the catalog's nullability (registry table lookups).
-    pub fn with_nullable(mut self, nullable: Option<bool>) -> Self {
-        self.nullable = nullable;
-        self
+    /// The arena-local identity minted for this occurrence.
+    pub fn identity(&self) -> crate::names::ColId {
+        self.identity
     }
 
-    // ------------------------------------------------------------------
-    // Addressing mode: (declared_bare, access_name) as one law object.
-    // Every scope-boundary crossing must state how the column is
-    // addressed afterwards; these are the only spellings.
-    // ------------------------------------------------------------------
-
-    /// Whether the column's full name is a user-declared bare lvar.
-    pub fn declared_bare(&self) -> bool {
-        self.declared_bare
-    }
-
-    /// The name the column answers to across an entity boundary.
-    pub fn access_name(&self) -> Option<&SqlIdentifier> {
-        self.access_name.as_ref()
-    }
-
-    /// Entity-boundary export: the column crosses out of a consulted
-    /// view/fact and henceforth answers to the caller-facing name (the
-    /// user's alias, or the bare entity name). Nothing bare leaks
-    /// through the boundary — declared_bare belongs to the caller's own
-    /// argumentative bindings.
-    pub fn export_answering_to(&mut self, access: SqlIdentifier) {
-        self.declared_bare = false;
-        self.access_name = Some(access);
-    }
-
-    /// Argumentative declaration: the caller binds this column as a
-    /// bare lvar (positional pattern, anonymous header, drill binding).
-    /// A bare declaration answers to no access name — the source
-    /// boundary's stamp does not ride through the caller's own binding.
-    pub fn declare_bare(&mut self) {
-        self.declared_bare = true;
-        self.access_name = None;
-    }
-
-    /// Argumentative declaration under a relation alias: bare for
-    /// full-name unification, but also answering to the alias so
-    /// alias-qualified references reach it.
-    pub fn declare_bare_answering(&mut self, alias: SqlIdentifier) {
-        self.declared_bare = true;
-        self.access_name = Some(alias);
-    }
-
-    /// Endpoint stamping: claim the answering channel only if no
-    /// boundary has claimed it yet (ER endpoints stamp outermost-wins).
-    pub fn answer_if_silent(&mut self, access: SqlIdentifier) {
-        if self.access_name.is_none() {
-            self.access_name = Some(access);
-        }
-    }
-
-    /// Endpoint rename: re-point an existing answering channel when the
-    /// boundary itself is renamed (`as u`); a channel answering to a
-    /// different name is left alone. Returns whether it re-pointed.
-    pub fn rename_answering_from(&mut self, old: &str, new: &SqlIdentifier) -> bool {
-        let hit = self
-            .access_name
-            .as_ref()
-            .is_some_and(|a| SqlIdentifier::str_eq(a.as_str(), old));
-        if hit {
-            self.access_name = Some(new.clone());
-        }
-        hit
-    }
-
-    /// Fresh identity, conserved value facts. Identity (provenance, scope,
-    /// position) is per-site and rebuilt freely; the facts attached to the
-    /// VALUE — declared type, nullability, interior heading — travel with
-    /// it wherever it goes. This is the chokepoint for every channel that
-    /// rebuilds a column around the same value: constructing bare
-    /// `ColumnMetadata::new` from an existing column is the smell this
-    /// exists to remove (a poorer intermediate type or a partial copy
-    /// silently strips what it cannot hold).
-    pub fn carrying(
-        source: &ColumnMetadata,
-        info: ColumnProvenance,
-        table_name: TableName,
-        table_position: Option<usize>,
-    ) -> Self {
-        let mut col = Self::new(info, table_name, table_position);
-        col.declared_type = source.declared_type.clone();
-        col.nullable = source.nullable;
-        col.interior_schema = source.interior_schema.clone();
-        col.interior_schema_conflict = source.interior_schema_conflict;
-        col
-    }
-
-    /// Attach the catalog's declared type (registry table lookups).
-    pub fn with_declared_type(mut self, declared_type: Option<String>) -> Self {
-        self.declared_type = declared_type;
-        self
-    }
-
-    /// The declared type as usable for typing a corresponding-union NULL
-    /// pad ("a pad is typed by the column it stands in for"). Filters the
-    /// declarations that lie too much to pad with: sqlite's NONE affinity
-    /// keyword (a non-type), and BOOLEAN — sqlite has no boolean storage,
-    /// so BOOLEAN declarations sit over text/int cells and a data-typed
-    /// target column contradicts a boolean-typed pad. Revisit BOOLEAN
-    /// with the boolean dirt migration.
-    pub fn pad_type(&self) -> Option<&str> {
-        self.declared_type.as_deref().filter(|t| {
-            !t.eq_ignore_ascii_case("none")
-                && !t.eq_ignore_ascii_case("boolean")
-                && !t.eq_ignore_ascii_case("bool")
-        })
-    }
-
-    /// The wrong-aim rule (interior-values matrix, task #22): a column whose
-    /// declared type is PLAINLY SCALAR cannot hold an interior value — aiming
-    /// a compound-value tool (pathing, narrow, drill) at it is a compile-time
-    /// error, not a target-dependent runtime surprise (sqlite: 'malformed
-    /// JSON' at runtime or silent NULLs, depending on whether the scalar
-    /// happens to parse as JSON). Returns the offending declaration when the
-    /// column is plainly scalar.
+    /// Return the arena scope shared by an entire heading.
     ///
-    /// TEXT (and CHAR/VARCHAR/CLOB) stay PERMISSIVE — documents live in TEXT
-    /// columns, and sqlite declarations lie anyway. JSON/JSONB, NONE, and
-    /// undeclared columns are also permissive. Only declarations that cannot
-    /// honestly hold a document reject: the integer/real/boolean/date
-    /// families.
-    pub fn scalar_only_declaration(&self) -> Option<&str> {
-        const SCALAR_PREFIXES: &[&str] = &[
-            "int", "bigint", "smallint", "tinyint", "real", "double", "float", "numeric",
-            "decimal", "bool", "date", "time", "timestamp", "datetime",
-        ];
-        self.declared_type.as_deref().filter(|t| {
-            let lower = t.to_ascii_lowercase();
-            SCALAR_PREFIXES.iter().any(|p| lower.starts_with(p))
-        })
-    }
-
-    /// Create new metadata with explicit user name flag
-    pub fn new_with_name_flag(
-        info: ColumnProvenance,
-        table_name: TableName,
-        table_position: Option<usize>,
-        has_user_name: bool,
-    ) -> Self {
-        Self {
-            info,
-            table_name,
-            table_position,
-            has_user_name,
-            declared_bare: false,
-            access_name: None,
-            needs_hygienic_alias: false,
-            needs_sql_rename: false,
-            interior_schema: None,
-            interior_schema_conflict: false,
-            declared_type: None,
-            nullable: None,
-        }
-    }
-
-    pub fn from_existing(other: &ColumnMetadata) -> Self {
-        other.clone()
-    }
-
-    pub fn has_alias(&self) -> bool {
-        self.info.has_alias()
-    }
-
-    pub fn was_qualified(&self) -> Option<bool> {
-        self.info.is_qualified()
-    }
-
-    pub fn name(&self) -> &str {
-        self.info.name().unwrap_or("<unnamed>")
-    }
-
-    pub fn original_name(&self) -> &str {
-        self.info.original_name().unwrap_or("<unnamed>")
-    }
-
-    pub fn set_alias(&mut self, alias: String) {
-        self.info = self.info.clone().with_alias(alias);
-    }
-
-    /// Get the current table qualifier
-    pub fn qualifier(&self) -> &TableName {
-        &self.table_name
-    }
-
-    /// Push a scope transition: updates both the table qualifier field
-    /// and the identity stack atomically. This is the only way to change
-    /// the qualifier after construction.
-    pub fn push_scope(
-        &mut self,
-        qualifier: TableName,
-        context: super::provenance::IdentityContext,
-    ) {
-        let name = self.info.name().unwrap_or("<unnamed>").to_string();
-        self.table_name = qualifier.clone();
-        self.info = self
-            .info
-            .clone()
-            .with_identity(super::provenance::ColumnIdentity {
-                name: name.into(),
-                context,
-                phase: super::provenance::TransformationPhase::Resolved,
-                table_qualifier: qualifier,
-            });
+    /// A partial or mixed heading is not evidence for one scope: every
+    /// column must carry an identity, and all of those identities must name
+    /// the same scope.
+    pub(crate) fn common_identity_scope(
+        columns: &[ColumnMetadata],
+        registry: &crate::names::Registry,
+    ) -> Option<crate::names::ScopeId> {
+        let mut scopes = columns
+            .iter()
+            .map(ColumnMetadata::identity)
+            .map(|column| registry.scope_of(column));
+        let first = scopes.next()?;
+        scopes.all(|scope| scope == first).then_some(first)
     }
 }
 
-/// A CprSchema bound to its SQL alias. Private fields enforce that
-/// the alias is reflected in the schema's provenance stacks via SubqueryAlias.
-///
-/// Invariant: `schema` always has SubqueryAlias pushed for `alias`.
-/// Use `bind()` to construct (pushes provenance), or `from_parts()` when
-/// the schema is already scoped (e.g., rebuilder after flatten/rebuild cycle).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScopedSchema {
-    alias: SqlIdentifier,
-    schema: CprSchema,
-    /// Opaque resolver ID for this scope. Carried through to the transformer
-    /// so it can map directly to a ProvenanceId without string remapping.
-    #[serde(default)]
-    resolver_id: Option<super::provenance::ResolverId>,
+pub(crate) fn is_plainly_scalar_declaration(declaration: &str) -> bool {
+    const SCALAR_PREFIXES: &[&str] = &[
+        "int",
+        "bigint",
+        "smallint",
+        "tinyint",
+        "real",
+        "double",
+        "float",
+        "numeric",
+        "decimal",
+        "bool",
+        "date",
+        "time",
+        "timestamp",
+        "datetime",
+    ];
+    let lower = declaration.to_ascii_lowercase();
+    SCALAR_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
-impl ScopedSchema {
-    /// Construct a ScopedSchema, pushing SubqueryAlias onto every column.
-    /// This is the primary constructor — enforces the alias-schema invariant.
-    pub fn bind(
-        schema: CprSchema,
-        alias: SqlIdentifier,
-        resolver_id: Option<super::provenance::ResolverId>,
-    ) -> Self {
-        let scoped = crate::pipeline::resolver::helpers::extraction::scope_schema_to_alias(
-            schema,
-            &alias,
-            resolver_id,
-        );
-        ScopedSchema {
-            alias,
-            schema: scoped,
-            resolver_id,
-        }
-    }
-
-    /// Reconstruct from already-scoped parts (for rebuilder after flatten/rebuild).
-    /// The caller guarantees that `schema` already has the alias in its provenance.
-    pub fn from_parts(alias: SqlIdentifier, schema: CprSchema) -> Self {
-        ScopedSchema {
-            alias,
-            schema,
-            resolver_id: None,
-        }
-    }
-
-    pub fn alias(&self) -> &SqlIdentifier {
-        &self.alias
-    }
-
-    pub fn schema(&self) -> &CprSchema {
-        &self.schema
-    }
-
-    pub fn resolver_id(&self) -> Option<super::provenance::ResolverId> {
-        self.resolver_id
+impl PartialEq for ColumnMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
     }
 }
 
-impl ToLispy for ScopedSchema {
+impl ToLispy for ColumnMetadata {
     fn to_lispy(&self) -> String {
-        format!(
-            "(scoped-schema :alias {} {})",
-            self.alias,
-            self.schema.to_lispy()
-        )
-    }
-}
-
-/// Schema information for Current Piped Relation
-/// Used in resolved and refined phases to track column resolution state
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CprSchema {
-    /// Successfully resolved with available columns
-    Resolved(Vec<ColumnMetadata>),
-    /// Failed to resolve some columns
-    Failed {
-        resolved_columns: Vec<ColumnMetadata>,
-        unresolved_columns: Vec<ColumnMetadata>,
-    },
-    /// Needs resolution (bubbled up from operators)
-    Unresolved(Vec<ColumnMetadata>),
-    /// Unknown schema - for passthrough TVFs and external functions
-    Unknown,
-}
-
-impl ToLispy for CprSchema {
-    fn to_lispy(&self) -> String {
-        match self {
-            CprSchema::Resolved(cols) => {
-                let col_list = cols
-                    .iter()
-                    .map(|c| c.to_lispy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("(cpr_schema:resolved [{}])", col_list)
-            }
-            CprSchema::Failed {
-                resolved_columns,
-                unresolved_columns,
-                ..
-            } => {
-                let resolved_list = resolved_columns
-                    .iter()
-                    .map(|c| c.to_lispy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let unresolved_list = unresolved_columns
-                    .iter()
-                    .map(|c| c.to_lispy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!(
-                    "(cpr_schema:failed :resolved [{}] :unresolved [{}])",
-                    resolved_list, unresolved_list
-                )
-            }
-            CprSchema::Unresolved(cols) => {
-                let col_list = cols
-                    .iter()
-                    .map(|c| c.to_lispy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("(cpr_schema:unresolved [{}])", col_list)
-            }
-            CprSchema::Unknown => "(cpr_schema:unknown)".to_string(),
-        }
+        format!("{:?}", self.identity)
     }
 }
 
@@ -863,6 +484,29 @@ mod tests {
     fn test_namespace_path_empty_identifier_rejected() {
         let result = NamespacePath::from_parts(vec!["schema".into(), "".into()]);
         assert!(matches!(result, Err(NamespaceError::EmptyIdentifier)));
+    }
+
+    #[test]
+    fn scalar_declaration_authority_distinguishes_numeric_from_text_carriers() {
+        for declaration in ["INT", "BIGINT", "decimal(10, 2)", "timestamp"] {
+            assert!(
+                is_plainly_scalar_declaration(declaration),
+                "{declaration} is a scalar declaration"
+            );
+        }
+        for declaration in [
+            "VARCHAR(500)",
+            "CHAR(20)",
+            "NVARCHAR(100)",
+            "CLOB",
+            "TEXT",
+            "JSON",
+        ] {
+            assert!(
+                !is_plainly_scalar_declaration(declaration),
+                "{declaration} can carry structured document text"
+            );
+        }
     }
 
     #[test]

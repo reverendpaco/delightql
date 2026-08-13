@@ -10,6 +10,7 @@
 pub mod book;
 pub mod csvstruct;
 pub mod delegate;
+pub mod editor;
 pub mod explain;
 pub mod filemunge;
 pub mod format;

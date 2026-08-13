@@ -99,6 +99,10 @@ CREATE TABLE cartridge (
 CREATE TABLE entity (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
+    -- The identifier law's other half: 1 = the authored name was stropped
+    -- and keeps its exact identity; 0 = it folds. Agreement is computed
+    -- over (name, name_stropped), never by collation alone.
+    name_stropped INTEGER NOT NULL DEFAULT 0,
     type INTEGER NOT NULL,
     cartridge_id INTEGER NOT NULL,
     doc TEXT,
@@ -190,6 +194,26 @@ CREATE TABLE join_edge (
     FOREIGN KEY (entity_id) REFERENCES entity(id)
 );
 
+-- Functional Dependency: THE DECLARED MODE of a fact function.
+-- `f(a, b -> c, d ---- …)` declares that the inputs determine the outputs.
+-- That declaration is what makes ONE entity both an inspectable relation and
+-- a callable, so it is stored as a typed capability of the entity rather than
+-- re-derived from source text, argument count, or a callable category.
+-- `stropped` carries the authored identifier's identity: a stropped name
+-- compares verbatim, an unstropped one folds, and the pick is by exact
+-- agreement either way.
+CREATE TABLE functional_dependency (
+    id INTEGER PRIMARY KEY,
+    entity_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    attribute_name TEXT NOT NULL,
+    stropped INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (entity_id) REFERENCES entity(id),
+    UNIQUE (entity_id, role, position),
+    CHECK (role IN ('input', 'output'))
+);
+
 -- Interior Entity: Tracks interior relations (tree group columns) within entities.
 -- When a view produces a tree group column (e.g., ~> {name, type} as entities),
 -- an interior_entity row links the parent entity to the column name.
@@ -228,8 +252,8 @@ CREATE TABLE entity_resolution (
 -- ============================================================================
 
 -- Namespace: Hierarchical namespace tree
--- id is AUTOINCREMENT (review qmqwqlms round 3, P1): the liminal-program
--- compensation boundary is a namespace-id high-water mark, and its
+-- id is AUTOINCREMENT: the liminal-program compensation boundary is a
+-- namespace-id high-water mark, and its
 -- "created since" scan is exact only if ids are NEVER reused. Plain
 -- INTEGER PRIMARY KEY would let SQLite hand a deleted max rowid to the
 -- next insert, hiding that namespace from the failure teardown.
@@ -254,13 +278,36 @@ CREATE TABLE namespace (
 CREATE TABLE mount (
     namespace_id INTEGER PRIMARY KEY REFERENCES namespace(id),
     cartridge_id INTEGER NOT NULL UNIQUE REFERENCES cartridge(id),
-    attach_alias TEXT UNIQUE,
+    -- The PHYSICAL attachment handle. NOT unique: one file may be named by
+    -- more than one namespace, and naming it twice must not OPEN it twice —
+    -- one connection holding two handles on one file cannot write through
+    -- either while the other reads, and reports "database is locked" from a
+    -- statement with no second party in it. So the second namespace binds
+    -- the schema the first one is already using, and teardown refcounts:
+    -- a schema is detached when the last binding on it goes, the rule
+    -- mount_tree!'s shared connection already follows one level up.
+    attach_alias TEXT,
+    -- WHO OPENED the schema this binding names. 'owned' = this mount
+    -- attached it and may detach it; 'borrowed' = it was already open and
+    -- this mount only named it.
+    --
+    -- Refcounting and ownership answer different questions and neither
+    -- substitutes for the other: refcounting says whether anyone is still
+    -- using the schema, ownership says whether closing it was ever this
+    -- binding's to do. A borrowed schema may be SQLite's own `main`, which
+    -- cannot be detached at all, or another owner's attachment that is
+    -- still being read.
+    attachment TEXT CHECK (attachment IN ('owned', 'borrowed')),
     qualification TEXT NOT NULL CHECK (
         qualification IN ('unqualified', 'aliased', 'engine_schema')
     ),
     engine_schema TEXT,
     class TEXT NOT NULL CHECK (class IN ('attach', 'external')),
     CHECK (class != 'attach' OR attach_alias IS NOT NULL),
+    -- An attach-class binding always states who opened its handle; an
+    -- external one has no handle to state it for.
+    CHECK (class != 'attach' OR attachment IS NOT NULL),
+    CHECK (class != 'external' OR attachment IS NULL),
     CHECK (class != 'attach' OR engine_schema IS NULL),
     CHECK (qualification != 'aliased' OR class = 'attach'),
     CHECK (engine_schema IS NULL OR qualification = 'engine_schema'),
@@ -447,6 +494,47 @@ CREATE TABLE stack (
     PRIMARY KEY (compilation_id, function_name)
 );
 
+-- Compiler limits: the resource policies a compilation runs under.
+-- Addressed as sys::execution.compiler_limit(*).
+--
+-- A limit is a RESOURCE policy, never a rule of the language: no row here
+-- says what a valid query may be, only how much of this process one may
+-- spend. Every row therefore carries the identity its refusal reports, so an
+-- operator who meets a refusal can find the setting from the badge it wore.
+--
+-- `default_value` is what an unconfigured process uses; `hard_ceiling` is
+-- what ordinary runtime configuration cannot raise past. `hard_ceiling`
+-- bounds CONFIGURATION, not physics: it does not promise that its own value
+-- is survivable, only that no environment variable or host setter reaches
+-- past it. Every column is NOT NULL, so no reader has to ask whether a limit
+-- has a ceiling; each one does.
+--
+-- NO ROW IS AUTHORED HERE. The schema declares the table; the engine writes
+-- every column of every row from the typed policy the guards themselves
+-- enforce (crate::compiler_limits), at compilation entry. A row copied into
+-- this file would be a second authority — one a later safety adjustment can
+-- leave stating a default or a ceiling the guard has stopped using, with
+-- both sides still compiling.
+--
+-- `effective_value` is the column that moves between compilations, and it is
+-- the value the COMPILATION READING THIS ROW armed with — not a later read
+-- of process policy, which is a different number whenever a host changes a
+-- setting after that compilation started.
+--
+-- The rows are DIFFERENT budgets and must stay so. They measure different
+-- objects at different times — the authored parse tree before any walk, and
+-- active refiner frames while refinement runs — and raising one does not
+-- raise the other. Separate rows carrying separate error identities is that
+-- fact as data rather than as prose in two doc comments.
+CREATE TABLE compiler_limit (
+    name            TEXT PRIMARY KEY,
+    default_value   INTEGER NOT NULL,
+    effective_value INTEGER NOT NULL,
+    hard_ceiling    INTEGER NOT NULL,
+    unit            TEXT NOT NULL,
+    error           TEXT NOT NULL
+);
+
 -- ============================================================================
 -- THE TYPED EFFECT PLAN, MATERIALIZED (sys::execution — D4,
 -- DOGFOODING-EFFECT-EXECUTION-PLAN §4; Q-D3/Q-D4 as amended)
@@ -575,7 +663,7 @@ CREATE TABLE dialect_capability (
 
 -- ----------------------------------------------------------------------------
 -- Seed rows: the M1 generator deltas (previously `match dialect` arms in
--- generator_v3/{operators,literals,identifiers}.rs). Canonical (SQLite)
+-- generator/{operators,literals,identifiers}.rs). Canonical (SQLite)
 -- spellings stay in code: != , || , 1/0 booleans, "..." quoting.
 -- ----------------------------------------------------------------------------
 INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
@@ -593,6 +681,12 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
     ('mysql',     'op.is_distinct_from',     'template', 'NOT ({0} <=> {1})'),
     ('mysql',     'ident.quoted',    'template', '`{0}`'),
     ('mysql',     'ident.escape',    'template', '`'),
+    -- The POLARITY OBSERVATION. `IS [NOT] TRUE` is the canonical spelling
+    -- and three families have it; SQL Server has no boolean value at all, so
+    -- the collapse is written as the CASE that produces one. Both rows keep
+    -- the equipartition: a predicate answering UNKNOWN takes the ELSE.
+    ('sqlserver', 'op.is_true',      'template', 'CASE WHEN {0} THEN 1 ELSE 0 END = 1'),
+    ('sqlserver', 'op.is_not_true',  'template', 'CASE WHEN {0} THEN 1 ELSE 0 END = 0'),
     ('sqlserver', 'op.not_equal',    'template', '<>'),
     ('sqlserver', 'op.concatenate',  'template', '+'),
     ('sqlserver', 'lit.bool_true',   'template', 'TRUE'),
@@ -720,14 +814,19 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
 -- ----------------------------------------------------------------------------
 -- sys::identifiers — the engine identifier registry as burned rows.
 -- AUTHORED-AS-DATA: these rows are the
--- SOURCE of truth for `dql explain` and every future projection (the
--- former uri_registry.rs Rust static is gone; spelling-normalization
--- stays in code). One upstream per table — never also generate these.
+-- SOURCE of truth for `dql explain` and every future projection;
+-- spelling-normalization stays in code. One upstream per table — never
+-- also generate these.
 --
--- Invariants (PORCELAIN-AND-PLUMBING.md): (kind, hierarchy) is a FROZEN
--- identity — append-only, a hierarchy once minted is never reused or
--- reworded (URI-DESIGN.md §3); summary/explanation are porcelain and
--- may improve freely. kind ∈ error | danger | config.
+-- Invariants (PORCELAIN-AND-PLUMBING.md): summary/explanation are
+-- porcelain and may improve freely. (kind, hierarchy) is identity, and
+-- its permanence begins at the first public release or an explicit
+-- earlier vocabulary freeze (URI-DESIGN.md §3): from that boundary on, a
+-- hierarchy is never reassigned or deleted, and a rename is a permanent
+-- alias. BEFORE it, a hierarchy that has appeared in no released version
+-- may simply be deleted — pre-release vocabulary work owes no aliases,
+-- tombstones, or succession rows to an identifier no user could have
+-- received. kind ∈ error | danger | config.
 -- Addressed as sys::identifiers.identifier(*) (registered in system.rs
 -- alongside the other sys tables).
 -- ----------------------------------------------------------------------------
@@ -746,6 +845,7 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('error', 'parse/pony', 'Mixed operators without grouping (no PEMDAS).', 'DelightQL has NO operator precedence: `a * b + c` has no reading, because the language refuses to rank `*` over `+` (the PONY rule). Every composition is grouped explicitly — `((a * b) + c)` or `(a * (b + c))` — so the meaning is always on the page. The parser cannot accept the ungrouped form even to complain about it; this diagnosis is recovered from the failed parse''s token stream.'),
     ('error', 'parse/is_null', 'SQL `is null` used; DelightQL spells it `= null`.', 'There is no `is null` / `is not null` operator. `=` is the null-safe equality (compiles to IS NOT DISTINCT FROM), so `col = null` is the null check and `col != null` its negation. (`==` is the traditional SQL equality, where NULL never matches.)'),
     ('error', 'parse/anon_space', 'Space between `_` and `(` in an anonymous table.', 'The anonymous table constructor is ONE token: `_(id @ 1)`. With a space (`_ (id @ 1)`) the parser sees a discard followed by a parenthesized expression and rejects the statement. Remove the space.'),
+    ('error', 'parse/anon/empty', 'There is no empty anonymous table.', '`_()` names no relation: it has no columns and no rows, so there is nothing for it to be. It is not the union identity either — that is the empty relation OF THE MATCHING SCHEMA, whose typed spelling (`_(cols @)`) is reserved and not yet available. Write the relation you mean: `_(id @ 1)` for a row, or a header form `_(a, b ---- 1, 2)`. This diagnosis is recovered from the failed parse''s token stream.'),
     ('error', 'parse/comment', 'SQL `--` comment used; DelightQL comments are `//`.', 'There is no `--` line comment (and no `/* */` block comment): `--` lexes as two `-` operators and breaks the parse. The line comment is `//`, in both query mode and rules files. Inside a string literal `--` is ordinary text. If subtraction of a negative was meant, group it explicitly: `a - (-b)`. This diagnosis is recovered from the failed parse''s token stream.'),
     ('error', 'parse/sort_minus', 'Minus-prefix descending sort; the spelling is `col desc`.', 'There is no `#(-col)` descending shorthand. Descending is spelled per key with `desc`: `#(col desc)`, `#(a desc, b)` — in pipe sorts and window specs alike. A unary minus meant as arithmetic needs explicit grouping: `#((0 - col))`. This diagnosis is recovered from the failed parse''s token stream.'),
     ('error', 'semantic', 'The structure is valid but the meaning is wrong.', 'Semantic errors mean the query parsed, but a name failed to resolve, an arity was wrong, or a constraint was violated during compilation. The subhierarchy names what went wrong: resolution/ (name binding), constraint/, arity, limitation/ (known gaps).'),
@@ -762,6 +862,8 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('error', 'semantic/mention/term', 'A mention term''s spelling is ill-formed.', 'Term errors: the delimited or light mention spelling could not canonicalize, or the term shape does not match what the operation requires. Identity is decided by canonical bytes; the message shows the canonical spelling it derived.'),
     ('error', 'semantic/interior', 'An interior (nested) relation was misused.', 'The interior family covers relation-valued columns: drills, narrows, and interior-scoped operations. Members: topn/ (ordered-slice restrictions inside interiors).'),
     ('error', 'semantic/interior/topn', 'An ordered slice inside an interior hit a restriction.', 'Top-N-in-interior restrictions: what #<N and ordered slices may do inside a correlated interior in this release. Member: noneq_correlation (non-equality correlation under a top-N interior refuses — ruled deferred, the lateral road is future work).'),
+    ('error', 'semantic/limit', 'A row-bound value is invalid.', 'Limit and offset operators require an integer bound. A bare identifier is admitted only while expanding a higher-order body and only when it names an integer scalar binding.'),
+    ('error', 'semantic/limit/value', 'A limit or offset bound is not an integer value.', 'Write an integer literal, or bind the identifier to an integer scalar parameter in the active higher-order call. Missing bindings, fractional numbers, and values outside the integer range refuse instead of silently becoming zero.'),
     ('error', 'semantic/narrowing', 'A JSON narrowing operation was ill-typed or ill-aimed.', 'Narrowing reads interior values out of JSON-carrying columns (JSON-SUBSTRATE.md): owned at release points, contained elsewhere; non-array and malformed values narrow to ZERO ROWS by the null-interior road. Members refuse narrowing aimed at plainly scalar columns or ill-formed object literals.'),
     ('error', 'semantic/transform', 'The compiler''s own lowering failed an internal law.', 'The transform family is the self-check: post-lowering verification of the SQL the compiler is about to ship (qualifier visibility, column existence). These are internal invariant violations — a dql bug, not a user error; the message asks for a report.'),
     ('error', 'semantic/compound', 'A compound (multi-statement) source violated sequencing rules.', 'Compound errors cover multi-statement sources: what may follow what, and which statement kinds may share a submission.'),
@@ -776,14 +878,16 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('error', 'parse/general', 'Generic parse failure.', 'The grammar rejected the text and no more specific parse category applied. The caret in the message marks the first unreadable token.'),
     ('error', 'semantic/resolution/table', 'A named table (or relation) was not found.', 'The name does not exist in the current namespace. Check spelling, the mounted namespace prefix (ns.table), and whether the relation needs a mount!/consult! first.'),
     ('error', 'semantic/resolution/column', 'A named column was not found in scope.', 'The column does not exist in the relation''s schema at this pipeline stage. Note that |> projection changes the visible columns: a filter AFTER |> (a, b) sees only a and b.'),
+    ('error', 'semantic/resolution/schema', 'A relation has no structural schema for name binding.', 'Filters and other column-reading operations bind authored names to column identities. An opaque passthrough relation or unknown table-valued function may be carried without a heading, but it cannot be filtered until its columns are introspectable. Check the relation spelling or make its schema available.'),
     ('error', 'semantic/resolution/ambiguous', 'A name matches more than one column in scope.', 'After a join, an unqualified column name exists on more than one side. Qualify it with the relation alias (u.id).'),
+    ('error', 'semantic/constraint/positional_alias', 'An `as` alias stood in a positional slot.', 'THE WRITTEN NAME IS THE NAMING. A slot binds by POSITION: a bare name binds a fresh column, a qualified one reuses an existing value, and a term constrains the column and is consumed. None of them publishes a name for `as` to change. Rename where names are published — in a projection: `f(…) |> (col as name)`.'),
     ('error', 'semantic/arity', 'Wrong number of arguments.', 'A function, predicate, or POSITIONAL TABLE PATTERN received the wrong number of arguments. The commonest case: a table access like users(name, age) is not a projection — it is a positional pattern that must supply one slot per column (full arity). Fill unwanted positions with _ (users(_, name, _)) or keep everything with *. For functions and rules, the runtime error names the exact expected/actual counts.'),
     ('error', 'semantic/cast', 'Invalid cast:() usage.', 'cast:(expr, type) takes a bare type name from the v1 vocabulary: integer, real, text, numeric, boolean. Target engines apply their own cast semantics (Postgres rounds real→integer; SQLite truncates) — see the book''s cast page.'),
     ('error', 'semantic/recursion', 'A recursive definition breaks the recursion contract.', 'Family for refusals of recursive forms the language does not permit (RECURSION-CONTRACT.md). DelightQL recursion is a generator (co-recursion): each recursive clause sees only the previous iteration''s rows — never the accumulated result, never itself as a callable. Forms outside that contract are refused here, each with its rewrite path.'),
     ('error', 'semantic/recursion/nonlinear', 'A recursive rule references itself more than once.', 'The frontier cannot join with itself (or with the accumulated result) — forward evaluation carries one previous iteration. Carry the values you need as columns of one frontier row instead: the tupling transformation. fib is the canonical example — two self-calls become one two-column state, (a, b) stepping to (b, a+b). RECURSION-CONTRACT.md N1.'),
     ('error', 'semantic/recursion/aggregate', 'Aggregation inside a recursive rule.', 'An aggregate over the frontier would need the accumulated set, which a recursive rule never sees. Aggregate after the fixpoint — strata are textual, so a later pipe stage aggregates the finished recursion — or carry a running value as a column of the frontier row when the aggregation is per-path. RECURSION-CONTRACT.md N3.'),
     ('error', 'semantic/recursion/self_subquery', 'A recursive rule references itself inside a subquery.', 'Semi/anti-joins, IN, scalar subqueries, or derived tables against the definition itself would need the accumulated set — a recursive rule sees only the previous iteration''s rows, as a direct source. Track visited state in the frontier row (the visited-string idiom), or deduplicate/filter after the fixpoint. RECURSION-CONTRACT.md N4.'),
-    ('error', 'semantic/grounding', 'A head-grounding or mention rule was violated.', 'Family for the grounding/mention doctrine (GROUNDING-AND-MENTION.md): rule heads ground on literals and mentions by canonical spelling; contexts are symbols; edges are declared, finite, and selected by their terms'' exact canonical spellings. Subhierarchy: head/ (clause selection), er/ (the entity-relationship operators & and &&), jit_removed (the removed query-position ^ grounding).'),
+    ('error', 'semantic/grounding', 'A head-grounding or mention rule was violated.', 'Family for the grounding/mention doctrine (GROUNDING-AND-MENTION.md): rule heads ground on literals and mentions by canonical spelling; contexts are symbols; edges are declared, finite, and selected by their terms'' exact canonical spellings. Subhierarchy: head/ (clause selection), er/ (the entity-relationship operators & and &&).'),
     ('error', 'semantic/grounding/head/provable_miss', 'A literal ground argument matches no clause head.', 'A provable miss is an error, not an empty relation. The argument is written at the call site (a literal or mention), the parameter position is ground in every clause, and no clause head spells that value — emptiness by absent DECLARATION, which the catalog proves at compile time. The message enumerates the declared spellings. A data-borne value (a column, not a literal) keeps relational semantics and misses to empty; a free clause at the position makes every call satisfiable.'),
     ('error', 'semantic/grounding/er/unknown_context', 'No edge is declared in this context.', 'A context exists exactly where an edge declares it — the edge set per context is finite and declared, so an unknown context is a hard error at first use, never an empty result. The message lists the contexts that DO have declared edges in the enlisted scope. Declare edges with A(*) &(::ctx) B(*) :- body, and enlist!() the namespace that declares them.'),
     ('error', 'semantic/grounding/er/edge_miss', 'No edge declared for this pair of terms.', 'An edge is selected by its ground terms'' exact CANONICAL spellings — people(, age >= 18) is a different term from people(, 18 <= age), deliberately, because identity decidable by bytes is the point of matching by encoding. Whitespace and identifier case normalize; semantics never do. Restriction is downstream: select a declared edge (in practice declared over glob terms), then filter its relation. The message lists the declared edges.'),
@@ -792,15 +896,15 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('error', 'semantic/grounding/er/self_pair', 'A self-pair edge''s sides cannot yet be told apart.', 'The edge publishes the same table at both endpoints, so the two sides share every column name: the endpoint exports would bind one operand twice and the pairs would come back silently self-joined. Until the boundary can mask the sides apart, spell one side as a renamed rule view — boss(*) :- employees(*) — and declare the edge over the distinct terms; the call site then reads employees(*) &(::mgr) boss(*), each side addressable by its own name.'),
     ('error', 'semantic/resolution/setop/correlation_owner', 'A set-operation correlation reference has no clear operand owner.', 'A correlation after a union-flavored operator addresses the OPERANDS'' OWN HEADINGS — the NULL pads of the corresponding output shape are output artifacts, never addressable. Every reference must belong to exactly one operand: a qualified reference''s qualifier must name an operand (table name, alias, or answering name), and a bare reference''s column must be carried by exactly one operand''s heading. A bare name both operands carry is ambiguous — qualify it (x.col = y.col) to say which side it addresses.'),
     ('error', 'semantic/grounding/er/chain_shared_repeat', 'A chain repeats a relation beyond the shared endpoint.', 'Adjacent edge bodies in a transitive chain share exactly their common endpoint — that one occurrence merges, once. Any other repeated relation (a self-join inside a body, a helper table used by two bodies, a cyclic chain revisiting an endpoint) cannot be aliased apart during composition, and dropping an occurrence would silently rewrite the join, so the chain refuses. Restructure the bodies so only the shared endpoint repeats, or call the edges directly with &.'),
-    ('error', 'semantic/grounding/er/under_removed', 'The `under context:` ER dialect is removed.', 'The context is a symbol riding ON the operator, not a statement prefix: write a(*) &(::ctx) b(*) for a direct edge, a(*) &&(::ctx) b(*) for the transitive walk. The shape still parses so this teaching can fire.'),
-    ('error', 'semantic/grounding/er/within_removed', 'The `A & B(*) within ctx` declaration dialect is removed.', 'An edge declaration is a ground-instance clause wearing operator fixity: A(*) &(::ctx) B(*) :- body. Both terms and the context ground on mentions the infix form inserts.'),
     ('error', 'semantic/grounding/er/bare_operator', 'An ER operator without its context symbol.', 'The & and && operators take their context as a symbol on the operator: &(::your_context), &&(::your_context) — spelled with no space before the parenthesis. Contexts are symbols; the edge set per context is finite and declared.'),
     ('error', 'semantic/grounding/er/mixed_contexts', 'One chain names more than one context.', 'One chain, one context. Split the chain into separate expressions, or declare the edges in one context.'),
     ('error', 'semantic/grounding/er/operand_term', 'An ER operand is not a relation-access term.', 'Edges are selected by their terms'' canonical spellings, so each operand of & and && must be a relation-access term — people(*), people(, age >= 18). The alias stays OUTSIDE the term (people(*) as p selects by people(*), exports answer to p), and so does the outer marker (orders?(*)).'),
     ('error', 'semantic/grounding/er/alias_in_declaration', 'An alias inside an edge-declaration term.', 'Declaration-side terms are naked: the alias is call-site export vocabulary (people(*) as p & …), never part of the term that names the edge.'),
-    ('error', 'semantic/grounding/jit_removed', 'Query-position `^` grounding is removed.', 'Grounding is an effect, not a per-reference decoration: ground!("data_ns", "lib_ns", "grounded_ns") first, then address grounded_ns.entity(...) — or enlist!("grounded_ns") for unqualified access. The spelling still parses so this teaching can fire.'),
     ('error', 'semantic/resolution/ho/pipe_landing', 'The pipe''s landing at this call is ill-formed.', 'R8, strict: a piped relation lands at the FIRST formal parameter, or at exactly one explicit @ — never a search for a table parameter elsewhere, never displacement of a supplied argument. If the first parameter is already occupied, say where the pipe goes: f("arg", @). Two @ placeholders refuse — one pipe, one landing.'),
     ('error', 'semantic/resolution/ho_access/pattern_shape', 'An access-pattern element has an unsupported shape.', 'The trailing access group on a parameterized-rule call is ordinary argumentative access over the declared heading: bare names bind, _ discards, a repeated name self-unifies (null-safe), a literal filters. Other element shapes (qualified references, expressions) are not access patterns — compute in a pipe stage instead.'),
+    ('error', 'semantic/resolution/pipe', 'The deictic `_` did not select exactly one unnamed pipe output.', 'A pipe stage publishes a relation with no authored name, and `_` POINTS at it (LVARS.md). It is deixis, not a name: it performs no name lookup, and it requires exactly one visible unnamed pipe output. Members: no_unnamed_pipe (none is in view) and two_unnamed_pipes (more than one is). Naming a stage with `as` removes it from what `_` can point at, which is how the second is settled.'),
+    ('error', 'semantic/resolution/pipe/no_unnamed_pipe', '`_` was written where no unnamed pipe output is in view.', 'No pipe has run at this point, so there is nothing for `_` to point at. This is not a misspelled qualifier — `_` never names anything, so there is no name to have got wrong. Write the relation''s own name (users.id), or pipe first. A pipe whose output was named with `as` is no longer unnamed and is reached by that name instead.'),
+    ('error', 'semantic/resolution/pipe/two_unnamed_pipes', '`_` was written with more than one unnamed pipe output in view.', 'One spelling cannot stand for two relations, and a writer who meant a particular one has no way to say so. Name one of the stages with `as` — an alias replaces the anonymous form, leaving exactly one thing for `_` to point at.'),
     ('error', 'semantic/narrowing/object_literal', 'Narrowing a column whose every row is a single object.', 'Narrowing (.col{...}) iterates a SEQUENCE — every row of this column is a single object literal, a record, not a sequence of records. Path into the record instead ((col:{.field})), or spell the one-element sequence ([{...}]). Data-borne non-arrays the compiler cannot see contribute zero rows at runtime (JSON-SUBSTRATE.md).'),
     ('error', 'semantic/cte/head/names_only', 'A CTE head lists column names, nothing else.', 'A head is an ordered projection of its body''s heading (HEADS.md): names must exist in the body, head order is output order, unmentioned columns hide, and a head never renames or computes. Compute, rename, or filter in the body, then name the result: name(cols) : body |> (expr as col).'),
     ('error', 'semantic/transform/self_check', 'The transpiler''s own output failed verification.', 'The post-lowering self-check verifies every shipped statement''s name bindings on the exact SQL AST handed to the generator: every qualified reference must name a scope visible on its path, and a column read from an enumerable derived scope must exist in it. A failure here is a compiler invariant violation, never a user error — please report the query that produced it.'),
@@ -820,16 +924,17 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('error', 'internal/panic', 'dql itself crashed. This is a bug in dql, not in your query.', 'An internal invariant failed (a Rust panic). The CLI catches it and emits this record instead of a raw backtrace; rerun with RUST_BACKTRACE=1 for the developer trace, and please report the message and the query that triggered it. Your query may be perfectly valid — do not rewrite it to dodge this error; the bug is ours.'),
     ('error', 'runtime/connection', 'A database connection failed or was poisoned.', 'The connection to a mounted or primary database was lost or unusable at execution time.'),
     ('error', 'runtime/execution', 'The database engine refused the generated SQL at run time.', 'Compilation succeeded, but the engine rejected the statement while executing it — e.g. a JSON function received malformed text, a constraint fired, or a transaction statement failed. The message carries the engine''s own error text. Hookable: (~~error://runtime/execution ~~).'),
+    ('error', 'operational/resource/nesting', 'The query nests deeper than this session budgets for.', 'Depth is a RESOURCE policy, not a rule of the language (S11): nothing about DelightQL forbids a deeply nested query. The compiler''s phase walks recurse, and a walk deeper than the stack it runs on aborts the process instead of answering — which, for a compiler embedded in another program through the C interface, takes the HOST down. So the depth is measured on the parse tree, before any recursive walk, and refused. Raise the budget with DELIGHTQL_MAX_NESTING (or the host''s own setter), or flatten the query: a chain of pipe stages costs no depth where nested parentheses do.'),
+    ('error', 'operational/resource/refinement-depth', 'Refinement recursed deeper than this session budgets for.', 'The refiner walks a chain recursively, and its walks carry stacksafe — so a walk that stops making progress does not overflow the stack and fail promptly; it grows stack segments and clones AST state until the MACHINE gives out. A compilation therefore spends a bounded number of active refiner frames (512 by default, measured against a corpus maximum of 101), and the frame that would exceed the budget is refused instead of entered. This is a RESOURCE policy, not a rule of the language, and it is a DIFFERENT budget from operational/resource/nesting: that one measures the authored parse tree before any walk, this one measures refinement while it runs, and raising one does not raise the other. Meeting this refusal usually means one of two things: an unusually deep query, which an operator may afford by raising DELIGHTQL_MAX_REFINEMENT_DEPTH up to the ceiling of 4096; or a cycle in the compiler, which is a bug worth reporting with the query that found it. sys::execution.compiler_limit(*) reports the default, the effective value, and the ceiling. The session stays usable: the refusal ends the one compilation and nothing else.'),
     ('error', 'operational/federation-prohibited', 'One query may touch only one connection.', 'The query references namespaces served by different connections. DelightQL deliberately does not federate: split the query, or mount the data into one engine.'),
-    ('error', 'imprint', 'An imprint! lifecycle rule was violated.', 'Imprint errors cover the linear lifecycle of imprint!/imprint_replace! (namespace-catechism §V). imprint! is linear: it consumes the source namespace, archiving it as an inert {target}::_N_blueprint. blueprint/ members refuse operations that would animate that archive.'),
+    ('error', 'imprint', 'An imprint! lifecycle rule was violated.', 'Imprint errors cover the linear lifecycle of imprint!/imprint_replace!. imprint! is linear: it consumes the source namespace, archiving it as an inert {target}::_N_blueprint. blueprint/ members refuse operations that would animate that archive.'),
     ('error', 'imprint/blueprint/inert', 'An archived blueprint namespace is inert.', 'imprint! is linear: it consumed the source namespace into {target}::_N_blueprint and vacated the original path. The archive stays VISIBLE through the sys::meta catalog functor ({blueprint}::(*) still lists its entities) but is INERT — resolving an entity through it (blueprint.rule, blueprint::sub.rule), enlisting it, or grounding it is refused, because the archived blueprint and the live target tables it produced would otherwise drift. Re-consult the source path to obtain a fresh, live copy. Pinned by companion_linear--70 (query), --71 (enlist), --73 (ground); the visible half by --61.'),
     ('error', 'imprint/manifest/materialization', 'An imprinting() materialization value is not recognized.', 'The _internal imprinting() manifest declares each entity''s materialization; only "table" and "view" are valid. A typo (e.g. "veiw") is rejected at manifest-read rather than silently falling through to a table. Pinned by companion_linear--75 and manifest::tests::materialization_rejects_typo.'),
     ('error', 'imprint/manifest/extent', 'An imprinting() extent value is not recognized.', 'The _internal imprinting() manifest declares each entity''s extent; only "permanent" and "temporary" are valid. A typo (e.g. "temp") is rejected at manifest-read rather than silently meaning permanent. Pinned by companion_linear--76 and manifest::tests::extent_rejects_typo.'),
     ('error', 'imprint/manifest/entity_name', 'An imprint entity name contains a double quote.', 'imprint entity names are interpolated into quoted SQL identifiers; the declared-table branch routes through the DDL generator, which does not escape an embedded double quote. Such a name (only reachable via a triple-quoted DQL literal) is refused at manifest-read. Pinned by manifest::tests::entity_name_rejects_embedded_quote.'),
-    ('error', 'namespace', 'A namespace-creation target hit the system name guard.', 'The top level of the namespace tree stays open to user names, but USER-facing creation verbs (consult!/consult_tree!/mount!/ground!/named (~~ddl:"name" ~~) scratch) refuse the reserved system name pool (namespace-catechism Deviation #3, re-ruled 2026-07-07). Members: name/reserved (a bare system name sys/std/home, or a sys*/std* prefix, or any `_`-prefixed machinery segment), name/system_subtree (creation under sys::/std::). `main` is exempt (the primary data namespace, §II''s kind contract — Deviation #4); under home the prefix rule relaxes (home::sysinfo is legal) while the `_` reservation stays strict.'),
+    ('error', 'namespace', 'A namespace-creation target hit the system name guard.', 'The top level of the namespace tree stays open to user names, but USER-facing creation verbs (consult!/consult_tree!/mount!/ground!/named (~~ddl:"name" ~~) scratch) refuse the reserved system name pool. Members: name/reserved (a bare system name sys/std/home, or a sys*/std* prefix, or any `_`-prefixed machinery segment), name/system_subtree (creation under sys::/std::). `main` is exempt — the primary data namespace arrives through the same mount! verb; under home the prefix rule relaxes (home::sysinfo is legal) while the `_` reservation stays strict.'),
     ('error', 'namespace/name/reserved', 'A namespace-creation target used a reserved system name.', 'USER-facing namespace creation refused the target because it (a) IS a bare system name (sys/std/home), (b) begins with a reserved system prefix (sys*/std*, case-insensitive — sysinfo, stdlib, std2, SYS_foo), or (c) contains a segment beginning `_` (the _internal/_N_blueprint machinery convention, reserved on ANY segment EVERYWHERE, including under home). The message names the offending segment and the rule it hit. Fixes: choose a top-level name not beginning with sys/std and not equal to a system name; author scratch under home:: (where the sys*/std* prefix relaxes); never begin a segment with `_`. `main` is exempt (Deviation #4). Pinned by namespace_guard--01..05 and system::name_guard_tests.'),
     ('error', 'namespace/name/system_subtree', 'A namespace-creation target nested under sys:: or std::.', 'USER-facing namespace creation refused a target under the sys:: or std:: subtree — reserved for system machinery. (Before the guard this was only incidentally refused, and consult!/ground! into sys::/std:: actually SUCCEEDED, silently minting a flat-pid namespace beside the system rows.) Create your namespace at the top level, or under home::, instead. Pinned by namespace_guard--06 and system::name_guard_tests.'),
-    ('danger', 'cardinality/nulljoin', 'REMOVED: NULL-matching join equality has no gate.', 'REMOVED by the equality doctrine: equality is null-safe exactly where its answer cannot multiply rows, and correspondence — null matches nothing — exactly where rows multiply. A join is the multiplicative case, permanently: null-matching ON clauses take the null-group cross product AND assert correspondence between absences. A null that is meant to match is a value wearing null''s clothes — name it and join on the named key (coalesce into a marker column on both sides). Any use of this gate URI refuses with that teaching.'),
     ('danger', 'cardinality/cartesian', 'Unrestricted cartesian product.', 'DECLARED, NOT YET ENFORCED (2026-07-17, R-1): the intended OFF behavior — a join with no usable key refuses (the classic accidental row explosion) — is not built; today a condition-less join compiles and runs as a cartesian product regardless of this gate. When enforcement lands, OFF will refuse and ON will allow. Guardrail-class: may be opened from the CLI (--danger cardinality/cartesian=ON) or inline.'),
     ('danger', 'termination/unbounded', 'Unbounded recursive query.', 'DECLARED, NOT YET ENFORCED (2026-07-17, R-1): the intended OFF behavior — recursive queries must be provably bounded — is not built; today an unbounded recursion compiles without warning (and may not terminate). When enforcement lands, OFF will refuse and ON will allow. Guardrail-class: CLI-overridable.'),
     ('danger', 'semantics/min_multiplicity', 'True INTERSECT ALL via ROW_NUMBER (min-multiplicity).', 'Changes what a set operator MEANS (bag semantics via minimum multiplicity), so it is semantic-class: inline-only ((~~danger://semantics/min_multiplicity ON~~)), never a CLI flag — a flag that silently changes query meaning would make the same text mean different things in different shells.'),
@@ -840,6 +945,22 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('diagnostic', 'autoload/consult_failed', 'An autoload module parsed but failed to register.', 'The module parsed, but consulting it (registering its rules/entities) failed — typically a rule references a relation or namespace that does not exist. Check the referenced names in the module against what is available at load time. The finding''s detail carries the consult error.'),
     ('diagnostic', 'catalog', 'Integrity of the entity catalog.', 'The catalog provider (dql selftest) checks that the compiler''s own system tables are properly placed in the catalog. Members: catalog/orphaned_entity.'),
     ('diagnostic', 'catalog/orphaned_entity', 'A system table has no namespace address.', 'A physical system table exists (and is queryable by direct name via the schema fallback) but has no activated_entity row, so it lives in no sys:: namespace and is invisible to the namespace-organized views (sys::util.tables_as_d2, catalog enumeration). Doctrine: everything the compiler or runtime uses should be dogfood-exposed — there are no intentional hidden internals. Fix: activate the table into its namespace (import/activation.rs + import/namespace.rs), as sys::targeting did for the dialect_* tables.');
+
+INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
+    ('error', 'parse/session_position', 'A session directive stood inside a query.', 'Session directives (mount!, consult!, enlist!, and their kin) change what the compilation can see, so they are legal at the REPL/CLI top level or in a liminal program — never nested in a data position, where their ordering relative to the query around them would be undefined.'),
+    ('error', 'parse/assertion_directive', 'A directive stood inside an assertion.', 'An assertion is a read-only check written beside the query it judges. A directive effectuates, so it has no place there: whether the assertion ran would change what the query means.'),
+    ('error', 'parse/metadata_induction', 'A metadata group was induced under a data key.', '`"key": ~>` promises an interior TABLE — an array per group — while a metadata group yields an interior RECORD, one object per group. The two cannot be the same member. In a PATTERN, nest rather than iterate: `"key": { c: ~> {…} }`. A CONSTRUCTOR has no member for a metadata group at any depth, so build the group at reduction position instead.'),
+    ('error', 'parse/path_variable', 'The json accessor was handed something other than one literal path.', 'There is one accessor door and it takes exactly ONE path, spelled with its steps: `x:{.a.b}`. A path is spec, not a value — it never evaluates alone and nothing produces one at runtime, so a bare name inside the braces can never be fed. `"$…"` is the target engine''s own path sub-language and stays with the target. `x:[1]` says the same thing as `x:{.1}` with a shape that reads as a type: an accessor reads, so it takes the one path spelling.'),
+    ('error', 'parse/effect/purity', 'A pure head carried an effectful body.', 'A relational rule''s body is a relex and an effect rule''s is an effrelex, so a head without `!` whose body demands a directive has no derivation. Declare the effect in the head — `name!(*) :- …` — or take the directive out of the body.'),
+    ('error', 'parse/directive/position', 'A directive stood where only a relation derives.', 'Under an effect head the law admits a directive inside a predicate subquery; what is missing is its lowering, so nothing derives there yet. Lift it out of the predicate and demand it as its own step.'),
+    ('error', 'parse/effect/neck', 'An effect rule was written with the assigning neck.', 'An effect rule''s neck is `:-` and nothing else. `:=` assigns materialized data, and a directive body is not data — the two necks are not spellings of one thing.'),
+    ('error', 'parse/effect/label', 'An effectful body was bound under a pure label.', 'A label ASSERTS what its body is. A binding whose body demands a directive is an effect binding, so its label carries the mark: write `: name!`.'),
+    ('error', 'parse/structural_head', 'A head parameter named a shape to destructure.', 'Structural head grounding is reserved. A head parameter names a relation or a scalar; destructuring a shape in a head has no derivation.'),
+    ('error', 'parse/guard_grouping', 'A guard composed operators without grouping.', 'DelightQL has no operator precedence, and a bare `%` reads as the group-modulo sigil wherever a relational reading is possible. Parenthesize the arithmetic: `f:(n | (n % 2) = 0)`.'),
+    ('error', 'parse/glob_argument', 'A bare glob stood where a higher-order argument stands.', 'How many groups follow the name decides what the first one is. With ONE group, `f(*)` is ordinary access and the glob names the whole heading. With TWO, the left group supplies the callee''s parameters, and `*` names no relation for a relation parameter to bind — the same glyph does not mean access in one left group and an unspecified relation in another. Supply the relation itself (`f(users(*))(*)`), land it with `@`, or, to enumerate a ground-parameterized definition''s clauses, bind the parameter with a free identifier (`f(label)(*)`).'),
+    ('error', 'parse/head_computes', 'A defining head contained a computation.', 'A head is an ordered projection of its body''s heading: each position holds a name or a ground term, optionally labeled with `as`. A call or expression computes, and a computation is not a name — a head that computes is not a head. Compute in the body and label the result: `h(*) : body |> (count:(a) as n)`.'),
+    ('error', 'parse/lift_tail', 'A lift tail stood in a one-group call.', '`&` bounds arguments only in a two-group call, where the lifted rows follow it and dissolve into an anonymous-table argument (`f(users(*) & 1, 2)(*)`). A one-group call''s parentheses are its arguments alone, so a `&` tail there has no meaning. The projection the tail reaches for belongs to the ACCESS group: `json_each(doc, path)(value, type)`.'),
+    ('error', 'parse/value_naming', 'A definition''s body was a row of named values.', 'A definition''s body is ONE domain expression. `as` names a publication position — a projection item, an embed, a stage — and a parenthesized list of named values is a row, which a value definition does not produce. Publish the columns from the caller''s projection instead, applying the function per column.');
 
 -- ----------------------------------------------------------------------------
 -- sys::format — the formatter's style bundles as burned rows.
@@ -877,11 +998,10 @@ CREATE TABLE bundle (
     tree_inducer_break         TEXT,
     member_value_break         TEXT,
     annotation_placement       TEXT,
-    under_context_placement    TEXT,
     blank_lines                TEXT,
     cte_style                  TEXT,
     curly_opening_brace_inline INTEGER
 );
 
-INSERT INTO bundle (bundle, projection_length, continuation_length, pipe_indent, continuation_indent, map_cover_extra_indent, aggregation_arrow_indent, cte_indent, cte_columnar_padding, curly_member_indent, curly_inducer_indent, case_arm_indent, pipe_break_width, member_landing_pad, pipe_break, comma_clause_break, comma_join_args, brace_padding, member_landing, closer_placement, tree_inducer_break, member_value_break, annotation_placement, under_context_placement, blank_lines, cte_style, curly_opening_brace_inline)
-VALUES ('book', 72, 40, 2, 2, 4, 2, 3, 7, 5, 3, 3, 80, 2, 'fit', 'cascade', 'oxford', 'none', 'offset', 'own_line', 'always', 'always', 'inline', 'inline', 'preserve', 'subordinate', 0);
+INSERT INTO bundle (bundle, projection_length, continuation_length, pipe_indent, continuation_indent, map_cover_extra_indent, aggregation_arrow_indent, cte_indent, cte_columnar_padding, curly_member_indent, curly_inducer_indent, case_arm_indent, pipe_break_width, member_landing_pad, pipe_break, comma_clause_break, comma_join_args, brace_padding, member_landing, closer_placement, tree_inducer_break, member_value_break, annotation_placement, blank_lines, cte_style, curly_opening_brace_inline)
+VALUES ('book', 72, 40, 2, 2, 4, 2, 3, 7, 5, 3, 3, 80, 2, 'fit', 'cascade', 'oxford', 'none', 'offset', 'own_line', 'always', 'always', 'inline', 'preserve', 'subordinate', 0);

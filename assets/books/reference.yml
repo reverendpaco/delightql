@@ -5,6 +5,8 @@ frontmatter: |
   title: DelightQL Language Reference
   ---
 spine:
+  - introduction.md:
+      - typesetting.md
   - dql/_index.md:
       - dql/from.md
       - dql/order-by.md
@@ -55,3 +57,31 @@ spine:
       - dql/pivot.md
       - dql/tree-groups.md
       - dql/meta-ize.md
+  - ddl/_index.md:
+      - ddl/necks.md
+      - ddl/entity-types/_index.md
+      - ddl/head-semantics.md
+      - ddl/advanced/higher-order.md
+      - ddl/entity-types/sigma-predicates.md
+      - ddl/advanced/er-context-rules.md
+      - ddl/advanced/recursive.md
+      - ddl/entity-types/functions.md
+      - ddl/facts.md
+      - ddl/namespaces.md
+  - dml/_index.md
+  - annotations/_index.md:
+      - annotations/assertions.md
+      - annotations/errors.md
+      - annotations/danger.md
+      - annotations/options.md
+      - annotations/docs.md
+  # - normative/EFFECT-ALGEBRA.md:
+  #     - normative/EQUALITY.md
+  #     - normative/GROUNDING-AND-MENTION.md
+  #     - normative/GROUNDING-AND-MENTION-READING.md
+  #     - normative/HEADS.md
+  #     - normative/JSON-SUBSTRATE.md
+  - appendices/tree-normal-form.md
+  - appendices/error-uris.md
+  - appendices/danger-uris.md
+  - appendices/namespace-directives.md

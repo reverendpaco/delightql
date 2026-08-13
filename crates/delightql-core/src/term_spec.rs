@@ -28,6 +28,7 @@
 //! round-trip — are pinned in this module's tests.
 
 use crate::error::{DelightQLError, Result};
+use crate::pipeline::syntax::{cst, TypedNode};
 
 fn not_a_term(detail: String) -> DelightQLError {
     DelightQLError::validation_error_categorized(
@@ -88,36 +89,24 @@ pub(crate) fn mention_interior_from_token(token_text: &str) -> Result<String> {
 /// engine under the frozen default style. The returned bytes ARE the
 /// term's identity: byte-equal canonical spellings, same term.
 pub fn canonicalize_term(source: &str) -> Result<String> {
-    let tree = crate::pipeline::parser::parse(source)
+    let tree = crate::pipeline::parse::query_sequence(source)
         .map_err(|e| not_a_term(format!("this input does not parse: {e}")))?;
 
-    // The shape gate: exactly source_file → query → relational_expression
-    // → base_expression → table_access, each level the sole named child.
-    // A second statement, a pipe or join continuation, or a comment all
-    // add named children somewhere on this spine and refuse here.
-    let root = tree.root_node();
-    sole(root, "query")
-        .and_then(|q| sole(q, "relational_expression"))
-        .and_then(|r| sole(r, "base_expression"))
-        .and_then(|b| sole(b, "table_access"))
-        .ok_or_else(|| {
-            not_a_term("this input parses, but not as a single relation-access term".to_string())
-        })?;
+    // THE SHAPE GATE: one chain, whose head is a named relation access and
+    // whose body carries nothing else. A second statement, a preamble, a pipe
+    // or join continuation, or an annotation all add a member here and refuse.
+    if !is_single_relation_access(&tree, source) {
+        return Err(not_a_term(
+            "this input parses, but not as a single relation-access term".to_string(),
+        ));
+    }
 
-    // Fold identifier case exactly where the language folds it: an
-    // unstropped identifier is a leaf `identifier` node; a stropped one
-    // carries a child and its bytes stay untouched, as do string and
-    // number literals. ASCII-lowercase is byte-preserving, so the CST's
-    // byte ranges stay valid throughout.
-    let mut bytes = source.as_bytes().to_vec();
-    fold_unstropped_identifiers(root, &mut bytes);
-    let folded = String::from_utf8(bytes).expect("ASCII folding preserves UTF-8");
+    let folded = fold_unstropped_identifiers(&tree);
 
     // Emit through the format engine under the frozen default style.
     // A pass-through is a refusal, never a silent identity.
-    let language = crate::pipeline::parser::dql_language();
     let config = delightql_formatter::FormatConfig::default();
-    match delightql_formatter::format_outcome(&folded, &language, &config)
+    match delightql_formatter::format_outcome(&folded, &config)
         .map_err(|e| unformattable(e.to_string()))?
     {
         delightql_formatter::FormatOutcome::Formatted(text) => {
@@ -129,27 +118,75 @@ pub fn canonicalize_term(source: &str) -> Result<String> {
     }
 }
 
-/// The sole named child of `node`, if it exists and has `kind`.
-fn sole<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
-    if node.named_child_count() != 1 {
-        return None;
+/// ASCII-lowercase every unstropped identifier, and nothing else.
+///
+/// This is the one place the language folds: an unstropped identifier carries
+/// no child, a stropped one carries its `stropped_form` and its bytes are
+/// uninterpreted — as are string and number literals. ASCII-lowercasing is
+/// byte-preserving, so every other range stays valid.
+fn fold_unstropped_identifiers(tree: &crate::pipeline::syntax::SyntaxTree) -> String {
+    let mut bytes = tree.source().as_bytes().to_vec();
+    for node in crate::pipeline::syntax::walk(tree) {
+        let Some(identifier) = cst::Identifier::cast(node.node()) else {
+            continue;
+        };
+        if identifier.child().is_some() {
+            continue;
+        }
+        if let Some(range) = tree.byte_range(identifier) {
+            for b in &mut bytes[range] {
+                *b = b.to_ascii_lowercase();
+            }
+        }
     }
-    let child = node.named_child(0)?;
-    (child.kind() == kind).then_some(child)
+    String::from_utf8(bytes).expect("ASCII folding preserves UTF-8")
 }
 
-/// ASCII-lowercase every unstropped identifier's byte range in place.
-fn fold_unstropped_identifiers(node: tree_sitter::Node, bytes: &mut [u8]) {
-    if node.kind() == "identifier" && node.named_child_count() == 0 {
-        for b in &mut bytes[node.byte_range()] {
-            *b = b.to_ascii_lowercase();
-        }
-        return;
+/// Whether the submission is exactly one chain headed by a named relation
+/// access, with no preamble and no continuation.
+fn is_single_relation_access(tree: &crate::pipeline::syntax::SyntaxTree, source: &str) -> bool {
+    use crate::pipeline::syntax::cst;
+    let Some(cst::SourceFileChild::QuerySequenceRoot(root)) = tree.root_branch() else {
+        return false;
+    };
+    let mut forms = root.children().filter_map(|child| match child {
+        cst::QuerySequenceRootChild::QuerySequence(sequence) => Some(sequence),
+        cst::QuerySequenceRootChild::QuerySequenceHeader(_) => None,
+    });
+    let Some(sequence) = forms.next() else {
+        return false;
+    };
+    if forms.next().is_some() {
+        return false;
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        fold_unstropped_identifiers(child, bytes);
+    let mut members = sequence.children();
+    let Some(cst::QuerySequenceChild::Relex(relex)) = members.next() else {
+        return false;
+    };
+    if members.next().is_some() || relex.let_block().is_some() {
+        return false;
     }
+    let Some(body) = relex.body() else {
+        return false;
+    };
+    // A NAMED grelex and nothing beside it: the other members of
+    // `let_free_relex` are continuations and annotations, and a term carries
+    // neither.
+    if body.children().next().is_some() {
+        return false;
+    }
+    if !matches!(body.grelex(), Some(cst::Grelex::NamedGrelex(_))) {
+        return false;
+    }
+    // THE TERM IS THE WHOLE SUBMISSION. A comment is a grammar EXTRA and so
+    // leaves no member to count, but it is still text the term does not
+    // contain — and it survives formatting, so a canonical form built from it
+    // would not be a term. Nothing outside the form's own extent may be
+    // anything but whitespace.
+    let Some(extent) = tree.byte_range(relex) else {
+        return false;
+    };
+    source[..extent.start].trim().is_empty() && source[extent.end..].trim().is_empty()
 }
 
 #[cfg(test)]
@@ -179,37 +216,22 @@ mod tests {
         canonicalize_term(s).unwrap_or_else(|e| panic!("corpus term {s:?} refused: {e}"))
     }
 
-    /// Leaf (kind, text) stream of a parse — the byte-level witness of
-    /// parsed-term equality. `fold` lowercases unstropped identifier
-    /// leaves, mirroring the canonicalizer's fold for source-side
-    /// comparison.
-    fn leaf_tokens(source: &str, fold: bool) -> Vec<(String, String)> {
-        fn collect(
-            node: tree_sitter::Node,
-            src: &str,
-            fold: bool,
-            out: &mut Vec<(String, String)>,
-        ) {
-            if node.child_count() == 0 {
-                let text = &src[node.byte_range()];
-                let text = if fold && node.kind() == "identifier" {
-                    text.to_ascii_lowercase()
-                } else {
-                    text.to_string()
-                };
-                out.push((node.kind().to_string(), text));
-                return;
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect(child, src, fold, out);
-            }
-        }
-        let tree = crate::pipeline::parser::parse(source)
+    /// The AUTHORED token stream of a parse — the byte-level witness of
+    /// parsed-term equality. Nothing is normalized here: a strop's case IS
+    /// identity, and a comparison that lowercased it would agree about terms
+    /// the canonicalizer keeps apart.
+    fn leaf_tokens(source: &str) -> Vec<String> {
+        let tree = crate::pipeline::parse::query_sequence(source)
             .unwrap_or_else(|e| panic!("term {source:?} does not parse: {e}"));
-        let mut out = Vec::new();
-        collect(tree.root_node(), source, fold, &mut out);
-        out
+        tree.tokens().into_iter().map(|token| token.text).collect()
+    }
+
+    /// The input under the canonicalizer's OWN fold, so the round-trip law
+    /// compares like with like rather than against a second, looser rule.
+    fn folded(source: &str) -> String {
+        let tree = crate::pipeline::parse::query_sequence(source)
+            .unwrap_or_else(|e| panic!("term {source:?} does not parse: {e}"));
+        fold_unstropped_identifiers(&tree)
     }
 
     /// LAW 1 — determinism: same input bytes, same output bytes,
@@ -242,8 +264,8 @@ mod tests {
         for t in TERMS {
             let canonical = canon(t);
             assert_eq!(
-                leaf_tokens(&canonical, true),
-                leaf_tokens(t, true),
+                leaf_tokens(&canonical),
+                leaf_tokens(&folded(t)),
                 "canonical of {t:?} parses back as a different term"
             );
         }
@@ -258,7 +280,11 @@ mod tests {
             ("people(*)", &["people(*)", "people( * )", "PEOPLE(*)"]),
             (
                 "people(, age >= 30)",
-                &["people(, age >= 30)", "people(,age>=30)", "PEOPLE(, AGE >= 30)"],
+                &[
+                    "people(, age >= 30)",
+                    "people(,age>=30)",
+                    "PEOPLE(, AGE >= 30)",
+                ],
             ),
             (
                 "orders(id, _, total)",
@@ -266,7 +292,10 @@ mod tests {
             ),
             (
                 "members(, `Weird Col` >= 1)",
-                &["members(, `Weird Col` >= 1)", "MEMBERS(,   `Weird Col` >= 1)"],
+                &[
+                    "members(, `Weird Col` >= 1)",
+                    "MEMBERS(,   `Weird Col` >= 1)",
+                ],
             ),
         ];
         for (expected, members) in classes {
@@ -288,7 +317,11 @@ mod tests {
             ("members(, `Weird Col` >= 1)", "members(, `weird col` >= 1)"),
         ];
         for (a, b) in pairs {
-            assert_ne!(canon(a), canon(b), "distinct terms {a:?} and {b:?} collided");
+            assert_ne!(
+                canon(a),
+                canon(b),
+                "distinct terms {a:?} and {b:?} collided"
+            );
         }
     }
 

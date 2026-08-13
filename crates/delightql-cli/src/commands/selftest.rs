@@ -2,7 +2,7 @@
 // Copyright 2026 Daniel Eklund
 //! `dql selftest` — run self-diagnostics against a fresh in-memory system.
 //! Machine-facing front door of the diagnostics subsystem (the human
-//! `dql doctor` shares the same providers). See DIAGNOSTICS-DESIGN.md.
+//! `dql doctor` shares the same providers).
 
 use anyhow::Result;
 use delightql_core::diagnostics::{DiagnosticFinding, Severity};
@@ -16,7 +16,7 @@ pub fn handle_selftest(json: bool, strict: bool) -> Result<()> {
         print_human(&findings);
     }
 
-    // Exit policy (DIAGNOSTICS-DESIGN.md): Error always fails; Warn fails
+    // Exit policy: Error always fails; Warn fails
     // only under --strict (brew-doctor advisory posture otherwise).
     let failed = findings
         .iter()

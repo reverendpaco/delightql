@@ -1,58 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! The Epic-3.3 ENTRY POINTS: where the execution directives (`run!`,
+//! The effect chain's ENTRY POINTS: where the execution directives (`run!`,
 //! `run_namespace!`) and query-position DML/DDL directives leave today's
 //! single-statement pipeline and take the effect chain — the transformer
-//! (plan §3.1, `pipeline::effect_transformer`) compiles, the pump
-//! (plan §3.2, `relay::pump::handle_plan`) plays.
+//! (`pipeline::effect_transformer`) compiles, the pump
+//! (`relay::pump::handle_plan`) plays.
 //!
 //! `handle_query` consults `classify_effect_entry` before the ordinary
 //! compile path. Three shapes reroute, everything else stays byte-for-byte
 //! on today's path (the classifier answers `None`):
 //!
-//! 1. `run_namespace!(ns)` / `run_namespace!(ns)(*)` as the WHOLE statement
-//!    — F3: demand the consulted namespace's `main!`; refuse "has no main!
+//! 1. `run_namespace!(ns)(*)` / `run_namespace!(ns)(*)` as the WHOLE statement
+//!    — demand the consulted namespace's `main!`; refuse "has no main!
 //!    to demand" when absent (effects ball main--22).
-//! 2. `run!("file.dql")` / `run!("file.dql")(*)` as the whole statement —
-//!    F2: consult-then-demand. This retires run!'s old free-statement
-//!    query-grammar semantics (REPORT-2.1: run.rs:102 could never accept
-//!    `:-` definitions).
+//! 2. `run!("file.dql")(*)` / `run!("file.dql")(*)` as the whole statement —
+//!    consult-then-demand.
 //! 3. A statement whose top-level expression pipes into a DML terminal
 //!    (`insert!`/`update!`/`delete!`) or a DDL creation directive
 //!    (`temp_table!`/`table!`/`temp_view!`) — the statement compiles as a
-//!    one-clause effect body so it returns its RECEIPT per EFFECT-ALGEBRA
-//!    §3 (effects ball dml_receipt--01..06 / ddl_receipt--11..15) instead
-//!    of the legacy `affected_rows` relation.
+//!    one-clause effect body so it returns its RECEIPT (THE RECEIPT;
+//!    effects ball dml_receipt--01..06 / ddl_receipt--11..15) instead
+//!    of the `affected_rows` relation a raw statement returns.
 //!
 //! The classifier is deliberately conservative: it declines statements
 //! carrying assertions, emit streams, error hooks (pre-screened by the
 //! caller), danger/option annotations, or any parse/build trouble — those
 //! keep today's path and today's messages.
 
+use crate::pipeline::asts::core::AuthoredColumn;
 use delightql_protocol::{ErrorKind, ServerTerm, Transport};
 
 use super::RelayParty;
 use crate::error::DelightQLError;
+use crate::external_effects::CreatedObjectCatalog;
+use crate::pipeline::ast_unresolved::{Query, Relation};
 use crate::pipeline::asts::core::literals::LiteralValue;
 use crate::pipeline::asts::core::DomainExpression;
-use crate::pipeline::ast_unresolved::{
-    Query, Relation, RelationalExpression, UnaryRelationalOperator,
-};
-use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry};
-use crate::pipeline::{builder_v2, effect_transformer, parser};
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::asts::effects::DirectiveDescriptor;
+use crate::pipeline::asts::effects::{directive_category, DirectiveCategory};
+use crate::pipeline::compiled_query::CompiledPlan;
+use crate::pipeline::effect_transformer;
 
 /// A statement the effect chain owns.
 #[derive(Debug)]
 pub(super) enum EffectEntry {
-    /// `run_namespace!(ns)` — demand an already-consulted namespace's main!.
+    /// `run_namespace!(ns)(*)` — demand an already-consulted namespace's main!.
     RunNamespace {
         namespace: String,
         /// Non-glob receipt access: the exact-arity positional binding
-        /// list (F5 reified, Phase 6 slice 6). None = glob/bare — the
+        /// list. None = glob/bare — the
         /// execution family's payload-transparent dump.
         access: Option<Vec<String>>,
     },
-    /// `run!("file.dql")` — consult the file, then demand its main!.
+    /// `run!("file.dql")(*)` — consult the file, then demand its main!.
     RunFile {
         path: String,
         /// See RunNamespace::access.
@@ -62,196 +63,176 @@ pub(super) enum EffectEntry {
     /// effect body; the run's value is the directive's receipt.
     AdhocBody {
         query: Box<Query>,
-        /// Phase 10 slice b: statement annotations ride the typed program.
+        /// Statement annotations ride the typed program.
         assertions: Vec<crate::pipeline::asts::core::queries::AssertionSpec>,
     },
 }
 
-/// Classify a single-statement query text. `None` = not the effect chain's
-/// business; the caller proceeds on today's path. `allow_adhoc` is false
-/// when CLI danger/option overrides are active — the plan compiler applies
-/// default gates only, so overridden DML/DDL statements keep today's path;
-/// run!/run_namespace! have no legacy path and always classify.
-pub(super) fn classify_effect_entry(dql: &str, allow_adhoc: bool) -> Option<EffectEntry> {
-    // Cheap pre-filter: every target shape contains a directive call —
-    // `!` then `(`, with grammar-legal whitespace allowed between (review
-    // F6: a bare `contains("!(")` missed `run_namespace! (fx)` and the
-    // fallback refusal then lied; pinned by the effects ball's
-    // main--25_spaced_directive_classifies). The parse+build cost this
-    // gate accepts is unchanged for `!=`-style texts: `!` not followed by
-    // (whitespace and) `(` still declines without parsing.
-    if !contains_directive_call(dql) {
-        return None;
-    }
-    let tree = parser::parse(dql).ok()?;
-    let (mut queries, _features, assertions, dangers, options, ddl_blocks) =
-        builder_v2::parse_queries(&tree, dql).ok()?;
-    // Phase 10 slice b (semantic routing): assertions and emits ride the
-    // typed program as head steps — an annotated statement chooses the
-    // SAME execution generation as its unannotated twin. Danger/option
-    // overrides and inline DDL blocks are compile-mode configuration and
-    // conservatively keep today's path.
-    if queries.len() != 1 || !dangers.is_empty() || !options.is_empty() || !ddl_blocks.is_empty()
+/// Classify one NORMALIZED statement. `Err(goal)` hands the goal back
+/// unchanged — it is not the effect chain's business and the caller proceeds
+/// on the ordinary compilation path. `allow_adhoc` is false when CLI
+/// danger/option overrides are active: the plan compiler applies default
+/// gates only, so overridden DML/DDL statements keep that path.
+/// run!/run_namespace! have no other path and always classify.
+///
+/// The goal arrives already read. Classification is a question about the
+/// STATEMENT, and a classifier that re-parsed the text could answer it
+/// differently from the compilation that follows.
+pub(super) fn classify_effect_entry(
+    goal: crate::pipeline::normalize::Goal,
+    allow_adhoc: bool,
+) -> std::result::Result<EffectEntry, crate::pipeline::normalize::Goal> {
+    // Semantic routing: assertions and emits ride the typed program as head
+    // steps — an annotated statement chooses the SAME execution generation as
+    // its unannotated twin. Danger/option overrides and inline DDL blocks are
+    // compile-mode configuration and conservatively keep today's path.
+    if !goal.declared.dangers.is_empty()
+        || !goal.declared.options.is_empty()
+        || !goal.declared.ddl_blocks.is_empty()
     {
-        return None;
+        return Err(goal);
     }
-    let query = queries.pop().expect("length checked above");
-    match classify_query(query) {
-        Some(EffectEntry::AdhocBody { query, .. }) => {
-            if allow_adhoc {
-                Some(EffectEntry::AdhocBody { query, assertions })
-            } else {
-                None
-            }
+    let crate::pipeline::normalize::Goal { query, declared } = goal;
+    let assertions = declared.assertions.clone();
+    match classify_query(query.clone()) {
+        Some(EffectEntry::AdhocBody { query: body, .. }) if allow_adhoc => {
+            Ok(EffectEntry::AdhocBody {
+                query: body,
+                assertions,
+            })
         }
         // The run/entry forms take no statement annotations today; an
         // annotated run! keeps today's path rather than dropping them.
-        other if assertions.is_empty() => other,
-        _ => None,
-    }
-}
-
-/// `!` followed by `(`, tolerating whitespace between — the textual shadow
-/// of the grammar's directive-call rule (which permits the space).
-fn contains_directive_call(dql: &str) -> bool {
-    let mut rest = dql;
-    while let Some(pos) = rest.find('!') {
-        rest = &rest[pos + 1..];
-        if rest.trim_start().starts_with('(') {
-            return true;
+        Some(other) if assertions.is_empty() && !matches!(other, EffectEntry::AdhocBody { .. }) => {
+            Ok(other)
         }
+        _ => Err(crate::pipeline::normalize::Goal { query, declared }),
     }
-    false
 }
 
 #[stacksafe::stacksafe] // the Pipe payload is a StackSafe box
 fn classify_query(query: Query) -> Option<EffectEntry> {
-    let Query::Relational(ref expr) = query else {
-        // CTE-carrying and REPL-command shapes stay on today's path in
-        // v0.1 (effect-CTE labels only occur inside consulted rules).
+    // A statement that BINDS an effect CTE is an effect body, whatever its
+    // expression then does with the binding. A prompt statement is an
+    // implicit run and its extent is the statement (THE IMPLICIT RUN), so
+    // `n!(…)(*) : chain` and `chain : n!` bind here exactly what they bind
+    // inside a rule, and the composed demand forms — `,` for one run of
+    // two, `;` for two runs of one — are that run's as well. Classifying by
+    // the expression's directive TAIL would see neither, and a bound effect
+    // label the executor has never heard of refuses as an unknown directive.
+    //
+    // An effect CTE the body never demands is not an error: it does not
+    // execute (laziness). The body is still this road's, because the
+    // binding is.
+    //
+    // A CTE list with no effect mark in it stays on today's path: those
+    // bindings name pure expressions, nothing about them is a demand, and
+    // the ordinary pipeline is where they already compile.
+    if query.ctes.iter().any(|cte| cte.subject.declares_effect()) {
+        return Some(EffectEntry::AdhocBody {
+            query: Box::new(query),
+            assertions: Vec::new(),
+        });
+    }
+    if !query.is_bare() {
+        // Binding-carrying shapes with no effect mark stay on today's path.
         return None;
-    };
+    }
+    let expr = &query.body;
     // Descend through PURE postfix operators (drills, narrows,
     // projections — e.g. the `!>` normalization or an explicit
     // `.returned(*)` release over a DML receipt): the classification is
     // by the expression's directive TAIL, not its outermost operator.
     // The AdhocBody wraps the FULL original query either way.
-    let mut probe: &RelationalExpression = expr;
+    // The receipt a direct invocation was written with: the access standing
+    // in the effect position, which for a bare call is the read's own.
+    let head_access = expr
+        .head_access()
+        .cloned()
+        .unwrap_or(crate::pipeline::asts::core::Access::Unasked);
+    let mut probe = expr.steps();
     loop {
-        match probe {
-            RelationalExpression::Pipe(pipe)
-                if !matches!(
-                    &pipe.operator,
-                    UnaryRelationalOperator::DirectiveTerminal { .. }
-                        | UnaryRelationalOperator::DirectivePipeInvocation { .. }
-                ) =>
-            {
-                probe = &pipe.source;
-            }
+        match probe.split_last() {
+            // The structural forms — ordering, reposition, meta, the
+            // witnesses, drill, narrowing — and the pure pipe operators are
+            // the postfix steps this descent reads through: the
+            // classification is by the expression's directive TAIL, not its
+            // outermost step. Named by their exact variants — the pipe
+            // stage, and the structural step that is one BY TYPE — never by
+            // a run-membership protocol. An access is a boundary here as it
+            // always was — a receipt access stands between the descent and
+            // the call that owns it.
+            Some((
+                crate::pipeline::asts::core::Continuation::Pipe { .. }
+                | crate::pipeline::asts::core::Continuation::Structural(_),
+                prefix,
+            )) => probe = prefix,
             _ => break,
         }
     }
-    match probe {
-        RelationalExpression::Pipe(pipe) => {
-            match &pipe.operator {
-                // Relation-target DDL (Phase 3 canonical invocation) and
-                // DML (Phase 6 slice 5 — the designator form):
-                // source |> table!(my::ns.dump_table(*))(*) → receipt
-                // lowering, same as the bare-name terminal form.
-                UnaryRelationalOperator::DirectivePipeInvocation { name, .. }
-                    if matches!(
-                        name.as_str(),
-                        "temp_table!" | "table!" | "temp_view!" | "insert!" | "update!"
-                            | "delete!"
-                    ) =>
-                {
-                    Some(EffectEntry::AdhocBody {
-                        query: Box::new(query),
-                        assertions: Vec::new(),
-                    })
-                }
-                UnaryRelationalOperator::DirectiveTerminal { name, .. } => {
-                    match name.as_str() {
-                        // DDL creation directives → receipt lowering.
-                        // (`imprint!`/`imprint_replace!` keep their own
-                        // existing execution path.)
-                        "temp_table!" | "table!" | "temp_view!" => {
-                            Some(EffectEntry::AdhocBody {
-                                query: Box::new(query),
-                                assertions: Vec::new(),
-                            })
-                        }
-                        // Two-paren `run_namespace!(ns)(*)`: the builder
-                        // spells the argument as a one-row anonymous source.
-                        "run_namespace!" => single_anonymous_argument(&pipe.source)
-                            .map(|namespace| EffectEntry::RunNamespace {
-                                namespace,
-                                access: None,
-                            }),
-                        "run!" => single_anonymous_argument(&pipe.source)
-                            .map(|path| EffectEntry::RunFile { path, access: None }),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        }
-        // Direct invocations `run_namespace!(ns)` / `run!("file")`, with or
-        // without the `(*)` receipt access (Phase 3 canonical invocation:
-        // the two-paren spelling now builds this same PseudoPredicate shape).
-        // Non-glob receipt access is not classified here — it falls through
-        // to the executor, whose run!/run_namespace! entities refuse with
-        // their whole-statement policy until receipt access lands with the
-        // Phase 4 receipt rebuild.
-        RelationalExpression::Relation(Relation::PseudoPredicate {
-            name,
-            arguments,
-            access,
-            ..
-        }) => {
-            use crate::pipeline::asts::core::DomainSpec;
-            // Glob/bare access = the payload-transparent dump (F5's
-            // execution-family exception). A positional NAME list is the
-            // exact-arity receipt binding (Phase 6 slice 6); any other
+    match probe.last() {
+        // Direct invocations `run_namespace!(ns)(*)` / `run!("file")(*)`, with or
+        // without the `(*)` receipt access (the two-paren spelling builds
+        // the same `FunctorCall` shape). Non-glob receipt access is not
+        // classified here — it falls through to the executor, whose
+        // run!/run_namespace! entities refuse with their whole-statement
+        // policy until receipt access lands more generally.
+        None => {
+            let crate::pipeline::asts::core::Grelex::Reference(Relation::FunctorCall {
+                call, ..
+            }) = &expr.head
+            else {
+                return None;
+            };
+
+            // Glob/bare access = the payload-transparent dump (the
+            // execution family's exception). A positional NAME list is the
+            // exact-arity receipt binding; any other
             // spec falls through to the executor's refusal.
-            let run_access = match access {
-                DomainSpec::Glob | DomainSpec::Bare => Some(None),
-                DomainSpec::Positional(exprs) => {
-                    let glob = exprs.len() == 1
-                        && matches!(
-                            &exprs[0],
-                            crate::pipeline::asts::core::DomainExpression::Projection(
-                                crate::pipeline::asts::core::expressions::domain::ProjectionExpr::Glob { .. }
-                            )
-                        );
-                    if glob {
-                        Some(None)
-                    } else {
-                        exprs
-                            .iter()
-                            .map(|e| match e {
-                                crate::pipeline::asts::core::DomainExpression::Lvar {
-                                    name, ..
-                                } => Some(name.to_string()),
-                                _ => None,
-                            })
-                            .collect::<Option<Vec<String>>>()
-                            .map(Some)
-                    }
-                }
-                _ => None,
+            let reference = Some(&call.call().callee)?;
+            let name = reference.name_text();
+            if adhoc_statement_call(call.call()) {
+                return Some(EffectEntry::AdhocBody {
+                    query: Box::new(query),
+                    assertions: Vec::new(),
+                });
+            }
+            let access = &head_access;
+            let arguments = call
+                .call()
+                .arguments
+                .value_domains()
+                .cloned()
+                .collect::<Vec<_>>();
+            let run_access = if access.is_whole() {
+                Some(None)
+            } else {
+                access.binders().map(|names| {
+                    Some(
+                        names
+                            .into_iter()
+                            .map(|binder| binder.name.to_string())
+                            .collect(),
+                    )
+                })
             };
             let access = run_access?;
             match name.as_str() {
-                "run_namespace!" => single_argument(arguments).map(|namespace| {
-                    EffectEntry::RunNamespace {
+                "run_namespace!" => {
+                    single_argument(&arguments).map(|namespace| EffectEntry::RunNamespace {
                         namespace,
                         access: access.clone(),
-                    }
-                }),
-                "run!" => single_argument(arguments).map(|path| EffectEntry::RunFile {
+                    })
+                }
+                "run!" => single_argument(&arguments).map(|path| EffectEntry::RunFile {
                     path,
                     access: access.clone(),
+                }),
+                // `cli::repl.set_prompt!("✅")(*)` arrives here. See the
+                // matching arm above for why it is a run.
+                name if user_directive(name) => Some(EffectEntry::AdhocBody {
+                    query: Box::new(query),
+                    assertions: Vec::new(),
                 }),
                 _ => None,
             }
@@ -260,44 +241,68 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
     }
 }
 
+/// Does this call need the ad-hoc STATEMENT road?
+///
+/// Asked of the descriptor, which owns both halves of the answer: the
+/// directive writes the database, and its meaning requires the relation a
+/// pipe hands it. One classification serves the direct and the piped
+/// occurrence, because the normalized call already says the same thing in
+/// both positions and the enclosing position adds nothing to the question.
+///
+/// A list of the names that answer yes today would be a second population:
+/// declaring one more descriptor would leave it unrouted while every other
+/// authority described it completely, and changing a realization would leave
+/// the old routing live.
+fn adhoc_statement_call(call: &crate::pipeline::asts::core::FunctorCall) -> bool {
+    crate::pipeline::asts::effects::descriptor(&call.callee.name_text())
+        .is_some_and(DirectiveDescriptor::is_adhoc_statement_terminal)
+}
+
+/// Is this a user directive — an effect rule rather than a prelude entity?
+///
+/// Asked of the descriptor table rather than matched against a list of names.
+/// Thirty of the thirty-two descriptors are `std::prelude`, so "absent from the
+/// table" and "not a registered prelude entity" are the same statement, and
+/// `directive_category` already returns `User` for the miss. A hand-kept list
+/// here would be a second copy of that table, checked by nothing — the arms
+/// above grew to six names before anyone noticed the seventh could not be
+/// added.
+///
+/// Naming a rule that resolves to nothing still refuses; it refuses in the
+/// executor, where the registry can say so, instead of here where it cannot.
+fn user_directive(name: &str) -> bool {
+    // THE `!` IS PART OF THE NAME. Without it the reference names a PURE
+    // entity — a view, a bin relation — and "absent from the descriptor
+    // table" says nothing about it. A pure call is not a run, and routing one
+    // here takes it off the road where its own executor lives.
+    name.ends_with('!') && directive_category(name) == DirectiveCategory::User
+}
+
 /// The single argument of a run form: a bare/`::`-qualified name (an Lvar
-/// with the `::` text intact, REPORT-2.2) or a string literal.
+/// with the `::` text intact) or a string literal.
 fn single_argument(arguments: &[DomainExpression]) -> Option<String> {
     let [value] = arguments else { return None };
     argument_value(value)
 }
-
-fn single_anonymous_argument(source: &RelationalExpression) -> Option<String> {
-    let RelationalExpression::Relation(Relation::Anonymous { rows, .. }) = source else {
-        return None;
-    };
-    let [row] = rows.as_slice() else { return None };
-    let [value] = row.values.as_slice() else {
-        return None;
-    };
-    argument_value(value)
-}
-
 fn argument_value(value: &DomainExpression) -> Option<String> {
     match value {
-        DomainExpression::Lvar {
+        DomainExpression::Reference(Reference::Named(NamedReference(AuthoredColumn {
             name,
             qualifier: None,
             ..
-        } => Some(name.to_string()),
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Some(s.clone()),
+        }))) => Some(name.to_string()),
+        DomainExpression::Application(
+            crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::String(s)),
+        ) => Some(s.clone()),
         _ => None,
     }
 }
 
-/// The namespace `run!("path/to/script.dql")` consults into: the file stem,
-/// sanitized to identifier characters. EFFECT-ALGEBRA F2 names no
+/// The namespace `run!("path/to/script.dql")(*)` consults into: the file stem,
+/// sanitized to identifier characters. The directive's own syntax names no
 /// namespace; the stem is what a human would type, and it leaves the
-/// script addressable afterwards (F3: "a consulted script is thereby
-/// runnable without re-consulting" via `run_namespace!`).
+/// script addressable afterwards — a consulted script is thereby
+/// runnable without re-consulting, via `run_namespace!`.
 fn namespace_from_path(path: &str) -> String {
     let stem = std::path::Path::new(path)
         .file_stem()
@@ -305,7 +310,13 @@ fn namespace_from_path(path: &str) -> String {
         .unwrap_or_default();
     let sanitized: String = stem
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if sanitized.is_empty() {
         "script".to_string()
@@ -319,6 +330,14 @@ fn error_term(e: &DelightQLError) -> ServerTerm {
         kind: ErrorKind::Syntax,
         identity: e.error_uri().into_bytes(),
         message: format!("{}", e).into_bytes(),
+    }
+}
+
+fn created_object_registration_error(message: String) -> ServerTerm {
+    ServerTerm::Error {
+        kind: ErrorKind::Connection,
+        identity: b"delightql-error://runtime/session_health/external_effect".to_vec(),
+        message: message.into_bytes(),
     }
 }
 
@@ -342,7 +361,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 }
             }
             EffectEntry::RunFile { path, access } => {
-                // F2: consult-then-demand. Liminal directives execute at
+                // Consult-then-demand. Liminal directives execute at
                 // load; rules register; then main! is demanded exactly as
                 // run_namespace! would.
                 let namespace = match self.consult_for_run(&path) {
@@ -352,9 +371,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 let term = self.demand_namespace_main(&namespace);
                 match access {
                     None => term,
-                    Some(names) => {
-                        self.bind_run_receipt(term, "run!", "path", &path, &names)
-                    }
+                    Some(names) => self.bind_run_receipt(term, "run!", "path", &path, &names),
                 }
             }
             EffectEntry::AdhocBody { query, assertions } => {
@@ -372,7 +389,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     }
 
     /// Bind an exact-arity positional access list against the run's
-    /// REIFIED receipt (F5, Phase 6 slice 6): `(success, operation,
+    /// REIFIED receipt: `(success, operation,
     /// path|namespace, returned)`. The payload is the run's response,
     /// packaged as the `returned` interior; a NO run (exit! latch taken)
     /// ships the EMPTY receipt — zero rows, declared heading.
@@ -432,18 +449,21 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             None => "[]".to_string(),
         };
         let _ = dimensions;
-        let rows: Vec<Vec<String>> = if self.last_run_exited {
+        // The receipt is COMPOSED here, not read from an engine: every
+        // field is present by construction, so each is a cell carrying its
+        // own bytes.
+        let rows: Vec<Vec<delightql_protocol::Cell>> = if self.last_run_exited {
             Vec::new()
         } else {
             vec![vec![
-                "1".to_string(),
-                operation.to_string(),
-                echo_value.to_string(),
-                payload,
+                Some(b"1".to_vec()),
+                Some(operation.as_bytes().to_vec()),
+                Some(echo_value.to_string().into_bytes()),
+                Some(payload.into_bytes()),
             ]]
         };
         let columns: Vec<String> = names.to_vec();
-        self.eager_header(&columns, &rows)
+        self.eager_header(&columns, rows)
     }
 
     fn demand_namespace_main(&mut self, namespace: &str) -> ServerTerm {
@@ -453,90 +473,119 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         }
     }
 
-    /// Fresh scratch per run, then pump. A second run on the same session
-    /// must not collide with the first's leftover scratch (`__r_*`,
-    /// `__exit` are per-connection temp state and the plan re-CREATEs
-    /// them; a stale `__exit` row would even latch the exit peek and skip
-    /// the whole run). Pinned by the CLI integration test
+    /// Play the compiled plan. Every plan-scratch shell replaces residue
+    /// adjacent to its CREATE, before guards or exit checks can observe it,
+    /// so repeated runs on one session start with empty scratch. Pinned by
+    /// the CLI integration test
     /// `run_twice_on_one_session_gets_fresh_scratch`.
     fn play_plan(&mut self, plan: &CompiledPlan) -> ServerTerm {
-        // D4: materialize the plan's observational projection
+        self.play_plan_with_catalog(plan, &crate::system::RealCreatedObjectCatalog)
+    }
+
+    /// Test seam for the post-run catalog boundary. Production uses the real
+    /// catalog implementation; crate tests can inject a scripted failure
+    /// without changing target execution or bootstrap state.
+    pub(crate) fn play_plan_with_catalog<C: CreatedObjectCatalog>(
+        &mut self,
+        plan: &CompiledPlan,
+        catalog: &C,
+    ) -> ServerTerm {
+        // Materialize the plan's observational projection
         // (sys::execution.effect_plan/…) — clear-then-insert is the
         // next-run-clears lifecycle. Best-effort: bookkeeping never
-        // outranks the run (Q-D5's discipline, applied to the plan side).
+        // outranks the run.
         if let Some(typed) = &plan.typed {
             let _ = self.system.materialize_effect_plan(typed);
         }
-        self.drop_plan_scratch(plan);
         let response = self.handle_plan(plan);
         if !matches!(response, ServerTerm::Error { .. }) {
-            // Catalog registration for the run's created objects, so
-            // post-run statements resolve them bare (materialize-pipe §1;
-            // ddl_receipt--12/--13/--14, util--36). Best-effort per object:
-            // an object skipped past the exit flag simply does not exist
-            // and registers nothing.
-            for obj in &plan.created_objects {
-                let _ = self.system.register_run_created_object(
-                    &obj.name,
-                    obj.is_view,
-                    obj.connection_id.unwrap_or(2),
-                );
+            // Catalog registration is one plan-level reconciliation. Target
+            // read-backs happen before the bootstrap savepoint, so a failure
+            // cannot leave an earlier sibling registered. A skipped object is
+            // represented as NotPresent; unsupported metadata is surfaced.
+            if !plan.created_objects.is_empty() {
+                match self
+                    .system
+                    .register_run_created_objects_with(&plan.created_objects, catalog)
+                {
+                    Ok(outcomes) => {
+                        if let Some(reason) = outcomes.iter().find_map(|outcome| match outcome {
+                            crate::external_effects::RegistrationOutcome::Unsupported {
+                                reason,
+                            } => Some(reason.clone()),
+                            _ => None,
+                        }) {
+                            let primary = DelightQLError::database_error_categorized(
+                                "session_health/registration_unsupported",
+                                format!("created-object registration unsupported: {reason}"),
+                                "created-object registration invariant breach",
+                            );
+                            return self.fail_created_object_registration(
+                                response,
+                                format!("{primary} [{}]", primary.error_uri()),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        return self.fail_created_object_registration(
+                            response,
+                            format!(
+                                "created-object registration failed; the target object was created, \
+                                 but the session catalog could not be updated: {error} [{}]",
+                                error.error_uri()
+                            ),
+                        );
+                    }
+                }
             }
         }
         response
     }
 
-    /// Drop the plan's own scratch shells (the `CREATE TEMP TABLE temp.__…`
-    /// statements emitted before the transaction bracket, invariant §5.6)
-    /// if an earlier run on this session left them behind — a prior run
-    /// that ABORTED (shells are pre-bracket, so they survive the rollback)
-    /// or took `exit!` (which skips the plan's own trailing cleanup). Every
-    /// DROP is `temp.`-qualified: it structurally cannot bind into the
-    /// user's `main` schema (review F1, the SEV-1 this method used to be —
-    /// an unqualified `DROP __r_insert` on a fresh session resolved to
-    /// main and destroyed the user's table; pinned by the effects ball's
-    /// scratch--51_user_table_survives_adhoc_dml). Kept ALONGSIDE the
-    /// planner's adjacent/trailing drops because the pump's exit peek runs
-    /// before every plan entry: a stale `temp.__exit` ROW would latch the
-    /// peek and silently skip the entire run — including any in-plan DROP
-    /// that would have cleared it — so the clearing must happen before the
-    /// plan starts playing. Best-effort: a missing table is the normal
-    /// first-run case. Pinned by the CLI integration test
-    /// `run_twice_on_one_session_gets_fresh_scratch`.
-    ///
-    /// Each DROP routes on ITS SHELL ENTRY's `connection_id` — which is the
-    /// plan's ONE settled connection (E-T1: `compile_with_settled_connection`
-    /// stamps every entry uniformly for non-hub plans, pinned by
-    /// `fatboy_plan_entries_all_carry_the_plan_connection` in
-    /// pipeline/effect_transformer/tests.rs), so the clearing happens on the
-    /// engine the scratch lives on, never the hub by accident.
-    fn drop_plan_scratch(&mut self, plan: &CompiledPlan) {
-        for entry in &plan.entries {
-            match entry {
-                PlanEntry::BeginTransaction { .. } => break, // shells precede the bracket
-                PlanEntry::Statement(st) => {
-                    if let Some(rest) = st.sql.strip_prefix("CREATE TEMP TABLE temp.") {
-                        if rest.starts_with("__") {
-                            if let Some(name) =
-                                rest.split(|c: char| c == ' ' || c == '(').next()
-                            {
-                                let _ = self.execute_sql_routed(
-                                    &format!("DROP TABLE IF EXISTS temp.{}", name),
-                                    st.connection_id,
-                                );
-                            }
+    /// A successful plan may already have allocated a final Header handle
+    /// before its post-run catalog reconciliation fails. Retire that unsent
+    /// handle before returning the health error; non-final hook deliveries are
+    /// intentionally not retractable once they have been emitted.
+    fn fail_created_object_registration(
+        &mut self,
+        response: ServerTerm,
+        message: String,
+    ) -> ServerTerm {
+        let handle = match &response {
+            ServerTerm::Header { handle, .. } => Some(handle.clone()),
+            _ => None,
+        };
+        let mut failure = message;
+        if let Some(handle) = handle {
+            if self.eager_buffers.remove(&handle).is_none() {
+                if let Some(backend_handle) = self.handles.remove(&handle) {
+                    match self.sql_session.close(backend_handle) {
+                        Ok(delightql_protocol::CloseResponse::Ok) => {}
+                        Ok(delightql_protocol::CloseResponse::Error { message, .. }) => {
+                            failure.push_str(&format!(
+                                "; unsent handle close failed: {}",
+                                String::from_utf8_lossy(&message)
+                            ));
+                        }
+                        Err(error) => {
+                            failure.push_str(&format!(
+                                "; unsent handle close failed: {}",
+                                error.message
+                            ));
                         }
                     }
                 }
-                _ => {}
             }
         }
+        self.system
+            .quarantine_session("created-object registration", failure.clone());
+        created_object_registration_error(failure)
     }
 
     /// run!'s consult half: consult the file into its stem-derived
-    /// namespace, or RE-consult when an earlier run! (or consult!) already
+    /// namespace, or RE-consult when an earlier run! (or consult!)(*) already
     /// loaded that namespace — each run! re-reads the file (a script
-    /// runner's contract), while run_namespace! deliberately does not (F3).
+    /// runner's contract), while run_namespace! deliberately does not.
     fn consult_for_run(&mut self, path: &str) -> Result<String, DelightQLError> {
         let namespace = namespace_from_path(path);
         match self.namespace_kind(&namespace)? {
@@ -604,9 +653,13 @@ mod tests {
 
     #[test]
     fn whole_statement_run_namespace_classifies_both_forms() {
-        for dql in ["run_namespace!(fx)(*)", "run_namespace!(fx)", "run_namespace!(\"fx\")(*)"] {
-            match classify_effect_entry(dql, true) {
-                Some(EffectEntry::RunNamespace { namespace, .. }) => assert_eq!(namespace, "fx"),
+        for dql in [
+            "run_namespace!(fx)(*)",
+            "run_namespace!(fx)(*)",
+            "run_namespace!(\"fx\")(*)",
+        ] {
+            match classify_effect_entry(read_goal(dql), true) {
+                Ok(EffectEntry::RunNamespace { namespace, .. }) => assert_eq!(namespace, "fx"),
                 _ => panic!("expected RunNamespace for {:?}", dql),
             }
         }
@@ -614,42 +667,75 @@ mod tests {
 
     #[test]
     fn whole_statement_run_classifies_with_path() {
-        match classify_effect_entry("run!(\"ddl/script.dql\")(*)", true) {
-            Some(EffectEntry::RunFile { path, .. }) => assert_eq!(path, "ddl/script.dql"),
+        match classify_effect_entry(read_goal("run!(\"ddl/script.dql\")(*)"), true) {
+            Ok(EffectEntry::RunFile { path, .. }) => assert_eq!(path, "ddl/script.dql"),
             _ => panic!("expected RunFile"),
         }
     }
 
+    /// EVERY ad-hoc statement terminal the descriptor table declares reaches
+    /// the statement road — the population is iterated, not listed, so
+    /// declaring one more is covered here the moment it is declared.
     #[test]
-    fn dml_and_ddl_terminals_classify_as_adhoc_bodies() {
-        for dql in [
-            "orders(*), region = \"EU\" |> insert!(orders_eu(*))(*)",
-            "orders!!(*), status = \"old\" |> delete!(orders(*))(*)",
-            "orders(*) |> temp_table!(staged)",
-            "orders(*) |> table!(archive)",
-            "orders(*) |> temp_view!(fresh)",
-        ] {
+    fn every_declared_adhoc_terminal_classifies_as_an_adhoc_body() {
+        let terminals: Vec<&str> = crate::pipeline::asts::effects::DIRECTIVE_DESCRIPTORS
+            .iter()
+            .filter(|d| d.is_adhoc_statement_terminal())
+            .map(|d| d.name)
+            .collect();
+        assert!(
+            !terminals.is_empty(),
+            "the policy must select someone, or this test proves nothing"
+        );
+
+        for name in terminals {
+            // Every one of them names WHERE the effect lands as an ordinary
+            // relation designator, so one authored shape reaches them all.
+            let dql = format!("orders(*) |> {name}!(target(*))(*)");
             assert!(
-                matches!(classify_effect_entry(dql, true), Some(EffectEntry::AdhocBody { .. })),
-                "expected AdhocBody for {:?}",
-                dql
+                matches!(
+                    classify_effect_entry(read_goal(&dql), true),
+                    Ok(EffectEntry::AdhocBody { .. })
+                ),
+                "expected AdhocBody for {dql:?}"
             );
         }
+    }
+
+    /// The policy's two near misses, which a name list got right only by
+    /// accident: DDL realized as an ENTITY has a callable to invoke, and a
+    /// pipe terminal that writes no database is not a statement.
+    #[test]
+    fn writing_the_database_and_needing_the_pipe_are_both_required() {
+        use crate::pipeline::asts::effects::{descriptor, DirectiveCategory, DirectiveRealization};
+
+        let imprint = descriptor("imprint").expect("imprint is declared");
+        assert_eq!(imprint.category, DirectiveCategory::Ddl);
+        assert_eq!(imprint.realization, DirectiveRealization::Entity);
+        assert!(!imprint.is_adhoc_statement_terminal());
+
+        let returning = descriptor("returning").expect("returning is declared");
+        assert_eq!(returning.category, DirectiveCategory::Utility);
+        assert_eq!(
+            returning.realization,
+            DirectiveRealization::SyntaxPipeTerminal
+        );
+        assert!(!returning.is_adhoc_statement_terminal());
     }
 
     #[test]
     fn plain_queries_and_session_directives_stay_on_todays_path() {
         for dql in [
             "users(*)",
-            "consult!(\"x.dql\", \"fx\")",
-            "mount!(\"db.sqlite\", \"main\")",
+            "consult!(\"x.dql\", \"fx\")(*)",
+            "mount!(\"db.sqlite\", \"main\")(*)",
             "users(*), region = \"EU\"",
             // imprint! keeps its own existing execution path
-            "users(*) |> imprint!(t)",
+            "users(*) |> imprint!(t)(*)",
         ] {
             assert!(
-                classify_effect_entry(dql, true).is_none(),
-                "expected None for {:?}",
+                classify_effect_entry(read_goal(dql), true).is_err(),
+                "expected today's path for {:?}",
                 dql
             );
         }
@@ -657,39 +743,52 @@ mod tests {
 
     #[test]
     fn annotated_statements_ride_the_typed_program() {
-        // Phase 10 slice b (semantic routing): an assertion-carrying DML
+        // Semantic routing: an assertion-carrying DML
         // classifies — the annotation rides the typed program as a head
         // step, so wrapped and unwrapped demands choose the SAME
         // execution generation (the acceptance clause). The old
         // conservative bailout is gone.
-        let dql = "orders(*) |> insert!(t(*))(*) (~~assert ~> count:(*) as c, c = 1 |> exists(*) ~~)";
-        match classify_effect_entry(dql, true) {
-            Some(EffectEntry::AdhocBody { assertions, .. }) => {
+        let dql =
+            "orders(*) |> insert!(t(*))(*) (~~assert ~> count:(*) as c, c = 1 |> exists(*) ~~)";
+        match classify_effect_entry(read_goal(dql), true) {
+            Ok(EffectEntry::AdhocBody { assertions, .. }) => {
                 assert_eq!(assertions.len(), 1, "the assertion spec is threaded");
             }
             other => panic!("expected AdhocBody with the assertion, got {other:?}"),
         }
         // Danger/option overrides are compile-mode configuration and
         // conservatively keep today's path.
-        let dql = "orders(*) |> insert!(t(*))(*) (~~danger:allow_full_scan ~~)";
-        assert!(classify_effect_entry(dql, true).is_none());
+        let dql = "orders(*) |> insert!(t(*))(*) (~~danger://cardinality/cartesian ~~)";
+        assert!(classify_effect_entry(read_goal(dql), true).is_err());
     }
 
     #[test]
     fn spaced_directive_calls_classify() {
-        // Grammar-legal whitespace between `!` and `(` must not fall past
-        // the pre-filter into the lying position refusal (review F6;
-        // effects ball main--25 pins this end to end).
-        for dql in ["run_namespace! (fx)", "run_namespace!  (fx)(*)", "run! (\"a.dql\")"] {
+        // Grammar-legal whitespace between `!` and `(` reaches the classifier
+        // like any other spelling; nothing textual stands in front of it
+        // (effects ball main--25 pins this end to end).
+        for dql in [
+            "run_namespace! (fx)(*)",
+            "run_namespace!  (fx)(*)",
+            "run! (\"a.dql\")(*)",
+        ] {
             assert!(
-                classify_effect_entry(dql, true).is_some(),
+                classify_effect_entry(read_goal(dql), true).is_ok(),
                 "expected classification for {:?}",
                 dql
             );
         }
-        // `!` not followed by `(` still declines without a parse.
-        assert!(!contains_directive_call("users(*), a != b"));
-        assert!(contains_directive_call("run_namespace!\n(fx)"));
+        // An ordinary statement is not the effect chain's business.
+        assert!(classify_effect_entry(read_goal("users(*), a != b"), true).is_err());
+    }
+
+    /// One statement, read the way the relay reads it.
+    fn read_goal(dql: &str) -> crate::pipeline::normalize::Goal {
+        let tree = crate::pipeline::parse::prompt(dql).expect("the statement parses");
+        let registry = std::rc::Rc::new(crate::names::Registry::new(&[]));
+        let normalized = crate::pipeline::normalize::definition_file(&tree, registry)
+            .expect("the statement normalizes");
+        crate::pipeline::one_goal(normalized).expect("one statement, one goal")
     }
 
     #[test]

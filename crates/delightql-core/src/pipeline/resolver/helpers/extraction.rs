@@ -1,108 +1,62 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use crate::error::Result;
+use crate::names::ScopeId;
 use crate::pipeline::ast_resolved;
+use delightql_types::SqlIdentifier;
 
-#[stacksafe::stacksafe]
-pub(in super::super) fn extract_cpr_schema(
-    expr: &ast_resolved::RelationalExpression,
-) -> Result<ast_resolved::CprSchema> {
-    match expr {
-        ast_resolved::RelationalExpression::Relation(rel) => match rel {
-            ast_resolved::Relation::Ground { cpr_schema, .. } => Ok(cpr_schema.get().clone()),
-            ast_resolved::Relation::Anonymous { cpr_schema, .. } => Ok(cpr_schema.get().clone()),
-            ast_resolved::Relation::TVF { cpr_schema, .. } => Ok(cpr_schema.get().clone()),
-            ast_resolved::Relation::InnerRelation { cpr_schema, .. } => {
-                Ok(cpr_schema.get().clone())
-            }
-            ast_resolved::Relation::ConsultedView { scoped, .. } => {
-                Ok(scoped.get().schema().clone())
-            }
-            ast_resolved::Relation::PseudoPredicate { .. } => {
-                panic!(
-                    "INTERNAL ERROR: PseudoPredicate should not exist in this phase. \
-                     Pseudo-predicates are executed and replaced during Phase 1.X (Effect Executor)."
-                )
-            }
+/// The scope a chain publishes: the last continuation's, or the head's
+/// when nothing has consumed it.
+pub(in crate::pipeline) fn extract_cpr_schema(expr: &ast_resolved::Chain) -> ScopeId {
+    if let Some(continuation) = expr.continuations.last() {
+        return *continuation
+            .cpr_schema()
+            .expect("ER-join consumed by resolver");
+    }
+    extract_head_cpr_schema(&expr.head)
+}
+
+/// The scope a chain HEAD publishes.
+pub(in super::super) fn extract_head_cpr_schema(head: &ast_resolved::Grelex) -> ScopeId {
+    match head {
+        ast_resolved::Grelex::Literal(anon) => anon.table.cpr_schema,
+        ast_resolved::Grelex::Reference(rel) => match rel {
+            ast_resolved::Relation::Ground { cpr_schema, .. }
+            | ast_resolved::Relation::FunctorCall { cpr_schema, .. }
+            | ast_resolved::Relation::InnerRelation { cpr_schema, .. } => *cpr_schema,
+            ast_resolved::Relation::ConsultedView { scoped, .. } => *scoped,
         },
-        ast_resolved::RelationalExpression::Join { cpr_schema, .. } => Ok(cpr_schema.get().clone()),
-
-        ast_resolved::RelationalExpression::Filter { cpr_schema, .. } => {
-            Ok(cpr_schema.get().clone())
-        }
-        ast_resolved::RelationalExpression::Pipe(pipe_expr) => {
-            Ok(pipe_expr.cpr_schema.get().clone())
-        }
-        ast_resolved::RelationalExpression::SetOperation { cpr_schema, .. } => {
-            Ok(cpr_schema.get().clone())
-        }
-        ast_resolved::RelationalExpression::ErJoinChain { .. }
-        | ast_resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER-join consumed by resolver")
-        }
-        ast_resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
     }
 }
 
-/// Extract CprSchema from a resolved Query.
+/// The scope a resolved Query publishes.
 /// Dispatches to `extract_cpr_schema` on the main relational expression.
 pub(in super::super) fn extract_cpr_schema_from_query(
     query: &ast_resolved::Query,
-) -> Result<ast_resolved::CprSchema> {
-    match query {
-        ast_resolved::Query::Relational(expr) => extract_cpr_schema(expr),
-        ast_resolved::Query::WithCtes { query, .. } => extract_cpr_schema(query),
-        ast_resolved::Query::WithPrecompiledCfes { query, .. } => {
-            extract_cpr_schema_from_query(query)
-        }
-        ast_resolved::Query::ReplTempTable { query, .. } => extract_cpr_schema_from_query(query),
-        ast_resolved::Query::ReplTempView { query, .. } => extract_cpr_schema_from_query(query),
-        ast_resolved::Query::WithCfes { .. } => Err(crate::error::DelightQLError::parse_error(
-            "CFE queries must be precompiled before schema extraction",
-        )),
-        ast_resolved::Query::WithErContext { .. } => {
-            unreachable!("ER-context consumed by resolver")
-        }
-    }
+) -> Result<ScopeId> {
+    Ok(extract_cpr_schema(&query.body))
 }
 
 pub(in super::super) fn extract_inline_using_columns(
-    expr: &ast_resolved::RelationalExpression,
-) -> Option<Vec<String>> {
-    match expr {
-        ast_resolved::RelationalExpression::Relation(rel) => match rel {
-            ast_resolved::Relation::Ground { domain_spec, .. } => match domain_spec {
-                // GlobWithUsing: table(*.(col1, col2)) — has USING columns.
-                ast_resolved::DomainSpec::GlobWithUsing(cols) => Some(cols.clone()),
-                // Glob: table(*), Positional: table(a, b), Bare: natural join marker.
-                // None of these carry USING columns.
-                ast_resolved::DomainSpec::Glob
-                | ast_resolved::DomainSpec::GlobWithUsingAll
-                | ast_resolved::DomainSpec::Positional(_)
-                | ast_resolved::DomainSpec::Bare => None,
-            },
-            // Non-Ground relations (Anonymous, TVF, InnerRelation, ConsultedView,
-            // PseudoPredicate) don't have DomainSpec USING syntax.
-            ast_resolved::Relation::Anonymous { .. }
-            | ast_resolved::Relation::TVF { .. }
-            | ast_resolved::Relation::InnerRelation { .. }
-            | ast_resolved::Relation::ConsultedView { .. }
-            | ast_resolved::Relation::PseudoPredicate { .. } => None,
+    expr: &ast_resolved::Chain,
+) -> Option<Vec<SqlIdentifier>> {
+    // Only a read nothing has consumed carries an inline USING: the
+    // dequalifying access is the mention's own.
+    match expr.as_read_relation()? {
+        ast_resolved::Relation::Ground { .. } => match expr.head_access()? {
+            // Dequalify: table(*.(col1, col2)) — has USING columns.
+            ast_resolved::Access::Dequalify(cols) => Some(cols.clone()),
+            // Glob: table(*), Positional: table(a, b), Bare: natural join marker.
+            // None of these carry USING columns.
+            ast_resolved::Access::All
+            | ast_resolved::Access::DequalifyAll
+            | ast_resolved::Access::Slots(_)
+            | ast_resolved::Access::Unasked => None,
         },
-        // Non-Relation expressions don't carry inline USING columns.
-        ast_resolved::RelationalExpression::Filter { .. }
-        | ast_resolved::RelationalExpression::Pipe(_)
-        | ast_resolved::RelationalExpression::Join { .. }
-        | ast_resolved::RelationalExpression::SetOperation { .. } => None,
-        ast_resolved::RelationalExpression::ErJoinChain { .. }
-        | ast_resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before USING column extraction")
-        }
-        ast_resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
+        // Relations without an access spec carrying USING syntax.
+        ast_resolved::Relation::FunctorCall { call: _, .. }
+        | ast_resolved::Relation::InnerRelation { .. }
+        | ast_resolved::Relation::ConsultedView { .. } => None,
     }
 }
 
@@ -110,75 +64,20 @@ pub(in super::super) fn extract_inline_using_columns(
 /// This is used for CTEs to ensure their columns reference the CTE name, not the original table
 /// Also pushes CteRegistration identity onto each column's identity stack.
 /// `origin` is the binding's TYPED construction provenance — never inferred
-/// from the name (review qmqwqlms round 3, P2: a user may legally write
-/// `_ho_*` identifiers).
+/// from the name (a user may legally write `_ho_*` identifiers).
 pub(in super::super) fn transform_schema_table_names(
-    schema: ast_resolved::CprSchema,
-    new_table_name: &str,
+    input: ScopeId,
+    new_table_name: &SqlIdentifier,
     origin: ast_resolved::CteOrigin,
-) -> ast_resolved::CprSchema {
-    match schema {
-        ast_resolved::CprSchema::Resolved(columns) => {
-            let transformed_columns = columns
-                .into_iter()
-                .map(|mut col| {
-                    // Update the table name to the CTE's name and push CteRegistration identity.
-                    // CTEs are query-local — they don't belong to any database schema.
-                    // Clear namespace metadata so column refs produce `table.column`,
-                    // never `schema.table.column`.
-                    col.push_scope(
-                        ast_resolved::TableName::Named(new_table_name.to_string().into()),
-                        ast_resolved::IdentityContext::CteRegistration {
-                            cte_name: new_table_name.to_string(),
-                            origin,
-                        },
-                    );
-
-                    col
-                })
-                .collect();
-            ast_resolved::CprSchema::Resolved(transformed_columns)
-        }
-        // Other schema types pass through unchanged
-        other => other,
-    }
-}
-
-/// Push SubqueryAlias onto every column's identity stack.
-/// Called when a view body (which may contain inner CTEs) is wrapped
-/// as a ConsultedView subquery. Makes referenceable_cte_name() return
-/// the outer alias instead of the inner CTE name.
-pub(crate) fn scope_schema_to_alias(
-    schema: ast_resolved::CprSchema,
-    alias: &str,
-    resolver_id: Option<ast_resolved::ResolverId>,
-) -> ast_resolved::CprSchema {
-    match schema {
-        ast_resolved::CprSchema::Resolved(columns) => {
-            let transformed = columns
-                .into_iter()
-                .map(|mut col| {
-                    let prev = col.info.name().unwrap_or("<unnamed>").to_string();
-                    col.info = col
-                        .info
-                        .clone()
-                        .with_identity(ast_resolved::ColumnIdentity {
-                            name: prev.clone().into(),
-                            context: ast_resolved::IdentityContext::SubqueryAlias {
-                                alias: alias.to_string(),
-                                previous_context: prev,
-                                resolver_id,
-                            },
-                            phase: ast_resolved::TransformationPhase::Resolved,
-                            table_qualifier: ast_resolved::TableName::Named(
-                                alias.to_string().into(),
-                            ),
-                        });
-                    col
-                })
-                .collect();
-            ast_resolved::CprSchema::Resolved(transformed)
-        }
-        other => other,
-    }
+    role: crate::names::CteRole,
+    identities: &crate::names::Registry,
+) -> ScopeId {
+    let spelling = identities.intern(new_table_name.as_str(), new_table_name.is_stropped());
+    let hint = match origin {
+        ast_resolved::CteOrigin::UserDefined => crate::names::Hint::User(spelling),
+        ast_resolved::CteOrigin::CompilerGenerated => crate::names::Hint::Prefix("cte"),
+    };
+    let scope = identities.mint_derived_scope(crate::names::ScopeOrigin::Cte { input, role }, hint);
+    identities.republish_heading(input, scope, crate::names::Republish::BoundaryExport);
+    scope
 }

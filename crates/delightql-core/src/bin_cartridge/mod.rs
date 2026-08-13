@@ -25,7 +25,7 @@
 //!   └── base trait for all bin entities
 //!       ├── name, type, signature
 //!       └── EffectExecutable (for pseudo-predicates)
-//!           └── execute() method for Phase 1.X
+//!           └── execute() method for the effect executor
 //! ```
 //!
 //! ## Example: Pseudo-Predicate
@@ -54,7 +54,7 @@ pub mod registry;
 
 use crate::enums::{EntityType, Language};
 use crate::error::Result;
-use crate::pipeline::asts::unresolved::{DomainExpression, Relation};
+use crate::pipeline::asts::unresolved::{DomainExpression, Grelex};
 use crate::system::DelightQLSystem;
 use std::sync::Arc;
 
@@ -185,7 +185,7 @@ pub trait BinEntity: Send + Sync {
     /// Whether this entity has side effects
     ///
     /// Side-effecting entities (pseudo-predicates) must be executed during
-    /// Phase 1.X (Effect Executor) rather than deferred to later phases.
+    /// the effect executor rather than deferred to a later stage.
     fn has_side_effects(&self) -> bool {
         false // Most entities don't have side effects
     }
@@ -193,7 +193,7 @@ pub trait BinEntity: Send + Sync {
     /// Get this entity as an EffectExecutable trait object (if applicable)
     ///
     /// Returns Some if this entity implements EffectExecutable (i.e., can be executed
-    /// at Phase 1.X). Returns None otherwise.
+    /// in the effect executor). Returns None otherwise.
     ///
     /// Default implementation returns None. Override this for executable entities.
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
@@ -203,7 +203,7 @@ pub trait BinEntity: Send + Sync {
     /// Get this entity as an SqlGeneratable trait object (if applicable)
     ///
     /// Returns Some if this entity implements SqlGeneratable (i.e., can generate
-    /// SQL directly at Phase 5). Returns None otherwise.
+    /// SQL directly in the generator). Returns None otherwise.
     ///
     /// Default implementation returns None. Override this for sigma predicates and functions.
     fn as_sql_generatable(&self) -> Option<&dyn SqlGeneratable> {
@@ -212,16 +212,18 @@ pub trait BinEntity: Send + Sync {
 }
 
 // =============================================================================
-// Effect Execution (Phase 1.X)
+// Effect Execution
 // =============================================================================
 
 /// Result from executing an entity
 pub enum EntityResult {
-    /// Entity returned a relation
-    Relation(Relation),
+    /// Entity returned a relation: the chain HEAD it answers with — a
+    /// written-out table for most receipts, a named form where the entity
+    /// builds one.
+    Relation(Grelex),
 }
 
-/// Effect Executable - Entities that execute at Phase 1.X
+/// Effect Executable - Entities that execute in the effect executor
 ///
 /// Pseudo-predicates implement this trait to provide their execution logic.
 /// The effect executor calls `execute()` when it encounters the pseudo-predicate
@@ -263,8 +265,8 @@ pub trait EffectExecutable: BinEntity {
         alias: Option<String>,
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
-        // CODE-REVIEW-zzpmxuzp::otolxyzl finding 1: pipe is APPLICATION —
-        // an empty relation reaches the callee once, exactly like a
+        // Pipe is APPLICATION — an empty relation reaches the callee once,
+        // exactly like a
         // three-row one. For a scalar-signature entity, both are lift
         // shapes it cannot yet receive, so both get the SAME not-yet
         // refusal (never a silent no-op, never a different error). A
@@ -288,26 +290,27 @@ pub trait EffectExecutable: BinEntity {
 }
 
 // =============================================================================
-// SQL Generation (Phase 5 - Generator)
+// SQL Generation (the generator)
 // =============================================================================
 
-use crate::pipeline::generator_v3::SqlDialect;
-use crate::pipeline::sql_ast_v3::DomainExpression as SqlDomainExpression;
+use crate::pipeline::generator::SqlDialect;
+use crate::pipeline::sql_ast::DomainExpression as SqlDomainExpression;
 
 /// Generator context provided to SQL generatable entities
 pub struct GeneratorContext<'a> {
     /// SQL dialect being generated
     pub _dialect: SqlDialect,
 
-    /// Function to render a SQL AST expression to a string
-    /// This is provided by the transformer so entities can generate proper SQL
-    pub render_expr: &'a dyn Fn(&SqlDomainExpression) -> String,
+    /// Fallible function for rendering a SQL AST expression.
+    /// This is provided by the generator so entities can propagate rendering
+    /// failures without manufacturing SQL or panicking.
+    pub render_expr: &'a dyn Fn(&SqlDomainExpression) -> Result<String>,
 }
 
 /// SQL Generatable - Entities that can generate SQL directly
 ///
 /// Sigma predicates and functions implement this trait to generate
-/// dialect-specific SQL strings during Phase 5 (SQL generator).
+/// dialect-specific SQL strings in the SQL generator.
 ///
 /// The entity has complete control over SQL generation - the transformer
 /// does NOT interpret or map anything. It just asks the entity to generate SQL.

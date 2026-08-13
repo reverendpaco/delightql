@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 #![allow(unreachable_patterns)]
 
-use delightql_core::api::internals::{builder_v2, parser};
+use delightql_core::api::internals::parse;
 use delightql_core::error::{DelightQLError, KnownLimitationType};
 use rand::prelude::*;
 use serde::Deserialize;
@@ -326,7 +326,7 @@ impl<'a, R: Rng> Generator<'a, R> {
                     "_pipe" => "|>".to_string(),
 
                     // Common expression types
-                    "domain_expression" | "expression" | "simple_expression" => "1".to_string(),
+                    "domain_expression" | "expression" => "1".to_string(),
                     "relational_expression" => "users(*)".to_string(), // Must be complete
                     "table_reference" => "users".to_string(),          // Just the table name
                     "literal" => "1".to_string(),
@@ -563,7 +563,6 @@ fn parse_args() -> Args {
 
 fn print_help() {
     eprintln!("fuzzgen - Grammar-based fuzzer for DelightQL");
-    eprintln!("         Always tests with grammar v2 + builder_v2");
     eprintln!();
     eprintln!("USAGE:");
     eprintln!("    fuzzgen [OPTIONS]");
@@ -578,7 +577,6 @@ fn print_help() {
     eprintln!(
         "    --exact              Generate only query N (Note: still generates 1..N-1 internally)"
     );
-    eprintln!("    --use-old-builder    Use old builder v1 (deprecated)");
     eprintln!("    -h, --help           Show this help message");
     eprintln!();
     eprintln!("EXAMPLES:");
@@ -593,9 +591,10 @@ fn print_help() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
 
-    // Find grammar.json - always use grammar_dql directory
+    // Find grammar.json — the consolidated grammar's, which is derived and
+    // ignored, so a tree that has not generated one has nothing to fuzz.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let grammar_dir = "grammar_dql";
+    let grammar_dir = "grammar";
     let grammar_path = manifest_dir
         .parent() // up to crates
         .unwrap()
@@ -667,10 +666,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Optionally test it
         if args.test {
-            match parser::parse(&query) {
+            match parse::query_sequence(&query) {
                 Ok(tree) => {
-                    // Always use builder_v2 (old builder has been removed)
-                    let builder_result = builder_v2::parse_query(&tree, &query);
+                    let builder_result = parse::normalize_sequence(&tree);
 
                     match builder_result {
                         Ok(ast) => {

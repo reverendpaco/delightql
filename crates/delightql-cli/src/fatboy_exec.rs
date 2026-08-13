@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Fatboy execution helpers: the engine side of `fatboy://` connections.
+//! Fatboy execution helpers: the engine side of postgres and DuckDB
+//! connections.
 //!
 //! A fatboy is a separate process speaking the relay protocol over its
 //! stdin/stdout, with a foreign engine behind it (dql-fatboy-postgres,
@@ -10,7 +11,7 @@
 //! - **Query execution**: a `RemoteHandler` over `StdioTransport` — the
 //!   engine's own protocol terms (Version included) forward verbatim to
 //!   the fatboy. This is the relay's backend-facing side running for
-//!   real (ALL-SQL-TARGETING-STATE.md, step 4).
+//!   real.
 //! - **Mount/introspection**: `FatboyIntrospector`/`FatboySchema` issue
 //!   catalog queries as ORDINARY relay queries (`information_schema`
 //!   SQL) — relay-role question #4's convention: catalog discovery is
@@ -53,8 +54,7 @@ fn effective_schema<'a>(mounted_schema: &'a Option<String>, profile: &str) -> &'
     }
 }
 
-/// The per-engine enumeration of PERSISTENT schemas (EFFECTS-ON-TARGETS
-/// §4.3, R-S2). PG keeps public + user + information_schema + pg_catalog
+/// The per-engine enumeration of PERSISTENT schemas (R-S2). PG keeps public + user + information_schema + pg_catalog
 /// and excludes the transient `pg_temp_%` / `pg_toast*` prefixes; DuckDB
 /// dedups and excludes `temp`/`system`. Shared by Phase B's existence
 /// refusal and Phase C's `mount_tree!` enumeration.
@@ -107,8 +107,7 @@ pub(crate) fn fatboy_name(profile: &str) -> String {
     format!("dql-fatboy-{}{}", profile, std::env::consts::EXE_SUFFIX)
 }
 
-/// The managed store — delightql's libexec (JOE-EVERYBODY-DISTRIBUTION.md
-/// §3.2): per-version, private, never on PATH. Same ProjectDirs identity
+/// The managed store — delightql's libexec: per-version, private, never on PATH. Same ProjectDirs identity
 /// as the REPL's history file. `dql target install` will create it; this
 /// side only probes.
 pub(crate) fn fatboy_store_dir() -> Option<PathBuf> {
@@ -199,7 +198,12 @@ impl FatboyRelay {
     fn from_transport(transport: Box<dyn Transport + Send>) -> Result<Self, String> {
         let client = Client::new(transport);
         let session = match client
-            .version(1_000_000, b"relay0".to_vec(), 300_000, vec![Orientation::Rows])
+            .version(
+                1_000_000,
+                b"relay0".to_vec(),
+                300_000,
+                vec![Orientation::Rows],
+            )
             .map_err(|e| format!("fatboy handshake: {}", e.message))?
         {
             VersionResult::Accepted(s) => s,
@@ -242,9 +246,9 @@ impl FatboyRelay {
             .map_err(|e| format!("fatboy query: {}", e.message))?
         {
             QueryResponse::Header { handle, dimensions } => (handle, dimensions),
-            QueryResponse::Error { identity, message, .. } => {
-                return Err(format_protocol_error(&identity, &message))
-            }
+            QueryResponse::Error {
+                identity, message, ..
+            } => return Err(format_protocol_error(&identity, &message)),
         };
         let columns: Vec<String> = dimensions
             .iter()
@@ -267,9 +271,9 @@ impl FatboyRelay {
                     }
                 }
                 FetchResponse::End => break,
-                FetchResponse::Error { identity, message, .. } => {
-                    return Err(format_protocol_error(&identity, &message))
-                }
+                FetchResponse::Error {
+                    identity, message, ..
+                } => return Err(format_protocol_error(&identity, &message)),
             }
         }
         let _ = session.close(handle);
@@ -427,8 +431,7 @@ fn spawn_fatboy_stdio(profile: &str, spawn: &SpawnSpec) -> Result<Child, String>
 }
 
 /// The refusal a user reads when the adapter isn't there. Speaks the
-/// user's register, not the workshop's (JOE-EVERYBODY-DISTRIBUTION.md
-/// deviation 1): name the adapter, list every place dql looked, end
+/// user's register, not the workshop's: name the adapter, list every place dql looked, end
 /// with the way forward. The from-source line is the install story
 /// until `dql target install` exists to replace it.
 fn fatboy_spawn_message(profile: &str, bin: &std::path::Path, e: &std::io::Error) -> String {
@@ -534,29 +537,28 @@ impl DatabaseConnection for FatboyConnection {
         }))
     }
 
-    fn query_all_string_rows(
+    fn query_all_rows(
         &self,
         sql: &str,
         _params: &[DbValue],
-    ) -> delightql_types::Result<(Vec<String>, Vec<Vec<String>>)> {
+    ) -> delightql_types::Result<(Vec<String>, Vec<Vec<DbValue>>)> {
+        // The fatboy wire is protocol cells: absent or bytes, with the
+        // engine's kind riding in the dimension rather than the cell. A
+        // present cell therefore reads as text (the reading `query_nullable`
+        // has always given it); absence is the one spelling of NULL.
         let (cols, rows) = self.run(sql)?;
-        let string_rows = rows
+        let typed_rows = rows
             .into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|v| v.unwrap_or_else(|| "NULL".to_string()))
+                    .map(|v| match v {
+                        None => DbValue::Null,
+                        Some(s) => DbValue::Text(s),
+                    })
                     .collect()
             })
             .collect();
-        Ok((cols, string_rows))
-    }
-
-    fn query_all_nullable_rows(
-        &self,
-        sql: &str,
-        _params: &[DbValue],
-    ) -> delightql_types::Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
-        self.run(sql)
+        Ok((cols, typed_rows))
     }
 }
 
@@ -596,12 +598,16 @@ impl DatabaseIntrospector for FatboyIntrospector {
         // Rows ordered by (table_name, ordinal): fold into entities.
         let mut entities: Vec<DiscoveredEntity> = Vec::new();
         for row in rows {
-            let get = |i: usize| -> String {
-                row.get(i).cloned().flatten().unwrap_or_default()
-            };
+            let get = |i: usize| -> String { row.get(i).cloned().flatten().unwrap_or_default() };
             let (table, ttype) = (get(0), get(1));
-            let entity_type_id = if ttype.eq_ignore_ascii_case("VIEW") { 11 } else { 10 };
-            if entities.last().map(|e: &DiscoveredEntity| e.name.as_str() != table)
+            let entity_type_id = if ttype.eq_ignore_ascii_case("VIEW") {
+                11
+            } else {
+                10
+            };
+            if entities
+                .last()
+                .map(|e: &DiscoveredEntity| e.name.as_str() != table)
                 .unwrap_or(true)
             {
                 entities.push(DiscoveredEntity {
@@ -612,12 +618,16 @@ impl DatabaseIntrospector for FatboyIntrospector {
             }
             let position: i32 = get(2).parse().unwrap_or(0);
             let notnull = get(5) == "1";
-            entities.last_mut().unwrap().attributes.push(DiscoveredAttribute {
-                name: get(3).into(),
-                data_type: get(4),
-                position,
-                is_nullable: !notnull,
-            });
+            entities
+                .last_mut()
+                .unwrap()
+                .attributes
+                .push(DiscoveredAttribute {
+                    name: get(3).into(),
+                    data_type: get(4),
+                    position,
+                    is_nullable: !notnull,
+                });
         }
         Ok(entities)
     }
@@ -656,7 +666,11 @@ impl FatboySchema {
 }
 
 impl DatabaseSchema for FatboySchema {
-    fn get_table_columns(&self, _schema: Option<&str>, table_name: &str) -> Option<Vec<ColumnInfo>> {
+    fn get_table_columns(
+        &self,
+        _schema: Option<&str>,
+        table_name: &str,
+    ) -> delightql_types::Result<Option<Vec<ColumnInfo>>> {
         let escaped = table_name.replace('\'', "''");
         // Schema scoping, per profile (E-T5): on Postgres the lookup
         // prefers the SESSION'S OWN temp schema when the name is temp-held,
@@ -664,7 +678,7 @@ impl DatabaseSchema for FatboySchema {
         // for the registration read-back (`created_object_readback_sql`),
         // and PG's own resolution order (temp shadows public for
         // unqualified names, P1 §B). Without it a plan-created temp table
-        // (`|> temp_table!(staged)`) is invisible to the NEXT statement's
+        // (`|> temp_table!(staged(*))(*)`) is invisible to the NEXT statement's
         // column lookup — the read-back registers it, then live resolution
         // scoped to 'public' answers None ("Table not found"). DuckDB never
         // had the hole: its temp objects live in schema `main` (catalog
@@ -693,14 +707,21 @@ impl DatabaseSchema for FatboySchema {
              FROM information_schema.columns c \
              WHERE c.table_schema = {} AND c.table_name = '{}' \
              ORDER BY c.ordinal_position",
-            schema_scope,
-            escaped
+            schema_scope, escaped
         );
-        let (_cols, rows) = self.relay.relay().ok()?.query_nullable(&sql).ok()?;
+        let relay = self.relay.relay().map_err(|error| {
+            delightql_types::DelightQLError::database_error(
+                "Fatboy schema relay unavailable",
+                error,
+            )
+        })?;
+        let (_cols, rows) = relay.query_nullable(&sql).map_err(|error| {
+            delightql_types::DelightQLError::database_error("Fatboy schema query failed", error)
+        })?;
         if rows.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(
+        Ok(Some(
             rows.iter()
                 .enumerate()
                 .map(|(i, row)| {
@@ -713,13 +734,18 @@ impl DatabaseSchema for FatboySchema {
                     }
                 })
                 .collect(),
-        )
+        ))
     }
 
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool {
-        self.get_table_columns(schema, table_name)
+    fn table_exists(
+        &self,
+        schema: Option<&str>,
+        table_name: &str,
+    ) -> delightql_types::Result<bool> {
+        Ok(self
+            .get_table_columns(schema, table_name)?
             .map(|c| !c.is_empty())
-            .unwrap_or(false)
+            .unwrap_or(false))
     }
 }
 
@@ -749,7 +775,10 @@ pub fn create_fatboy_system_components(
         );
     }
     Ok(delightql_types::ConnectionComponents {
-        schema: Box::new(FatboySchema::with_schema(mgr.clone(), mounted_schema.clone())),
+        schema: Box::new(FatboySchema::with_schema(
+            mgr.clone(),
+            mounted_schema.clone(),
+        )),
         connection: std::sync::Arc::new(Mutex::new(FatboyConnection::new(mgr.clone()))),
         introspector: Box::new(FatboyIntrospector::with_schema(
             mgr.clone(),
@@ -799,7 +828,7 @@ pub fn create_fatboy_tree_components(
     Ok(out)
 }
 
-/// Resource-asserted identity, obtained at connect (URI-DESIGN.md §4):
+/// Resource-asserted identity, obtained at connect:
 /// Postgres asserts its cluster system identifier; a DuckDB file's
 /// identity is filesystem identity (canonical path). Failure to obtain
 /// one degrades gracefully to None — identity strengthens dedupe, never

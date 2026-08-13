@@ -6,13 +6,12 @@
 //! compilation: the primary SQL, assertion SQL, and emit streams. The host
 //! (CLI, TUI, library) receives this and decides how to execute each piece.
 //!
-//! `CompiledPlan` is the generalization (effect algebra, plan §2.3): an
-//! ORDERED list of entries the pump plays start to finish — plain
-//! statements, statements whose result sets ship to the client, assertion
-//! checks, emit streams, and the transaction bracket. A plain query is the
-//! degenerate plan (see `From<CompiledQuery> for CompiledPlan`); the effect
-//! transformer (Epic 3) is what will produce multi-entry plans.
-
+//! `CompiledPlan` is the generalization (effect algebra): an ORDERED list
+//! of entries the pump plays start to finish — plain statements,
+//! statements whose result sets ship to the client, assertion checks,
+//! emit streams, and the transaction bracket. A plain query is the
+//! degenerate plan (see `From<CompiledQuery> for CompiledPlan`); the
+//! effect transformer produces multi-entry plans.
 
 /// Whether the compiled SQL is a query (returns rows) or a DML statement (returns affected count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,31 +27,73 @@ pub enum SqlKind {
 /// The host receives this and decides how to execute each piece:
 /// - Primary SQL goes to the main result display (stdout, table pane, etc.)
 /// - Assertion SQL is evaluated for boolean verdicts
+/// One compiled assertion.
+///
+/// A struct rather than a tuple: the author's NAME is the third thing an
+/// assertion carries, and a positional pair is what let it be dropped
+/// silently for as long as the spelling has existed.
+#[derive(Debug, Clone)]
+pub struct CompiledAssertion {
+    /// The boolean SQL evaluated for the verdict.
+    pub sql: String,
+    /// The author's name from `(~~assert:"…" ~~)`, when given.
+    pub name: Option<String>,
+}
+
+/// A read the primary statement may not run without, and what its failure
+/// means.
+///
+/// Unlike an assertion, nobody wrote it: the compiler attached it because
+/// the statement's meaning depends on a fact about the data. It is evaluated
+/// before the statement and refuses the run — with its own identifier, not
+/// an assertion's — when it does not hold.
+#[derive(Debug, Clone)]
+pub struct CompiledObligation {
+    pub sql: String,
+    pub refusal: Refusal,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledQuery {
     /// The primary SQL query.
     pub primary_sql: String,
     /// Whether this is a query or DML statement.
     pub _kind: SqlKind,
-    /// Assertion SQLs (boolean queries). Each is `(sql, source_location)`.
-    pub assertion_sqls: Vec<(String, Option<(usize, usize)>)>,
+    /// The compiled assertions, in written order.
+    pub assertion_sqls: Vec<CompiledAssertion>,
+    /// What the primary statement may not run without.
+    pub obligations: Vec<CompiledObligation>,
+    /// Statements that run, in order, before the assertions, the
+    /// obligations and the primary statement. A mutation stages the
+    /// relation it reads here, so its check and its write see the same
+    /// rows.
+    ///
+    /// Each begins by removing its own leftovers, so a run that ended before
+    /// its cleanup costs the next one nothing.
+    pub prepare_sqls: Vec<String>,
+    /// The statements that retire what `prepare_sqls` created.
+    ///
+    /// Every road that stages owes these on every terminal path. A streaming
+    /// result may owe them later — the rows are still being read — but never
+    /// never at all.
+    pub cleanup_sqls: Vec<String>,
     /// Connection ID for routing (which backend to execute on).
     pub connection_id: Option<i64>,
 }
 
 // ============================================================================
-// CompiledPlan — the generalized output structure (effect algebra, plan §2.3)
+// CompiledPlan — the generalized output structure (effect algebra)
 // ============================================================================
 
 /// One executable SQL statement inside a plan entry.
 ///
-/// Carries exactly what the pump consumes per statement today
+/// Carries exactly what the pump consumes per statement
 /// (relay `execute_sql_routed(&sql, connection_id)`), plus an optional
-/// comment used only by `CompiledPlan::render_sql` — the planner (Epic 3)
-/// writes the arm/step annotations there, in the TORTURE-TEST-NORMAL.sql
+/// comment used only by `CompiledPlan::render_sql` — the planner writes
+/// the arm/step annotations there, in the TORTURE-TEST-NORMAL.sql
 /// banner style.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by the pump/effect transformer (Epic 3); exercised by this file's tests today
+#[allow(dead_code)] // consumed by the pump/effect transformer; exercised by this file's tests
 pub struct PlanStatement {
     /// The SQL text, exactly as the generator spelled it.
     pub sql: String,
@@ -79,22 +120,21 @@ impl PlanStatement {
 
 /// One entry in a `CompiledPlan` — the unit the pump iterates.
 ///
-/// The variants are the pump's vocabulary (IMPLEMENTATION-ARCHITECTURE §4,
-/// "relay handle_query → the pump"):
+/// The variants are the pump's vocabulary:
 ///
 /// - `Statement` — execute, discard the result (DML, DDL, receipt inserts,
-///   the `__exit` insert). Exit-guard conjuncts (invariant §5.9) are
-///   compiled INTO the SQL text by the planner; the entry stays dumb.
+///   the `__exit` insert). Exit-guard conjuncts are compiled INTO the SQL
+///   text by the planner; the entry stays dumb.
 /// - `ShippedStatement` — execute AND forward the result set to the client
 ///   (`stdout!`, the final value). The marker is what lets the pump know a
 ///   result must ship without inspecting SQL text.
 /// - `Assertion` — execute, read the first value as a boolean verdict,
-///   abort the run on failure (today's assertion behavior, made an entry).
+///   abort the run on failure.
 /// - `BeginTransaction` / `CommitTransaction` — the bracket, as ordinary
 ///   list positions so the planner can EXPRESS placement invariants:
-///   scratch shells go BEFORE `BeginTransaction` (invariant §5.6), and "no
-///   transaction control between a DML and its receipt" (§5.2) is checkable
-///   as list adjacency. Rollback-on-error is pump behavior (Epic 3).
+///   scratch shells go BEFORE `BeginTransaction`, and "no transaction
+///   control between a DML and its receipt" is checkable as list
+///   adjacency. Rollback-on-error is pump behavior.
 ///
 /// Rendering of every variant is pinned by the `render_*` tests in this
 /// file's test module.
@@ -108,8 +148,8 @@ pub enum PlanEntry {
     /// Execute; first value is a pass/fail verdict; failure aborts the run.
     Assertion {
         statement: PlanStatement,
-        /// Source location in the original DQL (byte start, byte end).
-        source_location: Option<(usize, usize)>,
+        /// The author's name for the check, when given.
+        name: Option<String>,
     },
     /// Open the transaction bracket on the routed connection.
     BeginTransaction {
@@ -124,11 +164,11 @@ pub enum PlanEntry {
 }
 
 // ============================================================================
-// The typed effect plan (D2, DOGFOODING-EFFECT-EXECUTION-PLAN §5)
+// The typed effect plan
 // ============================================================================
 
 /// A guard edge's polarity. `always` is the ABSENCE of a requirement row,
-/// never a third value (Q-D3).
+/// never a third value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardPolarity {
     /// Continue when the guard relation has a row.
@@ -137,15 +177,15 @@ pub enum GuardPolarity {
     Absent,
 }
 
-/// A guard DEFINITION (Q-D3 as amended): typed guard identity plus its
-/// SQL lowering — a pure one-row SELECT; any row = open. NOT a scheduled
-/// step: no ordinal, no occurrence. Sampled at each DEPENDENT (Q-D1;
-/// early sampling only under provable interval stability). Shared by any
-/// number of requirements.
+/// A guard DEFINITION: typed guard identity plus its SQL lowering — a
+/// scalar count probe whose value decides openness. NOT a scheduled step:
+/// no ordinal, no occurrence. Sampled at each DEPENDENT (early sampling
+/// only under provable interval stability). Shared by any number of
+/// requirements.
 #[derive(Debug, Clone)]
 pub struct GuardDefinition {
     pub guard_id: usize,
-    /// The SQL lowering, standalone (`SELECT 1 WHERE EXISTS (…)`).
+    /// A standalone scalar count probe. The runner executes it verbatim.
     pub sql: String,
 }
 
@@ -156,26 +196,42 @@ pub struct Requirement {
     pub guard_id: usize,
     pub polarity: GuardPolarity,
     /// Diagnostics only (`"comma"`, `"exit"`) — the runner must never
-    /// branch on provenance (§3 of the dogfooding plan).
+    /// branch on provenance.
     pub reason: &'static str,
 }
 
-/// What a scheduled step's action IS — the ruled sum type
-/// (CODE-REVIEW-zzpmxuzp::otolxyzl finding 3: illegal combinations such
-/// as "DDL carrying a shipped host statement" are structurally
-/// inexpressible; only Host and Return can ship). Each SQL-bearing
-/// variant owns its LOWERED statement stream in emission order — the
-/// §5.1 adjacency discipline lives here (Q-D9).
+/// What a scheduled step's action IS — the ruled sum type: illegal
+/// combinations such as "DDL carrying a shipped host statement" are
+/// structurally inexpressible; only Host and Return can ship. Each
+/// SQL-bearing variant owns its LOWERED statement stream in emission
+/// order — the DML/receipt adjacency discipline lives here.
+/// A compiler-written check's refusal: the identifier the program sees and
+/// the sentence that explains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub identity: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum EffectAction {
-    /// A statement-level ASSERTION (Phase 10 slice b: annotated
+    /// A statement-level ASSERTION (annotated
     /// statements ride the typed program — the same semantic policy as
     /// unannotated ones). Runs FIRST, read-only, aborts the run on a
     /// false verdict; never inside the bracket.
     Assertion {
         statement: PlanStatement,
-        source_location: Option<(usize, usize)>,
+        name: Option<String>,
+        /// What a false verdict MEANS, when the compiler wrote the check
+        /// rather than the program. A user's `~~assert~~` failing is an
+        /// assertion failure and says so; a check the compiler attached to
+        /// a statement failing is that statement being refused, and it has
+        /// to be able to say which refusal it is.
+        refusal: Option<Refusal>,
     },
+    /// Materialize what a later step reads. Runs before the checks and the
+    /// occurrence that consume it; the trailing cleanup removes it.
+    Stage(Vec<PlanStatement>),
     /// DML occurrence: statement + adjacent receipt machinery.
     Dml(Vec<PlanStatement>),
     /// DDL occurrence: replace/holder drops + CREATE + receipt.
@@ -197,8 +253,8 @@ pub enum EffectAction {
         ship: Option<PlanStatement>,
     },
     /// Scratch shells. Placement is the step's POSITION: before Begin on
-    /// SQLite/DuckDB, after Begin on PG (ON COMMIT DROP) — invariant
-    /// §5.6, carried by order instead of assembly-time branching.
+    /// SQLite/DuckDB, after Begin on PG (ON COMMIT DROP) — carried by
+    /// order instead of assembly-time branching.
     Setup(Vec<PlanStatement>),
     /// Open the transaction bracket.
     Begin { connection_id: Option<i64> },
@@ -208,11 +264,15 @@ pub enum EffectAction {
     Cleanup(Vec<PlanStatement>),
 }
 
-/// The projection's step-kind vocabulary, DERIVED from the action — the
-/// former sidecar enum no longer travels beside the stream (finding 3).
+/// The projection's step-kind vocabulary, DERIVED from the action. A sidecar
+/// enum travelling beside the stream would be free to disagree with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectStepKind {
     Assertion,
+    /// Materialize what a later step reads, so that step and the ones
+    /// checking it consume one relation rather than two evaluations of one
+    /// definition.
+    Stage,
     Dml,
     Ddl,
     Exit,
@@ -229,6 +289,7 @@ impl EffectAction {
     pub fn kind(&self) -> EffectStepKind {
         match self {
             EffectAction::Assertion { .. } => EffectStepKind::Assertion,
+            EffectAction::Stage(_) => EffectStepKind::Stage,
             EffectAction::Dml(_) => EffectStepKind::Dml,
             EffectAction::Ddl(_) => EffectStepKind::Ddl,
             EffectAction::Exit(_) => EffectStepKind::Exit,
@@ -245,7 +306,8 @@ impl EffectAction {
     /// The action's plain statements (excluding any ship).
     pub fn statements(&self) -> &[PlanStatement] {
         match self {
-            EffectAction::Dml(s)
+            EffectAction::Stage(s)
+            | EffectAction::Dml(s)
             | EffectAction::Ddl(s)
             | EffectAction::Exit(s)
             | EffectAction::RuleBoundary(s)
@@ -271,17 +333,17 @@ impl EffectAction {
 
 /// One scheduled step of the typed plan. Ordinal = position in
 /// `TypedEffectPlan::steps`; occurrence identity is the demand-expansion
-/// path (Q-D2).
+/// path.
 #[derive(Debug, Clone)]
 pub struct EffectStep {
     /// Demand-expansion path + per-plan counter (`fx::route#3`): two
     /// mentions are two occurrences (mention is instantiation).
     pub occurrence: String,
     /// The directive's name as written (`insert!`) — STORED, never parsed
-    /// out of the occurrence string (review finding 3).
+    /// out of the occurrence string.
     pub operation: String,
     /// Source span provenance (byte start, end). OWED: ratified with
-    /// occurrence identity (Q-D2); populated once directive AST nodes
+    /// occurrence identity; populated once directive AST nodes
     /// carry spans through the builder — the field keeps the debt
     /// visible instead of silently dropped.
     pub span: Option<(usize, usize)>,
@@ -295,11 +357,12 @@ pub struct EffectStep {
 }
 
 impl EffectStepKind {
-    /// The ruled step_kind / action_kind projection vocabulary (Q-D4):
+    /// The ruled step_kind / action_kind projection vocabulary:
     /// step_kind ∈ effect|return|control, action_kind ∈ dml|ddl|sql|host.
     pub fn projection_kinds(self) -> (&'static str, &'static str) {
         match self {
             EffectStepKind::Assertion => ("control", "sql"),
+            EffectStepKind::Stage => ("control", "sql"),
             EffectStepKind::Dml => ("effect", "dml"),
             EffectStepKind::Ddl => ("effect", "ddl"),
             EffectStepKind::Exit => ("effect", "sql"),
@@ -326,8 +389,11 @@ impl EffectStep {
             EffectAction::Begin { .. } => "BEGIN".to_string(),
             EffectAction::Commit { .. } => "COMMIT".to_string(),
             action => {
-                let mut parts: Vec<String> =
-                    action.statements().iter().map(|st| st.sql.clone()).collect();
+                let mut parts: Vec<String> = action
+                    .statements()
+                    .iter()
+                    .map(|st| st.sql.clone())
+                    .collect();
                 if let Some(ship) = action.ship() {
                     parts.push(ship.sql.clone());
                 }
@@ -337,11 +403,11 @@ impl EffectStep {
     }
 }
 
-/// The typed in-memory plan (D2): scheduled steps + guard definitions.
-/// This is the CANONICAL structure the transformer builds; the flat
+/// The typed in-memory plan: scheduled steps + guard definitions. This is
+/// the CANONICAL structure the transformer builds; the flat
 /// `CompiledPlan::entries` list is derived from it at assembly (shells +
-/// BEGIN + step streams + COMMIT + cleanup). The system relations of
-/// D4/D5 are a read-only projection of THIS (Q-D11: observational).
+/// BEGIN + step streams + COMMIT + cleanup). The `sys::execution` system
+/// relations are a read-only, observational projection of THIS.
 #[derive(Debug, Clone, Default)]
 pub struct TypedEffectPlan {
     pub steps: Vec<EffectStep>,
@@ -350,8 +416,8 @@ pub struct TypedEffectPlan {
 
 impl TypedEffectPlan {
     /// Derive the flat entry list — the ONE typed program is the source;
-    /// the positional rendering is a projection (review finding 3: no
-    /// cloned streams to drift, no arithmetic reconstruction).
+    /// the positional rendering is a projection: no cloned streams to
+    /// drift, no arithmetic reconstruction.
     pub fn flatten(&self) -> Vec<PlanEntry> {
         let mut out = Vec::new();
         for step in &self.steps {
@@ -369,12 +435,11 @@ impl TypedEffectPlan {
                     });
                 }
                 EffectAction::Assertion {
-                    statement,
-                    source_location,
+                    statement, name, ..
                 } => {
                     out.push(PlanEntry::Assertion {
                         statement: statement.clone(),
-                        source_location: *source_location,
+                        name: name.clone(),
                     });
                 }
                 action => {
@@ -402,23 +467,15 @@ impl TypedEffectPlan {
 pub struct CompiledPlan {
     /// The ordered entries. The pump executes them first to last.
     pub entries: Vec<PlanEntry>,
-    /// Name of the exit-flag table, when the plan uses the exit machinery,
-    /// carried in the SETTLED connection's dialect spelling (`temp.__exit`
-    /// on SQLite/DuckDB, `pg_temp.__exit` on PG — R-T2; the pump runs it
-    /// VERBATIM, so the planner owns the spelling; pinned by
-    /// `pg_exit_table_and_wrap_guard_spell_pg_temp` in
-    /// pipeline/effect_transformer/tests.rs). Since D3a the exit flag
-    /// rides Absent requirement edges on later steps; this name serves
-    /// the ONE remaining latch read — pre-COMMIT, deciding whether the
-    /// post-COMMIT tail (trailing cleanup) runs. `None` = no exit
-    /// machinery. Populated by the effect transformer.
-    pub exit_table: Option<String>,
+    /// Complete scalar SQL probe for the exit latch. The planner owns every
+    /// identifier and dialect spelling; the pump executes this text verbatim
+    /// before COMMIT to decide whether the post-COMMIT tail runs.
+    pub exit_probe_sql: Option<String>,
     /// The user-visible objects this plan's DDL directives create
     /// (`temp_table!`/`table!`/`temp_view!` targets — NOT the `__`-scratch
-    /// shells). The pump ignores these; the Epic-3.3 entry point registers
-    /// them in the session catalog after a successful run so post-run
-    /// statements resolve them bare (materialize-pipe.md §1
-    /// "catalog-registered"; pinned by the effects ball's
+    /// shells). The pump ignores these; the entry point registers them in
+    /// the session catalog after a successful run so post-run statements
+    /// resolve them bare (pinned by the effects ball's
     /// ddl_receipt--12/--13/--14 and util--36 post-state reads).
     pub created_objects: Vec<PlanCreatedObject>,
     /// The typed plan this entry list was derived FROM
@@ -426,7 +483,7 @@ pub struct CompiledPlan {
     /// (`From<CompiledQuery>`) and hand-built test plans — those take the
     /// pump's plain entry loop; a typed plan is walked DIRECTLY
     /// (`play_typed`), and `entries` serves rendering and the degenerate
-    /// consumers only. D4 projects this into `sys::execution`.
+    /// consumers only. This projects into `sys::execution`.
     pub typed: Option<TypedEffectPlan>,
 }
 
@@ -434,7 +491,7 @@ pub struct CompiledPlan {
 #[derive(Debug, Clone)]
 pub struct PlanCreatedObject {
     /// Bare object name as created (unqualified — temp objects live in the
-    /// connection's temp schema, materialize-pipe.md §3).
+    /// connection's temp schema).
     pub name: String,
     /// True for `temp_view!` targets; false for the table directives.
     pub is_view: bool,
@@ -454,27 +511,58 @@ impl From<CompiledQuery> for CompiledPlan {
     /// `degenerate_entry_order_mirrors_relay` and
     /// `degenerate_plain_query_is_one_shipped_entry`.
     fn from(q: CompiledQuery) -> Self {
-        let mut entries = Vec::with_capacity(q.assertion_sqls.len() + 1);
-        for (sql, source_location) in q.assertion_sqls {
+        let mut entries = Vec::with_capacity(q.assertion_sqls.len() + q.obligations.len() + 1);
+        for assertion in q.assertion_sqls {
             entries.push(PlanEntry::Assertion {
                 statement: PlanStatement {
-                    sql,
+                    sql: assertion.sql,
                     connection_id: q.connection_id,
                     comment: None,
                 },
-                source_location,
+                name: assertion.name,
             });
+        }
+        // What the statement may not run without, in the same abort-on-false
+        // position the relay evaluates it in. The flat entry list has no room
+        // for the refusal's own identifier, so it arrives as an assertion
+        // failure here — a coarser answer, never a quieter one.
+        for obligation in q.obligations {
+            entries.push(PlanEntry::Assertion {
+                statement: PlanStatement {
+                    sql: obligation.sql,
+                    connection_id: q.connection_id,
+                    comment: Some(obligation.refusal.identity),
+                },
+                name: None,
+            });
+        }
+        // The authored preconditions come first; only then is the source
+        // evaluated. A false one must not have run a volatile source or left
+        // compiler state behind.
+        for sql in q.prepare_sqls {
+            entries.push(PlanEntry::Statement(PlanStatement {
+                sql,
+                connection_id: q.connection_id,
+                comment: Some("stage the source".to_string()),
+            }));
         }
         entries.push(PlanEntry::ShippedStatement(PlanStatement {
             sql: q.primary_sql,
             connection_id: q.connection_id,
             comment: None,
         }));
+        for sql in q.cleanup_sqls {
+            entries.push(PlanEntry::Statement(PlanStatement {
+                sql,
+                connection_id: q.connection_id,
+                comment: Some("retire the staged source".to_string()),
+            }));
+        }
         CompiledPlan {
             entries,
-            exit_table: None,
+            exit_probe_sql: None,
             created_objects: Vec::new(),
-            // Degenerate plans carry no typed layer (D2): nothing here is
+            // Degenerate plans carry no typed layer: nothing here is
             // an effect occurrence.
             typed: None,
         }
@@ -484,8 +572,8 @@ impl From<CompiledQuery> for CompiledPlan {
 #[allow(dead_code)] // see dead_code note on PlanStatement
 impl CompiledPlan {
     /// Render the plan as a readable, commented, `;`-terminated statement
-    /// list — the TORTURE-TEST-NORMAL.sql format (plan §2.3: that file IS
-    /// the target output for how a plan prints under `--to sql`).
+    /// list — the TORTURE-TEST-NORMAL.sql format (that file IS the target
+    /// output for how a plan prints under `--to sql`).
     ///
     /// Format, pinned by the `render_*` tests below:
     /// - entries are separated by one blank line;
@@ -500,9 +588,9 @@ impl CompiledPlan {
     /// - the bracket prints as bare `BEGIN;` / `COMMIT;`.
     ///
     /// NOTE: `--to sql` for plain queries does NOT route through this
-    /// renderer today — its output stays byte-identical to the generator's
+    /// renderer — its output stays byte-identical to the generator's
     /// (no `;`, no banners). This renderer takes over only when a compiler
-    /// path produces multi-entry plans (Epic 3).
+    /// path produces multi-entry plans.
     pub fn render_sql(&self) -> String {
         let blocks: Vec<String> = self.entries.iter().map(render_entry).collect();
         blocks.join("\n\n")
@@ -585,6 +673,9 @@ mod tests {
             primary_sql: primary.to_string(),
             _kind: SqlKind::Query,
             assertion_sqls: vec![],
+            obligations: vec![],
+            prepare_sqls: vec![],
+            cleanup_sqls: vec![],
             connection_id,
         }
     }
@@ -596,7 +687,7 @@ mod tests {
     #[test]
     fn degenerate_plain_query_is_one_shipped_entry() {
         let plan: CompiledPlan = plain_query("SELECT 1 AS a", Some(3)).into();
-        assert!(plan.exit_table.is_none());
+        assert!(plan.exit_probe_sql.is_none());
         assert_eq!(plan.entries.len(), 1);
         match &plan.entries[0] {
             PlanEntry::ShippedStatement(st) => {
@@ -614,22 +705,30 @@ mod tests {
         let q = CompiledQuery {
             primary_sql: "SELECT * FROM t".to_string(),
             _kind: SqlKind::Query,
+            obligations: vec![],
+            prepare_sqls: vec![],
+            cleanup_sqls: vec![],
             assertion_sqls: vec![
-                ("SELECT count(*) > 0 FROM t".to_string(), Some((5, 9))),
-                ("SELECT 1".to_string(), None),
+                CompiledAssertion {
+                    sql: "SELECT count(*) > 0 FROM t".to_string(),
+                    name: Some("rows exist".to_string()),
+                },
+                CompiledAssertion {
+                    sql: "SELECT 1".to_string(),
+                    name: None,
+                },
             ],
             connection_id: Some(7),
         };
         let plan: CompiledPlan = q.into();
         assert_eq!(plan.entries.len(), 3);
         match &plan.entries[0] {
-            PlanEntry::Assertion {
-                statement,
-                source_location,
-            } => {
+            PlanEntry::Assertion { statement, name } => {
+                // The author's name rides all the way to the plan; it is
+                // what a failure will name instead of an ordinal.
+                assert_eq!(name.as_deref(), Some("rows exist"));
                 assert_eq!(statement.sql, "SELECT count(*) > 0 FROM t");
                 assert_eq!(statement.connection_id, Some(7));
-                assert_eq!(*source_location, Some((5, 9)));
             }
             other => panic!("entry 0: expected Assertion, got {:?}", other),
         }
@@ -653,7 +752,7 @@ mod tests {
             entries: vec![PlanEntry::Statement(PlanStatement::bare(
                 "CREATE TEMP TABLE __r_s (success INTEGER, name TEXT)",
             ))],
-            exit_table: None,
+            exit_probe_sql: None,
             created_objects: Vec::new(),
             typed: None,
         };
@@ -667,7 +766,7 @@ mod tests {
     fn render_does_not_double_semicolon() {
         let plan = CompiledPlan {
             entries: vec![PlanEntry::Statement(PlanStatement::bare("SELECT 1;"))],
-            exit_table: None,
+            exit_probe_sql: None,
             created_objects: Vec::new(),
             typed: None,
         };
@@ -678,7 +777,7 @@ mod tests {
     fn render_multi_entry_statement_list() {
         // A hand-constructed slice of the torture lowering: scratch shell,
         // shipped stdout! SELECT, CTAS, receipt insert. No compiler path
-        // produces this yet (Epic 3); the format itself is what's pinned.
+        // produces this yet; the format itself is what's pinned.
         let plan = CompiledPlan {
             entries: vec![
                 PlanEntry::Statement(PlanStatement {
@@ -696,7 +795,7 @@ mod tests {
                     sql: "CREATE TEMP TABLE staged AS\nSELECT * FROM source.orders WHERE order_date >= '2026-07-01'"
                         .to_string(),
                     connection_id: None,
-                    comment: Some("[arm s!] recent_orders(*) |> temp_table!(staged)".to_string()),
+                    comment: Some("[arm s!] recent_orders(*) |> temp_table!(staged(*))(*)".to_string()),
                 }),
                 PlanEntry::Statement(PlanStatement {
                     sql: "INSERT INTO __r_s SELECT 1, 'staged'".to_string(),
@@ -704,7 +803,7 @@ mod tests {
                     comment: Some("echo receipt: (success, name)".to_string()),
                 }),
             ],
-            exit_table: Some("__exit".to_string()),
+            exit_probe_sql: Some("SELECT count(*) FROM temp.__exit".to_string()),
             created_objects: Vec::new(),
             typed: None,
         };
@@ -715,7 +814,7 @@ CREATE TEMP TABLE __r_s (success INTEGER, name TEXT);
 -- [ship] stdout! #1
 SELECT * FROM source.orders WHERE order_date >= '2026-07-01';
 
--- [arm s!] recent_orders(*) |> temp_table!(staged)
+-- [arm s!] recent_orders(*) |> temp_table!(staged(*))(*)
 CREATE TEMP TABLE staged AS
 SELECT * FROM source.orders WHERE order_date >= '2026-07-01';
 
@@ -726,7 +825,7 @@ INSERT INTO __r_s SELECT 1, 'staged';";
 
     #[test]
     fn render_transaction_bracket_after_scratch_shells() {
-        // Invariant §5.6: scratch shells first, THEN the bracket. The list
+        // Scratch shells first, THEN the bracket. The list
         // representation expresses the placement; this pins how it prints.
         let plan = CompiledPlan {
             entries: vec![
@@ -745,7 +844,7 @@ INSERT INTO __r_s SELECT 1, 'staged';";
                     comment: None,
                 },
             ],
-            exit_table: Some("__exit".to_string()),
+            exit_probe_sql: Some("SELECT count(*) FROM temp.__exit".to_string()),
             created_objects: Vec::new(),
             typed: None,
         };
@@ -766,7 +865,7 @@ COMMIT;";
             entries: vec![
                 PlanEntry::Assertion {
                     statement: PlanStatement::bare("SELECT count(*) = 3 FROM t"),
-                    source_location: None,
+                    name: None,
                 },
                 PlanEntry::ShippedStatement(PlanStatement {
                     sql: "SELECT * FROM t".to_string(),
@@ -774,7 +873,7 @@ COMMIT;";
                     comment: None,
                 }),
             ],
-            exit_table: None,
+            exit_probe_sql: None,
             created_objects: Vec::new(),
             typed: None,
         };
@@ -793,9 +892,11 @@ SELECT * FROM t;";
             entries: vec![PlanEntry::Statement(PlanStatement {
                 sql: "DELETE FROM staged".to_string(),
                 connection_id: None,
-                comment: Some("[arm k!] cleanup respelled as delete!\nthe condition inlines".to_string()),
+                comment: Some(
+                    "[arm k!] cleanup respelled as delete!\nthe condition inlines".to_string(),
+                ),
             })],
-            exit_table: None,
+            exit_probe_sql: None,
             created_objects: Vec::new(),
             typed: None,
         };
@@ -809,7 +910,7 @@ DELETE FROM staged;";
     #[test]
     fn render_degenerate_plain_query() {
         // The degenerate plan of a plain query prints as one shipped entry.
-        // (`--to sql` does NOT route through this today — see render_sql docs.)
+        // (`--to sql` does NOT route through this — see render_sql docs.)
         let plan: CompiledPlan = plain_query("SELECT 1 AS a", None).into();
         assert_eq!(plan.render_sql(), "-- [ship]\nSELECT 1 AS a;");
     }

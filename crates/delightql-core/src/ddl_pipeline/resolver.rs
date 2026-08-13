@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
-use delightql_types::SqlIdentifier;
 
 use crate::pipeline::ast_resolved;
-use crate::pipeline::asts::core::expressions::boolean::BooleanExpression;
 use crate::pipeline::asts::core::expressions::domain::DomainExpression;
-use crate::pipeline::asts::core::metadata::TableName;
-use crate::pipeline::asts::core::provenance::ColumnProvenance;
+use crate::pipeline::asts::core::expressions::truth::TruthExpression;
 use crate::pipeline::asts::core::{LiteralValue, Resolved, Unresolved};
-use crate::pipeline::resolver::resolving::resolve_domain_expr_via_registry;
+use crate::pipeline::resolver::resolving::{
+    resolve_domain_expr_via_registry, resolve_truth_via_registry,
+};
 use crate::Result;
 
 use super::asts::{ColumnDef, CreateTableDef, DdlConstraint, DdlDefault};
+use crate::pipeline::asts::core::{Comparison, Membership};
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::asts::core::{Probe, ValueRow};
 
 /// Validate column references and resolve phase markers.
 ///
@@ -20,93 +22,162 @@ use super::asts::{ColumnDef, CreateTableDef, DdlConstraint, DdlDefault};
 ///   using the DQL resolver, validating Lvar references against the table's columns.
 /// - Pattern-matches `@ != null` / `@ IS NOT NULL` in Check constraints → NotNull.
 /// - Validates composite PK/UNIQUE column names exist in the table's column list.
-pub fn resolve(def: CreateTableDef<Unresolved>) -> Result<CreateTableDef<Resolved>> {
-    let available = build_available(&def.columns);
+pub fn resolve(
+    def: CreateTableDef<Unresolved>,
+) -> Result<(
+    CreateTableDef<Resolved>,
+    std::rc::Rc<crate::names::Registry>,
+)> {
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let (table, available) = build_available(&def.columns, &def.name, &identities);
 
     let mut resolved_columns = Vec::with_capacity(def.columns.len());
-    for col in def.columns {
-        let constraints = resolve_constraints(col.constraints, &available)?;
-        let default = resolve_default(col.default, &available)?;
+    for (col, metadata) in def.columns.into_iter().zip(&available) {
+        let subject = Some(col.name.as_str());
+        let constraints =
+            resolve_constraints(col.constraints, &available, &identities, false, subject)?;
+        let default = resolve_default(col.default, &available, &identities, subject)?;
         resolved_columns.push(ColumnDef {
-            name: col.name,
+            name: metadata.identity(),
             col_type: col.col_type,
             constraints,
             default,
         });
     }
 
-    // Validate and resolve table-level constraints
-    let table_constraints = resolve_constraints(def.table_constraints, &available)?;
+    let table_constraints =
+        resolve_constraints(def.table_constraints, &available, &identities, true, None)?;
 
-    // Validate composite key columns exist
-    let col_names: Vec<&str> = resolved_columns.iter().map(|c| c.name.as_str()).collect();
-    validate_composite_keys(&resolved_columns, &table_constraints, &col_names)?;
-
-    Ok(CreateTableDef {
-        name: def.name,
-        temp: def.temp,
-        columns: resolved_columns,
-        table_constraints,
-    })
+    Ok((
+        CreateTableDef {
+            name: table,
+            temp: def.temp,
+            columns: resolved_columns,
+            table_constraints,
+        },
+        identities,
+    ))
 }
 
 /// Build synthetic `ColumnMetadata` for each column so the DQL resolver
 /// can validate Lvar references within DDL expressions.
-fn build_available(columns: &[ColumnDef<Unresolved>]) -> Vec<ast_resolved::ColumnMetadata> {
-    columns
+fn build_available(
+    columns: &[ColumnDef<Unresolved>],
+    table_name: &str,
+    identities: &std::rc::Rc<crate::names::Registry>,
+) -> (crate::names::ScopeId, Vec<ast_resolved::ColumnMetadata>) {
+    let table_spelling = identities.intern(table_name, false);
+    let entity = identities.mint_entity(table_spelling);
+    let scope = identities.mint_scope(
+        crate::names::ScopeOrigin::Resolution { of: entity },
+        crate::names::Hint::User(table_spelling),
+        None,
+    );
+    let available = columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
-            ast_resolved::ColumnMetadata::new(
-                ColumnProvenance::from_table_column(
-                    SqlIdentifier::from(col.name.as_str()),
-                    TableName::Fresh,
-                    crate::pipeline::asts::core::QualificationSource::None,
-                ),
-                TableName::Fresh,
-                Some(i),
-            )
+            let published = identities.intern(col.name.as_str(), false);
+            let identity = identities.mint_column(
+                scope,
+                crate::names::ColumnOrigin::Bound { position: i as u32 },
+                Some(published),
+                crate::names::Addressing::Published,
+                crate::names::ValueFacts::default(),
+            );
+            ast_resolved::ColumnMetadata::new(identity)
         })
-        .collect()
+        .collect();
+    (scope, available)
 }
 
 /// Empty schema — DDL expressions don't reference external tables.
 struct EmptySchema;
 
 impl DatabaseSchema for EmptySchema {
-    fn get_table_columns(&self, _: Option<&str>, _: &str) -> Option<Vec<ColumnInfo>> {
-        None
+    fn get_table_columns(
+        &self,
+        _: Option<&str>,
+        _: &str,
+    ) -> crate::Result<Option<Vec<ColumnInfo>>> {
+        Ok(None)
     }
-    fn table_exists(&self, _: Option<&str>, _: &str) -> bool {
-        false
+    fn table_exists(&self, _: Option<&str>, _: &str) -> crate::Result<bool> {
+        Ok(false)
     }
 }
 
 fn resolve_constraints(
     constraints: Vec<DdlConstraint<Unresolved>>,
     available: &[ast_resolved::ColumnMetadata],
+    identities: &std::rc::Rc<crate::names::Registry>,
+    table_level: bool,
+    subject: Option<&str>,
 ) -> Result<Vec<DdlConstraint<Resolved>>> {
     let mut result = Vec::with_capacity(constraints.len());
     for c in constraints {
         match c {
             DdlConstraint::PrimaryKey { columns } => {
-                result.push(DdlConstraint::PrimaryKey { columns });
+                result.push(DdlConstraint::PrimaryKey {
+                    columns: columns
+                        .map(|names| resolve_local_columns(names, available, identities))
+                        .transpose()?,
+                });
             }
             DdlConstraint::Unique { columns } => {
-                result.push(DdlConstraint::Unique { columns });
+                result.push(DdlConstraint::Unique {
+                    columns: columns
+                        .map(|names| resolve_local_columns(names, available, identities))
+                        .transpose()?,
+                });
             }
             DdlConstraint::NotNull => {
                 result.push(DdlConstraint::NotNull);
             }
             DdlConstraint::ForeignKey { table, columns } => {
-                result.push(DdlConstraint::ForeignKey { table, columns });
+                if table_level {
+                    return Err(crate::DelightQLError::validation_error_categorized(
+                        "imprint/manifest/table_foreign_key",
+                        "A table-level foreign key cannot distinguish its local columns from its referenced columns",
+                        "attach a one-column foreign key to its local schema column, for example \
+                         (\"local_column\", \"+parent(remote_column)\", \"fk_name\"); \
+                         composite foreign keys require a dedicated syntax",
+                    ));
+                }
+                let table_spelling = identities.intern(&table, false);
+                let entity = identities.mint_entity(table_spelling);
+                let ref_table = identities.mint_scope(
+                    crate::names::ScopeOrigin::Resolution { of: entity },
+                    crate::names::Hint::User(table_spelling),
+                    None,
+                );
+                let columns = columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, name)| {
+                        let spelling = identities.intern(&name, false);
+                        identities.mint_column(
+                            ref_table,
+                            crate::names::ColumnOrigin::Bound {
+                                position: position as u32,
+                            },
+                            Some(spelling),
+                            crate::names::Addressing::Published,
+                            crate::names::ValueFacts::default(),
+                        )
+                    })
+                    .collect();
+                result.push(DdlConstraint::ForeignKey {
+                    table: ref_table,
+                    columns,
+                });
             }
             DdlConstraint::Check { expr } => {
                 // Check for NotNull pattern before resolving
                 if is_not_null_pattern(&expr) {
                     result.push(DdlConstraint::NotNull);
                 } else {
-                    let resolved = resolve_expr(expr, available)?;
+                    let resolved = resolve_truth(expr, available, identities, subject)?;
                     result.push(DdlConstraint::Check { expr: resolved });
                 }
             }
@@ -115,18 +186,50 @@ fn resolve_constraints(
     Ok(result)
 }
 
+fn resolve_local_columns(
+    names: Vec<String>,
+    available: &[ast_resolved::ColumnMetadata],
+    identities: &crate::names::Registry,
+) -> Result<Vec<crate::names::ColId>> {
+    names
+        .into_iter()
+        .map(|name| {
+            let spelling = identities.intern(&name, false);
+            let symbol = identities.canonical(spelling);
+            let matches: Vec<_> = available
+                .iter()
+                .map(ast_resolved::ColumnMetadata::identity)
+                .filter(|column| identities.published_sym(*column) == Some(symbol))
+                .collect();
+            match matches.as_slice() {
+                [column] => Ok(*column),
+                [] => Err(crate::DelightQLError::validation_error(
+                    format!("Constraint references unknown column '{name}'"),
+                    "ddl_pipeline::resolver",
+                )),
+                _ => Err(crate::DelightQLError::validation_error(
+                    format!("Constraint references ambiguous column '{name}'"),
+                    "ddl_pipeline::resolver",
+                )),
+            }
+        })
+        .collect()
+}
+
 fn resolve_default(
     default: Option<DdlDefault<Unresolved>>,
     available: &[ast_resolved::ColumnMetadata],
+    identities: &std::rc::Rc<crate::names::Registry>,
+    subject: Option<&str>,
 ) -> Result<Option<DdlDefault<Resolved>>> {
     match default {
         None => Ok(None),
         Some(DdlDefault::Value { expr }) => {
-            let resolved = resolve_expr(expr, available)?;
+            let resolved = resolve_expr(expr, available, identities, subject)?;
             Ok(Some(DdlDefault::Value { expr: resolved }))
         }
         Some(DdlDefault::Generated { expr, kind }) => {
-            let resolved = resolve_expr(expr, available)?;
+            let resolved = resolve_expr(expr, available, identities, subject)?;
             Ok(Some(DdlDefault::Generated {
                 expr: resolved,
                 kind,
@@ -135,115 +238,171 @@ fn resolve_default(
     }
 }
 
+/// Resolve a DDL expression.
+///
+/// `subject` is the column the expression is attached to, and it is what `@`
+/// MEANS here: a CHECK or DEFAULT written on a column refers to that column's
+/// value. It is resolved to the column at this boundary, so nothing carries a
+/// DDL self-reference past the pipeline that knows what it names — a
+/// table-level expression has no subject, and `@` in one refuses.
+/// Replace `@` with a reference to the column the expression is written on.
+///
+/// In a column's CHECK or DEFAULT, `@` MEANS that column's value, and the DDL
+/// text is where its name comes from — nothing is read back out of the
+/// registry. What leaves here is an ordinary authored reference, so the DDL
+/// self-reference is a form that exists only in front of this boundary.
+/// A table-level expression has no subject, and `@` in one refuses.
+fn name_the_subject_in_truth(
+    expr: TruthExpression<Unresolved>,
+    subject: Option<&str>,
+) -> Result<TruthExpression<Unresolved>> {
+    crate::pipeline::ast_transform::AstTransform::transform_boolean(
+        &mut NameSubject { subject },
+        expr,
+    )
+}
+
+fn name_the_subject(
+    expr: DomainExpression<Unresolved>,
+    subject: Option<&str>,
+) -> Result<DomainExpression<Unresolved>> {
+    crate::pipeline::ast_transform::AstTransform::transform_domain(
+        &mut NameSubject { subject },
+        expr,
+    )
+}
+
+/// The one walk that spends `@`, shared by the two body categories a DDL
+/// column carries: a DEFAULT is a value, a CHECK is a truth.
+struct NameSubject<'a> {
+    subject: Option<&'a str>,
+}
+
+impl crate::pipeline::ast_transform::AstTransform<Unresolved, Unresolved> for NameSubject<'_> {
+    crate::pipeline::ast_transform::same_phase_payload_folds!(Unresolved);
+
+    fn transform_domain(
+        &mut self,
+        expression: DomainExpression<Unresolved>,
+    ) -> Result<DomainExpression<Unresolved>> {
+        match expression {
+            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(crate::pipeline::asts::core::DomainHole::CompositionInput)) => {
+                let Some(subject) = self.subject else {
+                    return Err(crate::DelightQLError::transpilation_error(
+                        "A table-level DDL expression cannot use the value placeholder",
+                        "ddl_pipeline::resolver",
+                    ));
+                };
+                Ok(DomainExpression::Reference(Reference::Named(
+                    NamedReference(crate::pipeline::asts::core::AuthoredColumn {
+                        name: subject.into(),
+                        qualifier: None,
+                        namespace_path: crate::pipeline::asts::core::NamespacePath::empty(),
+                    }),
+                )))
+            }
+            other => crate::pipeline::ast_transform::walk_transform_domain(self, other),
+        }
+    }
+}
+
 fn resolve_expr(
     expr: DomainExpression<Unresolved>,
     available: &[ast_resolved::ColumnMetadata],
+    identities: &std::rc::Rc<crate::names::Registry>,
+    subject: Option<&str>,
 ) -> Result<DomainExpression<Resolved>> {
-    // Intercept In predicates: the DQL resolver desugars In into InnerExists
-    // (anonymous table), which is a query-time construct. In DDL context we keep
-    // In as a simple value list — no subqueries.
-    if let DomainExpression::Predicate {
-        expr: ref pred,
-        ref alias,
-    } = expr
-    {
-        if let BooleanExpression::In {
-            ref value,
-            ref set,
-            ref negated,
-        } = **pred
-        {
-            let resolved_value = resolve_expr((**value).clone(), available)?;
-            let resolved_set = set
-                .iter()
-                .map(|e| resolve_expr(e.clone(), available))
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(DomainExpression::Predicate {
-                expr: Box::new(BooleanExpression::In {
-                    value: Box::new(resolved_value),
-                    set: resolved_set,
-                    negated: *negated,
-                }),
-                alias: alias.clone(),
-            });
-        }
-    }
-
+    let expr = name_the_subject(expr, subject)?;
     let schema = EmptySchema;
-    let mut registry = crate::resolution::EntityRegistry::new(&schema);
+    let mut registry =
+        crate::resolution::EntityRegistry::new(&schema, std::rc::Rc::clone(identities));
     resolve_domain_expr_via_registry(expr, &mut registry, available, false)
 }
 
-/// Pattern-match `@ != null` → promote to NotNull.
+/// Resolve a DDL CHECK's body, which is a TRUTH.
 ///
-/// The builder produces:
-///   `Predicate(Comparison { operator: "traditional_ne", left: ValuePlaceholder, right: Literal(Null) })`
-/// for `@ != null`.
-fn is_not_null_pattern(expr: &DomainExpression<Unresolved>) -> bool {
-    match expr {
-        DomainExpression::Predicate { expr: pred, .. } => match pred.as_ref() {
-            BooleanExpression::Comparison {
-                operator,
-                left,
-                right,
-            } => {
-                let op = operator.as_str();
-                let ne = op == "traditional_ne" || op == "null_safe_ne";
-                if ne && is_value_placeholder(left) && is_null_literal(right) {
-                    return true;
-                }
-                if ne && is_null_literal(left) && is_value_placeholder(right) {
-                    return true;
-                }
-                false
+/// Membership is intercepted: the DQL resolver desugars `in` into an
+/// anonymous-table inner exists, which is a query-time construct, and a
+/// constraint has no query to put one in. Here it stays a list of values,
+/// each resolved on its own.
+fn resolve_truth(
+    expr: TruthExpression<Unresolved>,
+    available: &[ast_resolved::ColumnMetadata],
+    identities: &std::rc::Rc<crate::names::Registry>,
+    subject: Option<&str>,
+) -> Result<TruthExpression<Resolved>> {
+    let expr = name_the_subject_in_truth(expr, subject)?;
+    if let TruthExpression::Membership(Membership {
+        probe,
+        rows,
+        negated,
+        source,
+    }) = expr
+    {
+        let resolved_probe = match probe {
+            Probe::Value(value) => Probe::Value(Box::new(resolve_expr(
+                *value, available, identities, subject,
+            )?)),
+            Probe::Row(values) => {
+                Probe::Row(values.try_map(|v| resolve_expr(v, available, identities, subject))?)
             }
-            _ => false,
-        },
+        };
+        let resolved_rows = rows.try_map(|row| -> Result<_> {
+            Ok(ValueRow(row.0.try_map(|e| {
+                resolve_expr(e, available, identities, subject)
+            })?))
+        })?;
+        return Ok(TruthExpression::Membership(Membership {
+            probe: resolved_probe,
+            rows: resolved_rows,
+            negated,
+            source,
+        }));
+    }
+
+    let schema = EmptySchema;
+    let mut registry =
+        crate::resolution::EntityRegistry::new(&schema, std::rc::Rc::clone(identities));
+    resolve_truth_via_registry(expr, &mut registry, available)
+}
+
+/// Pattern-match the null-safe `@ != null` → promote to NotNull.
+///
+/// The builder produces
+///   `Comparison { operator: "null_safe_ne", left: @, right: Literal(Null) }`
+/// for `@ != null`.
+///
+/// SQL inequality (`@ !== null`) must remain a CHECK: its unknown result admits
+/// null, unlike the null-safe comparison.
+fn is_not_null_pattern(expr: &TruthExpression<Unresolved>) -> bool {
+    match expr {
+        TruthExpression::Comparison(Comparison {
+            operator,
+            left,
+            right,
+        }) => {
+            let null_safe_ne = *operator == crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual;
+            if null_safe_ne && is_value_placeholder(left) && is_null_literal(right) {
+                return true;
+            }
+            if null_safe_ne && is_null_literal(left) && is_value_placeholder(right) {
+                return true;
+            }
+            false
+        }
         _ => false,
     }
 }
 
 fn is_value_placeholder(expr: &DomainExpression<Unresolved>) -> bool {
-    matches!(expr, DomainExpression::ValuePlaceholder { .. })
+    matches!(expr, DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(crate::pipeline::asts::core::DomainHole::CompositionInput)))
 }
 
 fn is_null_literal(expr: &DomainExpression<Unresolved>) -> bool {
     matches!(
         expr,
-        DomainExpression::Literal {
-            value: LiteralValue::Null,
-            ..
-        }
+        DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Null))
     )
-}
-
-/// Validate that composite PK/UNIQUE constraint columns exist in the table.
-fn validate_composite_keys(
-    _columns: &[ColumnDef<Resolved>],
-    constraints: &[DdlConstraint<Resolved>],
-    col_names: &[&str],
-) -> Result<()> {
-    for c in constraints {
-        match c {
-            DdlConstraint::PrimaryKey {
-                columns: Some(cols),
-            }
-            | DdlConstraint::Unique {
-                columns: Some(cols),
-            } => {
-                for col in cols {
-                    if !col_names.contains(&col.as_str()) {
-                        return Err(crate::DelightQLError::validation_error(
-                            format!("Composite key references unknown column '{col}'"),
-                            "ddl_pipeline::resolver",
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -272,7 +431,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let resolved = resolve(def).unwrap();
+        let resolved = resolve(def).unwrap().0;
         assert!(matches!(
             &resolved.columns[0].constraints[0],
             DdlConstraint::PrimaryKey { columns: None }
@@ -292,7 +451,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let resolved = resolve(def).unwrap();
+        let resolved = resolve(def).unwrap().0;
         assert!(matches!(
             &resolved.columns[0].constraints[0],
             DdlConstraint::Unique { columns: None }
@@ -318,7 +477,7 @@ mod tests {
             ],
             table_constraints: vec![],
         };
-        let resolved = resolve(def).unwrap();
+        let resolved = resolve(def).unwrap().0;
         assert!(matches!(
             &resolved.columns[1].constraints[0],
             DdlConstraint::Check { .. }
@@ -360,7 +519,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let resolved = resolve(def).unwrap();
+        let resolved = resolve(def).unwrap().0;
         assert!(matches!(
             &resolved.columns[0].constraints[0],
             DdlConstraint::NotNull
@@ -390,11 +549,37 @@ mod tests {
                 columns: Some(vec!["a".into(), "b".into()]),
             }],
         };
-        let resolved = resolve(def).unwrap();
+        let resolved = resolve(def).unwrap().0;
         assert!(matches!(
             &resolved.table_constraints[0],
             DdlConstraint::PrimaryKey { columns: Some(cols) } if cols.len() == 2
         ));
+    }
+
+    #[test]
+    fn table_level_foreign_key_refuses_ambiguous_column_roles() {
+        let foreign_key =
+            crate::ddl_pipeline::builder::build_constraint("+parents(parent_code)").unwrap();
+        let def = CreateTableDef {
+            name: "children".into(),
+            temp: false,
+            columns: vec![
+                simple_column("id", "INTEGER"),
+                simple_column("parent_code", "TEXT"),
+            ],
+            table_constraints: vec![foreign_key],
+        };
+
+        let error = match resolve(def) {
+            Ok(_) => panic!("table-level foreign key should refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://imprint/manifest/table_foreign_key"
+        );
+        assert!(error.to_string().contains("local columns"));
+        assert!(error.to_string().contains("referenced columns"));
     }
 
     #[test]
@@ -413,7 +598,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let resolved = resolve(def).unwrap();
+        let resolved = resolve(def).unwrap().0;
         assert!(matches!(
             &resolved.columns[0].constraints[0],
             DdlConstraint::Check { .. }
@@ -435,7 +620,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let resolved = resolve(def).unwrap();
+        let resolved = resolve(def).unwrap().0;
         assert!(matches!(
             &resolved.columns[0].default,
             Some(DdlDefault::Value { .. })

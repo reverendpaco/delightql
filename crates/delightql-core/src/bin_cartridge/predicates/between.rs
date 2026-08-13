@@ -78,7 +78,7 @@ impl BinEntity for BetweenPredicate {
 impl SqlGeneratable for BetweenPredicate {
     fn generate_sql<'a>(
         &self,
-        args: &[crate::pipeline::sql_ast_v3::DomainExpression],
+        args: &[crate::pipeline::sql_ast::DomainExpression],
         context: &GeneratorContext<'a>,
         negated: bool,
     ) -> Result<String> {
@@ -89,10 +89,10 @@ impl SqlGeneratable for BetweenPredicate {
             ));
         }
 
-        // Use the render function provided by the transformer
-        let value_sql = (context.render_expr)(&args[0]);
-        let low_sql = (context.render_expr)(&args[1]);
-        let high_sql = (context.render_expr)(&args[2]);
+        // Use the render function provided by the generator.
+        let value_sql = (context.render_expr)(&args[0])?;
+        let low_sql = (context.render_expr)(&args[1])?;
+        let high_sql = (context.render_expr)(&args[2])?;
 
         // Generate the BETWEEN expression
         let operator = if negated { "NOT BETWEEN" } else { "BETWEEN" };

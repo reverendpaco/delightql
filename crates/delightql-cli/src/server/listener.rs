@@ -202,7 +202,7 @@ fn worker_loop(
     if let Some(path) = db_path {
         match handle.session() {
             Ok(mut session) => {
-                let mount_dql = format!("mount!(\"{}\", \"main\")", path);
+                let mount_dql = format!("mount!(\"{}\", \"main\")(*)", path);
                 if let Err(e) = crate::exec_ng::run_dql_query(&mount_dql, &mut *session) {
                     eprintln!("worker-{}: failed to mount database: {}", worker_id, e);
                     return;

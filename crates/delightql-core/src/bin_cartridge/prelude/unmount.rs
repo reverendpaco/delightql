@@ -40,7 +40,7 @@ impl BinEntity for UnmountPredicate {
                 _is_optional: false,
             }],
             // The receipt heading is the DESCRIPTOR's declaration
-            // (Phase 6 slice 2): core + ruled §8 additions.
+            // Core + ruled §8 additions.
             output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("unmount")),
         }
     }
@@ -92,10 +92,7 @@ impl EffectExecutable for UnmountPredicate {
 
 fn extract_string_literal(expr: &DomainExpression, param_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
         _ => Err(DelightQLError::database_error(
             format!(
                 "unmount!() expects '{}' to be a string literal, got: {:?}",

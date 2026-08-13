@@ -980,7 +980,6 @@ version = "0.1.0"
 name = "delightql-cabi"
 version = "0.1.0"
 dependencies = [
- "cc",
  "delightql-backends",
  "delightql-core",
  "delightql-sqlite-relay",
@@ -1007,6 +1006,7 @@ dependencies = [
  "delightql-buildinfo",
  "delightql-cli-siso",
  "delightql-core",
+ "delightql-cst",
  "delightql-formatter",
  "delightql-protocol",
  "delightql-sqlite-relay",
@@ -1054,8 +1054,8 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
- "cc",
  "colored",
+ "delightql-cst",
  "delightql-formatter",
  "delightql-macros",
  "delightql-protocol",
@@ -1075,8 +1075,18 @@ dependencies = [
  "smallvec",
  "sqlparser",
  "stacksafe",
+ "syn 2.0.106",
  "tempfile",
  "thiserror 1.0.69",
+ "tree-sitter-c2rust",
+]
+
+[[package]]
+name = "delightql-cst"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "serde_json",
  "tree-sitter-c2rust",
 ]
 
@@ -1096,9 +1106,8 @@ name = "delightql-formatter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cc",
  "clap 4.5.49",
- "serde_json",
+ "delightql-cst",
  "tree-sitter-c2rust",
 ]
 
@@ -1147,7 +1156,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tree-sitter-c2rust",
 ]
 
 [[package]]
@@ -1311,13 +1319,12 @@ checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 name = "dql-test-ball-runner"
 version = "0.1.0"
 dependencies = [
- "cc",
  "clap 4.5.49",
  "delightql-buildinfo",
+ "delightql-cst",
  "delightql-protocol",
  "rusqlite",
  "sha2",
- "tree-sitter-c2rust",
  "zstd",
 ]
 

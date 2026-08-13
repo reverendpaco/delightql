@@ -15,8 +15,8 @@ pub enum KnownLimitationType {
     // Other future limitations can be added here
 }
 
-/// The identifier badge scheme for compiler-minted error identities
-/// (URI-DESIGN.md §2): `delightql-error://<hierarchy>` ⇌
+/// The identifier badge scheme for compiler-minted error identities:
+/// `delightql-error://<hierarchy>` ⇌
 /// `https://delightql.org/uri/error/<hierarchy>`.
 pub const ERROR_URI_SCHEME: &str = "delightql-error://";
 
@@ -66,9 +66,6 @@ pub enum DelightQLError {
         context: String,
         subcategory: Option<&'static str>,
     },
-
-    #[error("Tree-sitter error: {0}")]
-    TreeSitterError(#[from] tree_sitter::LanguageError),
 
     #[error("Database operation failed: {message} - {details}")]
     DatabaseOperationError {
@@ -297,7 +294,12 @@ impl DelightQLError {
                 message,
                 ..
             } => match subcategory {
-                Some(sub) if sub.starts_with("dml/") => format!("{S}{}", sub),
+                // A diagnosis may name the identity the SEMANTIC layer would
+                // have used, had the form reached it: what the author needs
+                // is the refusal's own name, not the phase that noticed.
+                Some(sub) if sub.starts_with("dml/") || sub.starts_with("semantic/") => {
+                    format!("{S}{}", sub)
+                }
                 Some(sub) => format!("{S}parse/{}", sub),
                 None => format!("{S}parse/{}", Self::parse_subcategory(message)),
             },
@@ -343,9 +345,10 @@ impl DelightQLError {
                 Some(sub) if sub.starts_with("dml/") => format!("{S}{}", sub),
                 Some(sub) if sub.starts_with("operational/") => format!("{S}{}", sub),
                 // NB: effect-algebra discipline refusals (`effect/…`
-                // subcategories: R1–R9, registration, effect-transformer
-                // limitations) deliberately take NO carve-out — they fall to the
-                // default `semantic/` prefix below (spelled `semantic/effect/…`).
+                // subcategories: rule violations, registration,
+                // effect-transformer limitations) deliberately take NO
+                // carve-out — they fall to the default `semantic/` prefix
+                // below (spelled `semantic/effect/…`).
                 // Effect discipline IS a semantic error; the documented hierarchy
                 // is parse/semantic/runtime and `error://semantic` must keep
                 // matching them (pinned by the effects ball's
@@ -353,14 +356,13 @@ impl DelightQLError {
                 // imprint! lifecycle refusals (blueprint inertness) are their
                 // own top segment, not a query-semantic error.
                 Some(sub) if sub.starts_with("imprint/") => format!("{S}{}", sub),
-                // namespace-creation name-guard refusals (system name pool,
-                // Deviation #3) are their own top segment — a lifecycle-policy
-                // refusal, not a query semantic error.
+                // namespace-creation name-guard refusals (the reserved
+                // system name pool) are their own top segment — a
+                // lifecycle-policy refusal, not a query semantic error.
                 Some(sub) if sub.starts_with("namespace/") => format!("{S}{}", sub),
                 Some(sub) => format!("{S}semantic/{}", sub),
                 None => format!("{S}semantic/{}", Self::semantic_subcategory(message)),
             },
-            Self::TreeSitterError(_) => format!("{S}parse/tree_sitter"),
             Self::DatabaseOperationError { subcategory, .. } => match subcategory {
                 // target-side failures are their own top segment (the
                 // runtime/target double-spelling collapsed here)

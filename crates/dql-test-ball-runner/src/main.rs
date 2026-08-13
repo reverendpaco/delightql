@@ -16,17 +16,12 @@ use rusqlite::Connection;
 
 use clap::Parser;
 use sha2::{Digest, Sha256};
-use tree_sitter::Language;
 
 use delightql_protocol::socket::SocketTransport;
 use delightql_protocol::{
     AgreedOrientation, Cell, Client, ControlResult, FetchResponse, Orientation, Projection,
     QueryResponse, Session, VersionResult,
 };
-
-extern "C" {
-    fn tree_sitter_delightql_v2() -> Language;
-}
 
 #[derive(Parser)]
 #[command(
@@ -49,12 +44,46 @@ struct Args {
     /// Write results to a SQLite database (created if missing, appended to if existing)
     #[arg(long)]
     results_db: Option<PathBuf>,
+
+    /// Client threads per ball. Balls run concurrently and each also has a
+    /// server-side pool, so this is sized against the machine rather than
+    /// the core count.
+    #[arg(long, default_value_t = 2)]
+    workers: usize,
+
+    /// Seconds to wait for the server to say anything before giving up on a
+    /// test. A query that never answers is recorded as an error instead of
+    /// holding the ball open. Zero waits forever.
+    #[arg(long, default_value_t = 30)]
+    query_timeout: u64,
+}
+
+/// The per-process limits the whole run reads, set once from the arguments.
+///
+/// A global because every worker thread and every reconnect needs them and
+/// threading them through each phase would say nothing the name does not.
+static LIMITS: std::sync::OnceLock<Limits> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct Limits {
+    workers: usize,
+    query_timeout: Option<std::time::Duration>,
+}
+
+fn limits() -> Limits {
+    *LIMITS.get().expect("limits are set before any ball runs")
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum HashMode {
     String,
     Byte,
+}
+
+#[derive(Debug)]
+struct HashObservation {
+    digest: String,
+    empty_columns: Option<usize>,
 }
 
 struct TestResultRow {
@@ -78,11 +107,133 @@ struct WorkerResult {
 // Protocol helpers
 // ---------------------------------------------------------------------------
 
-fn connect_session(
+/// Whether a failure means the SESSION is unusable, as opposed to the query
+/// having been ANSWERED with a refusal.
+///
+/// A refusal is an answer: the frame arrived and the session is in step, so
+/// the next request reads its own reply. A transport failure is not — a read
+/// deadline leaves the abandoned request's response still to come, and the
+/// next reader would take that late frame for its own. Reusing the session
+/// across one is how a single silent query took the rest of a shard with it.
+fn is_transport_failure(message: &str) -> bool {
+    !message.starts_with("query error:")
+}
+
+/// What a caller is told when the link holds no session: the reconnect that
+/// would have supplied one could not reach the server. It reads as a
+/// transport failure, so the test that follows tries the reconnect again
+/// instead of inheriting a dead link in silence.
+const SESSION_LOST: &str = "session lost: the reconnect did not reach the server";
+
+/// A session and the means to replace it.
+///
+/// Every phase holds one of these rather than a bare session, because the
+/// recovery rule is the same everywhere: on a transport failure the session
+/// is discarded, a new one is taken, and the test's required state is
+/// established again on it.
+struct Link {
+    socket: PathBuf,
+    query_timeout: Option<Duration>,
+    /// Empty exactly while a replacement is being taken, and after a
+    /// reconnect that failed. The option is what makes the poisoned session
+    /// droppable BEFORE its replacement is opened; a plain field can only be
+    /// overwritten after, which keeps the dead connection alive across the
+    /// new handshake.
+    session: Option<Session<SocketTransport>>,
+    orientation: AgreedOrientation,
+}
+
+impl Link {
+    fn connect(socket: &Path, query_timeout: Option<Duration>) -> Result<Self, String> {
+        let (session, orientation) = open_session(socket, query_timeout)?;
+        Ok(Link {
+            socket: socket.to_path_buf(),
+            query_timeout,
+            session: Some(session),
+            orientation,
+        })
+    }
+
+    /// The live session, or the reason there is none.
+    fn session(&mut self) -> Result<&mut Session<SocketTransport>, String> {
+        self.session
+            .as_mut()
+            .ok_or_else(|| SESSION_LOST.to_string())
+    }
+
+    /// Discard the poisoned session and take a fresh one.
+    ///
+    /// The old session is taken and dropped BEFORE the replacement is opened,
+    /// closing its socket first. A server serves one connection per worker
+    /// until that connection closes: hold the poisoned one open across the
+    /// replacement's connect and handshake and the worker that must service
+    /// the replacement is still owned by the connection being abandoned. The
+    /// replacement then waits behind it for another deadline, and the late
+    /// response is written into a stream that is still open to read it.
+    fn renew(&mut self) -> Result<(&mut Session<SocketTransport>, AgreedOrientation), String> {
+        drop(self.session.take());
+        let (session, orientation) = open_session(&self.socket, self.query_timeout)?;
+        self.orientation = orientation;
+        Ok((self.session.insert(session), orientation))
+    }
+
+    /// Establish a test's required session state, taking a fresh session if
+    /// the current one has been poisoned.
+    ///
+    /// Setup is where a poisoned session shows itself: a late frame is what
+    /// the next reset would read. Retrying ONCE on a new session is enough —
+    /// a second failure is the server being gone, not a stale frame, and the
+    /// caller records it against the test rather than abandoning the shard.
+    fn establish(
+        &mut self,
+        setup: &dyn Fn(&mut Session<SocketTransport>, AgreedOrientation) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let orientation = self.orientation;
+        let first = match self.session.as_mut() {
+            Some(session) => setup(session, orientation),
+            None => Err(SESSION_LOST.to_string()),
+        };
+        match first {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                let (session, orientation) = self
+                    .renew()
+                    .map_err(|e| format!("{}; reconnect failed: {}", first, e))?;
+                setup(session, orientation)
+                    .map_err(|e| format!("{}; after reconnect: {}", first, e))
+            }
+        }
+    }
+
+    /// Answer a test's outcome, renewing the session first when the failure
+    /// was the transport's. The row is the caller's to record — exactly one,
+    /// whether the query answered, refused, or went silent.
+    fn recover_if_poisoned(&mut self, outcome: &Result<HashObservation, String>) {
+        if let Err(message) = outcome {
+            if is_transport_failure(message) {
+                eprintln!("runner: session lost ({}), reconnecting", message);
+                if let Err(e) = self.renew() {
+                    eprintln!("runner: reconnect failed: {}", e);
+                }
+            }
+        }
+    }
+}
+
+fn open_session(
     socket_path: &Path,
+    query_timeout: Option<Duration>,
 ) -> Result<(Session<SocketTransport>, AgreedOrientation), String> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("connect to {}: {}", socket_path.display(), e))?;
+    // A deadline on READS, which is what a silent server looks like from
+    // here. It bounds the wait between bytes rather than the whole query, so
+    // it stops a hang without cutting a slow-but-answering stream short.
+    if let Some(timeout) = query_timeout {
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| format!("set read timeout: {}", e))?;
+    }
     let transport = SocketTransport::new(stream);
     let client = Client::new(transport);
 
@@ -136,7 +287,7 @@ fn send_mount(
     db_filename: &str,
     rows_orientation: AgreedOrientation,
 ) -> Result<(), String> {
-    let mount_query = format!("mount!(\"{}\",\"main\")", db_filename);
+    let mount_query = format!("mount!(\"{}\",\"main\")(*)", db_filename);
     let handle = match session
         .query(mount_query.as_bytes().to_vec())
         .map_err(|e| format!("mount: {}", e.message))?
@@ -330,21 +481,30 @@ fn compute_byte_hash(rows: &[Vec<Cell>]) -> String {
 // Query helpers
 // ---------------------------------------------------------------------------
 
+fn query_error(identity: &[u8], message: &[u8]) -> String {
+    let identity = String::from_utf8_lossy(identity);
+    let message = String::from_utf8_lossy(message);
+    if identity.is_empty() {
+        format!("query error: {message}")
+    } else {
+        format!("query error: {identity}: {message}")
+    }
+}
+
 fn send_query_and_hash(
     session: &mut Session<SocketTransport>,
     query_text: &str,
     rows_orientation: AgreedOrientation,
-) -> Result<String, String> {
-    let handle = match session
+) -> Result<HashObservation, String> {
+    let (handle, column_count) = match session
         .query(query_text.as_bytes().to_vec())
         .map_err(|e| format!("query: {}", e.message))?
     {
-        QueryResponse::Header { handle, .. } => handle,
-        QueryResponse::Error { message, .. } => {
-            return Err(format!(
-                "query error: {}",
-                String::from_utf8_lossy(&message)
-            ));
+        QueryResponse::Header { handle, dimensions } => (handle, dimensions.len()),
+        QueryResponse::Error {
+            identity, message, ..
+        } => {
+            return Err(query_error(&identity, &message));
         }
     };
     let mut all_rows: Vec<Vec<Cell>> = Vec::new();
@@ -364,24 +524,26 @@ fn send_query_and_hash(
         }
     }
     let _ = session.close(handle);
-    Ok(compute_data_hash(&all_rows))
+    Ok(HashObservation {
+        digest: compute_data_hash(&all_rows),
+        empty_columns: all_rows.is_empty().then_some(column_count),
+    })
 }
 
 fn send_query_and_bhash(
     session: &mut Session<SocketTransport>,
     query_text: &str,
     rows_orientation: AgreedOrientation,
-) -> Result<String, String> {
-    let handle = match session
+) -> Result<HashObservation, String> {
+    let (handle, column_count) = match session
         .query(query_text.as_bytes().to_vec())
         .map_err(|e| format!("query: {}", e.message))?
     {
-        QueryResponse::Header { handle, .. } => handle,
-        QueryResponse::Error { message, .. } => {
-            return Err(format!(
-                "query error: {}",
-                String::from_utf8_lossy(&message)
-            ));
+        QueryResponse::Header { handle, dimensions } => (handle, dimensions.len()),
+        QueryResponse::Error {
+            identity, message, ..
+        } => {
+            return Err(query_error(&identity, &message));
         }
     };
     let mut all_rows: Vec<Vec<Cell>> = Vec::new();
@@ -401,7 +563,10 @@ fn send_query_and_bhash(
         }
     }
     let _ = session.close(handle);
-    Ok(compute_byte_hash(&all_rows))
+    Ok(HashObservation {
+        digest: compute_byte_hash(&all_rows),
+        empty_columns: all_rows.is_empty().then_some(column_count),
+    })
 }
 
 fn send_query_and_hash_dispatch(
@@ -409,34 +574,45 @@ fn send_query_and_hash_dispatch(
     query_text: &str,
     rows_orientation: AgreedOrientation,
     mode: HashMode,
-) -> Result<String, String> {
+) -> Result<HashObservation, String> {
     match mode {
         HashMode::String => send_query_and_hash(session, query_text, rows_orientation),
         HashMode::Byte => send_query_and_bhash(session, query_text, rows_orientation),
     }
 }
 
+/// The AUTHORED extent of each query in a submission, in order.
+///
+/// The sequence root draws these boundaries; a text scan for a separator would
+/// have to know which newline is inside a template and which ends a query — a
+/// question the parse has already answered.
+/// A DEFECTIVE SOURCE HAS NO BOUNDARIES, so it is ONE submission and the
+/// server answers it. The runner splits where the sequence root draws lines
+/// and has no parse teaching of its own to offer — inventing one here would
+/// hide the compiler's, which is the answer the test is about.
 fn split_queries(source: &str) -> Result<Vec<String>, String> {
-    let mut parser = tree_sitter::Parser::new();
-    let language = unsafe { tree_sitter_delightql_v2() };
-    parser
-        .set_language(&language)
-        .map_err(|e| format!("language: {e}"))?;
+    use delightql_cst::cst;
 
-    let tree = parser
-        .parse(source, None)
-        .ok_or("tree-sitter parse failed")?;
-    let root = tree.root_node();
-
-    if root.has_error() {
-        return Err(find_first_error(&root, source));
+    let tree = delightql_cst::Parser::new().parse_query_sequence(source);
+    if tree.has_defects() {
+        return Ok(vec![source.to_string()]);
     }
-
-    let mut cursor = root.walk();
-    let queries: Vec<String> = root
-        .children(&mut cursor)
-        .filter(|c| c.kind() == "query")
-        .map(|c| source[c.start_byte()..c.end_byte()].to_string())
+    let Some(cst::SourceFileChild::QuerySequenceRoot(root)) = tree.root_branch() else {
+        return Ok(vec![source.to_string()]);
+    };
+    let Some(sequence) = root.children().find_map(|child| match child {
+        cst::QuerySequenceRootChild::QuerySequence(sequence) => Some(sequence),
+        cst::QuerySequenceRootChild::QuerySequenceHeader(_) => None,
+    }) else {
+        return Ok(vec![source.to_string()]);
+    };
+    let queries: Vec<String> = sequence
+        .children()
+        .filter_map(|child| match child {
+            cst::QuerySequenceChild::Relex(relex) => tree.byte_range(relex),
+            cst::QuerySequenceChild::Effrelex(effrelex) => tree.byte_range(effrelex),
+        })
+        .map(|range| source[range].to_string())
         .collect();
 
     if queries.is_empty() {
@@ -445,44 +621,23 @@ fn split_queries(source: &str) -> Result<Vec<String>, String> {
     Ok(queries)
 }
 
-fn find_first_error(node: &tree_sitter::Node, source: &str) -> String {
-    if node.kind() == "ERROR" || node.is_error() {
-        let start = node.start_position();
-        let snippet: String = source[node.start_byte()..node.end_byte()]
-            .chars()
-            .take(40)
-            .collect();
-        return format!(
-            "syntax error at line {}:{}: {}",
-            start.row + 1,
-            start.column + 1,
-            snippet
-        );
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.has_error() {
-            let msg = find_first_error(&child, source);
-            if !msg.is_empty() {
-                return msg;
-            }
-        }
-    }
-    "syntax error (unknown location)".into()
-}
-
 fn send_sequential_and_hash(
     session: &mut Session<SocketTransport>,
     dql: &str,
     rows_orientation: AgreedOrientation,
     mode: HashMode,
-) -> Result<String, String> {
+) -> Result<HashObservation, String> {
     let queries = split_queries(dql)?;
-    let mut last_hash = String::new();
+    let mut last = None;
     for q in &queries {
-        last_hash = send_query_and_hash_dispatch(session, q, rows_orientation, mode)?;
+        last = Some(send_query_and_hash_dispatch(
+            session,
+            q,
+            rows_orientation,
+            mode,
+        )?);
     }
-    Ok(last_hash)
+    last.ok_or_else(|| "no queries found in source".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -512,10 +667,27 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+fn observed_baseline(
+    observation: &HashObservation,
+    hashtype: Option<&str>,
+    preserve_empty_shape: bool,
+) -> String {
+    if preserve_empty_shape {
+        if let Some(columns) = observation.empty_columns {
+            return format!("EMPTY:{columns}");
+        }
+    }
+    if hashtype == Some("shash") {
+        observation.digest.clone()
+    } else {
+        hex2hash(&observation.digest)
+    }
+}
+
 fn judge(
     ball_name: &str,
     test_name: &str,
-    exec_result: Result<String, String>,
+    exec_result: Result<HashObservation, String>,
     expected_hash: &Option<String>,
     hashtype: &Option<String>,
     elapsed: Duration,
@@ -524,18 +696,28 @@ fn judge(
     let dur = format_duration(elapsed);
     let duration_ms = elapsed.as_secs_f64() * 1000.0;
     let is_error_test = hashtype.as_deref() == Some("error");
+    let empty_error_expectation = is_error_test
+        && expected_hash
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty();
 
-    let (status, detail) = if is_error_test {
+    let (status, detail) = if empty_error_expectation {
+        ("ERROR", "empty refusal expectation".to_string())
+    } else if is_error_test {
+        let pattern = expected_hash
+            .as_deref()
+            .expect("a non-empty error expectation was checked above");
         match &exec_result {
             Err(e) => {
-                if let Some(pattern) = expected_hash.as_ref().filter(|p| !p.is_empty()) {
-                    if e.contains(pattern.as_str()) {
-                        ("PASS", String::new())
-                    } else {
-                        ("FAIL", format!("error expected to contain '{}' but got: {}", pattern, e))
-                    }
-                } else {
+                if e.contains(pattern) {
                     ("PASS", String::new())
+                } else {
+                    (
+                        "FAIL",
+                        format!("error expected to contain '{}' but got: {}", pattern, e),
+                    )
                 }
             }
             Ok(_) => ("FAIL", "expected error but query succeeded".to_string()),
@@ -544,15 +726,16 @@ fn judge(
         match &exec_result {
             Ok(actual_hex) => match expected_hash {
                 None => {
-                    let actual_short = hex2hash(actual_hex);
+                    let actual_short =
+                        observed_baseline(actual_hex, hashtype.as_deref(), false);
                     ("MEH", actual_short)
                 }
                 Some(expected) => {
-                    let actual_short = if hashtype.as_deref() == Some("shash") {
-                        actual_hex.clone()
-                    } else {
-                        hex2hash(actual_hex)
-                    };
+                    let actual_short = observed_baseline(
+                        actual_hex,
+                        hashtype.as_deref(),
+                        expected.starts_with("EMPTY:"),
+                    );
                     if *expected == actual_short {
                         ("PASS", String::new())
                     } else {
@@ -801,10 +984,7 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
     let init_map = Arc::new(init_map);
     let tmpdir = Arc::new(tmpdir);
 
-    let max_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1);
+    let max_workers = limits().workers.max(1);
 
     let socket_owned = socket_path.to_owned();
 
@@ -880,7 +1060,8 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                 let sef_runs = Arc::clone(&sef_runs);
 
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
-                    let (mut session, rows_orientation) = connect_session(&socket)?;
+                    let mut link = Link::connect(&socket, limits().query_timeout)?;
+                    let rows_orientation = link.orientation;
                     let mut result = WorkerResult {
                         passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
                     };
@@ -897,52 +1078,47 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                             needs_remount = true;
                         }
                         for &idx in &batch {
+                            let run = &sef_runs[idx];
+                            let t0 = Instant::now();
+
                             // (Re)mount if needed (start of batch or after reconnect)
                             if needs_remount {
                                 if let Some(ref mp) = current_mount_path {
-                                    if send_reset(&mut session).is_err()
-                                        || send_mount(&mut session, mp, rows_orientation).is_err()
-                                    {
-                                        // Connection dead on setup — reconnect
-                                        match connect_session(&socket) {
-                                            Ok((s, _)) => { session = s; }
-                                            Err(_) => continue,
-                                        }
-                                        if send_reset(&mut session).is_err()
-                                            || send_mount(&mut session, mp, rows_orientation).is_err()
-                                        {
-                                            continue;
-                                        }
+                                    let mp = mp.clone();
+                                    if let Err(e) = link.establish(&move |session, orientation| {
+                                        send_reset(session)?;
+                                        send_mount(session, &mp, orientation)
+                                    }) {
+                                        // The test still answers for itself:
+                                        // a setup that could not be made to
+                                        // hold is this test's error, not a
+                                        // reason to drop the rest of the shard.
+                                        judge(&ball_name, &run.name, Err(format!("session setup: {}", e)),
+                                              &run.hash, &run.hashtype, t0.elapsed(), &mut result);
+                                        continue;
                                     }
                                 }
                                 needs_remount = false;
                             }
 
-                            let run = &sef_runs[idx];
                             let hash_mode = match run.hashtype.as_deref() {
                                 Some("bhash") => HashMode::Byte,
                                 _ => HashMode::String,
                             };
-                            let t0 = Instant::now();
                             let exec = if run.sequential {
-                                send_sequential_and_hash(&mut session, &run.dql, rows_orientation, hash_mode)
+                                link.session().and_then(|session| {
+                                    send_sequential_and_hash(session, &run.dql, rows_orientation, hash_mode)
+                                })
                             } else {
-                                send_query_and_hash_dispatch(&mut session, &run.dql, rows_orientation, hash_mode)
+                                link.session().and_then(|session| {
+                                    send_query_and_hash_dispatch(session, &run.dql, rows_orientation, hash_mode)
+                                })
                             };
                             let elapsed = t0.elapsed();
 
-                            // If the query failed with a connection-level error,
-                            // reconnect for subsequent queries. Query-level errors
-                            // (prefixed "query error:") don't break the connection.
-                            if let Err(ref e) = exec {
-                                let is_query_error = e.starts_with("query error:");
-                                if !is_query_error {
-                                    eprintln!("runner: connection lost ({}), reconnecting", e);
-                                    if let Ok((s, _)) = connect_session(&socket) {
-                                        session = s;
-                                        needs_remount = true;
-                                    }
-                                }
+                            link.recover_if_poisoned(&exec);
+                            if exec.as_ref().err().is_some_and(|e| is_transport_failure(e)) {
+                                needs_remount = true;
                             }
 
                             judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
@@ -977,7 +1153,8 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                 let tmpdir = Arc::clone(&tmpdir);
 
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
-                    let (mut session, rows_orientation) = connect_session(&socket)?;
+                    let mut link = Link::connect(&socket, limits().query_timeout)?;
+                    let rows_orientation = link.orientation;
                     let mut result = WorkerResult {
                         passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
                     };
@@ -1007,26 +1184,41 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                             None
                         };
 
-                        send_reset(&mut session)?;
-
                         let cwd = match work_dir {
                             Some(ref dir) => dir.to_string_lossy().into_owned(),
                             None => tmpdir.to_string_lossy().into_owned(),
                         };
-                        send_cwd(&mut session, &cwd)?;
-
                         let mount_path = db_paths
                             .get(&run.db_id)
-                            .ok_or_else(|| format!("no path for db_id {}", run.db_id))?;
-                        send_mount(&mut session, &mount_path.to_string_lossy(), rows_orientation)?;
+                            .ok_or_else(|| format!("no path for db_id {}", run.db_id))?
+                            .to_string_lossy()
+                            .into_owned();
 
                         let hash_mode = match run.hashtype.as_deref() {
                             Some("bhash") => HashMode::Byte,
                             _ => HashMode::String,
                         };
                         let t0 = Instant::now();
-                        let exec = send_sequential_and_hash(&mut session, &run.dql, rows_orientation, hash_mode);
+
+                        // Reset, CWD and mount are this test's required state.
+                        // A failure to establish them is the TEST's error —
+                        // it was once a `?` that took every remaining test in
+                        // the shard out of the reported totals with it.
+                        let setup = link.establish(&move |session, orientation| {
+                            send_reset(session)?;
+                            send_cwd(session, &cwd)?;
+                            send_mount(session, &mount_path, orientation)
+                        });
+                        let exec = match setup {
+                            Ok(()) => link.session().and_then(|session| {
+                                send_sequential_and_hash(
+                                    session, &run.dql, rows_orientation, hash_mode,
+                                )
+                            }),
+                            Err(e) => Err(format!("session setup: {}", e)),
+                        };
                         let elapsed = t0.elapsed();
+                        link.recover_if_poisoned(&exec);
                         judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
 
                         if let Some(ref dir) = work_dir {
@@ -1062,7 +1254,8 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                 let dml_runs = Arc::clone(&dml_runs);
 
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
-                    let (mut session, rows_orientation) = connect_session(&socket)?;
+                    let mut link = Link::connect(&socket, limits().query_timeout)?;
+                    let rows_orientation = link.orientation;
                     let mut result = WorkerResult {
                         passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
                     };
@@ -1095,9 +1288,8 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                                     .map_err(|e| format!("create init db: {}", e))?;
                                 init_conn.execute_batch(sql)
                                     .map_err(|e| format!("init sql {}: {}", init_name, e))?;
-                                // bugs/nullmount Phase 1: mount! is now
-                                // attach-only and rejects empty/headerless
-                                // files. A schema-less init (e.g. a
+                                // mount! is attach-only and rejects
+                                // empty/headerless files. A schema-less init (e.g. a
                                 // comment-only main.sql, as the companion
                                 // imprint/define tests use) leaves a 0-byte
                                 // db; force the SQLite header page out so the
@@ -1122,17 +1314,32 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                             }
                         }
 
-                        send_reset(&mut session)?;
-                        send_cwd(&mut session, &isolate_dir.to_string_lossy())?;
-                        send_mount(&mut session, &mount_db, rows_orientation)?;
-
                         let hash_mode = match run.hashtype.as_deref() {
                             Some("bhash") => HashMode::Byte,
                             _ => HashMode::String,
                         };
+                        let cwd = isolate_dir.to_string_lossy().into_owned();
+                        let mount_db = mount_db.clone();
                         let t0 = Instant::now();
-                        let exec = send_sequential_and_hash(&mut session, &run.dql, rows_orientation, hash_mode);
+
+                        // Same law as DDL: the state this test needs is this
+                        // test's to answer for, on a session that is replaced
+                        // when its transport has failed.
+                        let setup = link.establish(&move |session, orientation| {
+                            send_reset(session)?;
+                            send_cwd(session, &cwd)?;
+                            send_mount(session, &mount_db, orientation)
+                        });
+                        let exec = match setup {
+                            Ok(()) => link.session().and_then(|session| {
+                                send_sequential_and_hash(
+                                    session, &run.dql, rows_orientation, hash_mode,
+                                )
+                            }),
+                            Err(e) => Err(format!("session setup: {}", e)),
+                        };
                         let elapsed = t0.elapsed();
+                        link.recover_if_poisoned(&exec);
                         judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
 
                         let _ = std::fs::remove_dir_all(&isolate_dir);
@@ -1166,6 +1373,14 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
 
 fn send_shutdown(socket_path: &Path) -> Result<(), String> {
     let stream = UnixStream::connect(socket_path).map_err(|e| format!("connect: {}", e))?;
+    // Shutdown must not become the wait the query deadline just removed. A
+    // server still working through a request the client abandoned answers
+    // this handshake late or not at all, and the runner's last act would
+    // otherwise be to block on it forever.
+    if let Some(timeout) = limits().query_timeout {
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(timeout));
+    }
     let transport = SocketTransport::new(stream);
     let client = Client::new(transport);
     let mut session = match client
@@ -1186,8 +1401,338 @@ fn send_shutdown(socket_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A server with ONE bounded worker: it answers the handshake, goes SILENT on
+/// the first connection's query, and cannot service the next connection until
+/// the first one is CLOSED.
+///
+/// That bound is the topology under test, not an incidental simplification.
+/// `dql server` gives a connection a worker until the connection closes, so a
+/// client that holds a poisoned connection open while opening its replacement
+/// is queued behind itself: the replacement is connected but never serviced.
+/// A stub that spawns a thread per connection cannot show this — every
+/// replacement handshake succeeds there regardless of what the client still
+/// holds open.
+#[cfg(test)]
+fn spawn_bounded_worker_server(socket: &Path) -> std::thread::JoinHandle<()> {
+    use std::os::unix::net::UnixListener;
+
+    let listener = UnixListener::bind(socket).expect("bind stub socket");
+    std::thread::spawn(move || {
+        // Serial, in the accepting thread: the one worker. Later connections
+        // sit in the listen backlog — connected, as far as the client can
+        // tell, and unserved.
+        for (connection, stream) in listener.incoming().flatten().enumerate() {
+            serve_stub_connection(connection, stream);
+        }
+    })
+}
+
+#[cfg(test)]
+fn serve_stub_connection(connection: usize, mut stream: UnixStream) {
+    use delightql_protocol::socket::{read_client_message, write_server_message};
+    use delightql_protocol::{ClientMessage, ClientTerm, Dimension, ServerMessage, ServerTerm};
+
+    let mut buf = Vec::new();
+    loop {
+        let Ok(message) = read_client_message(&mut stream, &mut buf) else {
+            return;
+        };
+        let ClientMessage::Data(term) = message else {
+            // Control ops (reset, cwd) are acknowledged so a caller's state
+            // restoration can complete on the fresh session.
+            let ok = ServerMessage::Control(delightql_protocol::ControlResult::Ok);
+            if write_server_message(&mut stream, &ok).is_err() {
+                return;
+            }
+            continue;
+        };
+        let reply = match term {
+            ClientTerm::Version { .. } => ServerTerm::Version {
+                max_message_size: 1_000_000,
+                protocol_version: b"relay0".to_vec(),
+                lease_ms: 300_000,
+                orientations: vec![Orientation::Rows],
+            },
+            ClientTerm::Query { .. } if connection == 0 => {
+                // The silence under test. A worker inside a query that
+                // outlives the client's deadline answers nothing else on that
+                // connection either — the reset the next test sends is read by
+                // no one — so everything after this goes unanswered. The
+                // connection stays OPEN: a closed socket is a different
+                // failure, and the client's deadline is what must answer here.
+                // These reads return only when the CLIENT closes the
+                // connection, which is what frees this bounded worker.
+                while read_client_message(&mut stream, &mut buf).is_ok() {}
+                return;
+            }
+            ClientTerm::Query { .. } => ServerTerm::Header {
+                handle: b"h1".to_vec(),
+                dimensions: vec![Dimension {
+                    position: 1,
+                    name: b"k".to_vec(),
+                    descriptor: b"INTEGER".to_vec(),
+                }],
+            },
+            ClientTerm::Fetch { .. } => ServerTerm::End,
+            _ => ServerTerm::Ok { count_hint: 0 },
+        };
+        if write_server_message(&mut stream, &ServerMessage::Data(reply)).is_err() {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{
+        compute_data_hash, judge, observed_baseline, query_error, HashObservation, WorkerResult,
+    };
+
+    fn empty(columns: usize) -> HashObservation {
+        HashObservation {
+            digest: compute_data_hash(&[]),
+            empty_columns: Some(columns),
+        }
+    }
+
+    fn worker_result() -> WorkerResult {
+        WorkerResult {
+            passed: 0,
+            failed: 0,
+            errors: 0,
+            meh: 0,
+            output: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// A link whose silent query has just answered as a transport failure,
+    /// against a server with one bounded worker still owned by that
+    /// connection. The elapsed wait is returned with it: it is the deadline,
+    /// and what follows must not spend another.
+    fn poisoned_link_against_a_bounded_worker(
+        socket: &std::path::Path,
+        deadline: Duration,
+    ) -> (super::Link, Duration, String) {
+        use super::{is_transport_failure, send_query_and_hash, spawn_bounded_worker_server, Link};
+
+        let _ = std::fs::remove_file(socket);
+        // The handle is dropped: the worker thread outlives the test by
+        // design, blocked on an accept nothing will answer.
+        let _server = spawn_bounded_worker_server(socket);
+
+        let mut link = Link::connect(socket, Some(deadline)).expect("connect to stub");
+        let orientation = link.orientation;
+
+        let started = std::time::Instant::now();
+        let first = send_query_and_hash(
+            link.session().expect("a fresh link holds a session"),
+            "k(*)",
+            orientation,
+        );
+        let waited = started.elapsed();
+        let message = first.expect_err("a silent server cannot produce a hash");
+        assert!(
+            is_transport_failure(&message),
+            "a silent server is a transport failure, not a refusal: {message}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the deadline must bound the wait, waited {waited:?}"
+        );
+
+        (link, waited, message)
+    }
+
+    /// A silent request is reported ONCE and the shard keeps going, through
+    /// the immediate road every phase loop takes after a query answers.
+    ///
+    /// The server's one worker is still owned by the poisoned connection, so
+    /// the replacement is serviced only because `renew` drops that connection
+    /// before opening it. Opening first queues the replacement behind the very
+    /// connection it replaces, and it waits there for a second deadline: that
+    /// is what the timing assertion catches.
+    #[test]
+    fn recovery_releases_the_bounded_worker_before_taking_a_replacement() {
+        use super::send_query_and_hash;
+        use std::path::PathBuf;
+
+        let socket = PathBuf::from(format!(
+            "/tmp/dql-runner-recovery-{}-{}.sock",
+            std::process::id(),
+            line!()
+        ));
+        let deadline = Duration::from_millis(300);
+        let (mut link, waited, message) =
+            poisoned_link_against_a_bounded_worker(&socket, deadline);
+
+        let mut result = super::WorkerResult {
+            passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
+        };
+        let outcome: Result<super::HashObservation, String> = Err(message);
+
+        // The road all three phase loops take once a query has answered:
+        // recover, record the row, run the next test.
+        let recovery = std::time::Instant::now();
+        link.recover_if_poisoned(&outcome);
+
+        // Exactly one row for that test, and it is an error.
+        judge("ball", "silent", outcome, &None, &None, waited, &mut result);
+        assert_eq!(result.rows.len(), 1, "the timed-out test reports one row");
+        assert_eq!(result.rows[0].status, "ERROR");
+        assert_eq!(result.errors, 1);
+
+        let orientation = link.orientation;
+        let second = send_query_and_hash(
+            link.session()
+                .expect("recovery leaves a session to run the next test on"),
+            "k(*)",
+            orientation,
+        );
+        let recovered_in = recovery.elapsed();
+        assert!(
+            second.is_ok(),
+            "the next test must run on the fresh session: {second:?}"
+        );
+        assert!(
+            recovered_in < deadline,
+            "the replacement must not wait on a second deadline, took {recovered_in:?}"
+        );
+
+        judge("ball", "after", second, &None, &None, Duration::from_millis(1), &mut result);
+        assert_eq!(result.rows.len(), 2, "the following test reports its own row");
+        assert_eq!(result.errors, 1, "recovery adds no second error");
+
+        drop(link);
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// The same release, through the setup road the DDL and DML loops take.
+    ///
+    /// `establish` finds the poisoned session under it when the reset it
+    /// sends goes unanswered, and the fresh session it takes must be one the
+    /// bounded worker can actually serve. Carrying the poisoned session into
+    /// the retry is how a `?` on the next reset takes every remaining test in
+    /// the shard out of the reported totals.
+    #[test]
+    fn established_state_lands_on_a_session_the_bounded_worker_can_serve() {
+        use super::send_query_and_hash;
+        use std::path::PathBuf;
+
+        let socket = PathBuf::from(format!(
+            "/tmp/dql-runner-recovery-{}-{}.sock",
+            std::process::id(),
+            line!()
+        ));
+        let deadline = Duration::from_millis(300);
+        let (mut link, _waited, _message) =
+            poisoned_link_against_a_bounded_worker(&socket, deadline);
+
+        // The reset probe spends one deadline on the poisoned session before
+        // `establish` gives up on it; the reconnect and retry after that must
+        // spend none.
+        let started = std::time::Instant::now();
+        link.establish(&|session, _| super::send_reset(session))
+            .expect("required state is re-established on a fresh session");
+        let established_in = started.elapsed();
+        assert!(
+            established_in < deadline * 2,
+            "only the probe may wait on a deadline, took {established_in:?}"
+        );
+
+        let orientation = link.orientation;
+        let next = send_query_and_hash(
+            link.session()
+                .expect("establish leaves a session to run the test on"),
+            "k(*)",
+            orientation,
+        );
+        assert!(
+            next.is_ok(),
+            "the test must run on the fresh session: {next:?}"
+        );
+
+        drop(link);
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn query_refusal_preserves_its_structured_identity() {
+        assert_eq!(
+            query_error(
+                b"delightql-error://semantic/setop/correspondence/ambiguous",
+                b"more than one column corresponds"
+            ),
+            "query error: delightql-error://semantic/setop/correspondence/ambiguous: more than one column corresponds"
+        );
+    }
+
+    #[test]
+    fn shaped_empty_baseline_preserves_column_count() {
+        assert_eq!(observed_baseline(&empty(7), Some("hash"), true), "EMPTY:7");
+    }
+
+    #[test]
+    fn unshaped_empty_baseline_observes_the_raw_hash() {
+        // A zero-row result hashes the same whatever its width, so a baseline
+        // that did not ask for the shape is compared against that one value.
+        assert_eq!(
+            observed_baseline(&empty(7), Some("hash"), false),
+            "5yt78PzT"
+        );
+    }
+
+    #[test]
+    fn empty_error_expectation_is_an_instrument_error() {
+        let mut result = worker_result();
+        judge(
+            "ball",
+            "empty-error-baseline",
+            Err("an unrelated refusal".to_string()),
+            &Some(" \n".to_string()),
+            &Some("error".to_string()),
+            Duration::from_secs(0),
+            &mut result,
+        );
+
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.rows[0].status, "ERROR");
+        assert_eq!(result.rows[0].detail, "empty refusal expectation");
+    }
+
+    #[test]
+    fn nonempty_error_expectation_still_matches_the_refusal() {
+        let mut result = worker_result();
+        judge(
+            "ball",
+            "specific-error-baseline",
+            Err("prefix: named refusal".to_string()),
+            &Some("named refusal".to_string()),
+            &Some("error".to_string()),
+            Duration::from_secs(0),
+            &mut result,
+        );
+
+        assert_eq!(result.passed, 1);
+        assert_eq!(result.errors, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.rows[0].status, "PASS");
+    }
+}
+
 fn main() {
     let args = Args::parse();
+    LIMITS
+        .set(Limits {
+            workers: args.workers,
+            query_timeout: (args.query_timeout > 0)
+                .then(|| std::time::Duration::from_secs(args.query_timeout)),
+        })
+        .unwrap_or_else(|_| unreachable!("limits are set once, before any ball runs"));
 
     if args.balls.is_empty() {
         eprintln!("dql-test-ball-runner: no ball files specified");

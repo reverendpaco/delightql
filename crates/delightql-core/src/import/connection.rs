@@ -4,8 +4,6 @@
 //
 // This module handles registering database connections in the bootstrap metadata.
 // Connections represent physical database connections that cartridges can reference.
-//
-// See: documentation/design/ddl/SYS-NS-CARTRIDGE-CONNECTION.md
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -83,10 +81,10 @@ pub fn register_connection(
     connection_type: i32,
     description: &str,
 ) -> Result<i32> {
-    // Structural guarantee (SYS-NAMESPACE-TAXONOMY.md credential-sourcing
-    // policy): credentials never enter the connection catalog. Enforced here,
-    // at the single core sink, so every host inherits it — not at a frontend
-    // that a new host could bypass. The message deliberately does NOT echo the
+    // Structural guarantee (the credential-sourcing policy): credentials
+    // never enter the connection catalog. Enforced here, at the single
+    // core sink, so every host inherits it — not at a frontend that a
+    // new host could bypass. The message deliberately does NOT echo the
     // offending URI (that would re-leak the password into logs/errors).
     if resource_uri_embeds_credentials(resource_uri) {
         anyhow::bail!(

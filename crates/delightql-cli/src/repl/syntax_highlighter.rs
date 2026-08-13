@@ -10,12 +10,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
-use tree_sitter::{Language, Parser};
+use delightql_cst::cst::{self, TypedNode};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
-
-extern "C" {
-    fn tree_sitter_delightql_v2() -> Language;
-}
 
 /// ANSI color codes
 const BLUE: &str = "\x1b[34m";
@@ -108,7 +104,7 @@ fn highlight_from_query_with_theme<'a>(
 ) -> Cow<'a, str> {
     use crate::theme::ThemeConfig;
 
-    let language = unsafe { tree_sitter_delightql_v2() };
+    let language = super::dql_language();
 
     // Create highlighter configuration
     let mut config = match HighlightConfiguration::new(
@@ -238,74 +234,29 @@ fn highlight_from_query_with_theme<'a>(
     Cow::Owned(result)
 }
 
-/// Original hardcoded highlighting (default)
+/// Original hardcoded highlighting (default).
+///
+/// Runs on every keystroke over text that is usually INCOMPLETE, so it reads a
+/// defective tree on purpose — a walk over what recovery proved, taking spans
+/// from the typed nodes rather than scanning the line for characters. A byte
+/// scan for `|>` would colour the two characters inside a string literal.
 fn highlight_hardcoded(line: &str) -> Cow<'_, str> {
-    // Use tree-sitter directly to get CST even with errors
-    // This allows highlighting to work even with incomplete input
-    let mut parser = Parser::new();
-    let language = unsafe { tree_sitter_delightql_v2() };
+    let tree = super::parse_line(line);
 
-    if parser.set_language(&language).is_err() {
-        return highlight_pipes_simple(line);
-    }
-
-    let tree = match parser.parse(line, None) {
-        Some(tree) => tree,
-        None => return highlight_pipes_simple(line),
-    };
-
-    // Find table names and pipes to highlight
-    let mut highlights = Vec::new();
-
-    // Walk the entire tree recursively looking for table_access nodes
-    let root = tree.root_node();
-    find_highlights_recursive(root, &mut highlights);
-
-    fn find_highlights_recursive(
-        node: tree_sitter::Node,
-        highlights: &mut Vec<(usize, usize, &'static str)>,
-    ) {
-        // Check if this is a table_access node
-        if node.kind() == "table_access" {
-            // Find the identifier child (table name)
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if child.kind() == "identifier" {
-                        let start = child.start_byte();
-                        let end = child.end_byte();
-                        highlights.push((start, end, GREEN));
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Recursively visit all children
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                find_highlights_recursive(child, highlights);
-            }
-        }
-    }
-
-    // Also find pipes
-    if line.contains("|>") || line.contains("|~>") {
-        let mut i = 0;
-        let bytes = line.as_bytes();
-        while i < bytes.len() {
-            if i + 1 < bytes.len() && bytes[i] == b'|' && bytes[i + 1] == b'>' {
-                highlights.push((i, i + 2, BLUE));
-                i += 2;
-            } else if i + 2 < bytes.len()
-                && bytes[i] == b'|'
-                && bytes[i + 1] == b'~'
-                && bytes[i + 2] == b'>'
-            {
-                highlights.push((i, i + 3, BLUE));
-                i += 3;
-            } else {
-                i += 1;
-            }
+    let mut highlights: Vec<(usize, usize, &'static str)> = Vec::new();
+    for node in delightql_cst::walk(&tree) {
+        // A relation's own name, wherever a functor heads one.
+        let colour = if cst::RelationName::cast(node.node()).is_some() {
+            GREEN
+        } else if cst::PipeOperator::cast(node.node()).is_some()
+            || cst::UnwrapPipeOperator::cast(node.node()).is_some()
+        {
+            BLUE
+        } else {
+            continue;
+        };
+        if let Some(range) = tree.byte_range(node) {
+            highlights.push((range.start, range.end, colour));
         }
     }
 
@@ -313,28 +264,24 @@ fn highlight_hardcoded(line: &str) -> Cow<'_, str> {
         return Cow::Borrowed(line);
     }
 
-    // Sort highlights by position
     highlights.sort_by_key(|&(start, _, _)| start);
 
-    // Build highlighted string
     let mut result = String::with_capacity(line.len() * 2);
     let mut last_end = 0;
 
     for (start, end, color) in highlights {
-        // Add text before this highlight
+        if start < last_end || end > line.len() {
+            continue;
+        }
         if start > last_end {
             result.push_str(&line[last_end..start]);
         }
-
-        // Add highlighted text
         result.push_str(color);
         result.push_str(&line[start..end]);
         result.push_str(RESET);
-
         last_end = end;
     }
 
-    // Add remaining text
     if last_end < line.len() {
         result.push_str(&line[last_end..]);
     }

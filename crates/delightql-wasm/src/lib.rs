@@ -73,16 +73,6 @@ fn parse_bridge_result(js_val: &JsValue) -> Option<BridgeSqlResult> {
     serde_json::from_str(&json_str).ok()
 }
 
-fn json_value_to_string(val: &serde_json::Value) -> Option<String> {
-    match val {
-        serde_json::Value::Null => None,
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
-        other => Some(other.to_string()),
-    }
-}
-
 fn json_value_to_db_value(val: &serde_json::Value) -> DbValue {
     match val {
         serde_json::Value::Null => DbValue::Null,
@@ -145,22 +135,18 @@ impl DatabaseConnection for WasmDatabaseConnection {
         }
     }
 
-    fn query_all_string_rows(
+    fn query_all_rows(
         &self,
         sql: &str,
         _params: &[DbValue],
-    ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    ) -> Result<(Vec<String>, Vec<Vec<DbValue>>)> {
         let result = js_bridge_sql(sql);
         match parse_bridge_result(&result) {
             Some(parsed) => {
                 let rows = parsed
                     .rows
                     .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|v| json_value_to_string(v).unwrap_or_else(|| "NULL".to_string()))
-                            .collect()
-                    })
+                    .map(|row| row.iter().map(json_value_to_db_value).collect())
                     .collect();
                 Ok((parsed.columns, rows))
             }
@@ -168,24 +154,7 @@ impl DatabaseConnection for WasmDatabaseConnection {
         }
     }
 
-    fn query_all_nullable_rows(
-        &self,
-        sql: &str,
-        _params: &[DbValue],
-    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
-        let result = js_bridge_sql(sql);
-        match parse_bridge_result(&result) {
-            Some(parsed) => {
-                let rows = parsed
-                    .rows
-                    .iter()
-                    .map(|row| row.iter().map(json_value_to_string).collect())
-                    .collect();
-                Ok((parsed.columns, rows))
-            }
-            None => Ok((vec![], vec![])),
-        }
-    }
+
 }
 
 // ============================================================================
@@ -217,7 +186,7 @@ impl delightql_types::introspect::DatabaseIntrospector for WasmIntrospector {
 
 struct BufferedCursor {
     columns: Vec<String>,
-    rows: VecDeque<Vec<Option<String>>>,
+    rows: VecDeque<Vec<Cell>>,
 }
 
 pub struct WasmParty {
@@ -249,12 +218,17 @@ impl WasmParty {
 
         let conn = self.connection.lock().unwrap();
 
-        let (columns, rows) = match conn.query_all_nullable_rows(&sql, &[]) {
-            Ok((cols, rows)) if !cols.is_empty() => (cols, VecDeque::from(rows)),
+        let (columns, rows) = match conn.query_all_rows(&sql, &[]) {
+            Ok((cols, rows)) if !cols.is_empty() => (
+                cols,
+                rows.into_iter()
+                    .map(|row| row.into_iter().map(|v| v.into_wire_bytes()).collect())
+                    .collect(),
+            ),
             Ok(_) | Err(_) => match conn.execute(&sql, &[]) {
                 Ok(affected) => {
                     let mut rows = VecDeque::new();
-                    rows.push_back(vec![Some(affected.to_string())]);
+                    rows.push_back(vec![Some(affected.to_string().into_bytes())]);
                     (vec!["affected_rows".to_string()], rows)
                 }
                 Err(e) => {
@@ -313,20 +287,13 @@ impl WasmParty {
             return ServerTerm::End;
         }
 
-        let rows: Vec<Vec<Option<String>>> = state.rows.drain(..n).collect();
+        let rows: Vec<Vec<Cell>> = state.rows.drain(..n).collect();
         let col_indices = resolve_projection(&projection, &state.columns);
 
         let cells: Vec<Vec<Cell>> = match orientation {
             Orientation::Rows => rows
                 .iter()
-                .map(|row| {
-                    col_indices
-                        .iter()
-                        .map(|&ci| {
-                            row[ci].as_ref().map(|s| s.as_bytes().to_vec())
-                        })
-                        .collect()
-                })
+                .map(|row| col_indices.iter().map(|&ci| row[ci].clone()).collect())
                 .collect(),
             Orientation::Columns => {
                 return ServerTerm::Error {
@@ -484,7 +451,7 @@ pub fn init_delightql() -> std::result::Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
     let factory = Box::new(WasmConnectionFactory);
-    // No types-level mount factory: URI-scheme mounts (pipe://, etc.)
+    // No types-level mount factory: URI-scheme mounts (delightql-siso://, etc.)
     // are not available in the browser sandbox.
     let handle = api::open(factory, None).map_err(|e| JsValue::from_str(&e))?;
 
@@ -574,18 +541,5 @@ mod tests {
             json_value_to_db_value(&serde_json::json!("hello")),
             DbValue::Text(_)
         ));
-    }
-
-    #[test]
-    fn test_json_value_to_string() {
-        assert_eq!(json_value_to_string(&serde_json::Value::Null), None);
-        assert_eq!(
-            json_value_to_string(&serde_json::json!(42)),
-            Some("42".to_string())
-        );
-        assert_eq!(
-            json_value_to_string(&serde_json::json!("hello")),
-            Some("hello".to_string())
-        );
     }
 }

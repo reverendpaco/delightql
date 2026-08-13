@@ -20,7 +20,7 @@ pub struct BinCartridgeRegistry {
 
     /// (namespace fq, local entity name) → entity.
     ///
-    /// CANONICAL IDENTITY (DIRECTIVE-CONVERGENCE-PLAN Phase 2): registry
+    /// CANONICAL IDENTITY: registry
     /// keys contain namespace plus local entity name. A built-in cannot
     /// become globally callable merely because its local name happens to
     /// contain `::` — the old single-string index allowed exactly that
@@ -78,11 +78,7 @@ impl BinCartridgeRegistry {
             }
         }
 
-        if metadata.is_universal
-            && !self
-                .universal_namespaces
-                .contains(&metadata.namespace_path)
-        {
+        if metadata.is_universal && !self.universal_namespaces.contains(&metadata.namespace_path) {
             self.universal_namespaces
                 .push(metadata.namespace_path.clone());
         }
@@ -106,26 +102,22 @@ impl BinCartridgeRegistry {
 
     /// Look up an entity by its namespace-qualified identity
     /// (e.g., ["sys", "execution"] + "compile").
-    pub fn lookup_qualified_entity(
+    pub fn lookup_qualified_entity<S: AsRef<str>>(
         &self,
-        namespace_path: &[&str],
+        namespace_path: &[S],
         name: &str,
     ) -> Option<Arc<dyn BinEntity>> {
         if namespace_path.is_empty() {
             return self.lookup_entity(name);
         }
-        let namespace = namespace_path.join("::");
+        let namespace = namespace_path
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join("::");
         self.entity_index
             .get(&(namespace, name.to_string()))
             .cloned()
-    }
-
-    /// The effective identity namespace of an entity in `cartridge`.
-    pub fn effective_namespace(cartridge: &dyn BinCartridge, entity: &dyn BinEntity) -> String {
-        entity
-            .namespace_override()
-            .unwrap_or(&cartridge.metadata().namespace_path)
-            .to_string()
     }
 
     /// Get all registered cartridges
@@ -218,23 +210,33 @@ mod tests {
         // TestCartridge is NOT universal: unqualified visibility refuses...
         assert!(registry.lookup_entity("test!").is_none());
         // ...while the (namespace, name) identity resolves qualified.
-        assert!(registry.lookup_qualified_entity(&["test"], "test!").is_some());
+        assert!(registry
+            .lookup_qualified_entity(&["test"], "test!")
+            .is_some());
 
         // Should return None for non-existent identities
-        assert!(registry.lookup_qualified_entity(&["test"], "nonexistent!").is_none());
-        assert!(registry.lookup_qualified_entity(&["other"], "test!").is_none());
+        assert!(registry
+            .lookup_qualified_entity(&["test"], "nonexistent!")
+            .is_none());
+        assert!(registry
+            .lookup_qualified_entity(&["other"], "test!")
+            .is_none());
     }
 
     #[test]
     fn test_counts() {
         let mut registry = BinCartridgeRegistry::new();
         assert_eq!(registry.cartridges().len(), 0);
-        assert!(registry.lookup_qualified_entity(&["test"], "test!").is_none());
+        assert!(registry
+            .lookup_qualified_entity(&["test"], "test!")
+            .is_none());
 
         registry.register_cartridge(Arc::new(TestCartridge));
 
         assert_eq!(registry.cartridges().len(), 1);
-        assert!(registry.lookup_qualified_entity(&["test"], "test!").is_some());
+        assert!(registry
+            .lookup_qualified_entity(&["test"], "test!")
+            .is_some());
     }
 
     #[test]

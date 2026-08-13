@@ -8,24 +8,37 @@
 # is the optional dependency doctor (`make setup`) for the wider
 # toolchain (wasm, duckdb, tree-sitter regeneration).
 
-# Tree-sitter CLI must match tree-sitter-c2rust version in Cargo.toml
+# The grammar is generated at build time from ignored paths, so
+# compiling delightql-core requires the pinned CLI — `build` and `ship` ensure
+# it. Tree-sitter CLI must match tree-sitter-c2rust version in Cargo.toml
 TREE_SITTER_EXPECTED_VERSION := 0.25.2
 LLVM_PATH := /opt/homebrew/opt/llvm/bin/clang
 DUCKDB_LIB := /opt/homebrew/lib/libduckdb.dylib
 
 .DEFAULT_GOAL := build
 
-.PHONY: build
+# NOT part of the routine per-bump check. Clippy re-checks all of
+# delightql-core on any edit and --all-targets adds every test target, so
+# this is minutes, not seconds. It has its own CARGO_TARGET_DIR (see
+# lint_ratchet.py) so it does not evict the debug build's artifacts —
+# but run it when a change could add a lint class, not reflexively.
+.PHONY: lint build grammar-fields error-expectations
 # The default is the CLONER's build: fast to produce, symbols intact, panics
 # legible. `make ship` is for producing the deliverable, not for meeting the
 # project.
-build: ensure-cargo ensure-uv
+build: ensure-cargo ensure-uv ensure-tree-sitter grammar-fields error-expectations
 	cargo build --bin dql
 	@echo ""
 	@echo "✓ built: target/debug/dql"
 
+grammar-fields:
+	@./grammar_field_check.py
+
+error-expectations:
+	@./error_expectation_check.py
+
 .PHONY: ship
-ship: ensure-cargo ensure-uv
+ship: ensure-cargo ensure-uv ensure-tree-sitter grammar-fields error-expectations
 	cargo build --profile release-ship --bin dql
 	@echo ""
 	@echo "✓ built: target/release-ship/dql  (optimized, fat LTO, stripped)"
@@ -120,40 +133,41 @@ ensure-tree-sitter:
 		echo "  Note: Must be v$(TREE_SITTER_EXPECTED_VERSION) to match tree-sitter-c2rust in Cargo.toml"; \
 	fi
 
-.PHONY: generate-parser
-generate-parser: ensure-tree-sitter
-	@echo "Checking tree-sitter CLI version..."
+.PHONY: generate-grammar
+# THE GRAMMAR'S ONE GENERATION CONTRACT: the pinned CLI named here, enforced
+# (not hinted) by delightql-cst's build.rs, writing only into ignored paths.
+# This target exists for humans; the crate build does not shell out to make.
+generate-grammar: ensure-tree-sitter
 	@INSTALLED_VERSION=$$(tree-sitter --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1); \
 	if [ "$$INSTALLED_VERSION" != "$(TREE_SITTER_EXPECTED_VERSION)" ]; then \
-		echo ""; \
-		echo "❌ ERROR: Wrong tree-sitter CLI version!"; \
-		echo ""; \
-		echo "   Expected: $(TREE_SITTER_EXPECTED_VERSION) (must match tree-sitter-c2rust)"; \
-		echo "   Found:    $$INSTALLED_VERSION"; \
-		echo ""; \
-		echo "   The parser.c file must be generated with tree-sitter $(TREE_SITTER_EXPECTED_VERSION)"; \
-		echo "   to match the tree-sitter-c2rust crate version for ABI compatibility."; \
-		echo ""; \
-		echo "   To fix this, reinstall the correct version:"; \
-		echo "     cargo install tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) --force"; \
-		echo ""; \
+		echo "❌ tree-sitter CLI $$INSTALLED_VERSION; the pin is $(TREE_SITTER_EXPECTED_VERSION)"; \
+		echo "   cargo install tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) --force"; \
 		exit 1; \
 	fi
-	@echo "✓ tree-sitter CLI version $(TREE_SITTER_EXPECTED_VERSION) confirmed"
-	@echo "Generating parser from grammar.js..."
-	@cd grammar_dql && tree-sitter generate
-	@echo "✓ Parser generated"
+	@cd grammar && tree-sitter generate
+	@echo "✓ grammar generated (derived output stays ignored)"
 
 .PHONY: help
+# The pipeline's lint directives are clippy-only and had never run: clippy
+# hard-failed in delightql-formatter before reaching core. It runs now, and
+# its findings are ratcheted rather than paid down — the count may fall,
+# never rise. See lint_ratchet.py for why neither weakening the directives
+# nor a 549-site burndown is the answer.
+lint: grammar-fields error-expectations
+	@./lint_ratchet.py
+
+
 help:
 	@echo "DelightQL Dependency Management"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make [build]           - Check cargo+uv, build dql -> target/debug/dql"
+	@echo "  make grammar-fields    - Refuse grammar fields without Rust readers"
+	@echo "  make error-expectations - Ratchet empty and bare refusal expectations"
 	@echo "  make ship              - Optimized build (fat LTO, stripped) -> target/release-ship/dql"
 	@echo "  make setup             - Ensure all build dependencies are installed"
 	@echo "  make ensure-tree-sitter - Ensure tree-sitter CLI is installed (pinned to $(TREE_SITTER_EXPECTED_VERSION))"
-	@echo "  make generate-parser   - Generate parser.c from grammar.js"
+	@echo "  make generate-grammar  - Generate the parser from grammar.js (derived, ignored)"
 	@echo "  make help              - Show this help"
 	@echo ""
 	@echo "Individual dependency checks:"

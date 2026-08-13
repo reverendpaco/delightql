@@ -95,8 +95,6 @@ pub struct FormatConfig {
     /// Annotation ((~~…~~)) placement: "inline" after the expression
     /// or "own_line" indented below it
     pub annotation_placement: Placement,
-    /// `under ctx:` directive: "own_line" or "inline" with its query
-    pub under_context_placement: Placement,
     /// Blank lines between queries: "collapse" or "preserve"
     pub blank_lines: BlankLines,
 }
@@ -187,7 +185,6 @@ impl Default for FormatConfig {
             tree_inducer_break: BreakMode::Always,
             member_value_break: BreakMode::Always,
             annotation_placement: Placement::Inline,
-            under_context_placement: Placement::Inline,
             blank_lines: BlankLines::Preserve,
         }
     }
@@ -284,8 +281,6 @@ pub const KNOBS: &[Knob] = &[
         "always" => BreakMode::Always, "fit" => BreakMode::Fit),
     enum_knob!("annotation_placement", annotation_placement,
         "inline" => Placement::Inline, "own_line" => Placement::OwnLine),
-    enum_knob!("under_context_placement", under_context_placement,
-        "own_line" => Placement::OwnLine, "inline" => Placement::Inline),
     enum_knob!("blank_lines", blank_lines,
         "collapse" => BlankLines::Collapse, "preserve" => BlankLines::Preserve),
     Knob {
@@ -355,9 +350,6 @@ mod tests {
         let mut c = FormatConfig::default();
         assert!(c.apply("definitely_not_a_knob", "1").is_err());
         assert!(c.apply("pipe_break", "sometimes").is_err());
-        // The legacy cte_centric spelling is gone; it now errs like
-        // any unknown knob instead of silently accepting any value.
-        assert!(c.apply("cte_centric", "maybe").is_err());
     }
 
     #[test]

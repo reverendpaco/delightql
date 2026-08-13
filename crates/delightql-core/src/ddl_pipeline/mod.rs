@@ -40,10 +40,10 @@ pub fn create_temp_table_from_manifest(
         &constraint_rows,
         &default_rows,
     )?;
-    let resolved = resolver::resolve(unresolved)?;
-    let sql_ast = transformer::transform(resolved)?;
+    let (resolved, identities) = resolver::resolve(unresolved)?;
+    let sql_ast = transformer::transform(resolved, &identities)?;
     Ok(Some(ManifestCreateResult {
-        create_sql: generator::generate(&sql_ast),
+        create_sql: generator::generate(&sql_ast, &identities)?,
         schema_rows,
     }))
 }
@@ -57,9 +57,9 @@ mod tests {
     fn generate_create_table_from_def(
         def: asts::CreateTableDef<crate::pipeline::asts::core::Unresolved>,
     ) -> Result<String> {
-        let resolved = resolver::resolve(def)?;
-        let sql_ast = transformer::transform(resolved)?;
-        Ok(generator::generate(&sql_ast))
+        let (resolved, identities) = resolver::resolve(def)?;
+        let sql_ast = transformer::transform(resolved, &identities)?;
+        generator::generate(&sql_ast, &identities)
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-existing drift: written against an older grammar; failed on first compile after lib-test rot repair 2026-07-01"]
+    #[ignore = "drift: written against an older grammar; does not compile against the current one"]
     fn test_end_to_end_function_default() {
         let default = builder::build_default("now:()").unwrap();
         let def = CreateTableDef {
@@ -158,6 +158,135 @@ mod tests {
         assert!(sql.contains("DEFAULT now()"));
     }
 
+    /// Build a one-column table whose only constraint is `expr`, and
+    /// return the emitted CHECK text.
+    fn check_text(expr: &str) -> String {
+        let def = CreateTableDef {
+            name: "t".to_string(),
+            temp: false,
+            columns: vec![ColumnDef {
+                name: "state".into(),
+                col_type: "INTEGER".into(),
+                constraints: vec![builder::build_constraint(expr).unwrap()],
+                default: None,
+            }],
+            table_constraints: vec![],
+        };
+        generate_create_table_from_def(def).unwrap()
+    }
+
+    /// The two equalities are distinct operators and must stay distinct
+    /// through DDL lowering. `=` is null-safe everywhere but a join, so a
+    /// CHECK written with it rejects null; `==` is SQL equality, whose
+    /// answer on null is unknown, which a CHECK admits.
+    ///
+    /// Collapsing them makes every equality CHECK more permissive than the
+    /// language says, and makes `@ = null` a constraint that cannot fire.
+    #[test]
+    fn test_e2e_eq_lowers_null_safe() {
+        let sql = check_text("@ = 5");
+        assert!(
+            sql.contains("CHECK(state IS NOT DISTINCT FROM 5)"),
+            "`=` must lower null-safe, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_e2e_eqeq_lowers_sql_equality() {
+        let sql = check_text("@ == 5");
+        assert!(
+            sql.contains("CHECK(state = 5)"),
+            "`==` must lower to SQL equality, got: {sql}"
+        );
+    }
+
+    /// The inequalities are already split; they pin the shape the equality
+    /// side is being brought into line with.
+    #[test]
+    fn test_e2e_ne_lowers_null_safe() {
+        let sql = check_text("@ != 5");
+        assert!(
+            sql.contains("CHECK(state IS DISTINCT FROM 5)"),
+            "`!=` must lower null-safe, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_e2e_nene_lowers_sql_inequality() {
+        let sql = check_text("@ !== 5");
+        assert!(
+            sql.contains("CHECK(state != 5)"),
+            "`!==` must lower to SQL inequality, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_e2e_null_inequalities_keep_distinct_constraint_semantics() {
+        let null_safe = check_text("@ != null");
+        assert!(
+            null_safe.contains("\"state\" INTEGER NOT NULL"),
+            "`@ != null` must promote to NOT NULL, got: {null_safe}"
+        );
+
+        let sql_inequality = check_text("@ !== null");
+        assert!(
+            sql_inequality.contains("CHECK(state != NULL)"),
+            "`@ !== null` must remain an SQL inequality CHECK, got: {sql_inequality}"
+        );
+        assert!(
+            !sql_inequality.contains("\"state\" INTEGER NOT NULL"),
+            "`@ !== null` must admit null rather than promote to NOT NULL, got: {sql_inequality}"
+        );
+    }
+
+    /// A NULL PROBE FINDS A NULL CANDIDATE. Under SQL `IN` this comparison
+    /// is unknown, and a CHECK admits whatever it cannot call false — so the
+    /// null-safe correspondence is what makes the constraint mean what it
+    /// says.
+    #[test]
+    fn a_ddl_membership_over_null_is_null_safe() {
+        let check = builder::build_constraint("@ in (1; null)").unwrap();
+        let def = CreateTableDef {
+            name: "t".to_string(),
+            temp: false,
+            columns: vec![ColumnDef {
+                name: "status".into(),
+                col_type: "INTEGER".into(),
+                constraints: vec![check],
+                default: None,
+            }],
+            table_constraints: vec![],
+        };
+        let sql = generate_create_table_from_def(def).unwrap();
+        assert!(!sql.contains(" IN ("), "{sql}");
+        assert_eq!(sql.matches("IS NOT DISTINCT FROM").count(), 2, "{sql}");
+        assert!(sql.contains("NULL"), "{sql}");
+    }
+
+    /// A CANDIDATE ROW IS A ROW. Every component of the probe is compared to
+    /// the corresponding component of each candidate; dropping the later
+    /// components or flattening the rows would test a different question.
+    #[test]
+    fn a_ddl_tuple_membership_keeps_its_rows() {
+        let check = builder::build_constraint("(@, @) in (1, 2; 3, 4)").unwrap();
+        let def = CreateTableDef {
+            name: "t".to_string(),
+            temp: false,
+            columns: vec![ColumnDef {
+                name: "status".into(),
+                col_type: "INTEGER".into(),
+                constraints: vec![check],
+                default: None,
+            }],
+            table_constraints: vec![],
+        };
+        let sql = generate_create_table_from_def(def).unwrap();
+        assert!(!sql.contains(" IN ("), "{sql}");
+        // Two components per row, two rows: four correspondences, ANDed
+        // within a row and ORed across rows.
+        assert_eq!(sql.matches("IS NOT DISTINCT FROM").count(), 4, "{sql}");
+    }
+
     #[test]
     fn test_e2e_in_check() {
         let check = builder::build_constraint("@ in (1; 2; 3)").unwrap();
@@ -173,14 +302,23 @@ mod tests {
             table_constraints: vec![],
         };
         let sql = generate_create_table_from_def(def).unwrap();
+        // NULL-SAFE MEMBERSHIP, in a CHECK as in a query. SQL `IN` answers
+        // unknown on a null probe and a CHECK admits whatever it cannot call
+        // false, so emitting it would silently admit exactly the rows the
+        // constraint names.
         assert!(
-            sql.contains("CHECK(status IN (1, 2, 3))"),
-            "Expected IN check, got: {sql}"
+            !sql.contains(" IN ("),
+            "a DDL membership must not lower to SQL IN: {sql}"
+        );
+        assert_eq!(
+            sql.matches("IS NOT DISTINCT FROM").count(),
+            3,
+            "one null-safe correspondence per candidate: {sql}"
         );
     }
 
     #[test]
-    #[ignore = "pre-existing drift: written against an older grammar; failed on first compile after lib-test rot repair 2026-07-01"]
+    #[ignore = "drift: written against an older grammar; does not compile against the current one"]
     fn test_e2e_like_check() {
         let check = builder::build_constraint("+like(@, '%abc')").unwrap();
         let def = CreateTableDef {

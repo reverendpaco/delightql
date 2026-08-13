@@ -45,32 +45,45 @@ impl<'stmt> Row for DuckDBRow<'stmt> {
     }
 }
 
-/// Convert duckdb ValueRef to DbValue
+/// Convert duckdb ValueRef to DbValue.
+///
+/// Every number reaches `DbValue` without narrowing. DuckDB carries wider
+/// integers than `DbValue::Integer` (HUGEINT is 128 bits, UBIGINT is
+/// unsigned 64) and an exact DECIMAL that no `f64` can hold; `DbValue::whole`
+/// and `DbValue::exact_numeric` say what becomes of each. There is no `as`
+/// on a value here, and no numeric default anywhere: a conversion that
+/// cannot be made faithfully is not made.
 fn duckdb_value_to_db_value(value: duckdb::types::ValueRef<'_>) -> DbValue {
     use duckdb::types::ValueRef;
 
     match value {
         ValueRef::Null => DbValue::Null,
         ValueRef::Boolean(b) => DbValue::Integer(if b { 1 } else { 0 }),
-        ValueRef::TinyInt(i) => DbValue::Integer(i as i64),
-        ValueRef::SmallInt(i) => DbValue::Integer(i as i64),
-        ValueRef::Int(i) => DbValue::Integer(i as i64),
-        ValueRef::BigInt(i) => DbValue::Integer(i),
-        ValueRef::HugeInt(i) => DbValue::Integer(i as i64),
-        ValueRef::UTinyInt(i) => DbValue::Integer(i as i64),
-        ValueRef::USmallInt(i) => DbValue::Integer(i as i64),
-        ValueRef::UInt(i) => DbValue::Integer(i as i64),
-        ValueRef::UBigInt(i) => DbValue::Integer(i as i64),
-        ValueRef::Float(f) => DbValue::Real(f as f64),
+        ValueRef::TinyInt(i) => DbValue::whole(i.into()),
+        ValueRef::SmallInt(i) => DbValue::whole(i.into()),
+        ValueRef::Int(i) => DbValue::whole(i.into()),
+        ValueRef::BigInt(i) => DbValue::whole(i.into()),
+        ValueRef::HugeInt(i) => DbValue::whole(i),
+        ValueRef::UTinyInt(i) => DbValue::whole(i.into()),
+        ValueRef::USmallInt(i) => DbValue::whole(i.into()),
+        ValueRef::UInt(i) => DbValue::whole(i.into()),
+        ValueRef::UBigInt(i) => DbValue::whole(i.into()),
+        // f32 -> f64 is exact: every f32 is an f64.
+        ValueRef::Float(f) => DbValue::Real(f.into()),
         ValueRef::Double(f) => DbValue::Real(f),
-        ValueRef::Decimal(d) => DbValue::Real(d.try_into().unwrap_or(0.0)),
+        ValueRef::Decimal(d) => DbValue::exact_numeric(d.to_string()),
         ValueRef::Timestamp(_, _) => DbValue::Text(format!("{:?}", value)),
         ValueRef::Text(s) => DbValue::Text(String::from_utf8_lossy(s).to_string()),
         ValueRef::Blob(b) => DbValue::Blob(b.to_vec()),
         ValueRef::Date32(_) => DbValue::Text(format!("{:?}", value)),
         ValueRef::Time64(_, _) => DbValue::Text(format!("{:?}", value)),
         ValueRef::Interval { .. } => DbValue::Text(format!("{:?}", value)),
-        ValueRef::Enum(_, v) => DbValue::Integer(v as i64),
+        // An enum's ordinal is a `usize`; on a hypothetical platform where
+        // that is wider than i128 the spelling still stands in for it.
+        ValueRef::Enum(_, v) => match i128::try_from(v) {
+            Ok(ordinal) => DbValue::whole(ordinal),
+            Err(_) => DbValue::Text(v.to_string()),
+        },
         ValueRef::List(_, _) => DbValue::Text(format!("{:?}", value)),
         ValueRef::Struct(_, _) => DbValue::Text(format!("{:?}", value)),
         ValueRef::Array(_, _) => DbValue::Text(format!("{:?}", value)),
@@ -210,11 +223,11 @@ impl DatabaseConnection for DuckDBConnection {
         }
     }
 
-    fn query_all_string_rows(
+    fn query_all_rows(
         &self,
         sql: &str,
         params: &[DbValue],
-    ) -> DelightQLResult<(Vec<String>, Vec<Vec<String>>)> {
+    ) -> DelightQLResult<(Vec<String>, Vec<Vec<DbValue>>)> {
         let conn = self.conn.lock().map_err(|e| {
             delightql_types::DelightQLError::connection_poison_error(
                 "Connection mutex poisoned",
@@ -233,20 +246,16 @@ impl DatabaseConnection for DuckDBConnection {
             delightql_types::DelightQLError::database_error("Failed to prepare query", e.to_string())
         })?;
 
-        let column_names: Vec<String> = stmt.column_names();
-
+        // ROWS FIRST, HEADING SECOND. A duckdb statement has no schema
+        // until it has run — asking a prepared-but-unexecuted statement for
+        // its column names panics inside the driver — so the width comes
+        // from each row and the names are read once the rows are drained.
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
-                let mut values = Vec::new();
-                for idx in 0..column_names.len() {
-                    let val = row.get_ref(idx)?;
-                    let string_val = match val {
-                        duckdb::types::ValueRef::Null => "NULL".to_string(),
-                        duckdb::types::ValueRef::Text(s) => String::from_utf8_lossy(s).to_string(),
-                        duckdb::types::ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
-                        other => format!("{:?}", other),
-                    };
-                    values.push(string_val);
+                let width = row.as_ref().column_count();
+                let mut values = Vec::with_capacity(width);
+                for idx in 0..width {
+                    values.push(duckdb_value_to_db_value(row.get_ref(idx)?));
                 }
                 Ok(values)
             })
@@ -261,10 +270,107 @@ impl DatabaseConnection for DuckDBConnection {
             })?);
         }
 
+        let column_names: Vec<String> = stmt.column_names();
+
         Ok((column_names, result_rows))
     }
+
 }
 
 // Note: DatabaseConnectionExt is automatically implemented for DuckDBConnection
 // via the blanket implementation in delightql_types::db_traits.
 // The blanket impl provides query_row() and query() methods using query_row_values().
+
+#[cfg(test)]
+mod tests {
+    use super::DuckDBConnection;
+    use crate::duckdb::connection::DuckDBConnectionManager;
+    use delightql_types::{DatabaseConnection, DbValue};
+
+    /// Every value below comes from the ENGINE, not from a hand-built
+    /// `ValueRef`: HUGEINT, UBIGINT and DECIMAL are exactly the widths a
+    /// Rust-side literal cannot stand in for.
+    ///
+    /// NOTE: this module needs `libduckdb` to link, so it runs only where
+    /// the `duckdb` feature can be built (`cargo test -p delightql-backends
+    /// --no-default-features --features duckdb`). It is not part of the
+    /// default lane.
+    fn one_cell(sql: &str) -> DbValue {
+        let manager = DuckDBConnectionManager::new_memory().expect("in-memory duckdb");
+        let connection = DuckDBConnection::new(manager.get_connection_arc());
+        let (_columns, mut rows) = connection
+            .query_all_rows(sql, &[])
+            .expect("the engine answers");
+        assert_eq!(rows.len(), 1, "one row expected from: {sql}");
+        let mut row = rows.swap_remove(0);
+        assert_eq!(row.len(), 1, "one column expected from: {sql}");
+        row.swap_remove(0)
+    }
+
+    fn wire(sql: &str) -> Vec<u8> {
+        one_cell(sql)
+            .into_wire_bytes()
+            .expect("a present value, not NULL")
+    }
+
+    /// A HUGEINT past `i64` keeps its digits. `as i64` would have answered
+    /// `-9223372036854775808` for the first of these.
+    #[test]
+    fn a_hugeint_past_the_top_is_not_narrowed() {
+        assert_eq!(
+            wire("SELECT CAST('9223372036854775808' AS HUGEINT)"),
+            b"9223372036854775808".to_vec()
+        );
+        assert_eq!(
+            wire("SELECT CAST('170141183460469231731687303715884105727' AS HUGEINT)"),
+            b"170141183460469231731687303715884105727".to_vec()
+        );
+        // One that fits is still an Integer, unchanged by the widening.
+        assert!(matches!(
+            one_cell("SELECT CAST('42' AS HUGEINT)"),
+            DbValue::Integer(42)
+        ));
+    }
+
+    /// A UBIGINT past `i64::MAX` keeps its digits AND its sign. `as i64`
+    /// would have answered `-1` for `u64::MAX`.
+    #[test]
+    fn a_ubigint_past_the_top_is_not_narrowed() {
+        assert_eq!(
+            wire("SELECT CAST('18446744073709551615' AS UBIGINT)"),
+            b"18446744073709551615".to_vec()
+        );
+        assert!(matches!(
+            one_cell("SELECT CAST('7' AS UBIGINT)"),
+            DbValue::Integer(7)
+        ));
+    }
+
+    /// A DECIMAL keeps its own exact spelling. Through an `f64` the first
+    /// of these comes back `1234567890.1234567`, and the old code did that
+    /// silently; a DECIMAL the conversion could not make at all became
+    /// `0.0`, which is why no `f64` step remains.
+    #[test]
+    fn a_decimal_keeps_its_exact_spelling() {
+        assert_eq!(
+            wire("SELECT CAST('1234567890.1234567891' AS DECIMAL(20,10))"),
+            b"1234567890.1234567891".to_vec()
+        );
+        // Scale is part of the spelling: a DECIMAL(4,2) two is "2.00".
+        assert_eq!(
+            wire("SELECT CAST('2' AS DECIMAL(4,2))"),
+            b"2.00".to_vec()
+        );
+    }
+
+    /// The kinds P.11's carrier pins already cover on the other engines,
+    /// asserted here on DuckDB's own values so the roads agree.
+    #[test]
+    fn absence_blobs_and_text_survive_the_duckdb_road() {
+        assert!(matches!(one_cell("SELECT NULL"), DbValue::Null));
+        assert_eq!(one_cell("SELECT NULL").into_wire_bytes(), None);
+        assert_eq!(wire("SELECT 'NULL'"), b"NULL".to_vec());
+        assert_eq!(wire("SELECT CAST('NULL' AS BLOB)"), b"NULL".to_vec());
+        assert_eq!(wire("SELECT '\\x00\\x01\\xFF'::BLOB"), vec![0x00, 0x01, 0xff]);
+    }
+}

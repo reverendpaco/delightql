@@ -6,6 +6,7 @@
 /// both delightql-core (for resolution) and delightql-backends (for implementations).
 
 use crate::identifier::SqlIdentifier;
+use crate::error::Result;
 
 /// Information about a database column (simple version for trait interface)
 #[derive(Debug, Clone)]
@@ -35,8 +36,12 @@ pub trait DatabaseSchema: Send + Sync {
     /// - Regular tables (None, "users")
     /// - Schema-qualified tables (Some("temp"), "sqlite_master")
     /// - Attached databases (Some("nba"), "player")
-    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Option<Vec<ColumnInfo>>;
+    fn get_table_columns(
+        &self,
+        schema: Option<&str>,
+        table_name: &str,
+    ) -> Result<Option<Vec<ColumnInfo>>>;
 
     /// Check if a table exists in the given schema
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool;
+    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool>;
 }

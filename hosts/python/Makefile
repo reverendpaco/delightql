@@ -12,7 +12,7 @@ endif
 RUST_SRCS := $(shell find $(REPO_ROOT)/crates -name '*.rs' -o -name 'Cargo.toml') \
              $(REPO_ROOT)/Cargo.toml \
              $(REPO_ROOT)/Cargo.lock \
-             $(wildcard $(REPO_ROOT)/grammar_dql/src/parser.c)
+             $(wildcard $(REPO_ROOT)/grammar/src/parser.c)
 
 # Stamp file — tracks last successful wheel build
 STAMP := dist/.wheel-stamp

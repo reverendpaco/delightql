@@ -17,6 +17,8 @@ use delightql_protocol::{
 };
 
 use super::RelayParty;
+use crate::external_effects::CreatedObjectCatalog;
+use crate::external_effects::CreatedObjectRegistration;
 use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry, PlanStatement};
 use crate::relay::RelayHooks;
 use crate::system::DelightQLSystem;
@@ -27,7 +29,7 @@ use delightql_types::test_utils::MockDatabaseConnection;
 // Test backend: an eager protocol Handler over a real rusqlite connection.
 // ---------------------------------------------------------------------
 
-struct EagerSqliteHandler {
+pub(super) struct EagerSqliteHandler {
     conn: Arc<Mutex<rusqlite::Connection>>,
     buffers: HashMap<Vec<u8>, (Vec<Dimension>, Vec<Vec<Cell>>, usize)>,
     next_handle: u64,
@@ -77,9 +79,7 @@ impl EagerSqliteHandler {
                         let val: rusqlite::types::Value = row.get(idx)?;
                         cells.push(match val {
                             rusqlite::types::Value::Null => None,
-                            rusqlite::types::Value::Integer(i) => {
-                                Some(i.to_string().into_bytes())
-                            }
+                            rusqlite::types::Value::Integer(i) => Some(i.to_string().into_bytes()),
                             rusqlite::types::Value::Real(f) => Some(f.to_string().into_bytes()),
                             rusqlite::types::Value::Text(s) => Some(s.into_bytes()),
                             rusqlite::types::Value::Blob(b) => Some(b),
@@ -184,17 +184,17 @@ impl DatabaseIntrospector for EmptyIntrospector {
     }
 }
 
-fn fresh_system() -> DelightQLSystem {
+pub(super) fn fresh_system() -> DelightQLSystem {
     let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
     DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
         .expect("fresh in-memory system should build")
 }
 
-type TestRelay<'a> = RelayParty<'a, DirectTransport<EagerSqliteHandler>>;
+pub(super) type TestRelay<'a> = RelayParty<'a, DirectTransport<EagerSqliteHandler>>;
 
 /// Build a relay whose default (connection 2) backend is `conn` — a REAL
 /// rusqlite connection the caller keeps a clone of for state inspection.
-fn relay_over(
+pub(super) fn relay_over(
     system: &mut DelightQLSystem,
     conn: Arc<Mutex<rusqlite::Connection>>,
 ) -> TestRelay<'_> {
@@ -228,10 +228,112 @@ fn relay_over_with_log(
     (RelayParty::new(system, session), sql_log)
 }
 
-fn shared_sqlite() -> Arc<Mutex<rusqlite::Connection>> {
+pub(super) fn shared_sqlite() -> Arc<Mutex<rusqlite::Connection>> {
     Arc::new(Mutex::new(
         rusqlite::Connection::open_in_memory().expect("in-memory sqlite"),
     ))
+}
+
+#[test]
+fn quarantined_session_refuses_a_new_query_before_compilation() {
+    let mut system = fresh_system();
+    system.quarantine_session("test operation", "uncertain cleanup");
+    let conn = shared_sqlite();
+    let mut relay = relay_over(&mut system, conn);
+
+    let response = relay.handle(ClientTerm::Query {
+        text: b"select 1".to_vec(),
+    });
+    match response {
+        ServerTerm::Error {
+            kind,
+            identity,
+            message,
+        } => {
+            assert_eq!(kind, ErrorKind::Connection);
+            assert_eq!(
+                identity,
+                b"delightql-error://runtime/session_health/external_effect".to_vec()
+            );
+            assert!(String::from_utf8_lossy(&message).contains("reset or reconnect"));
+        }
+        other => panic!("quarantined query must be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn quarantined_session_allows_fetch_and_close_on_an_existing_handle() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+
+    let response = relay.handle_plan(&plan(vec![ship("SELECT 1 AS value")]));
+    let handle = match response {
+        ServerTerm::Header { handle, .. } => handle,
+        other => panic!("expected a handle before quarantining, got {other:?}"),
+    };
+    relay
+        .system
+        .quarantine_session("test operation", "uncertain cleanup");
+
+    match relay.handle(ClientTerm::Fetch {
+        handle: handle.clone(),
+        projection: Projection::All,
+        count: u64::MAX,
+        orientation: Orientation::Rows,
+    }) {
+        ServerTerm::Data { cells } => assert_eq!(cells.len(), 1),
+        other => panic!("quarantine must not retract existing data: {other:?}"),
+    }
+    assert!(matches!(
+        relay.handle(ClientTerm::Fetch {
+            handle: handle.clone(),
+            projection: Projection::All,
+            count: u64::MAX,
+            orientation: Orientation::Rows,
+        }),
+        ServerTerm::End
+    ));
+    assert!(matches!(
+        relay.handle(ClientTerm::Close { handle }),
+        ServerTerm::Ok { .. }
+    ));
+}
+
+#[test]
+fn post_run_unsupported_registration_is_a_quarantine_invariant_breach() {
+    let conn = shared_sqlite();
+    // Bypass the planner's pre-flight only to exercise the invariant-breach
+    // branch: a target approved earlier must never abstain during read-back.
+    let mut system = DelightQLSystem::new(
+        Arc::new(Mutex::new(MockDatabaseConnection::new())),
+        Box::new(EmptyIntrospector),
+        "postgres",
+    )
+    .expect("fresh postgres system should build");
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+    let p = CompiledPlan {
+        entries: vec![ship("SELECT 1 AS value")],
+        exit_probe_sql: None,
+        created_objects: vec![crate::pipeline::compiled_query::PlanCreatedObject {
+            name: "created".to_string(),
+            is_view: false,
+            connection_id: None,
+        }],
+        typed: None,
+    };
+
+    let response = relay.play_plan_with_catalog(&p, &CatalogShouldNotRun);
+    let (identity, message) = error_message(response);
+    assert_eq!(
+        identity,
+        b"delightql-error://runtime/session_health/external_effect".to_vec()
+    );
+    assert!(
+        message.contains("session_health/registration_unsupported"),
+        "the invariant breach URI remains in message data: {message}"
+    );
+    assert!(relay.system.require_healthy().is_err());
 }
 
 fn bare(sql: &str) -> PlanEntry {
@@ -242,12 +344,24 @@ fn ship(sql: &str) -> PlanEntry {
     PlanEntry::ShippedStatement(PlanStatement::bare(sql))
 }
 
-fn plan(entries: Vec<PlanEntry>) -> CompiledPlan {
+pub(super) fn plan(entries: Vec<PlanEntry>) -> CompiledPlan {
     CompiledPlan {
         entries,
-        exit_table: None,
+        exit_probe_sql: None,
         created_objects: Vec::new(),
         typed: None,
+    }
+}
+
+struct CatalogShouldNotRun;
+
+impl CreatedObjectCatalog for CatalogShouldNotRun {
+    fn reconcile(
+        &self,
+        _catalog: &rusqlite::Connection,
+        _registrations: &[CreatedObjectRegistration],
+    ) -> delightql_types::Result<()> {
+        panic!("catalog reconciliation must not run after a failed target read-back")
     }
 }
 
@@ -331,6 +445,46 @@ fn plays_entries_in_order_and_returns_final_ship() {
     assert_eq!(rows, vec![vec!["a,b".to_string()]]);
 }
 
+#[test]
+fn created_object_registration_failure_retires_the_unsent_final_handle() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+    let p = CompiledPlan {
+        entries: vec![ship("SELECT 1 AS value")],
+        exit_probe_sql: None,
+        created_objects: vec![crate::pipeline::compiled_query::PlanCreatedObject {
+            name: "created".to_string(),
+            is_view: false,
+            connection_id: None,
+        }],
+        typed: None,
+    };
+
+    let response = relay.play_plan_with_catalog(&p, &CatalogShouldNotRun);
+    let (identity, message) = error_message(response);
+    assert_eq!(
+        identity,
+        b"delightql-error://runtime/session_health/external_effect".to_vec()
+    );
+    assert!(
+        message.contains("created-object registration failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("delightql-error://"),
+        "the primary failure URI is retained as message data: {message}"
+    );
+    assert!(
+        relay.handles.is_empty(),
+        "an unsent streaming handle is retired"
+    );
+    assert!(
+        relay.eager_buffers.is_empty(),
+        "an unsent eager handle is retired"
+    );
+}
+
 /// Per-entry connection routing: entries carrying `Some(1)` execute on the
 /// bootstrap connection, not the default backend. The table must exist on
 /// the bootstrap side and must NOT exist on the backend connection.
@@ -371,11 +525,7 @@ use crate::pipeline::compiled_query::{
     EffectAction, EffectStep, GuardDefinition, GuardPolarity, Requirement, TypedEffectPlan,
 };
 
-fn step(
-    action: EffectAction,
-    occurrence: &str,
-    requirements: Vec<Requirement>,
-) -> EffectStep {
+fn step(action: EffectAction, occurrence: &str, requirements: Vec<Requirement>) -> EffectStep {
     EffectStep {
         occurrence: occurrence.to_string(),
         operation: occurrence.to_string(),
@@ -401,17 +551,21 @@ fn req(guard_id: usize, polarity: GuardPolarity) -> Requirement {
 fn bracketed_typed_plan(
     body_steps: Vec<EffectStep>,
     guards: Vec<GuardDefinition>,
-    exit_table: Option<&str>,
+    exit_probe_sql: Option<&str>,
     cleanup: Vec<PlanStatement>,
 ) -> CompiledPlan {
     let mut steps = vec![step(
-        EffectAction::Begin { connection_id: None },
+        EffectAction::Begin {
+            connection_id: None,
+        },
         "begin",
         vec![],
     )];
     steps.extend(body_steps);
     steps.push(step(
-        EffectAction::Commit { connection_id: None },
+        EffectAction::Commit {
+            connection_id: None,
+        },
         "commit",
         vec![],
     ));
@@ -421,7 +575,7 @@ fn bracketed_typed_plan(
     let typed = TypedEffectPlan { steps, guards };
     CompiledPlan {
         entries: typed.flatten(),
-        exit_table: exit_table.map(str::to_string),
+        exit_probe_sql: exit_probe_sql.map(str::to_string),
         created_objects: Vec::new(),
         typed: Some(typed),
     }
@@ -495,15 +649,23 @@ fn exit_absent_edges_skip_later_steps_and_the_tail() {
             ),
         ],
         guards,
-        Some("__exit"),
+        Some("SELECT count(*) FROM __exit"),
         stmts(&["INSERT INTO cleanup_probe VALUES ('tail')"]),
     );
     let resp = relay.handle_plan(&p);
     let (columns, rows) = fetch_all(&mut relay, resp);
     assert!(columns.is_empty(), "post-exit run answers the empty header");
     assert!(rows.is_empty());
-    assert_eq!(count_rows(&conn, "t"), 0, "data step after exit is declined");
-    assert_eq!(*shipped.lock().unwrap(), 0, "ship step after exit is declined");
+    assert_eq!(
+        count_rows(&conn, "t"),
+        0,
+        "data step after exit is declined"
+    );
+    assert_eq!(
+        *shipped.lock().unwrap(),
+        0,
+        "ship step after exit is declined"
+    );
     assert_eq!(
         count_rows(&conn, "cleanup_probe"),
         0,
@@ -530,7 +692,8 @@ fn typed_walk_declines_steps_with_closed_present_edges() {
 
     let guards = vec![GuardDefinition {
         guard_id: 0,
-        sql: "SELECT 1 WHERE EXISTS (SELECT 1 FROM gate)".to_string(),
+        sql: "SELECT count(*) FROM (SELECT 1 WHERE EXISTS (SELECT 1 FROM gate)) AS guard_scope"
+            .to_string(),
     }];
     let p = bracketed_typed_plan(
         vec![
@@ -565,7 +728,11 @@ fn typed_walk_declines_steps_with_closed_present_edges() {
     let resp = relay.handle_plan(&p);
     let (_cols, rows) = fetch_all(&mut relay, resp);
     assert_eq!(rows, vec![vec!["1".to_string()]]);
-    assert_eq!(count_rows(&conn, "miss"), 0, "closed edge declines the step");
+    assert_eq!(
+        count_rows(&conn, "miss"),
+        0,
+        "closed edge declines the step"
+    );
     assert_eq!(count_rows(&conn, "hit"), 1, "open edge lets the step run");
     let log = sql_log.lock().unwrap();
     assert!(
@@ -581,7 +748,7 @@ fn typed_walk_declines_steps_with_closed_present_edges() {
     );
 }
 
-/// Round-3 hardening: fault ATTRIBUTION across the whole typed program.
+/// Fault ATTRIBUTION across the whole typed program.
 /// A mid-step statement failure marks THAT step `error` (with the
 /// message), every completed step `done` (control steps included), and
 /// every unreached step `pending` — read back from the materialized
@@ -636,7 +803,7 @@ fn statement_failure_attributes_error_done_and_pending() {
     assert_eq!(outcomes[5].1, "pending");
 }
 
-/// Round-3 hardening: a GUARD-SAMPLING failure is the dependent step's
+/// A GUARD-SAMPLING failure is the dependent step's
 /// failure — `error` with the sampling message, never `pending`.
 #[test]
 fn guard_sampling_failure_attributes_to_the_dependent_step() {
@@ -702,7 +869,7 @@ fn untyped_plans_have_no_exit_machinery() {
             bare("INSERT INTO t VALUES ('runs anyway')"),
             ship("SELECT count(*) AS n FROM t"),
         ],
-        exit_table: Some("__exit".to_string()),
+        exit_probe_sql: Some("SELECT count(*) FROM temp.__exit".to_string()),
         created_objects: Vec::new(),
         typed: None,
     };
@@ -833,12 +1000,12 @@ fn assertion_failure_mid_plan_aborts_and_rolls_back() {
         },
         bare("INSERT INTO t VALUES ('rolled back')"),
         PlanEntry::Assertion {
+            name: None,
             statement: PlanStatement::bare("SELECT 1"),
-            source_location: None,
         },
         PlanEntry::Assertion {
+            name: None,
             statement: PlanStatement::bare("SELECT 0"),
-            source_location: None,
         },
         bare("INSERT INTO t VALUES ('never reached')"),
         PlanEntry::CommitTransaction {
@@ -884,8 +1051,8 @@ fn assertion_abort_skips_later_entries_without_bracket() {
     let p = plan(vec![
         bare("INSERT INTO t VALUES ('a')"),
         PlanEntry::Assertion {
+            name: None,
             statement: PlanStatement::bare("SELECT 0"),
-            source_location: None,
         },
         bare("INSERT INTO t VALUES ('b')"),
         ship("SELECT v FROM t"),
@@ -925,7 +1092,11 @@ fn non_final_shipped_deliver_via_on_ship_in_order() {
     let mut system = fresh_system();
     let mut relay = relay_over(&mut system, Arc::clone(&conn));
 
-    let ships = Arc::new(Mutex::new(Vec::<(Vec<String>, Vec<Vec<String>>)>::new()));
+    #[allow(clippy::type_complexity)]
+    let ships = Arc::new(Mutex::new(Vec::<(
+        Vec<String>,
+        Vec<Vec<delightql_protocol::Cell>>,
+    )>::new()));
     let ships_in_hook = Arc::clone(&ships);
     relay.set_hooks(RelayHooks {
         on_ship: Some(Box::new(move |cols, rows| {
@@ -952,10 +1123,9 @@ fn non_final_shipped_deliver_via_on_ship_in_order() {
     let seen = ships.lock().unwrap();
     assert_eq!(seen.len(), 2, "exactly the two NON-final shipped sets");
     assert_eq!(seen[0].0, vec!["first_ship"]);
-    assert_eq!(seen[0].1, vec![vec!["one".to_string()]]);
+    assert_eq!(seen[0].1, vec![vec![Some(b"one".to_vec())]]);
     assert_eq!(seen[1].0, vec!["second_ship"]);
-    assert_eq!(seen[1].1, vec![vec!["2".to_string()]]);
-
+    assert_eq!(seen[1].1, vec![vec![Some(b"2".to_vec())]]);
 }
 
 /// The final shipped statement streams through the backend session (the
@@ -1049,4 +1219,154 @@ fn plan_with_no_shipped_entry_returns_empty_header() {
     assert!(columns.is_empty());
     assert!(rows.is_empty());
     assert_eq!(count_rows(&conn, "t"), 1, "the effects still ran");
+}
+
+// ---------------------------------------------------------------------
+// The REPL recovery boundary (R4.2.6): a prompt is never presented over a
+// quarantined session. These pins exercise the ACTUAL external-effect
+// quarantine road, the typed health report the host reads, and the one
+// reset authority that clears — or refuses to clear — the latch.
+// ---------------------------------------------------------------------
+
+/// SUCCESSFUL RECOVERY. The session quarantines on the real created-object
+/// registration road; the typed report names the incident; the one reset
+/// authority replaces the session; and a following `_(1)` succeeds.
+#[test]
+fn recovery_replaces_a_quarantined_session_and_the_next_query_succeeds() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+
+    // 1. The actual quarantine road: a plan that created an object whose
+    //    catalog registration fails after the run.
+    {
+        let mut relay = relay_over(&mut system, Arc::clone(&conn));
+        let p = CompiledPlan {
+            entries: vec![ship("SELECT 1 AS value")],
+            exit_probe_sql: None,
+            created_objects: vec![crate::pipeline::compiled_query::PlanCreatedObject {
+                name: "created".to_string(),
+                is_view: false,
+                connection_id: None,
+            }],
+            typed: None,
+        };
+        let response = relay.play_plan_with_catalog(&p, &CatalogShouldNotRun);
+        let (identity, _message) = error_message(response);
+        assert_eq!(
+            identity,
+            b"delightql-error://runtime/session_health/external_effect".to_vec()
+        );
+        // The latch holds: an ordinary next query is refused, which is the
+        // state a REPL must never wrap in another prompt.
+        let refused = relay.handle(ClientTerm::Query {
+            text: b"_(1)".to_vec(),
+        });
+        let (identity, _message) = error_message(refused);
+        assert_eq!(
+            identity,
+            b"delightql-error://runtime/session_health/external_effect".to_vec()
+        );
+    }
+
+    // 2. The TYPED report distinguishes the ruled incident — the host reads
+    //    this, never error text.
+    let (operation, message) = system
+        .health_incident()
+        .expect("the quarantine is visible to the typed report");
+    assert_eq!(operation, "created-object registration");
+    assert!(message.contains("delightql-error://"));
+
+    // 3. The one reset authority clears the latch...
+    system
+        .reinit_bootstrap()
+        .expect("recovery with no pending inverses succeeds");
+    assert!(system.health_incident().is_none());
+
+    // 4. ...and the replaced session answers an ordinary `_(1)`.
+    let mut relay = relay_over(&mut system, conn);
+    let resp = relay.handle(ClientTerm::Query {
+        text: b"_(1)".to_vec(),
+    });
+    let (_columns, rows) = fetch_all(&mut relay, resp);
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// FAILED RECOVERY. A pending inverse that still fails on reset leaves the
+/// incident latched: reset refuses, the report still says quarantined, and a
+/// new query is still refused — the host's only lawful move is to terminate
+/// the connection.
+#[test]
+fn a_failed_recovery_retains_the_quarantine() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+
+    // A previously-Empty file that is now MISSING is the conservative
+    // file-inverse uncertainty (ruled): restore_empty refuses to recreate it.
+    let missing = std::env::temp_dir().join(format!(
+        "dql_recovery_pin_missing_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    system.quarantine_session_with_pending(
+        "liminal external-effect compensation",
+        "test incident: a created file's inverse failed",
+        vec![crate::external_effects::ExternalEffect::CreatedFile {
+            path: missing,
+            prior_state: crate::external_effects::CreatedFilePriorState::Empty,
+        }],
+    );
+
+    let error = system
+        .reinit_bootstrap()
+        .expect_err("reset must refuse while an inverse still fails");
+    assert!(
+        error.error_uri().contains("session_health/external_effect"),
+        "got {}",
+        error.error_uri()
+    );
+
+    // The latch and the typed report both survive the failed reset.
+    let (operation, _message) = system
+        .health_incident()
+        .expect("a failed recovery retains the incident");
+    assert_eq!(operation, "liminal external-effect compensation");
+
+    let mut relay = relay_over(&mut system, conn);
+    let refused = relay.handle(ClientTerm::Query {
+        text: b"_(1)".to_vec(),
+    });
+    let (identity, _message) = error_message(refused);
+    assert_eq!(
+        identity,
+        b"delightql-error://runtime/session_health/external_effect".to_vec()
+    );
+}
+
+/// NON-QUARANTINE CONTROL. An ordinary error — here a plain unknown-name
+/// resolution failure — leaves the session healthy: the typed report says
+/// so and the next query runs without any recovery.
+#[test]
+fn an_ordinary_error_does_not_trigger_the_recovery_boundary() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+
+    let response = relay.handle(ClientTerm::Query {
+        text: b"no_such_table(*)".to_vec(),
+    });
+    let (identity, _message) = error_message(response);
+    assert_ne!(
+        identity,
+        b"delightql-error://runtime/session_health/external_effect".to_vec()
+    );
+    assert!(relay.system.health_incident().is_none());
+
+    let resp = relay.handle(ClientTerm::Query {
+        text: b"_(1)".to_vec(),
+    });
+    let (_columns, rows) = fetch_all(&mut relay, resp);
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
 }

@@ -4,9 +4,10 @@
 //
 // This module handles constraint extraction from positional patterns and anonymous table processing
 
-use super::reference_extraction::extract_table_references_in_scope;
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::Comparison;
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved;
-use crate::pipeline::asts::unresolved::NamespacePath;
 use crate::pipeline::refiner::flattener::{FlatOperator, FlatOperatorKind, FlatSegment, FlatTable};
 use crate::pipeline::refiner::types::*;
 
@@ -14,6 +15,7 @@ use crate::pipeline::refiner::types::*;
 pub(super) fn create_anonymous_table_join_predicates(
     analyzed_predicates: &mut Vec<AnalyzedPredicate>,
     flat: &FlatSegment,
+    identities: &crate::names::Registry,
 ) {
     log::debug!(
         "create_anonymous_table_join_predicates called with {} tables",
@@ -27,108 +29,58 @@ pub(super) fn create_anonymous_table_join_predicates(
             table.anonymous_data.is_some()
         );
         if let Some(ref anon_data) = table.anonymous_data {
-            // EXISTS-mode anonymous tables (from IN literal desugaring) are self-contained
-            // subqueries — their qualified column headers are correlation references to the
-            // outer scope, not join conditions within this segment.
-            if anon_data.exists_mode {
-                log::debug!(
-                    "Skipping exists-mode anonymous table at index {}",
-                    table_idx
-                );
-                continue;
-            }
             log::debug!("Processing anonymous table at index {}", table_idx);
-            if let Some(ref headers) = anon_data.column_headers {
+            if let Some(ref headers) = anon_data.body.header {
                 log::debug!("Anonymous table has {} headers", headers.len());
                 // Process each header - create constraints for all non-pure-Lvar expressions
-                for (col_idx, header) in headers.iter().enumerate() {
+                for (col_idx, item) in headers.iter().enumerate() {
+                    let header = item.term().expect("an anonymous header has a domain term");
                     log::debug!("Processing header {} : {:?}", col_idx, header);
 
-                    // Determine column name and whether to create a constraint
-                    let (column_name, should_create_constraint) = match header {
-                        // Pure Lvars just introduce columns, not constraints
-                        resolved::DomainExpression::Lvar {
-                            name,
-                            qualifier: None,
-                            ..
-                        } => (name.to_string(), false),
-                        // Qualified Lvars - use the name part as column name
-                        resolved::DomainExpression::Lvar {
-                            name,
-                            qualifier: Some(_),
-                            ..
-                        } => (name.to_string(), true),
-                        // Everything else creates a constraint with generic column name
-                        _ => (
-                            crate::pipeline::naming::generate_domain_expression_column_name(
-                                header, col_idx,
-                            ),
-                            true,
-                        ),
-                    };
+                    let anon_column = identities
+                        .known_heading(table.identity)
+                        .expect("an anonymous table publishes what it was written with")
+                        .in_order()
+                        .nth(col_idx)
+                        .copied()
+                        .expect("anonymous headers and their structural heading agree");
+                    let should_create_constraint = !matches!(
+                        &header,
+                        resolved::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence { column, .. })))
+                            if *column == anon_column
+                    );
 
                     // Create constraint for any non-pure-Lvar expression
                     if should_create_constraint {
-                        // Generic constraint: _.column = domain_expression
-                        let anon_table_alias = "_";
+                        let left = resolved::DomainExpression::Reference(Reference::Named(
+                            NamedReference(ColumnOccurrence {
+                                column: anon_column,
+                                explicit_qualifier: false,
+                            }),
+                        ));
 
-                        // Left side: anonymous table column
-                        let left = resolved::DomainExpression::Lvar {
-                            name: column_name.clone().into(),
-                            qualifier: Some(anon_table_alias.into()),
-                            alias: None,
-                            namespace_path: NamespacePath::empty(),
-                            provenance: resolved::PhaseBox::phantom(),
-                        };
-
-                        // Right side: the original expression (ANY DomainExpression!)
                         let right = header.clone();
+                        let predicate = resolved::TruthExpression::Comparison(Comparison {
+                            operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        });
 
-                        // Check if we can use USING clause instead of ON
-                        // This happens when the right side is a simple column reference with the same name
-                        let predicate = match header {
-                            resolved::DomainExpression::Lvar {
-                                name: right_name,
-                                qualifier: Some(_),
-                                ..
-                            } if right_name == &column_name => {
-                                // Both sides have same column name - use USING for cleaner SQL
-                                log::debug!("Creating USING predicate for column: {}", column_name);
-                                resolved::BooleanExpression::Using {
-                                    columns: vec![resolved::UsingColumn::Regular(
-                                        resolved::QualifiedName {
-                                            namespace_path: NamespacePath::empty(),
-                                            name: column_name.clone().into(),
-                                            grounding: None,
-                                        },
-                                    )],
-                                }
-                            }
-                            _ => {
-                                // Different names or complex expression - use ON
-                                resolved::BooleanExpression::Comparison {
-                                    operator: "traditional_eq".to_string(),
-                                    left: Box::new(left),
-                                    right: Box::new(right),
-                                }
-                            }
+                        let referenced_table = match &header {
+                            resolved::DomainExpression::Reference(Reference::Named(
+                                NamedReference(ColumnOccurrence { column, .. }),
+                            )) => Some(identities.scope_of(*column)),
+                            _ => None,
                         };
 
-                        // Determine classification based on expression type
-                        // Check if expression references other tables (for join vs filter classification)
-                        let referenced_tables = extract_table_references_in_scope(header);
-
-                        let class = if !referenced_tables.is_empty() {
-                            // Expression references other tables - create FJC (join condition)
-                            // Use the first referenced table as the "left" side
+                        let class = if let Some(referenced_table) = referenced_table {
                             PredicateClass::FJC {
-                                left: referenced_tables[0].clone(),
-                                right: anon_table_alias.to_string(),
+                                left: referenced_table,
+                                right: table.identity,
                             }
                         } else {
-                            // No table references - this is a filter on the anonymous table
                             PredicateClass::F {
-                                table: anon_table_alias.to_string(),
+                                table: table.identity,
                             }
                         };
 
@@ -141,13 +93,6 @@ pub(super) fn create_anonymous_table_join_predicates(
                             OperatorRef::TopLevel
                         };
 
-                        log::debug!(
-                            "Creating anonymous table constraint (generic): {}.{} = {:?}",
-                            anon_table_alias,
-                            column_name,
-                            header
-                        );
-
                         analyzed_predicates.push(AnalyzedPredicate {
                             class,
                             expr: predicate,
@@ -155,126 +100,134 @@ pub(super) fn create_anonymous_table_join_predicates(
                             origin: resolved::FilterOrigin::Generated,
                         });
                     }
-
-                    // Note: column_name is used by the transformer to name the column
                 }
             }
         }
     }
 }
 
-/// Process GlobWithUsing domain specs and update join operators with USING columns
+/// Attach each table's dequalifying names to the join that brings it in.
+///
+/// ONE ALGORITHM, TWO POSITIONS. A `.(cols)` step is the mention's own access
+/// when the mention could absorb it (`orders(*.(status))`) and a step on the
+/// mention's result when it could not (`orders(id, _) .(status)`); both hold
+/// the same `Access::Dequalify`. What those names MEAN to the join is one
+/// question, and this is the one place that answers it.
 pub(super) fn process_glob_with_using(
     mut operators: Vec<FlatOperator>,
     tables: &[FlatTable],
+    identities: &crate::names::Registry,
 ) -> Vec<FlatOperator> {
-    // Look for tables with GlobWithUsing and update the next join operator
-    for i in 0..tables.len() {
-        if let resolved::DomainSpec::GlobWithUsing(using_cols) = &tables[i].domain_spec {
-            log::debug!(
-                "Found GlobWithUsing on table {} with columns: {:?}",
-                tables[i]
-                    .alias
-                    .as_deref()
-                    .unwrap_or(&tables[i].identifier.name),
-                using_cols
+    crate::probe::probing!(using, {
+        for (i, table) in tables.iter().enumerate() {
+            crate::probe::probe!(
+                using,
+                "table {i} {:?} spec={:?} names={:?}",
+                table.identity,
+                table.access,
+                published_names(table, identities)
             );
-
-            // The join operator at position j-1 joins table[j-1] with table[j]
-            // If table[j] has GlobWithUsing, it applies to join j-1
-            // But actually: orders(*{user_id}) means the USING applies when joining TO orders
-            // So if orders is at position 1, the join at position 0 should get the USING
-            if i > 0 && i - 1 < operators.len() {
-                log::debug!("Applying USING to join at position {}", i - 1);
-                if let FlatOperatorKind::Join {
-                    ref mut using_columns,
-                } = &mut operators[i - 1].kind
-                {
-                    *using_columns = Some(using_cols.clone());
-                }
-            }
         }
-    }
-
-    operators
-}
-
-/// Process Using operators (.(cols)) in pipe expressions and update join operators with USING columns
-///
-/// Similar to process_glob_with_using, but handles the new `.(cols)` unary operator syntax
-/// which is stored in the table's pipe_expr rather than domain_spec.
-pub(super) fn process_using_operators(
-    mut operators: Vec<FlatOperator>,
-    tables: &[FlatTable],
-) -> Vec<FlatOperator> {
-    // Look for tables with pipe expressions containing Using operators
+        for (i, op) in operators.iter().enumerate() {
+            crate::probe::probe!(using, "operator {i} {:?}", op.kind);
+        }
+    });
     for i in 0..tables.len() {
-        if let Some(ref pipe_expr) = tables[i].pipe_expr {
-            // Recursively search for Using operators in the pipe chain
-            if let Some(using_cols) = extract_using_columns_from_pipe(pipe_expr) {
-                log::debug!(
-                    "Found Using operator on table {} with columns: {:?}",
-                    tables[i]
-                        .alias
-                        .as_deref()
-                        .unwrap_or(&tables[i].identifier.name),
-                    using_cols
-                );
-
-                // Same logic as GlobWithUsing: the join operator at position i-1
-                // joins table[i-1] with table[i]
-                if i > 0 && i - 1 < operators.len() {
-                    log::debug!("Applying USING to join at position {}", i - 1);
-                    if let FlatOperatorKind::Join {
-                        ref mut using_columns,
-                    } = &mut operators[i - 1].kind
-                    {
-                        *using_columns = Some(using_cols);
-                    }
-                }
-            }
+        let Some(using_cols) = dequalifying_names(&tables[i]) else {
+            continue;
+        };
+        log::debug!(
+            "Found a dequalifying access on table {:?} with columns: {:?}",
+            tables[i].identity,
+            using_cols
+        );
+        // The join at position i-1 joins table[i-1] to table[i], and a
+        // dequalifying access on table[i] is about the join that brings it
+        // in: `orders(*.(user_id))` means USING when joining TO orders.
+        if i > 0 && i - 1 < operators.len() {
+            log::debug!("Applying USING to join at position {}", i - 1);
+            let FlatOperatorKind::Join {
+                ref mut correspondence,
+            } = &mut operators[i - 1].kind;
+            *correspondence = Some(resolved::Correspondence::new(
+                using_cols
+                    .iter()
+                    .map(|name| {
+                        // Both pieces of the identifier: the strop decides
+                        // whether the join corresponds on `Name` or on any
+                        // casing of it, so a heading holding both publishes
+                        // two columns and only the spelling says which was
+                        // asked for.
+                        let spelling = identities.intern(name.as_str(), name.is_stropped());
+                        identities.canonical(spelling)
+                    })
+                    .collect(),
+            ));
         }
     }
 
     operators
 }
 
-/// Recursively search a pipe expression for a Using operator and extract its columns.
+/// The names a table dequalifies onto, from whichever position holds them.
 ///
-/// KEPT LOCAL (not routed through Helper A `source_spine`): this descends `Pipe`
-/// ONLY and STOPS at a Filter (`Filter => None`) — a `.(cols)` Using separated
-/// from the outer chain by a filter is deliberately NOT found. Helper A descends
-/// `Filter` AND `Pipe`, so routing this through it would look past a Filter and
-/// change results (INVENTORY §4 grouped it with Helper A, but its Filter
-/// boundary diverges — a named local accessor is correct here).
-#[stacksafe::stacksafe]
-fn extract_using_columns_from_pipe(expr: &resolved::RelationalExpression) -> Option<Vec<String>> {
-    match expr {
-        resolved::RelationalExpression::Pipe(pipe) => {
-            // Check if this pipe's operator is Using
-            if let resolved::UnaryRelationalOperator::Using { columns } = &pipe.operator {
-                return Some(columns.clone());
+/// The mention's own access is asked FIRST: it is the position the author
+/// wrote inside the parens, and a step on the result only exists when the
+/// mention could not hold one, so the two are never both present for one
+/// table.
+fn dequalifying_names(table: &FlatTable) -> Option<Vec<delightql_types::SqlIdentifier>> {
+    if let resolved::Access::Dequalify(columns) = &table.access {
+        return Some(columns.clone());
+    }
+    table
+        .pipe_expr
+        .as_deref()
+        .and_then(trailing_dequalifying_access)
+}
+
+/// The dequalifying access of a chain's trailing pipe run.
+///
+/// KEPT LOCAL (not routed through `Chain::source_spine`): this reads the pipe
+/// run ONLY and stops at a restriction — a `.(cols)` separated from the outer
+/// chain by a filter is deliberately NOT found, and the source spine reads
+/// through restrictions.
+fn trailing_dequalifying_access(
+    expr: &resolved::Chain,
+) -> Option<Vec<delightql_types::SqlIdentifier>> {
+    // THE STEPS ONLY. A mention's own access is asked through `table.access`;
+    // reading it here as well would find a dequalification the mention
+    // already answered for, at a table this walk was handed for its pipes.
+    let mut rest = expr.steps();
+    while let Some((last, prefix)) = rest.split_last() {
+        match last {
+            resolved::Continuation::Access {
+                access: resolved::Access::Dequalify(columns),
+                ..
+            } => return Some(columns.clone()),
+            resolved::Continuation::Access { .. } | resolved::Continuation::Pipe { .. } => {}
+            _ => return None,
+        }
+        rest = prefix;
+    }
+    None
+}
+
+/// The canonical spellings a table publishes, in heading order.
+///
+/// Order carries: the USING list decides which side of the merged column the
+/// output takes, and two tables that share a name must agree on where it sits.
+fn published_names(
+    table: &FlatTable,
+    identities: &crate::names::Registry,
+) -> Vec<crate::names::Sym> {
+    let scope = table.schema;
+    let mut names = Vec::new();
+    for column in identities.heading(scope).columns_seen() {
+        if let Some(published) = identities.published_sym(column) {
+            if !names.contains(&published) {
+                names.push(published);
             }
-            // Recursively check the source
-            extract_using_columns_from_pipe(&pipe.source)
-        }
-        // STOP at the WHOLE node: Filter (this peel stops at a Filter, unlike the
-        // base spine), Relation, Join, SetOperation. Stopping at the whole node
-        // hides no recursive field (Filter.source/condition, Join arms, SetOp
-        // operands) — the node IS the boundary. Every variant is spelled (no bare
-        // `_`) so a new relational variant forces a decision (R-I3).
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::Filter { .. }
-        | resolved::RelationalExpression::Join { .. }
-        | resolved::RelationalExpression::SetOperation { .. } => None,
-        // ER chains consumed before refiner
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before constraint analysis")
-        }
-        // IntersectCorresponding is produced by the refiner, not present in resolved phase
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
+    names
 }

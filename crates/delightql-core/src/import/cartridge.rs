@@ -6,8 +6,6 @@
 // - Database connections (SQLite, PostgreSQL, etc.)
 // - DQL/SQL files
 // - Binary/built-in entities
-//
-// See: documentation/design/ddl/SYS-NS-CARTRIDGE-ER-DESIGN.md
 
 use anyhow::Result;
 use rusqlite::Connection;

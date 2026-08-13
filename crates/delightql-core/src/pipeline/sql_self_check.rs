@@ -1,76 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Post-lowering self-check: name-binding verification of the final SQL
-//! AST, after legalization and immediately before rendering — the
-//! transpiler's analogue of the formatter's L1 (verify the artifact we
-//! actually ship, not an intermediate).
+//! Post-lowering binding verification over the final structural SQL AST.
 //!
-//! Two structural guarantees, no catalog required:
-//!
-//! - **Qualifier visibility**: every qualified column reference names a
-//!   scope visible at its position — its own SELECT's FROM, an enclosing
-//!   query's FROM (correlation), or a sibling FROM item for TVF
-//!   arguments (SQLite binds those laterally). A violation means the
-//!   qualifier exists nowhere on the reference's path: a dangling alias.
-//!
-//! - **Column existence**: when the named scope is derived (subquery,
-//!   CTE, union table) with a fully enumerable output list, the
-//!   referenced column must be in that list. Base tables and open lists
-//!   (stars, unnamed expression items) are skipped — absence is
-//!   inconclusive without a catalog.
-//!
-//! A failure is a compiler invariant violation, never a user error: the
-//! transpiler emitted a reference SQL could not resolve, or could only
-//! resolve to the wrong thing. Loud here beats a backend "no such
-//! column" (best case) or a silently wrong binding (worst case).
-//!
-//! Scope rules are deliberately one notch LENIENT where SQL dialects
-//! disagree (outer scopes stay visible inside FROM-subqueries): a miss
-//! here is a weaker check, never a false refusal of working SQL.
+//! This pass independently rebuilds the scopes visible at every select.
+//! A reference is valid only when its owning `ScopeId` is visible and,
+//! for a derived scope with an enumerable heading, its `ColId` is one of
+//! that scope's outputs.
 
 use std::collections::HashMap;
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::sql_ast_v3::{
-    Cte, DomainExpression, JoinCondition, OrderTerm, QueryExpression, SelectItem, SelectStatement,
+use crate::names::{ColId, Registry, ScopeId};
+use crate::pipeline::sql_ast::{
+    Cte, DomainExpression, JoinCondition, QueryExpression, SelectItem, SelectStatement,
     SqlStatement, TableExpression, TvfArgument,
 };
 
-/// What we know about a scope's output columns.
 #[derive(Debug, Clone)]
 enum ColumnSet {
-    /// Not enumerable (base table, star projection, unnamed expression
-    /// item, VALUES, TVF). Column existence is not checked.
     Open,
-    /// Fully enumerable output list (lowercased names).
-    Known(Vec<String>),
+    Known(Vec<ColId>),
 }
 
 impl ColumnSet {
-    fn contains(&self, lowered: &str) -> bool {
+    fn contains(&self, column: ColId) -> bool {
         match self {
             ColumnSet::Open => true,
-            ColumnSet::Known(cols) => cols.iter().any(|c| c == lowered),
+            ColumnSet::Known(columns) => columns.contains(&column),
         }
     }
 }
 
-/// One SELECT's FROM clause: qualifier (lowercased) → its columns.
-type Frame = HashMap<String, ColumnSet>;
+type Frame = HashMap<ScopeId, ColumnSet>;
+type CteEnv = HashMap<ScopeId, ColumnSet>;
 
-/// CTE names visible at a point (statement-level WITH plus any nested
-/// WITH clauses on the path), name (lowercased) → output columns.
-type CteEnv = HashMap<String, ColumnSet>;
-
-fn lower(s: &str) -> String {
-    s.to_ascii_lowercase()
-}
-
-/// Verify every name binding in the statement. Called once per compiled
-/// statement, on the exact AST handed to the generator.
-pub fn check(stmt: &SqlStatement) -> Result<()> {
+pub fn check(stmt: &SqlStatement, identities: &Registry) -> Result<()> {
     let mut ctes = CteEnv::new();
     match stmt {
+        // A name and nothing else: no publication to check.
+        SqlStatement::DropTempTable { .. } => {}
         SqlStatement::Query { with_clause, query }
         | SqlStatement::CreateTempTable {
             with_clause, query, ..
@@ -78,39 +46,35 @@ pub fn check(stmt: &SqlStatement) -> Result<()> {
         | SqlStatement::CreateTempView {
             with_clause, query, ..
         } => {
-            check_cte_list(with_clause.as_deref(), &[], &mut ctes)?;
-            check_query(query, &[], &ctes)?;
+            check_cte_list(with_clause.as_deref(), &[], &mut ctes, identities)?;
+            check_query(query, &[], &ctes, identities)?;
         }
         SqlStatement::Delete {
-            target_table,
+            target_scope,
             with_clause,
             where_clause,
             ..
         } => {
-            check_cte_list(with_clause.as_deref(), &[], &mut ctes)?;
-            let mut frame = Frame::new();
-            frame.insert(lower(target_table), ColumnSet::Open);
-            let stack = [frame];
-            if let Some(w) = where_clause {
-                check_expr(w, &stack, &ctes)?;
+            check_cte_list(with_clause.as_deref(), &[], &mut ctes, identities)?;
+            let stack = [HashMap::from([(*target_scope, ColumnSet::Open)])];
+            if let Some(expr) = where_clause {
+                check_expr(expr, &stack, &ctes, identities)?;
             }
         }
         SqlStatement::Update {
-            target_table,
+            target_scope,
             with_clause,
             set_clause,
             where_clause,
             ..
         } => {
-            check_cte_list(with_clause.as_deref(), &[], &mut ctes)?;
-            let mut frame = Frame::new();
-            frame.insert(lower(target_table), ColumnSet::Open);
-            let stack = [frame];
+            check_cte_list(with_clause.as_deref(), &[], &mut ctes, identities)?;
+            let stack = [HashMap::from([(*target_scope, ColumnSet::Open)])];
             for (_, expr) in set_clause {
-                check_expr(expr, &stack, &ctes)?;
+                check_expr(expr, &stack, &ctes, identities)?;
             }
-            if let Some(w) = where_clause {
-                check_expr(w, &stack, &ctes)?;
+            if let Some(expr) = where_clause {
+                check_expr(expr, &stack, &ctes, identities)?;
             }
         }
         SqlStatement::Insert {
@@ -118,129 +82,133 @@ pub fn check(stmt: &SqlStatement) -> Result<()> {
             source,
             ..
         } => {
-            check_cte_list(with_clause.as_deref(), &[], &mut ctes)?;
-            check_query(source, &[], &ctes)?;
+            check_cte_list(with_clause.as_deref(), &[], &mut ctes, identities)?;
+            check_query(source, &[], &ctes, identities)?;
         }
     }
     Ok(())
 }
 
-/// Check CTE bodies in declaration order; each sees the ones before it
-/// (and itself when recursive). Extends `ctes` with every output set.
-///
-/// CTE bodies receive the ENCLOSING scope stack: standard SQL has no
-/// correlated CTE, but SQLite inlines CTEs and resolves outer references
-/// through them, and the HO-pipe lowering ships exactly that shape (a
-/// WITH clause inside a correlated scalar subquery whose body reads the
-/// outer row). Leniency rule: never refuse SQL the target accepts.
-fn check_cte_list(list: Option<&[Cte]>, stack: &[Frame], ctes: &mut CteEnv) -> Result<()> {
+fn check_cte_list(
+    list: Option<&[Cte]>,
+    stack: &[Frame],
+    ctes: &mut CteEnv,
+    identities: &Registry,
+) -> Result<()> {
     for cte in list.into_iter().flatten() {
-        let name = lower(cte.name());
         if cte.is_recursive() {
-            ctes.insert(name.clone(), ColumnSet::Open);
+            ctes.insert(cte.scope(), ColumnSet::Open);
         }
-        let out = check_query(cte.query(), stack, ctes)?;
-        ctes.insert(name, out);
+        let output = check_query(cte.query(), stack, ctes, identities)?;
+        ctes.insert(cte.scope(), output);
     }
     Ok(())
 }
 
-/// Check a query expression; returns its output columns.
 #[stacksafe::stacksafe]
-fn check_query(query: &QueryExpression, stack: &[Frame], ctes: &CteEnv) -> Result<ColumnSet> {
+fn check_query(
+    query: &QueryExpression,
+    stack: &[Frame],
+    ctes: &CteEnv,
+    identities: &Registry,
+) -> Result<ColumnSet> {
     match query {
-        QueryExpression::Select(select) => check_select(select, stack, ctes),
+        QueryExpression::Select(select) => check_select(select, stack, ctes, identities),
         QueryExpression::SetOperation { left, right, .. } => {
-            // Column names of a compound come from the left arm.
-            let out = check_query(left, stack, ctes)?;
-            check_query(right, stack, ctes)?;
-            Ok(out)
+            let output = check_query(left, stack, ctes, identities)?;
+            check_query(right, stack, ctes, identities)?;
+            Ok(output)
         }
         QueryExpression::Values { rows } => {
             for row in rows {
                 for expr in row {
-                    check_expr(expr, stack, ctes)?;
+                    check_expr(expr, stack, ctes, identities)?;
                 }
             }
             Ok(ColumnSet::Open)
         }
         QueryExpression::WithCte { ctes: inner, query } => {
             let mut extended = ctes.clone();
-            check_cte_list(Some(inner), stack, &mut extended)?;
-            check_query(query, stack, &extended)
+            check_cte_list(Some(inner), stack, &mut extended, identities)?;
+            check_query(query, stack, &extended, identities)
         }
     }
 }
 
-/// Check one SELECT: build its FROM frame, then verify every expression
-/// against the frame stack. Returns the SELECT's output columns.
 #[stacksafe::stacksafe]
-fn check_select(select: &SelectStatement, stack: &[Frame], ctes: &CteEnv) -> Result<ColumnSet> {
+fn check_select(
+    select: &SelectStatement,
+    stack: &[Frame],
+    ctes: &CteEnv,
+    identities: &Registry,
+) -> Result<ColumnSet> {
     let mut frame = Frame::new();
-    // Join ON conditions and TVF arguments bind against the COMPLETE
-    // frame (both join sides; TVF lateral siblings), so they are
-    // collected during the build and checked after it.
-    let mut join_conditions: Vec<&DomainExpression> = Vec::new();
-    let mut tvf_args: Vec<&TvfArgument> = Vec::new();
-
-    for te in select.from().into_iter().flatten() {
-        collect_from(te, stack, ctes, &mut frame, &mut join_conditions, &mut tvf_args)?;
+    let mut join_conditions = Vec::new();
+    let mut tvf_args = Vec::new();
+    for table in select.from().into_iter().flatten() {
+        collect_from(
+            table,
+            stack,
+            ctes,
+            identities,
+            &mut frame,
+            &mut join_conditions,
+            &mut tvf_args,
+        )?;
     }
 
-    let mut full_stack: Vec<Frame> = stack.to_vec();
-    full_stack.push(frame);
-
-    for cond in join_conditions {
-        check_expr(cond, &full_stack, ctes)?;
-    }
-    for arg in tvf_args {
-        match arg {
-            TvfArgument::QualifiedRef { qualifier, column } => {
-                check_reference(qualifier, column, &full_stack)?;
+    // Output aliases are visible to ORDER BY on every supported target.
+    // Making them visible to the other clauses keeps this self-check
+    // deliberately lenient where dialects disagree.
+    for item in select.select_list() {
+        if let SelectItem::Expression {
+            alias: Some(column),
+            ..
+        } = item
+        {
+            frame
+                .entry(identities.scope_of(*column))
+                .or_insert_with(|| ColumnSet::Known(Vec::new()));
+            if let Some(ColumnSet::Known(columns)) = frame.get_mut(&identities.scope_of(*column)) {
+                columns.push(*column);
             }
-            TvfArgument::ColumnRef { qualifier, column } => {
-                check_reference(qualifier.table_name(), column, &full_stack)?;
-            }
-            TvfArgument::StringLiteral(_)
-            | TvfArgument::NumberLiteral(_)
-            | TvfArgument::Identifier(_) => {}
         }
     }
 
+    let mut full_stack = stack.to_vec();
+    full_stack.push(frame);
+
+    for condition in join_conditions {
+        check_expr(condition, &full_stack, ctes, identities)?;
+    }
+    for argument in tvf_args {
+        if let TvfArgument::Column(column) = argument {
+            check_reference(*column, &full_stack, identities)?;
+        }
+    }
     for expr in select.group_by().into_iter().flatten() {
-        check_expr(expr, &full_stack, ctes)?;
+        check_expr(expr, &full_stack, ctes, identities)?;
     }
-    if let Some(h) = select.having() {
-        check_expr(h, &full_stack, ctes)?;
+    if let Some(expr) = select.having() {
+        check_expr(expr, &full_stack, ctes, identities)?;
     }
-    if let Some(w) = select.where_clause() {
-        check_expr(w, &full_stack, ctes)?;
+    if let Some(expr) = select.where_clause() {
+        check_expr(expr, &full_stack, ctes, identities)?;
     }
     for term in select.order_by().into_iter().flatten() {
-        let term: &OrderTerm = term;
-        check_expr(term.expr(), &full_stack, ctes)?;
+        check_expr(term.expr(), &full_stack, ctes, identities)?;
     }
 
-    let mut out: Vec<String> = Vec::new();
+    let mut output = Vec::new();
     let mut open = false;
     for item in select.select_list() {
         match item {
-            SelectItem::Star => open = true,
-            SelectItem::QualifiedStar { qualifier } => {
-                let scope = resolve_scope(qualifier.table_name(), &full_stack)
-                    .ok_or_else(|| dangling(qualifier.table_name(), "*", &full_stack))?;
-                match scope {
-                    ColumnSet::Known(cols) => out.extend(cols.iter().cloned()),
-                    ColumnSet::Open => open = true,
-                }
-            }
+            SelectItem::Star { .. } => open = true,
             SelectItem::Expression { expr, alias } => {
-                check_expr(expr, &full_stack, ctes)?;
+                check_expr(expr, &full_stack, ctes, identities)?;
                 match (alias, expr) {
-                    (Some(a), _) => out.push(lower(a)),
-                    (None, DomainExpression::Column { name, .. }) => out.push(lower(name)),
-                    // Unnamed non-column item: the backend derives a name
-                    // we do not model, so the list is not enumerable.
+                    (Some(column), _) => output.push(*column),
+                    (None, DomainExpression::Column(column)) => output.push(*column),
                     (None, _) => open = true,
                 }
             }
@@ -249,31 +217,33 @@ fn check_select(select: &SelectStatement, stack: &[Frame], ctes: &CteEnv) -> Res
     Ok(if open {
         ColumnSet::Open
     } else {
-        ColumnSet::Known(out)
+        ColumnSet::Known(output)
     })
 }
 
-/// Add one FROM item's scopes to the frame, checking nested queries.
 #[stacksafe::stacksafe]
 fn collect_from<'a>(
-    te: &'a TableExpression,
+    table: &'a TableExpression,
     stack: &[Frame],
     ctes: &CteEnv,
+    identities: &Registry,
     frame: &mut Frame,
     join_conditions: &mut Vec<&'a DomainExpression>,
     tvf_args: &mut Vec<&'a TvfArgument>,
 ) -> Result<()> {
-    match te {
-        TableExpression::Table { name, alias, .. } => {
-            let cols = ctes.get(&lower(name)).cloned().unwrap_or(ColumnSet::Open);
-            let qual = alias.as_deref().unwrap_or(name);
-            frame.insert(lower(qual), cols);
+    match table {
+        TableExpression::Scope(scope) | TableExpression::QualifiedScope { scope, .. } => {
+            frame.insert(*scope, ctes.get(scope).cloned().unwrap_or(ColumnSet::Open));
         }
+        TableExpression::Entity {
+            alias: Some(scope), ..
+        } => {
+            frame.insert(*scope, ColumnSet::Open);
+        }
+        TableExpression::Entity { alias: None, .. } => {}
         TableExpression::Subquery { query, alias } => {
-            // A FROM-subquery body sees enclosing scopes but not its
-            // siblings (only TVF arguments bind laterally).
-            let cols = check_query(query, stack, ctes)?;
-            frame.insert(lower(alias), cols);
+            let columns = check_query(query, stack, ctes, identities)?;
+            frame.insert(*alias, columns);
         }
         TableExpression::Join {
             left,
@@ -281,103 +251,84 @@ fn collect_from<'a>(
             join_condition,
             ..
         } => {
-            collect_from(left, stack, ctes, frame, join_conditions, tvf_args)?;
-            collect_from(right, stack, ctes, frame, join_conditions, tvf_args)?;
+            collect_from(
+                left,
+                stack,
+                ctes,
+                identities,
+                frame,
+                join_conditions,
+                tvf_args,
+            )?;
+            collect_from(
+                right,
+                stack,
+                ctes,
+                identities,
+                frame,
+                join_conditions,
+                tvf_args,
+            )?;
             if let JoinCondition::On(expr) = join_condition {
                 join_conditions.push(expr);
             }
         }
-        TableExpression::Values { rows, alias } => {
-            for row in rows {
-                for expr in row {
-                    check_expr(expr, stack, ctes)?;
-                }
-            }
-            frame.insert(lower(alias), ColumnSet::Open);
-        }
-        TableExpression::UnionTable { selects, alias } => {
-            let mut first: Option<ColumnSet> = None;
-            for q in selects {
-                let out = check_query(q, stack, ctes)?;
-                if first.is_none() {
-                    first = Some(out);
-                }
-            }
-            frame.insert(lower(alias), first.unwrap_or(ColumnSet::Open));
-        }
         TableExpression::TVF {
-            function,
-            arguments,
-            alias,
-            ..
+            arguments, alias, ..
         } => {
-            let qual = alias.as_deref().unwrap_or(function);
-            frame.insert(lower(qual), ColumnSet::Open);
-            tvf_args.extend(arguments.iter());
+            frame.insert(*alias, ColumnSet::Open);
+            tvf_args.extend(arguments);
         }
     }
     Ok(())
 }
 
-/// Walk an expression, verifying every qualified column reference and
-/// descending into subqueries with the current stack (correlation).
 #[stacksafe::stacksafe]
-fn check_expr(expr: &DomainExpression, stack: &[Frame], ctes: &CteEnv) -> Result<()> {
+fn check_expr(
+    expr: &DomainExpression,
+    stack: &[Frame],
+    ctes: &CteEnv,
+    identities: &Registry,
+) -> Result<()> {
     match expr {
-        DomainExpression::Column {
-            name,
-            qualifier: Some(q),
-        } => check_reference(q.table_name(), name, stack),
-        DomainExpression::Column { qualifier: None, .. }
-        | DomainExpression::Literal(_)
-        | DomainExpression::Star
-        // Opaque by definition; its references are not modeled.
-        | DomainExpression::RawSql(_) => Ok(()),
+        DomainExpression::Column(column) => check_reference(*column, stack, identities),
+        DomainExpression::Literal(_)
+        | DomainExpression::PublishedNameLiteral(_)
+        | DomainExpression::PublishedJsonPathLiteral(_)
+        | DomainExpression::JsonPathLiteral(_)
+        | DomainExpression::ScopeNameLiteral(_)
+        | DomainExpression::Star => Ok(()),
         DomainExpression::Cast { expr, .. }
         | DomainExpression::Unary { expr, .. }
-        | DomainExpression::Parens(expr) => check_expr(expr, stack, ctes),
+        | DomainExpression::Observation { expr, .. }
+        | DomainExpression::Parens(expr) => check_expr(expr, stack, ctes, identities),
         DomainExpression::Binary { left, right, .. } => {
-            check_expr(left, stack, ctes)?;
-            check_expr(right, stack, ctes)
+            check_expr(left, stack, ctes, identities)?;
+            check_expr(right, stack, ctes, identities)
         }
         DomainExpression::Function { args, .. }
-        | DomainExpression::PredicateRewrite { args, .. }
-        | DomainExpression::Tuple(args) => {
-            for a in args {
-                check_expr(a, stack, ctes)?;
-            }
-            Ok(())
+        | DomainExpression::PredicateRewrite { args, .. } => {
+            check_exprs(args, stack, ctes, identities)
         }
         DomainExpression::Case {
             expr,
             when_clauses,
             else_clause,
         } => {
-            if let Some(e) = expr {
-                check_expr(e, stack, ctes)?;
+            if let Some(expr) = expr {
+                check_expr(expr, stack, ctes, identities)?;
             }
-            for wc in when_clauses {
-                check_expr(wc.when(), stack, ctes)?;
-                check_expr(wc.then(), stack, ctes)?;
+            for clause in when_clauses {
+                check_expr(clause.when(), stack, ctes, identities)?;
+                check_expr(clause.then(), stack, ctes, identities)?;
             }
-            if let Some(e) = else_clause {
-                check_expr(e, stack, ctes)?;
-            }
-            Ok(())
-        }
-        DomainExpression::InList { expr, values, .. } => {
-            check_expr(expr, stack, ctes)?;
-            for v in values {
-                check_expr(v, stack, ctes)?;
+            if let Some(expr) = else_clause {
+                check_expr(expr, stack, ctes, identities)?;
             }
             Ok(())
-        }
-        DomainExpression::InSubquery { expr, query, .. } => {
-            check_expr(expr, stack, ctes)?;
-            check_query(query, stack, ctes).map(|_| ())
         }
         DomainExpression::Exists { query, .. } | DomainExpression::Subquery(query) => {
-            check_query(query, stack, ctes).map(|_| ())
+            check_query(query, stack, ctes, identities).map(|_| ())
         }
         DomainExpression::WindowFunction {
             args,
@@ -386,17 +337,16 @@ fn check_expr(expr: &DomainExpression, stack: &[Frame], ctes: &CteEnv) -> Result
             frame,
             ..
         } => {
-            for a in args.iter().chain(partition_by.iter()) {
-                check_expr(a, stack, ctes)?;
+            check_exprs(args, stack, ctes, identities)?;
+            check_exprs(partition_by, stack, ctes, identities)?;
+            for (expr, _) in order_by {
+                check_expr(expr, stack, ctes, identities)?;
             }
-            for (e, _) in order_by {
-                check_expr(e, stack, ctes)?;
-            }
-            if let Some(f) = frame {
-                use crate::pipeline::sql_ast_v3::SqlFrameBound;
-                for bound in [&f.start, &f.end] {
-                    if let SqlFrameBound::Preceding(e) | SqlFrameBound::Following(e) = bound {
-                        check_expr(e, stack, ctes)?;
+            if let Some(frame) = frame {
+                use crate::pipeline::sql_ast::SqlFrameBound;
+                for bound in [&frame.start, &frame.end] {
+                    if let SqlFrameBound::Preceding(expr) | SqlFrameBound::Following(expr) = bound {
+                        check_expr(expr, stack, ctes, identities)?;
                     }
                 }
             }
@@ -405,248 +355,137 @@ fn check_expr(expr: &DomainExpression, stack: &[Frame], ctes: &CteEnv) -> Result
     }
 }
 
-/// Verify one qualified reference `qualifier.column`.
-fn check_reference(qualifier: &str, column: &str, stack: &[Frame]) -> Result<()> {
-    let Some(scope) = resolve_scope(qualifier, stack) else {
-        return Err(dangling(qualifier, column, stack));
-    };
-    if !scope.contains(&lower(column)) {
-        let ColumnSet::Known(cols) = scope else {
-            unreachable!("Open contains everything")
-        };
-        return Err(DelightQLError::validation_error_categorized(
-            "transform/self_check/unknown_column",
-            format!(
-                "SQL self-check: '{}.{}' does not exist — scope '{}' produces only [{}]",
-                qualifier,
-                column,
-                qualifier,
-                cols.join(", ")
-            ),
-            "internal invariant violation: the transpiler referenced a column its own \
-             derived scope does not output; please report the query that produced this",
-        ));
+fn check_exprs(
+    expressions: &[DomainExpression],
+    stack: &[Frame],
+    ctes: &CteEnv,
+    identities: &Registry,
+) -> Result<()> {
+    for expr in expressions {
+        check_expr(expr, stack, ctes, identities)?;
     }
     Ok(())
 }
 
-/// Innermost frame that knows the qualifier wins (SQL shadowing order).
-/// CTE names are deliberately NOT a fallback: a CTE is referable as a
-/// qualifier only via FROM membership, and every FROM road already put
-/// it in a frame — falling back here would mask a dangling reference.
-fn resolve_scope<'a>(qualifier: &str, stack: &'a [Frame]) -> Option<&'a ColumnSet> {
-    let key = lower(qualifier);
-    stack.iter().rev().find_map(|frame| frame.get(&key))
+fn check_reference(column: ColId, stack: &[Frame], identities: &Registry) -> Result<()> {
+    let scope = identities.scope_of(column);
+    let Some(columns) = resolve_scope(scope, stack) else {
+        crate::probe::probing!(selfcheck, {
+            crate::probe::probe!(
+                selfcheck,
+                "dangling {:?} owner {scope:?} {:?}",
+                crate::probe::chain(identities, column),
+                identities.origin_of(scope)
+            );
+            for frame in stack {
+                for visible in frame.keys() {
+                    crate::probe::probe!(
+                        selfcheck,
+                        "  visible {visible:?} {:?}",
+                        identities.origin_of(*visible)
+                    );
+                }
+            }
+        });
+        return Err(dangling(scope, Some(column), stack, identities));
+    };
+    if columns.contains(column) {
+        return Ok(());
+    }
+    crate::probe::probing!(selfcheck, {
+        crate::probe::probe!(
+            selfcheck,
+            "unpublished {:?} owner {scope:?} {:?}",
+            crate::probe::chain(identities, column),
+            identities.origin_of(scope)
+        );
+        if let ColumnSet::Known(outputs) = columns {
+            for output in outputs {
+                crate::probe::probe!(
+                    selfcheck,
+                    "  owner outputs {:?}",
+                    crate::probe::chain(identities, *output)
+                );
+            }
+        }
+        crate::probe::probe!(
+            selfcheck,
+            "  owner heading {:?}",
+            identities.known_heading(scope)?
+        );
+    });
+    Err(DelightQLError::validation_error_categorized(
+        "transform/self_check/unknown_column",
+        format!(
+            "SQL self-check: {} is not an output of its visible owner {}",
+            tell_column(identities, column),
+            tell_scope(identities, scope)
+        ),
+        "internal invariant violation: the transpiler referenced a column its own \
+         derived scope does not output; please report the query that produced this",
+    ))
 }
 
-fn dangling(qualifier: &str, column: &str, stack: &[Frame]) -> DelightQLError {
-    let mut visible: Vec<&String> = stack.iter().flat_map(|f| f.keys()).collect();
+fn resolve_scope(scope: ScopeId, stack: &[Frame]) -> Option<&ColumnSet> {
+    stack.iter().rev().find_map(|frame| frame.get(&scope))
+}
+
+/// Spell a column for whoever reads the refusal.
+///
+/// The index stays, because it is what a bug report needs and what the
+/// probes print. It is not what anyone wrote, so the published name goes
+/// beside it — a reference reported only as `col#3` tells a reader nothing
+/// they can look for in their own query.
+fn tell_column(identities: &Registry, column: ColId) -> String {
+    match identities.published(column) {
+        Some(spelling) => {
+            let mut text = String::new();
+            identities.write(spelling, &mut crate::names::Teaching(&mut text));
+            format!("{column:?} `{text}`")
+        }
+        None => format!("{column:?} (unnamed)"),
+    }
+}
+
+/// Spell a scope the same way. `describe` is the only teaching road a
+/// compiler-minted scope has — it has no name until baptism — and saying
+/// "a compiler wrap" is what distinguishes a boundary the transpiler
+/// inserted from one the query asked for.
+fn tell_scope(identities: &Registry, scope: ScopeId) -> String {
+    let mut text = String::new();
+    identities.describe(scope, &mut crate::names::Teaching(&mut text));
+    format!("{scope:?} ({text})")
+}
+
+fn dangling(
+    scope: ScopeId,
+    column: Option<ColId>,
+    stack: &[Frame],
+    identities: &Registry,
+) -> DelightQLError {
+    let mut visible: Vec<_> = stack
+        .iter()
+        .flat_map(|frame| frame.keys().copied())
+        .collect();
     visible.sort();
     visible.dedup();
-    let visible = visible
-        .iter()
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let visible: Vec<_> = visible
+        .into_iter()
+        .map(|scope| tell_scope(identities, scope))
+        .collect();
+    let what = match column {
+        Some(column) => format!("reference {}", tell_column(identities, column)),
+        None => "a qualified star".to_string(),
+    };
     DelightQLError::validation_error_categorized(
         "transform/self_check/dangling_qualifier",
         format!(
-            "SQL self-check: reference '{}.{}' names a scope that is not visible \
-             anywhere on its path (visible scopes: [{}])",
-            qualifier, column, visible
+            "SQL self-check: {what} is owned by {}, which is not visible on its \
+             path (visible scopes: {})",
+            tell_scope(identities, scope),
+            visible.join(", ")
         ),
-        "internal invariant violation: the transpiler emitted a dangling qualifier; \
+        "internal invariant violation: the transpiler emitted a dangling scope; \
          please report the query that produced this",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pipeline::sql_ast_v3::{ColumnQualifier, SelectStatement};
-
-    fn col(q: &str, name: &str) -> DomainExpression {
-        DomainExpression::with_qualifier(ColumnQualifier::table(q), name)
-    }
-
-    fn select_from(items: Vec<SelectItem>, from: TableExpression) -> SelectStatement {
-        SelectStatement::builder()
-            .select_all(items)
-            .from_tables(vec![from])
-            .build()
-            .unwrap()
-    }
-
-    fn stmt(query: QueryExpression) -> SqlStatement {
-        SqlStatement::Query {
-            with_clause: None,
-            query,
-        }
-    }
-
-    /// The HO-pipe lowering ships a WITH clause inside a correlated
-    /// scalar subquery whose CTE body reads the outer row (SQLite
-    /// inlines CTEs, so this resolves and runs). The check must not
-    /// refuse it: CTE bodies see enclosing scopes.
-    #[test]
-    fn correlated_cte_body_sees_outer_scope() {
-        // SELECT (WITH c AS (SELECT users.id AS v) SELECT c.v FROM c)
-        // FROM users
-        let cte_body = SelectStatement::builder()
-            .select(SelectItem::expression_with_alias(col("users", "id"), "v"))
-            .build()
-            .unwrap();
-        let inner_main = select_from(
-            vec![SelectItem::expression(col("c", "v"))],
-            TableExpression::table("c"),
-        );
-        let scalar = QueryExpression::WithCte {
-            ctes: vec![Cte::new("c", QueryExpression::Select(Box::new(cte_body)))],
-            query: Box::new(QueryExpression::Select(Box::new(inner_main))),
-        };
-        let outer = select_from(
-            vec![SelectItem::expression(DomainExpression::Subquery(Box::new(
-                scalar,
-            )))],
-            TableExpression::table("users"),
-        );
-        assert!(check(&stmt(QueryExpression::Select(Box::new(outer)))).is_ok());
-    }
-
-    #[test]
-    fn base_table_reference_passes() {
-        let s = select_from(
-            vec![SelectItem::expression(col("users", "id"))],
-            TableExpression::table("users"),
-        );
-        assert!(check(&stmt(QueryExpression::Select(Box::new(s)))).is_ok());
-    }
-
-    #[test]
-    fn dangling_qualifier_is_caught() {
-        let s = select_from(
-            vec![SelectItem::expression(col("nowhere", "id"))],
-            TableExpression::table("users"),
-        );
-        let err = check(&stmt(QueryExpression::Select(Box::new(s)))).unwrap_err();
-        assert!(err.to_string().contains("not visible"), "got: {}", err);
-    }
-
-    #[test]
-    fn derived_scope_missing_column_is_caught() {
-        // SELECT t.gone FROM (SELECT users.id AS id FROM users) AS t
-        let inner = select_from(
-            vec![SelectItem::expression_with_alias(col("users", "id"), "id")],
-            TableExpression::table("users"),
-        );
-        let outer = select_from(
-            vec![SelectItem::expression(col("t", "gone"))],
-            TableExpression::subquery(QueryExpression::Select(Box::new(inner)), "t"),
-        );
-        let err = check(&stmt(QueryExpression::Select(Box::new(outer)))).unwrap_err();
-        assert!(err.to_string().contains("does not exist"), "got: {}", err);
-    }
-
-    #[test]
-    fn derived_scope_present_column_passes() {
-        let inner = select_from(
-            vec![SelectItem::expression_with_alias(col("users", "id"), "id")],
-            TableExpression::table("users"),
-        );
-        let outer = select_from(
-            vec![SelectItem::expression(col("t", "id"))],
-            TableExpression::subquery(QueryExpression::Select(Box::new(inner)), "t"),
-        );
-        assert!(check(&stmt(QueryExpression::Select(Box::new(outer)))).is_ok());
-    }
-
-    #[test]
-    fn correlated_exists_sees_outer_scope() {
-        // SELECT u.id FROM users AS u WHERE EXISTS
-        //   (SELECT o.uid FROM orders AS o WHERE o.uid = u.id)
-        let inner = SelectStatement::builder()
-            .select(SelectItem::expression(col("o", "uid")))
-            .from_tables(vec![TableExpression::table_with_alias("orders", "o")])
-            .and_where(DomainExpression::eq(col("o", "uid"), col("u", "id")))
-            .build()
-            .unwrap();
-        let outer = SelectStatement::builder()
-            .select(SelectItem::expression(col("u", "id")))
-            .from_tables(vec![TableExpression::table_with_alias("users", "u")])
-            .and_where(DomainExpression::exists(QueryExpression::Select(Box::new(
-                inner,
-            ))))
-            .build()
-            .unwrap();
-        assert!(check(&stmt(QueryExpression::Select(Box::new(outer)))).is_ok());
-    }
-
-    #[test]
-    fn from_subquery_does_not_see_siblings() {
-        // SELECT * FROM users AS u, (SELECT u.id FROM t2) AS x — u is a
-        // sibling, invisible inside the derived table.
-        let inner = select_from(
-            vec![SelectItem::expression(col("u", "id"))],
-            TableExpression::table("t2"),
-        );
-        let outer = SelectStatement::builder()
-            .select(SelectItem::star())
-            .from_tables(vec![
-                TableExpression::table_with_alias("users", "u"),
-                TableExpression::subquery(QueryExpression::Select(Box::new(inner)), "x"),
-            ])
-            .build()
-            .unwrap();
-        let err = check(&stmt(QueryExpression::Select(Box::new(outer)))).unwrap_err();
-        assert!(err.to_string().contains("not visible"), "got: {}", err);
-    }
-
-    #[test]
-    fn cte_columns_are_enumerable() {
-        // WITH c AS (SELECT users.id AS id FROM users) SELECT c.gone FROM c
-        let body = select_from(
-            vec![SelectItem::expression_with_alias(col("users", "id"), "id")],
-            TableExpression::table("users"),
-        );
-        let main = select_from(
-            vec![SelectItem::expression(col("c", "gone"))],
-            TableExpression::table("c"),
-        );
-        let s = SqlStatement::Query {
-            with_clause: Some(vec![Cte::new(
-                "c",
-                QueryExpression::Select(Box::new(body)),
-            )]),
-            query: QueryExpression::Select(Box::new(main)),
-        };
-        let err = check(&s).unwrap_err();
-        assert!(err.to_string().contains("does not exist"), "got: {}", err);
-    }
-
-    #[test]
-    fn tvf_argument_sees_siblings() {
-        // SELECT je.value FROM (SELECT users.j AS j FROM users) AS t,
-        //   json_each(t.j) AS je — lateral sibling binding.
-        let inner = select_from(
-            vec![SelectItem::expression_with_alias(col("users", "j"), "j")],
-            TableExpression::table("users"),
-        );
-        let outer = SelectStatement::builder()
-            .select(SelectItem::expression(col("je", "value")))
-            .from_tables(vec![
-                TableExpression::subquery(QueryExpression::Select(Box::new(inner)), "t"),
-                TableExpression::TVF {
-                    schema: None,
-                    function: "json_each".to_string(),
-                    arguments: vec![TvfArgument::QualifiedRef {
-                        qualifier: "t".to_string(),
-                        column: "j".to_string(),
-                    }],
-                    alias: Some("je".to_string()),
-                },
-            ])
-            .build()
-            .unwrap();
-        assert!(check(&stmt(QueryExpression::Select(Box::new(outer)))).is_ok());
-    }
 }

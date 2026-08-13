@@ -4,7 +4,7 @@
 //!
 //! Speaks the relay protocol over its stdin/stdout (engine-facing side,
 //! the LSP model), libpq on the database-facing side. dql spawns one per
-//! `fatboy://postgres/<db>` connection and reaps it on drop; the pipe is
+//! `postgres://` connection and reaps it on drop; the pipe is
 //! the lifecycle (EOF on stdin = the spawner is gone, so exit). No socket
 //! file, no PDEATHSIG, no lease watchdog — portable with no per-OS code.
 //!

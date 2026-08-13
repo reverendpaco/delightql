@@ -34,10 +34,10 @@ fn load_pages() -> Result<Vec<Page>> {
     let pages = {
         let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
         // The embedded image is bound as "man" by open_handle and mounted
-        // via its locator (BYTES-SCHEME-DESIGN.md): attach-class, read-only,
+        // via its locator: attach-class, read-only,
         // zero-copy from rodata — no temp file, no guard.
         crate::exec_ng::run_dql_query(
-            "mount!(\"delightql-bytes://man\", \"cli::man\")",
+            "mount!(\"delightql-bytes://man\", \"cli::man\")(*)",
             &mut *session,
         )?;
         crate::embedded_db::verify_bundle_schema_version(&mut *session, "cli::man")?;

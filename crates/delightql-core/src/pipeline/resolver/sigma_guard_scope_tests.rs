@@ -4,29 +4,28 @@
 //! (`resolution_namespace = Some(ns)`), not just through namespaces
 //! enlisted into main.
 //!
-//! Bug pinned here (IMPLEMENTATION-PLAN §4.2): a same-file SIGMA-PREDICATE rule
+//! Bug pinned here: a same-file SIGMA-PREDICATE rule
 //! (`tiny(col) :- col < 2`, entity_type 9) used as a guard inside an effect
-//! body — `…, +tiny(amount) |> …` — died at SQL generation with
-//! "Unknown predicate rewrite: 'tiny'". `lookup_enlisted_sigma`
+//! body — `…, +tiny(amount) |> …` — dies at SQL generation with
+//! "Unknown predicate rewrite: 'tiny'" unless the guard resolves under its
+//! own consulted scope. `lookup_enlisted_sigma`
 //! (resolution/registry.rs) searches only namespaces enlisted into MAIN, so
-//! a sigma rule was invisible WHILE ITS OWN FILE'S BODY compiled; and
-//! entity_type 9 is invisible to `resolve_entity_with_alias`'s consulted
-//! branch, so the enlisted-guard fix's relation probe could not catch it
-//! either (nor should it — sigma rules expand to their boolean body via
-//! `expand_consulted_sigma`, never to an EXISTS over a relation).
+//! a sigma rule is invisible while its own file's body compiles unless that
+//! scope is also consulted; and entity_type 9 is invisible to
+//! `resolve_entity_with_alias`'s consulted branch, so the enlisted-guard
+//! fix's relation probe cannot catch it either (nor should it — sigma
+//! rules expand to their boolean body via `expand_consulted_sigma`, never
+//! to an EXISTS over a relation).
 //!
-//! Red-first: every affected-shape test in this file was observed failing
-//! against the pre-fix compiler ("Unknown predicate rewrite: 'tiny'"); the
-//! controls were green before and after.
+//! Losing the scoped sigma lookup makes every affected-shape test in this
+//! file die with "Unknown predicate rewrite: 'tiny'"; the controls hold
+//! either way, which is what makes them controls.
 
 use super::{resolve_query_inline, ResolutionConfig};
 use crate::bin_cartridge::prelude::consult::execute_consult;
 use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry};
 use crate::pipeline::effect_transformer::compile_namespace_main;
-use crate::pipeline::{
-    addresser, ast_unresolved, builder_v2, danger_gates, generator_v3, parser, refiner,
-    transformer_v4,
-};
+use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
 use crate::resolution::EntityRegistry;
 use crate::system::DelightQLSystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
@@ -83,10 +82,10 @@ fn enlisted_world() -> DelightQLSystem {
     let dir = MOUNT_DIR.get_or_init(|| {
         let dir = tempfile::tempdir().expect("mount tempdir");
         // mount_database is now attach-only and rejects 0-byte files
-        // (bugs/nullmount Phase 1); materialize a valid empty SQLite db
+        // (mount! is attach-only); materialize a valid empty SQLite db
         // (header forced out by PRAGMA user_version) rather than touch b"".
-        let conn = rusqlite::Connection::open(dir.path().join("maindb.sqlite"))
-            .expect("create mount db");
+        let conn =
+            rusqlite::Connection::open(dir.path().join("maindb.sqlite")).expect("create mount db");
         conn.execute_batch("PRAGMA user_version = 0;")
             .expect("materialize mount db header");
         dir
@@ -132,25 +131,30 @@ fn plan_sql(plan: &CompiledPlan) -> String {
 // ------------------------------------------------------------------
 
 fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result<String> {
-    let tree = parser::parse(source).expect("source should parse");
-    let (query, _features, _asserts, _dangers, _options, _ddl) =
-        builder_v2::parse_query(&tree, source).expect("source should build");
-    let query: ast_unresolved::Query = query;
+    let tree = crate::pipeline::parse::query_sequence(source).expect("source should parse");
+    let mut normalized =
+        crate::pipeline::parse::normalize_sequence(&tree).expect("source should normalize");
+    assert_eq!(normalized.queries.len(), 1, "one statement expected");
+    let query: ast_unresolved::Query = normalized.queries.remove(0).query;
     let schema = system.get_schema()?;
-    let mut registry = EntityRegistry::new_with_system(schema, system);
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let mut registry =
+        EntityRegistry::new_with_system(schema, system, std::rc::Rc::clone(&identities));
     let config = ResolutionConfig::default();
     let (resolved, _bubbled) = resolve_query_inline(query, &mut registry, None, &config, None)?;
     let gates = danger_gates::DangerGateMap::with_defaults();
-    let refined = refiner::refine_query_with_gates(resolved, gates.clone())?;
-    let addressed = addresser::address_query(refined)?;
-    let ctx = transformer_v4::TransformCtx {
-        cfes: vec![],
-        names: transformer_v4::builder::NameGenerator::new(),
+    let refined =
+        refiner::refine_query_with_gates(resolved, gates.clone(), std::rc::Rc::clone(&identities))?;
+    let ctx = transformer::TransformCtx {
+        identities: std::rc::Rc::clone(&identities),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&identities)),
         outer_columns: vec![],
         danger_gates: gates,
     };
-    let sql_ast = transformer_v4::transform(addressed, &ctx)?;
-    generator_v3::SqlGenerator::new()
+    let sql_ast = transformer::transform(refined, &ctx)?.without_obligations()?;
+    let names = generator::baptise_statements(&identities, &[&sql_ast])
+        .map_err(|e| e.into_delightql_error("sigma-guard SQL naming failed"))?;
+    generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
         .map_err(|e| {
             crate::error::DelightQLError::validation_error(
@@ -170,10 +174,9 @@ fn flat(s: &str) -> String {
 // THE FILING'S REPRO: effect body under Some(ns), same-file sigma guard.
 // ============================================================================
 
-/// The filing verbatim: `+tiny(amount)` inside an effect-rule body where
-/// `tiny(col) :- col < 2` is defined in the SAME consulted file. Pre-fix:
-/// "effect plan SQL generation error: Unknown predicate rewrite: 'tiny'".
-/// Post-fix: compiles; the guard expands to the sigma rule's boolean body.
+/// `+tiny(amount)` inside an effect-rule body where `tiny(col) :- col < 2`
+/// is defined in the SAME consulted file: the guard expands to the sigma
+/// rule's boolean body rather than dying on "Unknown predicate rewrite".
 #[test]
 fn effect_body_same_file_sigma_guard_expands_boolean_body() {
     let mut system = enlisted_world();
@@ -216,7 +219,7 @@ fn effect_body_same_file_sigma_antijoin_guard_expands_negated() {
 }
 
 /// Disjunctive sigma (two clauses, same head) under the scope: the clauses
-/// OR together (book/reference/ddl/entity-types/sigma-predicates.md).
+/// OR together.
 #[test]
 fn effect_body_same_file_disjunctive_sigma_guard_ors_clauses() {
     let mut system = enlisted_world();
@@ -238,8 +241,8 @@ fn effect_body_same_file_disjunctive_sigma_guard_ors_clauses() {
 /// SCOPE-FIRST PRIORITY: when the SAME sigma name exists both in the
 /// consulted scope (fx: `col < 2`) and in a namespace enlisted into main
 /// (sx: `col < 5`), the scope's rule wins — mirroring the relation path's
-/// scope-then-main-fallback. Pre-fix this silently expanded the WRONG
-/// (enlisted) rule.
+/// scope-then-main-fallback. Preferring the enlisted rule expands the
+/// WRONG body, silently.
 #[test]
 fn effect_body_scoped_sigma_shadows_enlisted_sigma() {
     let mut system = enlisted_world();
@@ -270,7 +273,7 @@ fn effect_body_scoped_sigma_shadows_enlisted_sigma() {
 
 /// Consulted view body, namespace NOT enlisted into main, called qualified:
 /// body resolves under Some("vx") where the sigma rule lives — the bug
-/// predates effects. Pre-fix: "Unknown predicate rewrite: 'tiny'".
+/// is independent of effects.
 #[test]
 fn qualified_consulted_view_body_with_same_file_sigma_guard_expands() {
     let mut system = enlisted_world();
@@ -289,9 +292,9 @@ fn qualified_consulted_view_body_with_same_file_sigma_guard_expands() {
     );
 }
 
-/// CONTROL (green pre-fix): the same view file ENLISTED into main and called
-/// bare — `lookup_enlisted_sigma` already found the sigma through the
-/// enlistment edge. Pins that the fix cannot regress the enlisted route.
+/// CONTROL: the same view file ENLISTED into main and called bare —
+/// `lookup_enlisted_sigma` finds the sigma through the enlistment edge.
+/// Pins that the scoped lookup cannot regress the enlisted route.
 #[test]
 fn enlisted_consulted_view_body_with_same_file_sigma_guard_still_expands() {
     let mut system = enlisted_world();
@@ -311,10 +314,9 @@ fn enlisted_consulted_view_body_with_same_file_sigma_guard_still_expands() {
     );
 }
 
-/// CONTROL (green pre-fix): plain pipeline, no resolution namespace — a
-/// sigma rule in a consulted-and-ENLISTED namespace guards a main-scope
-/// query. This is exactly what `lookup_enlisted_sigma` handles today; the
-/// fix must not regress it.
+/// CONTROL: plain pipeline, no resolution namespace — a sigma rule in a
+/// consulted-and-ENLISTED namespace guards a main-scope query. This is
+/// `lookup_enlisted_sigma`'s own route, and it must stay intact.
 #[test]
 fn plain_query_enlisted_sigma_guard_still_expands() {
     let mut system = enlisted_world();
@@ -329,7 +331,7 @@ fn plain_query_enlisted_sigma_guard_still_expands() {
     );
 }
 
-/// CONTROL (green pre-fix): bin-cartridge sigma predicates (`+like`) keep
+/// CONTROL: bin-cartridge sigma predicates (`+like`) keep
 /// their fall-through route under Some(ns) — the scoped sigma lookup must
 /// not swallow them (consulted-sigma-before-bin-rewrite priority holds, and
 /// unknown-to-the-scope functors still reach the bin path).

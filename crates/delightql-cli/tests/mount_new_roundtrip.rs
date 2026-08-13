@@ -79,7 +79,7 @@ fn mount_new_then_mount_round_trips() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         host_str,
-        r#"mount_new!("fresh.db", "f")"#,
+        r#"mount_new!("fresh.db", "f")(*)"#,
     );
     assert!(
         ok,
@@ -104,7 +104,7 @@ fn mount_new_then_mount_round_trips() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         host_str,
-        r#"mount!("fresh.db", "f")"#,
+        r#"mount!("fresh.db", "f")(*)"#,
     );
     assert!(
         ok,
@@ -134,7 +134,7 @@ fn mount_new_refuses_to_clobber() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         host_str,
-        r#"mount_new!("occupied.db", "occ")"#,
+        r#"mount_new!("occupied.db", "occ")(*)"#,
     );
     assert!(
         !ok,

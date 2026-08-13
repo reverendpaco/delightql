@@ -163,62 +163,6 @@ pub fn write_server_message<W: Write>(
     })
 }
 
-// --- Legacy helpers (layer0-only, kept for backward compat) ---
-
-/// Read one ClientTerm from a UnixStream. Blocks until a complete frame arrives.
-/// DEPRECATED: Use read_client_message() for layer1-aware servers.
-pub fn read_client_term(
-    stream: &mut UnixStream,
-    buf: &mut Vec<u8>,
-) -> Result<ClientTerm, TransportError> {
-    loop {
-        match manifest::read_frame(buf)? {
-            Some((payload, rest)) => {
-                // Try decoding as ClientMessage first (layer1 envelope)
-                if let Ok(msg) = manifest::decode_client_message(payload) {
-                    *buf = rest.to_vec();
-                    match msg {
-                        ClientMessage::Data(term) => return Ok(term),
-                        ClientMessage::Control(_) => {
-                            return Err(TransportError {
-                                message: "unexpected control message on layer0 path".into(),
-                            });
-                        }
-                    }
-                }
-                // Fall back to raw ClientTerm decode (legacy layer0 clients)
-                let term = manifest::decode_client(payload)?;
-                *buf = rest.to_vec();
-                return Ok(term);
-            }
-            None => {
-                let mut tmp = [0u8; 8192];
-                let n = stream.read(&mut tmp).map_err(|e| TransportError {
-                    message: format!("socket read error: {}", e),
-                })?;
-                if n == 0 {
-                    return Err(TransportError {
-                        message: "connection closed".into(),
-                    });
-                }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-        }
-    }
-}
-
-/// Write one ServerTerm to a UnixStream as a framed message.
-/// DEPRECATED: Use write_server_message() for layer1-aware servers.
-pub fn write_server_term(
-    stream: &mut UnixStream,
-    term: &ServerTerm,
-) -> Result<(), TransportError> {
-    let frame = manifest::frame_server(term)?;
-    stream.write_all(&frame).map_err(|e| TransportError {
-        message: format!("socket write error: {}", e),
-    })
-}
-
 // --- Session::reset() ---
 
 use crate::layer0::Session;

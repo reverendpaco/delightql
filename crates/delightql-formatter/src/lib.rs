@@ -1,53 +1,77 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+//! The DelightQL source formatter.
+//!
+//! It reads the typed CST `delightql-cst` produces from the one consolidated
+//! grammar. Every layout decision comes from typed fields, generated supertype
+//! enums, and authored spans; none comes from a node-kind string, a regex over
+//! the source, or a second parse of synthesized text.
+//!
+//! ## The entrance is named, never guessed
+//!
+//! The grammar's two file branches OVERLAP — `f(1, 2)` is a fact in the
+//! canonical form and an argumentative query in the utility one, identical
+//! bytes — so a formatter that inferred the branch from which parse succeeded
+//! would be deciding a semantic question the language reserves for the author.
+//! This formatter is a QUERY formatter: it names the utility entrance, and a
+//! tree that turns out to hold something else is reported as a form it does
+//! not lay out yet rather than laid out under the wrong reading.
+//!
+//! An authored `#!dql query-sequence` header is preserved like any other
+//! token. A submission without one is framed by the façade with exactly the
+//! same bytes, which have no authored span and so never appear in the output.
+//!
+//! ## The laws
+//!
+//! L1 token identity — the formatted text's authored token stream equals the
+//! input's. The formatter changed whitespace and nothing else.
+//! L2 idempotence — `format(format(x)) == format(x)`.
+//! L3 semantic preservation — the formatted query means what the original
+//! meant; the corpus harness holds this one.
+//! Registry honesty — a kind the registry says has a layout arm must reach
+//! it. Coverage — nothing in the corpus passes through.
+
 mod builder;
 pub mod registry;
 pub mod rules;
 mod visitor;
 
 use anyhow::Result;
+use delightql_cst::{Parser, SyntaxTree};
 use std::path::Path;
-use tree_sitter::{Language, Parser};
 
 pub use rules::{CteStyle, FormatConfig, Knob, KNOBS};
 pub use visitor::Formatter;
 
-/// Get the bundled tree-sitter Language for DQL.
-/// Only available when built with the bundled-parser feature.
-#[cfg(feature = "bundled-parser")]
-pub fn language() -> Language {
-    extern "C" {
-        fn tree_sitter_delightql_v2() -> Language;
-    }
-    unsafe { tree_sitter_delightql_v2() }
-}
-
 /// Why the formatter returned the input unchanged instead of formatting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PassReason {
-    /// The input does not parse cleanly. The formatter formats only
-    /// what it can fully read; recovery trees are not a formatting
-    /// substrate.
+    /// The input does not parse cleanly at the formatter's entrance. A
+    /// recovery tree is not a formatting substrate: its shape is a decision
+    /// the parser made about broken text, not the author's structure.
     ParseError,
-    /// The visitor met a named node kind it takes no position on yet;
-    /// the string names the first such kind.
+    /// The input is a definition library. `dql format` speaks the utility
+    /// form; rule definitions have no layout here yet.
+    DefinitionFile,
+    /// The visitor met a node its registry entry says has a layout arm, or
+    /// one the registry does not place at all. The string names the kind.
     UnhandledNode(String),
-    /// The formatted output's token stream diverged from the input's —
-    /// the reflow crossed a whitespace-sensitive boundary or the
-    /// visitor dropped/rewrote a token. The string describes the first
-    /// diverging token.
+    /// The output's token stream diverged from the input's — a reflow crossed
+    /// a whitespace-sensitive boundary, or the visitor dropped or rewrote a
+    /// token. The string describes the divergence.
     TokenStreamChanged(String),
 }
 
-/// What `format_outcome` actually did — the safety fallbacks (return the
-/// input unchanged rather than risk corrupting code) are sound, but they
-/// must be VISIBLE to callers: a CI gate that can't tell "already
-/// formatted" from "formatter gave up" blesses unformatted code.
+/// What `format_outcome` actually did.
+///
+/// The safety fallbacks — return the input unchanged rather than risk
+/// corrupting code — are sound, but they must be VISIBLE: a gate that cannot
+/// tell "already formatted" from "formatter gave up" blesses unformatted code.
 #[derive(Debug)]
 pub enum FormatOutcome {
-    /// The visitor handled everything and the output is token-stream
-    /// identical to the input (same (kind, text) sequence, comments
-    /// included). Always ends with a final newline.
+    /// The visitor handled everything and the output's token stream is
+    /// identical to the input's, comments included. Always ends with a final
+    /// newline.
     Formatted(String),
     /// Input returned byte-for-byte unchanged; `reason` says why.
     PassedThrough { source: String, reason: PassReason },
@@ -63,190 +87,117 @@ impl FormatOutcome {
     }
 }
 
-/// Format a DelightQL query string.
-/// Caller provides the tree-sitter Language (avoids grammar compilation in this crate).
+/// Format a DelightQL query sequence.
 ///
-/// Compatibility wrapper over [`format_outcome`]: flattens pass-through
-/// to the unchanged source. Callers that gate on "is this formatted?"
-/// must use `format_outcome` instead — this wrapper cannot distinguish
-/// clean output from a formatter gap.
-pub fn format(source: &str, language: &Language, config: &FormatConfig) -> Result<String> {
-    Ok(match format_outcome(source, language, config)? {
+/// Compatibility wrapper over [`format_outcome`]: flattens pass-through to
+/// the unchanged source. A caller gating on "is this formatted?" must use
+/// `format_outcome` — this wrapper cannot tell clean output from a gap.
+pub fn format(source: &str, config: &FormatConfig) -> Result<String> {
+    Ok(match format_outcome(source, config)? {
         FormatOutcome::Formatted(s) => s,
         FormatOutcome::PassedThrough { source, .. } => source,
     })
 }
 
-/// Format a DelightQL query string, reporting whether the formatter
-/// actually formatted or safely passed the input through.
-pub fn format_outcome(
-    source: &str,
-    language: &Language,
-    config: &FormatConfig,
-) -> Result<FormatOutcome> {
-    // Parse the source using tree-sitter
+/// Format, reporting whether the formatter actually formatted or safely
+/// passed the input through.
+pub fn format_outcome(source: &str, config: &FormatConfig) -> Result<FormatOutcome> {
     let mut parser = Parser::new();
-    parser
-        .set_language(language)
-        .map_err(|e| anyhow::anyhow!("Failed to set language: {}", e))?;
+    let tree = parser.parse_query_sequence(source);
 
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse query"))?;
-
-    // Error-free parses only: a recovery tree's shape is unstable
-    // across grammar regenerations, so formatting one risks silent
-    // corruption. Pass through instead.
-    if tree.root_node().has_error() {
-        return Ok(FormatOutcome::PassedThrough {
+    let passed = |reason: PassReason| {
+        Ok(FormatOutcome::PassedThrough {
             source: source.to_string(),
-            reason: PassReason::ParseError,
-        });
+            reason,
+        })
+    };
+
+    if tree.has_defects() {
+        return passed(PassReason::ParseError);
     }
 
-    // Create formatter and visit the tree
-    let mut formatter = Formatter::new_with_config(source, config.clone());
-    formatter.format_node(&tree.root_node())?;
+    let mut formatter = Formatter::new(&tree, config.clone());
+    match formatter.format_root()? {
+        visitor::Branch::Formatted => {}
+        // Reached only when the utility entrance admitted a tree that is not
+        // a query sequence, which the grammar's start rule does not do today.
+        // Naming it is what keeps the branch from becoming a silent skip.
+        visitor::Branch::DefinitionFile | visitor::Branch::CompanionCell => {
+            return passed(PassReason::DefinitionFile)
+        }
+    }
 
-    // Level 2: If the visitor hit an unrecognized named node, the output
-    // may be incomplete — bail to the original input, naming the node.
     if formatter.hit_unknown {
-        let node_kind = formatter.unknown_kind.clone().unwrap_or_default();
-        return Ok(FormatOutcome::PassedThrough {
-            source: source.to_string(),
-            reason: PassReason::UnhandledNode(node_kind),
-        });
+        let kind = formatter.unknown_kind.clone().unwrap_or_default();
+        return passed(PassReason::UnhandledNode(kind));
     }
 
     let mut formatted = formatter.output();
 
-    // Level 1: token-stream identity. The parser is deterministic, so
-    // an identical (kind, text) leaf sequence — comments included —
-    // implies an identical CST: the formatter changed whitespace and
-    // nothing else. This also covers token.immediate boundaries (the
-    // metadata colon, CTE label necks), where whitespace placement
-    // changes the token stream itself.
-    let reparse_tree = match parser.parse(&formatted, None) {
-        Some(t) => t,
-        None => {
-            return Ok(FormatOutcome::PassedThrough {
-                source: source.to_string(),
-                reason: PassReason::TokenStreamChanged(
-                    "formatted output failed to parse at all".to_string(),
-                ),
-            });
-        }
+    // L1. The parser is deterministic, so an identical authored token stream
+    // implies an identical tree: the formatter changed whitespace and nothing
+    // else. This also covers `token.immediate` boundaries, where whitespace
+    // placement changes the token stream itself.
+    let reparsed = parser.parse_query_sequence(&formatted);
+    let divergence = if reparsed.has_defects() {
+        Some("formatted output does not parse".to_string())
+    } else {
+        first_divergence(&tree, &reparsed)
     };
-
-    if let Some(divergence) = first_token_divergence(&tree, source, &reparse_tree, &formatted) {
-        // The discarded output is otherwise invisible; surface it for
-        // visitor debugging on request.
+    if let Some(divergence) = divergence {
+        // The discarded output is otherwise invisible; surface it for visitor
+        // debugging on request.
         if std::env::var_os("DQL_FMT_DEBUG").is_some() {
             eprintln!("--- discarded formatted output ---\n{formatted}\n---");
         }
-        return Ok(FormatOutcome::PassedThrough {
-            source: source.to_string(),
-            reason: PassReason::TokenStreamChanged(divergence),
-        });
+        return passed(PassReason::TokenStreamChanged(divergence));
     }
 
-    // Canonical form ends with a final newline, like the peer
-    // formatters — check mode byte-compares against POSIX files.
+    // Canonical form ends with a final newline, like the peer formatters —
+    // check mode byte-compares against POSIX files.
     if !formatted.ends_with('\n') {
         formatted.push('\n');
     }
-
     Ok(FormatOutcome::Formatted(formatted))
 }
 
-/// Collect the leaf tokens of a parse tree in document order as
-/// (kind, text) pairs. Leaves include anonymous tokens and comments.
-/// Hidden tokens (e.g. the alias keyword `as`) have NO node in the
-/// tree — they live in the gaps between leaves — so each non-blank
-/// gap word is emitted as a ("hidden", word) pseudo-token. Without
-/// this, dropping a hidden token would be invisible to the stream
-/// comparison whenever the result still parses.
-fn collect_leaf_tokens<'s>(
-    node: tree_sitter::Node,
-    source: &'s str,
-    prev_end: &mut usize,
-    out: &mut Vec<(&'static str, &'s str)>,
-) {
-    if node.child_count() == 0 {
-        let start = node.start_byte();
-        if start > *prev_end {
-            for word in source[*prev_end..start].split_whitespace() {
-                out.push(("hidden", word));
-            }
-        }
-        out.push((node.kind(), &source[node.byte_range()]));
-        *prev_end = node.end_byte();
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_leaf_tokens(child, source, prev_end, out);
-    }
-}
-
-/// Compare the leaf token streams of two parses; `None` means identical.
-/// `Some` describes the first diverging token for the diagnostic.
-fn first_token_divergence(
-    original: &tree_sitter::Tree,
-    original_src: &str,
-    formatted: &tree_sitter::Tree,
-    formatted_src: &str,
-) -> Option<String> {
-    let mut a = Vec::new();
-    let mut b = Vec::new();
-    collect_leaf_tokens(original.root_node(), original_src, &mut 0, &mut a);
-    collect_leaf_tokens(formatted.root_node(), formatted_src, &mut 0, &mut b);
-
-    for (i, (ta, tb)) in a.iter().zip(b.iter()).enumerate() {
-        if ta != tb {
+/// Compare two authored token streams; `None` means identical.
+fn first_divergence(original: &SyntaxTree, formatted: &SyntaxTree) -> Option<String> {
+    let a = original.tokens();
+    let b = formatted.tokens();
+    for (i, (left, right)) in a.iter().zip(b.iter()).enumerate() {
+        if left.text != right.text {
             return Some(format!(
-                "token {}: input has {} {:?}, output has {} {:?}",
+                "token {}: input has {:?}, output has {:?}",
                 i + 1,
-                ta.0,
-                ta.1,
-                tb.0,
-                tb.1
+                left.text,
+                right.text
             ));
         }
     }
     match a.len().cmp(&b.len()) {
         std::cmp::Ordering::Equal => None,
-        std::cmp::Ordering::Greater => {
-            let t = &a[b.len()];
-            Some(format!(
-                "output is missing input's token {}: {} {:?}",
-                b.len() + 1,
-                t.0,
-                t.1
-            ))
-        }
-        std::cmp::Ordering::Less => {
-            let t = &b[a.len()];
-            Some(format!(
-                "output has extra token {}: {} {:?}",
-                a.len() + 1,
-                t.0,
-                t.1
-            ))
-        }
+        std::cmp::Ordering::Greater => Some(format!(
+            "output is missing input's token {}: {:?}",
+            b.len() + 1,
+            a[b.len()].text
+        )),
+        std::cmp::Ordering::Less => Some(format!(
+            "output has extra token {}: {:?}",
+            a.len() + 1,
+            b[a.len()].text
+        )),
     }
 }
 
-/// Overlay a .dql-format file onto an existing config, applying each
-/// key through the knob registry. If path is None, searches the
-/// current working directory. Returns a warning per line that named
-/// an unknown knob or an unparsable value — a typo'd key must not
-/// silently do nothing.
+/// Overlay a `.dql-format` file onto an existing config, applying each key
+/// through the knob registry. With no path, searches the current directory.
+/// Returns a warning per line naming an unknown knob or an unparsable value —
+/// a typo'd key must not silently do nothing.
 pub fn apply_config_file(config: &mut FormatConfig, path: Option<&Path>) -> Vec<String> {
     use std::fs;
 
     let mut warnings = Vec::new();
-
     let file_path = match path {
         Some(p) => p.to_path_buf(),
         None => std::path::PathBuf::from(".dql-format"),
@@ -272,9 +223,9 @@ pub fn apply_config_file(config: &mut FormatConfig, path: Option<&Path>) -> Vec<
                 }
             }
         }
-        // Absence is the one quiet case (implicit discovery); a file
-        // that EXISTS but cannot be read or decoded must not silently
-        // become "no configuration".
+        // Absence is the one quiet case (implicit discovery); a file that
+        // EXISTS but cannot be read must not silently become "no
+        // configuration".
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warnings.push(format!("{}: unreadable: {e}", file_path.display())),
     }
@@ -282,7 +233,7 @@ pub fn apply_config_file(config: &mut FormatConfig, path: Option<&Path>) -> Vec<
     warnings
 }
 
-/// Load format configuration from a .dql-format file over the frozen
+/// Load format configuration from a `.dql-format` file over the frozen
 /// defaults, reporting warnings.
 pub fn load_config_report(path: Option<&Path>) -> (FormatConfig, Vec<String>) {
     let mut config = FormatConfig::default();
@@ -290,9 +241,8 @@ pub fn load_config_report(path: Option<&Path>) -> (FormatConfig, Vec<String>) {
     (config, warnings)
 }
 
-/// Load format configuration from a .dql-format file, discarding
-/// warnings. Callers with a user-facing channel should use
-/// [`load_config_report`].
+/// Load format configuration, discarding warnings. A caller with a user-facing
+/// channel should use [`load_config_report`].
 pub fn load_config(path: Option<&Path>) -> FormatConfig {
     load_config_report(path).0
 }

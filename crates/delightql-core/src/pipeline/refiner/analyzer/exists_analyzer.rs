@@ -1,276 +1,105 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-// exists_analyzer.rs - EXISTS dependency detection and analysis
-//
-// This module handles detection of interdependent EXISTS clauses and their relationships
+//! Structural dependency analysis for interdependent EXISTS clauses.
 
-use crate::pipeline::asts::resolved;
+use crate::error::Result;
+use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::Existence;
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::asts::resolved::{self, Resolved};
 use crate::pipeline::refiner::flattener::FlatPredicate;
 use std::collections::{HashMap, HashSet};
 
-/// EXISTS dependency tracking
 #[derive(Debug, Clone, Default)]
 pub struct ExistsDependencies {
-    /// Map from EXISTS table name to tables it references
-    pub dependencies: HashMap<String, HashSet<String>>,
-    /// Root EXISTS (those that only reference outer context)
-    pub roots: HashSet<String>,
-    /// Tables introduced by EXISTS clauses
-    pub exists_tables: HashSet<String>,
+    pub dependencies: HashMap<crate::names::ScopeId, HashSet<crate::names::ScopeId>>,
+    pub roots: HashSet<crate::names::ScopeId>,
+    pub exists_scopes: HashSet<crate::names::ScopeId>,
 }
 
-/// Detect interdependent EXISTS clauses
-pub(super) fn detect_interdependent_exists(predicates: &[FlatPredicate]) -> ExistsDependencies {
+pub(super) fn detect_interdependent_exists(
+    predicates: &[FlatPredicate],
+    identities: &crate::names::Registry,
+) -> Result<ExistsDependencies> {
     let mut deps = ExistsDependencies::default();
 
-    log::debug!(
-        "detect_interdependent_exists: checking {} predicates",
-        predicates.len()
-    );
-
     for pred in predicates {
-        if let resolved::BooleanExpression::InnerExists { identifier, .. } = &pred.expr {
-            log::debug!("Found EXISTS for table: {}", identifier.name);
-            deps.exists_tables.insert(identifier.name.to_string());
-        }
-    }
-
-    for pred in predicates {
-        if let resolved::BooleanExpression::InnerExists {
-            identifier,
-            subquery,
-            ..
-        } = &pred.expr
+        if let resolved::TruthExpression::Existence(Existence {
+            relation: subquery, ..
+        }) = &pred.expr
         {
-            let table_name = identifier.name.to_string();
-
-            let mut references = HashSet::new();
-            extract_table_references_from_exists(subquery, &mut references);
-
-            references.remove(&table_name);
-
-            log::debug!("EXISTS {} references tables: {:?}", table_name, references);
-
-            let exists_refs: HashSet<String> = references
-                .intersection(&deps.exists_tables)
-                .cloned()
-                .collect();
-
-            log::debug!("EXISTS {} depends on EXISTS: {:?}", table_name, exists_refs);
-
-            if exists_refs.is_empty() {
-                deps.roots.insert(table_name.clone());
-            } else {
-                deps.dependencies.insert(table_name, exists_refs);
-            }
+            deps.exists_scopes
+                .insert(super::super::pattern_classifier::relational_scope(
+                    subquery,
+                )?);
         }
     }
 
-    deps
-}
+    for pred in predicates {
+        let resolved::TruthExpression::Existence(Existence {
+            relation: subquery, ..
+        }) = &pred.expr
+        else {
+            continue;
+        };
+        let exists_scope = super::super::pattern_classifier::relational_scope(subquery)?;
+        let mut collector = ReferencedScopes {
+            identities,
+            scopes: HashSet::new(),
+        };
+        walk_visit_relational(&mut collector, subquery)?;
+        collector
+            .scopes
+            .retain(|scope| !identities.contains_scope(exists_scope, *scope));
 
-#[stacksafe::stacksafe]
-fn extract_table_references_from_exists(
-    expr: &resolved::RelationalExpression,
-    references: &mut HashSet<String>,
-) {
-    match expr {
-        resolved::RelationalExpression::Filter {
-            source, condition, ..
-        } => {
-            if let resolved::SigmaCondition::Predicate(pred) = condition {
-                extract_table_refs_from_predicate(pred, references);
-            }
-            extract_table_references_from_exists(source, references);
-        }
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            ..
-        } => {
-            if let Some(cond) = join_condition {
-                extract_table_refs_from_predicate(cond, references);
-            }
-            extract_table_references_from_exists(left, references);
-            extract_table_references_from_exists(right, references);
-        }
-        resolved::RelationalExpression::Relation(_) => {}
-        resolved::RelationalExpression::Pipe(pipe) => {
-            extract_table_references_from_exists(&pipe.source, references);
-        }
-        resolved::RelationalExpression::SetOperation { operands, .. } => {
-            for operand in operands {
-                extract_table_references_from_exists(operand, references);
-            }
-        }
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before EXISTS analysis")
-        }
-        // IntersectCorresponding is produced by the refiner, not present in resolved phase
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+        let references = deps
+            .exists_scopes
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                collector.scopes.iter().any(|referenced| {
+                    candidate == referenced || identities.contains_scope(*candidate, *referenced)
+                })
+            })
+            .collect::<HashSet<_>>();
+
+        if references.is_empty() {
+            deps.roots.insert(exists_scope);
+        } else {
+            deps.dependencies.insert(exists_scope, references);
         }
     }
+
+    Ok(deps)
 }
 
-fn extract_table_refs_from_predicate(
-    expr: &resolved::BooleanExpression,
-    references: &mut HashSet<String>,
-) {
-    match expr {
-        resolved::BooleanExpression::Comparison { left, right, .. } => {
-            extract_table_refs_from_domain(left, references);
-            extract_table_refs_from_domain(right, references);
-        }
-        resolved::BooleanExpression::And { left, right }
-        | resolved::BooleanExpression::Or { left, right } => {
-            extract_table_refs_from_predicate(left, references);
-            extract_table_refs_from_predicate(right, references);
-        }
-        resolved::BooleanExpression::Not { expr } => {
-            extract_table_refs_from_predicate(expr, references);
-        }
-        resolved::BooleanExpression::InnerExists { subquery, .. } => {
-            extract_table_references_from_exists(subquery, references);
-        }
-        // In: walk value and set expressions for table refs.
-        resolved::BooleanExpression::In { value, set, .. } => {
-            extract_table_refs_from_domain(value, references);
-            for expr in set {
-                extract_table_refs_from_domain(expr, references);
+struct ReferencedScopes<'a> {
+    identities: &'a crate::names::Registry,
+    scopes: HashSet<crate::names::ScopeId>,
+}
+
+impl AstVisit<Resolved> for ReferencedScopes<'_> {
+    fn enter_domain(&mut self, expr: &resolved::DomainExpression) -> Result<Descent> {
+        match expr {
+            resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                ColumnOccurrence { column, .. },
+            ))) => {
+                self.scopes.insert(self.identities.scope_of(*column));
             }
+            _ => {}
         }
-        // InRelational: walk value (subquery is inner scope).
-        resolved::BooleanExpression::InRelational { value, .. } => {
-            extract_table_refs_from_domain(value, references);
-        }
-        // GlobCorrelation: table.* = table.* — both sides are table references.
-        resolved::BooleanExpression::GlobCorrelation { left, right } => {
-            references.insert(left.to_string());
-            references.insert(right.to_string());
-        }
-        resolved::BooleanExpression::OrdinalGlobCorrelation { left, right } => {
-            references.insert(left.to_string());
-            references.insert(right.to_string());
-        }
-        // Using/BooleanLiteral/Sigma: no table references to extract.
-        resolved::BooleanExpression::Using { .. }
-        | resolved::BooleanExpression::BooleanLiteral { .. }
-        | resolved::BooleanExpression::Sigma { .. } => {}
+        Ok(Descent::Continue)
     }
-}
 
-fn extract_table_refs_from_domain(
-    expr: &resolved::DomainExpression,
-    references: &mut HashSet<String>,
-) {
-    match expr {
-        resolved::DomainExpression::Lvar {
-            qualifier: Some(qual),
-            ..
-        } => {
-            references.insert(qual.to_string());
+    /// A whole-heading correlation references its two arms BY SCOPE — there
+    /// is no column walk to find them, so the continuation that holds one is
+    /// read directly.
+    fn enter_continuation(&mut self, continuation: &resolved::Continuation) -> Result<Descent> {
+        if let resolved::Continuation::Correlate { whole, .. } = continuation {
+            let (left, right) = whole.arms();
+            self.scopes.extend([*left, *right]);
         }
-        resolved::DomainExpression::Function(func) => match func {
-            resolved::FunctionExpression::Regular { arguments, .. }
-            | resolved::FunctionExpression::Curried { arguments, .. }
-            | resolved::FunctionExpression::Bracket { arguments, .. } => {
-                for arg in arguments {
-                    extract_table_refs_from_domain(arg, references);
-                }
-            }
-            resolved::FunctionExpression::Infix { left, right, .. } => {
-                extract_table_refs_from_domain(left, references);
-                extract_table_refs_from_domain(right, references);
-            }
-            resolved::FunctionExpression::HigherOrder {
-                curried_arguments,
-                regular_arguments,
-                ..
-            } => {
-                for arg in curried_arguments {
-                    extract_table_refs_from_domain(arg, references);
-                }
-                for arg in regular_arguments {
-                    extract_table_refs_from_domain(arg, references);
-                }
-            }
-            resolved::FunctionExpression::Lambda { body, .. } => {
-                extract_table_refs_from_domain(body, references);
-            }
-            resolved::FunctionExpression::Window {
-                arguments,
-                partition_by,
-                order_by,
-                ..
-            } => {
-                for arg in arguments {
-                    extract_table_refs_from_domain(arg, references);
-                }
-                for expr in partition_by {
-                    extract_table_refs_from_domain(expr, references);
-                }
-                for spec in order_by {
-                    extract_table_refs_from_domain(&spec.column, references);
-                }
-            }
-            resolved::FunctionExpression::JsonPath { source, .. } => {
-                extract_table_refs_from_domain(source, references);
-            }
-            // StringTemplate, CaseExpression, Curly, Array, MetadataTreeGroup:
-            // rare in EXISTS conditions, no simple table refs to extract.
-            resolved::FunctionExpression::StringTemplate { .. }
-            | resolved::FunctionExpression::CaseExpression { .. }
-            | resolved::FunctionExpression::Curly { .. }
-            | resolved::FunctionExpression::Array { .. }
-            | resolved::FunctionExpression::MetadataTreeGroup { .. } => {}
-        },
-        resolved::DomainExpression::Parenthesized { inner, .. } => {
-            extract_table_refs_from_domain(inner, references);
-        }
-        // Unqualified Lvar: no table reference to extract.
-        resolved::DomainExpression::Lvar {
-            qualifier: None, ..
-        } => {}
-        // PipedExpression: walk value and transforms.
-        resolved::DomainExpression::PipedExpression {
-            value, transforms, ..
-        } => {
-            extract_table_refs_from_domain(value, references);
-            for (_, func) in transforms {
-                match func {
-                    resolved::FunctionExpression::Regular { arguments, .. }
-                    | resolved::FunctionExpression::Curried { arguments, .. }
-                    | resolved::FunctionExpression::Bracket { arguments, .. } => {
-                        for arg in arguments {
-                            extract_table_refs_from_domain(arg, references);
-                        }
-                    }
-                    _ => {} // Other function types in pipe transforms are rare
-                }
-            }
-        }
-        // Tuple: walk elements.
-        resolved::DomainExpression::Tuple { elements, .. } => {
-            for elem in elements {
-                extract_table_refs_from_domain(elem, references);
-            }
-        }
-        // Predicate: walk the boolean expression.
-        resolved::DomainExpression::Predicate { expr, .. } => {
-            extract_table_refs_from_predicate(expr, references);
-        }
-        // Leaf expressions: no table references.
-        resolved::DomainExpression::Literal { .. }
-        | resolved::DomainExpression::Projection(_)
-        | resolved::DomainExpression::NonUnifiyingUnderscore
-        | resolved::DomainExpression::ValuePlaceholder { .. }
-        | resolved::DomainExpression::Substitution(_)
-        | resolved::DomainExpression::ColumnOrdinal(_)
-        | resolved::DomainExpression::PivotOf { .. } => {}
-        // ScalarSubquery: inner scope — don't extract outer table refs.
-        resolved::DomainExpression::ScalarSubquery { .. } => {}
+        Ok(Descent::Continue)
     }
 }

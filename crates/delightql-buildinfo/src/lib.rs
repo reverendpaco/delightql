@@ -10,7 +10,7 @@
 //! never from the lagging colocated git HEAD) only this crate and the
 //! binaries recompile.
 //!
-//! Identity contract (TEST-ARCHITECTURE.md §11): dev builds report "dev" —
+//! Identity contract: dev builds report "dev" —
 //! in monorepo mode, build-from-source IS the attribution. Supplied mode
 //! (CI, releases, conformance consumers) must refuse binaries that report
 //! "dev".
@@ -27,7 +27,7 @@ pub const IDENT: Option<&str> = option_env!("DQL_BUILD_IDENT");
 /// builds the fatboys and BEFORE it builds the CLI — the CLI carries the
 /// expected hashes of its own version+triple's adapters, so downloads
 /// and `dql target verify` check against a manifest that cannot drift
-/// from the binary (JOE-EVERYBODY-DISTRIBUTION.md §3.4). `None` for dev
+/// from the binary. `None` for dev
 /// builds, same contract as IDENT: dev builds verify nothing and say so.
 pub const FATBOY_DIGESTS: Option<&str> = option_env!("DQL_FATBOY_DIGESTS");
 

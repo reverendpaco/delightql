@@ -4,8 +4,6 @@
 //
 // This module handles creating and managing the namespace hierarchy.
 // Namespaces provide logical organization for entities.
-//
-// See: documentation/design/ddl/SYS-NS-CARTRIDGE-ER-DESIGN.md
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -33,7 +31,6 @@ pub struct NamespaceSpec {
 
 /// Create a single namespace
 ///
-/// This is Step 4 of the bootstrap process (REUSABLE).
 /// Creates a namespace with a given name and parent.
 ///
 /// # Arguments
@@ -272,8 +269,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             writable: false,
         },
         // id 14 is intentionally skipped: reserved for `sys::session`
-        // (assertions/danger/errors), deferred as Part 1b — see
-        // SYS-NAMESPACE-TAXONOMY.md. Those tables stay bare in `sys` for now.
+        // (assertions/danger/errors). Those tables stay bare in `sys`.
         NamespaceSpec {
             id: 15,
             name: "ho".into(),
@@ -294,7 +290,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             source_path: None,
             writable: false,
         },
-        // `home` — the user's scratch container (catechism §II/§IV, Deviation #2).
+        // `home` — the user's scratch container.
         // Parented to the root `_` (id=1), like `main`/`sys`/`std`. It is the
         // enlisted destination for in-session authored definitions. Ships typed
         // as `lib` from day one (the source text you just typed is its truth),
@@ -474,7 +470,7 @@ mod tests {
     use crate::bootstrap::initialize_bootstrap_db;
 
     /// The root row `_` is the tree's root: id=1, pid=NULL, kind=system.
-    /// home parents to it (catechism §II).
+    /// home parents to it.
     #[test]
     fn test_root_row_is_id_1() {
         let conn = Connection::open_in_memory().unwrap();
@@ -494,7 +490,7 @@ mod tests {
     }
 
     /// `home` ships as a real bootstrap namespace: parented to root, lib-kind,
-    /// writable, bootstrap-provenance (catechism §II/§IV, Deviation #2).
+    /// writable, bootstrap-provenance.
     #[test]
     fn test_home_bootstrap_row() {
         let conn = Connection::open_in_memory().unwrap();

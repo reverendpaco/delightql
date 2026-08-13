@@ -5,7 +5,8 @@
 //! These types represent what things exist in DelightQL's world.
 //! They are NOT AST nodes, but domain concepts that the AST references.
 
-use crate::pipeline::ast_resolved::{CprSchema, NamespacePath};
+use crate::names::ScopeId;
+use crate::pipeline::ast_resolved::NamespacePath;
 use delightql_types::SqlIdentifier;
 
 /// Information about an entity discovered by the resolver
@@ -60,5 +61,5 @@ pub enum SchemaSource {
 #[derive(Debug, Clone)]
 pub enum EntityDefinition {
     /// For relations (tables, CTEs, etc.)
-    RelationSchema(CprSchema),
+    RelationSchema(ScopeId),
 }

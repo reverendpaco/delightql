@@ -33,7 +33,9 @@ pub mod test_utils;
 pub use db_traits::{DatabaseConnection, DatabaseConnectionExt, DbValue, FromDbValue, Row, ToDbValue};
 pub use error::{DelightQLError, KnownLimitationType, Result};
 pub use identifier::SqlIdentifier;
-pub use introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
+pub use introspect::{
+    DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity, DiscoveredRelation,
+};
 pub use namespace::{NamespaceItem, NamespacePath};
 pub use factory::{ConnectionComponents, ConnectionFactory};
 pub use schema::{ColumnInfo, DatabaseSchema};
@@ -52,4 +54,3 @@ pub fn teach_runtime_message(msg: String) -> String {
     }
     msg
 }
-

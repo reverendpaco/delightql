@@ -2,8 +2,8 @@
 // Copyright 2026 Daniel Eklund
 // `dql explain <identifier>` — the registry-backed identifier explainer.
 //
-// The window into the compiler's identifier taxonomy (URI-DESIGN.md §3).
-// Since SYS-HELP-DESIGN.md phase 1, the registry IS a burned relation:
+// The window into the compiler's identifier taxonomy.
+// The registry IS a burned relation:
 // this command queries `sys::identifiers.identifier(*)` from the in-memory
 // bootstrap (rows authored in bootstrap/schema.sql), so `dql explain`,
 // `sys::identifiers.identifier(*)` in a query, and every future projection
@@ -18,7 +18,7 @@ use delightql_core::uri_registry::{
 
 /// Load the identifier rows by standing up the in-memory system and
 /// querying the burned table — the same ~25ms a `dql query` pays, so
-/// explain's latency is unchanged (measured, SYS-HELP finding #5).
+/// explain's latency is unchanged (measured).
 fn load_rows() -> Result<Vec<IdentifierEntry>> {
     let mut handle = crate::connection::open_handle()?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;

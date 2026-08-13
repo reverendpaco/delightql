@@ -106,7 +106,9 @@ pub fn sqlite3_profile() -> PipeProfile {
         null_value: "NULL".into(),
         cli_flags: vec![],
         introspection: IntrospectionMode::SingleQuery(
-            "SELECT s.name, s.type, p.cid, p.name, p.type, p.\"notnull\" \
+            "SELECT s.name AS table_name, s.type AS table_type, \
+             p.cid AS cid, p.name AS col_name, p.type AS col_type, \
+             p.\"notnull\" AS \"notnull\" \
              FROM sqlite_master s, pragma_table_info(s.name) p \
              WHERE s.type IN ('table','view') AND s.name NOT LIKE 'sqlite_%' \
              ORDER BY s.name, p.cid".into()
@@ -130,9 +132,10 @@ pub fn duckdb_profile() -> PipeProfile {
         null_value: "NULL".into(),
         cli_flags: vec!["-csv".into(), "-interactive".into()],
         introspection: IntrospectionMode::SingleQuery(
-            "SELECT t.table_name, t.table_type, c.ordinal_position - 1 AS cid, \
-             c.column_name, c.data_type, \
-             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS notnull \
+            "SELECT t.table_name AS table_name, t.table_type AS table_type, \
+             c.ordinal_position - 1 AS cid, c.column_name AS col_name, \
+             c.data_type AS col_type, \
+             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS \"notnull\" \
              FROM information_schema.tables t \
              JOIN information_schema.columns c \
                ON t.table_catalog = c.table_catalog \
@@ -161,7 +164,7 @@ pub fn duckdb_profile() -> PipeProfile {
 /// publishes 127.0.0.1:5433 with trust auth); for any other server, use a
 /// TOML profile override (`config_profile_path`) or pass a full conninfo
 /// URI as the target. Target is the database name:
-/// `pipe://postgres/dql_core`.
+/// `delightql-siso://postgres/dql_core`.
 pub fn postgres_profile() -> PipeProfile {
     PipeProfile {
         name: "postgres".into(),
@@ -173,10 +176,10 @@ pub fn postgres_profile() -> PipeProfile {
         null_value: "NULL".into(),
         cli_flags: vec!["-X".into(), "-q".into(), "--csv".into()],
         introspection: IntrospectionMode::SingleQuery(
-            "SELECT t.table_name, t.table_type, \
+            "SELECT t.table_name AS table_name, t.table_type AS table_type, \
              c.ordinal_position - 1 AS cid, \
-             c.column_name, c.data_type, \
-             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS notnull \
+             c.column_name AS col_name, c.data_type AS col_type, \
+             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS \"notnull\" \
              FROM information_schema.tables t \
              JOIN information_schema.columns c \
                ON t.table_catalog = c.table_catalog \
@@ -213,10 +216,10 @@ pub fn snowflake_profile() -> PipeProfile {
         null_value: "NULL".into(),
         cli_flags: vec![],
         introspection: IntrospectionMode::SingleQuery(
-            "SELECT t.table_name, t.table_type, \
+            "SELECT t.table_name AS table_name, t.table_type AS table_type, \
              c.ordinal_position - 1 AS cid, \
-             c.column_name, c.data_type, \
-             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS notnull \
+             c.column_name AS col_name, c.data_type AS col_type, \
+             CASE WHEN c.is_nullable = 'YES' THEN 0 ELSE 1 END AS \"notnull\" \
              FROM information_schema.tables t \
              JOIN information_schema.columns c \
                ON t.table_catalog = c.table_catalog \

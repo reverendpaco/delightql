@@ -4,18 +4,14 @@
 //!
 //! Syntax: `run!(file_path)` — REPL/CLI top level ONLY (EFFECT-ALGEBRA R9).
 //!
-//! ## Behavior (Epic 3.3, EFFECT-ALGEBRA F2)
+//! ## Behavior (EFFECT-ALGEBRA F2)
 //!
 //! `run!("file.dql")` = consult the file, then demand its `main!` — the
-//! run's value is `main!`'s return table. The LIVE implementation is the
-//! relay entry point (`relay/entry.rs`): a whole-statement `run!` is
-//! classified there and never reaches this entity. The old implementation
-//! here parsed the file with the QUERY grammar (REPORT-2.1: it could never
-//! accept `:-` rule definitions) and executed free statements; that
-//! semantics is RETIRED (effects ball main--21_run_file pins the
-//! consult-then-demand behavior).
+//! run's value is `main!`'s return table. That behavior lives at the relay
+//! entry point (`relay/entry.rs`): a whole-statement `run!` is classified
+//! there and never reaches this entity (effects ball main--21_run_file).
 //!
-//! This registration remains so `run!` demanded from any NON-whole-statement
+//! This registration exists so `run!` demanded from any NON-whole-statement
 //! position (a conjunct, a subquery) refuses with a directed message rather
 //! than "Unknown pseudo-predicate".
 
@@ -45,9 +41,8 @@ impl BinEntity for RunPredicate {
                 data_type: "String".to_string(),
                 _is_optional: false,
             }],
-            // The receipt heading is the DESCRIPTOR's declaration
-            // (Phase 6 slice 6, F5 reified): core + `path` echo +
-            // the `returned` payload (main!'s return table).
+            // The receipt heading is the DESCRIPTOR's declaration: core +
+            // `path` echo + the `returned` payload (main!'s return table).
             output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("run")),
         }
     }

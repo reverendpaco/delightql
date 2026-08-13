@@ -1,28 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! E-T5 — THE EFFECTS-ON-TARGETS LANE (EFFECTS-ON-TARGETS-PLAN.md §3):
 //! `run!` and the query-position effect directives against LIVE Postgres
-//! and DuckDB mounts, P2 §B's outcome matrix turned POSITIVE. These are
-//! the tests the T0 strike's removal is conditioned on: every target
-//! test here was observed RED (refusing with the strike's message) on
-//! 2026-07-11 against the strike-in-place binary, and went green when
-//! the strike was deleted — the conversion moment the strike's own
-//! comment block promised.
+//! and DuckDB mounts.
 //!
 //! Why integration tests: honesty is a TOPOLOGY property — a real dql
 //! process, a real fatboy child, a real engine, post-state verified
 //! through the engine's OWN door (psql / the duckdb CLI), never through
-//! dql's receipts alone (P2 §B's liar matrix is exactly what receipts-
-//! only verification missed).
+//! dql's receipts alone.
 //!
-//! Environment gating (T0's pattern, kept): DuckDB tests need the
+//! Environment gating: DuckDB tests need the
 //! `dql-fatboy-duckdb` binary next to the dql under test AND a `duckdb`
 //! CLI on PATH; Postgres tests need TCP 127.0.0.1:5433 (the sweep
 //! lane's container `dql-sweep-pg`, new_test_suite/sweep.py), the
 //! `dql-fatboy-postgres` sibling, and a `psql` on PATH. Each test SKIPS
 //! with an eprintln when its environment is absent. Every PG test
 //! creates its own scratch DATABASE (`probe_e5_<test>`) and drops it
-//! panic-safely (E-T3a's ScratchDb precedent) — nothing outside the
+//! panic-safely — nothing outside the
 //! scratch databases is ever touched.
 
 use std::io::Write;
@@ -70,7 +63,10 @@ fn run_dql(dir: &Path, db: &str, query: &str, sequential: bool) -> (bool, String
 fn fatboy_present(name: &str) -> bool {
     PathBuf::from(dql_bin())
         .parent()
-        .map(|d| d.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX)).is_file())
+        .map(|d| {
+            d.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX))
+                .is_file()
+        })
         .unwrap_or(false)
 }
 
@@ -99,7 +95,7 @@ fn duckdb_env_or_skip(test: &str) -> bool {
 }
 
 /// Author a DuckDB file via the duckdb CLI (dql's fatboy holds the file
-/// exclusively while a session runs — E-T3b — so authoring and
+/// exclusively while a session runs, so authoring and
 /// post-state checks bracket the dql invocations).
 fn duckdb_exec(db: &Path, sql: &str) {
     let status = Command::new("duckdb")
@@ -169,7 +165,11 @@ fn pg_env_or_skip(test: &str) -> bool {
         return false;
     }
     if !fatboy_present("dql-fatboy-postgres") {
-        eprintln!("SKIP {}: no dql-fatboy-postgres next to {}", test, dql_bin());
+        eprintln!(
+            "SKIP {}: no dql-fatboy-postgres next to {}",
+            test,
+            dql_bin()
+        );
         return false;
     }
     if !cli_present("psql") {
@@ -201,8 +201,8 @@ fn psql(db: &str, sql: &str) -> String {
 }
 
 /// A scratch DATABASE on the sweep container, dropped panic-safely on
-/// Drop (E-T3a's ScratchDb precedent; `WITH (FORCE)` evicts any
-/// lingering backend). Rerun-safe: pre-drops before creating.
+/// Drop (`WITH (FORCE)` evicts any lingering backend). Rerun-safe:
+/// pre-drops before creating.
 struct ScratchDb {
     name: String,
 }
@@ -233,7 +233,10 @@ impl Drop for ScratchDb {
         let _ = Command::new("psql")
             .arg(pg_uri("postgres"))
             .arg("-c")
-            .arg(format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name))
+            .arg(format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                self.name
+            ))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -250,16 +253,13 @@ fn pg_orders_fixture(db: &ScratchDb) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// DuckDB — P2 §B's matrix, positive
+// DuckDB — effect directives against a live mount
 // ════════════════════════════════════════════════════════════════════════
 
-/// P2 §B row 1 turned positive: ad-hoc `temp_table!` with a RESOLVED
-/// source returns its receipt, the object is readable IN-SESSION (the
-/// registration read-back round trip over a real relay), and it is GONE
-/// after the session (session-temp, no durable residue in the file).
-///
-/// RED 2026-07-11 (strike in place): exit 1,
-/// "effect directives are not yet supported on duckdb connections".
+/// Ad-hoc `temp_table!` with a RESOLVED source returns its receipt, the
+/// object is readable IN-SESSION (the registration read-back round trip
+/// over a real relay), and it is GONE after the session (session-temp,
+/// no durable residue in the file).
 #[test]
 fn duckdb_resolved_source_temp_table_receipt_and_session_scratch() {
     if !duckdb_env_or_skip("duckdb_resolved_source_temp_table_receipt_and_session_scratch") {
@@ -270,8 +270,16 @@ fn duckdb_resolved_source_temp_table_receipt_and_session_scratch() {
     let db_str = db.to_str().unwrap();
 
     // The receipt.
-    let (ok, stdout, stderr) = run_dql(dir.path(), db_str, "orders(*) |> temp_table!(staged)", false);
-    assert!(ok, "temp_table! on duckdb must execute.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db_str,
+        "orders(*) |> temp_table!(staged(*))(*)",
+        false,
+    );
+    assert!(
+        ok,
+        "temp_table! on duckdb must execute.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("temp_table!") && stdout.contains("staged"),
         "expected the creation receipt.\nstdout:\n{stdout}"
@@ -281,10 +289,13 @@ fn duckdb_resolved_source_temp_table_receipt_and_session_scratch() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         db_str,
-        "orders(*) |> temp_table!(staged)\n\nstaged(*) ~> count:(*) as n",
+        "orders(*) |> temp_table!(staged(*))(*)\n\nstaged(*) ~> count:(*) as n",
         true,
     );
-    assert!(ok, "in-session read of the created temp table.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        ok,
+        "in-session read of the created temp table.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains('3'),
         "staged holds the 3 staged orders.\nstdout:\n{stdout}"
@@ -298,18 +309,17 @@ fn duckdb_resolved_source_temp_table_receipt_and_session_scratch() {
         "session temp must leave no durable residue.\ntables:\n{tables}"
     );
     let (ok, stdout, _stderr) = run_dql(dir.path(), db_str, "staged(*)", false);
-    assert!(!ok, "a fresh session must not resolve the dead scratch.\nstdout:\n{stdout}");
+    assert!(
+        !ok,
+        "a fresh session must not resolve the dead scratch.\nstdout:\n{stdout}"
+    );
 }
 
-/// P2 §B row 2 turned positive — THE OLD LIAR: `_(x @ 1) |> temp_table!(t)`
-/// used to return a success receipt while the object landed on the
-/// invisible in-memory SQLite hub. Now the plan settles on the MAIN
-/// mount's connection (E-T1), so the in-session read — which routes to
-/// the TARGET (registration keys on the object's connection) — answers
-/// the row. If the object had gone to the hub again, that read would be
-/// the exact P2 liar shape: "no such table" on the target session.
-///
-/// RED 2026-07-11 (strike in place): exit 1, the duckdb strike message.
+/// `_(x @ 1) |> temp_table!(t(*))(*)`'s anon-source object must land on the
+/// MAIN mount's connection: the in-session read routes to the TARGET
+/// (registration keys on the object's connection), so a hub landing
+/// instead would surface the liar's shape — a success receipt
+/// followed by "no such table" on the target session.
 #[test]
 fn duckdb_anon_source_temp_table_lands_on_the_target_session() {
     if !duckdb_env_or_skip("duckdb_anon_source_temp_table_lands_on_the_target_session") {
@@ -323,7 +333,7 @@ fn duckdb_anon_source_temp_table_lands_on_the_target_session() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         db_str,
-        "_(x @ 1) |> temp_table!(t)\n\nt(*)",
+        "_(x @ 1) |> temp_table!(t(*))(*)\n\nt(*)",
         true,
     );
     assert!(
@@ -331,10 +341,18 @@ fn duckdb_anon_source_temp_table_lands_on_the_target_session() {
         "the anon-source object must be readable on the TARGET session \
          (a hub landing errors here — the liar's shape).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stdout.contains('1'), "t holds the anon row.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains('1'),
+        "t holds the anon row.\nstdout:\n{stdout}"
+    );
 
     // The receipt, on its own session.
-    let (ok, stdout, stderr) = run_dql(dir.path(), db_str, "_(x @ 1) |> temp_table!(t)", false);
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db_str,
+        "_(x @ 1) |> temp_table!(t(*))(*)",
+        false,
+    );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.contains("temp_table!") && stdout.contains('t'),
@@ -350,12 +368,8 @@ fn duckdb_anon_source_temp_table_lands_on_the_target_session() {
 }
 
 /// Ad-hoc DML lands on the target with YES receipts; a predicate that
-/// matches nothing gives the EMPTY receipt (the pre-count gate working
-/// live — DuckDB's R-T6 form). Post-state verified through the duckdb
-/// CLI, never through dql.
-///
-/// RED 2026-07-11 (strike in place): every statement refused, duckdb
-/// strike message.
+/// matches nothing gives the EMPTY receipt (the pre-count gate). Post-
+/// state verified through the duckdb CLI, never through dql.
 #[test]
 fn duckdb_adhoc_dml_receipts_and_post_state() {
     if !duckdb_env_or_skip("duckdb_adhoc_dml_receipts_and_post_state") {
@@ -373,7 +387,10 @@ fn duckdb_adhoc_dml_receipts_and_post_state() {
         false,
     );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("insert!"), "YES receipt expected.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains("insert!"),
+        "YES receipt expected.\nstdout:\n{stdout}"
+    );
     assert_eq!(duckdb_query(&db, "SELECT count(*) FROM orders_eu"), "2");
 
     // insert! NO: nothing matches, EMPTY receipt (zero rows — the
@@ -384,7 +401,10 @@ fn duckdb_adhoc_dml_receipts_and_post_state() {
         r#"orders(*), region = "XX" |> insert!(orders_eu(*))(*)"#,
         false,
     );
-    assert!(ok, "a NO answer is not an error.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        ok,
+        "a NO answer is not an error.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         !stdout.contains("insert!"),
         "NO must be the EMPTY receipt, not a success row.\nstdout:\n{stdout}"
@@ -399,8 +419,14 @@ fn duckdb_adhoc_dml_receipts_and_post_state() {
         false,
     );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("update!"), "YES receipt expected.\nstdout:\n{stdout}");
-    assert_eq!(duckdb_query(&db, "SELECT count(*) FROM orders WHERE amount = 999"), "1");
+    assert!(
+        stdout.contains("update!"),
+        "YES receipt expected.\nstdout:\n{stdout}"
+    );
+    assert_eq!(
+        duckdb_query(&db, "SELECT count(*) FROM orders WHERE amount = 999"),
+        "1"
+    );
 
     // delete! YES: the EU rows go.
     let (ok, stdout, stderr) = run_dql(
@@ -410,15 +436,16 @@ fn duckdb_adhoc_dml_receipts_and_post_state() {
         false,
     );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("delete!"), "YES receipt expected.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains("delete!"),
+        "YES receipt expected.\nstdout:\n{stdout}"
+    );
     assert_eq!(duckdb_query(&db, "SELECT count(*) FROM orders"), "1");
 }
 
 /// `table!` durable on a DuckDB file: the object persists across a full
 /// reopen (verified through the duckdb CLI after the dql session exits)
 /// and a SECOND dql session resolves it bare (mount introspection).
-///
-/// RED 2026-07-11 (strike in place): refused, duckdb strike message.
 #[test]
 fn duckdb_table_bang_durable_persists_across_reopen() {
     if !duckdb_env_or_skip("duckdb_table_bang_durable_persists_across_reopen") {
@@ -428,9 +455,17 @@ fn duckdb_table_bang_durable_persists_across_reopen() {
     let db = duckdb_orders_fixture(dir.path());
     let db_str = db.to_str().unwrap();
 
-    let (ok, stdout, stderr) = run_dql(dir.path(), db_str, "orders(*) |> table!(archive)", false);
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db_str,
+        "orders(*) |> table!(archive(*))(*)",
+        false,
+    );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("table!"), "creation receipt expected.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains("table!"),
+        "creation receipt expected.\nstdout:\n{stdout}"
+    );
 
     // Across a reopen, through the engine's own door.
     assert_eq!(duckdb_query(&db, "SELECT count(*) FROM archive"), "3");
@@ -438,15 +473,15 @@ fn duckdb_table_bang_durable_persists_across_reopen() {
     // A second dql session resolves it bare.
     let (ok, stdout, stderr) = run_dql(dir.path(), db_str, "archive(*) ~> count:(*) as n", false);
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains('3'), "the durable object survives sessions.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains('3'),
+        "the durable object survives sessions.\nstdout:\n{stdout}"
+    );
 }
 
-/// An ABORTING plan on DuckDB: R-T3's uniform discipline live — the
-/// constraint violation's TRUE error surfaces (not the poisoned-
-/// transaction message, P3 §A), ROLLBACK undoes the plan's earlier
-/// mutation, exit code 1.
-///
-/// RED 2026-07-11 (strike in place): refused at compile instead.
+/// An ABORTING plan on DuckDB: the constraint violation's TRUE error
+/// surfaces (not a poisoned-transaction message), ROLLBACK undoes the
+/// plan's earlier mutation, exit code 1.
 #[test]
 fn duckdb_aborting_plan_rolls_back_and_surfaces_the_true_error() {
     if !duckdb_env_or_skip("duckdb_aborting_plan_rolls_back_and_surfaces_the_true_error") {
@@ -469,8 +504,16 @@ fn duckdb_aborting_plan_rolls_back_and_surfaces_the_true_error() {
     )
     .unwrap();
 
-    let (ok, stdout, stderr) = run_dql(dir.path(), db.to_str().unwrap(), "run!(\"abort.dql\")(*)", false);
-    assert!(!ok, "the aborting plan must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db.to_str().unwrap(),
+        "run!(\"abort.dql\")(*)",
+        false,
+    );
+    assert!(
+        !ok,
+        "the aborting plan must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("CHECK constraint"),
         "the TRUE constraint error must surface.\nstderr:\n{stderr}"
@@ -489,15 +532,12 @@ fn duckdb_aborting_plan_rolls_back_and_surfaces_the_true_error() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Postgres — the matrix positive, plus the capstone
+// Postgres — effect directives against a live mount, plus the capstone
 // ════════════════════════════════════════════════════════════════════════
 
-/// Ad-hoc DML on PG: the fused data-modifying-CTE receipts (R-T6's PG
-/// form) live — YES receipts with rows landing, the NO case's empty
-/// receipt, update!/delete! post-states verified via psql.
-///
-/// RED 2026-07-11 (strike in place): every statement refused,
-/// "effect directives are not yet supported on postgres connections".
+/// Ad-hoc DML on PG: the fused data-modifying-CTE receipts — YES
+/// receipts with rows landing, the NO case's empty receipt,
+/// update!/delete! post-states verified via psql.
 #[test]
 fn pg_adhoc_dml_receipts_and_post_state() {
     if !pg_env_or_skip("pg_adhoc_dml_receipts_and_post_state") {
@@ -515,7 +555,10 @@ fn pg_adhoc_dml_receipts_and_post_state() {
         false,
     );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("insert!"), "YES receipt expected.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains("insert!"),
+        "YES receipt expected.\nstdout:\n{stdout}"
+    );
     assert_eq!(db.sql("SELECT count(*) FROM orders_eu"), "2");
 
     // insert! NO: empty receipt, nothing lands.
@@ -525,7 +568,10 @@ fn pg_adhoc_dml_receipts_and_post_state() {
         r#"orders(*), region = "XX" |> insert!(orders_eu(*))(*)"#,
         false,
     );
-    assert!(ok, "a NO answer is not an error.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        ok,
+        "a NO answer is not an error.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         !stdout.contains("insert!"),
         "NO must be the EMPTY receipt (the fused gate working live).\nstdout:\n{stdout}"
@@ -540,8 +586,14 @@ fn pg_adhoc_dml_receipts_and_post_state() {
         false,
     );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("update!"), "YES receipt expected.\nstdout:\n{stdout}");
-    assert_eq!(db.sql("SELECT count(*) FROM orders WHERE amount = 999"), "1");
+    assert!(
+        stdout.contains("update!"),
+        "YES receipt expected.\nstdout:\n{stdout}"
+    );
+    assert_eq!(
+        db.sql("SELECT count(*) FROM orders WHERE amount = 999"),
+        "1"
+    );
 
     // delete! YES.
     let (ok, stdout, stderr) = run_dql(
@@ -551,15 +603,16 @@ fn pg_adhoc_dml_receipts_and_post_state() {
         false,
     );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("delete!"), "YES receipt expected.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains("delete!"),
+        "YES receipt expected.\nstdout:\n{stdout}"
+    );
     assert_eq!(db.sql("SELECT count(*) FROM orders"), "1");
 }
 
-/// The anon-source liar on PG, positive: the object lands on the TARGET
-/// session (in-session read routes to the mount's connection and
-/// answers), pg_class confirms it never became durable.
-///
-/// RED 2026-07-11 (strike in place): refused, postgres strike message.
+/// The anon-source object lands on the TARGET session (in-session read
+/// routes to the mount's connection and answers), pg_class confirms it
+/// never became durable.
 #[test]
 fn pg_anon_source_temp_table_lands_on_the_target() {
     if !pg_env_or_skip("pg_anon_source_temp_table_lands_on_the_target") {
@@ -572,7 +625,7 @@ fn pg_anon_source_temp_table_lands_on_the_target() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         &db.uri(),
-        "_(x @ 1) |> temp_table!(t)\n\nt(*)",
+        "_(x @ 1) |> temp_table!(t(*))(*)\n\nt(*)",
         true,
     );
     assert!(
@@ -580,7 +633,10 @@ fn pg_anon_source_temp_table_lands_on_the_target() {
         "the anon-source object must be readable on the TARGET session \
          (a hub landing errors here — the P2 liar's shape).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stdout.contains('1'), "t holds the anon row.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains('1'),
+        "t holds the anon row.\nstdout:\n{stdout}"
+    );
 
     // Never durable: the scratch database's catalog holds no relation `t`
     // after the session (its pg_temp schema died with the backend).
@@ -595,13 +651,11 @@ fn pg_anon_source_temp_table_lands_on_the_target() {
     );
 }
 
-/// E-T4's live proofs (its flags 1a/1b/1c): the registration read-back
-/// round trip over a REAL relay — PG's information_schema lists the
-/// session's OWN temp table, so the created object is queryable by a
-/// subsequent statement in the SAME session — and `table!` spells
-/// `public.<name>` in a real bracket, durable across sessions.
-///
-/// RED 2026-07-11 (strike in place): refused, postgres strike message.
+/// The registration read-back round trip over a REAL relay — PG's
+/// information_schema lists the session's OWN temp table, so the
+/// created object is queryable by a subsequent statement in the SAME
+/// session — and `table!` spells `public.<name>` in a real bracket,
+/// durable across sessions.
 #[test]
 fn pg_temp_readback_round_trip_and_table_bang_lands_in_public() {
     if !pg_env_or_skip("pg_temp_readback_round_trip_and_table_bang_lands_in_public") {
@@ -611,38 +665,49 @@ fn pg_temp_readback_round_trip_and_table_bang_lands_in_public() {
     pg_orders_fixture(&db);
     let dir = tempfile::tempdir().unwrap();
 
-    // temp_table! + same-session read (flags 1a + 1b: the read-back
-    // registered the object from information_schema's view of pg_temp).
+    // temp_table! + same-session read: the read-back registers the
+    // object from information_schema's view of pg_temp.
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         &db.uri(),
-        "orders(*) |> temp_table!(staged)\n\nstaged(*) ~> count:(*) as n",
+        "orders(*) |> temp_table!(staged(*))(*)\n\nstaged(*) ~> count:(*) as n",
         true,
     );
-    assert!(ok, "same-session read of the created temp table.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains('3'), "staged holds the 3 orders.\nstdout:\n{stdout}");
+    assert!(
+        ok,
+        "same-session read of the created temp table.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains('3'),
+        "staged holds the 3 orders.\nstdout:\n{stdout}"
+    );
 
     // table! durable + same-session read, then public placement + rows
-    // verified via psql after the session (flag 1c).
+    // verified via psql after the session.
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         &db.uri(),
-        "orders(*) |> table!(archive)\n\narchive(*) ~> count:(*) as n",
+        "orders(*) |> table!(archive(*))(*)\n\narchive(*) ~> count:(*) as n",
         true,
     );
-    assert!(ok, "same-session read of the durable creation.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains('3'), "archive holds the 3 orders.\nstdout:\n{stdout}");
+    assert!(
+        ok,
+        "same-session read of the durable creation.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains('3'),
+        "archive holds the 3 orders.\nstdout:\n{stdout}"
+    );
     assert_eq!(
-        db.sql(
-            "SELECT table_schema FROM information_schema.tables WHERE table_name = 'archive'"
-        ),
+        db.sql("SELECT table_schema FROM information_schema.tables WHERE table_name = 'archive'"),
         "public",
         "table! spells the mounted schema (R-T4): public.archive"
     );
     assert_eq!(db.sql("SELECT count(*) FROM public.archive"), "3");
 
     // A second dql session resolves the durable bare.
-    let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), "archive(*) ~> count:(*) as n", false);
+    let (ok, stdout, stderr) =
+        run_dql(dir.path(), &db.uri(), "archive(*) ~> count:(*) as n", false);
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(stdout.contains('3'), "stdout:\n{stdout}");
 }
@@ -655,8 +720,6 @@ fn pg_temp_readback_round_trip_and_table_bang_lands_in_public() {
 /// tail reading DURABLE post-state. Everything verified through psql:
 /// the routed rows, the processed window, and ZERO residue (no durable
 /// scratch, no `__` names; pg_temp died with the session).
-///
-/// RED 2026-07-11 (strike in place): refused, postgres strike message.
 #[test]
 fn pg_run_torture_shaped_script_the_capstone() {
     if !pg_env_or_skip("pg_run_torture_shaped_script_the_capstone") {
@@ -702,10 +765,10 @@ mark_processed!(*) :-
       |> update!(orders(*))(*)
 
 main!(*) :-
-    recent_orders(*) |> stdout!(*) |> temp_table!(staged) : s!
+    recent_orders(*) |> stdout!(*) |> temp_table!(staged(*))(*) : s!
     staged(*) ~> count:(*) as n, n = 0, exit!(*) : x!
     staged(*), +customers(customer_id), amount > 0
-      |> temp_view!(valid) : v!
+      |> temp_view!(valid(*))(*) : v!
     staged(*), \+customers(customer_id) |> quarantine!(*) : q!
     route!(*), mark_processed!(*) : rm!
     staged!!(*), \+customers(customer_id) or amount <= 0
@@ -717,17 +780,18 @@ main!(*) :-
     )
     .unwrap();
 
-    let (ok, stdout, stderr) = run_dql(
-        dir.path(),
-        &db.uri(),
-        "run!(\"capstone.dql\")(*)",
-        false,
+    let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), "run!(\"capstone.dql\")(*)", false);
+    assert!(
+        ok,
+        "the capstone run must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(ok, "the capstone run must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
 
     // The mid-run ships arrived: the staged orders (stdout! #1) and the
     // total ledger (stdout! #2 — every arm's directive present).
-    assert!(stdout.contains("101"), "the staging stdout! shipped.\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains("101"),
+        "the staging stdout! shipped.\nstdout:\n{stdout}"
+    );
     for op in ["temp_table!", "temp_view!", "insert!", "update!", "delete!"] {
         assert!(
             stdout.contains(op),
@@ -736,7 +800,10 @@ main!(*) :-
     }
     // The return value: durable post-state buckets.
     for bucket in ["eu", "us", "quarantine"] {
-        assert!(stdout.contains(bucket), "final_summary bucket {bucket}.\nstdout:\n{stdout}");
+        assert!(
+            stdout.contains(bucket),
+            "final_summary bucket {bucket}.\nstdout:\n{stdout}"
+        );
     }
 
     // Durable post-state through psql (the oracle's shape: eu=1, us=1,
@@ -744,7 +811,10 @@ main!(*) :-
     assert_eq!(db.sql("SELECT count(*) FROM orders_eu"), "1");
     assert_eq!(db.sql("SELECT count(*) FROM orders_us"), "1");
     assert_eq!(db.sql("SELECT count(*) FROM orders_quarantine"), "1");
-    assert_eq!(db.sql("SELECT count(*) FROM orders WHERE status = 'processed'"), "4");
+    assert_eq!(
+        db.sql("SELECT count(*) FROM orders WHERE status = 'processed'"),
+        "4"
+    );
     assert_eq!(db.sql("SELECT order_id FROM orders_quarantine"), "103");
 
     // ZERO residue: exactly the five fixture tables; nothing named like
@@ -774,11 +844,9 @@ main!(*) :-
 }
 
 /// An ABORTING plan on PG: the mid-plan constraint violation surfaces
-/// its TRUE error (23514's message, never the 25P02 mask — E-T3a plus
-/// the pump's ROLLBACK-on-first-error), the bracket rolls back the
-/// plan's earlier successful insert, exit code 1, zero residue.
-///
-/// RED 2026-07-11 (strike in place): refused at compile instead.
+/// its TRUE error (23514's message, never the 25P02 mask — the pump's
+/// ROLLBACK-on-first-error), the bracket rolls back the plan's earlier
+/// successful insert, exit code 1, zero residue.
 #[test]
 fn pg_aborting_plan_surfaces_the_true_error_and_rolls_back() {
     if !pg_env_or_skip("pg_aborting_plan_surfaces_the_true_error_and_rolls_back") {
@@ -801,7 +869,10 @@ fn pg_aborting_plan_surfaces_the_true_error_and_rolls_back() {
     .unwrap();
 
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), "run!(\"abort.dql\")(*)", false);
-    assert!(!ok, "the aborting plan must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !ok,
+        "the aborting plan must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("violates check constraint"),
         "the TRUE error surfaces (E-T3a + R-T3).\nstderr:\n{stderr}"
@@ -825,13 +896,10 @@ fn pg_aborting_plan_surfaces_the_true_error_and_rolls_back() {
     );
 }
 
-/// exit! taken AND not taken on PG — the dialected exit peek live. This
-/// is also the pump's peek-WINDOW fix end-to-end: on PG the exit shell
-/// sits INSIDE the bracket (ON COMMIT DROP), so a pre-shell peek would
-/// have poisoned the whole bracket (P1 H5); the plan only runs because
-/// peeks start after the shell entry.
-///
-/// RED 2026-07-11 (strike in place): refused, postgres strike message.
+/// exit! taken AND not taken on PG — the dialected exit peek live: on
+/// PG the exit shell sits INSIDE the bracket (ON COMMIT DROP), so a
+/// pre-shell peek would poison the whole bracket; the plan only runs
+/// because peeks start after the shell entry.
 #[test]
 fn pg_exit_taken_and_not_taken() {
     if !pg_env_or_skip("pg_exit_taken_and_not_taken") {
@@ -848,7 +916,7 @@ fn pg_exit_taken_and_not_taken() {
         r#"final_count(*) :- sink(*) ~> count:(*) as n
 
 main!(*) :-
-    src(*), x >= 100 |> temp_table!(staged) : s!
+    src(*), x >= 100 |> temp_table!(staged(*))(*) : s!
 
     staged(*) ~> count:(*) as n, n = 0, exit!(*) : x!
 
@@ -862,26 +930,37 @@ main!(*) :-
     // TAKEN: nothing stages, exit! fires, the insert is skipped, the
     // wrap-guarded return is empty — a graceful exit, code 0.
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), "run!(\"exit.dql\")(*)", false);
-    assert!(ok, "exit! is graceful, not an abort.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        ok,
+        "exit! is graceful, not an abort.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         !stdout.contains("insert!"),
         "post-exit arms must not run (their receipts never ship).\nstdout:\n{stdout}"
     );
-    assert_eq!(db.sql("SELECT count(*) FROM sink"), "0", "exit! stopped the run before the insert");
+    assert_eq!(
+        db.sql("SELECT count(*) FROM sink"),
+        "0",
+        "exit! stopped the run before the insert"
+    );
 
     // NOT TAKEN: a row stages, the run continues to the insert.
     db.sql("INSERT INTO src VALUES (150)");
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), "run!(\"exit.dql\")(*)", false);
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains('1'), "the return reads sink's count = 1.\nstdout:\n{stdout}");
-    assert_eq!(db.sql("SELECT count(*) FROM sink"), "1", "the staged row landed");
+    assert!(
+        stdout.contains('1'),
+        "the return reads sink's count = 1.\nstdout:\n{stdout}"
+    );
+    assert_eq!(
+        db.sql("SELECT count(*) FROM sink"),
+        "1",
+        "the staged row landed"
+    );
 }
 
 /// `stdout!` mid-pipe on PG: on_ship over a real relay — the mid-run
-/// set prints live, then the receipt arrives as the return value (P2
-/// pinned this on DuckDB; this is the PG pin).
-///
-/// RED 2026-07-11 (strike in place): refused, postgres strike message.
+/// set prints live, then the receipt arrives as the return value.
 #[test]
 fn pg_stdout_mid_pipe_ships_live() {
     if !pg_env_or_skip("pg_stdout_mid_pipe_ships_live") {
@@ -894,7 +973,7 @@ fn pg_stdout_mid_pipe_ships_live() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         &db.uri(),
-        r#"orders(*), region = "EU" |> stdout!(*) |> temp_table!(staged)"#,
+        r#"orders(*), region = "EU" |> stdout!(*) |> temp_table!(staged(*))(*)"#,
         false,
     );
     assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
@@ -908,28 +987,27 @@ fn pg_stdout_mid_pipe_ships_live() {
     );
 }
 
-/// The RULED liminal-ledger answer, pinned live: consult-then-run
-/// against a PG mount records the ledger normally — ON THE HUB's
-/// internal SQLite (the sys::ns bootstrap table), never on the
-/// customer's engine. The ledger read works after the run, and the
-/// target database gained no tables.
-///
-/// RED 2026-07-11 (strike in place): the run half refused; the ledger
-/// question was unobservable.
+/// The RULED liminal-ledger answer: consult-then-run against a PG
+/// mount records the ledger normally — ON THE HUB's internal SQLite
+/// (the sys::ns bootstrap table), never on the customer's engine. The
+/// ledger read works after the run, and the target database gained no
+/// tables.
 #[test]
 fn pg_consult_plus_run_records_the_liminal_ledger_on_the_hub() {
     if !pg_env_or_skip("pg_consult_plus_run_records_the_liminal_ledger_on_the_hub") {
         return;
     }
     let db = ScratchDb::create("probe_e5_ledger");
-    db.sql("CREATE TABLE orders (order_id INTEGER, region TEXT); INSERT INTO orders VALUES (1,'EU');");
+    db.sql(
+        "CREATE TABLE orders (order_id INTEGER, region TEXT); INSERT INTO orders VALUES (1,'EU');",
+    );
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("ledger.dql"),
         r#"doc!("main", "the ledger stays on the hub")
 
 main!(*) :-
-    orders(*) |> temp_table!(staged) : s!
+    orders(*) |> temp_table!(staged(*))(*) : s!
     s!(*) |> returning!(*)
 "#,
     )
@@ -951,17 +1029,14 @@ main!(*) :-
 
     // No sys tables — no tables at all — landed on the customer's engine.
     assert_eq!(
-        db.sql(
-            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
-        ),
+        db.sql("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"),
         "1",
         "the target database holds exactly its fixture; the ledger never lands there"
     );
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// The non-firing control (all-SQLite unchanged) — kept from
-// effects_engine_strike.rs, which this lane converts and replaces.
+// The non-firing control: all-SQLite effect statements are unaffected.
 // ════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -978,7 +1053,7 @@ fn sqlite_effects_still_run() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         db.to_str().unwrap(),
-        "orders(*) |> temp_table!(staged)",
+        "orders(*) |> temp_table!(staged(*))(*)",
         false,
     );
     assert!(

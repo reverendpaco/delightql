@@ -13,8 +13,8 @@
 // use the join operand aliases (u.id, o.total) which must remain in scope.
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::generator_v3::SqlDialect;
-use crate::pipeline::sql_ast_v3::{
+use crate::pipeline::generator::SqlDialect;
+use crate::pipeline::sql_ast::{
     BinaryOperator, DomainExpression, JoinCondition, JoinType, QueryExpression, SelectItem,
     SelectStatement, SetOperator, SqlStatement, TableExpression,
 };
@@ -28,10 +28,13 @@ pub fn needs_expansion(dialect: SqlDialect) -> bool {
 }
 
 /// Walk the SQL statement and expand any FULL OUTER JOINs.
-pub fn expand_full_outer_joins(stmt: SqlStatement) -> Result<SqlStatement> {
+pub fn expand_full_outer_joins(
+    stmt: SqlStatement,
+    identities: &crate::names::Registry,
+) -> Result<SqlStatement> {
     match stmt {
         SqlStatement::Query { with_clause, query } => {
-            let rewritten = rewrite_query(query)?;
+            let rewritten = rewrite_query(query, identities)?;
             Ok(SqlStatement::Query {
                 with_clause,
                 query: rewritten,
@@ -42,23 +45,26 @@ pub fn expand_full_outer_joins(stmt: SqlStatement) -> Result<SqlStatement> {
 }
 
 #[stacksafe::stacksafe]
-fn rewrite_query(query: QueryExpression) -> Result<QueryExpression> {
+fn rewrite_query(
+    query: QueryExpression,
+    identities: &crate::names::Registry,
+) -> Result<QueryExpression> {
     match query {
-        QueryExpression::Select(select) => rewrite_select_query(*select),
+        QueryExpression::Select(select) => rewrite_select_query(*select, identities),
         QueryExpression::SetOperation { op, left, right } => {
-            let left = Box::new(rewrite_query(*left)?);
-            let right = Box::new(rewrite_query(*right)?);
+            let left = Box::new(rewrite_query(*left, identities)?);
+            let right = Box::new(rewrite_query(*right, identities)?);
             Ok(QueryExpression::SetOperation { op, left, right })
         }
         QueryExpression::WithCte { ctes, query } => {
             let ctes = ctes
                 .into_iter()
                 .map(|cte| {
-                    let rewritten = rewrite_query(cte.query().clone())?;
-                    Ok(crate::pipeline::sql_ast_v3::Cte::new(cte.name(), rewritten))
+                    let rewritten = rewrite_query(cte.query().clone(), identities)?;
+                    Ok(cte.with_query(rewritten))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let query = Box::new(rewrite_query(*query)?);
+            let query = Box::new(rewrite_query(*query, identities)?);
             Ok(QueryExpression::WithCte { ctes, query })
         }
         other => Ok(other),
@@ -68,7 +74,10 @@ fn rewrite_query(query: QueryExpression) -> Result<QueryExpression> {
 /// Rewrite a SELECT. If its FROM contains a top-level FULL OUTER JOIN,
 /// expand the entire SELECT into a UNION ALL of two LEFT JOINs.
 /// If the FULL OUTER is nested deeper, recurse into subqueries.
-fn rewrite_select_query(stmt: SelectStatement) -> Result<QueryExpression> {
+fn rewrite_select_query(
+    stmt: SelectStatement,
+    identities: &crate::names::Registry,
+) -> Result<QueryExpression> {
     let Some(from) = stmt.from() else {
         return Ok(QueryExpression::Select(Box::new(stmt)));
     };
@@ -88,16 +97,22 @@ fn rewrite_select_query(stmt: SelectStatement) -> Result<QueryExpression> {
             // computation; duplicating it per branch computes it once
             // per part and yields two rows where a scalar is promised.
             if computes_over_whole_relation(&stmt) {
-                return expand_full_outer_select_aggregated(&stmt, left, right, join_condition);
+                return expand_full_outer_select_aggregated(
+                    &stmt,
+                    left,
+                    right,
+                    join_condition,
+                    identities,
+                );
             }
-            return expand_full_outer_select(&stmt, left, right, join_condition);
+            return expand_full_outer_select(&stmt, left, right, join_condition, identities);
         }
     }
 
     // No top-level FULL OUTER — recurse into subqueries within FROM
     let new_from: Vec<TableExpression> = from
         .iter()
-        .map(|t| rewrite_table_subqueries(t.clone()))
+        .map(|t| rewrite_table_subqueries(t.clone(), identities))
         .collect::<Result<Vec<_>>>()?;
 
     rebuild_select_with_from(stmt, new_from).map(|s| QueryExpression::Select(Box::new(s)))
@@ -115,12 +130,13 @@ fn expand_full_outer_select(
     left: &TableExpression,
     right: &TableExpression,
     condition: &JoinCondition,
+    identities: &crate::names::Registry,
 ) -> Result<QueryExpression> {
     // First, recursively expand any FULL OUTERs in the children
-    let left = rewrite_table_subqueries(left.clone())?;
-    let right = rewrite_table_subqueries(right.clone())?;
+    let left = rewrite_table_subqueries(left.clone(), identities)?;
+    let right = rewrite_table_subqueries(right.clone(), identities)?;
 
-    let null_check_col = extract_null_check_column(condition, operand_alias(&left))?;
+    let null_check_col = extract_null_check_column(condition, operand_scope(&left), identities)?;
 
     // Branch 1: A LEFT JOIN B ON cond (same projection, same WHERE)
     let branch1_from = TableExpression::Join {
@@ -207,7 +223,8 @@ fn computes_over_whole_relation(stmt: &SelectStatement) -> bool {
 fn contains_whole_relation_fn(expr: &DomainExpression) -> bool {
     match expr {
         DomainExpression::Function { name, args, .. } => {
-            AGGREGATE_FNS.contains(&name.to_lowercase().as_str())
+            name.user()
+                .is_some_and(|name| AGGREGATE_FNS.contains(&name.to_lowercase().as_str()))
                 || args.iter().any(contains_whole_relation_fn)
         }
         DomainExpression::WindowFunction { .. } => true,
@@ -226,12 +243,10 @@ fn contains_whole_relation_fn(expr: &DomainExpression) -> bool {
                 || when_clauses.iter().any(|w| {
                     contains_whole_relation_fn(w.when()) || contains_whole_relation_fn(w.then())
                 })
-                || else_clause.as_deref().is_some_and(contains_whole_relation_fn)
+                || else_clause
+                    .as_deref()
+                    .is_some_and(contains_whole_relation_fn)
         }
-        DomainExpression::InList { expr, values, .. } => {
-            contains_whole_relation_fn(expr) || values.iter().any(contains_whole_relation_fn)
-        }
-        DomainExpression::Tuple(items) => items.iter().any(contains_whole_relation_fn),
         DomainExpression::PredicateRewrite { args, .. } => {
             args.iter().any(contains_whole_relation_fn)
         }
@@ -261,14 +276,13 @@ fn expand_full_outer_select_aggregated(
     left: &TableExpression,
     right: &TableExpression,
     condition: &JoinCondition,
+    identities: &crate::names::Registry,
 ) -> Result<QueryExpression> {
-    const SUB: &str = "__fo";
-
     // Recursively expand any FULL OUTERs in the children first.
-    let left = rewrite_table_subqueries(left.clone())?;
-    let right = rewrite_table_subqueries(right.clone())?;
+    let left = rewrite_table_subqueries(left.clone(), identities)?;
+    let right = rewrite_table_subqueries(right.clone(), identities)?;
 
-    let (Some(left_alias), Some(right_alias)) = (operand_alias(&left), operand_alias(&right))
+    let (Some(left_scope), Some(right_scope)) = (operand_scope(&left), operand_scope(&right))
     else {
         return Err(DelightQLError::ParseError {
             message: "FULL OUTER JOIN under an aggregate: operands must carry aliases".to_string(),
@@ -276,48 +290,83 @@ fn expand_full_outer_select_aggregated(
             subcategory: None,
         });
     };
-    let aliases = [left_alias.to_string(), right_alias.to_string()];
+    let operand_scopes = [left_scope, right_scope];
 
-    let null_check_col = extract_null_check_column(condition, Some(left_alias))?;
+    let null_check_col = extract_null_check_column(condition, Some(left_scope), identities)?;
 
     // Every operand column the outer clauses reference.
-    let mut refs: Vec<(String, String)> = Vec::new();
+    let mut refs: Vec<crate::names::ColId> = Vec::new();
     for item in stmt.select_list() {
         if let SelectItem::Expression { expr, .. } = item {
-            collect_operand_refs(expr, &aliases, &mut refs);
+            collect_operand_refs(expr, &operand_scopes, identities, &mut refs);
         }
     }
     if let Some(gb) = stmt.group_by() {
         for e in gb {
-            collect_operand_refs(e, &aliases, &mut refs);
+            collect_operand_refs(e, &operand_scopes, identities, &mut refs);
         }
     }
     if let Some(h) = stmt.having() {
-        collect_operand_refs(h, &aliases, &mut refs);
+        collect_operand_refs(h, &operand_scopes, identities, &mut refs);
     }
     if let Some(ob) = stmt.order_by() {
         for term in ob {
-            collect_operand_refs(term.expr(), &aliases, &mut refs);
+            collect_operand_refs(term.expr(), &operand_scopes, identities, &mut refs);
         }
     }
 
+    let join_scope = identities.mint_scope(
+        crate::names::ScopeOrigin::Join {
+            left: left_scope,
+            right: right_scope,
+        },
+        crate::names::Hint::None,
+        None,
+    );
+    let carrier_scope = identities.mint_derived_scope(
+        crate::names::ScopeOrigin::Wrap {
+            input: join_scope,
+            why: crate::names::WrapReason::SetOperation,
+        },
+        crate::names::Hint::None,
+    );
+    let mut replacements = std::collections::HashMap::new();
     let inner_items: Vec<SelectItem> = if refs.is_empty() {
         // count(*)-style: no column refs — the branches still must
         // produce one column per row.
+        let output = identities.mint_column(
+            carrier_scope,
+            crate::names::ColumnOrigin::Computed {
+                via: crate::names::Computation::Literal,
+            },
+            None,
+            crate::names::Addressing::Hygienic,
+            crate::names::ValueFacts::default(),
+        );
         vec![SelectItem::Expression {
             expr: DomainExpression::Literal(crate::pipeline::ast_refined::LiteralValue::Number(
                 "1".to_string(),
             )),
-            alias: Some("one".to_string()),
+            alias: Some(output),
         }]
     } else {
         refs.iter()
-            .map(|(q, n)| SelectItem::Expression {
-                expr: DomainExpression::Column {
-                    name: n.clone(),
-                    qualifier: Some(crate::pipeline::sql_ast_v3::ColumnQualifier::table(q)),
-                },
-                alias: Some(mangle_ref(q, n)),
+            .map(|source| {
+                let output = identities.mint_column(
+                    carrier_scope,
+                    crate::names::ColumnOrigin::Republished {
+                        from: *source,
+                        how: crate::names::Republish::BoundaryExport,
+                    },
+                    identities.published(*source),
+                    crate::names::Addressing::Published,
+                    identities.facts(*source),
+                );
+                replacements.insert(*source, output);
+                SelectItem::Expression {
+                    expr: DomainExpression::Column(*source),
+                    alias: Some(output),
+                }
             })
             .collect()
     };
@@ -348,11 +397,21 @@ fn expand_full_outer_select_aggregated(
         if let Some(w) = where_clause {
             b = b.where_clause(w);
         }
-        b.build().map_err(|e| DelightQLError::ParseError {
-            message: format!("sql_rewriter full_outer aggregated branch: {}", e),
-            source: None,
-            subcategory: None,
-        })
+        // The branch stands at the carrier the union publishes through, and
+        // its items name the occurrences just minted there — a heading of its
+        // own, so it goes through the authority rather than carrying evidence
+        // from a statement it is not a rewrite of.
+        crate::pipeline::transformer::builder::publish_at(
+            carrier_scope,
+            inner_items
+                .iter()
+                .filter_map(|item| match item.publishes() {
+                    crate::pipeline::sql_ast::Publishes::One(column) => Some(column),
+                    _ => None,
+                }),
+            b,
+            identities,
+        )
     };
     let null_check = DomainExpression::Binary {
         left: Box::new(null_check_col),
@@ -371,7 +430,7 @@ fn expand_full_outer_select_aggregated(
     };
     let sub = TableExpression::Subquery {
         query: Box::new(stacksafe::StackSafe::new(union)),
-        alias: SUB.to_string(),
+        alias: carrier_scope,
     };
 
     // The outer SELECT: original clauses over the union, operand refs
@@ -384,18 +443,10 @@ fn expand_full_outer_select_aggregated(
         stmt.select_list()
             .iter()
             .map(|item| match item {
-                SelectItem::Expression { expr, alias } => {
-                    // An unaliased bare column renders under its own
-                    // name; pin that name before the rewrite mangles it.
-                    let alias = alias.clone().or_else(|| match expr {
-                        DomainExpression::Column { name, .. } => Some(name.clone()),
-                        _ => None,
-                    });
-                    SelectItem::Expression {
-                        expr: rewrite_operand_refs(expr.clone(), &aliases, SUB),
-                        alias,
-                    }
-                }
+                SelectItem::Expression { expr, alias } => SelectItem::Expression {
+                    expr: rewrite_operand_refs(expr.clone(), &replacements),
+                    alias: *alias,
+                },
                 other => other.clone(),
             })
             .collect(),
@@ -404,31 +455,27 @@ fn expand_full_outer_select_aggregated(
     if let Some(gb) = stmt.group_by() {
         builder = builder.group_by(
             gb.iter()
-                .map(|e| rewrite_operand_refs(e.clone(), &aliases, SUB))
+                .map(|e| rewrite_operand_refs(e.clone(), &replacements))
                 .collect(),
         );
     }
     if let Some(h) = stmt.having() {
-        builder = builder.having(rewrite_operand_refs(h.clone(), &aliases, SUB));
+        builder = builder.having(rewrite_operand_refs(h.clone(), &replacements));
     }
     if let Some(ob) = stmt.order_by() {
         for term in ob {
-            builder = builder.order_by(crate::pipeline::sql_ast_v3::OrderTerm::new(
-                rewrite_operand_refs(term.expr().clone(), &aliases, SUB),
+            builder = builder.order_by(crate::pipeline::sql_ast::OrderTerm::new(
+                rewrite_operand_refs(term.expr().clone(), &replacements),
                 term.direction().cloned(),
             ));
         }
     }
     if let Some(lim) = stmt.limit() {
-        if let Some(off) = lim.offset() {
-            builder = builder.limit_offset(lim.count(), off);
-        } else {
-            builder = builder.limit(lim.count());
-        }
+        builder = builder.limit_from(lim.clone());
     }
 
     builder
-        .build()
+        .rebuilding(stmt)
         .map(|s| QueryExpression::Select(Box::new(s)))
         .map_err(|e| DelightQLError::ParseError {
             message: format!("sql_rewriter full_outer aggregated rebuild: {}", e),
@@ -437,31 +484,21 @@ fn expand_full_outer_select_aggregated(
         })
 }
 
-fn mangle_ref(qualifier: &str, name: &str) -> String {
-    format!("{}__{}", qualifier, name)
-}
-
-/// Collect (qualifier, name) for every column ref whose qualifier is a
-/// join operand. Does not descend into subquery bodies.
+/// Collect every column ref owned by a join operand. Does not descend
+/// into subquery bodies.
 fn collect_operand_refs(
     expr: &DomainExpression,
-    aliases: &[String; 2],
-    out: &mut Vec<(String, String)>,
+    operand_scopes: &[crate::names::ScopeId; 2],
+    identities: &crate::names::Registry,
+    out: &mut Vec<crate::names::ColId>,
 ) {
-    let walk = |e: &DomainExpression, out: &mut Vec<(String, String)>| {
-        collect_operand_refs(e, aliases, out)
+    let walk = |e: &DomainExpression, out: &mut Vec<crate::names::ColId>| {
+        collect_operand_refs(e, operand_scopes, identities, out)
     };
     match expr {
-        DomainExpression::Column {
-            name,
-            qualifier: Some(qual),
-        } => {
-            let t = qual.table_name();
-            if aliases.iter().any(|a| a == t) {
-                let entry = (t.to_string(), name.clone());
-                if !out.contains(&entry) {
-                    out.push(entry);
-                }
+        DomainExpression::Column(column) => {
+            if operand_scopes.contains(&identities.scope_of(*column)) && !out.contains(column) {
+                out.push(*column);
             }
         }
         DomainExpression::Binary { left, right, .. } => {
@@ -493,17 +530,6 @@ fn collect_operand_refs(
                 walk(e, out);
             }
         }
-        DomainExpression::InList { expr, values, .. } => {
-            walk(expr, out);
-            for v in values {
-                walk(v, out);
-            }
-        }
-        DomainExpression::Tuple(items) => {
-            for i in items {
-                walk(i, out);
-            }
-        }
         DomainExpression::WindowFunction {
             args,
             partition_by,
@@ -521,35 +547,16 @@ fn collect_operand_refs(
     }
 }
 
-/// Rewrite operand column refs to the mangled subquery columns. Same
-/// coverage as `collect_operand_refs` — anything not collected is not
-/// rewritten.
+/// Rewrite operand column refs to the carrier's republished columns.
 fn rewrite_operand_refs(
     expr: DomainExpression,
-    aliases: &[String; 2],
-    sub_alias: &str,
+    replacements: &std::collections::HashMap<crate::names::ColId, crate::names::ColId>,
 ) -> DomainExpression {
-    let walk = |e: DomainExpression| rewrite_operand_refs(e, aliases, sub_alias);
-    let walk_box = |e: Box<DomainExpression>| Box::new(rewrite_operand_refs(*e, aliases, sub_alias));
+    let walk = |e: DomainExpression| rewrite_operand_refs(e, replacements);
+    let walk_box = |e: Box<DomainExpression>| Box::new(rewrite_operand_refs(*e, replacements));
     match expr {
-        DomainExpression::Column {
-            name,
-            qualifier: Some(qual),
-        } => {
-            let t = qual.table_name();
-            if aliases.iter().any(|a| a == t) {
-                DomainExpression::Column {
-                    name: mangle_ref(t, &name),
-                    qualifier: Some(crate::pipeline::sql_ast_v3::ColumnQualifier::table(
-                        sub_alias,
-                    )),
-                }
-            } else {
-                DomainExpression::Column {
-                    name,
-                    qualifier: Some(qual),
-                }
-            }
+        DomainExpression::Column(column) => {
+            DomainExpression::Column(replacements.get(&column).copied().unwrap_or(column))
         }
         DomainExpression::Binary { left, op, right } => DomainExpression::Binary {
             left: walk_box(left),
@@ -593,28 +600,22 @@ fn rewrite_operand_refs(
                 .into_iter()
                 .map(|w| {
                     let (when, then) = (w.when().clone(), w.then().clone());
-                    crate::pipeline::sql_ast_v3::WhenClause::new(walk(when), walk(then))
+                    crate::pipeline::sql_ast::WhenClause::new(walk(when), walk(then))
                 })
                 .collect(),
             else_clause: else_clause.map(walk_box),
         },
-        DomainExpression::InList { expr, not, values } => DomainExpression::InList {
-            expr: walk_box(expr),
-            not,
-            values: values.into_iter().map(walk).collect(),
-        },
-        DomainExpression::Tuple(items) => {
-            DomainExpression::Tuple(items.into_iter().map(walk).collect())
-        }
         DomainExpression::WindowFunction {
             name,
             args,
+            distinct,
             partition_by,
             order_by,
             frame,
         } => DomainExpression::WindowFunction {
             name,
             args: args.into_iter().map(walk).collect(),
+            distinct,
             partition_by: partition_by.into_iter().map(walk).collect(),
             order_by: order_by.into_iter().map(|(e, d)| (walk(e), d)).collect(),
             frame,
@@ -624,10 +625,13 @@ fn rewrite_operand_refs(
 }
 
 /// Recurse into subqueries within table expressions (for nested FULL OUTERs)
-fn rewrite_table_subqueries(table: TableExpression) -> Result<TableExpression> {
+fn rewrite_table_subqueries(
+    table: TableExpression,
+    identities: &crate::names::Registry,
+) -> Result<TableExpression> {
     match table {
         TableExpression::Subquery { query, alias } => {
-            let rewritten = rewrite_query((*query).into_inner())?;
+            let rewritten = rewrite_query((*query).into_inner(), identities)?;
             Ok(TableExpression::Subquery {
                 query: Box::new(stacksafe::StackSafe::new(rewritten)),
                 alias,
@@ -639,8 +643,8 @@ fn rewrite_table_subqueries(table: TableExpression) -> Result<TableExpression> {
             right,
             join_condition,
         } => {
-            let left = Box::new(rewrite_table_subqueries(*left)?);
-            let right = Box::new(rewrite_table_subqueries(*right)?);
+            let left = Box::new(rewrite_table_subqueries(*left, identities)?);
+            let right = Box::new(rewrite_table_subqueries(*right, identities)?);
             Ok(TableExpression::Join {
                 left,
                 join_type,
@@ -702,34 +706,27 @@ fn rebuild_select_with_from_and_extra_where(
         }
     }
     if let Some(lim) = stmt.limit() {
-        if let Some(off) = lim.offset() {
-            builder = builder.limit_offset(lim.count(), off);
-        } else {
-            builder = builder.limit(lim.count());
-        }
+        builder = builder.limit_from(lim.clone());
     }
 
-    builder.build().map_err(|e| DelightQLError::ParseError {
-        message: format!("sql_rewriter full_outer rebuild: {}", e),
-        source: None,
-        subcategory: None,
-    })
+    builder
+        .rebuilding(stmt)
+        .map_err(|e| DelightQLError::ParseError {
+            message: format!("sql_rewriter full_outer rebuild: {}", e),
+            source: None,
+            subcategory: None,
+        })
 }
 
 /// The single alias under which a join operand is addressable. The
 /// transformer subquery-wraps nested joins, so operands here always
 /// carry one alias; None only for shapes this rewriter never receives.
-fn operand_alias(table: &TableExpression) -> Option<&str> {
+fn operand_scope(table: &TableExpression) -> Option<crate::names::ScopeId> {
     match table {
-        TableExpression::Table {
-            name, alias: None, ..
-        } => Some(name),
-        TableExpression::Table {
-            alias: Some(alias), ..
-        } => Some(alias),
-        TableExpression::Subquery { alias, .. } => Some(alias),
-        TableExpression::Values { alias, .. } => Some(alias),
-        TableExpression::UnionTable { alias, .. } => Some(alias),
+        TableExpression::Scope(scope) => Some(*scope),
+        TableExpression::Entity { alias, .. } => *alias,
+        TableExpression::Subquery { alias, .. } => Some(*alias),
+        TableExpression::TVF { alias, .. } => Some(*alias),
         _ => None,
     }
 }
@@ -742,32 +739,33 @@ fn operand_alias(table: &TableExpression) -> Option<&str> {
 /// branch 2 return zero rows and silently drops left-side orphans.
 fn extract_null_check_column(
     condition: &JoinCondition,
-    left_alias: Option<&str>,
+    left_scope: Option<crate::names::ScopeId>,
+    identities: &crate::names::Registry,
 ) -> Result<DomainExpression> {
     match condition {
         JoinCondition::On(expr) => {
-            find_qualified_column_of(expr, left_alias).ok_or_else(|| DelightQLError::ParseError {
-                message: format!(
-                    "FULL OUTER JOIN: no column of the preserved side{} found in ON condition for NULL check",
-                    left_alias.map(|a| format!(" ('{}')", a)).unwrap_or_default()
-                ),
+            find_column_of(expr, left_scope, identities).ok_or_else(|| DelightQLError::ParseError {
+                message:
+                    "FULL OUTER JOIN: no column of the preserved side found in ON condition for NULL check"
+                        .to_string(),
                 source: None,
                 subcategory: None,
             })
         }
         JoinCondition::Using(cols) => {
-            let (Some(col), Some(alias)) = (cols.first(), left_alias) else {
+            let Some(col) = cols
+                .iter()
+                .copied()
+                .find(|column| left_scope == Some(identities.scope_of(*column)))
+            else {
                 return Err(DelightQLError::ParseError {
-                    message: "FULL OUTER JOIN with USING: no column or no left alias for NULL check"
+                    message: "FULL OUTER JOIN with USING: no preserved-side column for NULL check"
                         .to_string(),
                     source: None,
                     subcategory: None,
                 });
             };
-            Ok(DomainExpression::Column {
-                name: col.clone(),
-                qualifier: Some(crate::pipeline::sql_ast_v3::ColumnQualifier::table(alias)),
-            })
+            Ok(DomainExpression::Column(col))
         }
         JoinCondition::Natural => Err(DelightQLError::ParseError {
             message: "FULL OUTER JOIN with NATURAL is not supported".to_string(),
@@ -779,22 +777,21 @@ fn extract_null_check_column(
 
 /// First qualified column whose qualifier names `of_alias` (any
 /// qualified column when no alias is known).
-fn find_qualified_column_of(
+fn find_column_of(
     expr: &DomainExpression,
-    of_alias: Option<&str>,
+    of_scope: Option<crate::names::ScopeId>,
+    identities: &crate::names::Registry,
 ) -> Option<DomainExpression> {
     match expr {
-        DomainExpression::Column {
-            name,
-            qualifier: Some(qual),
-        } if of_alias.is_none_or(|a| qual.table_name() == a) => Some(DomainExpression::Column {
-            name: name.clone(),
-            qualifier: Some(qual.clone()),
-        }),
-        DomainExpression::Binary { left, right, .. } => find_qualified_column_of(left, of_alias)
-            .or_else(|| find_qualified_column_of(right, of_alias)),
-        DomainExpression::Parens(inner) => find_qualified_column_of(inner, of_alias),
-        DomainExpression::Cast { expr, .. } => find_qualified_column_of(expr, of_alias),
+        DomainExpression::Column(column)
+            if of_scope.is_none_or(|scope| identities.scope_of(*column) == scope) =>
+        {
+            Some(DomainExpression::Column(*column))
+        }
+        DomainExpression::Binary { left, right, .. } => find_column_of(left, of_scope, identities)
+            .or_else(|| find_column_of(right, of_scope, identities)),
+        DomainExpression::Parens(inner) => find_column_of(inner, of_scope, identities),
+        DomainExpression::Cast { expr, .. } => find_column_of(expr, of_scope, identities),
         _ => None,
     }
 }

@@ -9,13 +9,18 @@
 // Current passes:
 // - Cleanup (Basic): redundant subquery elimination
 //
-// See OPTIMIZER.md for the theory (epistemological barrier / grammar barrier).
+// A rewrite may cross projections, filters, and joins — row identity survives
+// and substitution is always available — but never push through GROUP BY,
+// DISTINCT, LIMIT, or a set operation (row identity is already destroyed:
+// the epistemological barrier) or blindly through a window function (the
+// information survives but SQL's evaluation order blocks access: the
+// grammar barrier).
 
 mod cleanup;
 mod visitor;
 
 use crate::error::Result;
-use crate::pipeline::sql_ast_v3::SqlStatement;
+use crate::pipeline::sql_ast::SqlStatement;
 
 use cleanup::pass_cleanup;
 

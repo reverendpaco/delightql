@@ -11,7 +11,7 @@
 // 3. Each pass implements its own transformer that focuses on the optimization logic
 
 use crate::error::Result;
-use crate::pipeline::sql_ast_v3::{
+use crate::pipeline::sql_ast::{
     DomainExpression, QueryExpression, SelectStatement, SqlStatement, TableExpression,
 };
 
@@ -53,7 +53,7 @@ pub trait QueryTransformer {
     /// Default: ignore. A pass that must distinguish "reference to an
     /// enclosing scope" from "reference to a name I might expose" keeps
     /// a stack from these calls.
-    fn enter_expr_scope(&mut self, _names: &[String]) {}
+    fn enter_expr_scope(&mut self, _scopes: &[crate::names::ScopeId]) {}
 
     /// The walker finished the expressions of the SELECT that pushed the
     /// matching `enter_expr_scope`.
@@ -120,10 +120,7 @@ fn transform_query<T: QueryTransformer>(
                 .into_iter()
                 .map(|cte| {
                     let transformed_query = transform_query(cte.query().clone(), transformer)?;
-                    Ok(crate::pipeline::sql_ast_v3::Cte::new(
-                        cte.name(),
-                        transformed_query,
-                    ))
+                    Ok(cte.with_query(transformed_query))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -173,13 +170,13 @@ fn transform_select<T: QueryTransformer>(
     // Recursively transform WHERE and HAVING under this statement's
     // expression scope: subqueries inside them can correlate against
     // this FROM's exposed names.
-    let scope_names: Vec<String> = transformed_from
+    let scopes: Vec<crate::names::ScopeId> = transformed_from
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .flat_map(exposed_table_names)
+        .flat_map(exposed_scopes)
         .collect();
-    transformer.enter_expr_scope(&scope_names);
+    transformer.enter_expr_scope(&scopes);
     let transformed_where = if let Some(expr) = where_clause {
         Some(transform_domain_expr(expr, transformer)?)
     } else {
@@ -224,20 +221,17 @@ fn transform_select<T: QueryTransformer>(
     }
 
     if let Some(limit_clause) = limit {
-        if let Some(offset_val) = limit_clause.offset() {
-            builder = builder.limit_offset(limit_clause.count(), offset_val);
-        } else {
-            builder = builder.limit(limit_clause.count());
-        }
+        builder = builder.limit_from(limit_clause.clone());
     }
 
-    let rebuilt = builder
-        .build()
-        .map_err(|e| crate::error::DelightQLError::ParseError {
-            message: format!("Failed to rebuild SELECT: {}", e),
-            source: None,
-            subcategory: None,
-        })?;
+    let rebuilt =
+        builder
+            .rebuilding(&stmt)
+            .map_err(|e| crate::error::DelightQLError::ParseError {
+                message: format!("Failed to rebuild SELECT: {}", e),
+                source: None,
+                subcategory: None,
+            })?;
 
     // Apply the transformer to the rebuilt statement
     match transformer.transform_select(rebuilt.clone())? {
@@ -270,7 +264,7 @@ fn transform_table<T: QueryTransformer>(
             let transformed_right = Box::new(transform_table(*right, transformer)?);
 
             // Transform join condition if it's an ON clause
-            use crate::pipeline::sql_ast_v3::JoinCondition;
+            use crate::pipeline::sql_ast::JoinCondition;
             let transformed_condition = match join_condition {
                 JoinCondition::On(expr) => {
                     JoinCondition::On(transform_domain_expr(expr, transformer)?)
@@ -283,17 +277,6 @@ fn transform_table<T: QueryTransformer>(
                 join_type,
                 right: transformed_right,
                 join_condition: transformed_condition,
-            }
-        }
-        TableExpression::UnionTable { selects, alias } => {
-            // Transform each query in the union table
-            let transformed_selects = selects
-                .into_iter()
-                .map(|query| transform_query(query, transformer))
-                .collect::<Result<Vec<_>>>()?;
-            TableExpression::UnionTable {
-                selects: transformed_selects,
-                alias,
             }
         }
         // Other table types (Table, TableFunction) - no nested queries
@@ -337,18 +320,6 @@ fn transform_domain_expr<T: QueryTransformer>(
                 type_name,
             }
         }
-        DomainExpression::InList { expr, not, values } => {
-            let transformed_expr = Box::new(transform_domain_expr(*expr, transformer)?);
-            let transformed_values = values
-                .into_iter()
-                .map(|v| transform_domain_expr(v, transformer))
-                .collect::<Result<Vec<_>>>()?;
-            DomainExpression::InList {
-                expr: transformed_expr,
-                not,
-                values: transformed_values,
-            }
-        }
         DomainExpression::Exists { not, query } => {
             let transformed_query = transform_query(*query, transformer)?;
             DomainExpression::Exists {
@@ -378,7 +349,7 @@ fn transform_domain_expr<T: QueryTransformer>(
                         transform_domain_expr(when_clause.when().clone(), transformer)?;
                     let transformed_then =
                         transform_domain_expr(when_clause.then().clone(), transformer)?;
-                    Ok(crate::pipeline::sql_ast_v3::WhenClause::new(
+                    Ok(crate::pipeline::sql_ast::WhenClause::new(
                         transformed_when,
                         transformed_then,
                     ))
@@ -411,19 +382,23 @@ fn transform_domain_expr<T: QueryTransformer>(
 /// The table names a FROM item exposes into its statement's scope:
 /// bare tables by alias-or-name, aliased subqueries by alias, join
 /// trees recursively.
-pub(super) fn exposed_table_names(table: &TableExpression) -> Vec<String> {
+pub(super) fn exposed_scopes(table: &TableExpression) -> Vec<crate::names::ScopeId> {
     let mut out = Vec::new();
-    fn walk(table: &TableExpression, out: &mut Vec<String>) {
+    fn walk(table: &TableExpression, out: &mut Vec<crate::names::ScopeId>) {
         match table {
-            TableExpression::Table { name, alias, .. } => {
-                out.push(alias.as_deref().unwrap_or(name).to_string());
+            TableExpression::Scope(scope) | TableExpression::QualifiedScope { scope, .. } => {
+                out.push(*scope)
             }
-            TableExpression::Subquery { alias, .. } => out.push(alias.clone()),
+            TableExpression::Entity {
+                alias: Some(scope), ..
+            } => out.push(*scope),
+            TableExpression::Entity { alias: None, .. } => {}
+            TableExpression::Subquery { alias, .. } => out.push(*alias),
             TableExpression::Join { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);
             }
-            _ => {}
+            TableExpression::TVF { alias, .. } => out.push(*alias),
         }
     }
     walk(table, &mut out);

@@ -58,50 +58,6 @@ impl fmt::Display for SqlValue {
     }
 }
 
-/// Type-safe query result that preserves NULL type information
-#[derive(Debug, Clone, PartialEq)]
-pub struct TypedQueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<SqlValue>>,
-    pub affected_rows: Option<usize>,
-}
-
-impl TypedQueryResult {
-    pub fn new(columns: Vec<String>, rows: Vec<Vec<SqlValue>>) -> Self {
-        Self {
-            columns,
-            rows,
-            affected_rows: None,
-        }
-    }
-    
-    pub fn with_affected_rows(mut self, affected: usize) -> Self {
-        self.affected_rows = Some(affected);
-        self
-    }
-    
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-    
-    pub fn column_count(&self) -> usize {
-        self.columns.len()
-    }
-    
-    /// Convert to string-based result for backward compatibility
-    pub fn to_string_result(&self) -> super::executor::QueryResult {
-        let string_rows = self.rows.iter()
-            .map(|row| row.iter().map(|val| val.to_display_string()).collect())
-            .collect();
-            
-        super::executor::QueryResult {
-            columns: self.columns.clone(),
-            rows: string_rows,
-            affected_rows: self.affected_rows,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

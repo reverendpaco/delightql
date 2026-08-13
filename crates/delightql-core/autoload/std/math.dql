@@ -15,7 +15,7 @@ sub(T(v))(*) :-
       _(v ---- 10; 3; 2) |> std::math.sub(*)
       -- result: 5  (i.e. 10 - 3 - 2)
   ~~)
-  T(*) |> +(row_number:(<~) as pos) : numbered
+  T(*) |> +(row_number:() <~ as pos) : numbered
   numbered(*), pos = 1 |> (v as acc, 1 as i) : fold
   fold(*) as f, numbered(*) as n, n.pos = (f.i + 1)
     |> (f.acc - n.v as acc, f.i + 1 as i) : fold
@@ -30,7 +30,7 @@ div(T(v))(*) :-
       _(v ---- 10.0; 3.0; 2.0) |> std::math.div(*)
       -- result: 1.6667  (i.e. 10 / 3 / 2)
   ~~)
-  T(*) |> +(row_number:(<~) as pos) : numbered
+  T(*) |> +(row_number:() <~ as pos) : numbered
   numbered(*), pos = 1 |> (v as acc, 1 as i) : fold
   fold(*) as f, numbered(*) as n, n.pos = (f.i + 1)
     |> (f.acc / n.v as acc, f.i + 1 as i) : fold
@@ -45,7 +45,7 @@ mul(T(v))(*) :-
       _(v ---- 2; 3; 4) |> std::math.mul(*)
       -- result: 24  (i.e. 2 * 3 * 4)
   ~~)
-  T(*) |> +(row_number:(<~) as pos) : numbered
+  T(*) |> +(row_number:() <~ as pos) : numbered
   numbered(*), pos = 1 |> (v as acc, 1 as i) : fold
   fold(*) as f, numbered(*) as n, n.pos = (f.i + 1)
     |> (f.acc * n.v as acc, f.i + 1 as i) : fold

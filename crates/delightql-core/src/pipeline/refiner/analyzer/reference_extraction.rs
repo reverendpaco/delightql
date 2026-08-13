@@ -1,265 +1,213 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-// reference_extraction.rs - Extract table references from expressions
-//
-// This module handles extraction of table references from various AST node types
+//! Structural scope extraction for predicate classification.
 
-use crate::error::Result;
-use crate::pipeline::asts::resolved;
+use crate::error::{DelightQLError, Result};
+use crate::names::{Registry, ScopeId};
 use crate::pipeline::refiner::flattener::{FlatPredicate, FlatSegment};
 use std::collections::HashSet;
 
-/// Extract table references from a DomainExpression (recursively).
-///
-/// SCOPE-LOCAL (INVENTORY L6): collects table refs from a predicate within the
-/// current scope; the boolean sub-walker
-/// (`extract_table_references_from_boolean`) does NOT descend nested subquery
-/// scopes. The `_in_scope` name marks that stop boundary (and disambiguates it
-/// from the whole-tree `cte_validation::extract_table_references`).
-pub(super) fn extract_table_references_in_scope(expr: &resolved::DomainExpression) -> Vec<String> {
-    let mut tables = Vec::new();
-
-    match expr {
-        resolved::DomainExpression::Lvar {
-            qualifier: Some(qual),
-            ..
-        } => {
-            tables.push(qual.to_string());
-        }
-        resolved::DomainExpression::Lvar {
-            qualifier: None, ..
-        } => {
-            // Unqualified column: no table reference to extract
-        }
-        resolved::DomainExpression::Function(func) => {
-            // Recursively extract from function arguments
-            match func {
-                resolved::FunctionExpression::Regular { arguments, .. }
-                | resolved::FunctionExpression::Curried { arguments, .. }
-                | resolved::FunctionExpression::Bracket { arguments, .. } => {
-                    for arg in arguments {
-                        tables.extend(extract_table_references_in_scope(arg));
-                    }
-                }
-                resolved::FunctionExpression::HigherOrder {
-                    curried_arguments,
-                    regular_arguments,
-                    ..
-                } => {
-                    for arg in curried_arguments {
-                        tables.extend(extract_table_references_in_scope(arg));
-                    }
-                    for arg in regular_arguments {
-                        tables.extend(extract_table_references_in_scope(arg));
-                    }
-                }
-                resolved::FunctionExpression::Infix { left, right, .. } => {
-                    tables.extend(extract_table_references_in_scope(left));
-                    tables.extend(extract_table_references_in_scope(right));
-                }
-                resolved::FunctionExpression::Lambda { body, .. } => {
-                    tables.extend(extract_table_references_in_scope(body));
-                }
-                resolved::FunctionExpression::StringTemplate { .. } => {
-                    // StringTemplate should have been expanded to concat by resolver
-                    // No table references to extract from unexpanded templates
-                }
-                resolved::FunctionExpression::CaseExpression { arms, .. } => {
-                    // Extract table references from all CASE arms
-                    for arm in arms {
-                        match arm {
-                            resolved::CaseArm::Simple {
-                                test_expr, result, ..
-                            } => {
-                                tables.extend(extract_table_references_in_scope(test_expr));
-                                tables.extend(extract_table_references_in_scope(result));
-                            }
-                            resolved::CaseArm::CurriedSimple { result, .. } => {
-                                // Curried simple has no test_expr (it uses @)
-                                tables.extend(extract_table_references_in_scope(result));
-                            }
-                            resolved::CaseArm::Searched { condition, result } => {
-                                tables.extend(extract_table_references_from_boolean(condition));
-                                tables.extend(extract_table_references_in_scope(result));
-                            }
-                            resolved::CaseArm::Default { result } => {
-                                tables.extend(extract_table_references_in_scope(result));
-                            }
-                        }
-                    }
-                }
-                resolved::FunctionExpression::Curly { .. } => {
-                    // Tree groups don't contain table references (Epoch 1)
-                }
-                resolved::FunctionExpression::MetadataTreeGroup { .. } => {
-                    // Tree groups don't contain table references (Epoch 1)
-                }
-                resolved::FunctionExpression::Window {
-                    arguments,
-                    partition_by,
-                    order_by,
-                    ..
-                } => {
-                    // Extract from window function arguments, partition, and order clauses
-                    for arg in arguments {
-                        tables.extend(extract_table_references_in_scope(arg));
-                    }
-                    for arg in partition_by {
-                        tables.extend(extract_table_references_in_scope(arg));
-                    }
-                    for spec in order_by {
-                        tables.extend(extract_table_references_in_scope(&spec.column));
-                    }
-                }
-                // Spelled per R-I3 (was a bare `_ =>`): JsonPath.source/path and
-                // Array.members carry recursive domain expressions this scope-local
-                // walker does not yet extract from. Kept as the SAME `unimplemented!`
-                // (byte-identical) so a newly-added function variant forces a
-                // decision here instead of being swallowed.
-                resolved::FunctionExpression::JsonPath { .. }
-                | resolved::FunctionExpression::Array { .. } => {
-                    unimplemented!("JsonPath not yet implemented in this phase")
-                }
-            }
-        }
-        resolved::DomainExpression::Predicate { expr, .. } => {
-            // Extract from boolean expression
-            tables.extend(extract_table_references_from_boolean(expr));
-        }
-        resolved::DomainExpression::PipedExpression {
-            value, transforms, ..
-        } => {
-            tables.extend(extract_table_references_in_scope(value));
-            for (_, transform) in transforms {
-                if let resolved::FunctionExpression::Regular { arguments, .. } = transform {
-                    for arg in arguments {
-                        tables.extend(extract_table_references_in_scope(arg));
-                    }
-                }
-            }
-        }
-        resolved::DomainExpression::Parenthesized { inner, .. } => {
-            tables.extend(extract_table_references_in_scope(inner));
-        }
-        // Tuple: recurse into elements
-        resolved::DomainExpression::Tuple { elements, .. } => {
-            for elem in elements {
-                tables.extend(extract_table_references_in_scope(elem));
-            }
-        }
-        // ScalarSubquery: the subquery relation references tables, but that's handled
-        // at the relational level, not here
-        resolved::DomainExpression::ScalarSubquery { .. } => {}
-        // PivotOf: recurse
-        resolved::DomainExpression::PivotOf {
-            value_column,
-            pivot_key,
-            ..
-        } => {
-            tables.extend(extract_table_references_in_scope(value_column));
-            tables.extend(extract_table_references_in_scope(pivot_key));
-        }
-        // Leaf types: no table references
-        resolved::DomainExpression::Literal { .. }
-        | resolved::DomainExpression::Projection(_)
-        | resolved::DomainExpression::NonUnifiyingUnderscore
-        | resolved::DomainExpression::ValuePlaceholder { .. }
-        | resolved::DomainExpression::Substitution(_)
-        | resolved::DomainExpression::ColumnOrdinal(_) => {}
-    }
-
-    tables
-}
-
-/// Helper to extract table references from boolean expressions
-pub(super) fn extract_table_references_from_boolean(
-    expr: &resolved::BooleanExpression,
-) -> Vec<String> {
-    let mut tables = Vec::new();
-
-    match expr {
-        resolved::BooleanExpression::Comparison { left, right, .. } => {
-            tables.extend(extract_table_references_in_scope(left));
-            tables.extend(extract_table_references_in_scope(right));
-        }
-        resolved::BooleanExpression::And { left, right } => {
-            tables.extend(extract_table_references_from_boolean(left));
-            tables.extend(extract_table_references_from_boolean(right));
-        }
-        resolved::BooleanExpression::Or { left, right } => {
-            tables.extend(extract_table_references_from_boolean(left));
-            tables.extend(extract_table_references_from_boolean(right));
-        }
-        resolved::BooleanExpression::Not { expr } => {
-            tables.extend(extract_table_references_from_boolean(expr));
-        }
-        resolved::BooleanExpression::GlobCorrelation { left, right } => {
-            tables.push(left.to_string());
-            tables.push(right.to_string());
-        }
-        resolved::BooleanExpression::OrdinalGlobCorrelation { left, right } => {
-            tables.push(left.to_string());
-            tables.push(right.to_string());
-        }
-        // SCOPE-LOCAL contract, spelled per R-I3 (was a bare `other =>`). This
-        // predicate-reference walker runs over already-flattened current-scope
-        // conjunctions of comparisons; the subquery-bearing variants
-        // (InnerExists.subquery, InRelational.value/subquery, In.value/set,
-        // Sigma.condition) do NOT reach it in practice — they are handled at the
-        // relational level, before/around flattening — so encountering one is an
-        // internal invariant violation, kept as the SAME LOUD panic (byte-identical
-        // behavior). Spelling the variants means a newly-added boolean variant now
-        // forces a decision here instead of being silently swallowed.
-        other @ (resolved::BooleanExpression::InnerExists { .. }
-        | resolved::BooleanExpression::InRelational { .. }
-        | resolved::BooleanExpression::In { .. }
-        | resolved::BooleanExpression::Sigma { .. }
-        | resolved::BooleanExpression::Using { .. }
-        | resolved::BooleanExpression::BooleanLiteral { .. }) => panic!("catch-all hit in analyzer/reference_extraction.rs extract_table_references_from_boolean: {:?}", other),
-    }
-
-    tables
-}
-
-/// Check if a table's schema contains a specific column
-pub(super) fn table_has_column(schema: &resolved::CprSchema, column_name: &str) -> bool {
-    if let resolved::CprSchema::Resolved(columns) = schema {
-        columns
-            .iter()
-            .any(|col| delightql_types::SqlIdentifier::str_eq(col.name(), column_name))
-    } else {
-        false
-    }
-}
-
-/// Extract which tables are referenced by this predicate
 pub(super) fn extract_referenced_tables(
     pred: &FlatPredicate,
     flat: &FlatSegment,
-) -> Result<HashSet<String>> {
-    let mut tables = HashSet::new();
+    identities: &Registry,
+) -> Result<HashSet<ScopeId>> {
+    pred.references
+        .iter()
+        .map(|column| {
+            let scope = identities.scope_of(*column);
+            if flat.tables.iter().any(|table| table.identity == scope) {
+                return Ok(scope);
+            }
+            // A hoisted correlation filter speaks in the subquery's interior
+            // occurrences, while the segment table stands at the boundary. The
+            // boundary column republishes the interior one, and only that chain
+            // says which table the reference belongs to — the raw scope is one
+            // no operator's table list contains.
+            //
+            // ALL owners are enumerated, never the first: two occurrences of
+            // one materialized relation both republish its interior columns,
+            // and table order deciding which arm owns a predicate would move
+            // it silently — on an outer join, into different row survival.
+            // A table whose dimensions the target never published could
+            // carry this reference too, so no other table can be named its
+            // sole owner while one is in the list.
+            for table in &flat.tables {
+                if identities.heading(table.identity).is_opaque() {
+                    return Err(crate::pipeline::resolver::opaque_reference_refusal());
+                }
+            }
+            let mut owners = flat.tables.iter().filter(|table| {
+                identities
+                    .known_heading(table.identity)
+                    .map(|heading| {
+                        heading
+                            .iter()
+                            .any(|export| identities.republishes(*export, *column))
+                    })
+                    .unwrap_or(false)
+            });
+            match (owners.next(), owners.next()) {
+                (Some(owner), None) => Ok(owner.identity),
+                (None, _) => Ok(scope),
+                (Some(_), Some(_)) => Err(DelightQLError::validation_error(
+                    format!(
+                        "{column:?} is carried by more than one relation occurrence \
+                         here, so the predicate that references it belongs to no \
+                         single table"
+                    ),
+                    "in predicate classification",
+                )),
+            }
+        })
+        .collect()
+}
 
-    // Add qualified references
-    for qual_ref in &pred.qualified_refs {
-        tables.insert(qual_ref.clone());
+#[cfg(test)]
+mod tests {
+    //! What reference-to-table ownership must REFUSE.
+    //!
+    //! A hoisted predicate lands in a join ON by whichever table owns its
+    //! references. Two occurrences of one materialized relation both
+    //! republish its interior columns, and answering with the first would
+    //! let table order decide the owner — on an outer join, silently
+    //! changing which rows survive.
+
+    use super::extract_referenced_tables;
+    use crate::names::{
+        Addressing, ColId, ColumnOrigin, Computation, CteRole, Hint, Registry, Republish, ScopeId,
+        ScopeOrigin, ValueFacts,
+    };
+    use crate::pipeline::asts::resolved;
+    use crate::pipeline::refiner::flattener::{FlatPredicate, FlatSegment, FlatTable};
+
+    fn interior_column(registry: &Registry) -> ColId {
+        let entity = registry.mint_entity(registry.intern("t", false));
+        let base = registry.mint_scope(ScopeOrigin::BaseTable { entity }, Hint::None, None);
+        let cte = registry.mint_scope(
+            ScopeOrigin::Cte {
+                input: base,
+                role: CteRole::Materialize,
+            },
+            Hint::None,
+            None,
+        );
+        registry.mint_column(
+            cte,
+            ColumnOrigin::Computed {
+                via: Computation::Operator,
+            },
+            Some(registry.intern("k", false)),
+            Addressing::Published,
+            ValueFacts::default(),
+        )
     }
 
-    // For unqualified refs, use CPR schema to determine which table they belong to
-    for unqual_ref in &pred.unqualified_refs {
-        // Search through all tables' schemas to find the column
-        for table in &flat.tables {
-            if table_has_column(&table.schema, unqual_ref) {
-                let table_name = table
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| table.identifier.name.to_string());
-                tables.insert(table_name);
-                break; // Found the table for this column
+    fn boundary_table(registry: &Registry, carries: Option<ColId>, position: usize) -> FlatTable {
+        let identity = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
+        match carries {
+            Some(source) => {
+                registry.republish_column(
+                    source,
+                    identity,
+                    Republish::BoundaryExport,
+                    registry.published(source),
+                    Addressing::Published,
+                    |_| {},
+                );
+            }
+            None => {
+                registry.mint_column(
+                    identity,
+                    ColumnOrigin::Computed {
+                        via: Computation::Operator,
+                    },
+                    Some(registry.intern("other", false)),
+                    Addressing::Published,
+                    ValueFacts::default(),
+                );
             }
         }
-        // Note: If we can't find the column in any schema, we don't add any table
-        // This lets the caller handle the error case appropriately
+        FlatTable {
+            identity,
+            position,
+            _scope_id: 0,
+            access: resolved::Access::All,
+            schema: identity,
+            outer: false,
+            anonymous_data: None,
+            inner_relation_pattern: None,
+            preminted_scope: None,
+            subquery_segment: None,
+            pipe_expr: None,
+            consulted_view_query: None,
+            _table_filters: vec![],
+            tvf_data: None,
+        }
     }
 
-    Ok(tables)
+    fn segment(tables: Vec<FlatTable>) -> FlatSegment {
+        FlatSegment {
+            tables,
+            predicates: Vec::new(),
+            operators: Vec::new(),
+        }
+    }
+
+    fn predicate_on(column: ColId) -> FlatPredicate {
+        FlatPredicate {
+            // The predicate's SHAPE is irrelevant here — only the
+            // references it is recorded with. A real comparison, because
+            // there is no synthetic truth leaf.
+            expr: resolved::TruthExpression::Comparison(
+                crate::pipeline::asts::core::Comparison {
+                    operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                    left: Box::new(resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".into()),))),
+                    right: Box::new(resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".into()),))),
+                },
+            ),
+            position: 0,
+            references: std::iter::once(column).collect(),
+            _scope_id: 0,
+            origin: resolved::FilterOrigin::UserWritten,
+        }
+    }
+
+    fn owners(
+        registry: &Registry,
+        flat: &FlatSegment,
+        column: ColId,
+    ) -> crate::error::Result<Vec<ScopeId>> {
+        Ok(
+            extract_referenced_tables(&predicate_on(column), flat, registry)?
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn one_carrying_boundary_owns_regardless_of_table_order() {
+        let registry = Registry::new(&[]);
+        let column = interior_column(&registry);
+        let carrier = boundary_table(&registry, Some(column), 0);
+        let bystander = boundary_table(&registry, None, 1);
+        let owner = carrier.identity;
+        let forward = owners(
+            &registry,
+            &segment(vec![carrier.clone(), bystander.clone()]),
+            column,
+        );
+        let reversed = owners(&registry, &segment(vec![bystander, carrier]), column);
+        assert_eq!(forward.unwrap(), vec![owner]);
+        assert_eq!(reversed.unwrap(), vec![owner]);
+    }
+
+    #[test]
+    fn two_carrying_boundaries_refuse() {
+        let registry = Registry::new(&[]);
+        let column = interior_column(&registry);
+        let first = boundary_table(&registry, Some(column), 0);
+        let second = boundary_table(&registry, Some(column), 1);
+        assert!(owners(&registry, &segment(vec![first, second]), column).is_err());
+    }
 }

@@ -2,7 +2,7 @@
 // Copyright 2026 Daniel Eklund
 /// Multi-database connection wrapper
 ///
-/// Provides a unified interface for SQLite, pipe-based, and fatboy connections
+/// Provides a unified interface for SQLite, siso, and fatboy connections
 use anyhow::Result;
 use delightql_backends::SqliteConnectionManager;
 use delightql_types::DatabaseConnection;
@@ -27,7 +27,7 @@ pub fn looks_like_uri(path: &str) -> bool {
 /// Only URI-shaped inputs are split; a bare file path keeps any `#`
 /// verbatim (a legit filename character), so the fragment surface is a
 /// deliberate URI feature. `?schema=` is NOT a fragment and is never
-/// consulted here (it was rejected as fake conninfo, §4.9).
+/// consulted here — it reads as fake conninfo, and is refused as such.
 pub fn split_schema_fragment(input: &str) -> (String, Option<String>) {
     if !looks_like_uri(input) {
         return (input.to_string(), None);
@@ -39,9 +39,9 @@ pub fn split_schema_fragment(input: &str) -> (String, Option<String>) {
 }
 
 /// One classified route for a `--db` / `mount!()` input — THE single
-/// scheme-dispatch point (URI-DESIGN.md §4: users speak in resources,
-/// DelightQL chooses mechanisms). An unknown scheme teaches; it can never
-/// fall through to file-path handling.
+/// scheme-dispatch point (users speak in resources, DelightQL chooses
+/// mechanisms). An unknown scheme teaches; it can never fall through to
+/// file-path handling.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
     /// A SQLite file — in-process.
@@ -68,9 +68,13 @@ pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
 
     if let Some(rest) = input.strip_prefix("delightql-siso://") {
         if rest.is_empty() {
-            anyhow::bail!("delightql-siso:// needs a profile: delightql-siso://<profile>[/<target>]");
+            anyhow::bail!(
+                "delightql-siso:// needs a profile: delightql-siso://<profile>[/<target>]"
+            );
         }
-        return Ok(Route::Siso { rest: rest.to_string() });
+        return Ok(Route::Siso {
+            rest: rest.to_string(),
+        });
     }
 
     if looks_like_uri(input) {
@@ -78,9 +82,8 @@ pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
         let scheme = input[..scheme_end].to_ascii_lowercase();
         return match scheme.as_str() {
             "postgres" | "postgresql" => {
-                let url = url::Url::parse(input).map_err(|e| {
-                    anyhow::anyhow!("'{input}': not a valid postgres URL: {e}")
-                })?;
+                let url = url::Url::parse(input)
+                    .map_err(|e| anyhow::anyhow!("'{input}': not a valid postgres URL: {e}"))?;
                 if url.password().is_some() {
                     anyhow::bail!(
                         "'{input}': passwords are never accepted in connection URLs \
@@ -117,16 +120,6 @@ pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
                 }
                 classify_file_path(url.path(), via)
             }
-            "fatboy" => anyhow::bail!(
-                "'{input}': fatboy:// is retired. Name the resource instead: \
-                 postgres:///<dbname> (or postgres://host:port/db) for Postgres, \
-                 or the file path for DuckDB — the right adapter is chosen \
-                 automatically."
-            ),
-            "pipe" => anyhow::bail!(
-                "'{input}': pipe:// is now delightql-siso:// (same \
-                 profile/target syntax)."
-            ),
             other => anyhow::bail!(
                 "'{input}': unsupported URI scheme '{other}://'. Known: \
                  postgres://, file://, delightql-siso://, or a plain file path."
@@ -177,7 +170,7 @@ pub enum ConnectionManager {
     SQLite(SqliteConnectionManager),
     Pipe(Arc<delightql_cli_siso::PipeConnectionManager>),
     /// A fatboy process: relay protocol over a Unix socket, foreign
-    /// engine behind it (`fatboy://postgres/<db>`).
+    /// engine behind it (`postgres://host/<db>`, or a DuckDB file).
     Fatboy(Arc<crate::fatboy_exec::FatboyManager>),
 }
 
@@ -259,8 +252,10 @@ impl ConnectionManager {
         }
     }
 
-    /// Get connection Arc (for SQLite - backward compatibility)
-    /// TODO: Remove this once all code uses database-agnostic APIs
+    /// The raw SQLite handle. Only the in-process SQLite manager owns one;
+    /// every other backend reaches its database through a protocol, so
+    /// asking them for a `rusqlite::Connection` is a caller error, not a
+    /// missing capability.
     pub fn get_connection_arc(&self) -> std::sync::Arc<std::sync::Mutex<rusqlite::Connection>> {
         match self {
             ConnectionManager::SQLite(conn) => conn.get_connection_arc(),
@@ -368,55 +363,7 @@ impl ConnectionManager {
             .map_err(|e| anyhow::anyhow!("{}", e)),
             ConnectionManager::Pipe(mgr) => crate::pipe_exec::execute_sql_with_pipe(sql, mgr)
                 .map_err(|e| anyhow::anyhow!("{}", e)),
-            ConnectionManager::Fatboy(mgr) => {
-                crate::fatboy_exec::execute_sql_with_fatboy(sql, mgr)
-                    .map_err(|e| anyhow::anyhow!("{}", e))
-            }
-        }
-    }
-
-    /// Execute a SQL query with NULL fidelity preserved.
-    ///
-    /// Returns rows as `Vec<Vec<Option<String>>>` where `None` = SQL NULL.
-    /// Used by the relay adapter to produce honest `Cell = Option<ByteSeq>`.
-    pub fn execute_query_typed(
-        &self,
-        sql: &str,
-        db_label: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
-        match self {
-            ConnectionManager::SQLite(conn) => {
-                let mut executor = delightql_backends::SqliteExecutorImpl::new(conn);
-                let typed = executor
-                    .execute_query_typed(sql)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let rows = typed
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|val| match val {
-                                delightql_backends::SqlValue::Null => None,
-                                other => Some(other.to_display_string()),
-                            })
-                            .collect()
-                    })
-                    .collect();
-                Ok((typed.columns, rows))
-            }
-            ConnectionManager::Pipe(_) => {
-                let results = self.execute_query(sql, db_label)?;
-                let rows = results
-                    .rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(Some).collect())
-                    .collect();
-                Ok((results.columns, rows))
-            }
-            // NULL fidelity is native here: relay Cells are Option already.
-            ConnectionManager::Fatboy(mgr) => mgr
-                .relay()
-                .and_then(|r| r.query_nullable(sql))
+            ConnectionManager::Fatboy(mgr) => crate::fatboy_exec::execute_sql_with_fatboy(sql, mgr)
                 .map_err(|e| anyhow::anyhow!("{}", e)),
         }
     }
@@ -478,7 +425,6 @@ impl ConnectionManager {
             }
         }
     }
-
 }
 
 /// Open a DqlHandle using the factory-only API.
@@ -491,16 +437,17 @@ impl ConnectionManager {
 /// builds the session purely from the factories and never consulted a
 /// manager's own backend — the session's one backend is created by the
 /// `mount!` first-query, not by any pre-opened `ConnectionManager`. Keeping
-/// it self-less makes that separation explicit (it used to be a `&self`
-/// method that ignored `self`, which read as if a manager fed the handle).
+/// it self-less makes that separation explicit: a `&self` method that
+/// ignores `self` reads as if a manager fed the handle.
 pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
     let factory = Box::new(crate::connection_factory::CliConnectionFactory);
     // Second factory (types-level) powers mount!/import! of URI-scheme
-    // databases (pipe://, etc.). Same unit struct, both trait impls.
+    // databases (postgres://, delightql-siso://, …). Same unit struct, both
+    // trait impls.
     let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
     let mut handle = delightql_core::api::open(factory, Some(mount_factory))
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    // Bind the CLI's embedded database images (BYTES-SCHEME-DESIGN.md).
+    // Bind the CLI's embedded database images.
     // A binding is a name→bytes map entry, not a mount: no attachment, no
     // I/O, no cost until a session actually runs
     // `mount!("delightql-bytes://book", ...)`. Binding on every handle is
@@ -511,6 +458,9 @@ pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
     handle
         .bind_static_bytes("man", crate::embedded_db::MAN_BYTES)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+    handle
+        .bind_static_bytes("editor", crate::embedded_db::EDITOR_BYTES)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     crate::cli_surface::attach(handle)
 }
 
@@ -518,9 +468,9 @@ pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
 mod tests {
     use super::*;
 
-    /// BYTES-SCHEME-DESIGN.md: bindings are immutable for the life of a
-    /// handle — rebinding refuses, even to the same bytes, so a locator's
-    /// referent can never change underneath a mounted namespace.
+    /// Bindings are immutable for the life of a handle — rebinding
+    /// refuses, even to the same bytes, so a locator's referent can never
+    /// change underneath a mounted namespace.
     #[test]
     fn byte_bindings_are_immutable() {
         let mut handle = open_handle().unwrap();
@@ -535,8 +485,8 @@ mod tests {
         assert!(err.contains("invalid byte-binding name"), "got: {err}");
     }
 
-    /// MOUNT-SPINE-PLAN.md Phase 1 (review R2): invalid images refuse AT
-    /// BIND, in a scratch connection — never on the session connection.
+    /// Invalid images refuse AT BIND, in a scratch connection — never on
+    /// the session connection.
     /// (sqlite3_deserialize installs a buffer without validating it; a
     /// garbage image poisons the hosting connection, including the DETACH
     /// that would remove it. Bind-time validation makes that state
@@ -550,7 +500,10 @@ mod tests {
         let err = handle
             .bind_static_bytes("junk", b"this is not a sqlite database image")
             .expect_err("garbage must refuse at bind");
-        assert!(err.contains("not a valid SQLite database image"), "got: {err}");
+        assert!(
+            err.contains("not a valid SQLite database image"),
+            "got: {err}"
+        );
 
         // Header-prefixed garbage: refused by the scratch-connection probe.
         static CRAFTED: [u8; 512] = {
@@ -566,40 +519,44 @@ mod tests {
         let err = handle
             .bind_static_bytes("crafted", &CRAFTED)
             .expect_err("header-prefixed garbage must refuse at bind");
-        assert!(err.contains("not a valid SQLite database image"), "got: {err}");
+        assert!(
+            err.contains("not a valid SQLite database image"),
+            "got: {err}"
+        );
 
         // Refusal-class mount failures (unbound name) leave the namespace
         // cleanly mountable afterwards.
         let mut session = handle.session().unwrap();
         session
-            .query("mount!(\"delightql-bytes://junk\", \"spot\")")
+            .query("mount!(\"delightql-bytes://junk\", \"spot\")(*)")
             .err()
             .expect("unbound name must refuse");
         session
-            .query("mount!(\"delightql-bytes://man\", \"spot\")")
+            .query("mount!(\"delightql-bytes://man\", \"spot\")(*)")
             .expect("a refused mount must not leave metadata that blocks the namespace");
     }
 
     /// Owned bindings (bind_owned_bytes) share the whole contract: bind-time
     /// validation, locator mounting — and an EMPTY bytes image reaches the
-    /// deliberate immutable-image refresh refusal (second review F2) rather
-    /// than "no cartridge".
+    /// deliberate immutable-image refresh refusal rather than "no
+    /// cartridge".
     #[test]
     fn owned_empty_image_refresh_refuses_as_immutable() {
         // A valid, empty, runtime-built image.
         let image = {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
-            conn.execute_batch("CREATE TABLE t(x); DROP TABLE t;").unwrap();
+            conn.execute_batch("CREATE TABLE t(x); DROP TABLE t;")
+                .unwrap();
             conn.serialize("main").unwrap().to_vec()
         };
         let mut handle = open_handle().unwrap();
         handle.bind_owned_bytes("emptyimg", image).unwrap();
         let mut session = handle.session().unwrap();
         session
-            .query("mount!(\"delightql-bytes://emptyimg\", \"emptyns\")")
+            .query("mount!(\"delightql-bytes://emptyimg\", \"emptyns\")(*)")
             .expect("empty owned image must mount");
         let err = session
-            .query("refresh!(\"emptyns\")")
+            .query("refresh!(\"emptyns\")(*)")
             .err()
             .expect("refresh of a bytes image must refuse");
         assert!(
@@ -608,12 +565,10 @@ mod tests {
         );
     }
 
-    /// Refresh-to-empty transitions are LEGAL
-    /// (NAMESPACE-CARTRIDGE-LINK-DESIGN.md: each namespace's cartridge is
-    /// a stored link, so multiple same-source empty mounts stay
-    /// distinguishable — the interim refusal is repealed). Both mounts
-    /// refresh into empties, both unmount cleanly, the source mounts
-    /// again — no leaked alias.
+    /// Refresh-to-empty transitions are LEGAL: each namespace's cartridge
+    /// is a stored link, so multiple same-source empty mounts stay
+    /// distinguishable. Both mounts refresh into empties, both unmount
+    /// cleanly, the source mounts again — no leaked alias.
     #[test]
     fn refresh_to_empty_transition_keeps_lifecycle_sound() {
         let dir = tempfile::tempdir().unwrap();
@@ -627,10 +582,10 @@ mod tests {
         let mut handle = open_handle().unwrap();
         let mut session = handle.session().unwrap();
         session
-            .query(&format!("mount!(\"{db_s}\", \"a\")"))
+            .query(&format!("mount!(\"{db_s}\", \"a\")(*)"))
             .expect("non-empty mount a");
         session
-            .query(&format!("mount!(\"{db_s}\", \"b\")"))
+            .query(&format!("mount!(\"{db_s}\", \"b\")(*)"))
             .expect("non-empty same-source mount b is allowed");
 
         // The source loses its table out from under both mounts.
@@ -640,26 +595,26 @@ mod tests {
             .unwrap();
 
         session
-            .query("refresh!(\"a\")")
+            .query("refresh!(\"a\")(*)")
             .expect("first refresh-to-empty");
         session
-            .query("refresh!(\"b\")")
+            .query("refresh!(\"b\")(*)")
             .expect("second refresh-to-empty is legal under the stored link");
 
         // Lifecycle stays sound afterwards.
-        session.query("unmount!(\"a\")").expect("unmount a");
-        session.query("unmount!(\"b\")").expect("unmount b");
+        session.query("unmount!(\"a\")(*)").expect("unmount a");
+        session.query("unmount!(\"b\")(*)").expect("unmount b");
         session
-            .query(&format!("mount!(\"{db_s}\", \"c\")"))
+            .query(&format!("mount!(\"{db_s}\", \"c\")(*)"))
             .expect("no leaked alias: the source mounts again");
     }
 
-    /// Fourth review, P1: imprint! must target the REQUESTED namespace's
-    /// mount, not the newest same-source cartridge. One owned image mounted
-    /// twice (same locator → same source_path → two independent deserialized
-    /// copies): imprinting into `ia` must land the table in ia's image and
-    /// leave ib's untouched. Pre-fix, the ORDER BY c.id DESC source-match
-    /// fallback routed the imprint into `ib`.
+    /// imprint! must target the REQUESTED namespace's mount, not the
+    /// newest same-source cartridge. One owned image mounted twice (same
+    /// locator → same source_path → two independent deserialized copies):
+    /// imprinting into `ia` must land the table in ia's image and leave
+    /// ib's untouched — an ORDER BY c.id DESC source-match fallback would
+    /// route the imprint into `ib` instead.
     #[test]
     fn imprint_targets_the_requested_mount_not_the_newest() {
         let image = {
@@ -687,16 +642,16 @@ mod tests {
         handle.bind_owned_bytes("imprintimg", image).unwrap();
         let mut session = handle.session().unwrap();
         session
-            .query("mount!(\"delightql-bytes://imprintimg\", \"ia\")")
+            .query("mount!(\"delightql-bytes://imprintimg\", \"ia\")(*)")
             .expect("mount ia");
         session
-            .query("mount!(\"delightql-bytes://imprintimg\", \"ib\")")
+            .query("mount!(\"delightql-bytes://imprintimg\", \"ib\")(*)")
             .expect("second same-source mount ib is legal under the link");
         session
-            .query(&format!("consult!(\"{lib_path}\", \"lib::imp\")"))
+            .query(&format!("consult!(\"{lib_path}\", \"lib::imp\")(*)"))
             .expect("consult");
         session
-            .query("imprint!(\"lib::imp\", \"ia\")")
+            .query("imprint!(\"lib::imp\", \"ia\")(*)")
             .expect("imprint into ia");
 
         session
@@ -735,7 +690,9 @@ mod tests {
         // --via siso reroutes to the pipe coprocess
         assert_eq!(
             classify("postgres:///dql_core", Some("siso")).unwrap(),
-            Route::Siso { rest: "postgres/dql_core".into() }
+            Route::Siso {
+                rest: "postgres/dql_core".into()
+            }
         );
     }
 
@@ -767,30 +724,38 @@ mod tests {
             classify("file:///data/x.duckdb", None).unwrap(),
             Route::DuckdbFatboy("/data/x.duckdb".into())
         );
-        let err = classify("file://remotehost/x.db", None).unwrap_err().to_string();
+        let err = classify("file://remotehost/x.db", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("remote host"), "{err}");
     }
 
     #[test]
-    fn retired_and_unknown_schemes_teach() {
-        let err = classify("fatboy://postgres/db", None).unwrap_err().to_string();
-        assert!(err.contains("retired"), "{err}");
-        assert!(err.contains("postgres:///"), "{err}");
-        let err = classify("pipe://psql", None).unwrap_err().to_string();
-        assert!(err.contains("delightql-siso://"), "{err}");
-        let err = classify("mysql://host/db", None).unwrap_err().to_string();
-        assert!(err.contains("unsupported URI scheme 'mysql://'"), "{err}");
+    fn unknown_schemes_teach_the_supported_set() {
+        for input in ["mysql://host/db", "oracle://host/db", "delightql://x"] {
+            let err = classify(input, None).unwrap_err().to_string();
+            let scheme = &input[..input.find("://").unwrap()];
+            assert!(
+                err.contains(&format!("unsupported URI scheme '{scheme}://'")),
+                "{input}: {err}"
+            );
+            assert!(err.contains("Known: postgres://"), "{input}: {err}");
+        }
     }
 
     #[test]
     fn siso_scheme_routes() {
         assert_eq!(
             classify("delightql-siso://osqueryi", None).unwrap(),
-            Route::Siso { rest: "osqueryi".into() }
+            Route::Siso {
+                rest: "osqueryi".into()
+            }
         );
         assert_eq!(
             classify("delightql-siso://postgres/dql_core", None).unwrap(),
-            Route::Siso { rest: "postgres/dql_core".into() }
+            Route::Siso {
+                rest: "postgres/dql_core".into()
+            }
         );
     }
 }

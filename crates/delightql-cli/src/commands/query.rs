@@ -31,8 +31,8 @@ fn check_database_exists(db_path: &str, make_new_db_if_missing: bool) -> Result<
 /// A plain-file `--db` target is CREATE intent when `--make-new-db-if-missing`
 /// is set and the path is missing or a 0-byte stub: the primary mount then
 /// routes through `mount_new!` (which materializes a VALID empty database)
-/// rather than the now attach-only `mount!` (bugs/nullmount Phase 1 /
-/// EFFECT-ALGEBRA §6 — `mount!` rejects missing/empty/invalid files). An
+/// rather than the attach-only `mount!` (EFFECT-ALGEBRA §6 — `mount!`
+/// rejects missing/empty/invalid files). An
 /// existing non-empty database, or any URI, keeps `mount!`.
 /// Pinned by tests/mount_validation.rs::make_new_db_if_missing_creates_and_works.
 fn wants_provision(db_path: &str, make_new_db_if_missing: bool) -> bool {
@@ -60,7 +60,7 @@ fn make_connection(
 
 /// Execute a query string: create session via handle, call exec_ng.
 ///
-/// Human-output modes (`--to results` / default) get the Epic-3.3 console
+/// Human-output modes (`--to results` / default) get the console
 /// sink: mid-run `stdout!` result sets print live as the run executes
 /// (EFFECT-ALGEBRA §5; the run's return value still arrives as the ordinary
 /// result). Machine modes (`--to hash`, `--to sql`, …) install NO sink so
@@ -78,17 +78,26 @@ fn run_query(
     let console_sink = matches!(to, None | Some(args::Stage::Results));
     let hooks = if console_sink {
         delightql_core::api::SessionHooks {
-            on_ship: Some(Box::new(move |columns: &[String], rows: &[Vec<String>]| {
-                let output = crate::output_format::format_output_with_zebra(
-                    columns,
-                    rows,
-                    output_format,
-                    None,
-                    no_headers,
-                    no_sanitize,
-                );
-                print!("{}", output);
-            })),
+            on_ship: Some(Box::new(
+                move |columns: &[String], rows: &[Vec<Option<Vec<u8>>>]| {
+                    // The display boundary: cells become text HERE, where
+                    // the choice of what to print for an absent one is the
+                    // console's to make.
+                    let display_rows: Vec<Vec<String>> = rows
+                        .iter()
+                        .map(|row| crate::exec_ng::cells_to_display(row))
+                        .collect();
+                    let output = crate::output_format::format_output_with_zebra(
+                        columns,
+                        &display_rows,
+                        output_format,
+                        None,
+                        no_headers,
+                        no_sanitize,
+                    );
+                    print!("{}", output);
+                },
+            )),
         }
     } else {
         delightql_core::api::SessionHooks::default()
@@ -195,9 +204,9 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
     if let Some(ref path) = db_path {
         let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
         let directive = if wants_provision(path, base_args.make_new_db_if_missing) {
-            format!("mount_new!(\"{}\", \"main\")", path)
+            format!("mount_new!(\"{}\", \"main\")(*)", path)
         } else {
-            format!("mount!(\"{}\", \"main\")", path)
+            format!("mount!(\"{}\", \"main\")(*)", path)
         };
         crate::exec_ng::run_dql_query(&directive, &mut *session)?;
     }

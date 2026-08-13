@@ -1,0 +1,59 @@
+.TH DQL-EDITOR 1 "2026-08-08" "dql 0.1.0" "DelightQL Manual"
+.SH NAME
+dql-editor \- export the embedded editor-support artifacts
+.SH SYNOPSIS
+.B dql editor export-artifacts
+.RB [ \-\-dir
+.IR DIR ]
+.SH DESCRIPTION
+The
+.B dql
+binary carries its own editor support: the authored tree-sitter
+grammar, the highlight query files, and the compiled parser shared
+library, embedded as a read-only database image. This command writes
+those artifacts to disk in one layout serving two consumers:
+.PP
+.EX
+DIR/parser/delightql.so        compiled parser
+DIR/queries/delightql/*.scm    highlight queries
+DIR/grammar/                   tree-sitter project sources
+.EE
+.PP
+Point an editor's runtime path at
+.I DIR
+and it finds the parser and queries by convention.
+.I DIR/grammar
+is a complete tree-sitter project: the grammar sources suffice to
+regenerate and recompile the parser on a platform other than the one
+this binary was built for.
+.PP
+The embedded parser fits exactly one platform \(em the one the binary
+was compiled for \(em and speaks one tree-sitter ABI version. The
+closing output line names both, so a mismatch is visible before an
+editor attempts to load the library.
+.SH COMMANDS
+.TP
+.BR export-artifacts " [" \-\-dir " \fIDIR\fP]"
+Write every artifact into
+.I DIR
+(default: the current directory). Directories are created as needed;
+existing files are overwritten. Each written path is printed on its own
+line, followed by the parser's platform target and tree-sitter ABI
+version.
+.SH OPTIONS
+.TP
+.BI \-\-dir " DIR"
+Output directory for
+.BR export-artifacts .
+Defaults to the current directory.
+.SH DATA ACCESS
+The same artifacts are queryable in any session without touching disk:
+.PP
+.EX
+mount!("delightql-bytes://editor", "e")(*)
+e::(*)
+e.parser_artifact(*) |> (target, abi_version)
+.EE
+.SH SEE ALSO
+.BR dql (1),
+.BR dql-query (1)

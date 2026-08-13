@@ -2,17 +2,16 @@
 // Copyright 2026 Daniel Eklund
 //! Unit tests for the `AstVisit` closure and its two control axes.
 //!
-//! These are the red-first pins for the new traversal infrastructure
-//! (INDUCTIVE-TRAVERSAL-PLAN §5 Phases B and E; house rule "a comment claiming a
-//! guarantee names its test"):
-//! - `r_i4_recursion_closure_matrix` — **THE R-I4 recursion-closure matrix**
-//!   (PLAN §5 Phase E; R-I4). It grew from the Phase-B seed
-//!   (`visit_reaches_every_query_bearing_edge`) into the comprehensive matrix
-//!   the plan calls for: a distinct sentinel beneath EVERY query-bearing edge
-//!   INVENTORY §5 enumerates — including EACH Pipe-operator argument form
-//!   (General expressions, AggregatePipe aggregations, Transform transformations
-//!   AND its `conditioned_on`, MapCover `conditioned_on`, Modulo GroupBy, and a
-//!   `DirectivePipeInvocation` relational argument), reached by the default
+//! These are the red-first pins for the traversal infrastructure (house rule
+//! "a comment claiming a guarantee names its test"):
+//! - `r_i4_recursion_closure_matrix` — **THE R-I4 recursion-closure matrix**.
+//!   It grew from the Phase-B seed
+//!   (`visit_reaches_every_query_bearing_edge`) into the comprehensive matrix:
+//!   a distinct sentinel beneath EVERY query-bearing edge the grammar
+//!   enumerates — including EACH Pipe-operator argument form
+//!   (General expressions, Transform transformations
+//!   AND its `conditioned_on`, MapCover `conditioned_on`, Group Reduce, and a
+//!   relation-position `FunctorCall` argument), reached by the default
 //!   full-descend walk. It is the standing structural proof that "no recursive
 //!   field is silently dropped": dropping the recursive edge that uniquely
 //!   reaches a given sentinel fails that sentinel's assertion (drop-an-edge
@@ -20,35 +19,42 @@
 //!   COMPLEMENTS — does not replace — the Phase-C `p1_closure_matrix` (which
 //!   proves the two P1 schemes coincide on one fixture); this one proves the
 //!   `AstVisit` default walk itself is complete.
-//! - `visit_reaches_setoperation_correlation` — the matrix's correlation arm:
-//!   the one edge the cross-phase transform must phantom (§5 finding 9), reached
-//!   via `PhaseBox::correlation`. It lives in its own test because correlation
-//!   is only populatable at Refined, the phase this arm therefore pins.
 //! - `skip_subtree_prunes_exactly_its_subtree` — boundary axis.
-//! - `break_stops_the_walk_promptly` — early termination (§5 finding 12).
-//! - `err_hook_short_circuits_the_walk` — error propagation (§5 finding 13).
+//! - `break_stops_the_walk_promptly` — early termination.
+//! - `err_hook_short_circuits_the_walk` — error propagation.
 
 use super::*;
 use crate::error::DelightQLError;
 use crate::pipeline::asts::core::expressions::helpers::QualifiedName;
-use crate::pipeline::asts::core::expressions::metadata_types::{FilterOrigin, SetOperator};
+use crate::pipeline::asts::core::expressions::metadata_types::FilterOrigin;
+use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
 use crate::pipeline::asts::core::metadata::NamespacePath;
 use crate::pipeline::asts::core::operators::HoArgument;
+use crate::pipeline::asts::core::specs::{GroupSpec, OutItem};
+use crate::pipeline::asts::core::Access;
+use crate::pipeline::asts::core::OutValue;
+use crate::pipeline::asts::core::ProbeAddressing;
 use crate::pipeline::asts::core::{
-    BooleanExpression, CteBinding, DomainExpression, FunctionExpression, PhaseBox, PipeExpression,
-    Query, Refined, Relation, RelationalExpression, SigmaCondition, UnaryRelationalOperator,
-    Unresolved,
+    Chain, Continuation, CteBinding, DomainExpression, FunctionApplication, FunctorCall, PipeOp,
+    PureCall, Query, Relation, SealedCall, StandardApplication, TruthExpression, Unresolved,
+    WindowSpec,
 };
-use crate::pipeline::asts::core::DomainSpec;
-use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
-use crate::pipeline::asts::core::specs::{ContainmentSemantic, ModuloSpec, OutputDomainExpression};
-use delightql_types::SqlIdentifier;
+use crate::pipeline::asts::core::{Existence, RelationalMembership};
+use crate::pipeline::asts::core::{Polarity, Probe};
 
 // Additional carriers exercised by the RED-4 extended matrix.
-use crate::pipeline::asts::core::operators::{ColumnSelector, DmlKind};
-use crate::pipeline::asts::core::specs::{DelegateSpec, OrderingSpec, RenameSpec, RenameTarget, RepositionSpec};
-use crate::pipeline::asts::core::expressions::functions::{ArrayMember, CaseArm, CurlyMember, StringTemplatePart};
-use crate::pipeline::asts::core::expressions::metadata_types::{CteRequirements, TreeGroupLocation};
+use crate::pipeline::asts::core::expressions::functions::{
+    CaseExpression, SearchedArm, ValueTemplate, ValueTemplatePart,
+};
+use crate::pipeline::asts::core::expressions::metadata_types::{
+    CteRequirements, ReductionPlan, TreeGroupLocation, TreeGroupPlan,
+};
+use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
+use crate::pipeline::asts::core::specs::{DelegateSpec, NameTarget, OrderingSpec, RenameSpec};
+use crate::pipeline::asts::core::{
+    AuthoredColumn, Enclyph, NamedReference, Record, RecordMember, ReductionItem,
+};
+use crate::pipeline::asts::vocabulary::Vec1;
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -58,102 +64,194 @@ fn qn(name: &str) -> QualifiedName {
     QualifiedName {
         namespace_path: NamespacePath::empty(),
         name: name.into(),
-        grounding: None,
     }
 }
 
-/// A recognizable "directive" sentinel: a `PseudoPredicate` whose `name` is the
-/// tag. Phase-generic (`PseudoPredicate` and `PhaseBox::phantom` are both
-/// phase-generic), so it seeds both the Unresolved closure tree and the Refined
-/// SetOperation-correlation tree.
-fn sentinel<P>(tag: &str) -> RelationalExpression<P> {
-    RelationalExpression::Relation(Relation::PseudoPredicate {
-        name: tag.to_string(),
-        namespace: Vec::new(),
-        access: DomainSpec::Glob,
-        arguments: vec![],
-        alias: None,
-        cpr_schema: PhaseBox::phantom(),
+fn test_ref(name: &str) -> crate::pipeline::asts::vocabulary::Ref {
+    crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
+        &std::rc::Rc::new(crate::names::Registry::new(&[])),
+        crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
+        name,
+    )
+}
+
+fn call(name: &str, ho_arguments: Vec<HoArgument<Unresolved>>) -> SealedCall<Unresolved> {
+    SealedCall::from_inner(
+        FunctorCall {
+            callee: test_ref(name),
+            arguments: crate::pipeline::asts::core::operators::CallArguments::higher_order(
+                ho_arguments,
+            ),
+            marks: Default::default(),
+        },
+        false,
+    )
+}
+
+fn pure_call(name: &str, ho_arguments: Vec<HoArgument<Unresolved>>) -> PureCall<Unresolved> {
+    PureCall::from_inner(call(name, ho_arguments).into_inner())
+}
+
+/// An application, with whatever scalar context the edge under test needs.
+fn applied(
+    name: &str,
+    ho_arguments: Vec<HoArgument<Unresolved>>,
+    window: Option<WindowSpec<Unresolved>>,
+    guard: Option<TruthExpression<Unresolved>>,
+) -> FunctionApplication<Unresolved> {
+    FunctionApplication::Standard(StandardApplication {
+        call: pure_call(name, ho_arguments),
+        guard: guard.map(Box::new),
+        window,
     })
 }
 
-/// Collects the tags of every `PseudoPredicate` sentinel the walk enters.
+/// A recognizable callable sentinel whose written reference spelling is the tag.
+fn sentinel(tag: &str) -> Chain<Unresolved> {
+    Chain::relation(Relation::FunctorCall {
+        alias: None,
+        call: FunctorCall::written(test_ref(tag), vec![]).into(),
+        cpr_schema: (),
+    })
+}
+
+/// The consulted-view edge, proven in the phase whose trees can hold one.
+///
+/// A consulted view is the resolver's own product: `Unresolved::Consulted` is
+/// uninhabited, so the authored-phase matrix above cannot carry one. The edge
+/// is still query-bearing and still has to be walked, so it is pinned here
+/// instead of going unpinned.
+#[test]
+fn the_walk_reaches_a_consulted_views_body() {
+    use crate::pipeline::asts::core::Resolved;
+
+    let registry = crate::names::Registry::new(&[]);
+    let spelling = registry.intern("v", false);
+    let scope = registry.mint_scope(
+        crate::names::ScopeOrigin::AnonRelation,
+        crate::names::Hint::User(spelling),
+        None,
+    );
+    let body = Relation::ground_read(Access::All, false, scope);
+    let view = Chain::<Resolved>::relation(Relation::ConsultedView {
+        body: Box::new(Query::relational(body)),
+        scoped: scope,
+        outer: false,
+    });
+
+    #[derive(Default)]
+    struct Seen(Vec<String>);
+    impl AstVisit<Resolved> for Seen {
+        fn enter_relation(&mut self, r: &Relation<Resolved>) -> Result<Descent> {
+            if let Relation::Ground { cpr_schema, .. } = r {
+                self.0.push(format!("{cpr_schema:?}"));
+            }
+            Ok(Descent::Continue)
+        }
+    }
+
+    let mut seen = Seen::default();
+    walk_visit_relational(&mut seen, &view).expect("walk ok");
+    assert!(
+        seen.0.iter().any(|tag| *tag == format!("{scope:?}")),
+        "the walk did not descend into the consulted view's body; reached: {:?}",
+        seen.0
+    );
+}
+
+/// Collects the tags of every functor sentinel the walk enters.
 #[derive(Default)]
 struct SentinelCollector {
     seen: Vec<String>,
 }
 
-impl<P> AstVisit<P> for SentinelCollector {
-    fn enter_relation(&mut self, r: &Relation<P>) -> Result<Descent> {
-        if let Relation::PseudoPredicate { name, .. } = r {
-            self.seen.push(name.clone());
+impl AstVisit<Unresolved> for SentinelCollector {
+    fn enter_relation(&mut self, r: &Relation<Unresolved>) -> Result<Descent> {
+        if let Relation::FunctorCall { call, .. } = r {
+            self.seen.push(call.call().callee.name_text());
         }
         Ok(Descent::Continue)
     }
 }
 
-fn chain(exprs: Vec<RelationalExpression<Unresolved>>) -> RelationalExpression<Unresolved> {
+fn chain(exprs: Vec<Chain<Unresolved>>) -> Chain<Unresolved> {
     exprs
         .into_iter()
-        .reduce(|left, right| RelationalExpression::Join {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_condition: None,
-            join_type: None,
-            cpr_schema: PhaseBox::phantom(),
+        .reduce(|left, right| {
+            left.then(Continuation::Member {
+                rhs: right,
+                correlation: None,
+                join_type: None,
+                cpr_schema: (),
+            })
         })
         .expect("at least one carrier")
 }
 
 /// A scalar subquery whose subquery IS a `tag` sentinel: the query-bearing
-/// `DomainExpression::ScalarSubquery` edge, used to smuggle a nested relation
+/// `FunctionApplication::Scalarized` edge, used to smuggle a nested relation
 /// beneath any domain-valued operator argument.
 fn scalar_sub(tag: &str) -> DomainExpression<Unresolved> {
-    DomainExpression::ScalarSubquery {
-        identifier: qn(tag),
-        subquery: Box::new(sentinel(tag)),
-        alias: None,
-    }
+    DomainExpression::Application(
+        crate::pipeline::asts::core::FunctionApplication::Scalarized(
+            crate::pipeline::asts::core::ScalarRelation::Named {
+                identifier: qn(tag),
+                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
+                    body: sentinel(tag),
+                    scalarization: crate::pipeline::asts::core::Scalarization::BoundToOne {
+                        ordering: Vec::new(),
+                    },
+                    scope: (),
+                    output: (),
+                }),
+            },
+        ),
+    )
 }
 
 /// An `EXISTS` whose subquery IS a `tag` sentinel: the query-bearing
-/// `BooleanExpression::InnerExists` edge, used to smuggle a nested relation
+/// `TruthExpression::InnerExists` edge, used to smuggle a nested relation
 /// beneath any boolean-valued operator argument (`conditioned_on`).
-fn inner_exists(tag: &str) -> BooleanExpression<Unresolved> {
-    BooleanExpression::InnerExists {
-        exists: true,
-        identifier: qn(tag),
-        subquery: Box::new(sentinel(tag)),
-        alias: None,
-        using_columns: vec![],
-    }
+fn inner_exists(tag: &str) -> TruthExpression<Unresolved> {
+    TruthExpression::Existence(Existence {
+        polarity: Polarity::Positive,
+        relation: Box::new(sentinel(tag)),
+        addressing: ProbeAddressing {
+            identifier: qn(tag),
+            using_columns: vec![],
+        },
+    })
 }
 
 /// A one-operator pipe: `sentinel(source_tag) |> operator`. The source sentinel
 /// pins the `Pipe.source` edge; `operator` pins whichever operator-argument edge
 /// the caller wired a sentinel beneath.
-fn pipe_with(
-    source_tag: &str,
-    operator: UnaryRelationalOperator<Unresolved>,
-) -> RelationalExpression<Unresolved> {
-    RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-        source: sentinel(source_tag),
-        operator,
-        cpr_schema: PhaseBox::phantom(),
-    })))
+/// A call's ACCESS stands where a relational access stands: after it.
+fn access_step(chain: Chain<Unresolved>, access: Access<Unresolved>) -> Chain<Unresolved> {
+    chain.then(Continuation::Access {
+        access,
+        cpr_schema: (),
+    })
+}
+
+fn pipe_with(source_tag: &str, operator: PipeOp<Unresolved>) -> Chain<Unresolved> {
+    sentinel(source_tag).then(Continuation::Pipe {
+        operator: operator,
+        named: None,
+        cpr_schema: (),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // The R-I4 closure seed
 // ---------------------------------------------------------------------------
 
-/// THE R-I4 recursion-closure matrix (PLAN §5 Phase E; R-I4).
+/// THE R-I4 recursion-closure matrix.
 ///
 /// The default full-descend walk reaches a distinct sentinel beneath EVERY
-/// query-bearing edge INVENTORY §5 enumerates — Filter.condition, join_condition,
+/// query-bearing edge the grammar enumerates — Filter.condition, correlation,
 /// EACH Pipe-operator argument form, WithCtes body, ConsultedView body, CFE body,
-/// HO table argument, and InnerRelation subquery. (SetOperation.correlation is
-/// the matrix's Refined-phase arm, `visit_reaches_setoperation_correlation`.)
+/// HO table argument, and InnerRelation subquery.
 /// Each sentinel sits beneath a structurally-unique carrier, so dropping the
 /// recursive edge that uniquely reaches a sentinel fails that sentinel's
 /// assertion — the standing structural proof that "no recursive field is
@@ -166,26 +264,31 @@ fn pipe_with(
 #[test]
 fn r_i4_recursion_closure_matrix() {
     // Finding 2 — Filter.condition (headline edge; the P1/P2 hole).
-    let filter_condition = RelationalExpression::Filter {
-        source: Box::new(sentinel("filter_source")),
-        condition: SigmaCondition::Predicate(BooleanExpression::InRelational {
-            value: Box::new(DomainExpression::NonUnifiyingUnderscore),
-            subquery: Box::new(sentinel("filter_condition")),
-            identifier: qn("f"),
+    let filter_condition = sentinel("filter_source").then(Continuation::Restrict {
+        condition: TruthExpression::RelationalMembership(RelationalMembership {
+            probe: Probe::Value(Box::new(DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Open(
+                    crate::pipeline::asts::core::DomainHole::Disregarded,
+                ),
+            ))),
+            relation: Box::new(sentinel("filter_condition")),
+            addressing: ProbeAddressing {
+                identifier: qn("f"),
+                using_columns: vec![],
+            },
             negated: false,
         }),
         origin: FilterOrigin::UserWritten,
-        cpr_schema: PhaseBox::phantom(),
-    };
+        cpr_schema: (),
+    });
 
-    // Finding 3 — Join.join_condition (via InnerExists subquery).
-    let join_condition = RelationalExpression::Join {
-        left: Box::new(sentinel("join_left")),
-        right: Box::new(sentinel("join_right")),
-        join_condition: Some(inner_exists("join_condition")),
+    // Finding 3 — Join.correlation (via InnerExists subquery).
+    let correlation = sentinel("join_left").then(Continuation::Member {
+        rhs: sentinel("join_right"),
+        correlation: Some(MemberCorrelation::Condition(inner_exists("correlation"))),
         join_type: None,
-        cpr_schema: PhaseBox::phantom(),
-    };
+        cpr_schema: (),
+    });
 
     // Finding 4 — EACH Pipe-operator argument form carries a query-bearing edge.
     // A single operator arm was the seed's only probe; the matrix probes every
@@ -195,138 +298,131 @@ fn r_i4_recursion_closure_matrix() {
     //     edge missed by ALL relational-entry whole-tree walkers today).
     let op_transform_transformation = pipe_with(
         "op_transform_source",
-        UnaryRelationalOperator::Transform {
-            transformations: vec![(
-                scalar_sub("op_transform_transformation"),
-                "a".to_string(),
-                None,
-            )],
-            conditioned_on: None,
+        PipeOp::Transform {
+            items: crate::pipeline::asts::vocabulary::Vec1::new(crate::pipeline::asts::core::NamedOutItem {
+                expr: OutValue::Domain(scalar_sub("op_transform_transformation")),
+                naming: "a".into(),
+                qualifier: None,
+                output: (),
+            }),
+            guard: None,
         },
     );
     // (b) Transform conditioned_on: an EXISTS guarding a `$$` cover.
     let op_transform_conditioned = pipe_with(
         "op_transform_cond_source",
-        UnaryRelationalOperator::Transform {
-            transformations: vec![],
-            conditioned_on: Some(Box::new(inner_exists("op_transform_conditioned_on"))),
+        PipeOp::Transform {
+            items: crate::pipeline::asts::vocabulary::Vec1::new(crate::pipeline::asts::core::NamedOutItem {
+                expr: OutValue::Domain(DomainExpression::Application(
+                    crate::pipeline::asts::core::FunctionApplication::Ground(
+                        crate::pipeline::asts::core::LiteralValue::Number("1".to_string()),
+                    ),
+                )),
+                naming: "b".into(),
+                qualifier: None,
+                output: (),
+            }),
+            guard: Some(Box::new(inner_exists("op_transform_conditioned_on"))),
         },
     );
     // (c) General projection expressions: a scalar subquery in `(...)` / `[...]`.
     let op_general = pipe_with(
         "op_general_source",
-        UnaryRelationalOperator::General {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            expressions: vec![scalar_sub("op_general_expr")],
-        },
-    );
-    // (d) AggregatePipe aggregations: a scalar subquery in a `|~>` aggregation.
-    let op_aggregate = pipe_with(
-        "op_aggregate_source",
-        UnaryRelationalOperator::AggregatePipe {
-            aggregations: vec![scalar_sub("op_aggregate_expr")],
-        },
+        PipeOp::Project(crate::pipeline::asts::vocabulary::Vec1::new(out_item(scalar_sub(
+            "op_general_expr",
+        )))),
     );
     // (e) MapCover conditioned_on: an EXISTS guarding a `$` map cover — a DISTINCT
     //     operator arm from Transform's conditioned_on (a dropped edge on either
     //     arm must be caught independently).
     let op_mapcover = pipe_with(
         "op_mapcover_source",
-        UnaryRelationalOperator::MapCover {
-            function: FunctionExpression::Bracket {
-                arguments: vec![],
-                alias: None,
-            },
-            columns: vec![],
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            conditioned_on: Some(Box::new(inner_exists("op_mapcover_conditioned_on"))),
-        },
+        PipeOp::MapCover(MapCover {
+            callable: crate::pipeline::asts::core::Callable::Lambda(
+                crate::pipeline::asts::core::Lambda {
+                    body: Box::new(scalar_sub("cover_callable_body_ignored")),
+                },
+            ),
+            selector: vec![],
+            guard: Some(Box::new(inner_exists("op_mapcover_conditioned_on"))),
+            cells: Vec::new(),
+        }),
     );
-    // (f) Modulo GroupBy reducing_on: a scalar subquery in a `%(...)` group — the
+    // (f) Group Reduce reductions: a scalar subquery in a `%(...)` group — the
     //     descent path the now-deleted `_tg_N` tree-group walk (W8) took.
-    let op_modulo = pipe_with(
-        "op_modulo_source",
-        UnaryRelationalOperator::Modulo {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            spec: ModuloSpec::GroupBy {
-                reducing_by: vec![],
-                reducing_on: vec![OutputDomainExpression {
-                    expr: scalar_sub("op_modulo_reducing_on"),
-                    output: PhaseBox::phantom(),
-                }],
-                delegates: vec![],
-            },
-        },
+    let op_group = pipe_with(
+        "op_group_source",
+        PipeOp::Group(GroupSpec::Reduce {
+            keys: vec![],
+            reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(out_item(
+                scalar_sub("op_group_reducing_on"),
+            ))),
+            plan: ReductionPlan::empty(),
+        }),
     );
-    // (g) DirectivePipeInvocation argument: a directive's relational HO argument
+    // (g) relation-position FunctorCall argument: a directive's relational HO argument
     //     (a query-bearing edge that returns straight to relational syntax).
-    let op_directive = pipe_with(
-        "op_directive_source",
-        UnaryRelationalOperator::DirectivePipeInvocation {
-            name: "d!".to_string(),
-            argument: Box::new(sentinel("op_directive_pipe_arg")),
-            domain_spec: DomainSpec::Glob,
-        },
-    );
+    let op_directive = Chain::relation(Relation::FunctorCall {
+        call: call(
+            "d!",
+            vec![
+                HoArgument::Relation(sentinel("op_directive_pipe_arg")),
+                HoArgument::Relation(sentinel("op_directive_source")),
+            ],
+        ),
+        alias: None,
+        cpr_schema: (),
+    });
 
     // Finding 8 — a higher-order table argument on a TVF.
-    let ho_tvf = RelationalExpression::Relation(Relation::TVF {
-        function: "tvf".into(),
-        argument_groups: None,
-        ho_arguments: vec![HoArgument::Table(sentinel("ho_argument"))],
-        domain_spec: DomainSpec::Glob,
+    let ho_tvf = Chain::relation(Relation::FunctorCall {
         alias: None,
-        namespace: None,
-        backend_schema: PhaseBox::phantom(),
-        grounding: None,
-        cpr_schema: PhaseBox::phantom(),
+        call: call("tvf", vec![HoArgument::Relation(sentinel("ho_argument"))]),
+        cpr_schema: (),
     });
 
     // Finding 10 — an InnerRelation subquery.
-    let inner_relation = RelationalExpression::Relation(Relation::InnerRelation {
+    let inner_relation = Chain::relation(Relation::InnerRelation {
         pattern: InnerRelationPattern::Indeterminate {
             identifier: qn("i"),
             subquery: Box::new(sentinel("inner_relation_subquery")),
         },
+        preminted_scope: None,
         alias: None,
         outer: false,
-        cpr_schema: PhaseBox::phantom(),
-    });
-
-    // Finding 6 — a consulted-view body (a full Query).
-    let consulted_view = RelationalExpression::Relation(Relation::ConsultedView {
-        identifier: qn("v"),
-        body: Box::new(Query::Relational(sentinel("consulted_view_body"))),
-        scoped: PhaseBox::phantom(),
-        outer: false,
+        cpr_schema: (),
     });
 
     let body = chain(vec![
         filter_condition,
-        join_condition,
+        correlation,
         op_transform_transformation,
         op_transform_conditioned,
         op_general,
-        op_aggregate,
         op_mapcover,
-        op_modulo,
+        op_group,
         op_directive,
         ho_tvf,
         inner_relation,
-        consulted_view,
     ]);
 
     // Finding 5 — a WithCtes body (a CteBinding expression).
-    let query = Query::WithCtes {
+    let query = Query::<crate::pipeline::asts::core::Unresolved> {
+        cfes: Vec::new(),
         ctes: vec![CteBinding {
             expression: sentinel("cte_body"),
-            name: "c".to_string(),
-            origin: Default::default(),
-            resolution_owner: Default::default(),
-            effect_label: false,
-            is_recursive: PhaseBox::phantom(),
+            subject: crate::pipeline::asts::core::CteSubject::Authored {
+                name: delightql_types::SqlIdentifier::new("c"),
+                effect: crate::pipeline::asts::core::CteEffectDeclaration::Pure,
+            },
+            authority: crate::pipeline::asts::core::CteAuthority {
+                head: crate::pipeline::asts::core::definitions::Head::glob(),
+                origin: Default::default(),
+                resolution_owner: Default::default(),
+            },
+            recursion: (),
         }],
-        query: body,
+        body,
     };
 
     let mut c = SentinelCollector::default();
@@ -334,21 +430,19 @@ fn r_i4_recursion_closure_matrix() {
     assert_eq!(flow, Descent::Continue);
 
     for expected in [
-        // Filter.condition / join_condition
+        // Filter.condition / correlation
         "filter_condition",
-        "join_condition",
+        "correlation",
         // each Pipe-operator argument form (finding 4)
         "op_transform_transformation",
         "op_transform_conditioned_on",
         "op_general_expr",
-        "op_aggregate_expr",
         "op_mapcover_conditioned_on",
-        "op_modulo_reducing_on",
+        "op_group_reducing_on",
         "op_directive_pipe_arg",
         // structural boundaries
         "ho_argument",
         "inner_relation_subquery",
-        "consulted_view_body",
         "cte_body",
     ] {
         assert!(
@@ -362,11 +456,21 @@ fn r_i4_recursion_closure_matrix() {
     // pattern), because `WithCfes.cfes` is a non-phase-parameterized side
     // structure the generic walk cannot descend. Prove the rooted-at-domain
     // entry reaches a sentinel beneath it.
-    let cfe_body: DomainExpression<Unresolved> = DomainExpression::ScalarSubquery {
-        identifier: qn("c"),
-        subquery: Box::new(sentinel("cfe_body")),
-        alias: None,
-    };
+    let cfe_body: DomainExpression<Unresolved> = DomainExpression::Application(
+        crate::pipeline::asts::core::FunctionApplication::Scalarized(
+            crate::pipeline::asts::core::ScalarRelation::Named {
+                identifier: qn("c"),
+                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
+                    body: sentinel("cfe_body"),
+                    scalarization: crate::pipeline::asts::core::Scalarization::BoundToOne {
+                        ordering: Vec::new(),
+                    },
+                    scope: (),
+                    output: (),
+                }),
+            },
+        ),
+    );
     let mut cfe = SentinelCollector::default();
     walk_visit_domain(&mut cfe, &cfe_body).expect("walk ok");
     assert!(
@@ -376,393 +480,380 @@ fn r_i4_recursion_closure_matrix() {
     );
 }
 
-/// The `SetOperation.correlation` edge — phantomed by the cross-phase transform,
-/// reached by the same-phase visit (§5 finding 9). Correlation is only
-/// populatable at Refined (`PhaseBox::with_correlation`), so this pins at Refined.
-#[test]
-fn visit_reaches_setoperation_correlation() {
-    let correlation = BooleanExpression::<Refined>::InnerExists {
-        exists: true,
-        identifier: qn("q"),
-        subquery: Box::new(sentinel::<Refined>("setop_correlation")),
-        alias: None,
-        using_columns: vec![],
-    };
-    let setop = RelationalExpression::<Refined>::SetOperation {
-        operator: SetOperator::SmartUnionAll,
-        operands: vec![
-            sentinel::<Refined>("setop_operand_a"),
-            sentinel::<Refined>("setop_operand_b"),
-        ],
-        correlation: <PhaseBox<Option<BooleanExpression<Refined>>, Refined>>::with_correlation(
-            Some(correlation),
-        ),
-        cpr_schema: PhaseBox::phantom(),
-    };
-
-    let mut c = SentinelCollector::default();
-    walk_visit_relational(&mut c, &setop).expect("walk ok");
-
-    assert!(
-        c.seen.iter().any(|s| s == "setop_correlation"),
-        "visit did not reach SetOperation.correlation; reached: {:?}",
-        c.seen
-    );
-    // Operands are reached too (sanity).
-    assert!(c.seen.iter().any(|s| s == "setop_operand_a"));
-    assert!(c.seen.iter().any(|s| s == "setop_operand_b"));
-}
-
 // ---------------------------------------------------------------------------
 // RED-4 (F4): the R-I4 matrix under-covers its stated guarantee
 // ---------------------------------------------------------------------------
 
-/// An `OutputDomainExpression` whose expr is a `tag` scalar-subquery sentinel.
-fn out_dom(tag: &str) -> OutputDomainExpression<Unresolved> {
-    OutputDomainExpression {
-        expr: scalar_sub(tag),
-        output: PhaseBox::phantom(),
-    }
+/// An unnamed publication item whose value is a `tag` scalar-subquery sentinel.
+fn out_dom(tag: &str) -> OutItem<Unresolved> {
+    out_item(scalar_sub(tag))
 }
 
-/// Wrap a `FunctionExpression` as a `DomainExpression` so it can ride a
+/// An unnamed publication item over an arbitrary value.
+fn out_item(expr: DomainExpression<Unresolved>) -> OutItem<Unresolved> {
+    OutItem::plain(expr, ())
+}
+
+/// Wrap a `FunctionApplication` as a `DomainExpression` so it can ride a
 /// `General` projection's `expressions` vec.
-fn func_dom(f: FunctionExpression<Unresolved>) -> DomainExpression<Unresolved> {
-    DomainExpression::Function(f)
+fn func_dom(f: FunctionApplication<Unresolved>) -> DomainExpression<Unresolved> {
+    DomainExpression::Application(f)
 }
 
 /// A `General` projection pipe carrying one function-valued expression: the
-/// smuggling vector for every FunctionExpression container carrier.
-fn general_with_func(source_tag: &str, f: FunctionExpression<Unresolved>) -> RelationalExpression<Unresolved> {
+/// smuggling vector for every FunctionApplication container carrier.
+fn general_with_func(source_tag: &str, f: FunctionApplication<Unresolved>) -> Chain<Unresolved> {
     pipe_with(
         source_tag,
-        UnaryRelationalOperator::General {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            expressions: vec![func_dom(f)],
-        },
+        PipeOp::Project(crate::pipeline::asts::vocabulary::Vec1::new(out_item(func_dom(f)))),
     )
 }
 
-/// THE R-I4 matrix EXTENSION (RED-4; review pnxwskxr::nzpzwxqx [P2]).
+/// The recursion-closure matrix, carrier by carrier.
 ///
 /// `r_i4_recursion_closure_matrix` claims to cover "EACH Pipe-operator argument
-/// form" and generalizes to "the whole grammar," but the review enumerates ~a
-/// dozen independent query-bearing carriers it never probes. This test plants a
-/// distinct sentinel beneath EACH — every operator-argument carrier the review
-/// lists, plus the function/container fields it flags as un-pinned. Any sentinel
-/// the default `AstVisit` walk does NOT reach is a real closure hole and reds
-/// its assertion; the rest close the coverage gap so the "no recursive field is
-/// silently dropped" guarantee is actually earned.
+/// form" and generalizes to "the whole grammar," but a dozen independent
+/// query-bearing carriers go unprobed by it. This test plants a distinct
+/// sentinel beneath EACH operator-argument carrier and each function/container
+/// field. Any sentinel the default `AstVisit` walk does NOT reach is a real
+/// closure hole and reds its assertion; together they are what earns the "no
+/// recursive field is silently dropped" guarantee.
 #[test]
 fn r_i4_recursion_closure_matrix_extended() {
-    let mut carriers: Vec<RelationalExpression<Unresolved>> = Vec::new();
+    let mut carriers: Vec<Chain<Unresolved>> = Vec::new();
 
-    // --- Operator-argument carriers the review lists as MISSING ---------------
+    // --- Operator-argument carriers ------------------------------------------
 
     // ProjectOut.expressions — `-(...)`
-    carriers.push(pipe_with(
-        "projectout_src",
-        UnaryRelationalOperator::ProjectOut {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            expressions: vec![scalar_sub("projectout_expressions")],
-        },
-    ));
+    carriers.push(pipe_with("projectout_src", PipeOp::ProjectOut(Vec::new())));
 
-    // TupleOrdering.specs — `#(...)`
-    carriers.push(pipe_with(
-        "tupleordering_src",
-        UnaryRelationalOperator::TupleOrdering {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            specs: vec![OrderingSpec {
-                column: scalar_sub("tupleordering_specs"),
-                direction: None,
-            }],
+    // Ordering.specs — `#(...)`, now chain structure
+    carriers.push(sentinel("tupleordering_src").then(Continuation::Structural(
+        crate::pipeline::asts::core::StructuralStep {
+            form: crate::pipeline::asts::core::StructuralForm::Ordering {
+                specs: vec![OrderingSpec {
+                    column: scalar_sub("tupleordering_specs"),
+                    direction: None,
+                }],
+            },
+            named: None,
+            cpr_schema: (),
         },
-    ));
+    )));
 
     // MapCover.function
     carriers.push(pipe_with(
         "mapcover_fn_src",
-        UnaryRelationalOperator::MapCover {
-            function: FunctionExpression::Bracket {
-                arguments: vec![scalar_sub("mapcover_function")],
-                alias: None,
-            },
-            columns: vec![],
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            conditioned_on: None,
-        },
+        PipeOp::MapCover(MapCover {
+            callable: crate::pipeline::asts::core::Callable::Lambda(
+                crate::pipeline::asts::core::Lambda {
+                    body: Box::new(scalar_sub("mapcover_function")),
+                },
+            ),
+            selector: vec![],
+            guard: None,
+            cells: Vec::new(),
+        }),
     ));
     // MapCover.columns
     carriers.push(pipe_with(
         "mapcover_cols_src",
-        UnaryRelationalOperator::MapCover {
-            function: FunctionExpression::Bracket {
-                arguments: vec![],
-                alias: None,
-            },
-            columns: vec![scalar_sub("mapcover_columns")],
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            conditioned_on: None,
-        },
+        PipeOp::MapCover(MapCover {
+            callable: crate::pipeline::asts::core::Callable::Lambda(
+                crate::pipeline::asts::core::Lambda {
+                    body: Box::new(scalar_sub("cover_callable_body_ignored")),
+                },
+            ),
+            selector: Vec::new(),
+            guard: None,
+            cells: Vec::new(),
+        }),
     ));
 
-    // Modulo GroupBy.reducing_by
+    // Group Reduce.keys
     carriers.push(pipe_with(
-        "modulo_rb_src",
-        UnaryRelationalOperator::Modulo {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            spec: ModuloSpec::GroupBy {
-                reducing_by: vec![out_dom("modulo_reducing_by")],
-                reducing_on: vec![],
-                delegates: vec![],
-            },
-        },
+        "group_keys_src",
+        PipeOp::Group(GroupSpec::Reduce {
+            keys: vec![out_dom("group_keys")],
+            reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(out_dom(
+                "group_reduction",
+            ))),
+            plan: ReductionPlan::empty(),
+        }),
     ));
-    // Modulo GroupBy.delegates
+    // Group Reduce.delegates
     carriers.push(pipe_with(
-        "modulo_del_src",
-        UnaryRelationalOperator::Modulo {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            spec: ModuloSpec::GroupBy {
-                reducing_by: vec![],
-                reducing_on: vec![],
-                delegates: vec![DelegateSpec {
-                    payload: vec![out_dom("modulo_delegates")],
+        "group_del_src",
+        PipeOp::Group(GroupSpec::Reduce {
+            keys: vec![],
+            reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Delegate(
+                DelegateSpec {
+                    payload: vec![out_dom("group_delegates")],
                     order: vec![],
-                }],
-            },
-        },
+                },
+            )),
+            plan: ReductionPlan::empty(),
+        }),
     ));
-    // Modulo Columns (the simple reducing_by list, a distinct ModuloSpec arm)
+    // Group Distinct (the simple keys list)
     carriers.push(pipe_with(
-        "modulo_cols_src",
-        UnaryRelationalOperator::Modulo {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            spec: ModuloSpec::Columns(vec![scalar_sub("modulo_columns")]),
-        },
+        "group_cols_src",
+        PipeOp::Group(GroupSpec::Distinct {
+            keys: crate::pipeline::asts::vocabulary::Vec1::new(out_item(scalar_sub("group_distinct_keys"))),
+        }),
     ));
 
-    // RenameCover.specs — `*(...)`
+    // Rename pairs — `*(...)`
     carriers.push(pipe_with(
         "renamecover_src",
-        UnaryRelationalOperator::RenameCover {
-            specs: vec![RenameSpec {
-                from: scalar_sub("renamecover_specs"),
-                to: RenameTarget::Literal("x".to_string()),
-            }],
-        },
-    ));
-
-    // Reposition.moves — `|col as n|`
-    carriers.push(pipe_with(
-        "reposition_src",
-        UnaryRelationalOperator::Reposition {
-            moves: vec![RepositionSpec {
-                column: scalar_sub("reposition_moves"),
-                position: 0,
-            }],
-        },
+        PipeOp::Rename(crate::pipeline::asts::vocabulary::Vec1::new(RenameSpec {
+            from: crate::pipeline::asts::core::RenameSource::Glob(
+                crate::pipeline::asts::core::Glob::whole(),
+            ),
+            to: NameTarget::Identifier("x".to_string()),
+        })),
     ));
 
     // EmbedMapCover.function
     carriers.push(pipe_with(
         "embed_fn_src",
-        UnaryRelationalOperator::EmbedMapCover {
-            function: FunctionExpression::Bracket {
-                arguments: vec![scalar_sub("embedmapcover_function")],
-                alias: None,
-            },
-            selector: ColumnSelector::All,
-            alias_template: None,
-            containment_semantic: ContainmentSemantic::Parenthesis,
-        },
+        PipeOp::EmbedMapCover(EmbedMapCover {
+            callable: crate::pipeline::asts::core::Callable::Lambda(
+                crate::pipeline::asts::core::Lambda {
+                    body: Box::new(scalar_sub("embedmapcover_function")),
+                },
+            ),
+            naming: None,
+            selector: Vec::new(),
+            cells: Vec::new(),
+        }),
     ));
     // EmbedMapCover.selector
     carriers.push(pipe_with(
         "embed_sel_src",
-        UnaryRelationalOperator::EmbedMapCover {
-            function: FunctionExpression::Bracket {
-                arguments: vec![],
-                alias: None,
-            },
-            selector: ColumnSelector::Explicit(vec![scalar_sub("embedmapcover_selector")]),
-            alias_template: None,
-            containment_semantic: ContainmentSemantic::Parenthesis,
-        },
+        PipeOp::EmbedMapCover(EmbedMapCover {
+            callable: crate::pipeline::asts::core::Callable::Lambda(
+                crate::pipeline::asts::core::Lambda {
+                    body: Box::new(scalar_sub("cover_callable_body_ignored")),
+                },
+            ),
+            naming: None,
+            selector: Vec::new(),
+            cells: Vec::new(),
+        }),
     ));
 
-    // HoViewApplication.domain_spec and .first_parens_spec
-    carriers.push(pipe_with(
-        "hoview_ds_src",
-        UnaryRelationalOperator::HoViewApplication {
-            function: "v".to_string(),
-            arguments: vec![],
-            first_parens_spec: None,
-            domain_spec: DomainSpec::Positional(vec![scalar_sub("hoview_domain_spec")]),
-            namespace: None,
-            grounding: None,
-        },
+    // A common functor call carries the relational argument, and the access
+    // group standing after it asks what the call publishes.
+    carriers.push(access_step(
+        Chain::relation(Relation::FunctorCall {
+            call: call(
+                "v",
+                vec![
+                    HoArgument::Value(crate::pipeline::asts::core::ArgumentValue::plain(
+                        scalar_sub("hoview_rich_argument"),
+                    )),
+                    HoArgument::Relation(sentinel("hoview_ds_src")),
+                ],
+            ),
+            alias: None,
+            cpr_schema: (),
+        }),
+        Access::from_terms(vec![scalar_sub("hoview_access")]),
     ));
-    carriers.push(pipe_with(
-        "hoview_fp_src",
-        UnaryRelationalOperator::HoViewApplication {
-            function: "v".to_string(),
-            arguments: vec![],
-            first_parens_spec: Some(DomainSpec::Positional(vec![scalar_sub(
-                "hoview_first_parens_spec",
-            )])),
-            domain_spec: DomainSpec::Glob,
-            namespace: None,
-            grounding: None,
-        },
+    carriers.push(Chain::relation(Relation::FunctorCall {
+        call: call(
+            "v",
+            vec![
+                HoArgument::Value(crate::pipeline::asts::core::ArgumentValue::plain(
+                    scalar_sub("hoview_first_parens_spec"),
+                )),
+                HoArgument::Relation(sentinel("hoview_fp_src")),
+            ],
+        ),
+        alias: None,
+        cpr_schema: (),
+    }));
+
+    // A DML terminal's RECEIPT: the access standing in the effect position.
+    carriers.push(access_step(
+        Chain::relation(Relation::FunctorCall {
+            call: call(
+                "insert!",
+                vec![
+                    HoArgument::Relation(sentinel("dml_target")),
+                    HoArgument::Relation(sentinel("dml_src")),
+                ],
+            ),
+            alias: None,
+            cpr_schema: (),
+        }),
+        Access::from_terms(vec![scalar_sub("dml_access")]),
     ));
 
-    // DmlTerminal.domain_spec
-    carriers.push(pipe_with(
-        "dml_src",
-        UnaryRelationalOperator::DmlTerminal {
-            kind: DmlKind::Insert,
-            target: "t".to_string(),
-            target_namespace: None,
-            domain_spec: DomainSpec::Positional(vec![scalar_sub("dml_domain_spec")]),
-        },
+    // Functor-call scalar arguments — the terminal's own argument row
+    carriers.push(Chain::relation(Relation::FunctorCall {
+        call: call(
+            "d!",
+            vec![
+                HoArgument::Value(crate::pipeline::asts::core::ArgumentValue::plain(
+                    scalar_sub("directiveterminal_arguments"),
+                )),
+                HoArgument::Relation(sentinel("directiveterminal_src")),
+            ],
+        ),
+        alias: None,
+        cpr_schema: (),
+    }));
+
+    // A directive's receipt (the matrix already pins its argument)
+    carriers.push(access_step(
+        Chain::relation(Relation::FunctorCall {
+            call: call(
+                "d!",
+                vec![
+                    HoArgument::Relation(sentinel("dpi_ds_argument_ignored")),
+                    HoArgument::Relation(sentinel("dpi_ds_src")),
+                ],
+            ),
+            alias: None,
+            cpr_schema: (),
+        }),
+        Access::from_terms(vec![scalar_sub("dpi_access")]),
     ));
 
-    // DirectiveTerminal.arguments — `|> d!(args)`
-    carriers.push(pipe_with(
-        "directiveterminal_src",
-        UnaryRelationalOperator::DirectiveTerminal {
-            name: "d!".to_string(),
-            arguments: vec![scalar_sub("directiveterminal_arguments")],
-        },
-    ));
-
-    // DirectivePipeInvocation.domain_spec (the matrix already pins its argument)
-    carriers.push(pipe_with(
-        "dpi_ds_src",
-        UnaryRelationalOperator::DirectivePipeInvocation {
-            name: "d!".to_string(),
-            argument: Box::new(sentinel("dpi_ds_argument_ignored")),
-            domain_spec: DomainSpec::Positional(vec![scalar_sub("dpi_domain_spec")]),
-        },
-    ));
-
-    // --- Function / container carriers the review flags as un-pinned ----------
+    // --- Function / container carriers ----------------------------------------
 
     // Case arms — condition (Searched) and result.
     carriers.push(general_with_func(
         "case_src",
-        FunctionExpression::CaseExpression {
-            arms: vec![CaseArm::Searched {
+        crate::pipeline::asts::core::FunctionApplication::Case(CaseExpression::Searched {
+            arms: Vec1::new(SearchedArm {
                 condition: Box::new(inner_exists("case_arm_condition")),
                 result: Box::new(scalar_sub("case_arm_result")),
-            }],
-            alias: None,
-        },
-    ));
-
-    // Curly members — a key/value member.
-    carriers.push(general_with_func(
-        "curly_src",
-        FunctionExpression::Curly {
-            members: vec![CurlyMember::KeyValue {
-                key: "k".to_string(),
-                nested_reduction: false,
-                value: Box::new(scalar_sub("curly_member")),
-            }],
-            inner_grouping_keys: vec![],
-            cte_requirements: None,
-            alias: None,
-        },
-    ));
-
-    // Curly cte_requirements — the resolver-populated side structure.
-    carriers.push(general_with_func(
-        "cte_req_src",
-        FunctionExpression::Curly {
-            members: vec![],
-            inner_grouping_keys: vec![],
-            cte_requirements: Some(CteRequirements {
-                needs_cte: false,
-                accumulated_grouping_keys: vec![(None, scalar_sub("cte_requirements"))],
-                join_keys: vec![],
-                location: TreeGroupLocation::InReducingBy,
-                nested_members_info: vec![],
             }),
-            alias: None,
-        },
+            default: Some(Box::new(scalar_sub("case_default_result"))),
+        }),
     ));
 
-    // Arrays — an array member's path.
+    // Record members — a keyed member.
     carriers.push(general_with_func(
-        "array_src",
-        FunctionExpression::Array {
-            members: vec![ArrayMember::Index {
-                path: Box::new(scalar_sub("array_member")),
-                alias: None,
-            }],
-            alias: None,
-        },
+        "record_src",
+        crate::pipeline::asts::core::FunctionApplication::Enclyph(Enclyph::Record(Record::plain(
+            Vec1::new(RecordMember::Keyed {
+                key: "k".to_string(),
+                value: Box::new(scalar_sub("record_member")),
+            }),
+        ))),
     ));
 
-    // Windows — arguments, partition_by, and order_by.
+    // A reduction plan owns the record CTE requirements, and the walk reaches
+    // its expressions beside the record occurrence it analyzes.
+    let planned_record =
+        crate::pipeline::asts::core::FunctionApplication::Enclyph(Enclyph::Record(Record::plain(
+            Vec1::new(RecordMember::SelfKeyed(NamedReference(AuthoredColumn {
+                name: "k".into(),
+                qualifier: None,
+                namespace_path: NamespacePath::empty(),
+            }))),
+        )));
+    carriers.push(pipe_with(
+        "cte_req_src",
+        PipeOp::Group(GroupSpec::Reduce {
+            keys: vec![out_item(func_dom(planned_record))],
+            reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(out_dom(
+                "cte_req_reduction",
+            ))),
+            plan: ReductionPlan {
+                tree_groups: vec![TreeGroupPlan {
+                    location: TreeGroupLocation::InKeys,
+                    item_index: 0,
+                    requirements: CteRequirements {
+                        needs_cte: false,
+                        accumulated_grouping_keys: vec![(None, scalar_sub("cte_requirements"))],
+                        join_keys: vec![],
+                        location: TreeGroupLocation::InKeys,
+                        nested_members_info: vec![],
+                    },
+                }],
+            },
+        }),
+    ));
+
+    // Applications — arguments, partition, ordering, and the scalar guard.
     carriers.push(general_with_func(
         "window_arg_src",
-        FunctionExpression::Window {
-            name: "w".into(),
-            arguments: vec![scalar_sub("window_arguments")],
-            partition_by: vec![],
-            order_by: vec![],
-            frame: None,
-            alias: None,
-        },
+        applied(
+            "w",
+            vec![HoArgument::Value(
+                crate::pipeline::asts::core::ArgumentValue::plain(scalar_sub("window_arguments")),
+            )],
+            Some(WindowSpec {
+                partition: vec![],
+                ordering: vec![],
+                frame: None,
+            }),
+            None,
+        ),
     ));
     carriers.push(general_with_func(
         "window_part_src",
-        FunctionExpression::Window {
-            name: "w".into(),
-            arguments: vec![],
-            partition_by: vec![scalar_sub("window_partition_by")],
-            order_by: vec![],
-            frame: None,
-            alias: None,
-        },
+        applied(
+            "w",
+            vec![],
+            Some(WindowSpec {
+                partition: vec![scalar_sub("window_partition_by")],
+                ordering: vec![],
+                frame: None,
+            }),
+            None,
+        ),
+    ));
+    carriers.push(general_with_func(
+        "application_guard_src",
+        applied("w", vec![], None, Some(inner_exists("application_guard"))),
     ));
     carriers.push(general_with_func(
         "window_order_src",
-        FunctionExpression::Window {
-            name: "w".into(),
-            arguments: vec![],
-            partition_by: vec![],
-            order_by: vec![OrderingSpec {
-                column: scalar_sub("window_order_by"),
-                direction: None,
-            }],
-            frame: None,
-            alias: None,
-        },
+        applied(
+            "w",
+            vec![],
+            Some(WindowSpec {
+                partition: vec![],
+                ordering: vec![OrderingSpec {
+                    column: scalar_sub("window_order_by"),
+                    direction: None,
+                }],
+                frame: None,
+            }),
+            None,
+        ),
     ));
 
     // Templates — a string-template interpolation.
     carriers.push(general_with_func(
         "template_src",
-        FunctionExpression::StringTemplate {
-            parts: vec![StringTemplatePart::Interpolation(Box::new(scalar_sub(
-                "template_interpolation",
-            )))],
-            alias: None,
-        },
+        crate::pipeline::asts::core::FunctionApplication::Template(
+            ValueTemplate::interpolating(vec![ValueTemplatePart::Interpolation(Box::new(
+                scalar_sub("template_interpolation"),
+            ))])
+            .expect("one interpolation"),
+        ),
     ));
 
-    // JSON paths — the source expression.
+    // JSON access — the source expression. The path is a spec: there is no
+    // expression under it for a walk to reach.
     carriers.push(general_with_func(
-        "jsonpath_src",
-        FunctionExpression::JsonPath {
-            source: Box::new(scalar_sub("jsonpath_source")),
-            path: Box::new(DomainExpression::NonUnifiyingUnderscore),
-            alias: None,
-        },
+        "jsonaccess_src",
+        crate::pipeline::asts::core::FunctionApplication::JsonAccess(
+            crate::pipeline::asts::core::JsonAccess {
+                source: Box::new(scalar_sub("jsonaccess_source")),
+                path: crate::pipeline::asts::core::Path::try_from_steps(vec![
+                    crate::pipeline::asts::core::PathStep::Key("k".to_string()),
+                ])
+                .expect("one step"),
+            },
+        ),
     ));
 
     let body = chain(carriers);
@@ -773,32 +864,28 @@ fn r_i4_recursion_closure_matrix_extended() {
     // Every carrier's sentinel MUST be reached. A missing one is a real closure
     // hole in the shared `AstVisit` walk (RED — the fix closes that walk edge).
     let expected = [
-        "projectout_expressions",
         "tupleordering_specs",
         "mapcover_function",
-        "mapcover_columns",
-        "modulo_reducing_by",
-        "modulo_delegates",
-        "modulo_columns",
-        "renamecover_specs",
-        "reposition_moves",
+        "group_keys",
+        "group_delegates",
+        "group_distinct_keys",
         "embedmapcover_function",
-        "embedmapcover_selector",
-        "hoview_domain_spec",
+        "hoview_access",
+        "hoview_rich_argument",
         "hoview_first_parens_spec",
-        "dml_domain_spec",
+        "dml_access",
         "directiveterminal_arguments",
-        "dpi_domain_spec",
+        "dpi_access",
         "case_arm_condition",
         "case_arm_result",
-        "curly_member",
+        "record_member",
         "cte_requirements",
-        "array_member",
         "window_arguments",
         "window_partition_by",
         "window_order_by",
+        "application_guard",
         "template_interpolation",
-        "jsonpath_source",
+        "jsonaccess_source",
     ];
     let missing: Vec<&str> = expected
         .iter()
@@ -825,8 +912,10 @@ struct PruneInnerRelations {
 }
 impl AstVisit<Unresolved> for PruneInnerRelations {
     fn enter_relation(&mut self, r: &Relation<Unresolved>) -> Result<Descent> {
-        if let Relation::PseudoPredicate { name, .. } = r {
-            self.seen.push(name.clone());
+        if let Relation::FunctorCall { call, .. } = r {
+            if let Some(reference) = Some(&call.call().callee) {
+                self.seen.push(reference.name_text().to_string());
+            }
         }
         Ok(Descent::Continue)
     }
@@ -837,22 +926,22 @@ impl AstVisit<Unresolved> for PruneInnerRelations {
 
 #[test]
 fn skip_subtree_prunes_exactly_its_subtree() {
-    let pruned = RelationalExpression::Relation(Relation::InnerRelation {
+    let pruned = Chain::relation(Relation::InnerRelation {
         pattern: InnerRelationPattern::Indeterminate {
             identifier: qn("i"),
             subquery: Box::new(sentinel("under_pruned")),
         },
+        preminted_scope: None,
         alias: None,
         outer: false,
-        cpr_schema: PhaseBox::phantom(),
+        cpr_schema: (),
     });
-    let tree = RelationalExpression::Join {
-        left: Box::new(pruned),
-        right: Box::new(sentinel("sibling")),
-        join_condition: None,
+    let tree = pruned.then(Continuation::Member {
+        rhs: sentinel("sibling"),
+        correlation: None,
         join_type: None,
-        cpr_schema: PhaseBox::phantom(),
-    };
+        cpr_schema: (),
+    });
 
     let mut c = PruneInnerRelations::default();
     walk_visit_relational(&mut c, &tree).expect("walk ok");
@@ -880,8 +969,12 @@ struct BreakAt {
 }
 impl AstVisit<Unresolved> for BreakAt {
     fn enter_relation(&mut self, r: &Relation<Unresolved>) -> Result<Descent> {
-        if let Relation::PseudoPredicate { name, .. } = r {
-            self.seen.push(name.clone());
+        if let Relation::FunctorCall { call, .. } = r {
+            let Some(reference) = Some(&call.call().callee) else {
+                return Ok(Descent::Continue);
+            };
+            let name = reference.name_text();
+            self.seen.push(name.to_string());
             if name == self.stop_at {
                 return Ok(Descent::Break);
             }
@@ -893,19 +986,17 @@ impl AstVisit<Unresolved> for BreakAt {
 #[test]
 fn break_stops_the_walk_promptly() {
     // Left-to-right: first, then (second, third).
-    let tree = RelationalExpression::Join {
-        left: Box::new(sentinel("first")),
-        right: Box::new(RelationalExpression::Join {
-            left: Box::new(sentinel("second")),
-            right: Box::new(sentinel("third")),
-            join_condition: None,
+    let tree = sentinel("first").then(Continuation::Member {
+        rhs: sentinel("second").then(Continuation::Member {
+            rhs: sentinel("third"),
+            correlation: None,
             join_type: None,
-            cpr_schema: PhaseBox::phantom(),
+            cpr_schema: (),
         }),
-        join_condition: None,
+        correlation: None,
         join_type: None,
-        cpr_schema: PhaseBox::phantom(),
-    };
+        cpr_schema: (),
+    });
 
     let mut c = BreakAt {
         stop_at: "second",
@@ -933,11 +1024,15 @@ struct FailAt {
 }
 impl AstVisit<Unresolved> for FailAt {
     fn enter_relation(&mut self, r: &Relation<Unresolved>) -> Result<Descent> {
-        if let Relation::PseudoPredicate { name, .. } = r {
+        if let Relation::FunctorCall { call, .. } = r {
+            let Some(reference) = Some(&call.call().callee) else {
+                return Ok(Descent::Continue);
+            };
+            let name = reference.name_text();
             if name == self.boom {
                 return Err(DelightQLError::parse_error("boom"));
             }
-            self.seen.push(name.clone());
+            self.seen.push(name.to_string());
         }
         Ok(Descent::Continue)
     }
@@ -945,19 +1040,17 @@ impl AstVisit<Unresolved> for FailAt {
 
 #[test]
 fn err_hook_short_circuits_the_walk() {
-    let tree = RelationalExpression::Join {
-        left: Box::new(sentinel("before")),
-        right: Box::new(RelationalExpression::Join {
-            left: Box::new(sentinel("boom")),
-            right: Box::new(sentinel("after")),
-            join_condition: None,
+    let tree = sentinel("before").then(Continuation::Member {
+        rhs: sentinel("boom").then(Continuation::Member {
+            rhs: sentinel("after"),
+            correlation: None,
             join_type: None,
-            cpr_schema: PhaseBox::phantom(),
+            cpr_schema: (),
         }),
-        join_condition: None,
+        correlation: None,
         join_type: None,
-        cpr_schema: PhaseBox::phantom(),
-    };
+        cpr_schema: (),
+    });
 
     let mut c = FailAt {
         boom: "boom",
@@ -978,23 +1071,29 @@ fn err_hook_short_circuits_the_walk() {
     );
 }
 
-/// REVIEW REMEDIATION (Phase 3a review, P1): `PseudoPredicate.access` is a
-/// recursive field — a demand or subquery embedded in the receipt-access
-/// spec must be visible to every `AstVisit` tenant (effect discipline, R9
-/// discovery, compile purity). This is the structural regression for the
-/// missing walker edge: a sentinel smuggled beneath `access` via a scalar
-/// subquery must be seen by the generic walk.
+/// A call's RECEIPT is a recursive field of the position it stands in — a
+/// demand or subquery embedded in the receipt-access spec must be visible to
+/// every `AstVisit` tenant (effect discipline, R9 discovery, compile purity).
+/// The structural regression for a missing walker edge: a sentinel smuggled
+/// beneath the access via a scalar subquery must be seen by the generic walk.
 #[test]
-fn visit_reaches_pseudo_predicate_access() {
-    let expr: RelationalExpression<Unresolved> =
-        RelationalExpression::Relation(Relation::PseudoPredicate {
-            name: "outer!".to_string(),
-            namespace: Vec::new(),
-            arguments: vec![scalar_sub("inside-arguments")],
-            access: DomainSpec::Positional(vec![scalar_sub("inside-access")]),
+fn visit_reaches_functor_call_access() {
+    let expr: Chain<Unresolved> = Chain::read(
+        Relation::FunctorCall {
             alias: None,
-            cpr_schema: PhaseBox::phantom(),
-        });
+            call: call(
+                "outer!",
+                vec![HoArgument::Value(
+                    crate::pipeline::asts::core::ArgumentValue::plain(scalar_sub(
+                        "inside-arguments",
+                    )),
+                )],
+            ),
+            cpr_schema: (),
+        },
+        Access::from_terms(vec![scalar_sub("inside-access")]),
+        (),
+    );
 
     let mut collector = SentinelCollector::default();
     walk_visit_relational(&mut collector, &expr).expect("walk succeeds");
@@ -1009,4 +1108,35 @@ fn visit_reaches_pseudo_predicate_access() {
         "ACCESS edge lost — the recursive field has no walker edge: {:?}",
         collector.seen
     );
+}
+
+/// A NEW SEMANTIC MEMBER MUST FAIL EVERY CONSUMER THAT OWES A DECISION.
+///
+/// Both shared walks match every AST enum exhaustively: a variant added to
+/// one of them stops the build until each walk says what to do with it. A
+/// wildcard arm would make that silent, so the two walk modules carry
+/// exactly one — over `Descent`, the walks' own two-variant control answer,
+/// which is not an AST carrier.
+///
+/// This is a ratchet, not a style rule. If a wildcard is genuinely wanted,
+/// the number below moves in the same change that explains why.
+#[test]
+fn the_shared_walks_hide_no_ast_member_behind_a_wildcard() {
+    for (source, expected) in [
+        (include_str!("mod.rs"), 1),
+        (include_str!("../ast_transform/mod.rs"), 0),
+    ] {
+        let wildcards = source
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                line.starts_with("_ =>") || line.starts_with("_ if ")
+            })
+            .count();
+        assert_eq!(
+            wildcards, expected,
+            "a wildcard arm in a shared walk lets a new AST member pass \
+             without a decision"
+        );
+    }
 }

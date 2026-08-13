@@ -3,43 +3,40 @@
 // Smart constructors for AST expression types
 // Provides fluent builder APIs to reduce boilerplate in AST construction
 
+use crate::pipeline::asts::core::Comparison;
 use crate::pipeline::asts::core::{
-    BooleanExpression, ContainmentSemantic, DomainExpression, FilterOrigin, FunctionExpression,
-    JoinType, LiteralValue, ModuloSpec, OrderingSpec, OutputDomainExpression, PhaseBox,
-    RelationalExpression, RenameSpec, SigmaCondition, UnaryRelationalOperator, UsingColumn,
+    AuthoredColumn, Chain, Continuation, DomainExpression,
+    FunctionApplication, LiteralValue, Phase, RenameSpec, TruthExpression,
+    PipeOp, Unresolved,
 };
+use crate::pipeline::asts::core::{NamedReference, Reference, SelectorItem};
 use delightql_types::SqlIdentifier;
 
 // ============================================================================
 // DomainExpression Builders
 // ============================================================================
 
-impl<Phase> DomainExpression<Phase> {
-    pub fn lvar_builder(name: impl Into<SqlIdentifier>) -> LvarBuilder<Phase> {
+impl DomainExpression<Unresolved> {
+    /// A written column reference. Only the authored phase has one to write:
+    /// after resolution a column is an identity, and there is no door here
+    /// that turns characters back into one.
+    pub fn lvar_builder(name: impl Into<SqlIdentifier>) -> LvarBuilder {
         LvarBuilder {
             name: name.into(),
             qualifier: None,
             namespace_path: vec![],
-            alias: None,
-            _phase: std::marker::PhantomData,
         }
     }
+}
 
+impl<P: Phase> DomainExpression<P> {
     pub fn literal_builder(value: LiteralValue) -> LiteralBuilder {
-        LiteralBuilder { value, alias: None }
+        LiteralBuilder { value }
     }
 
-    pub fn predicate_builder(expr: BooleanExpression) -> PredicateBuilder {
+    pub fn predicate_builder(expr: TruthExpression) -> PredicateBuilder {
         PredicateBuilder {
             expr: Box::new(expr),
-            alias: None,
-        }
-    }
-
-    pub fn glob_builder() -> GlobBuilder {
-        GlobBuilder {
-            qualifier: None,
-            namespace_path: vec![],
         }
     }
 
@@ -52,15 +49,13 @@ impl<Phase> DomainExpression<Phase> {
 // Builder Structs
 // ============================================================================
 
-pub struct LvarBuilder<Phase> {
+pub struct LvarBuilder {
     name: SqlIdentifier,
     qualifier: Option<SqlIdentifier>,
     namespace_path: Vec<String>,
-    alias: Option<SqlIdentifier>,
-    _phase: std::marker::PhantomData<Phase>,
 }
 
-impl<Phase> LvarBuilder<Phase> {
+impl LvarBuilder {
     /// Set the qualifier, preserving the caller's SqlIdentifier (stroppedness
     /// survives). `String`/`&str` land unstropped via the From impls.
     pub fn with_qualifier(mut self, qualifier: impl Into<SqlIdentifier>) -> Self {
@@ -80,136 +75,84 @@ impl<Phase> LvarBuilder<Phase> {
         self
     }
 
-    /// Set the alias, preserving the caller's SqlIdentifier.
-    pub fn with_alias(mut self, alias: impl Into<SqlIdentifier>) -> Self {
-        self.alias = Some(alias.into());
-        self
-    }
-
-    /// Optional-alias form (mirrors `with_qualifier_opt`).
-    pub fn with_alias_opt(mut self, alias: Option<SqlIdentifier>) -> Self {
-        self.alias = alias;
-        self
-    }
-
-    pub fn build(self) -> DomainExpression<Phase> {
+    pub fn build(self) -> DomainExpression<Unresolved> {
         use crate::pipeline::asts::unresolved::NamespacePath;
-        DomainExpression::Lvar {
+        DomainExpression::Reference(Reference::Named(NamedReference(AuthoredColumn {
             name: self.name,
             qualifier: self.qualifier,
             namespace_path: NamespacePath::from_parts(self.namespace_path)
                 .expect("Invalid namespace path"),
-            alias: self.alias,
-            provenance: PhaseBox::phantom(),
-        }
+        })))
     }
 }
 
 pub struct LiteralBuilder {
     value: LiteralValue,
-    alias: Option<String>,
 }
 
 impl LiteralBuilder {
-    pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
-        self.alias = Some(alias.into());
-        self
-    }
-
     pub fn build(self) -> DomainExpression {
-        DomainExpression::Literal {
-            value: self.value,
-            alias: self.alias.map(|s| s.into()),
-        }
+        DomainExpression::Application(super::expressions::FunctionApplication::Ground(self.value))
     }
 }
 
 pub struct PredicateBuilder {
-    expr: Box<BooleanExpression>,
-    alias: Option<String>,
+    expr: Box<TruthExpression>,
 }
 
 impl PredicateBuilder {
-    pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
-        self.alias = Some(alias.into());
-        self
-    }
-
-    pub fn build(self) -> BooleanExpression {
+    pub fn build(self) -> TruthExpression {
         // Return the boolean expression directly - no wrapping!
         *self.expr
     }
 }
 
 // ============================================================================
-// BooleanExpression Builders
+// TruthExpression Builders
 // ============================================================================
 
-impl BooleanExpression {
+impl TruthExpression {
     pub fn comparison(
-        op: impl Into<String>,
+        op: crate::pipeline::asts::vocabulary::CmpOp,
         left: DomainExpression,
         right: DomainExpression,
     ) -> Self {
-        BooleanExpression::Comparison {
-            operator: op.into(),
+        TruthExpression::Comparison(Comparison {
+            operator: op,
             left: Box::new(left),
             right: Box::new(right),
-        }
-    }
-
-    pub fn and(left: BooleanExpression, right: BooleanExpression) -> Self {
-        BooleanExpression::And {
-            left: Box::new(left),
-            right: Box::new(right),
-        }
-    }
-
-    pub fn or(left: BooleanExpression, right: BooleanExpression) -> Self {
-        BooleanExpression::Or {
-            left: Box::new(left),
-            right: Box::new(right),
-        }
-    }
-
-    pub fn using(columns: Vec<UsingColumn>) -> Self {
-        BooleanExpression::Using { columns }
+        })
     }
 }
 
+// THE CANONICAL CONSTRUCTORS ARE `all` AND `any`, and they are the only ones.
+// A binary `and`/`or` pair stood here building a two-member `Vec2` directly,
+// which rebuilt the same-operator nesting the n-ary carrier exists to make
+// impossible: handed a conjunction, it produced a conjunction of one. They
+// had no caller; splicing is not an option a second door may decline.
+
 // ============================================================================
-// FunctionExpression Builders
+// FunctionApplication Builders
 // ============================================================================
 
-impl FunctionExpression {
-    pub fn function_builder(name: impl Into<String>) -> FunctionBuilder {
+impl FunctionApplication {
+    pub fn function_builder(reference: crate::pipeline::asts::vocabulary::Ref) -> FunctionBuilder {
         FunctionBuilder {
-            name: name.into(),
-            namespace: None,
+            reference,
             arguments: Vec::new(),
             alias: None,
             is_curried: false,
             conditioned_on: None,
         }
     }
-
-    pub fn infix(op: impl Into<String>, left: DomainExpression, right: DomainExpression) -> Self {
-        FunctionExpression::Infix {
-            operator: op.into(),
-            left: Box::new(left),
-            right: Box::new(right),
-            alias: None,
-        }
-    }
 }
 
 pub struct FunctionBuilder {
-    name: String,
-    namespace: Option<crate::pipeline::asts::core::metadata::NamespacePath>,
+    reference: crate::pipeline::asts::vocabulary::Ref,
     arguments: Vec<DomainExpression>,
     alias: Option<String>,
     is_curried: bool,
-    conditioned_on: Option<Box<BooleanExpression>>,
+    conditioned_on: Option<Box<TruthExpression>>,
 }
 
 impl FunctionBuilder {
@@ -223,68 +166,27 @@ impl FunctionBuilder {
         self
     }
 
-    pub fn with_namespace(
-        mut self,
-        namespace: Option<crate::pipeline::asts::core::metadata::NamespacePath>,
-    ) -> Self {
-        self.namespace = namespace;
-        self
-    }
-
     pub fn as_curried(mut self) -> Self {
         self.is_curried = true;
         self
     }
 
-    pub fn with_condition(mut self, condition: BooleanExpression) -> Self {
+    pub fn with_condition(mut self, condition: TruthExpression) -> Self {
         self.conditioned_on = Some(Box::new(condition));
         self
     }
 
-    pub fn build(self) -> FunctionExpression {
-        if self.is_curried {
-            FunctionExpression::Curried {
-                name: self.name.into(),
-                namespace: self.namespace,
-                arguments: self.arguments,
-                conditioned_on: self.conditioned_on,
-            }
-        } else {
-            FunctionExpression::Regular {
-                name: self.name.into(),
-                namespace: self.namespace,
-                arguments: self.arguments,
-                alias: self.alias.map(|s| s.into()),
-                conditioned_on: self.conditioned_on,
-            }
-        }
-    }
-}
-
-pub struct GlobBuilder {
-    qualifier: Option<String>,
-    namespace_path: Vec<String>,
-}
-
-impl GlobBuilder {
-    pub fn with_qualifier(mut self, qualifier: impl Into<String>) -> Self {
-        self.qualifier = Some(qualifier.into());
-        self
-    }
-
-    pub fn with_namespace_path(mut self, namespace_path: Vec<String>) -> Self {
-        self.namespace_path = namespace_path;
-        self
-    }
-
-    pub fn build(self) -> DomainExpression {
-        use crate::pipeline::asts::core::expressions::domain::ProjectionExpr;
-        use crate::pipeline::asts::unresolved::NamespacePath;
-        DomainExpression::Projection(ProjectionExpr::Glob {
-            qualifier: self.qualifier.map(|s| s.into()),
-            namespace_path: NamespacePath::from_parts(self.namespace_path)
-                .expect("Invalid namespace path"),
-        })
+    pub fn build(self) -> FunctionApplication {
+        let call = crate::pipeline::asts::core::FunctorCall::scalar(self.reference, self.arguments);
+        let _ = self.is_curried;
+        super::expressions::FunctionApplication::Standard(
+            crate::pipeline::asts::core::StandardApplication {
+                call: crate::pipeline::asts::core::PureCall::seal(call)
+                    .expect("scalar function builder only accepts pure references"),
+                guard: self.conditioned_on,
+                window: None,
+            },
+        )
     }
 }
 
@@ -292,7 +194,9 @@ pub struct PlaceholderBuilder;
 
 impl PlaceholderBuilder {
     pub fn build(self) -> DomainExpression {
-        DomainExpression::NonUnifiyingUnderscore
+        DomainExpression::Application(super::expressions::FunctionApplication::Open(
+            super::expressions::DomainHole::Disregarded,
+        ))
     }
 }
 
@@ -300,142 +204,20 @@ impl PlaceholderBuilder {
 // Mini-Kingdom: Binary Predicate Composition
 // ============================================================================
 // REMOVED - The old and/or methods were incorrectly wrapping predicates
-// Now we use the proper BooleanExpression::And and BooleanExpression::Or variants
-// defined above in the main BooleanExpression impl block
+// Now we use the proper TruthExpression::And and TruthExpression::Or variants
+// defined above in the main TruthExpression impl block
 
 // ============================================================================
-// Kingdom 2: RelationalExpression Builders
+// Kingdom 2: Chain builders
 // ============================================================================
 
-impl<Phase> RelationalExpression<Phase> {
-    /// Create a join builder
-    pub fn join_builder(
-        left: RelationalExpression<Phase>,
-        right: RelationalExpression<Phase>,
-    ) -> JoinBuilder<Phase> {
-        JoinBuilder {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_condition: None,
-            join_type: None,
-            cpr_schema: crate::pipeline::asts::core::PhaseBox::phantom(),
-            _phase: std::marker::PhantomData,
-        }
-    }
-
-    /// Create a filter builder  
-    pub fn filter_builder(source: RelationalExpression<Phase>) -> FilterBuilder<Phase> {
-        FilterBuilder {
-            source: Box::new(source),
-            condition: None,
-            cpr_schema: crate::pipeline::asts::core::PhaseBox::phantom(),
-            _phase: std::marker::PhantomData,
-        }
-    }
-
-    /// Create a pipe builder
-    pub fn pipe_builder(source: RelationalExpression<Phase>) -> PipeBuilder<Phase> {
+impl<P: Phase> Chain<P> {
+    /// Apply a pipe operator to this chain.
+    pub fn pipe_builder(source: Chain<P>, cpr_schema: P::Scope) -> PipeBuilder<P> {
         PipeBuilder {
             source,
             operator: None,
-            cpr_schema: crate::pipeline::asts::core::PhaseBox::phantom(),
-            _phase: std::marker::PhantomData,
-        }
-    }
-}
-
-// ============================================================================
-// Join Builder
-// ============================================================================
-
-pub struct JoinBuilder<Phase> {
-    left: Box<RelationalExpression<Phase>>,
-    right: Box<RelationalExpression<Phase>>,
-    join_condition: Option<BooleanExpression<Phase>>,
-    join_type: Option<JoinType>,
-    cpr_schema:
-        crate::pipeline::asts::core::PhaseBox<crate::pipeline::asts::core::CprSchema, Phase>,
-    _phase: std::marker::PhantomData<Phase>,
-}
-
-impl<Phase> JoinBuilder<Phase> {
-    /// Add ON condition (mutually exclusive with using/natural)
-    pub fn with_on(mut self, condition: SigmaCondition<Phase>) -> Self {
-        assert!(self.join_condition.is_none(), "Join condition already set");
-        self.join_condition = Some(match condition {
-            SigmaCondition::Predicate(expr) => expr,
-            _ => panic!("Only predicate conditions supported in ON clause"), // TODO: Better error handling
-        });
-        self
-    }
-
-    /// Add USING condition (mutually exclusive with on/natural)
-    pub fn with_using(mut self, condition: SigmaCondition<Phase>) -> Self {
-        assert!(self.join_condition.is_none(), "Join condition already set");
-        self.join_condition = Some(match condition {
-            SigmaCondition::Predicate(expr) => expr,
-            _ => panic!("Only predicate conditions supported in USING clause"), // TODO: Better error handling
-        });
-        self
-    }
-
-    /// Add a USING expression directly (mutually exclusive with on/natural/with_using)
-    pub fn with_using_expr(mut self, expr: BooleanExpression<Phase>) -> Self {
-        assert!(self.join_condition.is_none(), "Join condition already set");
-        self.join_condition = Some(expr);
-        self
-    }
-
-    /// Natural join (mutually exclusive with on/using)
-    pub fn natural(self) -> Self {
-        assert!(self.join_condition.is_none(), "Join condition already set");
-        // Natural joins have no explicit condition
-        self
-    }
-
-    /// Set join type
-    pub fn with_join_type(mut self, join_type: JoinType) -> Self {
-        self.join_type = Some(join_type);
-        self
-    }
-
-    pub fn build(self) -> RelationalExpression<Phase> {
-        RelationalExpression::Join {
-            left: self.left,
-            right: self.right,
-            join_condition: self.join_condition,
-            join_type: self.join_type,
-            cpr_schema: self.cpr_schema,
-        }
-    }
-}
-
-// ============================================================================
-// Filter Builder
-// ============================================================================
-
-pub struct FilterBuilder<Phase> {
-    source: Box<RelationalExpression<Phase>>,
-    condition: Option<SigmaCondition<Phase>>,
-    cpr_schema:
-        crate::pipeline::asts::core::PhaseBox<crate::pipeline::asts::core::CprSchema, Phase>,
-    _phase: std::marker::PhantomData<Phase>,
-}
-
-impl<Phase> FilterBuilder<Phase> {
-    /// Add WHERE condition
-    pub fn with_condition(mut self, condition: SigmaCondition<Phase>) -> Self {
-        assert!(self.condition.is_none(), "Filter condition already set");
-        self.condition = Some(condition);
-        self
-    }
-
-    pub fn build(self) -> RelationalExpression<Phase> {
-        RelationalExpression::Filter {
-            source: self.source,
-            condition: self.condition.expect("Filter must have a condition"),
-            origin: FilterOrigin::default(),
-            cpr_schema: self.cpr_schema,
+            cpr_schema,
         }
     }
 }
@@ -444,89 +226,46 @@ impl<Phase> FilterBuilder<Phase> {
 // Pipe Builder
 // ============================================================================
 
-pub struct PipeBuilder<Phase> {
-    source: RelationalExpression<Phase>,
-    operator: Option<UnaryRelationalOperator<Phase>>,
-    cpr_schema:
-        crate::pipeline::asts::core::PhaseBox<crate::pipeline::asts::core::CprSchema, Phase>,
-    _phase: std::marker::PhantomData<Phase>,
+pub struct PipeBuilder<P: Phase> {
+    source: Chain<P>,
+    operator: Option<PipeOp<P>>,
+    cpr_schema: P::Scope,
 }
 
-impl<Phase> PipeBuilder<Phase> {
-    /// Add projection operator |> [expressions]
-    pub fn with_projection(mut self, expressions: Vec<DomainExpression<Phase>>) -> Self {
-        assert!(self.operator.is_none(), "Pipe operator already set");
-        self.operator = Some(UnaryRelationalOperator::General {
-            containment_semantic: ContainmentSemantic::Bracket,
-            expressions,
-        });
-        self
-    }
-
-    /// Add grouping operator |> %(reducing_by)
-    pub fn with_grouping(
+impl<P: Phase> PipeBuilder<P> {
+    /// Add projection operator |> [items]
+    pub fn with_projection(
         mut self,
-        reducing_by: Vec<DomainExpression<Phase>>,
-        reducing_on: Vec<DomainExpression<Phase>>,
+        items: crate::pipeline::asts::vocabulary::Vec1<crate::pipeline::asts::core::OutItem<P>>,
     ) -> Self {
         assert!(self.operator.is_none(), "Pipe operator already set");
-        self.operator = Some(UnaryRelationalOperator::Modulo {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            spec: ModuloSpec::GroupBy {
-                // Phantom-wrap: the output decision is stamped by the resolver.
-                reducing_by: reducing_by
-                    .into_iter()
-                    .map(|expr| OutputDomainExpression {
-                        expr,
-                        output: PhaseBox::phantom(),
-                    })
-                    .collect(),
-                reducing_on: reducing_on
-                    .into_iter()
-                    .map(|expr| OutputDomainExpression {
-                        expr,
-                        output: PhaseBox::phantom(),
-                    })
-                    .collect(),
-                delegates: vec![], // Default to empty
-            },
-        });
+        self.operator = Some(PipeOp::Project(items));
         self
     }
 
-    /// Add ordering operator |> #(specs)
-    pub fn with_ordering(mut self, specs: Vec<OrderingSpec<Phase>>) -> Self {
-        assert!(self.operator.is_none(), "Pipe operator already set");
-        self.operator = Some(UnaryRelationalOperator::TupleOrdering {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            specs,
-        });
-        self
-    }
 
-    /// Add project out operator |> ^[expressions]
-    pub fn with_project_out(mut self, expressions: Vec<DomainExpression<Phase>>) -> Self {
+    /// Add project out operator |> ^[selector]
+    pub fn with_project_out(mut self, selector: Vec<SelectorItem<P>>) -> Self {
         assert!(self.operator.is_none(), "Pipe operator already set");
-        self.operator = Some(UnaryRelationalOperator::ProjectOut {
-            containment_semantic: ContainmentSemantic::Bracket,
-            expressions,
-        });
+        self.operator = Some(PipeOp::ProjectOut(selector));
         self
     }
 
     /// Add rename cover operator |> *(specs)
-    pub fn with_rename_cover(mut self, specs: Vec<RenameSpec<Phase>>) -> Self {
+    pub fn with_rename_cover(
+        mut self,
+        specs: crate::pipeline::asts::vocabulary::Vec1<RenameSpec<P>>,
+    ) -> Self {
         assert!(self.operator.is_none(), "Pipe operator already set");
-        self.operator = Some(UnaryRelationalOperator::RenameCover { specs });
+        self.operator = Some(PipeOp::Rename(specs));
         self
     }
 
-    pub fn build(self) -> RelationalExpression<Phase> {
-        use crate::pipeline::asts::core::PipeExpression;
-        RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-            source: self.source,
+    pub fn build(self) -> Chain<P> {
+        self.source.then(Continuation::Pipe {
             operator: self.operator.expect("Pipe must have an operator"),
+            named: P::no_stage_name(),
             cpr_schema: self.cpr_schema,
-        })))
+        })
     }
 }

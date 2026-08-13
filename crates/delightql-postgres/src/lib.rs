@@ -9,7 +9,7 @@
 //! is the protocol's "spoken identically on both sides" claim made
 //! a type-level fact.
 //!
-//! Step 2 (ALL-SQL-TARGETING-STATE.md): the query path.
+//! The query path.
 //!
 //! ## Text-mode execution (the parity decision)
 //!
@@ -30,8 +30,8 @@
 //! multi-statement input), descriptors degrade to empty and
 //! `simple_query` remains the single authoritative source of errors.
 //!
-//! **Inside an open transaction block the prepare is SKIPPED entirely**
-//! (E-T3a; EFFECTS-ON-TARGETS-PLAN.md §3). A failed extended-protocol
+//! **Inside an open transaction block the prepare is SKIPPED entirely.**
+//! A failed extended-protocol
 //! Parse inside a block ABORTS the block, so preparing mid-transaction
 //! (a) killed the caller's bracket one statement early and (b) masked
 //! every real error as 25P02 ("current transaction is aborted") when
@@ -49,8 +49,7 @@
 //! Eager materialization (SqlParty's cursor-streaming worker is the
 //! later perf upgrade, not a correctness need).
 //!
-//! ## The load path (step 7 — Prepare/Offer's first server AND first
-//! real exercise anywhere)
+//! ## The load path
 //!
 //! `Prepare` text must be a `COPY ... FROM STDIN` statement; the
 //! layer-1 convention (mirroring catalog discovery being "just Query")
@@ -91,7 +90,7 @@ struct LoadState {
     rows: Vec<Vec<Cell>>,
 }
 
-/// Transaction-block state of the party's one PG session (E-T3a).
+/// Transaction-block state of the party's one PG session.
 ///
 /// Tracked so the descriptor-harvest prepare runs ONLY outside a
 /// transaction block: a failed Parse inside a block aborts it, killing
@@ -217,7 +216,7 @@ pub struct PgParty {
     handles: HashMap<Handle, ResultState>,
     loads: HashMap<Handle, LoadState>,
     next_handle_id: u64,
-    /// E-T3a: transaction-block state of the one session, so the
+    /// Transaction-block state of the one session, so the
     /// descriptor prepare never runs (and never aborts) inside a block.
     /// A fresh connection is always idle.
     txn_state: TxnState,
@@ -282,7 +281,7 @@ impl PgParty {
         // On ANY prepare failure, fall through descriptor-less and let
         // simple_query be the single authoritative error source.
         //
-        // E-T3a: ONLY outside a transaction block. Inside one, a failed
+        // ONLY outside a transaction block. Inside one, a failed
         // Parse aborts the block — the caller's bracket would die one
         // statement early and every later error would surface as the
         // 25P02 mask instead of the true error. Mid-transaction,
@@ -542,11 +541,11 @@ fn unknown_handle() -> ServerTerm {
     error(ErrorKind::Connection, IDENT_PG_ERROR, b"unknown handle".to_vec())
 }
 
-/// SQLSTATE → identity-URI class (step 8 — relay-role question 5).
+/// SQLSTATE → identity-URI class.
 ///
 /// Identity = `delightql-error://target/postgres/<class>/<sqlstate>` — the class for
 /// programmatic matching by prefix, the exact SQLSTATE as the leaf for
-/// precision (feeds E11's diagnostics catalog). Exact codes override
+/// precision (feeds the diagnostics catalog). Exact codes override
 /// their class where the class default would mislead.
 fn sqlstate_class(code: &str) -> &'static str {
     match code {
@@ -598,12 +597,12 @@ fn pg_error(e: &postgres::Error) -> ServerTerm {
 impl Handler for PgParty {
     fn handle(&mut self, term: ClientTerm) -> ServerTerm {
         match term {
-            // Orientation negotiation per CP-2: intersect with what we
+            // Orientation negotiation: intersect with what we
             // support ([Rows], like SqlParty), error on empty agreement.
             // protocol_version/max_message_size/lease_ms echoed — the
             // fatboy grows an opinion about the version string when it
-            // becomes a separately-released binary (step 3/4); the lease
-            // becomes load-bearing at spawn-on-demand (step 5).
+            // becomes a separately-released binary; the lease
+            // becomes load-bearing at spawn-on-demand.
             ClientTerm::Version {
                 max_message_size,
                 protocol_version,
@@ -919,8 +918,6 @@ mod tests {
         session.close(handle).unwrap();
     }
 
-    /// THE MAIDEN VOYAGE: Prepare/Offer's first server and first real
-    /// exercise anywhere (the terms had ZERO clients before this).
     /// CREATE TEMP TABLE + COPY work in one relay connection because
     /// load-Close executes on the same PG session as queries.
     #[test]
@@ -1034,14 +1031,13 @@ mod tests {
         }
     }
 
-    // ── E-T3a: the descriptor-prepare must not poison open transactions ──
+    // ── the descriptor-prepare must not poison open transactions ──
     //
-    // P2 §D finding (EFFECTS-ON-TARGETS-PLAN.md §1 item 3): PgParty
-    // prepared EVERY query before simple_query. Inside an open
-    // transaction, a statement whose PREPARE failed aborted the PG
-    // transaction one statement early; the authoritative simple_query
-    // then reported 25P02, masking the real error (observed live: a
-    // receipt insert's true 3F000 surfaced as 25P02).
+    // Preparing EVERY query before simple_query is a tempting shortcut:
+    // inside an open transaction, a statement whose PREPARE fails aborts
+    // the PG transaction one statement early, and the authoritative
+    // simple_query then reports 25P02, masking the real error (e.g. a
+    // receipt insert's true 3F000 surfacing as 25P02).
     //
     // These tests use a scratch database (created here, dropped here,
     // WITH (FORCE)) so nothing in the container's shared fixtures is
@@ -1153,11 +1149,11 @@ mod tests {
         value
     }
 
-    /// (a) A mid-transaction statement's TRUE error must surface: the
-    /// receipt-insert shape from P2 §D — a statement referencing the
-    /// (nonexistent on PG) `temp` schema inside an open transaction —
-    /// must report 3F000 / `schema "temp" does not exist`, never the
-    /// 25P02 aborted-transaction mask.
+    /// (a) A mid-transaction statement's TRUE error must surface: a
+    /// statement referencing the (nonexistent on PG) `temp` schema
+    /// inside an open transaction must report 3F000 /
+    /// `schema "temp" does not exist`, never the 25P02
+    /// aborted-transaction mask.
     ///
     /// (b) The descriptor-prepare must never abort an open transaction
     /// one statement early. The distinguishing probe: a MULTI-STATEMENT
@@ -1183,11 +1179,11 @@ mod tests {
             session_on(&scratch_uri).expect("scratch db just created must be connectable");
 
         // ── (a) the masking reproduction ────────────────────────────
-        // The charter's receipt-insert shape. Live PG's TRUE error for
-        // DML into a missing schema is 42P01 "relation … does not
-        // exist" (3F000 is the CREATE spelling, next bracket): what
-        // matters is that the statement's OWN error surfaces, never the
-        // 25P02 aborted-transaction mask.
+        // This receipt-insert shape: live PG's TRUE error for DML into a
+        // missing schema is 42P01 "relation … does not exist" (3F000 is
+        // the CREATE spelling, next bracket) — what matters is that the
+        // statement's OWN error surfaces, never the 25P02
+        // aborted-transaction mask.
         expect_header(&mut s, "CREATE TABLE receipts_probe (id int, note text)");
         expect_header(&mut s, "BEGIN");
         expect_header(&mut s, "INSERT INTO receipts_probe VALUES (1, 'ok')");
@@ -1202,8 +1198,8 @@ mod tests {
         );
         expect_header(&mut s, "ROLLBACK");
 
-        // The receipt-SHELL shape (P2 §A's first hard refusal), whose
-        // true error IS 3F000 `schema "temp" does not exist`.
+        // The receipt-SHELL shape, whose true error IS 3F000
+        // `schema "temp" does not exist`.
         expect_header(&mut s, "BEGIN");
         expect_header(&mut s, "INSERT INTO receipts_probe VALUES (2, 'ok')");
         let msg = expect_error(&mut s, "CREATE TEMP TABLE temp.__r_x (x int)");
@@ -1227,8 +1223,8 @@ mod tests {
         );
         // The transaction is still healthy and sees both rows…
         let (h, dims) = expect_header(&mut s, "SELECT count(*) AS n FROM bracket_probe");
-        // …with descriptors DEGRADED inside the bracket (the agreed
-        // multi-statement-fallback behavior, now also the mid-txn one).
+        // …with descriptors DEGRADED inside the bracket (the same
+        // multi-statement-fallback behavior applies mid-transaction).
         assert_eq!(
             dims[0].descriptor,
             b(""),
@@ -1318,13 +1314,13 @@ mod tests {
 
     /// An erroring statement OUTSIDE any transaction must not degrade
     /// descriptor harvest for the statements after it (the pure-query
-    /// path keeps working exactly as today). Uses only the shared
+    /// path keeps working unaffected). Uses only the shared
     /// fixture read-only + errors: no objects created anywhere.
     #[test]
     fn descriptors_survive_errors_outside_transactions() {
         let Some((mut s, _)) = session() else { return };
         // (SELECT from a missing schema is 42P01 "relation does not
-        // exist" — 3F000 is the CREATE/INSERT spelling; P1 §H1.)
+        // exist" — 3F000 is the CREATE/INSERT spelling.)
         let msg = expect_error(&mut s, "SELECT * FROM temp.__r_x");
         assert!(msg.contains("42P01"), "expected 42P01, got: {msg}");
         let (h, dims) = expect_header(&mut s, "SELECT 1 AS x");

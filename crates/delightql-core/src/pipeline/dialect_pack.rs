@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 //! Per-compile dialect pack: the in-memory image of the `dialect_*`
-//! bootstrap tables (ALL-SQL-TARGETING-DESIGN.md §4, §7.11).
+//! bootstrap tables.
 //!
 //! Loaded once at the start of each query compile — alongside the other
 //! bootstrap-metadata reads — and handed to the target-aware stages
 //! (lowering, generator spelling) as a plain map, so the generator stays
 //! a pure in-memory walk and never holds a DB handle. SQLite is the
 //! canonical baseline and has no rows; a lookup miss means "use the
-//! code-resident canonical default" (DESIGN §7.10).
+//! code-resident canonical default".
 
-use rusqlite::Connection;
 use crate::enums::EntityType;
+use crate::names::Intrinsic;
+use rusqlite::Connection;
 use std::collections::HashMap;
 
-/// One rule body plus its interpreter discriminator (DESIGN §4.4).
+/// One rule body plus its interpreter discriminator.
 #[derive(Debug, Clone)]
 pub struct RenderRule {
     pub rule_kind: String,
@@ -24,7 +25,7 @@ pub struct RenderRule {
 impl RenderRule {
     /// The body as a positional template — the only interpreter the render
     /// layer accepts today. A row whose kind has no interpreter is a loud
-    /// error, never a silent fallback (DESIGN §4.4).
+    /// error, never a silent fallback.
     pub fn template(&self) -> Result<&str, String> {
         if self.rule_kind == "template" {
             Ok(&self.body)
@@ -38,7 +39,7 @@ impl RenderRule {
 }
 
 /// Form rules for one (dialect, form_type): the per-functor overrides plus
-/// the form-wide default (DESIGN §4.1's two grains via nullable entity_id).
+/// the form-wide default (two grains via nullable entity_id).
 #[derive(Debug, Default)]
 struct FormRules {
     default: Option<RenderRule>,
@@ -49,8 +50,33 @@ struct FormRules {
 #[derive(Debug, Default)]
 pub struct DialectPack {
     render: HashMap<String, HashMap<String, RenderRule>>,
+    intrinsic_render: HashMap<String, HashMap<(IntrinsicRenderKind, Intrinsic), RenderRule>>,
     /// dialect-family → form_type (entity_type_enum id) → rules.
     form: HashMap<String, HashMap<EntityType, FormRules>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum IntrinsicRenderKind {
+    Function,
+    Tvf,
+}
+
+fn intrinsic_render_key(key: &str) -> Option<(IntrinsicRenderKind, Intrinsic)> {
+    use crate::names::Intrinsic::{
+        Arbitrary, JsonEachArray, JsonEachObject, JsonExtractRaw, Round2, ScalarMax, ScalarMin,
+    };
+    use IntrinsicRenderKind::{Function, Tvf};
+
+    match key {
+        "fn.__dql_json_extract_raw" => Some((Function, JsonExtractRaw)),
+        "fn.__dql_scalar_max" => Some((Function, ScalarMax)),
+        "fn.__dql_scalar_min" => Some((Function, ScalarMin)),
+        "fn.__dql_round_2" => Some((Function, Round2)),
+        "fn.__dql_arbitrary" => Some((Function, Arbitrary)),
+        "tvf.__dql_json_each_array" => Some((Tvf, JsonEachArray)),
+        "tvf.__dql_json_each_object" => Some((Tvf, JsonEachObject)),
+        _ => None,
+    }
 }
 
 impl DialectPack {
@@ -68,6 +94,10 @@ impl DialectPack {
     /// exist); rows key on dialect family alone.
     pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
         let mut render: HashMap<String, HashMap<String, RenderRule>> = HashMap::new();
+        let mut intrinsic_render: HashMap<
+            String,
+            HashMap<(IntrinsicRenderKind, Intrinsic), RenderRule>,
+        > = HashMap::new();
         let mut stmt =
             conn.prepare("SELECT dialect, render_key, rule_kind, body FROM dialect_render")?;
         let rows = stmt.query_map([], |row| {
@@ -82,7 +112,14 @@ impl DialectPack {
         })?;
         for row in rows {
             let (dialect, key, rule) = row?;
-            render.entry(dialect).or_default().insert(key, rule);
+            if let Some(intrinsic) = intrinsic_render_key(&key) {
+                intrinsic_render
+                    .entry(dialect)
+                    .or_default()
+                    .insert(intrinsic, rule);
+            } else {
+                render.entry(dialect).or_default().insert(key, rule);
+            }
         }
 
         let mut form: HashMap<String, HashMap<EntityType, FormRules>> = HashMap::new();
@@ -124,7 +161,11 @@ impl DialectPack {
                 None => rules.default = Some(rule),
             }
         }
-        Ok(DialectPack { render, form })
+        Ok(DialectPack {
+            render,
+            intrinsic_render,
+            form,
+        })
     }
 
     /// Look up the render rule for a (dialect-family, render_key) pair.
@@ -133,8 +174,24 @@ impl DialectPack {
         self.render.get(dialect)?.get(key)
     }
 
+    pub fn render_intrinsic_function(
+        &self,
+        dialect: &str,
+        intrinsic: Intrinsic,
+    ) -> Option<&RenderRule> {
+        self.intrinsic_render
+            .get(dialect)?
+            .get(&(IntrinsicRenderKind::Function, intrinsic))
+    }
+
+    pub fn render_intrinsic_tvf(&self, dialect: &str, intrinsic: Intrinsic) -> Option<&RenderRule> {
+        self.intrinsic_render
+            .get(dialect)?
+            .get(&(IntrinsicRenderKind::Tvf, intrinsic))
+    }
+
     /// Look up the form-lowering rule for a functor invocation, with the
-    /// DESIGN §4.1 precedence: (entity + form + dialect) → (form + dialect
+    /// precedence: (entity + form + dialect) → (form + dialect
     /// default) → `None` = canonical code lowering.
     pub fn form_rule(
         &self,
@@ -148,7 +205,7 @@ impl DialectPack {
 }
 
 // ---------------------------------------------------------------------------
-// rust_handler interpreter (DESIGN §4.4): the rule body names a compiled
+// rust_handler interpreter: the rule body names a compiled
 // lowering fn for renders a positional template cannot express — argument
 // TRANSFORMATION (a '$.a.b' path literal rewritten to PG '{a,b}' spelling)
 // or argument SYNTHESIS (group_concat's implicit default separator).
@@ -235,7 +292,12 @@ fn pg_json_path(args: &[&str], distinct: bool, op: &str) -> Result<String, Strin
         return Err(format!("json path read takes 2 args, got {}", args.len()));
     };
     let elems = parse_sqlite_json_path(path)?;
-    Ok(format!("(CAST({} AS jsonb) {} '{{{}}}')", source, op, elems.join(",")))
+    Ok(format!(
+        "(CAST({} AS jsonb) {} '{{{}}}')",
+        source,
+        op,
+        elems.join(",")
+    ))
 }
 
 /// Parse a RENDERED SQLite json-path literal (`'$.a.b[0]'`, single-quoted
@@ -254,6 +316,32 @@ fn parse_sqlite_json_path(rendered: &str) -> Result<Vec<String>, String> {
     let mut chars = body.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
+            // A key the renderer QUOTED is unquoted here, undoing exactly
+            // the escaping it applied. The two are one law: the SQLite
+            // renderer quotes every structural key so a key carrying a `.`
+            // or a `"` cannot re-enter the path as syntax, and a reader
+            // that cannot undo that reads its own output as unparseable.
+            '.' if chars.peek() == Some(&'"') => {
+                chars.next();
+                let mut key = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\\') => match chars.next() {
+                            Some(escaped) => key.push(escaped),
+                            None => return Err(format!("json path ends in `\\`: `{inner}`")),
+                        },
+                        Some('"') => break,
+                        Some(c) => key.push(c),
+                        None => {
+                            return Err(format!("unterminated quoted key in json path `{inner}`"))
+                        }
+                    }
+                }
+                if key.is_empty() {
+                    return Err(format!("empty key in json path `{inner}`"));
+                }
+                elems.push(key);
+            }
             '.' => {
                 let mut key = String::new();
                 while let Some(&c) = chars.peek() {
@@ -292,7 +380,9 @@ fn parse_sqlite_json_path(rendered: &str) -> Result<Vec<String>, String> {
         }
     }
     if elems.is_empty() {
-        return Err(format!("root-only json path `{inner}` has no PG array form"));
+        return Err(format!(
+            "root-only json path `{inner}` has no PG array form"
+        ));
     }
     Ok(elems)
 }
@@ -306,8 +396,14 @@ fn pg_group_concat(args: &[&str], distinct: bool) -> Result<String, String> {
     let prefix = if distinct { "DISTINCT " } else { "" };
     match args {
         [x] => Ok(format!("string_agg({}CAST({} AS text), ',')", prefix, x)),
-        [x, sep] => Ok(format!("string_agg({}CAST({} AS text), {})", prefix, x, sep)),
-        _ => Err(format!("group_concat takes 1 or 2 args, got {}", args.len())),
+        [x, sep] => Ok(format!(
+            "string_agg({}CAST({} AS text), {})",
+            prefix, x, sep
+        )),
+        _ => Err(format!(
+            "group_concat takes 1 or 2 args, got {}",
+            args.len()
+        )),
     }
 }
 
@@ -342,9 +438,9 @@ pub fn apply_template(template: &str, args: &[&str]) -> Result<String, String> {
             out.push_str(&args.join(", "));
             consumed.iter_mut().for_each(|c| *c = true);
         } else {
-            let idx: usize = placeholder
-                .parse()
-                .map_err(|_| format!("bad placeholder '{{{placeholder}}}' in template '{template}'"))?;
+            let idx: usize = placeholder.parse().map_err(|_| {
+                format!("bad placeholder '{{{placeholder}}}' in template '{template}'")
+            })?;
             let arg = args.get(idx).ok_or_else(|| {
                 format!(
                     "template '{template}' wants arg {idx} but only {} given",
@@ -368,6 +464,32 @@ pub fn apply_template(template: &str, args: &[&str]) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// The SQLite renderer quotes every structural json-path key; this
+    /// reader must undo exactly that, or a path the compiler itself wrote
+    /// is unreadable on the dialect that needs it decomposed. No query
+    /// shows the difference — both spellings mean the same key on SQLite,
+    /// and the pg road is the only one that must take it apart.
+    #[test]
+    fn quoted_json_path_keys_round_trip_to_pg_elements() {
+        assert_eq!(
+            parse_sqlite_json_path("'$.\"rows\"'").unwrap(),
+            vec!["rows".to_string()]
+        );
+        assert_eq!(
+            parse_sqlite_json_path("'$.\"a.b\".c[2]'").unwrap(),
+            vec!["a.b".to_string(), "c".to_string(), "2".to_string()]
+        );
+        assert_eq!(
+            parse_sqlite_json_path("'$.\"say \\\"hi\\\"\"'").unwrap(),
+            vec!["say \"hi\"".to_string()]
+        );
+        assert_eq!(
+            parse_sqlite_json_path("'$.plain'").unwrap(),
+            vec!["plain".to_string()]
+        );
+        assert!(parse_sqlite_json_path("'$.\"unterminated'").is_err());
+    }
+
     fn seeded_pack() -> DialectPack {
         let conn = Connection::open_in_memory().unwrap();
         crate::bootstrap::initialize_bootstrap_db(&conn).unwrap();
@@ -390,17 +512,17 @@ mod tests {
         assert_eq!(body("postgres", "lit.bool_true"), "TRUE");
         assert_eq!(body("postgres", "lit.bool_false"), "FALSE");
         assert!(pack.render("postgres", "op.not_equal").is_none()); // != like sqlite
-        // mysql deltas — concatenate deliberately does NOT reproduce the old
-        // arm: `CONCAT` as an infix token was an M1-era bug faithfully
-        // migrated (DIALECT-CONTRACT.md B3); mysql CONCAT is a function, so
-        // the row is now an op template over both operands.
+                                                                    // mysql deltas — concatenate renders as the CONCAT(...) function
+                                                                    // call, never an infix operator token (mysql's CONCAT is a
+                                                                    // function, not an operator), so the row is an op template over
+                                                                    // both operands.
         assert_eq!(body("mysql", "op.not_equal"), "<>");
         assert_eq!(body("mysql", "op.concatenate"), "CONCAT({0}, {1})");
         assert_eq!(body("mysql", "op.is_not_distinct_from"), "<=>");
         assert_eq!(body("mysql", "op.is_distinct_from"), "NOT ({0} <=> {1})");
         assert_eq!(body("mysql", "ident.quoted"), "`{0}`");
         assert!(pack.render("mysql", "lit.bool_true").is_none()); // 1/0 like sqlite
-        // sqlserver deltas
+                                                                  // sqlserver deltas
         assert_eq!(body("sqlserver", "op.not_equal"), "<>");
         assert_eq!(body("sqlserver", "op.concatenate"), "+");
         assert_eq!(body("sqlserver", "lit.bool_true"), "TRUE");
@@ -433,15 +555,26 @@ mod tests {
         .unwrap();
         let pack = DialectPack::load(&conn).unwrap();
         // entity-specific wins for 'like'
-        assert_eq!(pack.form_rule("postgres", EntityType::BinSigmaPredicate, "like").unwrap().body, "ENTITY-RULE");
+        assert_eq!(
+            pack.form_rule("postgres", EntityType::BinSigmaPredicate, "like")
+                .unwrap()
+                .body,
+            "ENTITY-RULE"
+        );
         // any other entity in the form falls to the form default
         assert_eq!(
-            pack.form_rule("postgres", EntityType::BinSigmaPredicate, "between").unwrap().body,
+            pack.form_rule("postgres", EntityType::BinSigmaPredicate, "between")
+                .unwrap()
+                .body,
             "FORM-DEFAULT"
         );
         // other dialect / other form: canonical
-        assert!(pack.form_rule("sqlite", EntityType::BinSigmaPredicate, "like").is_none());
-        assert!(pack.form_rule("postgres", EntityType::BinPseudoPredicate, "like").is_none());
+        assert!(pack
+            .form_rule("sqlite", EntityType::BinSigmaPredicate, "like")
+            .is_none());
+        assert!(pack
+            .form_rule("postgres", EntityType::BinPseudoPredicate, "like")
+            .is_none());
     }
 
     #[test]

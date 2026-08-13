@@ -13,11 +13,10 @@ path = "src/main.rs"
 [dependencies]
 delightql-buildinfo = { path = "../delightql-buildinfo" }
 delightql-protocol = { path = "../delightql-protocol" }
+# The syntax front door. The runner splits a submission at the boundaries the
+# sequence root already draws; a second parser here would be a second answer.
+delightql-cst = { path = "../delightql-cst" }
 clap.workspace = true
 rusqlite.workspace = true
 sha2 = "0.10"
 zstd.workspace = true
-tree-sitter.workspace = true
-
-[build-dependencies]
-cc = "1.0"

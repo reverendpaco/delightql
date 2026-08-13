@@ -4,14 +4,12 @@
 //!
 //! `orders(*), +customers(customer_id)` must correlate the OUTER row's
 //! `customer_id` with the fact row's positional column:
-//! `orders.customer_id IS NOT DISTINCT FROM _fact.customer_id`. Before the
-//! fix, the argument resolved to the INNER `_fact` alias, producing the
-//! degenerate self-comparison `_fact.customer_id IS NOT DISTINCT FROM
+//! `orders.customer_id IS NOT DISTINCT FROM _fact.customer_id`. Resolving
+//! the argument to the INNER `_fact` alias instead degenerates to the
+//! self-comparison `_fact.customer_id IS NOT DISTINCT FROM
 //! _fact.customer_id` ("customers is nonempty").
 //!
-//! Red-first: every test in this file was observed failing against the
-//! pre-fix compiler (self-comparison in generated SQL). The data-level
-//! twins live in `new_test_suite/balls/correctness_bugs/
+//! The data-level twins live in `new_test_suite/balls/correctness_bugs/
 //! {semijoin,antijoin,semijoin_multicol}_lost_correlation.sef`.
 
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
@@ -23,14 +21,18 @@ use delightql_types::schema::{ColumnInfo, DatabaseSchema};
 struct TwoTableSchema;
 
 impl DatabaseSchema for TwoTableSchema {
-    fn get_table_columns(&self, _schema: Option<&str>, table: &str) -> Option<Vec<ColumnInfo>> {
+    fn get_table_columns(
+        &self,
+        _schema: Option<&str>,
+        table: &str,
+    ) -> delightql_types::Result<Option<Vec<ColumnInfo>>> {
         let cols: &[&str] = match table {
             "orders" => &["order_id", "customer_id", "amount"],
             "customers" => &["customer_id", "name"],
             "subs" => &["order_id", "customer_id", "plan"],
-            _ => return None,
+            _ => return Ok(None),
         };
-        Some(
+        Ok(Some(
             cols.iter()
                 .enumerate()
                 .map(|(i, name)| ColumnInfo {
@@ -40,11 +42,11 @@ impl DatabaseSchema for TwoTableSchema {
                     declared_type: Some("TEXT".to_string()),
                 })
                 .collect(),
-        )
+        ))
     }
 
-    fn table_exists(&self, _schema: Option<&str>, table: &str) -> bool {
-        matches!(table, "orders" | "customers" | "subs")
+    fn table_exists(&self, _schema: Option<&str>, table: &str) -> delightql_types::Result<bool> {
+        Ok(matches!(table, "orders" | "customers" | "subs"))
     }
 }
 
@@ -69,7 +71,10 @@ fn semi_join_argument_correlates_to_outer_row() {
 #[test]
 fn anti_join_argument_correlates_to_outer_row() {
     let sql = compile(r"orders(*), \+customers(customer_id)");
-    assert!(sql.contains("NOT EXISTS"), "anti-join must NOT EXISTS:\n{sql}");
+    assert!(
+        sql.contains("NOT EXISTS"),
+        "anti-join must NOT EXISTS:\n{sql}"
+    );
     assert!(
         sql.contains("orders.customer_id IS NOT DISTINCT FROM _fact.customer_id"),
         "anti-join guard must correlate the outer column, got:\n{sql}"
@@ -113,7 +118,7 @@ fn aliased_outer_relation_correlates_through_alias() {
 #[test]
 fn argument_inside_expression_correlates_to_outer_row() {
     // Lvars nested in expressions in argument position are outer
-    // references too (where.md: any domain expression may be argumentative).
+    // references too — any domain expression may be argumentative.
     let sql = compile("orders(*), +customers((customer_id + 0))");
     assert!(
         sql.contains("(orders.customer_id + 0) IS NOT DISTINCT FROM _fact.customer_id"),
@@ -125,8 +130,8 @@ fn argument_inside_expression_correlates_to_outer_row() {
 
 #[test]
 fn explicit_condition_form_stays_correct() {
-    // The interior-notation form (where.md "Semi-Joins and Anti-Joins")
-    // was never affected; pin it so the fix doesn't disturb it.
+    // The interior-notation form is unaffected by outer-row correlation;
+    // pinned so future changes don't disturb it.
     let sql = compile("orders(*) as o, +customers(, o.customer_id = customers.customer_id)");
     assert!(
         sql.contains("o.customer_id IS NOT DISTINCT FROM customers.customer_id"),
@@ -137,7 +142,7 @@ fn explicit_condition_form_stays_correct() {
 #[test]
 fn ground_argument_stays_ungrounded_selection() {
     // A literal argument grounds the positional column — no outer
-    // reference involved; was never affected.
+    // reference involved.
     let sql = compile("orders(*), +customers(42)");
     assert!(
         sql.contains("42 IS NOT DISTINCT FROM _fact.customer_id"),

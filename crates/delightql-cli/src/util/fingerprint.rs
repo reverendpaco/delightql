@@ -35,7 +35,6 @@ pub struct FingerprintJson {
     pub dbhash: String,
     pub datahash: String,   // Data only (no column names)
     pub tablehash: String,  // Schema + data
-    pub resulthash: String, // Legacy - same as tablehash for compatibility
     pub dimensions: String,
     pub totalhash: String,
     pub columns: Vec<String>, // Column names in order
@@ -156,7 +155,6 @@ impl ResultFingerprint {
             dbhash: self.db_hash.clone(),
             datahash: self.data_hash.clone(),
             tablehash: self.result_hash.clone(),
-            resulthash: self.result_hash.clone(), // Keep for backward compatibility
             dimensions: format!("{}x{}", self.row_count, self.column_count),
             totalhash: self.combined_hash.clone(),
             columns: self.columns.clone(),

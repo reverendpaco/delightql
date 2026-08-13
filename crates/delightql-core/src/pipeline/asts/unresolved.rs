@@ -17,244 +17,123 @@ pub type CteBinding =
     crate::pipeline::asts::core::CteBinding<crate::pipeline::asts::core::Unresolved>;
 // CFE definitions are not phase-specific (always unresolved at definition time)
 pub type CfeDefinition = crate::pipeline::asts::core::CfeDefinition;
-pub type PrecompiledCfeDefinition = crate::pipeline::asts::core::PrecompiledCfeDefinition;
 pub type ErContextSpec = crate::pipeline::asts::core::ErContextSpec;
-pub type RelationalExpression =
-    crate::pipeline::asts::core::RelationalExpression<crate::pipeline::asts::core::Unresolved>;
+pub type Chain = crate::pipeline::asts::core::Chain<crate::pipeline::asts::core::Unresolved>;
+pub type Grelex = crate::pipeline::asts::core::Grelex<crate::pipeline::asts::core::Unresolved>;
+pub type WholeHeading =
+    crate::pipeline::asts::core::WholeHeading<crate::pipeline::asts::core::Unresolved>;
+pub type MemberCorrelation =
+    crate::pipeline::asts::core::MemberCorrelation<crate::pipeline::asts::core::Unresolved>;
+pub type Continuation =
+    crate::pipeline::asts::core::Continuation<crate::pipeline::asts::core::Unresolved>;
+pub type StructuralStep =
+    crate::pipeline::asts::core::StructuralStep<crate::pipeline::asts::core::Unresolved>;
+pub type StructuralForm =
+    crate::pipeline::asts::core::StructuralForm<crate::pipeline::asts::core::Unresolved>;
+pub type AnonTable =
+    crate::pipeline::asts::core::AnonTable<crate::pipeline::asts::core::Unresolved>;
+pub type AnonRelation =
+    crate::pipeline::asts::core::AnonRelation<crate::pipeline::asts::core::Unresolved>;
+pub type Datum = crate::pipeline::asts::core::Datum<crate::pipeline::asts::core::Unresolved>;
+pub type HeaderItem =
+    crate::pipeline::asts::core::HeaderItem<crate::pipeline::asts::core::Unresolved>;
+pub type TabularBody<H, D> = crate::pipeline::asts::core::TabularBody<H, D>;
+pub type ErJoinStep =
+    crate::pipeline::asts::core::ErJoinStep<crate::pipeline::asts::core::Unresolved>;
 pub type Relation = crate::pipeline::asts::core::Relation<crate::pipeline::asts::core::Unresolved>;
-pub type PipeExpression =
-    crate::pipeline::asts::core::PipeExpression<crate::pipeline::asts::core::Unresolved>;
-pub type SigmaCondition =
-    crate::pipeline::asts::core::SigmaCondition<crate::pipeline::asts::core::Unresolved>;
 pub type DomainExpression =
     crate::pipeline::asts::core::DomainExpression<crate::pipeline::asts::core::Unresolved>;
-pub type ProjectionExpr =
-    crate::pipeline::asts::core::ProjectionExpr<crate::pipeline::asts::core::Unresolved>;
-pub type DomainSpec =
-    crate::pipeline::asts::core::DomainSpec<crate::pipeline::asts::core::Unresolved>;
-pub type FunctionExpression =
-    crate::pipeline::asts::core::FunctionExpression<crate::pipeline::asts::core::Unresolved>;
-pub type CurlyMember =
-    crate::pipeline::asts::core::CurlyMember<crate::pipeline::asts::core::Unresolved>;
-pub type ArrayMember =
-    crate::pipeline::asts::core::ArrayMember<crate::pipeline::asts::core::Unresolved>;
-pub type BooleanExpression =
-    crate::pipeline::asts::core::BooleanExpression<crate::pipeline::asts::core::Unresolved>;
-pub type UnaryRelationalOperator =
-    crate::pipeline::asts::core::UnaryRelationalOperator<crate::pipeline::asts::core::Unresolved>;
-pub type ModuloSpec =
-    crate::pipeline::asts::core::ModuloSpec<crate::pipeline::asts::core::Unresolved>;
+pub type Access = crate::pipeline::asts::core::Access<crate::pipeline::asts::core::Unresolved>;
+pub type Slot = crate::pipeline::asts::core::Slot<crate::pipeline::asts::core::Unresolved>;
+pub type FunctionApplication =
+    crate::pipeline::asts::core::FunctionApplication<crate::pipeline::asts::core::Unresolved>;
+pub type DomainHole = crate::pipeline::asts::core::DomainHole;
+pub type Enclyph = crate::pipeline::asts::core::Enclyph<crate::pipeline::asts::core::Unresolved>;
+pub type Record = crate::pipeline::asts::core::Record<crate::pipeline::asts::core::Unresolved>;
+pub type Tuple = crate::pipeline::asts::core::Tuple<crate::pipeline::asts::core::Unresolved>;
+pub type TreePattern =
+    crate::pipeline::asts::core::TreePattern<crate::pipeline::asts::core::Unresolved>;
+pub type RecordPattern =
+    crate::pipeline::asts::core::RecordPattern<crate::pipeline::asts::core::Unresolved>;
+pub type MetadataGroup =
+    crate::pipeline::asts::core::MetadataGroup<crate::pipeline::asts::core::Unresolved>;
+pub type FunctorCall =
+    crate::pipeline::asts::core::FunctorCall<crate::pipeline::asts::core::Unresolved>;
+pub type SealedCall =
+    crate::pipeline::asts::core::SealedCall<crate::pipeline::asts::core::Unresolved>;
+pub type PureCall = crate::pipeline::asts::core::PureCall<crate::pipeline::asts::core::Unresolved>;
+pub type Callable = crate::pipeline::asts::core::Callable<crate::pipeline::asts::core::Unresolved>;
+pub type ScalarRelation =
+    crate::pipeline::asts::core::ScalarRelation<crate::pipeline::asts::core::Unresolved>;
+pub type StandardApplication =
+    crate::pipeline::asts::core::StandardApplication<crate::pipeline::asts::core::Unresolved>;
+pub type TruthExpression =
+    crate::pipeline::asts::core::TruthExpression<crate::pipeline::asts::core::Unresolved>;
+pub type Probe = crate::pipeline::asts::core::Probe<crate::pipeline::asts::core::Unresolved>;
+pub type ValueRow = crate::pipeline::asts::core::ValueRow<crate::pipeline::asts::core::Unresolved>;
+pub type ArgumentValue =
+    crate::pipeline::asts::core::ArgumentValue<crate::pipeline::asts::core::Unresolved>;
+pub type OutValue = crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Unresolved>;
+pub type SlotConstraint =
+    crate::pipeline::asts::core::SlotConstraint<crate::pipeline::asts::core::Unresolved>;
+pub type PipeOp = crate::pipeline::asts::core::PipeOp<crate::pipeline::asts::core::Unresolved>;
+pub type GroupSpec =
+    crate::pipeline::asts::core::GroupSpec<crate::pipeline::asts::core::Unresolved>;
+pub type ReductionPlan =
+    crate::pipeline::asts::core::ReductionPlan<crate::pipeline::asts::core::Unresolved>;
 pub type OrderingSpec =
     crate::pipeline::asts::core::OrderingSpec<crate::pipeline::asts::core::Unresolved>;
+pub type OutItem = crate::pipeline::asts::core::OutItem<crate::pipeline::asts::core::Unresolved>;
+pub type ReductionItem =
+    crate::pipeline::asts::core::ReductionItem<crate::pipeline::asts::core::Unresolved>;
+pub type Reference =
+    crate::pipeline::asts::core::Reference<crate::pipeline::asts::core::Unresolved>;
+pub type OneOut = crate::pipeline::asts::core::OneOut<crate::pipeline::asts::core::Unresolved>;
+pub type NamedOutItem =
+    crate::pipeline::asts::core::NamedOutItem<crate::pipeline::asts::core::Unresolved>;
 pub type DelegateSpec =
     crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Unresolved>;
-pub type OutputDomainExpression =
-    crate::pipeline::asts::core::OutputDomainExpression<crate::pipeline::asts::core::Unresolved>;
 pub type RenameSpec =
     crate::pipeline::asts::core::RenameSpec<crate::pipeline::asts::core::Unresolved>;
-pub type RenameTarget = crate::pipeline::asts::core::RenameTarget;
+pub type RenameTarget = crate::pipeline::asts::core::NameTarget;
 pub type RepositionSpec =
     crate::pipeline::asts::core::RepositionSpec<crate::pipeline::asts::core::Unresolved>;
-pub type ColumnSelector =
-    crate::pipeline::asts::core::operators::ColumnSelector<crate::pipeline::asts::core::Unresolved>;
 pub type ColumnAlias = crate::pipeline::asts::core::operators::ColumnAlias;
-pub type ColumnNameTemplate = crate::pipeline::asts::core::operators::ColumnNameTemplate;
-pub type Row = crate::pipeline::asts::core::Row<crate::pipeline::asts::core::Unresolved>;
+pub type SelectorItem =
+    crate::pipeline::asts::core::SelectorItem<crate::pipeline::asts::core::Unresolved>;
+pub type Spread = crate::pipeline::asts::core::Spread<crate::pipeline::asts::core::Unresolved>;
+pub type RenameSource =
+    crate::pipeline::asts::core::RenameSource<crate::pipeline::asts::core::Unresolved>;
 pub type WindowFrame = crate::pipeline::asts::core::WindowFrame;
-pub type FrameMode = crate::pipeline::asts::core::FrameMode;
 pub type FrameBound = crate::pipeline::asts::core::FrameBound;
 pub type HoArgument =
     crate::pipeline::asts::core::operators::HoArgument<crate::pipeline::asts::core::Unresolved>;
+pub type ScalarArgument =
+    crate::pipeline::asts::core::operators::ScalarArgument<crate::pipeline::asts::core::Unresolved>;
+pub type CallArguments =
+    crate::pipeline::asts::core::operators::CallArguments<crate::pipeline::asts::core::Unresolved>;
 
 // Re-export non-parameterized types from core
-pub use crate::pipeline::asts::core::expressions::{
-    CaseArm, InnerRelationPattern, StringTemplatePart,
-};
+pub use crate::pipeline::asts::core::expressions::InnerRelationPattern;
+pub type CaseExpression = crate::pipeline::asts::core::expressions::CaseExpression<
+    crate::pipeline::asts::core::Unresolved,
+>;
+pub type ValueTemplatePart = crate::pipeline::asts::core::expressions::ValueTemplatePart<
+    crate::pipeline::asts::core::Unresolved,
+>;
 pub use crate::pipeline::asts::core::metadata::{GroundedPath, NamespacePath};
 pub use crate::pipeline::asts::core::{
-    AssertionPredicate, AssertionSpec, ColumnOrdinal, ColumnRange, ContainmentSemantic,
-    ContextMode, DangerSpec, DestructureMode, InlineDdlSpec, LiteralValue, OptionSpec,
-    OrderDirection, PhaseBox, PhaseBoxable, QualifiedName, SetOperator, TupleOrdinalClause,
-    TupleOrdinalOperator, UsingColumn,
+    AssertionSpec, ColumnOrdinal, ColumnRange, DangerSpec, DestructureMode, GroundMention,
+    InlineDdlBody, InlineDdlSpec, LiteralValue, OptionSpec, OrderDirection, QualifiedName,
+    SetOperator,
 };
 
-// ============================================================================
-// Top-Level Query Structure
-// ============================================================================
-
-// Query is now re-exported from core
-
-// ============================================================================
-// Relational Expressions (Primary Query Structure)
-// ============================================================================
-
-// RelationalExpression is now re-exported from core
-
-// Relation is now re-exported from core
-
-// AndExpression was removed - And pattern is now eliminated
-
-// SigmaCondition is now re-exported from core
-
-// PipeExpression is now re-exported from core
-
-// ============================================================================
-// Unary Relational Operators (Pipe Operations)
-// ============================================================================
-
-// UnaryRelationalOperator is now in core.rs
-
-// ============================================================================
-// Domain Expressions (Values and Computations)
-// ============================================================================
-
-// ============================================================================
-// Lispy Display Implementation
-// ============================================================================
-
-// ============================================================================
-// Builder convenience methods
-// ============================================================================
-
-impl Query {
-    /// Create a simple table query
-    pub fn table(name: &str) -> Self {
-        Query::Relational(RelationalExpression::Relation(Relation::Ground {
-            identifier: QualifiedName {
-                namespace_path: NamespacePath::empty(),
-                name: name.into(),
-                grounding: None,
-            },
-            canonical_name: PhaseBox::phantom(),
-            backend_schema: PhaseBox::phantom(),
-            domain_spec: DomainSpec::Glob,
-            alias: None,
-            outer: false,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: PhaseBox::phantom(),
-            hygienic_injections: Vec::new(),
-        }))
-    }
-}
-
-impl RelationalExpression {
-    /// Add an alias to a ground relation
-    pub fn with_alias(mut self, alias: &str) -> Self {
-        if let RelationalExpression::Relation(Relation::Ground {
-            alias: ref mut a, ..
-        }) = self
-        {
-            *a = Some(alias.into());
-        }
-        self
-    }
-
-    /// Create a join
-    pub fn join(self, other: RelationalExpression) -> Self {
-        RelationalExpression::Join {
-            left: Box::new(self),
-            right: Box::new(other),
-            join_condition: None,
-            join_type: None,
-            cpr_schema: PhaseBox::phantom(),
-        }
-    }
-
-    /// Add a sigma condition
-    pub fn where_condition(self, condition: BooleanExpression) -> Self {
-        // Now directly use BooleanExpression
-        let sigma_condition = SigmaCondition::Predicate(condition);
-
-        RelationalExpression::Filter {
-            source: Box::new(self),
-            condition: sigma_condition,
-            origin: crate::pipeline::asts::core::FilterOrigin::UserWritten,
-            cpr_schema: PhaseBox::phantom(),
-        }
-    }
-
-    pub fn pipe(self, operator: UnaryRelationalOperator) -> Self {
-        RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-            source: self,
+impl Chain {
+    pub fn pipe(self, operator: PipeOp) -> Self {
+        self.then(Continuation::Pipe {
             operator,
-            cpr_schema: PhaseBox::phantom(),
-        })))
-    }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_simple_query() {
-        let query = Query::table("users");
-        assert!(matches!(query, Query::Relational(_)));
-    }
-
-    #[test]
-    fn test_query_with_alias() {
-        let query = Query::Relational(
-            RelationalExpression::Relation(Relation::Ground {
-                identifier: QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: "users".to_string().into(),
-                    grounding: None,
-                },
-                canonical_name: PhaseBox::phantom(),
-                backend_schema: PhaseBox::phantom(),
-                domain_spec: DomainSpec::Glob,
-                alias: None,
-                outer: false,
-                mutation_target: false,
-                passthrough: false,
-                cpr_schema: PhaseBox::phantom(),
-                hygienic_injections: Vec::new(),
-            })
-            .with_alias("u"),
-        );
-
-        if let Query::Relational(RelationalExpression::Relation(Relation::Ground {
-            alias, ..
-        })) = query
-        {
-            assert_eq!(alias, Some("u".to_string().into()));
-        } else {
-            panic!("Expected ground relation");
-        }
-    }
-
-    #[test]
-    fn test_outer_join() {
-        let query = Query::Relational(RelationalExpression::Relation(Relation::Ground {
-            identifier: QualifiedName {
-                namespace_path: NamespacePath::empty(),
-                name: "orders".to_string().into(),
-                grounding: None,
-            },
-            canonical_name: PhaseBox::phantom(),
-            backend_schema: PhaseBox::phantom(),
-            domain_spec: DomainSpec::Glob,
-            alias: Some("o".to_string().into()),
-            outer: true,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: PhaseBox::phantom(),
-            hygienic_injections: Vec::new(),
-        }));
-
-        if let Query::Relational(RelationalExpression::Relation(Relation::Ground {
-            outer, ..
-        })) = query
-        {
-            assert!(outer);
-        } else {
-            panic!("Expected ground relation");
-        }
+            named: None,
+            cpr_schema: (),
+        })
     }
 }

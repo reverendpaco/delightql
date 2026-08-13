@@ -13,6 +13,10 @@
 
 use super::*;
 use crate::bin_cartridge::prelude::consult::execute_consult;
+use crate::pipeline::asts::core::OutValue;
+use crate::pipeline::asts::core::ProbeAddressing;
+use crate::pipeline::asts::core::{Existence, RelationalMembership};
+use crate::pipeline::asts::core::{Polarity, Probe};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -94,10 +98,9 @@ fn world_system() -> DelightQLSystem {
         let dir = tempfile::tempdir().expect("mount tempdir");
         for f in ["main.db", "source.db", "warehouse.db"] {
             // mount_database is now attach-only and rejects 0-byte files
-            // (bugs/nullmount Phase 1); materialize a valid empty SQLite db
+            // (mount! is attach-only); materialize a valid empty SQLite db
             // (header forced out by PRAGMA user_version) rather than touch b"".
-            let conn = rusqlite::Connection::open(dir.path().join(f))
-                .expect("create mount db");
+            let conn = rusqlite::Connection::open(dir.path().join(f)).expect("create mount db");
             conn.execute_batch("PRAGMA user_version = 0;")
                 .expect("materialize mount db header");
         }
@@ -113,6 +116,182 @@ fn world_system() -> DelightQLSystem {
             .unwrap_or_else(|e| panic!("mount {}: {}", ns, e));
     }
     system
+}
+
+#[test]
+fn catalogued_user_name_is_reserved_before_plan_scratch_baptism() {
+    let system = world_system();
+    {
+        let connection = system
+            .bootstrap_connection()
+            .lock()
+            .expect("bootstrap lock");
+        let cartridge: i64 = connection
+            .query_row("SELECT id FROM cartridge ORDER BY id LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("a bootstrap cartridge exists");
+        connection
+            .execute(
+                "INSERT INTO entity (name, type, cartridge_id) VALUES (?1, 1, ?2)",
+                rusqlite::params!["scratch_1", cartridge],
+            )
+            .expect("catalogue the user relation");
+    }
+
+    let registry = plan_registry(&system).expect("plan registry");
+    let scratch = registry.mint_scope(
+        crate::names::ScopeOrigin::Scratch {
+            role: crate::names::ScratchRole::Snapshot,
+        },
+        crate::names::Hint::None,
+        None,
+    );
+    let names = crate::names::baptise(
+        &registry,
+        &crate::names::Bundle {
+            statements: vec![crate::names::Statement {
+                scopes: vec![scratch],
+                headings: vec![],
+                refs: vec![],
+            }],
+        },
+    )
+    .expect("scratch baptism");
+    let mut spelling = String::new();
+    names.write_scope(scratch, &mut crate::names::sink::Probe(&mut spelling));
+    assert_ne!(
+        spelling, "scratch_1",
+        "plan scratch must not replace a catalogued user temp"
+    );
+}
+
+#[test]
+fn scratch_placement_is_driven_by_scope_origin() {
+    let system = world_system();
+    let registry = Rc::new(Registry::new(&[]));
+    let scratch = registry.mint_scope(
+        crate::names::ScopeOrigin::Scratch {
+            role: crate::names::ScratchRole::Snapshot,
+        },
+        crate::names::Hint::None,
+        None,
+    );
+    let authored_spelling = registry.intern("scratch_1", false);
+    let authored = registry.mint_scope(
+        crate::names::ScopeOrigin::AnonRelation,
+        crate::names::Hint::User(authored_spelling),
+        None,
+    );
+    let inner = select_one_from(scratch, &registry).expect("scratch EXISTS source");
+    let output = registry.mint_scope(
+        crate::names::ScopeOrigin::AnonRelation,
+        crate::names::Hint::None,
+        None,
+    );
+    let select = crate::pipeline::transformer::builder::publish_at(
+        output,
+        [],
+        SelectStatement::builder()
+            .select(SelectItem::star_over_nothing())
+            .from_tables(vec![
+                TableExpression::Scope(scratch),
+                TableExpression::Scope(authored),
+            ])
+            .where_clause(SqlExpr::exists(inner)),
+        &registry,
+    )
+    .expect("placement fixture");
+    let mut statement = SqlStatement::Query {
+        with_clause: None,
+        query: QueryExpression::Select(Box::new(select)),
+    };
+    let builder = PlanBuilder::new(&system, None, Rc::clone(&registry));
+    builder.qualify_scratch_refs(&mut statement, "temp");
+
+    let mut qualified_scratch = 0;
+    let mut bare_authored = 0;
+    crate::pipeline::sql_ast::walk::visit_tables_mut(&mut statement, &mut |table| match table {
+        TableExpression::QualifiedScope { schema, scope } if *scope == scratch => {
+            assert_eq!(schema, "temp");
+            qualified_scratch += 1;
+        }
+        TableExpression::Scope(scope) if *scope == authored => bare_authored += 1,
+        _ => {}
+    });
+    assert_eq!(qualified_scratch, 2, "FROM and EXISTS carry placement");
+    assert_eq!(bare_authored, 1, "authored lookalikes remain untouched");
+
+    let source_scope = registry.mint_scope(
+        crate::names::ScopeOrigin::AnonRelation,
+        crate::names::Hint::None,
+        None,
+    );
+    let source = crate::pipeline::transformer::builder::publish_at(
+        source_scope,
+        [],
+        SelectStatement::builder().select(SelectItem::star_over_nothing()),
+        &registry,
+    )
+    .expect("insert source");
+    let mut insert = SqlStatement::Insert {
+        target: crate::pipeline::sql_ast::statements::RelationTarget::Scope(scratch),
+        target_scope: scratch,
+        columns: vec![],
+        with_clause: None,
+        source: QueryExpression::Select(Box::new(source)),
+    };
+    builder.qualify_scratch_refs(&mut insert, "pg_temp");
+    assert!(matches!(
+        insert,
+        SqlStatement::Insert {
+            target:
+                crate::pipeline::sql_ast::statements::RelationTarget::QualifiedScope {
+                    ref schema,
+                    scope
+                },
+            ..
+        } if schema == "pg_temp" && scope == scratch
+    ));
+}
+
+#[test]
+fn star_shaped_plan_scope_keeps_its_resolved_heading() {
+    let system = world_system();
+    let registry = Rc::new(Registry::new(&[]));
+    let scratch = registry.mint_scope(
+        crate::names::ScopeOrigin::Scratch {
+            role: crate::names::ScratchRole::Snapshot,
+        },
+        crate::names::Hint::None,
+        None,
+    );
+    let x = registry.intern("x", false);
+    let column = registry.mint_column(
+        scratch,
+        crate::names::ColumnOrigin::Bound { position: 0 },
+        Some(x),
+        crate::names::Addressing::Published,
+        crate::names::ValueFacts::default(),
+    );
+    let query = Query::relational(Chain::read(
+        Relation::Ground {
+            mention: GroundMention::Plan {
+                scope: scratch,
+                authored_name: None,
+                alias: None,
+            },
+            outer: false,
+            cpr_schema: (),
+        },
+        Access::All,
+        (),
+    ));
+    let mut builder = PlanBuilder::new(&system, None, registry);
+    let compiled = builder
+        .compile_statement(query)
+        .expect("direct plan-scope read");
+    assert_eq!(compiled.columns, vec![column]);
 }
 
 /// Consult `source` into namespace `fx` and compile its main! into a plan.
@@ -287,21 +466,21 @@ fn dml_marker_multiple_refused() {
     .expect_err("two !! marks must refuse");
     let msg = format!("{err}");
     assert!(
-        msg.contains("multiple relations"),
+        msg.contains("carry the mutation marker"),
         "dml/marker/multiple substring: {msg}"
     );
 }
 
 // ============================================================================
 // Emission 2: DDL directive → CTAS/CREATE VIEW + UNCONDITIONAL receipt +
-// schema note for later statements (REPORT-3.0b)
+// schema note for later statements
 // ============================================================================
 
 #[test]
 fn ddl_emits_ctas_and_unconditional_receipt() {
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*), amount > 0 |> temp_table!(staged) : s!\n\
+         \x20   source.orders(*), amount > 0 |> temp_table!(staged(*))(*) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
     );
     let ctas = index_of(&plan, "CREATE TEMPORARY TABLE staged AS");
@@ -329,7 +508,7 @@ fn ddl_emits_ctas_and_unconditional_receipt() {
 fn created_table_resolves_in_later_statements() {
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*), amount > 0 |> temp_table!(staged) : s!\n\
+         \x20   source.orders(*), amount > 0 |> temp_table!(staged(*))(*) : s!\n\
          \x20   staged(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*) : l!\n\
          \x20   s!(*) ; l!(*)\n",
     );
@@ -358,12 +537,12 @@ fn receipt_mention_gates_later_directive_with_exists() {
     );
     let update = index_of(&plan, "UPDATE");
     let update_sql = sql_at(&plan, update);
-    // `temp.`-qualified per the scratch-collision invariant (review F1/F3;
-    // the generator quotes the schema keyword).
+    // `temp.`-qualified per the scratch-collision invariant; the generator
+    // quotes the schema keyword.
     // The mention's value is route!'s OUTER
     // receipt (built over its receipt shell), so the gate is EXISTS over
     // that derived receipt — still a 0/1 guard on __r_route's emptiness.
-    let flat_update = flat(update_sql.clone());
+    let flat_update = flat(update_sql);
     assert!(
         flat_update.contains("EXISTS (SELECT") && flat_update.contains("__r_route"),
         "the chained directive is gated on the receipt's non-emptiness: {}",
@@ -381,10 +560,9 @@ fn receipt_mention_gates_later_directive_with_exists() {
 // ============================================================================
 
 /// The ONE typed program: the flat entry list IS the flatten projection
-/// of the typed steps — byte-for-byte, variant-for-variant (review
-/// finding 3: no cloned streams to drift, no second positional
-/// authority). Setup, Begin, effect steps, Return, Commit, and Cleanup
-/// all appear as steps.
+/// of the typed steps — byte-for-byte, variant-for-variant: no cloned
+/// stream to drift, no second positional authority. Setup, Begin, effect
+/// steps, Return, Commit, and Cleanup all appear as steps.
 #[test]
 fn flat_entries_are_the_flatten_projection_of_the_typed_program() {
     let plan = plan_for(
@@ -392,7 +570,10 @@ fn flat_entries_are_the_flatten_projection_of_the_typed_program() {
          stage!(*) :- source.orders(*), region = \"US\" |> temp_table!(staged(*))(*)\n\
          main!(*) :- route!(*), stage!(*)\n",
     );
-    let typed = plan.typed.as_ref().expect("transformer plans carry the typed layer");
+    let typed = plan
+        .typed
+        .as_ref()
+        .expect("transformer plans carry the typed layer");
     let derived = typed.flatten();
     assert_eq!(plan.entries.len(), derived.len());
     for (a, b) in plan.entries.iter().zip(derived.iter()) {
@@ -411,8 +592,11 @@ fn flat_entries_are_the_flatten_projection_of_the_typed_program() {
     assert!(kinds.contains(&compiled_query::EffectStepKind::Commit));
     assert_eq!(kinds.last(), Some(&compiled_query::EffectStepKind::Cleanup));
     assert!(
-        typed.steps.iter().all(|s| !matches!(s.kind(), compiled_query::EffectStepKind::Dml)
-            || !s.action.statements().is_empty()),
+        typed
+            .steps
+            .iter()
+            .all(|s| !matches!(s.kind(), compiled_query::EffectStepKind::Dml)
+                || !s.action.statements().is_empty()),
         "effect steps own their statement streams"
     );
 }
@@ -458,7 +642,10 @@ fn typed_steps_carry_occurrences_and_requirement_edges() {
     assert!(dml.occurrence.contains("insert!"), "{}", dml.occurrence);
     assert_ne!(dml.occurrence, ddl.occurrence, "mention is instantiation");
     assert!(
-        typed.steps.iter().any(|s| s.kind() == compiled_query::EffectStepKind::Return),
+        typed
+            .steps
+            .iter()
+            .any(|s| s.kind() == compiled_query::EffectStepKind::Return),
         "the return step is scheduled"
     );
 }
@@ -481,10 +668,7 @@ fn typed_exit_stamps_later_steps_with_absent_edges() {
         .find(|s| s.kind() == compiled_query::EffectStepKind::Exit)
         .expect("exit! is a scheduled step");
     assert!(
-        !exit_step
-            .requirements
-            .iter()
-            .any(|r| r.reason == "exit"),
+        !exit_step.requirements.iter().any(|r| r.reason == "exit"),
         "exit!'s own step wears no edge on the latch it sets"
     );
     let dml = typed
@@ -526,7 +710,11 @@ fn conjunction_guarded_ddl_relies_on_step_edges_not_guarded_entries() {
         .iter()
         .find(|s| s.kind() == compiled_query::EffectStepKind::Ddl)
         .expect("stage!'s temp_table! is a Ddl step");
-    assert_eq!(ddl.requirements.len(), 1, "the comma edge does the suppressing");
+    assert_eq!(
+        ddl.requirements.len(),
+        1,
+        "the comma edge does the suppressing"
+    );
     // The sum type says it structurally: a Ddl action is plain statements
     // (no ship, no guard pairing possible).
     assert!(
@@ -559,7 +747,9 @@ fn multi_clause_rule_receipts_share_one_table() {
     let shells: Vec<&str> = plan.entries[..begin_index(&plan)]
         .iter()
         .filter_map(|e| match e {
-            PlanEntry::Statement(st) if st.sql.contains("__r_route") => Some(st.sql.as_str()),
+            PlanEntry::Statement(st) if st.sql.starts_with("CREATE TEMP TABLE temp.__r_route") => {
+                Some(st.sql.as_str())
+            }
             _ => None,
         })
         .collect();
@@ -578,6 +768,64 @@ fn multi_clause_rule_receipts_share_one_table() {
     );
 }
 
+#[test]
+fn heterogeneous_clause_receipts_null_pad_the_shared_shell() {
+    let plan = plan_for(
+        "hetero!(*) :- source.orders(*) |> insert!(warehouse.orders_eu(*))(*)\n\
+         hetero!(*) :- source.orders(*) |> stdout!(*)\n\
+         main!(*) :- hetero!(*)\n",
+    );
+    let sinks: Vec<String> = statement_sqls(&plan)
+        .into_iter()
+        .map(|(_, sql, _)| sql)
+        .filter(|sql| {
+            sql.contains("INSERT INTO")
+                && (sql.contains("'insert!'")
+                    || (sql.contains("'stdout!'") && sql.contains("NULL AS target")))
+        })
+        .collect();
+    assert_eq!(
+        sinks.len(),
+        2,
+        "both heterogeneous arms sink into one shell:\n{}",
+        plan.render_sql()
+    );
+    let sink_targets: Vec<&str> = sinks
+        .iter()
+        .map(|sql| {
+            sql.split_once("INSERT INTO ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .expect("a receipt sink has an INSERT target")
+        })
+        .collect();
+    assert_eq!(
+        sink_targets[0], sink_targets[1],
+        "both heterogeneous arms use the same receipt shell"
+    );
+
+    let dml_receipt = sinks
+        .iter()
+        .find(|sql| sql.contains("'insert!'"))
+        .expect("the DML receipt sink");
+    let dml_receipt = flat(dml_receipt);
+    assert!(
+        dml_receipt.contains(
+            "(success, operation, target, returned) SELECT 1, 'insert!', \
+             'warehouse.orders_eu', NULL"
+        ),
+        "the DML arm pads the compositional arm's returned column: {dml_receipt}"
+    );
+
+    let compositional_receipt = sinks
+        .iter()
+        .find(|sql| sql.contains("NULL AS target"))
+        .expect("the stdout receipt sink pads the DML arm's target column");
+    assert!(
+        compositional_receipt.contains("returned"),
+        "the stdout arm retains its returned payload: {compositional_receipt}"
+    );
+}
+
 // ============================================================================
 // Emission 4: exit! — the flag insert, the DML guard, the ship WRAP-guard
 // ============================================================================
@@ -590,9 +838,11 @@ fn exit_stamps_later_dml_and_wrap_guards_shipped_selects() {
          \x20   source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*) : l!\n\
          \x20   x!(*) ; l!(*) |> stdout!(*) |> returning_other!(customers(*))(*)\n",
     );
-    // The peek target is `temp.`-qualified by the planner (review F3; the
-    // pump interpolates it verbatim).
-    assert_eq!(plan.exit_table.as_deref(), Some("temp.__exit"));
+    let exit_probe = plan
+        .exit_probe_sql
+        .as_deref()
+        .expect("exit plans carry a complete scalar probe");
+    assert!(exit_probe.contains("FROM temp."), "{exit_probe}");
 
     let exit = index_of(&plan, "INSERT INTO \"temp\".__exit");
     let exit_sql = sql_at(&plan, exit);
@@ -655,7 +905,11 @@ fn signed_witness_lowers_to_dee_left_join() {
         "a NO arm contributes the met = 0 proxy row: {}",
         sql
     );
-    assert!(sql.contains("__r_a"), "the arm's receipt table is the witnessed relation: {}", sql);
+    assert!(
+        sql.contains("__r_a"),
+        "the arm's receipt table is the witnessed relation: {}",
+        sql
+    );
 }
 
 // ============================================================================
@@ -666,15 +920,14 @@ fn signed_witness_lowers_to_dee_left_join() {
 /// pure prefix re-evaluates with no mutation in between.
 #[test]
 fn stdout_prefix_snapshots_once() {
-    // OBSERVED-PAYLOAD FUSION (txmyxvos; formerly
-    // `stdout_prefix_reevaluates_adjacently`, which pinned the payload
-    // round-trip): the released tee materializes its prefix ONCE into a
-    // typed snapshot; the ship and the consumer BOTH read the snapshot,
+    // OBSERVED-PAYLOAD FUSION: the released tee materializes its prefix
+    // ONCE into a typed snapshot; the ship and the consumer BOTH read that
+    // snapshot,
     // so printed rows = staged rows by construction and the prefix is
     // never re-evaluated.
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*), amount > 0 !> stdout!(*) |> temp_table!(staged) : s!\n\
+         \x20   source.orders(*), amount > 0 !> stdout!(*) |> temp_table!(staged(*))(*) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
     );
     let (i, ship_sql, shipped) = statement_sqls(&plan)
@@ -732,10 +985,16 @@ fn stdout_prefix_snapshots_once() {
 /// BINDING POINT (before the mutation) and the splice reads the snapshot.
 #[test]
 fn ho_input_materializes_when_mutation_intervenes() {
+    // The splice projects back to the target's own heading: an insert names
+    // the columns its SOURCE supplies (dml/insert/unnamed_column), and the
+    // receipt m! joined in to sequence this after the mutation publishes
+    // columns orders_us does not have.
     let plan = plan_for(
         "sneaky!(In(*))(*) :-\n\
          \x20   source.orders(*), status = \"seed\" |> insert!(warehouse.orders_eu(*))(*) : m!\n\
-         \x20   m!(*), In(*) |> insert!(warehouse.orders_us(*))(*)\n\
+         \x20   m!(*), In(*)\n\
+         \x20     |> (order_id, customer_id, region, amount, order_date, status)\n\
+         \x20     |> insert!(warehouse.orders_us(*))(*)\n\
          main!(*) :- source.orders(*), status = \"new\" |> sneaky!(*)\n",
     );
     let snap = index_of(&plan, "CREATE TEMPORARY TABLE __src_in AS");
@@ -793,26 +1052,29 @@ fn bracket_scratch_shells_before_begin() {
     let begin = begin_index(&plan);
     let commit = commit_index(&plan);
     // COMMIT closes the bracket; after it comes ONLY the plan-scratch
-    // cleanup (temp.-qualified drops — review F1/F3: persisting scratch
-    // would shadow same-named user tables for later bare reads).
+    // cleanup (temp.-qualified drops — persisting scratch would shadow
+    // same-named user tables for later bare reads).
     assert!(begin < commit, "BEGIN precedes COMMIT");
     assert!(
         commit < plan.entries.len() - 1,
         "trailing scratch cleanup follows COMMIT"
     );
+    // Keyed on the marker the ONE cleanup emitter stamps, not on a name
+    // prefix: plan scratch includes the staged DML source, whose minted name
+    // carries no `__`, and a prefix test would call that a stray statement.
     for e in &plan.entries[commit + 1..] {
         assert!(
             matches!(
                 e,
                 PlanEntry::Statement(st)
-                    if st.sql.starts_with("DROP TABLE IF EXISTS temp.__")
+                    if st.comment.as_deref() == Some("plan-scratch cleanup")
+                        && st.sql.starts_with("DROP TABLE IF EXISTS temp.")
             ),
             "only scratch cleanup follows COMMIT: {:?}",
             e
         );
     }
-    // Every scratch shell precedes BEGIN (invariant §5.6), temp.-qualified
-    // (review F1/F3 layer 1).
+    // Every scratch shell precedes BEGIN (invariant §5.6), temp.-qualified.
     for (i, e) in plan.entries.iter().enumerate() {
         if let PlanEntry::Statement(st) = e {
             if st.sql.starts_with("CREATE TEMP TABLE temp.__r_") {
@@ -826,9 +1088,17 @@ fn bracket_scratch_shells_before_begin() {
         if sql.starts_with("CREATE TEMP TABLE temp.__") {
             assert!(i < begin, "shell after BEGIN: {}", sql);
         } else if sql.starts_with("DROP TABLE IF EXISTS temp.__") {
-            assert!(i > commit, "cleanup inside bracket: {}", sql);
+            assert!(
+                i < begin || i > commit,
+                "scratch drop inside bracket: {}",
+                sql
+            );
         } else {
-            assert!(i > begin && i < commit, "data statement outside bracket: {}", sql);
+            assert!(
+                i > begin && i < commit,
+                "data statement outside bracket: {}",
+                sql
+            );
         }
     }
 }
@@ -866,26 +1136,35 @@ fn no_transaction_control_between_dml_and_receipt() {
 fn self_referential_dml_materializes_view_source() {
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*), amount > 0 |> temp_table!(staged) : s!\n\
-         \x20   staged(*), region = \"EU\" |> temp_view!(valid) : v!\n\
-         \x20   staged!!(*), valid(*) |> delete!(staged(*))(*) : k!\n\
+         \x20   source.orders(*), amount > 0 |> temp_table!(staged(*))(*) : s!\n\
+         \x20   staged(*), region = \"EU\" |> temp_view!(valid(*))(*) : v!\n\
+         \x20   staged!!(*), +valid(, valid.order_id = staged.order_id) |> delete!(staged(*))(*) : k!\n\
          \x20   s!(*) ; v!(*) ; k!(*)\n",
     );
-    let snap = index_of(&plan, "CREATE TEMPORARY TABLE __snap_valid AS");
+    let (snap, snapshot_sql, _) = statement_sqls(&plan)
+        .into_iter()
+        .find(|(_, sql, _)| sql.contains("CREATE TEMPORARY TABLE") && sql.contains("FROM valid"))
+        .expect("the hazardous view is copied into plan scratch");
     let delete = index_of(&plan, "DELETE FROM staged");
     assert!(snap < delete, "the snapshot precedes the DELETE");
+    let snapshot_name = snapshot_sql
+        .split_once("CREATE TEMPORARY TABLE ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("snapshot CTAS carries a physical table name");
     let delete_sql = sql_at(&plan, delete);
     assert!(
-        delete_sql.contains("__snap_valid"),
+        delete_sql.contains(snapshot_name),
         "the DELETE reads the snapshot, not the view over its own target: {}",
         delete_sql
     );
     // `AS valid` is a legal preservation of the logical binding after the
-    // physical source becomes `__snap_valid`; only a FROM/JOIN of the live
-    // view would violate §5.4.
-    let without_snapshot_name = delete_sql.replace("__snap_valid", "");
+    // physical source becomes plan scratch; only a FROM/JOIN of the live view
+    // would violate §5.4.
+    let without_snapshot_name = delete_sql.replace(snapshot_name, "");
     assert!(
-        !without_snapshot_name.contains("FROM valid")
+        !without_snapshot_name.contains("FROM valid ")
+            && !without_snapshot_name.contains("FROM valid.")
+            && !without_snapshot_name.contains("FROM valid\n")
             && !without_snapshot_name.contains("JOIN valid")
             && !without_snapshot_name.contains("FROM \"valid\"")
             && !without_snapshot_name.contains("JOIN \"valid\""),
@@ -901,8 +1180,7 @@ fn self_referential_dml_materializes_view_source() {
 #[test]
 fn namespace_without_main_refuses() {
     let mut system = world_system();
-    consult_str(&mut system, "helper(*) :- customers(*), region = \"EU\"\n")
-        .expect("pure consult");
+    consult_str(&mut system, "helper(*) :- customers(*), region = \"EU\"\n").expect("pure consult");
     let err = compile_namespace_main(&system, "fx").expect_err("no main! to demand");
     let msg = format!("{err}");
     assert!(
@@ -912,34 +1190,15 @@ fn namespace_without_main_refuses() {
 }
 
 // ============================================================================
-// The name guard and the §3 clash
-// semantics — layer 2 of the scratch-collision
-// invariant, plus the temp-replace / durable-refuse pair. E2e pins:
+// Authored-name preservation and user-object clash semantics, plus the
+// temp-replace / durable-refuse pair. E2e pins:
 // effects ball scratch--54 / main--26 / clash--55.
 // ============================================================================
 
 #[test]
-fn ddl_name_guard_refuses_scratch_prefixed_targets() {
-    for directive in ["temp_table", "table", "temp_view"] {
-        let err = try_plan_for(&format!(
-            "main!(*) :- source.orders(*) |> {}!(__exit)\n",
-            directive
-        ))
-        .expect_err("__-prefixed DDL target must refuse");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("reserved"),
-            "{}!(__exit) refusal pins the `reserved` substring: {}",
-            directive,
-            msg
-        );
-    }
-}
-
-#[test]
 fn temp_creation_emits_adjacent_replace_drop_inside_bracket() {
     let plan = plan_for(
-        "main!(*) :- source.orders(*), amount > 0 |> temp_table!(staged) : s!\n\
+        "main!(*) :- source.orders(*), amount > 0 |> temp_table!(staged(*))(*) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
     );
     let ctas = index_of(&plan, "CREATE TEMPORARY TABLE staged AS");
@@ -957,7 +1216,7 @@ fn temp_creation_emits_adjacent_replace_drop_inside_bracket() {
 #[test]
 fn doc_in_body_refusal_does_not_cite_r9_as_prohibiting() {
     // R9 PERMITS doc! in bodies (annotation only); the refusal is honest
-    // scheduling — review F5, e2e pin rules--50.
+    // scheduling. End-to-end pin: rules--50.
     let err = try_plan_for(
         "main!(*) :- doc!(customers, \"note\"), source.orders(*) \
          |> insert!(warehouse.orders_eu(*))(*)\n",
@@ -981,10 +1240,7 @@ fn doc_in_body_refusal_does_not_cite_r9_as_prohibiting() {
 
 #[test]
 fn torture_main_compiles_to_the_normal_lowering_shape() {
-    let torture_path = format!(
-        "{}/../../TORTURE-TEST.dql",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let torture_path = format!("{}/../../TORTURE-TEST.dql", env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read_to_string(&torture_path).expect("read TORTURE-TEST.dql");
 
     let mut system = world_system();
@@ -994,24 +1250,27 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     execute_consult(&mut system, path.to_str().unwrap(), "torture", None)
         .expect("TORTURE-TEST.dql consults (2.2 acceptance)");
 
-    let plan = compile_namespace_main(&system, "torture")
-        .expect("the torture main! compiles to a plan");
+    let plan =
+        compile_namespace_main(&system, "torture").expect("the torture main! compiles to a plan");
     let rendered = plan.render_sql();
     // The human judges this text against TORTURE-TEST-NORMAL.sql; print it
     // so `cargo test -- --nocapture` shows the full lowering.
     eprintln!("=== torture main! plan ===\n{}\n=== end plan ===", rendered);
 
-    // The bracket (§5.6): shells, BEGIN, body, COMMIT, scratch cleanup
-    // (review F1/F3: shells are temp.-qualified; scratch dies with its
-    // plan).
+    // The bracket (§5.6): shells, BEGIN, body, COMMIT, scratch cleanup —
+    // shells are temp.-qualified, and scratch dies with its plan.
     let begin = begin_index(&plan);
     let commit = commit_index(&plan);
+    // Keyed on the marker the ONE cleanup emitter stamps, not on a name
+    // prefix: plan scratch includes the staged DML source, whose minted name
+    // carries no `__`, and a prefix test would call that a stray statement.
     for e in &plan.entries[commit + 1..] {
         assert!(
             matches!(
                 e,
                 PlanEntry::Statement(st)
-                    if st.sql.starts_with("DROP TABLE IF EXISTS temp.__")
+                    if st.comment.as_deref() == Some("plan-scratch cleanup")
+                        && st.sql.starts_with("DROP TABLE IF EXISTS temp.")
             ),
             "only scratch cleanup follows COMMIT: {:?}",
             e
@@ -1040,8 +1299,7 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
         staged_receipt
     );
 
-    // [arm x!] the if-empty idiom arms the exit flag (temp.-qualified,
-    // review F1/F3).
+    // [arm x!] the if-empty idiom arms the exit flag (temp.-qualified).
     let exit = index_of(&plan, "INSERT INTO \"temp\".__exit");
     assert!(exit > ctas, "exit! is demanded after the stage arm");
 
@@ -1080,15 +1338,14 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     let us = index_of(&plan, "orders_us");
     assert!(quarantine < eu && eu < us, "definition order (R5)");
     assert!(
-        sql_at(&plan, eu + 1).contains("__r_route")
-            && sql_at(&plan, us + 1).contains("__r_route"),
+        sql_at(&plan, eu + 1).contains("__r_route") && sql_at(&plan, us + 1).contains("__r_route"),
         "both route! receipts land in __r_route"
     );
     let update = index_of(&plan, "UPDATE");
     let update_sql = sql_at(&plan, update);
     // The gate is EXISTS over route!'s derived
     // OUTER receipt — still a 0/1 guard on __r_route's emptiness.
-    let flat_update = flat(update_sql.clone());
+    let flat_update = flat(update_sql);
     assert!(
         flat_update.contains("EXISTS (SELECT") && flat_update.contains("__r_route"),
         "mark_processed! is receipt-gated: {}",
@@ -1177,7 +1434,13 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
     // Every arm's receipt table is read exactly once (mention is
     // instantiation; the rm! arm joins two receipts inside ONE wrapper).
     for receipt in [
-        "__r_s", "__r_x", "__r_v", "__r_quarantine", "__r_route", "__r_mark_processed", "__r_k",
+        "__r_s",
+        "__r_x",
+        "__r_v",
+        "__r_quarantine",
+        "__r_route",
+        "__r_mark_processed",
+        "__r_k",
     ] {
         assert_eq!(
             ledger_flat
@@ -1192,10 +1455,24 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
             ledger
         );
     }
-    // D3: the rm! arm's joined receipts take the glob-join disambiguation.
+    // D3: the rm! arm joins two receipts inside ONE wrapper, so the ledger's
+    // corresponding heading carries both receipt shapes — ten slots where a
+    // single shape needs four. `success`, `operation` and `returned` each
+    // arrive twice, and an ambiguity poisons both sides: neither occurrence
+    // is the real `success`, so no `_2` suffix survives to claim one was.
+    let first_arm = ledger
+        .lines()
+        .find(|line| line.trim_start().starts_with("SELECT arm_"))
+        .expect("the ledger unions one select per arm");
+    assert_eq!(
+        first_arm.matches(" AS ").count(),
+        10,
+        "both receipt shapes reach the corresponding heading (D3): {}",
+        ledger
+    );
     assert!(
-        ledger.contains("success_2") && ledger.contains("operation_2"),
-        "rm!'s receipt join widens the ledger with _2 columns (D3): {}",
+        !ledger.contains("success_2") && !ledger.contains("operation_2"),
+        "a collision is poisoned, not privileged-and-suffixed (D3): {}",
         ledger
     );
     // Post-fusion the WRAP-guard (§5.9) sits on the SHIP that reads the
@@ -1252,7 +1529,10 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
         "the return is WRAP-guarded: {}",
         final_ship
     );
-    assert_eq!(plan.exit_table.as_deref(), Some("temp.__exit"));
+    assert!(plan
+        .exit_probe_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("FROM temp.")));
 }
 
 // ============================================================================
@@ -1273,8 +1553,8 @@ fn torture_main_compiles_to_the_normal_lowering_shape() {
 fn cross_kind_replace_view_over_table_drops_the_table_in_plan() {
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*) |> temp_table!(sw) : a!\n\
-         \x20   source.orders(*), amount > 0 |> temp_view!(sw) : b!\n\
+         \x20   source.orders(*) |> temp_table!(sw(*))(*) : a!\n\
+         \x20   source.orders(*), amount > 0 |> temp_view!(sw(*))(*) : b!\n\
          \x20   a!(*) ; b!(*)\n",
     );
     let view_idx = index_of(&plan, "CREATE TEMPORARY VIEW sw AS");
@@ -1303,8 +1583,8 @@ fn cross_kind_replace_view_over_table_drops_the_table_in_plan() {
 fn cross_kind_replace_table_over_view_drops_the_view_in_plan() {
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*) |> temp_view!(sw) : a!\n\
-         \x20   source.orders(*), amount > 0 |> temp_table!(sw) : b!\n\
+         \x20   source.orders(*) |> temp_view!(sw(*))(*) : a!\n\
+         \x20   source.orders(*), amount > 0 |> temp_table!(sw(*))(*) : b!\n\
          \x20   a!(*) ; b!(*)\n",
     );
     // The SECOND creation of `sw` — index_of finds the first, so search past it.
@@ -1341,7 +1621,7 @@ fn cross_kind_replace_table_over_view_drops_the_view_in_plan() {
 fn durable_ctas_spells_unqualified_when_no_alias_is_recoverable() {
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   source.orders(*) |> table!(dur) : a!\n\
+         \x20   source.orders(*) |> table!(dur(*))(*) : a!\n\
          \x20   a!(*) |> returning!(*)\n",
     );
     let idx = index_of(&plan, "CREATE TABLE");
@@ -1357,11 +1637,11 @@ fn durable_ctas_spells_unqualified_when_no_alias_is_recoverable() {
 // ------------------------------------------------------------------
 // The multi-connection refusals, pinned for table! (materialize-pipe §2:
 // "if [the attribution set] has more [than one member], the directive
-// refuses"). Both layers existed unpinned; pinned per Epic 4.1.
+// refuses"). Both layers are pinned here.
 // ------------------------------------------------------------------
 
 /// A second, genuinely separate connection (the mock analog of a
-/// pipe://-mounted engine — SQLite file mounts ATTACH on the primary and
+/// siso-mounted engine — SQLite file mounts ATTACH on the primary and
 /// share its connection, per §2 requirement 1).
 fn world_system_with_remote() -> DelightQLSystem {
     struct RemoteIntrospector;
@@ -1421,7 +1701,7 @@ fn try_plan_for_with_remote(source: &str) -> Result<CompiledPlan> {
 fn table_bang_multi_connection_source_refuses() {
     let err = try_plan_for_with_remote(
         "main!(*) :-\n\
-         \x20   source.orders(*), remote.rt(*) |> table!(dur) : a!\n\
+         \x20   source.orders(*), remote.rt(*) |> table!(dur(*))(*) : a!\n\
          \x20   a!(*) |> returning!(*)\n",
     )
     .expect_err("a multi-connection table! source must refuse (materialize-pipe §2)");
@@ -1432,6 +1712,153 @@ fn table_bang_multi_connection_source_refuses() {
     );
 }
 
+/// THE BOOTSTRAP IS A SOURCE, NEVER A TARGET (materialization-law §2): a
+/// source touching only `sys::` reaches ZERO target connections and lands
+/// on primary. The plan never latches onto connection 1, the created
+/// object registers under the ordinary road, and the CTAS carries the
+/// catalog rows as the literal snapshot — no plan statement reads the
+/// bootstrap's tables at run time.
+#[test]
+fn sys_only_source_materializes_on_primary() {
+    let system = world_system();
+    let plan = compile_query_plan(
+        &system,
+        &adhoc_query("sys::entities.entity(*) |> temp_table!(test(*))(*)"),
+        None,
+    )
+    .expect("a sys::-only materialization source lands on primary (materialization-law §2)");
+    for (i, conn) in entry_connections(&plan).iter().enumerate() {
+        assert_ne!(
+            *conn,
+            Some(1),
+            "entry {} must not execute on the bootstrap connection: {:?}",
+            i,
+            plan.entries[i]
+        );
+    }
+    for obj in &plan.created_objects {
+        assert_ne!(
+            obj.connection_id,
+            Some(1),
+            "created object '{}' must not register on the bootstrap connection",
+            obj.name
+        );
+    }
+    let create = statement_sqls(&plan)
+        .into_iter()
+        .find(|(_, sql, _)| sql.contains("CREATE TEMPORARY TABLE"))
+        .expect("the plan carries the CTAS");
+    assert!(
+        !create.1.contains("FROM entity") && !create.1.contains("FROM \"entity\""),
+        "the CTAS carries the snapshot, not a read of the bootstrap's table: {}",
+        create.1
+    );
+}
+
+/// One user connection plus `sys::` selects that user connection: a plan
+/// standing on a user connection materializes its sys::-source directive
+/// THERE — the exempt bootstrap contributes no target member and no latch.
+#[test]
+fn sys_source_in_a_user_connection_plan_lands_on_that_connection() {
+    let (mut system, conn_id) =
+        world_system_with_engine_remote_and_id("sqlite", "sqremote", "mock://sqremote");
+    consult_str(
+        &mut system,
+        "main!(*) :-\n\
+         \x20   sqremote.rt(*) |> temp_table!(staged(*))(*) : a!\n\
+         \x20   sys::entities.entity(*) |> temp_table!(cat(*))(*) : b!\n\
+         \x20   a!(*), b!(*)\n",
+    )
+    .expect("consult should register the rule");
+    let plan = compile_rule_plan(&system, "fx", "main!").expect(
+        "a user-connection plan with a sys::-source directive compiles \
+         (materialization-law §2)",
+    );
+    let cat = plan
+        .created_objects
+        .iter()
+        .find(|o| o.name == "cat")
+        .expect("the sys::-source creation is a plan object");
+    assert_eq!(
+        cat.connection_id,
+        Some(conn_id),
+        "one user connection plus sys:: selects that user connection"
+    );
+}
+
+/// ONE SOURCE joining a user connection with `sys::` attributes to that
+/// user connection (materialization-law §2): the bootstrap is ABSENT from
+/// the attribution set — never a federation refusal, never a tie-break —
+/// and the sys rows travel as the served snapshot inside the compiled
+/// source.
+#[test]
+fn one_mixed_user_and_sys_source_attributes_to_the_user_connection() {
+    let (mut system, conn_id) =
+        world_system_with_engine_remote_and_id("sqlite", "sqremote", "mock://sqremote");
+    consult_str(
+        &mut system,
+        "main!(*) :-\n\
+         \x20   sqremote.rt(*), sys::entities.entity(*) |> temp_table!(mixed(*))(*) : a!\n\
+         \x20   a!(*)\n",
+    )
+    .expect("consult should register the rule");
+    let plan = compile_rule_plan(&system, "fx", "main!")
+        .expect("one source containing user data plus sys:: compiles (materialization-law §2)");
+    let mixed = plan
+        .created_objects
+        .iter()
+        .find(|o| o.name == "mixed")
+        .expect("the mixed-source creation is a plan object");
+    assert_eq!(
+        mixed.connection_id,
+        Some(conn_id),
+        "one source joining a user connection with sys:: attributes to that user connection"
+    );
+    let create = statement_sqls(&plan)
+        .into_iter()
+        .find(|(_, sql, _)| sql.contains("CREATE TEMPORARY TABLE"))
+        .expect("the plan carries the CTAS");
+    assert!(
+        !create.1.contains("FROM entity") && !create.1.contains("FROM \"entity\""),
+        "the sys rows travel as the served snapshot, not a bootstrap read: {}",
+        create.1
+    );
+}
+
+/// THE SNAPSHOT SERVES EVERY TARGET DIALECT: a sys::-source materializer
+/// compiled against a PostgreSQL-typed plan carries the served rows
+/// through the ordinary anonymous-table lowering — no SQLite-flavored
+/// literal text, no dialect gate.
+#[test]
+fn sys_source_serves_on_a_postgresql_target() {
+    let (mut system, conn_id) =
+        world_system_with_engine_remote_and_id("postgresql", "pgremote", "mock://pgremote");
+    consult_str(
+        &mut system,
+        "main!(*) :-\n\
+         \x20   pgremote.rt(*), sys::entities.entity(*) |> temp_table!(pgmixed(*))(*) : a!\n\
+         \x20   a!(*)\n",
+    )
+    .expect("consult should register the rule");
+    let plan = compile_rule_plan(&system, "fx", "main!")
+        .expect("a sys::-source materializer compiles for a PostgreSQL target");
+    let pgmixed = plan
+        .created_objects
+        .iter()
+        .find(|o| o.name == "pgmixed")
+        .expect("the creation is a plan object");
+    assert_eq!(pgmixed.connection_id, Some(conn_id));
+    let create = statement_sqls(&plan)
+        .into_iter()
+        .find(|(_, sql, _)| sql.contains("CREATE TEMP"))
+        .expect("the plan carries the CTAS");
+    assert!(
+        !create.1.contains("FROM entity") && !create.1.contains("FROM \"entity\""),
+        "the sys rows travel as the served snapshot on a non-SQLite target: {}",
+        create.1
+    );
+}
+
 /// Layer 2 (per-plan): a single-connection table! statement on a DIFFERENT
 /// connection than the plan's refuses via route() — a v0.1 plan runs on
 /// one connection.
@@ -1439,8 +1866,8 @@ fn table_bang_multi_connection_source_refuses() {
 fn table_bang_on_second_connection_in_one_plan_refuses() {
     let err = try_plan_for_with_remote(
         "main!(*) :-\n\
-         \x20   source.orders(*) |> temp_table!(x) : a!\n\
-         \x20   remote.rt(*) |> table!(dur) : b!\n\
+         \x20   source.orders(*) |> temp_table!(x(*))(*) : a!\n\
+         \x20   remote.rt(*) |> table!(dur(*))(*) : b!\n\
          \x20   a!(*) ; b!(*)\n",
     )
     .expect_err("a cross-connection plan must refuse (v0.1 one-connection rule)");
@@ -1523,11 +1950,10 @@ fn world_system_with_engine_remote_and_id(
 
 /// Build the ad-hoc Query the relay entry would hand `compile_query_plan`.
 fn adhoc_query(dql: &str) -> Query {
-    let tree = crate::pipeline::parser::parse(dql).expect("parse");
-    let (mut queries, _features, _assertions, _dangers, _options, _ddl) =
-        crate::pipeline::builder_v2::parse_queries(&tree, dql).expect("build");
-    assert_eq!(queries.len(), 1, "one statement expected");
-    queries.pop().unwrap()
+    let tree = crate::pipeline::parse::query_sequence(dql).expect("parse");
+    let mut normalized = crate::pipeline::parse::normalize_sequence(&tree).expect("normalize");
+    assert_eq!(normalized.queries.len(), 1, "one statement expected");
+    normalized.queries.pop().unwrap().query
 }
 
 /// Non-firing control 1 (T0's, kept past the strike's deletion): the
@@ -1536,8 +1962,12 @@ fn adhoc_query(dql: &str) -> Query {
 #[test]
 fn all_sqlite_anon_source_plan_keeps_compiling() {
     let system = world_system();
-    compile_query_plan(&system, &adhoc_query("_(x @ 1) |> temp_table!(t)"), None)
-        .expect("an all-SQLite anon-source plan must keep compiling");
+    compile_query_plan(
+        &system,
+        &adhoc_query("_(x @ 1) |> temp_table!(t(*))(*)"),
+        None,
+    )
+    .expect("an all-SQLite anon-source plan must keep compiling");
 }
 
 /// Non-firing control 2 (T0's, kept past the strike's deletion): a
@@ -1548,7 +1978,7 @@ fn sqlite_plan_with_fatboy_mount_elsewhere_keeps_compiling() {
     let mut system = world_system_with_engine_remote("postgresql", "pgremote", "mock://pgremote");
     consult_str(
         &mut system,
-        "main!(*) :- source.orders(*) |> temp_table!(staged)\n",
+        "main!(*) :- source.orders(*) |> temp_table!(staged(*))(*)\n",
     )
     .expect("consult should register the rule");
     compile_namespace_main(&system, "fx")
@@ -1567,10 +1997,8 @@ fn sqlite_plan_with_fatboy_mount_elsewhere_keeps_compiling() {
 // convergence (the control below).
 // ------------------------------------------------------------------
 
-/// Every entry's connection stamp, in emission order. This is also what
-/// `drop_plan_scratch` (relay/entry.rs) routes by — it reads the SHELL
-/// entries' stamps — so shell uniformity is what puts the pre-run scratch
-/// clearing on the plan's connection.
+/// Every entry's connection stamp, in emission order. Shell uniformity puts
+/// both the adjacent replacement drop and the create on the plan connection.
 fn entry_connections(plan: &CompiledPlan) -> Vec<Option<i64>> {
     plan.entries
         .iter()
@@ -1587,16 +2015,14 @@ fn entry_connections(plan: &CompiledPlan) -> Vec<Option<i64>> {
 /// a pre-bracket scratch shell, the bracket itself, a data statement,
 /// a shipped statement, and a trailing drop.
 fn assert_plan_covers_the_entry_species(plan: &CompiledPlan) {
-    // The shell/drop spellings are dialect-carried after E-T2 (`temp.` on
-    // SQLite/DuckDB, `pg_temp.` on PG), so the species check matches the
-    // scratch shape, not one dialect's qualifier.
+    // Scratch has no character prefix. Its structural distinction reaches
+    // this post-baptism test as the temp-schema-qualified shell form.
     let is_shell = |sql: &str| {
-        sql.starts_with("CREATE TEMP TABLE ")
-            && (sql.contains(" temp.__") || sql.contains(" pg_temp.__"))
+        sql.starts_with("CREATE TEMP TABLE temp.") || sql.starts_with("CREATE TEMP TABLE pg_temp.")
     };
     let is_scratch_drop = |sql: &str| {
-        sql.starts_with("DROP TABLE IF EXISTS ")
-            && (sql.contains(" temp.__") || sql.contains(" pg_temp.__"))
+        sql.starts_with("DROP TABLE IF EXISTS temp.")
+            || sql.starts_with("DROP TABLE IF EXISTS pg_temp.")
     };
     assert!(
         plan.entries.iter().any(|e| matches!(
@@ -1634,7 +2060,7 @@ fn fatboy_plan_entries_all_carry_the_plan_connection() {
         world_system_with_engine_remote_and_id("postgresql", "pgremote", "mock://pgremote");
     consult_str(
         &mut system,
-        "main!(*) :- pgremote.rt(*) |> temp_table!(staged)\n",
+        "main!(*) :- pgremote.rt(*) |> temp_table!(staged(*))(*)\n",
     )
     .expect("consult should register the rule");
     let plan = compile_rule_plan(&system, "fx", "main!")
@@ -1693,8 +2119,12 @@ fn anon_source_plan_with_fatboy_main_stamps_the_main_connection() {
     let (main_id, _entities) = system
         .register_external_connection(components, "main", "mock://duckmain")
         .expect("duckdb main mount should register");
-    let plan = compile_query_plan(&system, &adhoc_query("_(x @ 1) |> temp_table!(t)"), None)
-        .expect("anon-source fatboy plans compile on the production entry (strike removed, E-T5)");
+    let plan = compile_query_plan(
+        &system,
+        &adhoc_query("_(x @ 1) |> temp_table!(t(*))(*)"),
+        None,
+    )
+    .expect("anon-source fatboy plans compile on the production entry (strike removed, E-T5)");
     assert_plan_covers_the_entry_species(&plan);
     for (i, conn) in entry_connections(&plan).iter().enumerate() {
         assert_eq!(
@@ -1720,11 +2150,8 @@ fn anon_source_plan_with_fatboy_main_stamps_the_main_connection() {
 // ------------------------------------------------------------------
 
 fn plan_on_engine_remote(db_type: &str, ns: &str, rule_source: &str) -> CompiledPlan {
-    let (mut system, _conn) = world_system_with_engine_remote_and_id(
-        db_type,
-        ns,
-        &format!("mock://{}", ns),
-    );
+    let (mut system, _conn) =
+        world_system_with_engine_remote_and_id(db_type, ns, &format!("mock://{}", ns));
     consult_str(&mut system, rule_source).expect("consult should register the rule");
     compile_rule_plan(&system, "fx", "main!")
         .expect("fatboy plans compile on the production entry (strike removed, E-T5)")
@@ -1769,7 +2196,7 @@ fn pg_released_tee_fuses_identically() {
     let plan = plan_on_engine_remote(
         "postgresql",
         "pgremote",
-        "main!(*) :- pgremote.rt(*) !> stdout!(*) |> temp_table!(staged) : s!\n\
+        "main!(*) :- pgremote.rt(*) !> stdout!(*) |> temp_table!(staged(*))(*) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
     );
     assert_no_sqlite_spellings(&plan);
@@ -1798,8 +2225,10 @@ fn pg_released_tee_fuses_identically() {
     );
     for (_, sql, _) in statement_sqls(&plan) {
         assert!(
-            !sql.contains("json_group_array") && !sql.contains("json_each")
-                && !sql.contains("json_agg") && !sql.contains("jsonb_array_elements"),
+            !sql.contains("json_group_array")
+                && !sql.contains("json_each")
+                && !sql.contains("json_agg")
+                && !sql.contains("jsonb_array_elements"),
             "no payload round-trip on the PG lane either (txmyxvos): {}",
             sql
         );
@@ -1813,13 +2242,16 @@ fn pg_shells_move_in_bracket_with_on_commit_drop_and_pg_temp_spelling() {
     let plan = plan_on_engine_remote(
         "postgresql",
         "pgremote",
-        "main!(*) :- pgremote.rt(*) |> temp_table!(staged) : s!\n\
+        "main!(*) :- pgremote.rt(*) |> temp_table!(staged(*))(*) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
     );
     assert_no_sqlite_spellings(&plan);
     let begin = begin_index(&plan);
     let commit = commit_index(&plan);
-    assert_eq!(begin, 0, "PG: BEGIN opens the plan — shells move inside the bracket");
+    assert_eq!(
+        begin, 0,
+        "PG: BEGIN opens the plan — shells move inside the bracket"
+    );
     let mut shells_seen = 0;
     for (i, sql, _) in statement_sqls(&plan) {
         if sql.starts_with("CREATE TEMP TABLE ") {
@@ -1891,15 +2323,14 @@ fn pg_dml_receipt_is_the_fused_data_modifying_cte() {
         .filter(|(_, sql, _)| sql.contains("__r_main") && sql.contains("'insert!'"))
         .count();
     assert_eq!(
-        receipt_writers, 1,
+        receipt_writers,
+        1,
         "exactly ONE statement writes the receipt (the fused wCTE):\n{}",
         plan.render_sql()
     );
 }
 
-/// R-T2 (PG): the pump's exit peek runs `CompiledPlan.exit_table`
-/// verbatim, so the stored spelling must be the dialect's; the shipped
-/// wrap-guard takes the same qualification (P1 H4).
+/// The planner supplies the pump's complete PostgreSQL exit probe.
 #[test]
 fn pg_exit_table_and_wrap_guard_spell_pg_temp() {
     let plan = plan_on_engine_remote(
@@ -1911,10 +2342,11 @@ fn pg_exit_table_and_wrap_guard_spell_pg_temp() {
          \x20   x!(*) ; l!(*)\n",
     );
     assert_no_sqlite_spellings(&plan);
-    assert_eq!(
-        plan.exit_table.as_deref(),
-        Some("pg_temp.__exit"),
-        "the peek spelling is dialect-carried (P1 H4)"
+    assert!(
+        plan.exit_probe_sql
+            .as_deref()
+            .is_some_and(|sql| sql.contains("FROM pg_temp.")),
+        "the complete exit probe uses the PostgreSQL scratch schema"
     );
     let ships: Vec<String> = statement_sqls(&plan)
         .into_iter()
@@ -1988,13 +2420,17 @@ fn duckdb_dml_receipt_gates_on_the_staged_precount() {
         "main!(*) :- duckremote.rt(*), region = \"EU\" |> insert!(duckremote.rt2(*))(*)\n",
     );
     for (_, sql, _) in statement_sqls(&plan) {
-        assert!(!sql.contains("changes()"), "no changes() on DuckDB: {}", sql);
+        assert!(
+            !sql.contains("changes()"),
+            "no changes() on DuckDB: {}",
+            sql
+        );
     }
     // DuckDB keeps shells-before-bracket byte-shaped as SQLite.
     let begin = begin_index(&plan);
     let shell = index_of(&plan, "CREATE TEMP TABLE temp.__r_main");
     assert!(shell < begin, "DuckDB shells stay before the bracket");
-    assert_eq!(plan.exit_table, None);
+    assert_eq!(plan.exit_probe_sql, None);
 
     // Statement order: [drop __aff] [stage the pre-count] [the DML]
     // [receipt gated on the count].
@@ -2036,8 +2472,12 @@ fn duckdb_dml_receipt_gates_on_the_staged_precount() {
 }
 
 /// The DuckDB pre-count of update!/delete! counts the DML's own
-/// predicate's selection over the target — including the stamped gates
-/// (`success` = matched cardinality of the actual statement, R-T6).
+/// selection over the target — including the stamped gates (`success` =
+/// matched cardinality of the actual statement, R-T6).
+///
+/// The count and the mutation read ONE staged source. Asserting that the
+/// count re-spells the authored predicate would assert the opposite: a
+/// second evaluation of the selection, which is the road R2.8 deleted.
 #[test]
 fn duckdb_update_precount_counts_the_matched_predicate() {
     let plan = plan_on_engine_remote(
@@ -2053,16 +2493,37 @@ fn duckdb_update_precount_counts_the_matched_predicate() {
         "count stage: {}",
         stage_sql
     );
-    assert!(
-        stage_sql.contains("rt") && stage_sql.contains("'new'"),
-        "the stage reads the TARGET under the UPDATE's own predicate: {}",
-        stage_sql
-    );
     let update_sql = sql_at(&plan, stage + 1);
     assert!(
         update_sql.starts_with("UPDATE"),
         "the UPDATE immediately follows: {}",
         update_sql
+    );
+    assert!(
+        stage_sql.contains("rt"),
+        "the stage reads the TARGET: {}",
+        stage_sql
+    );
+    // The staged source the UPDATE reads is the one the count reads. The
+    // name is minted, so it is recovered from the UPDATE rather than
+    // spelled here — a hardcoded `dml_source_1` would pass on the wrong
+    // relation the moment minting changed.
+    let flat_update = flat(update_sql);
+    let staged = flat_update
+        .match_indices("dml_source_")
+        .find_map(|(at, _)| {
+            let digits: String = flat_update[at + "dml_source_".len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            (!digits.is_empty()).then(|| format!("dml_source_{digits}"))
+        })
+        .unwrap_or_else(|| panic!("the UPDATE reads a staged source: {}", update_sql));
+    assert!(
+        stage_sql.contains(&staged),
+        "the count reads the SAME staged source as the UPDATE ({}): {}",
+        staged,
+        stage_sql
     );
 }
 
@@ -2076,6 +2537,11 @@ fn sqlite_representative_plan_render_pinned_byte_for_byte() {
         "main!(*) :- source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*)\n",
     );
     let expected = "-- [conn 2]\nCREATE TEMP TABLE temp.__r_main (success INTEGER, operation TEXT, target TEXT);\n\n-- [conn 2]\nBEGIN;\n\n-- [conn 2]\nINSERT INTO _imported_14.orders_eu (order_id, customer_id, region, amount, order_date, status) SELECT orders.order_id AS order_id, orders.customer_id AS customer_id, orders.region AS region, orders.amount AS amount, orders.order_date AS order_date, orders.status AS status\nFROM _imported_13.orders\nWHERE orders.region IS NOT DISTINCT FROM 'EU';\n\n-- [conn 2]\nINSERT INTO \"temp\".__r_main (success, operation, target) SELECT 1, 'insert!', 'warehouse.orders_eu'\nWHERE changes() > 0;\n\n-- [ship] [conn 2] the return value\nSELECT 1 AS success, 'main!' AS operation, t_2.returned AS returned\nFROM (\n  SELECT COALESCE(JSON('[' || GROUP_CONCAT(CASE WHEN ((__r_main.success IS NOT NULL OR __r_main.operation IS NOT NULL) OR __r_main.target IS NOT NULL) THEN JSON_OBJECT('success', __r_main.success, 'operation', __r_main.operation, 'target', __r_main.target) END, ',') || ']'), JSON('[]')) AS returned, count(*) AS __clause_count\n  FROM \"temp\".__r_main\n) AS t_2\nWHERE t_2.__clause_count > 0;\n\n-- [conn 2]\nCOMMIT;\n\n-- [conn 2] plan-scratch cleanup\nDROP TABLE IF EXISTS temp.__r_main;";
+    let expected = expected.replacen(
+        "-- [conn 2]\nCREATE TEMP TABLE temp.__r_main",
+        "-- [conn 2] clear plan scratch from a prior run\nDROP TABLE IF EXISTS temp.__r_main;\n\n-- [conn 2]\nCREATE TEMP TABLE temp.__r_main",
+        1,
+    );
     assert_eq!(
         plan.render_sql(),
         expected,
@@ -2127,7 +2593,7 @@ fn pg_table_bang_ctas_spells_the_mounted_schema_and_registers_on_the_connection(
     consult_str(
         &mut system,
         "main!(*) :-\n\
-         \x20   pgremote.rt(*) |> table!(dur) : a!\n\
+         \x20   pgremote.rt(*) |> table!(dur(*))(*) : a!\n\
          \x20   a!(*) |> returning!(*)\n",
     )
     .expect("consult should register the rule");
@@ -2169,7 +2635,7 @@ fn pg_table_bang_on_siso_connection_hits_the_siso_refusal_first() {
     consult_str(
         &mut system,
         "main!(*) :-\n\
-         \x20   pgremote.rt(*) |> table!(dur) : a!\n\
+         \x20   pgremote.rt(*) |> table!(dur(*))(*) : a!\n\
          \x20   a!(*) |> returning!(*)\n",
     )
     .expect("consult should register the rule");
@@ -2194,7 +2660,7 @@ fn duckdb_table_bang_on_the_direct_open_primary_stays_unqualified() {
         "duckdb",
         "dkremote",
         "main!(*) :-\n\
-         \x20   dkremote.rt(*) |> table!(dur) : a!\n\
+         \x20   dkremote.rt(*) |> table!(dur(*))(*) : a!\n\
          \x20   a!(*) |> returning!(*)\n",
     );
     let ctas = statement_sqls(&plan)
@@ -2209,8 +2675,8 @@ fn duckdb_table_bang_on_the_direct_open_primary_stays_unqualified() {
     );
 }
 
-/// §3 clash semantics on targets: the Epic-4.1 compile-time durable-clash
-/// refusal keys on the CONNECTION's namespace, so a PG-mounted name
+/// §3 clash semantics on targets: the compile-time durable-clash refusal
+/// keys on the CONNECTION's namespace, so a PG-mounted name
 /// (`rt2`, mount-introspected) refuses `table!` exactly as on SQLite.
 /// Compile-time — the refusal fires before any emission.
 #[test]
@@ -2220,7 +2686,7 @@ fn pg_durable_clash_on_the_target_refuses_at_compile_time() {
     consult_str(
         &mut system,
         "main!(*) :-\n\
-         \x20   pgremote.rt(*) |> table!(rt2) : a!\n\
+         \x20   pgremote.rt(*) |> table!(rt2(*))(*) : a!\n\
          \x20   a!(*) |> returning!(*)\n",
     )
     .expect("consult should register the rule");
@@ -2243,8 +2709,8 @@ fn pg_cross_kind_temp_replace_drops_spell_pg_temp_with_the_same_words() {
         "postgresql",
         "pgremote",
         "main!(*) :-\n\
-         \x20   pgremote.rt(*) |> temp_table!(sw) : a!\n\
-         \x20   pgremote.rt(*) |> temp_view!(sw) : b!\n\
+         \x20   pgremote.rt(*) |> temp_table!(sw(*))(*) : a!\n\
+         \x20   pgremote.rt(*) |> temp_view!(sw(*))(*) : b!\n\
          \x20   a!(*) ; b!(*)\n",
     );
     assert_no_sqlite_spellings(&plan);
@@ -2276,7 +2742,7 @@ fn pg_cross_kind_temp_replace_drops_spell_pg_temp_with_the_same_words() {
 // (pg_temp_readback_round_trip_and_table_bang_lands_in_public).
 // ------------------------------------------------------------------
 
-/// A connection that answers `query_all_string_rows` with canned rows
+/// A connection that answers `query_all_rows` with canned rows
 /// when the SQL contains a marker, errors otherwise, and records every
 /// SQL it was asked — the read-back seam's mock.
 struct CannedReadbackConnection {
@@ -2301,7 +2767,11 @@ impl CannedReadbackConnection {
 }
 
 impl delightql_types::db_traits::DatabaseConnection for CannedReadbackConnection {
-    fn execute(&self, sql: &str, _params: &[delightql_types::DbValue]) -> delightql_types::Result<usize> {
+    fn execute(
+        &self,
+        sql: &str,
+        _params: &[delightql_types::DbValue],
+    ) -> delightql_types::Result<usize> {
         self.executed.lock().unwrap().push(sql.to_string());
         Ok(1)
     }
@@ -2316,14 +2786,23 @@ impl delightql_types::db_traits::DatabaseConnection for CannedReadbackConnection
         self.executed.lock().unwrap().push(sql.to_string());
         Ok(None)
     }
-    fn query_all_string_rows(
+    fn query_all_rows(
         &self,
         sql: &str,
         _params: &[delightql_types::DbValue],
-    ) -> delightql_types::Result<(Vec<String>, Vec<Vec<String>>)> {
+    ) -> delightql_types::Result<(Vec<String>, Vec<Vec<delightql_types::DbValue>>)> {
         self.executed.lock().unwrap().push(sql.to_string());
-        if sql.contains(&self.answer_when_contains) {
-            Ok((self.columns.clone(), self.rows.clone()))
+        let text = |v: &str| delightql_types::DbValue::Text(v.to_string());
+        if sql.contains("information_schema.tables") {
+            Ok((vec!["table_name".to_string()], vec![vec![text("created")]]))
+        } else if sql.contains(&self.answer_when_contains) {
+            Ok((
+                self.columns.clone(),
+                self.rows
+                    .iter()
+                    .map(|r| r.iter().map(|v| text(v)).collect())
+                    .collect(),
+            ))
         } else {
             Err(delightql_types::DelightQLError::validation_error(
                 "canned connection: unexpected SQL",
@@ -2389,10 +2868,20 @@ fn pg_readback_routes_information_schema_sql_to_the_objects_connection() {
         canned.clone(),
     );
     let registered = system
-        .register_run_created_object("dur", false, conn_id)
+        .register_run_created_objects_with(
+            &[crate::pipeline::compiled_query::PlanCreatedObject {
+                name: "dur".to_string(),
+                is_view: false,
+                connection_id: Some(conn_id),
+            }],
+            &crate::system::RealCreatedObjectCatalog,
+        )
         .expect("read-back should not error");
     assert!(
-        registered,
+        matches!(
+            registered.as_slice(),
+            [crate::external_effects::RegistrationOutcome::Registered]
+        ),
         "the PG read-back must register from information_schema rows"
     );
     {
@@ -2412,7 +2901,10 @@ fn pg_readback_routes_information_schema_sql_to_the_objects_connection() {
             *executed
         );
     }
-    let bc = system.bootstrap_connection().lock().expect("bootstrap lock");
+    let bc = system
+        .bootstrap_connection()
+        .lock()
+        .expect("bootstrap lock");
     let count: i64 = bc
         .query_row(
             "SELECT COUNT(*) FROM entity e
@@ -2452,13 +2944,26 @@ fn duckdb_readback_keeps_pragma_and_tolerates_the_boolean_shape() {
         canned.clone(),
     );
     let registered = system
-        .register_run_created_object("dk_obj", false, conn_id)
+        .register_run_created_objects_with(
+            &[crate::pipeline::compiled_query::PlanCreatedObject {
+                name: "dk_obj".to_string(),
+                is_view: false,
+                connection_id: Some(conn_id),
+            }],
+            &crate::system::RealCreatedObjectCatalog,
+        )
         .expect("read-back should not error");
     assert!(
-        registered,
+        matches!(
+            registered.as_slice(),
+            [crate::external_effects::RegistrationOutcome::Registered]
+        ),
         "the DuckDB read-back registers from PRAGMA table_info rows"
     );
-    let bc = system.bootstrap_connection().lock().expect("bootstrap lock");
+    let bc = system
+        .bootstrap_connection()
+        .lock()
+        .expect("bootstrap lock");
     let dtype: String = bc
         .query_row(
             "SELECT ea.data_type FROM entity_attribute ea
@@ -2512,7 +3017,7 @@ fn effect_plan_on_siso_connection_refuses() {
         world_system_with_engine_remote_and_id("postgresql", "pgremote", "mock://pgremote");
     consult_str(
         &mut system,
-        "main!(*) :- pgremote.rt(*) |> temp_table!(staged)\n",
+        "main!(*) :- pgremote.rt(*) |> temp_table!(staged(*))(*)\n",
     )
     .expect("consult should register the rule");
     retype_connection_as_siso(&system, conn_id);
@@ -2531,11 +3036,15 @@ fn effect_plan_on_siso_connection_refuses() {
 /// scope, preserved through the strike's removal).
 #[test]
 fn anon_source_plan_with_siso_mount_elsewhere_still_compiles() {
-    let (mut system, conn_id) =
+    let (system, conn_id) =
         world_system_with_engine_remote_and_id("postgresql", "pgremote", "mock://pgremote");
     retype_connection_as_siso(&system, conn_id);
-    compile_query_plan(&system, &adhoc_query("_(x @ 1) |> temp_table!(t)"), None)
-        .expect("anon-source plans with a siso mount elsewhere keep hub convergence");
+    compile_query_plan(
+        &system,
+        &adhoc_query("_(x @ 1) |> temp_table!(t(*))(*)"),
+        None,
+    )
+    .expect("anon-source plans with a siso mount elsewhere keep hub convergence");
 }
 
 // ============================================================================
@@ -2551,122 +3060,125 @@ fn anon_source_plan_with_siso_mount_elsewhere_still_compiles() {
 // EVERY query-bearing edge, run through BOTH. If either scheme drops an edge,
 // this test fails on that edge's name.
 //
-// PRECISION LIMIT (other-code-review.md [P3]): this fixture is built at
-// Unresolved, where `SetOperation.correlation` is always empty — so this matrix
-// does NOT exercise the one edge where the two schemes genuinely differ
-// (AstVisit reaches correlation via `PhaseBox::correlation`; the cross-phase
-// AstTransform phantoms it). That divergence is harmless for GroundReadRenamer,
-// which runs strictly before correlation is populated (Refined). The
-// "coincide" claim is therefore scoped to the pre-correlation phases these
-// tenants run in — NOT a general same-phase guarantee. A future same-phase
-// transform that must preserve populated correlation needs its own mechanism
-// (INVENTORY §5 finding 9); do not read this matrix as proving that case.
+// This fixture covers the recursive carriers that can occur in unresolved
+// effect plans. A bag operation's correlation predicate is descended by both
+// generic walkers.
 
 mod p1_closure_matrix {
     use super::*;
     use crate::pipeline::asts::core::expressions::metadata_types::{FilterOrigin, SetOperator};
     use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
-    use crate::pipeline::asts::core::{
-        BooleanExpression, DomainExpression, SigmaCondition,
-    };
+    use crate::pipeline::asts::core::{DomainExpression, TruthExpression};
 
     fn qn(name: &str) -> QualifiedName {
         QualifiedName {
             namespace_path: crate::pipeline::ast_unresolved::NamespacePath::empty(),
             name: name.into(),
-            grounding: None,
         }
     }
 
-    fn join(
-        left: RelationalExpression,
-        right: RelationalExpression,
-        cond: Option<BooleanExpression>,
-    ) -> RelationalExpression {
-        RelationalExpression::Join {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_condition: cond,
+    fn join(left: Chain, right: Chain, cond: Option<TruthExpression>) -> Chain {
+        left.then(Continuation::Member {
+            rhs: right,
+            correlation: cond.map(crate::pipeline::ast_unresolved::MemberCorrelation::Condition),
             join_type: None,
-            cpr_schema: PhaseBox::phantom(),
-        }
+            cpr_schema: (),
+        })
     }
 
     /// One bare Ground read beneath every query-bearing edge, each uniquely
     /// named after the edge it sits under. The union of these names is the
     /// closure both schemes must reach.
-    fn every_edge_fixture() -> (RelationalExpression, Vec<&'static str>) {
+    fn every_edge_fixture() -> (Chain, Vec<&'static str>) {
         // Filter.source + Filter.condition (via InRelational subquery) — the
         // P1 headline hole.
-        let filter = RelationalExpression::Filter {
-            source: Box::new(ground_read("g_filter_source")),
-            condition: SigmaCondition::Predicate(BooleanExpression::InRelational {
-                value: Box::new(DomainExpression::NonUnifiyingUnderscore),
-                subquery: Box::new(ground_read("g_filter_condition")),
-                identifier: qn("f"),
+        let filter = named_ground_read("g_filter_source").then(Continuation::Restrict {
+            condition: TruthExpression::RelationalMembership(RelationalMembership {
+                probe: Probe::Value(Box::new(DomainExpression::Application(
+                    crate::pipeline::asts::core::FunctionApplication::Open(
+                        crate::pipeline::asts::core::DomainHole::Disregarded,
+                    ),
+                ))),
+                relation: Box::new(named_ground_read("g_filter_condition")),
+                addressing: ProbeAddressing {
+                    identifier: qn("f"),
+                    using_columns: vec![],
+                },
                 negated: false,
             }),
             origin: FilterOrigin::UserWritten,
-            cpr_schema: PhaseBox::phantom(),
-        };
+            cpr_schema: (),
+        });
 
-        // Join.left / Join.right / Join.join_condition (via InnerExists).
+        // Join.left / Join.right / Join.correlation (via InnerExists).
         let join_with_cond = join(
-            ground_read("g_join_left"),
-            ground_read("g_join_right"),
-            Some(BooleanExpression::InnerExists {
-                exists: true,
-                identifier: qn("j"),
-                subquery: Box::new(ground_read("g_join_condition")),
-                alias: None,
-                using_columns: vec![],
-            }),
+            named_ground_read("g_join_left"),
+            named_ground_read("g_join_right"),
+            Some(TruthExpression::Existence(Existence {
+                polarity: Polarity::Positive,
+                relation: Box::new(named_ground_read("g_correlation")),
+                addressing: ProbeAddressing {
+                    identifier: qn("j"),
+                    using_columns: vec![],
+                },
+            })),
         );
 
         // Pipe.source + a pipe-OPERATOR argument subquery (Transform → scalar
         // subquery): the edge missed by ALL relational-entry walkers today.
         let pipe = make_pipe(
-            ground_read("g_pipe_source"),
-            UnaryRelationalOperator::Transform {
-                transformations: vec![(
-                    DomainExpression::ScalarSubquery {
-                        identifier: qn("s"),
-                        subquery: Box::new(ground_read("g_operator_arg")),
-                        alias: None,
-                    },
-                    "a".to_string(),
-                    None,
-                )],
-                conditioned_on: None,
-            },
+            named_ground_read("g_pipe_source"),
+            PipeOp::Transform { items: crate::pipeline::asts::vocabulary::Vec1::new(crate::pipeline::asts::core::NamedOutItem {
+                    expr: OutValue::Domain(DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Scalarized(
+                            crate::pipeline::asts::core::ScalarRelation::Named {
+                                identifier: qn("s"),
+                                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
+                                    body: named_ground_read("g_operator_arg"),
+                                    scalarization:
+                                        crate::pipeline::asts::core::Scalarization::BoundToOne {
+                                            ordering: Vec::new(),
+                                        },
+                                    scope: (),
+                                    output: (),
+                                }),
+                            },
+                        ),
+                    )),
+                    naming: "a".into(),
+                    qualifier: None,
+                    output: (),
+                }), guard: None },
         );
 
         // SetOperation operand + an InnerRelation subquery.
-        let setop = RelationalExpression::SetOperation {
-            operator: SetOperator::SmartUnionAll,
-            operands: vec![
-                ground_read("g_setop_operand"),
-                RelationalExpression::Relation(Relation::InnerRelation {
-                    pattern: InnerRelationPattern::Indeterminate {
-                        identifier: qn("i"),
-                        subquery: Box::new(ground_read("g_inner_relation")),
-                    },
-                    alias: None,
-                    outer: false,
-                    cpr_schema: PhaseBox::phantom(),
-                }),
-            ],
-            correlation: PhaseBox::phantom(),
-            cpr_schema: PhaseBox::phantom(),
-        };
+        let setop = named_ground_read("g_setop_operand").bag_op(
+            SetOperator::SmartUnionAll,
+            Chain::relation(Relation::InnerRelation {
+                pattern: InnerRelationPattern::Indeterminate {
+                    identifier: qn("i"),
+                    subquery: Box::new(named_ground_read("g_inner_relation")),
+                },
+                preminted_scope: None,
+                alias: None,
+                outer: false,
+                cpr_schema: (),
+            }),
+            (),
+            (),
+        );
 
-        let fixture = join(filter, join(join_with_cond, join(pipe, setop, None), None), None);
+        let fixture = join(
+            filter,
+            join(join_with_cond, join(pipe, setop, None), None),
+            None,
+        );
         let names = vec![
             "g_filter_source",
             "g_filter_condition",
             "g_join_left",
             "g_join_right",
-            "g_join_condition",
+            "g_correlation",
             "g_pipe_source",
             "g_operator_arg",
             "g_setop_operand",
@@ -2678,6 +3190,21 @@ mod p1_closure_matrix {
     #[test]
     fn p1_closure_matrix_detection_and_rewrite_agree() {
         let (fixture, names) = every_edge_fixture();
+        struct PlanScopeCollector {
+            scopes: std::collections::HashSet<crate::names::ScopeId>,
+        }
+        impl AstVisit<Unresolved> for PlanScopeCollector {
+            fn enter_relation(&mut self, relation: &Relation) -> Result<Descent> {
+                if let Relation::Ground {
+                    mention: GroundMention::Plan { scope, .. },
+                    ..
+                } = relation
+                {
+                    self.scopes.insert(*scope);
+                }
+                Ok(Descent::Continue)
+            }
+        }
 
         // --- Detection (AstVisit) reaches every edge. ---
         let detected = collect_ground_names(&fixture);
@@ -2695,8 +3222,14 @@ mod p1_closure_matrix {
         // reached that exact edge and the detector sees the substitution. That
         // the SAME name set drives both halves is the R-I6 coincidence. ---
         for n in &names {
-            let snap = format!("{n}__snap");
-            let rewritten = rename_ground_reads(fixture.clone(), n, &snap);
+            let identities = crate::names::Registry::new(&[]);
+            let snap = identities.mint_derived_scope(
+                crate::names::ScopeOrigin::Scratch {
+                    role: crate::names::ScratchRole::Snapshot,
+                },
+                crate::names::Hint::None,
+            );
+            let rewritten = rename_ground_reads(fixture.clone(), n, snap);
             let after = collect_ground_names(&rewritten);
             assert!(
                 !after.contains(*n),
@@ -2704,13 +3237,162 @@ mod p1_closure_matrix {
                  (old name survived); after: {:?}",
                 after
             );
-            assert!(
-                after.contains(&snap),
-                "P1 REWRITE did not introduce the snapshot name at edge `{n}`; \
-                 after: {:?}",
-                after
-            );
+            let mut scopes = PlanScopeCollector {
+                scopes: std::collections::HashSet::new(),
+            };
+            walk_visit_relational(&mut scopes, &rewritten)
+                .expect("plan-scope detection is infallible");
+            assert!(scopes.scopes.contains(&snap));
         }
+    }
+
+    #[test]
+    fn plan_scope_rewrite_preserves_authored_access_shape() {
+        let identities = crate::names::Registry::new(&[]);
+        let snap = identities.mint_derived_scope(
+            crate::names::ScopeOrigin::Scratch {
+                role: crate::names::ScratchRole::Snapshot,
+            },
+            crate::names::Hint::None,
+        );
+        let source = Chain::read(
+            Relation::Ground {
+                mention: GroundMention::Named {
+                    identifier: qn("valid"),
+                    alias: Some("v".into()),
+                    mutation_target: false,
+                    passthrough: false,
+                },
+                outer: true,
+                cpr_schema: (),
+            },
+            Access::Unasked,
+            (),
+        );
+
+        let rewritten = rename_ground_reads(source, "valid", snap);
+        let access = rewritten
+            .head_access()
+            .cloned()
+            .expect("the read carries its access");
+        let Some(Relation::Ground {
+            mention:
+                GroundMention::Plan {
+                    scope,
+                    authored_name,
+                    alias,
+                },
+            outer,
+            ..
+        }) = rewritten.as_read_relation()
+        else {
+            panic!("the authored access should become an access-bearing plan scope")
+        };
+        let (scope, authored_name, alias, outer) =
+            (*scope, authored_name.clone(), alias.clone(), *outer);
+        assert_eq!(scope, snap);
+        assert_eq!(authored_name.as_deref(), Some("valid"));
+        assert!(matches!(access, Access::Unasked));
+        assert_eq!(alias.as_deref(), Some("v"));
+        assert!(outer);
+    }
+
+    #[test]
+    fn matched_plan_scope_still_rewrites_reads_inside_its_access() {
+        let identities = crate::names::Registry::new(&[]);
+        let snap = identities.mint_derived_scope(
+            crate::names::ScopeOrigin::Scratch {
+                role: crate::names::ScratchRole::Snapshot,
+            },
+            crate::names::Hint::None,
+        );
+        let source = Chain::read(
+            Relation::Ground {
+                mention: GroundMention::Named {
+                    identifier: qn("valid"),
+                    alias: None,
+                    mutation_target: false,
+                    passthrough: false,
+                },
+                outer: false,
+                cpr_schema: (),
+            },
+            Access::from_terms(vec![DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Scalarized(
+                    crate::pipeline::asts::core::ScalarRelation::Named {
+                        identifier: qn("probe"),
+                        body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
+                            body: named_ground_read("valid"),
+                            scalarization: crate::pipeline::asts::core::Scalarization::BoundToOne {
+                                ordering: Vec::new(),
+                            },
+                            scope: (),
+                            output: (),
+                        }),
+                    },
+                ),
+            )]),
+            (),
+        );
+        let rewritten = rename_ground_reads(source, "valid", snap);
+        struct CountPlanScopes(usize);
+        impl AstVisit<Unresolved> for CountPlanScopes {
+            fn enter_relation(&mut self, relation: &Relation) -> Result<Descent> {
+                if matches!(
+                    relation,
+                    Relation::Ground {
+                        mention: GroundMention::Plan { .. },
+                        ..
+                    }
+                ) {
+                    self.0 += 1;
+                }
+                Ok(Descent::Continue)
+            }
+        }
+        let mut count = CountPlanScopes(0);
+        walk_visit_relational(&mut count, &rewritten).expect("plan-scope visit is infallible");
+        assert_eq!(
+            count.0, 2,
+            "both the access root and its scalar-subquery read are rewritten"
+        );
+    }
+
+    #[test]
+    fn qualified_same_name_reads_are_outside_the_snapshot_rewrite() {
+        let mut identifier = qn("valid");
+        identifier.namespace_path =
+            crate::pipeline::ast_unresolved::NamespacePath::single("source");
+        let source = Chain::read(
+            Relation::Ground {
+                mention: GroundMention::Named {
+                    identifier,
+                    alias: None,
+                    mutation_target: false,
+                    passthrough: false,
+                },
+                outer: false,
+                cpr_schema: (),
+            },
+            Access::All,
+            (),
+        );
+        assert!(
+            collect_ground_names(&source).is_empty(),
+            "hazard detection and rewrite share the unqualified-access boundary"
+        );
+
+        let identities = crate::names::Registry::new(&[]);
+        let snap = identities.mint_derived_scope(
+            crate::names::ScopeOrigin::Scratch {
+                role: crate::names::ScratchRole::Snapshot,
+            },
+            crate::names::Hint::None,
+        );
+        assert!(matches!(
+            rename_ground_reads(source, "valid", snap).as_read_relation(),
+            Some(Relation::Ground { .. })
+        ));
     }
 }
 
@@ -2722,11 +3404,11 @@ mod p1_closure_matrix {
 //
 // These shapes are surface-inconstructible (the builder routes non-column
 // access expressions to WHERE filters), so they are pinned here at the level
-// they ARE constructible: a hand-built directive-bearing DomainSpec fed
+// they ARE constructible: a hand-built directive-bearing Access fed
 // straight into `walk_relation` (Ground) / `handle_dml` (DML). GREEN today (the
 // guards exist); RED-VERIFIABLE — deleting either guard drops the refusal and
 // lets the directive reach SQL unprocessed. Complements the existing detection
-// pin `effects::tests::domain_spec_demands_directive_reaches_positional_scalar_subquery`.
+// pin `effects::tests::access_demands_directive_reaches_positional_scalar_subquery`.
 // ============================================================================
 
 /// A `QualifiedName` for the RED-6 fixtures.
@@ -2734,59 +3416,72 @@ fn qn_red6(name: &str) -> QualifiedName {
     QualifiedName {
         namespace_path: crate::pipeline::asts::core::metadata::NamespacePath::empty(),
         name: name.into(),
-        grounding: None,
     }
 }
 
 /// A positional access spec that hides a directive (`insert!`) in a scalar
-/// subquery — the exact shape `domain_spec_demands_directive` detects.
-fn directive_bearing_domain_spec() -> DomainSpec {
-    DomainSpec::Positional(vec![DomainExpression::ScalarSubquery {
-        identifier: qn_red6("s"),
-        subquery: Box::new(RelationalExpression::Relation(Relation::PseudoPredicate {
-            name: "insert!".to_string(),
-            namespace: Vec::new(),
-            access: DomainSpec::Glob,
-            arguments: vec![],
-            alias: None,
-            cpr_schema: PhaseBox::phantom(),
-        })),
+/// subquery — the exact shape `access_demands_directive` detects.
+fn directive_bearing_access() -> Access {
+    let inner = Chain::relation(Relation::FunctorCall {
         alias: None,
-    }])
+        call: crate::pipeline::asts::core::FunctorCall::written(
+            crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
+                &std::rc::Rc::new(crate::names::Registry::new(&[])),
+                crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
+                "insert!",
+            ),
+            vec![],
+        )
+        .into(),
+        cpr_schema: (),
+    });
+    Access::from_terms(vec![DomainExpression::Application(
+        crate::pipeline::asts::core::FunctionApplication::Scalarized(
+            crate::pipeline::asts::core::ScalarRelation::Named {
+                identifier: qn_red6("s"),
+                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
+                    body: inner,
+                    scalarization: crate::pipeline::asts::core::Scalarization::BoundToOne {
+                        ordering: Vec::new(),
+                    },
+                    scope: (),
+                    output: (),
+                }),
+            },
+        ),
+    )])
 }
 
 fn top_walk_ctx() -> WalkCtx {
     WalkCtx {
         guards: Vec::new(),
-        label_hint: None,
         sink: None,
         ctes: Vec::new(),
         bindings: HashMap::new(),
+        receipt_name: "main".to_string(),
     }
 }
 
-/// RED-6 (Ground): `walk_relation` on a `Ground` read whose access spec demands
-/// a directive must refuse with the honest not-yet-lowerable diagnostic — never
-/// return the directive unprocessed. Pins the guard at mod.rs:792.
+/// RED-6 (Ground): a read whose access spec demands a directive must refuse
+/// with the honest not-yet-lowerable diagnostic — never return the directive
+/// unprocessed.
 #[test]
 fn ground_access_spec_directive_refuses_at_lowering() {
     let system = world_system();
-    let mut builder = PlanBuilder::new(&system, Some("fx"));
+    let mut builder = PlanBuilder::new(&system, Some("fx"), Rc::new(Registry::new(&[])));
     let ground = Relation::Ground {
-        identifier: qn_red6("orders"),
-        canonical_name: PhaseBox::phantom(),
-        backend_schema: PhaseBox::phantom(),
-        domain_spec: directive_bearing_domain_spec(),
-        alias: None,
+        mention: GroundMention::Named {
+            identifier: qn_red6("orders"),
+            alias: None,
+            mutation_target: false,
+            passthrough: false,
+        },
         outer: false,
-        mutation_target: false,
-        passthrough: false,
-        cpr_schema: PhaseBox::phantom(),
-        hygienic_injections: Vec::new(),
+        cpr_schema: (),
     };
 
     let err = builder
-        .walk_relation(ground, &top_walk_ctx())
+        .walk_read(ground, Some(directive_bearing_access()), &top_walk_ctx())
         .expect_err("a directive in a Ground access spec must refuse, not lower unprocessed");
     let msg = format!("{err}");
     assert!(
@@ -2802,28 +3497,49 @@ fn ground_access_spec_directive_refuses_at_lowering() {
 #[test]
 fn dml_access_spec_directive_refuses_at_lowering() {
     let system = world_system();
-    let mut builder = PlanBuilder::new(&system, Some("fx"));
+    let mut builder = PlanBuilder::new(&system, Some("fx"), Rc::new(Registry::new(&[])));
     // The walked source is immaterial: the guard fires before it is touched.
-    let walked_source = RelationalExpression::Relation(Relation::Ground {
-        identifier: qn_red6("source_rows"),
-        canonical_name: PhaseBox::phantom(),
-        backend_schema: PhaseBox::phantom(),
-        domain_spec: DomainSpec::Glob,
-        alias: None,
-        outer: false,
-        mutation_target: false,
-        passthrough: false,
-        cpr_schema: PhaseBox::phantom(),
-        hygienic_injections: Vec::new(),
-    });
+    let walked_source = Chain::read(
+        Relation::Ground {
+            mention: GroundMention::Named {
+                identifier: qn_red6("source_rows"),
+                alias: None,
+                mutation_target: false,
+                passthrough: false,
+            },
+            outer: false,
+            cpr_schema: (),
+        },
+        Access::All,
+        (),
+    );
 
     let err = builder
         .handle_dml(
             walked_source,
-            DmlKind::Insert,
+            crate::names::DmlVerb::Insert,
             "orders_eu".to_string(),
             Some("warehouse".to_string()),
-            directive_bearing_domain_spec(),
+            Chain::read(
+                Relation::Ground {
+                    mention: GroundMention::Named {
+                        identifier: qn_red6("orders_eu"),
+                        alias: None,
+                        mutation_target: false,
+                        passthrough: false,
+                    },
+                    outer: false,
+                    cpr_schema: (),
+                },
+                Access::All,
+                (),
+            ),
+            crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
+                &std::rc::Rc::new(crate::names::Registry::new(&[])),
+                crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
+                "insert!",
+            ),
+            directive_bearing_access(),
             &top_walk_ctx(),
         )
         .expect_err("a directive in a DML access spec must refuse, not lower unprocessed");

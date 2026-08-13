@@ -52,11 +52,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("warning: {warning}");
     }
 
-    // Get language
-    let language = delightql_formatter::language();
-
-    // Format
-    let outcome = delightql_formatter::format_outcome(&source, &language, &config)?;
+    let outcome = delightql_formatter::format_outcome(&source, &config)?;
 
     // Pass-through is safe but loud; "cannot determine" exits 2 so CI
     // can tell a formatter gap (2) from needs-formatting (1).
@@ -67,6 +63,16 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("warning: input does not parse; returned unchanged");
                 // No formatted form of unparseable input exists —
                 // "cannot determine" in both modes.
+                if !args.fail_if_not_formatted {
+                    print!("{}", outcome.text());
+                }
+                std::process::exit(2);
+            }
+            PassReason::DefinitionFile => {
+                eprintln!(
+                    "warning: this is a definition library — dql-fmt speaks the \
+                     query form only; returned unchanged"
+                );
                 if !args.fail_if_not_formatted {
                     print!("{}", outcome.text());
                 }

@@ -5,26 +5,29 @@
 //! TECHNICAL DEBT: This module hardcodes column schemas for known TVFs.
 //! The correct fix is making the resolver permissive about column references
 //! from Unknown-schema tables, then deleting this file entirely.
-//! See memory/tvf-passthrough-fix.md for the full plan.
-
-use crate::pipeline::ast_resolved;
 
 /// Create column metadata for a TVF column
-pub(super) fn create_tvf_column_metadata(
+fn tvf_column(
+    identities: &crate::names::Registry,
+    scope: crate::names::ScopeId,
+    entity: crate::names::EntityId,
     name: &str,
-    _data_type: &str,
-    table_name: &str,
+    data_type: &str,
     position: usize,
-) -> ast_resolved::ColumnMetadata {
-    let table = ast_resolved::TableName::Named(table_name.into());
-    ast_resolved::ColumnMetadata::new(
-        ast_resolved::ColumnProvenance::from_table_column(
-            name.to_string(),
-            table.clone(),
-            ast_resolved::QualificationSource::None, // TVF columns are not qualified in source
-        ),
-        table,
-        Some(position),
+) -> crate::names::ColId {
+    let published = identities.intern(name, false);
+    identities.mint_column(
+        scope,
+        crate::names::ColumnOrigin::CatalogColumn {
+            entity,
+            position: position as u32,
+        },
+        Some(published),
+        crate::names::Addressing::Published,
+        crate::names::ValueFacts {
+            declared_type: Some(data_type.to_string()),
+            ..Default::default()
+        },
     )
 }
 
@@ -33,34 +36,46 @@ pub(super) fn create_tvf_column_metadata(
 /// TECHNICAL DEBT: This should be replaced by runtime introspection.
 /// TVF columns should be discovered by the backend at execution time,
 /// with the resolver allowing Unknown-schema column references through.
-pub(super) fn get_tvf_schema(function: &str, alias: Option<&str>) -> ast_resolved::CprSchema {
+pub(super) fn get_tvf_schema(
+    function: &str,
+    alias: Option<&str>,
+    identities: &crate::names::Registry,
+) -> Option<crate::names::ScopeId> {
     let table_name = alias.unwrap_or(function);
+    let function_spelling = identities.intern(function, false);
+    let entity = identities.mint_entity(function_spelling);
+    let hint = identities.intern(table_name, false);
+    let scope = identities.mint_scope(
+        crate::names::ScopeOrigin::Resolution { of: entity },
+        crate::names::Hint::User(hint),
+        None,
+    );
 
-    match function {
-        "json_each" => {
-            let columns = vec![
-                create_tvf_column_metadata("key", "TEXT", table_name, 0),
-                create_tvf_column_metadata("value", "TEXT", table_name, 1),
-                create_tvf_column_metadata("type", "TEXT", table_name, 2),
-                create_tvf_column_metadata("atom", "TEXT", table_name, 3),
-                create_tvf_column_metadata("id", "INTEGER", table_name, 4),
-                create_tvf_column_metadata("parent", "INTEGER", table_name, 5),
-                create_tvf_column_metadata("fullkey", "TEXT", table_name, 6),
-                create_tvf_column_metadata("path", "TEXT", table_name, 7),
-            ];
-            ast_resolved::CprSchema::Resolved(columns)
-        }
-        "pragma_table_info" => {
-            let columns = vec![
-                create_tvf_column_metadata("cid", "INTEGER", table_name, 0),
-                create_tvf_column_metadata("name", "TEXT", table_name, 1),
-                create_tvf_column_metadata("type", "TEXT", table_name, 2),
-                create_tvf_column_metadata("notnull", "INTEGER", table_name, 3),
-                create_tvf_column_metadata("dflt_value", "TEXT", table_name, 4),
-                create_tvf_column_metadata("pk", "INTEGER", table_name, 5),
-            ];
-            ast_resolved::CprSchema::Resolved(columns)
-        }
-        _other => ast_resolved::CprSchema::Unknown,
+    let columns: &[(&str, &str)] = match function {
+        "json_each" => &[
+            ("key", "TEXT"),
+            ("value", "TEXT"),
+            ("type", "TEXT"),
+            ("atom", "TEXT"),
+            ("id", "INTEGER"),
+            ("parent", "INTEGER"),
+            ("fullkey", "TEXT"),
+            ("path", "TEXT"),
+        ],
+        "pragma_table_info" => &[
+            ("cid", "INTEGER"),
+            ("name", "TEXT"),
+            ("type", "TEXT"),
+            ("notnull", "INTEGER"),
+            ("dflt_value", "TEXT"),
+            ("pk", "INTEGER"),
+        ],
+        // The catalog does not describe this one; its heading is the
+        // target's, and the caller takes the default-transpilation road.
+        _other => return None,
+    };
+    for (position, (name, data_type)) in columns.iter().enumerate() {
+        tvf_column(identities, scope, entity, name, data_type, position);
     }
+    Some(scope)
 }

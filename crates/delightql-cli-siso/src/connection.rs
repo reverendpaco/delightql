@@ -19,6 +19,22 @@ impl PipeConnection {
     pub fn new(shared: Arc<SharedCoprocess>) -> Self {
         Self { shared }
     }
+
+    /// One coprocess field read as a value.
+    ///
+    /// A coprocess speaks text, so its null is whatever spelling the
+    /// profile told it to print (`.nullvalue`, `\pset null`). That
+    /// spelling is the ONLY thing that may mean absence here, and text
+    /// that happens to match it is indistinguishable from it — a
+    /// property of the wire the profile chose, not a decision this
+    /// connection is free to make differently in two places.
+    fn field(&self, text: String) -> DbValue {
+        if text == self.shared.profile().null_value {
+            DbValue::Null
+        } else {
+            DbValue::Text(text)
+        }
+    }
 }
 
 impl DatabaseConnection for PipeConnection {
@@ -37,7 +53,7 @@ impl DatabaseConnection for PipeConnection {
     }
 
     fn query_row_values(&self, sql: &str, _params: &[DbValue]) -> Result<Option<Vec<DbValue>>> {
-        let (_columns, rows) = self.shared.execute_query_raw(sql).map_err(|e| {
+        let (_columns, mut rows) = self.shared.execute_query_raw(sql).map_err(|e| {
             DelightQLError::database_error(
                 format!("Pipe query failed: {}", e),
                 e.to_string(),
@@ -48,60 +64,31 @@ impl DatabaseConnection for PipeConnection {
             return Ok(None);
         }
 
-        let row = &rows[0];
-        let values: Vec<DbValue> = row
-            .iter()
-            .map(|v| {
-                if v.is_empty() || v == "NULL" {
-                    DbValue::Null
-                } else {
-                    DbValue::Text(v.clone())
-                }
-            })
+        let values: Vec<DbValue> = rows
+            .swap_remove(0)
+            .into_iter()
+            .map(|v| self.field(v))
             .collect();
 
         Ok(Some(values))
     }
 
-    fn query_all_string_rows(
+    fn query_all_rows(
         &self,
         sql: &str,
         _params: &[DbValue],
-    ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-        self.shared.execute_query_raw(sql).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Pipe query failed: {}", e),
-                e.to_string(),
-            )
-        })
-    }
-
-    fn query_all_nullable_rows(
-        &self,
-        sql: &str,
-        _params: &[DbValue],
-    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
+    ) -> Result<(Vec<String>, Vec<Vec<DbValue>>)> {
         let (cols, rows) = self.shared.execute_query_raw(sql).map_err(|e| {
             DelightQLError::database_error(
                 format!("Pipe query failed: {}", e),
                 e.to_string(),
             )
         })?;
-        let nullable_rows = rows
+        let typed_rows = rows
             .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|v| {
-                        if v.is_empty() {
-                            None
-                        } else {
-                            Some(v)
-                        }
-                    })
-                    .collect()
-            })
+            .map(|row| row.into_iter().map(|v| self.field(v)).collect())
             .collect();
-        Ok((cols, nullable_rows))
+        Ok((cols, typed_rows))
     }
 }
 

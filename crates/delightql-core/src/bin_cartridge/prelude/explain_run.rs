@@ -29,14 +29,13 @@ use crate::bin_cartridge::{
 };
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::asts::core::expressions::functions::CurlyMember;
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
-use crate::pipeline::asts::core::expressions::PipeExpression;
 use crate::pipeline::asts::core::literals::LiteralValue;
 use crate::pipeline::asts::core::metadata::NamespacePath;
-use crate::pipeline::asts::core::specs::{ModuloSpec, OutputDomainExpression};
-use crate::pipeline::asts::core::ContainmentSemantic;
-use crate::pipeline::asts::core::FunctionExpression;
+use crate::pipeline::asts::core::specs::{GroupSpec, OneOut, OutItem, ReductionItem};
+use crate::pipeline::asts::core::FunctionApplication;
+use crate::pipeline::asts::core::OutValue;
+use crate::pipeline::asts::core::RecordMember;
 use crate::pipeline::asts::unresolved::*;
 use crate::pipeline::compiled_query::{EffectStep, TypedEffectPlan};
 
@@ -107,10 +106,7 @@ impl EffectExecutable for ExplainRunPredicate {
             ));
         }
         let path = match &arguments[0] {
-            DomainExpression::Literal {
-                value: LiteralValue::String(s),
-                ..
-            } => s.clone(),
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => s.clone(),
             other => {
                 return Err(DelightQLError::database_error(
                     format!("explain_run() file_path must be a string literal, got {other:?}"),
@@ -123,16 +119,13 @@ impl EffectExecutable for ExplainRunPredicate {
         // namespace consults; an existing one reconsults (lib/scratch
         // reload; other kinds surface reconsult's own curated refusal).
         let namespace = namespace_from_path(&path);
-        if let Err(consult_err) =
-            super::consult::execute_consult(system, &path, &namespace, None)
-        {
+        if let Err(consult_err) = super::consult::execute_consult(system, &path, &namespace, None) {
             system
                 .reconsult_namespace(&namespace, Some(&path))
                 .map_err(|_| consult_err)?;
         }
 
-        let plan =
-            crate::pipeline::effect_transformer::compile_namespace_main(system, &namespace)?;
+        let plan = crate::pipeline::effect_transformer::compile_namespace_main(system, &namespace)?;
         let typed = plan.typed.as_ref().ok_or_else(|| {
             DelightQLError::database_error(
                 "explain_run: the compiled plan carries no typed layer",
@@ -158,7 +151,13 @@ fn namespace_from_path(path: &str) -> String {
         .unwrap_or_default();
     let sanitized: String = stem
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if sanitized.is_empty() {
         "script".to_string()
@@ -167,7 +166,6 @@ fn namespace_from_path(path: &str) -> String {
     }
 }
 
-
 /// Build the explained plan as ordinary constructed relations: one row
 /// per scheduled step (flat columns joined with a one-row `requires`
 /// tree-group), unioned corresponding across steps, wrapped in an inner
@@ -175,25 +173,19 @@ fn namespace_from_path(path: &str) -> String {
 /// construction is what makes `requires` a schema-known interior for
 /// drills; a step with no edges contributes one all-NULL requirement row,
 /// which the tree-group constructor ELIDES into the empty interior.
-fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Relation {
-    let pipe = |source: RelationalExpression, operator: UnaryRelationalOperator| {
-        RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-            source,
-            operator,
-            cpr_schema: PhaseBox::phantom(),
-        })))
+fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grelex {
+    let pipe = |source: Chain, operator: PipeOp| {
+        source.then(Continuation::Pipe {
+            operator: operator,
+            named: None,
+            cpr_schema: (),
+        })
     };
 
-    let step_expr = |ordinal: usize, step: &EffectStep| -> RelationalExpression {
+    let step_expr = |ordinal: usize, step: &EffectStep| -> Chain {
         let (step_kind, action_kind) = step.kind().projection_kinds();
-        let s = |v: &str| DomainExpression::Literal {
-            value: LiteralValue::String(v.to_string()),
-            alias: None,
-        };
-        let n = |v: usize| DomainExpression::Literal {
-            value: LiteralValue::Number(v.to_string()),
-            alias: None,
-        };
+        let s = |v: &str| DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(v.to_string()),));
+        let n = |v: usize| DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(v.to_string()),));
         let flat_headers: Vec<DomainExpression> = [
             "plan_id",
             "step_id",
@@ -210,59 +202,42 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Relat
         .collect();
         let sql_display = step.sql_display();
         let route = match step.route {
-            Some(c) => DomainExpression::Literal {
-                value: LiteralValue::Number(c.to_string()),
-                alias: None,
-            },
-            None => DomainExpression::Literal {
-                value: LiteralValue::Null,
-                alias: None,
-            },
+            Some(c) => DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(c.to_string()),)),
+            None => DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null,)),
         };
-        let flat = Relation::Anonymous {
-            column_headers: Some(flat_headers),
-            rows: vec![Row {
-                values: vec![
-                    n(1),
-                    n(ordinal),
-                    n(ordinal),
-                    s(&step.occurrence),
-                    s(step_kind),
-                    s(action_kind),
-                    s(&step.operation),
-                    route,
-                    s(&sql_display),
-                ],
-            }],
-            alias: None,
-            outer: false,
-            exists_mode: false,
-            negated: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        };
+        let flat = AnonTable::from_values(
+            Some(flat_headers),
+            vec![vec![
+                n(1),
+                n(ordinal),
+                n(ordinal),
+                s(&step.occurrence),
+                s(step_kind),
+                s(action_kind),
+                s(&step.operation),
+                route,
+                s(&sql_display),
+            ]],
+            (),
+        )
+        .expect("an explain step has one nonempty row");
 
         let req_headers: Vec<DomainExpression> = ["guard_id", "polarity", "reason", "guard_sql"]
             .iter()
             .map(|h| DomainExpression::lvar_builder(h.to_string()).build())
             .collect();
-        let req_rows: Vec<Row> = if step.requirements.is_empty() {
+        let req_rows: Vec<Vec<DomainExpression>> = if step.requirements.is_empty() {
             // One all-NULL contributor row: the tree-group constructor
             // elides it into the empty interior `[]` — `always` is the
             // absence of edges, kept schema-known.
-            vec![Row {
-                values: (0..4)
-                    .map(|_| DomainExpression::Literal {
-                        value: LiteralValue::Null,
-                        alias: None,
-                    })
-                    .collect(),
-            }]
+            vec![(0..4)
+                .map(|_| DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null,)))
+                .collect()]
         } else {
             step.requirements
                 .iter()
-                .map(|r| Row {
-                    values: vec![
+                .map(|r| {
+                    vec![
                         n(r.guard_id),
                         s(match r.polarity {
                             crate::pipeline::compiled_query::GuardPolarity::Present => "present",
@@ -270,77 +245,73 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Relat
                         }),
                         s(r.reason),
                         s(&typed.guards[r.guard_id].sql),
-                    ],
+                    ]
                 })
                 .collect()
         };
-        let req_src = Relation::Anonymous {
-            column_headers: Some(req_headers),
-            rows: req_rows,
-            alias: None,
-            outer: false,
-            exists_mode: false,
-            negated: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        };
+        let req_src = AnonTable::from_values(Some(req_headers), req_rows, ())
+            .expect("an explain requirement source has a nonempty row");
         let grouped = pipe(
-            RelationalExpression::Relation(req_src),
-            UnaryRelationalOperator::Modulo {
-                containment_semantic: ContainmentSemantic::Parenthesis,
-                spec: ModuloSpec::GroupBy {
-                    reducing_by: Vec::new(),
-                    reducing_on: vec![OutputDomainExpression {
-                        expr: DomainExpression::Function(FunctionExpression::Curly {
-                            members: vec![CurlyMember::Glob],
-                            inner_grouping_keys: Vec::new(),
-                            cte_requirements: None,
-                            alias: Some("requires".into()),
-                        }),
-                        output: PhaseBox::phantom(),
-                    }],
-                    delegates: Vec::new(),
-                },
-            },
+            Chain::ground(Grelex::Literal(AnonRelation::plain(req_src))),
+            PipeOp::Group(GroupSpec::Reduce {
+                    plan: ReductionPlan::empty(),
+                    keys: Vec::new(),
+                    reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(OutItem::One(OneOut {
+                        expr: OutValue::Domain(DomainExpression::Application(
+                            FunctionApplication::Enclyph(
+                                crate::pipeline::asts::core::Enclyph::Record(
+                                    crate::pipeline::asts::core::Record::plain(
+                                        crate::pipeline::asts::vocabulary::Vec1::new(RecordMember::Spread(
+                                            crate::pipeline::asts::core::Spread::Glob(
+                                                crate::pipeline::asts::core::Glob::whole(),
+                                            ),
+                                        )),
+                                    ),
+                                ),
+                            ),
+                        )),
+                        naming: Some("requires".into()),
+                        output: (),
+                    }))),
+                }),
         );
-        RelationalExpression::Join {
-            left: Box::new(RelationalExpression::Relation(flat)),
-            right: Box::new(grouped),
-            join_condition: None,
+        Chain::ground(Grelex::Literal(AnonRelation::plain(flat))).then(Continuation::Member {
+            rhs: grouped,
+            correlation: None,
             join_type: None,
-            cpr_schema: PhaseBox::phantom(),
-        }
+            cpr_schema: (),
+        })
     };
 
-    let arms: Vec<RelationalExpression> = typed
+    let arms: Vec<Chain> = typed
         .steps
         .iter()
         .enumerate()
         .map(|(i, step)| step_expr(i, step))
         .collect();
-    let unioned = if arms.len() == 1 {
-        arms.into_iter().next().unwrap()
-    } else {
-        RelationalExpression::SetOperation {
-            operator: crate::pipeline::asts::core::expressions::SetOperator::UnionCorresponding,
-            operands: arms,
-            correlation: PhaseBox::phantom(),
-            cpr_schema: PhaseBox::phantom(),
-        }
-    };
+    let mut arms = arms.into_iter();
+    let mut unioned = arms.next().expect("a run has at least one step");
+    for arm in arms {
+        unioned = unioned.bag_op(
+            crate::pipeline::asts::core::expressions::SetOperator::UnionCorresponding,
+            arm,
+            (),
+            (),
+        );
+    }
 
-    let wrapper = alias.unwrap_or_else(|| "__explained_plan".to_string());
-    Relation::InnerRelation {
+    let identifier = alias.as_deref().unwrap_or("explain_run");
+    Grelex::Reference(Relation::InnerRelation {
         pattern: InnerRelationPattern::Indeterminate {
             identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
                 namespace_path: NamespacePath::empty(),
-                name: wrapper.clone().into(),
-                grounding: None,
+                name: identifier.into(),
             },
             subquery: Box::new(unioned),
         },
-        alias: Some(wrapper.into()),
+        preminted_scope: None,
+        alias: alias.map(Into::into),
         outer: false,
-        cpr_schema: PhaseBox::phantom(),
-    }
+        cpr_schema: (),
+    })
 }

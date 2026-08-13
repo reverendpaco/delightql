@@ -59,7 +59,7 @@ pub fn sync_bin_cartridges_to_bootstrap(
 
         // Step 3: Register each entity under its IDENTITY namespace — the
         // entity's namespace_override if declared, else the cartridge's
-        // namespace (DIRECTIVE-CONVERGENCE-PLAN Phase 2: deliberate catalog
+        // namespace (deliberate catalog
         // identities; compile activates under sys::execution, not
         // std::prelude).
         for entity in cartridge.entities() {
@@ -120,6 +120,21 @@ pub fn sync_bin_cartridges_to_bootstrap(
 
         // Step 4: activation happened per entity above, in each entity's
         // identity namespace.
+        //
+        // EVERY DECLARED DIRECTIVE IDENTITY PUBLISHES ITSELF. Identity and
+        // execution capability are separate: a directive realized as a
+        // syntax terminal or a liminal-only form has no bin entity to
+        // register, and its identity row is published HERE, from the one
+        // declaration — so a built-in cannot be implemented while
+        // forgetting to publish. An Entity realization must have arrived
+        // through the cartridge above; a missing registration is an error
+        // that propagates, never an absence.
+        publish_declared_directive_identities(
+            conn,
+            cartridge_id,
+            &metadata.namespace_path,
+            namespace_id,
+        )?;
         log::debug!(
             "Synced bin cartridge '{}' to bootstrap (namespace '{}')",
             metadata.source_uri,
@@ -127,7 +142,7 @@ pub fn sync_bin_cartridges_to_bootstrap(
         );
 
         // Step 5: Auto-enlist universal namespaces into `home` — the
-        // interactive session's own resolution scope (Phase 7/2H: edges
+        // interactive session's own resolution scope (edges
         // are owned by the namespace whose environment they extend,
         // never by the `main` data namespace)
         if metadata.is_universal {
@@ -157,7 +172,64 @@ pub fn sync_bin_cartridges_to_bootstrap(
     Ok(universal_namespaces)
 }
 
+/// Publish the identity of every DECLARED directive whose catalog namespace
+/// is this cartridge's namespace.
+///
+/// For an Entity realization the cartridge registration above is the
+/// publication, and its absence is an ERROR: the declaration says the entity
+/// exists, so a missing row means the realization dispatch forgot it — the
+/// error propagates rather than masquerading as absence. For a syntax
+/// terminal or a liminal-only form the identity row is inserted here with
+/// [`EntityType::SyntaxDirective`], so reflection enumerates the COMPLETE
+/// declared universe without pretending those identities are ordinary
+/// executable bin entities.
+fn publish_declared_directive_identities(
+    conn: &Connection,
+    cartridge_id: i32,
+    namespace_path: &str,
+    namespace_id: i32,
+) -> Result<()> {
+    use crate::pipeline::asts::effects::{DirectiveKind, DirectiveRealization};
+    for kind in DirectiveKind::ALL {
+        let descriptor = kind.descriptor();
+        if descriptor.namespace != namespace_path {
+            continue;
+        }
+        let bang = kind.bang_name();
+        match descriptor.realization {
+            DirectiveRealization::Entity => {
+                let registered: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM entity
+                      WHERE name = ?1 AND cartridge_id = ?2)",
+                    params![bang, cartridge_id],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    registered,
+                    "directive '{bang}' declares Entity realization but the \
+                     cartridge registered no entity for it: its identity \
+                     cannot be published"
+                );
+            }
+            DirectiveRealization::SyntaxPipeTerminal | DirectiveRealization::LiminalOnly => {
+                conn.execute(
+                    "INSERT INTO entity (name, type, cartridge_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        bang,
+                        crate::enums::EntityType::SyntaxDirective.as_i32(),
+                        cartridge_id,
+                    ],
+                )?;
+                let entity_id = conn.last_insert_rowid() as i32;
+                crate::import::activate_entity(conn, entity_id, namespace_id, cartridge_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Embedded seed for `dialect_form_rule` — per-functor targeting rules for
-/// bin entities (ALL-SQL-TARGETING-DESIGN.md §4.1). Runs after entity sync
+/// bin entities. Runs after entity sync
 /// because the rows resolve `entity_id` by (name, type) subselect.
 const FORM_RULES_SEED: &str = include_str!("../../bootstrap/form_rules.sql");

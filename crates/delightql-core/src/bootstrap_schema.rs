@@ -11,6 +11,7 @@
 /// - Works identically for SQLite, DuckDB, and future backends
 /// - Schema information arrives via mount!, not at open() time
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
+use delightql_types::{DelightQLError, Result};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -33,8 +34,17 @@ impl BootstrapBackedSchema {
 unsafe impl Sync for BootstrapBackedSchema {}
 
 impl DatabaseSchema for BootstrapBackedSchema {
-    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Option<Vec<ColumnInfo>> {
-        let conn = self.bootstrap_conn.lock().ok()?;
+    fn get_table_columns(
+        &self,
+        schema: Option<&str>,
+        table_name: &str,
+    ) -> Result<Option<Vec<ColumnInfo>>> {
+        let conn = self.bootstrap_conn.lock().map_err(|error| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire bootstrap schema connection",
+                error.to_string(),
+            )
+        })?;
 
         // The schema qualifier can be either:
         // 1. A namespace fq_name (e.g., "main", "zot") — used by direct user queries
@@ -52,7 +62,7 @@ impl DatabaseSchema for BootstrapBackedSchema {
         // single entity, PREFERRING the session-materialized one — this is
         // the ruled bare-name shadowing (materialize-pipe §6: temp shadows
         // main for unqualified names; a name-keyed schema question is
-        // unqualified-shaped). A `temp_table!(staged)` over a physical
+        // unqualified-shaped). A `temp_table!(staged(*))(*)` over a physical
         // `staged` leaves BOTH registered (the F2 retirement is scoped to
         // the session cartridge), so without this preference the old join
         // would interleave two column sets. Qualified reads punch through
@@ -77,10 +87,10 @@ impl DatabaseSchema for BootstrapBackedSchema {
             ORDER BY ea.position
         "#;
 
-        let columns = Self::query_columns(&conn, sql_by_namespace, qualifier, table_name);
+        let columns = Self::query_columns(&conn, sql_by_namespace, qualifier, table_name)?;
         if let Some(cols) = columns {
             if !cols.is_empty() {
-                return Some(cols);
+                return Ok(Some(cols));
             }
         }
 
@@ -88,33 +98,42 @@ impl DatabaseSchema for BootstrapBackedSchema {
         // to cartridge.source_ns. In particular an unqualified main mount may
         // still record its physical ATTACH alias on the cartridge without
         // making generated reads qualified.
+        //
+        // ONE entity's columns, never a merge — the same law the namespace
+        // path states, and it binds here for a second reason: a physical
+        // schema may back more than one mount (one file named by two
+        // namespaces), so this qualifier can reach several equally valid
+        // entities. Their attribute rows interleave by position into a
+        // heading that describes no relation, and every column in it loses
+        // its name. Pick one; they are the same table.
         let sql_by_mount_qualification = r#"
             SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
             FROM entity_attribute ea
-            JOIN entity e ON e.id = ea.entity_id
-            JOIN activated_entity ae ON ae.entity_id = e.id
-            JOIN cartridge c ON ae.cartridge_id = c.id
-            JOIN mount m ON m.namespace_id = ae.namespace_id
-                        AND m.cartridge_id = c.id
-            WHERE CASE
-                    WHEN m.qualification = 'aliased' THEN m.attach_alias
-                    WHEN m.qualification = 'engine_schema' THEN m.engine_schema
-                    ELSE NULL
-                  END = ?1
-              AND e.name = ?2
+            WHERE ea.entity_id = (
+                SELECT e.id
+                FROM entity e
+                JOIN activated_entity ae ON ae.entity_id = e.id
+                JOIN cartridge c ON ae.cartridge_id = c.id
+                JOIN mount m ON m.namespace_id = ae.namespace_id
+                            AND m.cartridge_id = c.id
+                WHERE CASE
+                        WHEN m.qualification = 'aliased' THEN m.attach_alias
+                        WHEN m.qualification = 'engine_schema' THEN m.engine_schema
+                        ELSE NULL
+                      END = ?1
+                  AND e.name = ?2
+                ORDER BY e.id DESC
+                LIMIT 1
+            )
               AND ea.attribute_type = 'output_column'
             ORDER BY ea.position
         "#;
 
-        let columns = Self::query_columns(
-            &conn,
-            sql_by_mount_qualification,
-            qualifier,
-            table_name,
-        );
+        let columns =
+            Self::query_columns(&conn, sql_by_mount_qualification, qualifier, table_name)?;
         if let Some(cols) = columns {
             if !cols.is_empty() {
-                return Some(cols);
+                return Ok(Some(cols));
             }
         }
 
@@ -137,18 +156,19 @@ impl DatabaseSchema for BootstrapBackedSchema {
             ORDER BY ea.position
         "#;
 
-        let columns = Self::query_columns(&conn, sql_by_non_mount_source_ns, qualifier, table_name);
+        let columns =
+            Self::query_columns(&conn, sql_by_non_mount_source_ns, qualifier, table_name)?;
         if let Some(cols) = columns {
             if !cols.is_empty() {
-                return Some(cols);
+                return Ok(Some(cols));
             }
         }
 
-        None
+        Ok(None)
     }
 
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool {
-        self.get_table_columns(schema, table_name).is_some()
+    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool> {
+        Ok(self.get_table_columns(schema, table_name)?.is_some())
     }
 }
 
@@ -158,8 +178,13 @@ impl BootstrapBackedSchema {
         sql: &str,
         qualifier: &str,
         table_name: &str,
-    ) -> Option<Vec<ColumnInfo>> {
-        let mut stmt = conn.prepare(sql).ok()?;
+    ) -> Result<Option<Vec<ColumnInfo>>> {
+        let mut stmt = conn.prepare(sql).map_err(|error| {
+            DelightQLError::database_error(
+                "Failed to prepare bootstrap schema query",
+                error.to_string(),
+            )
+        })?;
         let columns: Vec<ColumnInfo> = stmt
             .query_map(rusqlite::params![qualifier, table_name], |row| {
                 let name: String = row.get(0)?;
@@ -174,10 +199,17 @@ impl BootstrapBackedSchema {
                     declared_type: data_type.filter(|t| !t.is_empty()),
                 })
             })
-            .ok()?
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
+            .map_err(|error| {
+                DelightQLError::database_error(
+                    "Failed to query bootstrap schema",
+                    error.to_string(),
+                )
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                DelightQLError::database_error("Failed to read bootstrap schema", error.to_string())
+            })?;
 
-        Some(columns)
+        Ok(Some(columns))
     }
 }

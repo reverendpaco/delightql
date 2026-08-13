@@ -91,18 +91,17 @@ mod tests {
 mod red_pins {
     use super::*;
 
-    // RED pin (codex fresh-eyes 2026-07-20 F-24): the recovery tree of
-    // the ordinary incomplete editor buffer `people(` drives the
-    // indentation arithmetic below zero — attempt to subtract with
-    // overflow. CST inspection is FOR malformed input; the printer must
-    // be total over every tree the parser can produce.
+    // The recovery tree of the ordinary incomplete editor buffer
+    // `people(` drives the indentation arithmetic below zero — a
+    // subtract-with-overflow. CST inspection is FOR malformed input; the
+    // printer must be total over every tree the parser can produce.
     #[test]
     fn incomplete_table_call_pretty_prints_without_panic() {
-        // parse_for_cst_output is the --to cst path: it tolerates error
-        // trees, because inspecting malformed buffers is CST's job.
-        let tree = crate::pipeline::parser::parse_for_cst_output("people(")
+        // The `--to cst` road tolerates error trees, because inspecting
+        // malformed buffers is CST's job.
+        let tree = crate::pipeline::parse::prompt_showing_defects("people(")
             .expect("CST parse tolerates error trees");
-        let printed = custom_pretty_print(&tree.root_node().to_sexp());
+        let printed = custom_pretty_print(&tree.raw().root_node().to_sexp());
         assert!(!printed.is_empty());
     }
 }

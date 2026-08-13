@@ -2,200 +2,177 @@
 // Copyright 2026 Daniel Eklund
 //! Tree group CTE requirements analysis (Phase R2+)
 //!
-//! This module analyzes tree groups in modulo reductions to determine which ones
+//! This module analyzes tree groups in group reductions to determine which ones
 //! need CTEs and populates the `cte_requirements` metadata in the AST.
 //!
 //! The transformer (Phase R4+) will read this metadata to generate independent CTEs
 //! for each tree group with nested reductions.
 
 use crate::error::Result;
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::{Enclyph, MetadataTarget};
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved::{
-    self as ast, CteRequirements, FunctionExpression, NestedMemberCteInfo, TreeGroupLocation,
+    self as ast, CteRequirements, FunctionApplication, NestedMemberCteInfo, ReductionPlan,
+    TreeGroupLocation, TreeGroupPlan,
 };
 
-/// Check if a domain expression is a tree group with nested reductions
+/// WHAT A TREE GROUP IS, borrowed for annotation.
+///
+/// A record with an induced member and a metadata level both re-enter
+/// reduction under the parent's group, so both owe a CTE. Nothing else does,
+/// and the position says which one it is holding rather than a reader asking
+/// a value what it happens to be.
+enum TreeGroup<'a> {
+    Record(&'a mut ast::Record),
+    Metadata(&'a mut ast::MetadataGroup),
+}
+
+/// Does this published value build a tree group with nested reductions?
 fn has_nested_reductions(expr: &ast::DomainExpression) -> bool {
     match expr {
-        ast::DomainExpression::Function(FunctionExpression::Curly { members, .. }) => {
-            members.iter().any(|m| {
-                matches!(
-                    m,
-                    ast::CurlyMember::KeyValue {
-                        nested_reduction: true,
-                        ..
-                    }
-                )
-            })
-        }
-        ast::DomainExpression::Function(FunctionExpression::MetadataTreeGroup { .. }) => true,
-        // Non-tree-group function expressions: Regular, Curried, HigherOrder, Bracket,
-        // Infix, Lambda, StringTemplate, CaseExpression, Window, Array, JsonPath.
-        // None of these are tree groups — no nested reductions.
-        ast::DomainExpression::Function(FunctionExpression::Regular { .. })
-        | ast::DomainExpression::Function(FunctionExpression::Curried { .. })
-        | ast::DomainExpression::Function(FunctionExpression::HigherOrder { .. })
-        | ast::DomainExpression::Function(FunctionExpression::Bracket { .. })
-        | ast::DomainExpression::Function(FunctionExpression::Infix { .. })
-        | ast::DomainExpression::Function(FunctionExpression::Lambda { .. })
-        | ast::DomainExpression::Function(FunctionExpression::StringTemplate { .. })
-        | ast::DomainExpression::Function(FunctionExpression::CaseExpression { .. })
-        | ast::DomainExpression::Function(FunctionExpression::Window { .. })
-        | ast::DomainExpression::Function(FunctionExpression::Array { .. })
-        | ast::DomainExpression::Function(FunctionExpression::JsonPath { .. }) => false,
-        // Non-function domain expressions: columns, literals, placeholders, etc.
-        // None of these are tree groups.
-        ast::DomainExpression::Lvar { .. }
-        | ast::DomainExpression::Literal { .. }
-        | ast::DomainExpression::Projection(_)
-        | ast::DomainExpression::NonUnifiyingUnderscore
-        | ast::DomainExpression::ValuePlaceholder { .. }
-        | ast::DomainExpression::Substitution(_)
-        | ast::DomainExpression::Predicate { .. }
-        | ast::DomainExpression::PipedExpression { .. }
-        | ast::DomainExpression::Parenthesized { .. }
-        | ast::DomainExpression::Tuple { .. }
-        | ast::DomainExpression::ColumnOrdinal(_)
-        | ast::DomainExpression::ScalarSubquery { .. }
-        | ast::DomainExpression::PivotOf { .. } => false,
+        ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(
+            record,
+        ))) => record
+            .members
+            .iter()
+            .any(|member| matches!(member, ast::RecordMember::Induced { .. })),
+        _ => false,
     }
 }
 
-/// Extract inner grouping keys WITH KEY NAMES from a tree group
-/// Returns (key_name, expression) where key_name is Some for GROUPING DRESS, None for simple fields
+/// The tree group a reduction item carries, when it carries one.
+fn tree_group_of(item: &mut ast::ReductionItem) -> Option<TreeGroup<'_>> {
+    match item {
+        // A metadata level always reduces.
+        ast::ReductionItem::Metadata(metadata) => Some(TreeGroup::Metadata(&mut metadata.group)),
+        // A pivot rotates values into columns; a delegate selects a
+        // representative row: neither builds a tree.
+        ast::ReductionItem::Pivot(_) | ast::ReductionItem::Delegate(_) => None,
+        ast::ReductionItem::Out(item) => match item.domain_value_mut()? {
+            ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(
+                record,
+            ))) if record
+                .members
+                .iter()
+                .any(|member| matches!(member, ast::RecordMember::Induced { .. })) =>
+            {
+                Some(TreeGroup::Record(record))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// The inner grouping keys a tree group contributes, with the key name a
+/// GROUPING DRESS reconstructs under (`None` for a plain field).
 fn extract_inner_grouping_keys_with_names(
     expr: &ast::DomainExpression,
 ) -> Vec<(Option<String>, ast::DomainExpression)> {
     match expr {
-        ast::DomainExpression::Function(FunctionExpression::Curly { members, .. }) => {
-            // Extract non-nested members with their key names
-            members
+        ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(record))) => {
+            record
+                .members
                 .iter()
-                .filter_map(|m| match m {
-                    ast::CurlyMember::Shorthand {
-                        column,
-                        qualifier,
-                        schema,
-                    } => {
-                        // Simple scalar field - no key name
-                        Some((
-                            None,
-                            ast::DomainExpression::Lvar {
-                                name: column.clone(),
-                                qualifier: qualifier.clone(),
-                                namespace_path: schema
-                                    .as_ref()
-                                    .map(|s| ast::NamespacePath::single(s.clone()))
-                                    .unwrap_or_else(|| ast::NamespacePath::empty()),
-                                alias: None,
-                                provenance: ast::PhaseBox::phantom(),
+                .filter_map(|member| match member {
+                    ast::RecordMember::SelfKeyed(NamedReference(occurrence)) => Some((
+                        None,
+                        ast::DomainExpression::Reference(Reference::Named(NamedReference(
+                            ColumnOccurrence {
+                                column: occurrence.column,
+                                explicit_qualifier: false,
                             },
-                        ))
-                    }
-                    ast::CurlyMember::KeyValue {
-                        key,
-                        nested_reduction: false,
-                        value,
-                    } => {
-                        // Check if this is GROUPING DRESS (nested object) or simple renamed field
+                        ))),
+                    )),
+                    ast::RecordMember::Keyed { key, value } => {
+                        // GROUPING DRESS: a nested record standing as a key
+                        // is reconstructed under its own name; a plain renamed
+                        // field is just the value.
                         if matches!(
                             value.as_ref(),
-                            ast::DomainExpression::Function(FunctionExpression::Curly { .. })
+                            ast::DomainExpression::Application(FunctionApplication::Enclyph(
+                                Enclyph::Record(_)
+                            ))
                         ) {
-                            // GROUPING DRESS: nested object like {"key": {country, age}}
-                            // Include key name for reconstruction
                             Some((Some(key.clone()), *value.clone()))
                         } else {
-                            // Simple renamed field like {"key": column_name}
-                            // No key name (not GROUPING DRESS)
                             Some((None, *value.clone()))
                         }
                     }
-                    // KeyValue with nested_reduction (explosion ~>): NOT a grouping key
-                    // These are aggregation targets, not dimensions
-                    ast::CurlyMember::KeyValue {
-                        nested_reduction: true,
-                        ..
-                    } => None,
-                    // Comparison, Glob, Pattern, OrdinalRange, Placeholder, PathLiteral:
-                    // not grouping keys in tree group context — skip
-                    ast::CurlyMember::Comparison { .. }
-                    | ast::CurlyMember::Glob { .. }
-                    | ast::CurlyMember::Pattern { .. }
-                    | ast::CurlyMember::OrdinalRange { .. }
-                    | ast::CurlyMember::Placeholder { .. }
-                    | ast::CurlyMember::PathLiteral { .. } => None,
+                    // An induced member is an aggregation target, not a
+                    // dimension.
+                    ast::RecordMember::Induced { .. } => None,
+                    ast::RecordMember::Spread(spread) => spread.expanded(),
                 })
                 .collect()
-        }
-        ast::DomainExpression::Function(FunctionExpression::MetadataTreeGroup {
-            key_column,
-            key_qualifier,
-            key_schema,
-            ..
-        }) => {
-            // For metadata tree groups, the key column has no key name (not GROUPING DRESS)
-            vec![(
-                None,
-                ast::DomainExpression::Lvar {
-                    name: key_column.clone(),
-                    qualifier: key_qualifier.clone(),
-                    namespace_path: key_schema
-                        .as_ref()
-                        .map(|s| ast::NamespacePath::single(s.clone()))
-                        .unwrap_or_else(|| ast::NamespacePath::empty()),
-                    alias: None,
-                    provenance: ast::PhaseBox::phantom(),
-                },
-            )]
         }
         other => panic!("catch-all hit in tree_group_analysis.rs extract_inner_grouping_keys_with_names (DomainExpression): {:?}", other),
     }
 }
 
-/// Information about a tree group that needs CTE analysis
-struct TreeGroupToAnalyze<'a> {
-    /// Mutable reference to the expression (so we can update cte_requirements)
-    expr: &'a mut ast::DomainExpression,
-    /// Location in the query (reducing_by or reducing_on)
-    location: TreeGroupLocation,
-    /// Index in the original slice (for debugging)
-    #[allow(dead_code)]
-    index: usize,
+/// A metadata level's key column has no key name (not GROUPING DRESS).
+fn metadata_key(group: &ast::MetadataGroup) -> (Option<String>, ast::DomainExpression) {
+    (
+        None,
+        ast::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
+            column: group.key.column,
+            explicit_qualifier: false,
+        }))),
+    )
 }
 
-/// Collect all tree groups that need CTE analysis
+/// A tree group awaiting its CTE requirements, and where it stands.
+struct TreeGroupToAnalyze<'a> {
+    group: TreeGroup<'a>,
+    /// Location in the query (keys or reductions)
+    location: TreeGroupLocation,
+    item_index: usize,
+}
+
+/// Collect every tree group that needs CTE analysis.
 ///
-/// Searches through reducing_by and reducing_on for tree groups with nested reductions.
-/// Returns mutable references so we can populate their cte_requirements field.
+/// Returns mutable borrows so the requirements can be written back where
+/// they belong: on the record, or on the metadata level.
 fn collect_tree_groups_needing_ctes<'a>(
-    reducing_by: &'a mut [ast::OutputDomainExpression],
-    reducing_on: &'a mut [ast::OutputDomainExpression],
+    keys: &'a mut [ast::OutItem],
+    reductions: &'a mut [ast::ReductionItem],
 ) -> Vec<TreeGroupToAnalyze<'a>> {
     let mut result = Vec::new();
 
-    // Collect from reducing_by (scalar context). Keys now carry their output
-    // stamp (slice 4); the CTE analysis reaches through `.expr` — stamps untouched.
-    for (idx, ode) in reducing_by.iter_mut().enumerate() {
-        let expr = &mut ode.expr;
-        if has_nested_reductions(expr) {
+    // From keys (scalar context). A key is a publication item; the CTE
+    // analysis reaches the value it publishes and leaves the item's naming and
+    // output stamp alone. A spread publishes no value to analyze, and a
+    // metadata level has no derivation as a group key.
+    for (item_index, item) in keys.iter_mut().enumerate() {
+        let Some(expr) = item.domain_value_mut() else {
+            continue;
+        };
+        let ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(
+            record,
+        ))) = expr
+        else {
+            continue;
+        };
+        if record
+            .members
+            .iter()
+            .any(|member| matches!(member, ast::RecordMember::Induced { .. }))
+        {
             result.push(TreeGroupToAnalyze {
-                expr,
-                location: TreeGroupLocation::InReducingBy,
-                index: idx,
+                group: TreeGroup::Record(record),
+                location: TreeGroupLocation::InKeys,
+                item_index,
             });
         }
     }
 
-    // Collect from reducing_on (aggregate context). reducing_on now carries the
-    // resolver's per-expression output stamp (Batch 13); the CTE analysis reaches
-    // through `.expr` — stamps are untouched here.
-    for (idx, ode) in reducing_on.iter_mut().enumerate() {
-        let expr = &mut ode.expr;
-        if has_nested_reductions(expr) {
+    // From reductions (aggregate context), where a metadata level also stands.
+    for (item_index, item) in reductions.iter_mut().enumerate() {
+        if let Some(group) = tree_group_of(item) {
             result.push(TreeGroupToAnalyze {
-                expr,
-                location: TreeGroupLocation::InReducingOn,
-                index: idx,
+                group,
+                location: TreeGroupLocation::InReductions,
+                item_index,
             });
         }
     }
@@ -203,79 +180,41 @@ fn collect_tree_groups_needing_ctes<'a>(
     result
 }
 
-/// Recursively populate cte_requirements for nested MetadataTreeGroups
+/// Populate cte_requirements down a metadata CHAIN.
 ///
-/// For chained metadata tree groups like `country:~> status:~> name:~>`:
-/// - Each level needs its own cte_requirements
-/// - Each level's accumulated_keys = parent's accumulated_keys + this level's key
-///
-/// This function walks the constructor chain and populates each MetadataTreeGroup.
+/// For chained levels like `country:~> status:~> name:~>`:
+/// - each level needs its own cte_requirements;
+/// - each level's accumulated keys are its parent's plus its own key.
 fn populate_nested_metadata_cte_requirements(
-    expr: &mut ast::DomainExpression,
+    group: &mut ast::MetadataGroup,
     location: TreeGroupLocation,
     accumulated_keys: Vec<(Option<String>, ast::DomainExpression)>,
 ) -> Result<()> {
-    if let ast::DomainExpression::Function(FunctionExpression::MetadataTreeGroup {
-        key_column,
-        key_qualifier,
-        key_schema,
-        constructor,
-        keys_only: _,
-        cte_requirements,
-        ..
-    }) = expr
-    {
-        // This level's key
-        let this_key = ast::DomainExpression::Lvar {
-            name: key_column.clone(),
-            qualifier: key_qualifier.clone(),
-            namespace_path: key_schema
-                .as_ref()
-                .map(|s| ast::NamespacePath::single(s.clone()))
-                .unwrap_or_else(|| ast::NamespacePath::empty()),
-            alias: None,
-            provenance: ast::PhaseBox::phantom(),
-        };
+    let this_key =
+        ast::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
+            column: group.key.column,
+            explicit_qualifier: false,
+        })));
 
-        // Accumulated keys for this level = parent's keys + this key (no key name for metadata TG)
-        let mut my_accumulated_keys = accumulated_keys.clone();
-        my_accumulated_keys.push((None, this_key));
+    // Accumulated keys for this level = parent's keys + this key (a metadata
+    // level's key has no key name).
+    let mut my_accumulated_keys = accumulated_keys.clone();
+    my_accumulated_keys.push((None, this_key));
 
-        log::debug!(
-            "MetadataTreeGroup key={}, parent_keys={}, my_keys={}",
-            key_column,
-            accumulated_keys.len(),
-            my_accumulated_keys.len()
-        );
-
-        // Populate this level's cte_requirements
-        // For metadata tree groups, nested_members_info contains info about the constructor
-        let nested_members_info = vec![NestedMemberCteInfo {
+    // For metadata levels, nested_members_info describes the target.
+    group.cte_requirements = Some(CteRequirements {
+        needs_cte: true,
+        accumulated_grouping_keys: my_accumulated_keys.clone(),
+        // JOIN on parent's keys (just expressions)
+        join_keys: accumulated_keys.iter().map(|(_, e)| e.clone()).collect(),
+        location,
+        nested_members_info: vec![NestedMemberCteInfo {
             key: "constructor".to_string(),
-            cte_column_name: "constructor".to_string(),
-        }];
+        }],
+    });
 
-        *cte_requirements = Some(CteRequirements {
-            needs_cte: true,
-            accumulated_grouping_keys: my_accumulated_keys.clone(),
-            join_keys: accumulated_keys.iter().map(|(_, e)| e.clone()).collect(), // JOIN on parent's keys (just expressions)
-            location,
-            nested_members_info,
-        });
-
-        // Recursively process the constructor if it's another MetadataTreeGroup
-        if let FunctionExpression::MetadataTreeGroup { .. } = constructor.as_ref() {
-            let mut constructor_as_domain = ast::DomainExpression::Function(*constructor.clone());
-            populate_nested_metadata_cte_requirements(
-                &mut constructor_as_domain,
-                location,
-                my_accumulated_keys,
-            )?;
-            // Extract the mutated MetadataTreeGroup back
-            if let ast::DomainExpression::Function(func) = constructor_as_domain {
-                *constructor = Box::new(func);
-            }
-        }
+    if let MetadataTarget::Group(nested) = &mut group.target {
+        populate_nested_metadata_cte_requirements(nested, location, my_accumulated_keys)?;
     }
 
     Ok(())
@@ -285,8 +224,8 @@ fn populate_nested_metadata_cte_requirements(
 ///
 /// Given:
 /// - The tree group expression
-/// - Location (reducing_by or reducing_on)
-/// - Outer grouping keys (from the modulo reducing_by)
+/// - Location (keys or reductions)
+/// - Outer grouping keys (from the group keys)
 ///
 /// Returns CteRequirements with:
 /// - accumulated_grouping_keys = outer + inner
@@ -294,20 +233,32 @@ fn populate_nested_metadata_cte_requirements(
 /// - location
 /// - nested_members_info (placeholder for now, Phase R4+ will use this)
 fn compute_cte_requirements(
-    expr: &mut ast::DomainExpression,
+    group: &mut TreeGroup<'_>,
     location: TreeGroupLocation,
     outer_grouping_keys: &[(Option<String>, ast::DomainExpression)],
 ) -> Result<CteRequirements> {
-    // For MetadataTreeGroups, recursively populate nested ones first
-    if matches!(
-        expr,
-        ast::DomainExpression::Function(FunctionExpression::MetadataTreeGroup { .. })
-    ) {
-        populate_nested_metadata_cte_requirements(expr, location, outer_grouping_keys.to_vec())?;
-    }
-
-    // Extract inner grouping keys WITH KEY NAMES from this tree group
-    let inner_keys_with_names = extract_inner_grouping_keys_with_names(expr);
+    // The inner grouping keys this group contributes, and the nested members
+    // that will become CTE columns. A metadata chain populates every level of
+    // itself first, and contributes its own key.
+    let (inner_keys_with_names, nested_members_info) = match group {
+        TreeGroup::Record(record) => {
+            let expr = ast::DomainExpression::Application(FunctionApplication::Enclyph(
+                Enclyph::Record((**record).clone()),
+            ));
+            (
+                extract_inner_grouping_keys_with_names(&expr),
+                extract_nested_member_info(&expr),
+            )
+        }
+        TreeGroup::Metadata(group) => {
+            populate_nested_metadata_cte_requirements(
+                group,
+                location,
+                outer_grouping_keys.to_vec(),
+            )?;
+            (vec![metadata_key(group)], Vec::new())
+        }
+    };
     log::debug!(
         "Tree group inner_keys: {:?}, location: {:?}",
         inner_keys_with_names.len(),
@@ -322,21 +273,18 @@ fn compute_cte_requirements(
 
     // Logic differs based on location (scalar vs aggregate context)
     let (accumulated_grouping_keys, join_keys) = match location {
-        TreeGroupLocation::InReducingBy => {
+        TreeGroupLocation::InKeys => {
             // Scalar context: CTE groups by inner keys only, joins on inner keys
-            (inner_keys_with_names.clone(), inner_keys_exprs.clone())
+            (inner_keys_with_names, inner_keys_exprs)
         }
-        TreeGroupLocation::InReducingOn => {
-            // Aggregate context: CTE groups by outer + inner, joins on outer keys (just expressions)
+        TreeGroupLocation::InReductions => {
+            // Aggregate context: CTE groups by outer + inner, joins on outer keys
             let mut accumulated = outer_grouping_keys.to_vec();
             accumulated.extend(inner_keys_with_names);
             let join_exprs: Vec<_> = outer_grouping_keys.iter().map(|(_, e)| e.clone()).collect();
             (accumulated, join_exprs)
         }
     };
-
-    // Extract nested member info (keys that will become CTE columns)
-    let nested_members_info = extract_nested_member_info(expr);
 
     Ok(CteRequirements {
         needs_cte: true,
@@ -349,47 +297,27 @@ fn compute_cte_requirements(
 
 /// Extract nested member information from a tree group
 ///
-/// For each nested reduction ("key": ~> {...}), we need to track:
-/// - The key name
-/// - The CTE column name that will hold the aggregated result
-///
-/// Phase R4+ will use this to generate CTE columns and modify the tree group
-/// to reference them with JSON(cte_column).
+/// For each nested reduction (`"key": ~> {...}`), record the key name.
 fn extract_nested_member_info(expr: &ast::DomainExpression) -> Vec<NestedMemberCteInfo> {
     match expr {
-        ast::DomainExpression::Function(FunctionExpression::Curly { members, .. }) => {
-            members
+        ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(
+            record,
+        ))) => {
+            record
+                .members
                 .iter()
-                .filter_map(|m| match m {
-                    ast::CurlyMember::KeyValue {
-                        key,
-                        nested_reduction: true,
-                        ..
-                    } => Some(NestedMemberCteInfo {
-                        key: key.clone(),
-                        // CTE column name will be same as key (Phase R4+ may need to make unique)
-                        cte_column_name: key.clone(),
-                    }),
-                    // Non-nested-reduction members: Shorthand (plain column), KeyValue(reduction=false),
-                    // Comparison, Glob, Pattern, OrdinalRange, Placeholder, PathLiteral
-                    // These don't generate CTEs — filter them out
-                    ast::CurlyMember::Shorthand { .. }
-                    | ast::CurlyMember::KeyValue {
-                        nested_reduction: false,
-                        ..
+                .filter_map(|member| match member {
+                    ast::RecordMember::Induced { key, .. } => {
+                        Some(NestedMemberCteInfo { key: key.clone() })
                     }
-                    | ast::CurlyMember::Comparison { .. }
-                    | ast::CurlyMember::Glob { .. }
-                    | ast::CurlyMember::Pattern { .. }
-                    | ast::CurlyMember::OrdinalRange { .. }
-                    | ast::CurlyMember::Placeholder { .. }
-                    | ast::CurlyMember::PathLiteral { .. } => None,
+                    // No other member re-enters reduction, so none needs a CTE.
+                    ast::RecordMember::Keyed { .. }
+                    | ast::RecordMember::SelfKeyed(_)
+                    | ast::RecordMember::Spread(_) => None,
                 })
                 .collect()
         }
-        // MetadataTreeGroup: future phase
-        ast::DomainExpression::Function(FunctionExpression::MetadataTreeGroup { .. }) => vec![],
-        // All other DomainExpressions: not tree groups, no nested members
+        // A metadata level's own requirements are populated by the chain walk.
         _ => vec![],
     }
 }
@@ -397,26 +325,28 @@ fn extract_nested_member_info(expr: &ast::DomainExpression) -> Vec<NestedMemberC
 /// Main entry point: Analyze all tree groups and populate cte_requirements
 ///
 /// This function is called by the resolver after basic resolution is complete.
-/// It finds all tree groups with nested reductions in the modulo specification
+/// It finds all tree groups with nested reductions in the group specification
 /// and populates their cte_requirements field with the metadata needed for
 /// independent CTE generation.
 ///
 /// Parameters:
-/// - reducing_by: The grouping keys (may contain tree groups in scalar context)
-/// - reducing_on: The aggregate expressions (may contain tree groups in aggregate context)
+/// - keys: The grouping keys (may contain tree groups in scalar context)
+/// - reductions: The aggregate expressions (may contain tree groups in aggregate context)
 ///
 /// Side effects:
 /// - Mutates tree groups in-place to set their cte_requirements field
 pub fn analyze_tree_groups_for_ctes(
-    reducing_by: &mut [ast::OutputDomainExpression],
-    reducing_on: &mut [ast::OutputDomainExpression],
-) -> Result<()> {
-    // Build outer grouping keys WITH KEY NAMES, expanding tree groups to their inner keys
-    // This ensures we GROUP BY the actual identifiers, not the JSON construction
-    // (keys carry their output stamp now; reach through `.expr`).
+    keys: &mut [ast::OutItem],
+    reductions: &mut [ast::ReductionItem],
+) -> Result<ast::ReductionPlan> {
+    // Build outer grouping keys WITH KEY NAMES, expanding tree groups to their
+    // inner keys. This ensures we GROUP BY the actual identifiers, not the JSON
+    // construction (a key is a publication item; reach the value it publishes).
     let mut outer_grouping_keys: Vec<(Option<String>, ast::DomainExpression)> = Vec::new();
-    for ode in reducing_by.iter() {
-        let expr = &ode.expr;
+    for item in keys.iter() {
+        let Some(expr) = item.domain_value() else {
+            continue;
+        };
         if has_nested_reductions(expr) {
             // For tree groups, use their inner grouping keys with key names
             outer_grouping_keys.extend(extract_inner_grouping_keys_with_names(expr));
@@ -426,44 +356,22 @@ pub fn analyze_tree_groups_for_ctes(
         }
     }
 
-    // Phase 1: Collect all tree groups needing CTE analysis
-    let tree_groups = collect_tree_groups_needing_ctes(reducing_by, reducing_on);
-
-    if tree_groups.is_empty() {
-        // No tree groups with nested reductions - nothing to do
-        return Ok(());
-    }
-
-    // Phase 2: Compute CTE requirements for each tree group
-    for tree_group in tree_groups {
-        // Compute requirements based on location and outer grouping keys
-        let cte_req =
-            compute_cte_requirements(tree_group.expr, tree_group.location, &outer_grouping_keys)?;
-
-        // Phase 3: Annotate the AST node with requirements
-        match tree_group.expr {
-            ast::DomainExpression::Function(FunctionExpression::Curly {
-                cte_requirements, ..
-            }) => {
-                // Populate the cte_requirements field
-                *cte_requirements = Some(cte_req);
-            }
-            ast::DomainExpression::Function(FunctionExpression::MetadataTreeGroup {
-                keys_only: _,
-                cte_requirements,
-                ..
-            }) => {
-                // Populate the cte_requirements field for metadata tree groups
-                *cte_requirements = Some(cte_req);
-            }
-            other => {
-                panic!(
-                    "catch-all hit in tree_group_analysis.rs populate_cte_requirements: {:?}",
-                    other
-                );
-            }
+    let mut plan = ReductionPlan::empty();
+    for mut tree_group in collect_tree_groups_needing_ctes(keys, reductions) {
+        let requirements = compute_cte_requirements(
+            &mut tree_group.group,
+            tree_group.location,
+            &outer_grouping_keys,
+        )?;
+        match tree_group.group {
+            TreeGroup::Record(_) => plan.tree_groups.push(TreeGroupPlan {
+                location: tree_group.location,
+                item_index: tree_group.item_index,
+                requirements,
+            }),
+            TreeGroup::Metadata(group) => group.cte_requirements = Some(requirements),
         }
     }
 
-    Ok(())
+    Ok(plan)
 }

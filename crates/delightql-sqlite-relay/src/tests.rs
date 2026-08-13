@@ -2,11 +2,11 @@
 // Copyright 2026 Daniel Eklund
 // SqlParty Integration Tests
 //
-// Each test builds a SELF-CONTAINED in-memory database (these tests
-// once pointed at the retired test_suite/ fixture tree and silently
-// rotted when it was deleted — never again), wraps it in SqlParty +
-// DirectTransport + Client, does a version handshake to obtain a
-// Session, and runs a protocol conversation with raw SQL (not DQL).
+// Each test builds a SELF-CONTAINED in-memory database — a test reaching
+// for a shared fixture tree rots in silence the day that tree moves —
+// wraps it in SqlParty + DirectTransport + Client, does a version
+// handshake to obtain a Session, and runs a protocol conversation with
+// raw SQL (not DQL).
 
 use std::sync::{Arc, Mutex};
 
@@ -578,8 +578,8 @@ fn probe(sql: &str) -> (String, Vec<Option<Vec<u8>>>) {
 }
 
 // (a) A NULL-leading undeclared column elects INTEGER from its first
-// non-NULL value (row 2). Under the old first-row-only peek this was ""
-// (NULL declares nothing) — RED before the fix.
+// non-NULL value (row 2). A first-row-only peek answers "" here, because
+// NULL declares nothing.
 #[test]
 fn descriptor_elects_from_first_non_null_not_row_zero() {
     let (desc, cells) =
@@ -592,7 +592,7 @@ fn descriptor_elects_from_first_non_null_not_row_zero() {
 }
 
 // (b) Reversed-row pairs — identical data, opposite order — must produce
-// IDENTICAL descriptors. Under the old peek `5;null` gave INTEGER and
+// IDENTICAL descriptors. Under a first-row-only peek `5;null` gives INTEGER and
 // `null;5` gave "" — RED.
 #[test]
 fn descriptor_is_row_order_independent() {

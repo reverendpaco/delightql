@@ -11,13 +11,15 @@
 // Classification uses the AstTransform walk infrastructure to descend into
 // all node types (including operators, ConsultedView bodies, ScalarSubquery,
 // InnerExists). This fixes the classify_operator() no-op bug by construction.
-
 use super::correlation_analyzer;
 use crate::error::Result;
 use crate::pipeline::ast_transform::AstTransform;
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::OutValue;
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved;
-use crate::pipeline::asts::resolved::{InnerRelationPattern, QualifiedName, Resolved};
-use crate::pipeline::asts::unresolved::NamespacePath;
+use crate::pipeline::asts::resolved::{InnerRelationPattern, Resolved};
+use std::rc::Rc;
 
 // =============================================================================
 // ClassifierFold — AstTransform<Resolved, Resolved>
@@ -31,9 +33,13 @@ use crate::pipeline::asts::unresolved::NamespacePath;
 // Since this is Resolved→Resolved, it doesn't change the phase or run FAR.
 // It only classifies InnerRelation patterns encountered during the walk.
 
-struct ClassifierFold;
+struct ClassifierFold<'a> {
+    identities: &'a Rc<crate::names::Registry>,
+}
 
-impl AstTransform<Resolved, Resolved> for ClassifierFold {
+impl AstTransform<Resolved, Resolved> for ClassifierFold<'_> {
+    crate::pipeline::ast_transform::same_phase_payload_folds!(Resolved);
+
     fn transform_inner_relation(
         &mut self,
         pattern: InnerRelationPattern<Resolved>,
@@ -49,7 +55,7 @@ impl AstTransform<Resolved, Resolved> for ClassifierFold {
                 let classified_subquery = self.transform_relational_action(*subquery)?.into_inner();
 
                 // Classify this pattern based on the classified subquery.
-                classify_inner_relation_pattern(identifier, classified_subquery)
+                classify_inner_relation_pattern(identifier, classified_subquery, self.identities)
             }
             // Already classified — let the walk handle recursion into children
             other => crate::pipeline::ast_transform::walk_transform_inner_relation(self, other),
@@ -63,9 +69,10 @@ impl AstTransform<Resolved, Resolved> for ClassifierFold {
 /// ConsultedView bodies, ScalarSubquery, InnerExists — fixing the
 /// classify_operator() no-op bug.
 pub fn classify_patterns_via_fold(
-    ast: resolved::RelationalExpression,
-) -> Result<resolved::RelationalExpression> {
-    let mut fold = ClassifierFold;
+    ast: resolved::Chain,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<resolved::Chain> {
+    let mut fold = ClassifierFold { identities };
     fold.transform_relational_action(ast)
         .map(|a| a.into_inner())
 }
@@ -78,11 +85,13 @@ pub fn classify_patterns_via_fold(
 /// Inspects the subquery for correlation, aggregation, and limits.
 pub fn classify_inner_relation_pattern(
     identifier: resolved::QualifiedName,
-    subquery: resolved::RelationalExpression,
+    subquery: resolved::Chain,
+    identities: &Rc<crate::names::Registry>,
 ) -> Result<InnerRelationPattern<Resolved>> {
     // Step 1: Detect (but don't extract!) correlation filters from the subquery
     // The filters stay IN the subquery - we just use them for pattern detection
-    let correlation_filters = correlation_analyzer::detect_correlation_filters_in_scope(&subquery)?;
+    let correlation_filters =
+        correlation_analyzer::detect_correlation_filters_in_scope(&subquery, identities)?;
 
     // Step 2: Check if uncorrelated
     if correlation_filters.is_empty() {
@@ -98,29 +107,26 @@ pub fn classify_inner_relation_pattern(
     // CDT-SJ-shaped subquery whose body explicitly contains a ROW_NUMBER()
     // window expression and a `WHERE rn <= N` filter (Fork-1, P0').
     // The rewriter also runs hygienic-column injection when the user's
-    // projection strips correlation columns; we plumb the resulting
-    // injections directly into the CorrelatedScalarJoin pattern instead
-    // of recursing through classify (which would re-run injection on a
-    // shape that no longer matches its trigger).
+    // projection strips correlation columns. It is called directly rather
+    // than by recursing through classify, which would re-run injection on a
+    // shape that no longer matches its trigger.
     if has_limit(&subquery) {
-        let (rewritten, hygienic_injections) =
-            super::cdt_wj_rewriter::rewrite_window_join_subquery(
-                subquery,
-                &correlation_filters,
-                &identifier,
-            )?;
+        let rewritten = super::cdt_wj_rewriter::rewrite_window_join_subquery(
+            subquery,
+            &correlation_filters,
+            identities,
+        )?;
         return Ok(InnerRelationPattern::CorrelatedScalarJoin {
             identifier,
             correlation_filters,
             subquery: Box::new(rewritten),
-            hygienic_injections,
         });
     }
 
     // Inject hygienic columns if projection excludes correlation columns
     // This must happen BEFORE flattening so the flattener can rewrite predicates
-    let (final_subquery, injections) =
-        inject_hygienic_columns_if_needed(subquery, &correlation_filters, &identifier)?;
+    let final_subquery =
+        inject_hygienic_columns_if_needed(subquery, &correlation_filters, identities)?;
 
     // Step 4: Check for aggregation (CDT-GJ pattern)
     if has_aggregation(&final_subquery) {
@@ -130,7 +136,6 @@ pub fn classify_inner_relation_pattern(
             correlation_filters,
             aggregations,
             subquery: Box::new(final_subquery),
-            hygienic_injections: injections,
         });
     }
 
@@ -139,7 +144,6 @@ pub fn classify_inner_relation_pattern(
         identifier,
         correlation_filters,
         subquery: Box::new(final_subquery),
-        hygienic_injections: injections,
     })
 }
 
@@ -147,28 +151,24 @@ pub fn classify_inner_relation_pattern(
 // Helper Functions - Aggregation Detection
 // ============================================================================
 
-/// Does the top-level (source-spine) pipeline hold an aggregation operator?
-/// Rides Helper A [`source_spine`](crate::pipeline::spine::source_spine): an
-/// aggregation buried in a Join arm / SetOperation operand / subquery is NOT
-/// top-level, so the spine STOPS at those composites (returns `false`) — the
-/// byte-equivalent of the old `Filter→source, Pipe→(op? / source), _ => false`
-/// walk. Pinned by `source_spine_descends_filter_pipe_to_terminal`.
-fn has_aggregation(expr: &resolved::RelationalExpression) -> bool {
-    use crate::pipeline::spine::{source_spine, SpineStep};
-    source_spine(expr).any(|step| {
+/// Does the top-level shaping run hold an aggregation operator?
+///
+/// Rides [`Chain::source_spine`]: an aggregation inside a member's chain, a
+/// bag arm, or a subquery is NOT top-level, so the walk stops at the
+/// continuation that brings that relation in and answers `false`. Pinned by
+/// `source_spine_reads_restrictions_and_pipes_outermost_first` and
+/// `source_spine_stops_at_a_member_without_entering_either_relation`.
+fn has_aggregation(expr: &resolved::Chain) -> bool {
+    use crate::pipeline::asts::core::expressions::chain::SpineStep;
+    expr.source_spine().any(|step| {
         matches!(
             step,
-            SpineStep::Pipe(
-                resolved::UnaryRelationalOperator::AggregatePipe { .. }
-                    | resolved::UnaryRelationalOperator::Modulo { .. }
-            )
+            SpineStep::Pipe(resolved::PipeOp::Group(_))
         )
     })
 }
 
-fn extract_aggregations(
-    _expr: &resolved::RelationalExpression,
-) -> Result<Vec<resolved::DomainExpression>> {
+fn extract_aggregations(_expr: &resolved::Chain) -> Result<Vec<resolved::DomainExpression>> {
     // TODO: Extract aggregation expressions from GroupBy/WholeTableAggregation operators
     Ok(Vec::new())
 }
@@ -177,25 +177,24 @@ fn extract_aggregations(
 // Helper Functions - Limit/Order By Detection
 // ============================================================================
 
-/// Does the top-level (source-spine) pipeline hold a `#<N` limit filter?
-/// Rides Helper A [`source_spine`](crate::pipeline::spine::source_spine): each
-/// spine Filter's condition is inspected for a `TupleOrdinal LessThan`; a limit
-/// under a Join arm / SetOperation operand / subquery is not top-level, so the
-/// spine STOPS there. Byte-equivalent of the old `Filter→(cond? / source),
-/// Pipe→source, _ => false` walk. Pinned by
-/// `source_spine_descends_filter_pipe_to_terminal`.
-fn has_limit(expr: &resolved::RelationalExpression) -> bool {
-    use crate::pipeline::spine::{source_spine, SpineStep};
-    source_spine(expr).any(|step| {
+/// Does the top-level shaping run hold a `#<N` bound?
+///
+/// Rides [`Chain::source_spine`]: each restriction's condition is inspected
+/// for a `TupleOrdinal LessThan`; a bound inside a member's chain, a bag arm,
+/// or a subquery is not top-level, so the walk stops at the continuation that
+/// brings that relation in. Pinned by
+/// `source_spine_reads_restrictions_and_pipes_outermost_first` and
+/// `source_spine_stops_at_a_member_without_entering_either_relation`.
+fn has_limit(expr: &resolved::Chain) -> bool {
+    use crate::pipeline::asts::core::expressions::chain::SpineStep;
+    expr.source_spine().any(|step| {
         matches!(
             step,
-            SpineStep::Filter(resolved::SigmaCondition::TupleOrdinal(
-                resolved::TupleOrdinalClause {
-                    operator: resolved::TupleOrdinalOperator::LessThan,
-                    value: _,
-                    offset: _,
-                }
-            ))
+            SpineStep::Bound(resolved::TupleOrdinalClause {
+                operator: resolved::TupleOrdinalOperator::LessThan,
+                value: _,
+                offset: _,
+            })
         )
     })
 }
@@ -204,118 +203,166 @@ fn has_limit(expr: &resolved::RelationalExpression) -> bool {
 // Hygienic Column Injection
 // ============================================================================
 
-/// Inject hygienic columns into projection if correlation columns are missing
+/// Inject hygienic columns into the projection when it strips correlation
+/// columns.
 ///
-/// Returns: (modified_subquery, list_of_injections)
-/// where injections = Vec<(original_column_name, hygienic_alias)>
+/// The injected carriers are found again by asking the registry — see
+/// [`correlation_carriers`] — so nothing here is returned to be stored.
 pub(super) fn inject_hygienic_columns_if_needed(
-    subquery: resolved::RelationalExpression,
-    correlation_filters: &[resolved::BooleanExpression],
-    table_identifier: &QualifiedName,
-) -> Result<(resolved::RelationalExpression, Vec<(String, String)>)> {
+    subquery: resolved::Chain,
+    correlation_filters: &[resolved::TruthExpression],
+    identities: &Rc<crate::names::Registry>,
+) -> Result<resolved::Chain> {
     use crate::pipeline::asts::resolved;
 
-    // Extract correlation column names from filters
-    let correlation_columns = correlation_analyzer::extract_correlation_column_names(
+    let inner_scope = relational_scope(&subquery)?;
+    let correlation_columns = correlation_analyzer::extract_correlation_columns(
         correlation_filters,
-        table_identifier,
+        inner_scope,
+        identities,
     );
 
     if correlation_columns.is_empty() {
-        return Ok((subquery, vec![]));
+        return Ok(subquery);
     }
 
     // Check if subquery ends with a projection
-    let needs_injection = match &subquery {
-        resolved::RelationalExpression::Pipe(pipe) => {
-            matches!(
-                pipe.operator,
-                resolved::UnaryRelationalOperator::General {
-                    containment_semantic: resolved::ContainmentSemantic::Parenthesis,
-                    ..
-                }
-            )
-        }
-        // Non-Pipe expressions (Filter, Relation, Join, SetOperation):
-        // No explicit projection → all columns preserved → no injection needed.
-        resolved::RelationalExpression::Filter { .. }
-        | resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::Join { .. }
-        | resolved::RelationalExpression::SetOperation { .. } => false,
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains should be resolved before pattern classification")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
-    };
+    // Only a trailing explicit projection can drop a correlation column;
+    // anything else preserves every column, so nothing needs injecting.
+    let needs_injection = matches!(
+        subquery.continuations.last(),
+        Some(resolved::Continuation::Pipe {
+            operator: resolved::PipeOp::Project {
+                ..
+            },
+            ..
+        })
+    );
 
     if !needs_injection {
         // Subquery doesn't end with projection - all columns preserved (map-cover or glob)
-        return Ok((subquery, vec![]));
+        return Ok(subquery);
     }
 
     // Extract the projection expressions
-    if let resolved::RelationalExpression::Pipe(pipe) = &subquery {
-        if let resolved::UnaryRelationalOperator::General {
-            containment_semantic: resolved::ContainmentSemantic::Parenthesis,
-            expressions,
-        } = &pipe.operator
+    if let Some(resolved::Continuation::Pipe {
+        operator: pipe_operator,
+        named: (),
+        cpr_schema: pipe_cpr_schema,
+    }) = subquery.continuations.last().cloned()
+    {
+        if let resolved::PipeOp::Project(items)
+        | resolved::PipeOp::Embed(items) = &pipe_operator
         {
-            // Check which correlation columns are missing from projection
-            let projected_columns: std::collections::HashSet<String> = expressions
-                .iter()
-                .filter_map(|expr| {
-                    if let resolved::DomainExpression::Lvar { name, .. } = expr {
-                        Some(name.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // Check which correlation columns are missing from projection.
+            // The occurrence an item READS is what containment asks about,
+            // not the one it publishes.
+            fn projected_column(item: &resolved::OutItem) -> Option<crate::names::ColId> {
+                match item.domain_value() {
+                    Some(resolved::DomainExpression::Reference(Reference::Named(
+                        NamedReference(ColumnOccurrence { column, .. }),
+                    ))) => Some(*column),
+                    _ => None,
+                }
+            }
+            let projected_columns: std::collections::HashSet<crate::names::ColId> =
+                items.iter().filter_map(projected_column).collect();
 
-            let mut injections = vec![];
-            let mut new_expressions = expressions.clone();
+            let mut injected = 0usize;
+            let mut new_items = items.clone().into_vec();
 
-            for (idx, col_name) in correlation_columns.iter().enumerate() {
-                if !projected_columns.contains(col_name) {
-                    // Correlation column missing - inject with hygienic name
-                    let hygienic_name = format!("__dql_corr_{}", idx);
+            for source in correlation_columns {
+                // Already-projected is a CHAIN question, not a ColId one:
+                // the projection references a downstream occurrence of the
+                // access column the correlation names, and injecting beside
+                // it mints a second carrier of the same value — which later
+                // makes a by-value re-anchor genuinely ambiguous.
+                let projected = projected_columns
+                    .iter()
+                    .any(|column| identities.republishes(*column, source));
+                if !projected {
+                    // The carrier IS the record: it is hygienic, it lives in
+                    // the inner scope, and its origin names what it stands
+                    // for. A list kept beside the tree said the same three
+                    // things a second time, and a boundary republishing one
+                    // without the other made them disagree.
+                    let output = identities.republish_column(
+                        source,
+                        inner_scope,
+                        crate::names::Republish::Correlation,
+                        None,
+                        crate::names::Addressing::Hygienic,
+                        |_| {},
+                    );
 
-                    new_expressions.push(resolved::DomainExpression::Lvar {
-                        name: col_name.clone().into(),
-                        qualifier: None,
-                        namespace_path: NamespacePath::empty(),
-                        alias: Some(hygienic_name.clone().into()),
-                        provenance: resolved::PhaseBox::phantom(),
-                    });
+                    // A carrier the refiner injects publishes the occurrence
+                    // it just minted and answers to no authored name.
+                    new_items.push(resolved::OutItem::One(resolved::OneOut {
+                        expr: OutValue::Domain(resolved::DomainExpression::Reference(
+                            Reference::Named(NamedReference(ColumnOccurrence {
+                                column: output,
+                                explicit_qualifier: false,
+                            })),
+                        )),
+                        naming: None,
+                        output: Some(output),
+                    }));
 
-                    injections.push((col_name.clone(), hygienic_name));
+                    injected += 1;
                 }
             }
 
-            if injections.is_empty() {
+            if injected == 0 {
                 // All correlation columns already present
-                return Ok((subquery, vec![]));
+                return Ok(subquery);
             }
 
-            // Rebuild pipe with injected columns
-            let new_pipe = resolved::PipeExpression {
-                source: pipe.source.clone(),
-                operator: resolved::UnaryRelationalOperator::General {
-                    containment_semantic: resolved::ContainmentSemantic::Parenthesis,
-                    expressions: new_expressions,
-                },
-                cpr_schema: pipe.cpr_schema.clone(),
-            };
-
-            return Ok((
-                resolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(new_pipe))),
-                injections,
-            ));
+            // Rebuild the trailing projection with the injected columns.
+            let mut rebuilt = subquery.clone();
+            rebuilt.continuations.pop();
+            return Ok(rebuilt.then(resolved::Continuation::Pipe {
+                operator: resolved::PipeOp::Project(
+                    crate::pipeline::asts::vocabulary::Vec1::try_from_vec(new_items)
+                        .expect("injection extends a nonempty projection"),
+                ),
+                named: (),
+                cpr_schema: pipe_cpr_schema,
+            }));
         }
     }
 
-    Ok((subquery, vec![]))
+    Ok(subquery)
+}
+
+/// The correlation carriers a subquery publishes, each paired with what it
+/// stands for.
+///
+/// The subquery's own scope is resolved here; the answer comes from the one
+/// authority, which reads the registry. Nothing records this a second time,
+/// so there is nothing to drift.
+pub(super) fn correlation_carriers(
+    subquery: &resolved::Chain,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<Vec<(crate::names::ColId, crate::names::ColId)>> {
+    crate::pipeline::transformer::builder::correlation_carriers(
+        relational_scope(subquery)?,
+        identities,
+    )
+}
+
+pub(super) fn relational_scope(expr: &resolved::Chain) -> Result<crate::names::ScopeId> {
+    match expr.continuations.last() {
+        Some(continuation) => Ok(*continuation
+            .cpr_schema()
+            .expect("ER chains should be resolved before pattern classification")),
+        None => match &expr.head {
+            resolved::Grelex::Literal(anon) => Ok(anon.table.cpr_schema),
+            resolved::Grelex::Reference(relation) => match relation {
+                resolved::Relation::Ground { cpr_schema, .. }
+                | resolved::Relation::InnerRelation { cpr_schema, .. }
+                | resolved::Relation::FunctorCall { cpr_schema, .. } => Ok(*cpr_schema),
+                resolved::Relation::ConsultedView { scoped, .. } => Ok(*scoped),
+            },
+        },
+    }
 }

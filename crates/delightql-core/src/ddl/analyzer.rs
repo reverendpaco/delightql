@@ -9,14 +9,14 @@
 //! ## What counts as a reference
 //!
 //! - **Table references**: `Relation::Ground` nodes (e.g., `users(*)` → references "users")
-//! - **Function calls**: `FunctionExpression::Curried` nodes (e.g., `double:(x)` → references "double")
-//! - **EXISTS references**: `BooleanExpression::InnerExists` nodes (e.g., `+orders(...)` → references "orders")
-//! - **Scalar subqueries**: `DomainExpression::ScalarSubquery` nodes → references the table
+//! - **Function calls**: `crate::pipeline::asts::core::FunctionApplication::Standard` nodes (e.g., `double:(x)` → references "double")
+//! - **EXISTS references**: `TruthExpression::InnerExists` nodes (e.g., `+orders(...)` → references "orders")
+//! - **Scalar subqueries**: `FunctionApplication::Scalarized` nodes → references the table
 //!
 //! ## What does NOT count
 //!
 //! - Column references (`Lvar`) — these are resolved against table schemas, not entities
-//! - Built-in functions (`FunctionExpression::Regular`) — these are SQL functions like `sum`, `count`
+//! - Built-in calls without a registered entity — these are SQL functions like `sum`, `count`
 //! - Literals, operators, globs — structural, not references
 //!
 //! ## Apparent type classification
@@ -29,6 +29,12 @@
 //! (e.g., what looks like a table could be a view).
 
 use crate::enums::EntityType;
+use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
+use crate::pipeline::asts::core::{
+    Comparison, Existence, FunctionApplication, MemberCorrelation, Membership,
+    RelationalMembership, SigmaApplication, ValueTemplatePart,
+};
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::unresolved::*;
 
 /// A reference found in a definition body
@@ -42,41 +48,33 @@ pub struct ExtractedReference {
     pub apparent_type: i32,
 }
 
-/// Extract all entity references from a relational expression (view body)
-pub fn extract_references_from_relational(expr: &RelationalExpression) -> Vec<ExtractedReference> {
+/// Extract all entity references from a full query (view body, may include CTEs)
+pub fn extract_references_from_query(query: &Query) -> Vec<ExtractedReference> {
     let mut refs = Vec::new();
-    walk_relational(expr, &mut refs);
+    for cfe in &query.cfes {
+        match &cfe.body {
+            crate::pipeline::asts::core::OutValue::Domain(value) => walk_domain(value, &mut refs),
+            crate::pipeline::asts::core::OutValue::Truth(crossing) => {
+                walk_boolean(crossing.truth(), &mut refs)
+            }
+        }
+    }
+    for cte in &query.ctes {
+        walk_relational(&cte.expression, &mut refs);
+    }
+    walk_relational(&query.body, &mut refs);
     refs
 }
 
-/// Extract all entity references from a full query (view body, may include CTEs)
-pub fn extract_references_from_query(query: &Query) -> Vec<ExtractedReference> {
-    match query {
-        Query::Relational(expr) => extract_references_from_relational(expr),
-        Query::WithCtes { ctes, query: main } => {
-            let mut refs = Vec::new();
-            for cte in ctes {
-                walk_relational(&cte.expression, &mut refs);
-            }
-            walk_relational(main, &mut refs);
-            refs
-        }
-        Query::WithCfes { cfes, query: inner } => {
-            let mut refs = extract_references_from_query(inner);
-            for cfe in cfes {
-                walk_domain(&cfe.body, &mut refs);
-            }
-            refs
-        }
-        Query::WithPrecompiledCfes { query: inner, .. } => extract_references_from_query(inner),
-        Query::ReplTempTable { query: inner, .. } | Query::ReplTempView { query: inner, .. } => {
-            extract_references_from_query(inner)
-        }
-        Query::WithErContext { query: inner, .. } => extract_references_from_query(inner),
-    }
+/// Extract all entity references from a domain expression (function body)
+/// The same census over a TRUTH body — a sigma rule's, which names relations
+/// the same way a value body does.
+pub fn extract_references_from_truth(expr: &TruthExpression) -> Vec<ExtractedReference> {
+    let mut refs = Vec::new();
+    walk_boolean(expr, &mut refs);
+    refs
 }
 
-/// Extract all entity references from a domain expression (function body)
 pub fn extract_references_from_domain(expr: &DomainExpression) -> Vec<ExtractedReference> {
     let mut refs = Vec::new();
     walk_domain(expr, &mut refs);
@@ -86,47 +84,66 @@ pub fn extract_references_from_domain(expr: &DomainExpression) -> Vec<ExtractedR
 // --- Walkers ---
 
 #[stacksafe::stacksafe]
-fn walk_relational(expr: &RelationalExpression, refs: &mut Vec<ExtractedReference>) {
-    match expr {
-        RelationalExpression::Relation(rel) => walk_relation(rel, refs),
-        RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            ..
-        } => {
-            walk_relational(left, refs);
-            walk_relational(right, refs);
-            if let Some(cond) = join_condition {
-                walk_boolean(cond, refs);
+fn walk_relational(expr: &Chain, refs: &mut Vec<ExtractedReference>) {
+    match &expr.head {
+        Grelex::Reference(rel) => walk_relation(rel, refs),
+        Grelex::Literal(anon) => walk_anon_table(&anon.table, refs),
+    }
+    for continuation in &expr.continuations {
+        match continuation {
+            Continuation::Access { access, .. } => walk_access(access, refs),
+            Continuation::Restrict { condition, .. } => walk_boolean(condition, refs),
+            // A correlation names two arms by spelling; it holds no
+            // reference to a definition.
+            Continuation::Bound { .. } | Continuation::Correlate { .. } => {}
+            // A PATTERN REFERS TO NOTHING: its members bind names and reach
+            // with paths, and neither names a declared entity.
+            Continuation::Destructure { source, .. } => {
+                walk_domain(source, refs);
+            }
+            Continuation::Member {
+                rhs, correlation, ..
+            } => {
+                walk_relational(rhs, refs);
+                // A correspondence names columns, not references: only a
+                // condition has an expression to walk.
+                if let Some(cond) = correlation.as_ref().and_then(MemberCorrelation::condition) {
+                    walk_boolean(cond, refs);
+                }
+            }
+            Continuation::BagOp { arm, .. } => walk_relational(arm, refs),
+            Continuation::Pipe { operator, .. } => walk_unary_operator(operator, refs),
+            Continuation::Structural(step) => match &step.form {
+                crate::pipeline::asts::core::StructuralForm::Ordering { specs } => {
+                    for spec in specs {
+                        walk_domain(&spec.column, refs);
+                    }
+                }
+                // A reposition, a drill and a narrowing ADDRESS the operand's
+                // columns; the fixed-heading forms name nothing at all.
+                crate::pipeline::asts::core::StructuralForm::Reposition { .. }
+                | crate::pipeline::asts::core::StructuralForm::Meta
+                | crate::pipeline::asts::core::StructuralForm::Witness { .. }
+                | crate::pipeline::asts::core::StructuralForm::SignedWitness
+                | crate::pipeline::asts::core::StructuralForm::Drill { .. }
+                | crate::pipeline::asts::core::StructuralForm::Narrow { .. } => {}
+            },
+            Continuation::ErJoin(step) => walk_relational(&step.rhs, refs),
+        }
+    }
+}
+
+fn walk_anon_table(anon: &AnonTable, refs: &mut Vec<ExtractedReference>) {
+    if let Some(headers) = &anon.body.header {
+        for h in headers.iter() {
+            if let Some(term) = h.term() {
+                walk_domain(&term, refs);
             }
         }
-        RelationalExpression::Filter {
-            source, condition, ..
-        } => {
-            walk_relational(source, refs);
-            walk_sigma_condition(condition, refs);
-        }
-        RelationalExpression::Pipe(pipe) => {
-            walk_relational(&pipe.source, refs);
-            walk_unary_operator(&pipe.operator, refs);
-        }
-        RelationalExpression::SetOperation { operands, .. } => {
-            for operand in operands {
-                walk_relational(operand, refs);
-            }
-        }
-        RelationalExpression::ErJoinChain { relations, .. } => {
-            for rel in relations {
-                walk_relation(rel, refs);
-            }
-        }
-        RelationalExpression::ErTransitiveJoin { left, right, .. } => {
-            walk_relational(left, refs);
-            walk_relational(right, refs);
-        }
-        RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
+    }
+    for row in &anon.body.rows {
+        for datum in row.iter() {
+            walk_domain(&datum.value(), refs);
         }
     }
 }
@@ -134,8 +151,7 @@ fn walk_relational(expr: &RelationalExpression, refs: &mut Vec<ExtractedReferenc
 fn walk_relation(rel: &Relation, refs: &mut Vec<ExtractedReference>) {
     match rel {
         Relation::Ground {
-            identifier,
-            domain_spec,
+            mention: GroundMention::Named { identifier, .. },
             ..
         } => {
             let namespace = if identifier.namespace_path.is_empty() {
@@ -148,45 +164,26 @@ fn walk_relation(rel: &Relation, refs: &mut Vec<ExtractedReference>) {
                 namespace,
                 apparent_type: EntityType::DbPermanentTable.as_i32(),
             });
-            walk_domain_spec(domain_spec, refs);
         }
-        Relation::Anonymous {
-            column_headers,
-            rows,
+        // A plan read names compiler-owned storage by identity: no authored
+        // spelling participates, so it contributes no reference a DDL body
+        // could depend on.
+        Relation::Ground {
+            mention: GroundMention::Plan { .. },
             ..
-        } => {
-            if let Some(headers) = column_headers {
-                for h in headers {
-                    walk_domain(h, refs);
-                }
-            }
-            for row in rows {
-                for val in &row.values {
-                    walk_domain(val, refs);
-                }
-            }
-        }
-        Relation::TVF { .. } => {
-            // TVFs are built-in, not consulted entities
+        } => {}
+        Relation::FunctorCall { call, .. } => {
+            walk_functor_call(call.call(), refs);
         }
         Relation::InnerRelation { pattern, .. } => {
             walk_inner_relation_pattern(pattern, refs);
         }
-        Relation::PseudoPredicate { .. } => {
-            // Pseudo-predicates are built-in side-effect handlers
-        }
         Relation::ConsultedView { body, .. } => {
             // Recursively extract references from the consulted view body
-            match body.as_ref() {
-                Query::Relational(expr) => walk_relational(expr, refs),
-                Query::WithCtes { ctes, query: main } => {
-                    for cte in ctes {
-                        walk_relational(&cte.expression, refs);
-                    }
-                    walk_relational(main, refs);
-                }
-                other => panic!("catch-all hit in ddl/analyzer.rs walk_relation ConsultedView body: unexpected Query variant: {:?}", other),
+            for cte in &body.ctes {
+                walk_relational(&cte.expression, refs);
             }
+            walk_relational(&body.body, refs);
         }
     }
 }
@@ -256,396 +253,389 @@ fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<Ex
     }
 }
 
-fn walk_domain(expr: &DomainExpression, refs: &mut Vec<ExtractedReference>) {
-    match expr {
-        DomainExpression::Function(func) => walk_function(func, refs),
-        DomainExpression::Predicate {
-            expr: bool_expr, ..
-        } => walk_boolean(bool_expr, refs),
-        DomainExpression::PipedExpression {
-            value, transforms, ..
-        } => {
-            walk_domain(value, refs);
-            for (_, t) in transforms {
-                walk_function(t, refs);
-            }
+/// What an arm COMPUTES: a value, or the licensed crossing.
+fn walk_out_value(
+    value: &crate::pipeline::asts::core::OutValue,
+    refs: &mut Vec<ExtractedReference>,
+) {
+    match value {
+        crate::pipeline::asts::core::OutValue::Domain(domain) => walk_domain(domain, refs),
+        crate::pipeline::asts::core::OutValue::Truth(crossing) => {
+            walk_boolean(crossing.truth(), refs)
         }
-        DomainExpression::Parenthesized { inner, .. } => walk_domain(inner, refs),
-        DomainExpression::Tuple { elements, .. } => {
-            for el in elements {
-                walk_domain(el, refs);
-            }
-        }
-        DomainExpression::ScalarSubquery {
-            identifier,
-            subquery,
-            ..
-        } => {
-            refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
-            walk_relational(subquery, refs);
-        }
-        DomainExpression::PivotOf {
-            value_column,
-            pivot_key,
-            ..
-        } => {
-            walk_domain(value_column, refs);
-            walk_domain(pivot_key, refs);
-        }
-        // Leaf nodes — no references to extract
-        DomainExpression::Lvar { .. }
-        | DomainExpression::Literal { .. }
-        | DomainExpression::Projection(_)
-        | DomainExpression::NonUnifiyingUnderscore
-        | DomainExpression::ValuePlaceholder { .. }
-        | DomainExpression::Substitution(_)
-        | DomainExpression::ColumnOrdinal(_) => {}
     }
 }
 
-fn walk_function(func: &FunctionExpression, refs: &mut Vec<ExtractedReference>) {
+fn walk_domain(expr: &DomainExpression, refs: &mut Vec<ExtractedReference>) {
+    match expr {
+        DomainExpression::Application(func) => walk_function(func, refs),
+        DomainExpression::Reference(Reference::Named(NamedReference(_)))
+        | DomainExpression::Reference(Reference::Ordinal(_)) => {}
+    }
+}
+
+/// A RELATION MADE ONE VALUE names the relation it compresses.
+fn walk_scalar_relation(
+    relation: &crate::pipeline::asts::core::ScalarRelation,
+    refs: &mut Vec<ExtractedReference>,
+) {
+    if let crate::pipeline::asts::core::ScalarRelation::Named { identifier, .. } = relation {
+        refs.push(ExtractedReference {
+            name: identifier.name.to_string(),
+            namespace: namespace_from_path(&identifier.namespace_path),
+            apparent_type: EntityType::DbPermanentTable.as_i32(),
+        });
+    }
+    walk_relational(&relation.body().body, refs);
+}
+
+fn walk_function(func: &FunctionApplication, refs: &mut Vec<ExtractedReference>) {
     match func {
-        FunctionExpression::Regular {
-            arguments,
-            conditioned_on,
-            ..
-        } => {
-            // Regular functions (SQL builtins like sum, count) are not entity references
-            for arg in arguments {
-                walk_domain(arg, refs);
-            }
-            if let Some(cond) = conditioned_on {
-                walk_boolean(cond, refs);
-            }
+        crate::pipeline::asts::core::FunctionApplication::Ground(_)
+        | crate::pipeline::asts::core::FunctionApplication::Open(_) => {}
+        crate::pipeline::asts::core::FunctionApplication::Standard(application) => {
+            walk_standard_application(application, refs);
         }
-        FunctionExpression::Curried {
-            name,
-            namespace: _namespace,
-            arguments,
-            conditioned_on,
-        } => {
-            // Curried calls (name:(args)) ARE entity references — DQL functions
-            refs.push(ExtractedReference {
-                name: name.to_string(),
-                namespace: None,
-                apparent_type: EntityType::DqlFunctionExpression.as_i32(),
-            });
-            for arg in arguments {
-                walk_domain(arg, refs);
-            }
-            if let Some(cond) = conditioned_on {
-                walk_boolean(cond, refs);
-            }
+        crate::pipeline::asts::core::FunctionApplication::FieldSelect(select) => {
+            walk_standard_application(&select.application, refs);
         }
-        FunctionExpression::HigherOrder {
-            name,
-            curried_arguments,
-            regular_arguments,
-            conditioned_on,
-            ..
-        } => {
-            refs.push(ExtractedReference {
-                name: name.to_string(),
-                namespace: None,
-                apparent_type: EntityType::DqlFunctionExpression.as_i32(),
-            });
-            for arg in curried_arguments {
-                walk_domain(arg, refs);
-            }
-            for arg in regular_arguments {
-                walk_domain(arg, refs);
-            }
-            if let Some(cond) = conditioned_on {
-                walk_boolean(cond, refs);
-            }
+        crate::pipeline::asts::core::FunctionApplication::Enclyph(enclyph) => {
+            walk_enclyph(enclyph, refs)
         }
-        FunctionExpression::Bracket { arguments, .. } => {
-            for arg in arguments {
-                walk_domain(arg, refs);
-            }
+        crate::pipeline::asts::core::FunctionApplication::Infix(infix) => {
+            walk_domain(&infix.left, refs);
+            walk_domain(&infix.right, refs);
         }
-        FunctionExpression::Curly {
-            members,
-            inner_grouping_keys,
-            ..
-        } => {
-            for member in members {
-                walk_curly_member(member, refs);
-            }
-            for key in inner_grouping_keys {
-                walk_domain(key, refs);
-            }
-        }
-        FunctionExpression::Array { members, .. } => {
-            for member in members {
-                match member {
-                    ArrayMember::Index { path, .. } => walk_domain(path, refs),
-                }
-            }
-        }
-        FunctionExpression::MetadataTreeGroup { constructor, .. } => {
-            walk_function(constructor, refs);
-        }
-        FunctionExpression::Lambda { body, .. } => walk_domain(body, refs),
-        FunctionExpression::Infix { left, right, .. } => {
-            walk_domain(left, refs);
-            walk_domain(right, refs);
-        }
-        FunctionExpression::StringTemplate { parts, .. } => {
-            for part in parts {
-                if let StringTemplatePart::Interpolation(expr) = part {
+        crate::pipeline::asts::core::FunctionApplication::Template(template) => {
+            for part in template.parts() {
+                if let ValueTemplatePart::Interpolation(expr) = part {
                     walk_domain(expr, refs);
                 }
             }
         }
-        FunctionExpression::CaseExpression { arms, .. } => {
-            for arm in arms {
-                walk_case_arm(arm, refs);
+        crate::pipeline::asts::core::FunctionApplication::ClauseSelection(selection) => {
+            for arm in &selection.arms {
+                if let Some(guard) = &arm.guard {
+                    walk_boolean(guard, refs);
+                }
+                walk_out_value(&arm.result, refs);
             }
         }
-        FunctionExpression::Window {
-            arguments,
-            partition_by,
-            ..
-        } => {
-            for arg in arguments {
-                walk_domain(arg, refs);
-            }
-            for pb in partition_by {
-                walk_domain(pb, refs);
-            }
+        crate::pipeline::asts::core::FunctionApplication::Case(case) => walk_case(case, refs),
+        crate::pipeline::asts::core::FunctionApplication::Scalarized(relation) => {
+            walk_scalar_relation(relation, refs)
         }
-        FunctionExpression::JsonPath { source, path, .. } => {
-            walk_domain(source, refs);
-            walk_domain(path, refs);
+        // The path is a spec — it names no relation and no column.
+        crate::pipeline::asts::core::FunctionApplication::JsonAccess(access) => {
+            walk_domain(&access.source, refs)
         }
     }
 }
 
-fn walk_boolean(expr: &BooleanExpression, refs: &mut Vec<ExtractedReference>) {
+fn walk_boolean(expr: &TruthExpression, refs: &mut Vec<ExtractedReference>) {
     match expr {
-        BooleanExpression::Comparison { left, right, .. } => {
+        TruthExpression::Comparison(Comparison { left, right, .. }) => {
             walk_domain(left, refs);
             walk_domain(right, refs);
         }
-        BooleanExpression::And { left, right } => {
-            walk_boolean(left, refs);
-            walk_boolean(right, refs);
+        TruthExpression::Conjunction(parts) | TruthExpression::Disjunction(parts) => {
+            for part in parts.iter() {
+                walk_boolean(part, refs);
+            }
         }
-        BooleanExpression::Or { left, right } => {
-            walk_boolean(left, refs);
-            walk_boolean(right, refs);
-        }
-        BooleanExpression::Not { expr } => walk_boolean(expr, refs),
-        BooleanExpression::Using { .. } => {}
-        BooleanExpression::InnerExists {
-            identifier,
-            subquery,
+        TruthExpression::Not { expr } => walk_boolean(expr, refs),
+        TruthExpression::Existence(Existence {
+            addressing,
+            relation: subquery,
             ..
-        } => {
+        }) => {
             refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
+                name: addressing.identifier.name.to_string(),
+                namespace: namespace_from_path(&addressing.identifier.namespace_path),
                 apparent_type: EntityType::DbPermanentTable.as_i32(),
             });
             walk_relational(subquery, refs);
         }
-        BooleanExpression::In { value, set, .. } => {
-            walk_domain(value, refs);
-            for s in set {
-                walk_domain(s, refs);
+        TruthExpression::Membership(Membership { probe, rows, .. }) => {
+            for value in probe.values() {
+                walk_domain(value, refs);
+            }
+            for row in rows {
+                for value in &row.0 {
+                    walk_domain(value, refs);
+                }
             }
         }
-        BooleanExpression::InRelational {
-            value,
-            identifier,
-            subquery,
+        TruthExpression::RelationalMembership(RelationalMembership {
+            probe,
+            addressing,
+            relation: subquery,
             ..
-        } => {
-            walk_domain(value, refs);
+        }) => {
+            for value in probe.values() {
+                walk_domain(value, refs);
+            }
             refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
+                name: addressing.identifier.name.to_string(),
+                namespace: namespace_from_path(&addressing.identifier.namespace_path),
                 apparent_type: EntityType::DbPermanentTable.as_i32(),
             });
             walk_relational(subquery, refs);
         }
-        BooleanExpression::BooleanLiteral { .. } => {}
-        BooleanExpression::GlobCorrelation { .. } => {}
-        BooleanExpression::OrdinalGlobCorrelation { .. } => {}
-        BooleanExpression::Sigma { condition } => {
-            walk_sigma_condition(condition, refs);
-        }
-    }
-}
-
-fn walk_sigma_condition(cond: &SigmaCondition, refs: &mut Vec<ExtractedReference>) {
-    match cond {
-        SigmaCondition::Predicate(bool_expr) => walk_boolean(bool_expr, refs),
-        SigmaCondition::TupleOrdinal(_) => {}
-        SigmaCondition::Destructure {
-            json_column,
-            pattern,
+        // An authored application observes a CALL: the body slot is
+        // uninhabited before resolution, so there is no arm to write.
+        TruthExpression::Sigma(SigmaApplication {
+            proof: crate::pipeline::asts::core::NamedProof::Body(body),
             ..
-        } => {
-            walk_domain(json_column, refs);
-            walk_function(pattern, refs);
-        }
-        SigmaCondition::SigmaCall { arguments, .. } => {
-            for arg in arguments {
-                walk_domain(arg, refs);
-            }
-        }
+        }) => match *body {},
+        TruthExpression::Sigma(SigmaApplication {
+            proof: crate::pipeline::asts::core::NamedProof::Call(call),
+            ..
+        }) => walk_functor_call(call.call(), refs),
     }
 }
 
-fn walk_case_arm(arm: &CaseArm, refs: &mut Vec<ExtractedReference>) {
-    match arm {
-        CaseArm::Simple {
-            test_expr, result, ..
-        } => {
-            walk_domain(test_expr, refs);
-            walk_domain(result, refs);
-        }
-        CaseArm::CurriedSimple { result, .. } => walk_domain(result, refs),
-        CaseArm::Searched { condition, result } => {
-            walk_boolean(condition, refs);
-            walk_domain(result, refs);
-        }
-        CaseArm::Default { result } => walk_domain(result, refs),
+fn walk_functor_call(call: &FunctorCall, refs: &mut Vec<ExtractedReference>) {
+    // A QUALIFIED callee is a reference to the entity it names — the
+    // executable boundary asks the catalog which definitions reach a
+    // runtime-served relation, and the callee is how a body reaches one.
+    // An unqualified callee stays unrecorded: the grounding contract reads
+    // unqualified rows as free data-namespace variables, which a callee is
+    // not.
+    let namespace = call.call().callee.namespace_texts();
+    if !namespace.is_empty() {
+        refs.push(ExtractedReference {
+            name: call.call().callee.name_text().to_string(),
+            namespace: Some(namespace.join("::")),
+            apparent_type: EntityType::DbPermanentTable.as_i32(),
+        });
+    }
+    for rel in call.call().relations() {
+        walk_relational(rel, refs);
+    }
+    // A spread addresses columns of the operand and a star names the whole
+    // of it; neither refers to anything.
+    for expr in call.call().arguments.value_domains() {
+        walk_domain(expr, refs);
     }
 }
 
-fn walk_curly_member(member: &CurlyMember, refs: &mut Vec<ExtractedReference>) {
-    match member {
-        CurlyMember::Shorthand { .. } => {}
-        CurlyMember::Comparison { condition } => walk_boolean(condition, refs),
-        CurlyMember::KeyValue { value, .. } => walk_domain(value, refs),
-        CurlyMember::Glob => {}
-        CurlyMember::Pattern { .. } => {}
-        CurlyMember::OrdinalRange { .. } => {}
-        CurlyMember::Placeholder => {}
-        CurlyMember::PathLiteral { path, .. } => walk_domain(path, refs),
-    }
-}
-
-fn walk_modulo_spec(spec: &ModuloSpec, refs: &mut Vec<ExtractedReference>) {
-    match spec {
-        ModuloSpec::Columns(cols) => {
-            for col in cols {
-                walk_domain(col, refs);
-            }
+/// A COVER'S CALLABLE, walked as the form it is.
+fn walk_callable(
+    callable: &crate::pipeline::asts::core::Callable,
+    refs: &mut Vec<ExtractedReference>,
+) {
+    match callable {
+        crate::pipeline::asts::core::Callable::Functor(application) => {
+            walk_standard_application(application, refs)
         }
-        ModuloSpec::GroupBy {
-            reducing_by,
-            reducing_on,
-            delegates,
-        } => {
-            for ode in reducing_by {
-                walk_domain(&ode.expr, refs);
-            }
-            for ode in reducing_on {
-                walk_domain(&ode.expr, refs);
-            }
-            for w in delegates {
-                for ode in &w.payload {
-                    walk_domain(&ode.expr, refs);
-                }
-                for o in &w.order {
-                    walk_domain(&o.column, refs);
+        crate::pipeline::asts::core::Callable::String(template) => {
+            for part in template.parts() {
+                if let ValueTemplatePart::Interpolation(expr) = part {
+                    walk_domain(expr, refs);
                 }
             }
         }
+        crate::pipeline::asts::core::Callable::Lambda(lambda) => walk_domain(&lambda.body, refs),
     }
 }
 
-fn walk_domain_spec(spec: &DomainSpec, refs: &mut Vec<ExtractedReference>) {
-    match spec {
-        DomainSpec::Glob => {}
-        DomainSpec::GlobWithUsing(_) => {}
-        DomainSpec::GlobWithUsingAll => {}
-        DomainSpec::Positional(exprs) => {
-            for expr in exprs {
-                walk_domain(expr, refs);
+/// The whole application: the call's arguments, the window it is modified by
+/// and the guard it is filtered by.
+fn walk_standard_application(
+    application: &crate::pipeline::asts::core::StandardApplication,
+    refs: &mut Vec<ExtractedReference>,
+) {
+    walk_functor_call(application.call(), refs);
+    if let Some(window) = &application.window {
+        for expr in &window.partition {
+            walk_domain(expr, refs);
+        }
+        for ordering in &window.ordering {
+            walk_domain(&ordering.column, refs);
+        }
+        if let Some(frame) = &window.frame {
+            walk_window_frame(frame, refs);
+        }
+    }
+    if let Some(guard) = &application.guard {
+        walk_boolean(guard, refs);
+    }
+}
+
+fn walk_window_frame(frame: &WindowFrame, refs: &mut Vec<ExtractedReference>) {
+    let mut walk_bound = |bound: &FrameBound| match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => walk_domain(expr, refs),
+        FrameBound::Unbounded | FrameBound::CurrentRow => {}
+    };
+    walk_bound(&frame.start);
+    walk_bound(&frame.end);
+}
+
+fn walk_case(case: &CaseExpression, refs: &mut Vec<ExtractedReference>) {
+    let default = match case {
+        CaseExpression::Anchored {
+            anchor,
+            arms,
+            default,
+        } => {
+            walk_domain(anchor, refs);
+            for arm in arms.iter() {
+                walk_domain(&arm.result, refs);
+            }
+            default
+        }
+        CaseExpression::Searched { arms, default } => {
+            for arm in arms.iter() {
+                walk_boolean(&arm.condition, refs);
+                walk_domain(&arm.result, refs);
+            }
+            default
+        }
+    };
+    if let Some(result) = default {
+        walk_domain(result, refs);
+    }
+}
+
+fn walk_enclyph(
+    enclyph: &crate::pipeline::asts::core::Enclyph,
+    refs: &mut Vec<ExtractedReference>,
+) {
+    use crate::pipeline::asts::core::{Enclyph, RecordMember};
+    match enclyph {
+        Enclyph::Record(record) => {
+            for member in record.members.iter() {
+                match member {
+                    RecordMember::Keyed { value, .. } => walk_domain(value, refs),
+                    RecordMember::Induced { value, .. } => walk_enclyph(value, refs),
+                    // A self-keyed member and a spread both address columns
+                    // of the operand, not a declared entity.
+                    RecordMember::SelfKeyed(_) | RecordMember::Spread(_) => {}
+                }
             }
         }
-        DomainSpec::Bare => {}
+        Enclyph::EmptyRecord(empty) => match *empty {},
+        Enclyph::Tuple(tuple) => {
+            for element in tuple.elements.iter() {
+                walk_domain(element, refs);
+            }
+        }
     }
 }
 
-fn walk_unary_operator(op: &UnaryRelationalOperator, refs: &mut Vec<ExtractedReference>) {
+fn walk_metadata_group(
+    group: &crate::pipeline::asts::core::MetadataGroup,
+    refs: &mut Vec<ExtractedReference>,
+) {
+    use crate::pipeline::asts::core::MetadataTarget;
+    match &group.target {
+        MetadataTarget::Enclyph(enclyph) => walk_enclyph(enclyph, refs),
+        MetadataTarget::Group(nested) => walk_metadata_group(nested, refs),
+    }
+}
+
+/// A publication item references what its value references. A spread names
+/// columns of the operand rather than referring to a declared entity.
+fn walk_out_item(item: &crate::pipeline::asts::core::OutItem, refs: &mut Vec<ExtractedReference>) {
+    if let Some(expr) = item.domain_value() {
+        walk_domain(expr, refs);
+    }
+}
+
+/// A reduction publishes one column: a value, or a metadata level whose
+/// target holds the references.
+fn walk_reduction_item(
+    item: &crate::pipeline::asts::core::ReductionItem,
+    refs: &mut Vec<ExtractedReference>,
+) {
+    use crate::pipeline::asts::core::ReductionItem;
+    match item {
+        ReductionItem::Out(item) => walk_out_item(item, refs),
+        ReductionItem::Metadata(metadata) => walk_metadata_group(&metadata.group, refs),
+        ReductionItem::Pivot(pivot) => {
+            walk_domain(&pivot.value_column, refs);
+            walk_domain(&pivot.pivot_key, refs);
+        }
+        ReductionItem::Delegate(delegate) => {
+            for item in &delegate.payload {
+                walk_out_item(item, refs);
+            }
+            for o in &delegate.order {
+                walk_domain(&o.column, refs);
+            }
+        }
+    }
+}
+
+fn walk_group_spec(spec: &GroupSpec, refs: &mut Vec<ExtractedReference>) {
+    match spec {
+        GroupSpec::Distinct { keys } => {
+            for col in keys.iter() {
+                walk_out_item(col, refs);
+            }
+        }
+        GroupSpec::Reduce {
+            keys,
+            reductions,
+            plan: _,
+        } => {
+            for item in keys {
+                walk_out_item(item, refs);
+            }
+            for item in reductions.iter() {
+                walk_reduction_item(item, refs);
+            }
+        }
+    }
+}
+
+fn walk_access(spec: &Access, refs: &mut Vec<ExtractedReference>) {
+    match spec {
+        Access::All => {}
+        Access::Dequalify(_) => {}
+        Access::DequalifyAll => {}
+        Access::Slots(slots) => {
+            for slot in slots {
+                if let Some(term) = slot.constraint() {
+                    walk_domain(term, refs);
+                }
+            }
+        }
+        Access::Unasked => {}
+    }
+}
+
+fn walk_unary_operator(op: &PipeOp, refs: &mut Vec<ExtractedReference>) {
     match op {
-        UnaryRelationalOperator::General { expressions, .. } => {
-            for expr in expressions {
-                walk_domain(expr, refs);
+        PipeOp::Project(items) | PipeOp::Embed(items) => {
+            for item in items {
+                walk_out_item(item, refs);
             }
         }
-        UnaryRelationalOperator::Modulo { spec, .. } => {
-            walk_modulo_spec(spec, refs);
+        PipeOp::Group(spec) => {
+            walk_group_spec(spec, refs);
         }
-        UnaryRelationalOperator::TupleOrdering { specs, .. } => {
-            for spec in specs {
-                walk_domain(&spec.column, refs);
-            }
-        }
-        UnaryRelationalOperator::MapCover {
-            function, columns, ..
+        // A selector and a rename source ADDRESS columns of the operand:
+        // neither names a relation nor reaches a definition.
+        PipeOp::MapCover(MapCover {
+            callable: function, ..
+        }) => walk_callable(function, refs),
+        PipeOp::ProjectOut(_) | PipeOp::Rename(_) => {}
+        PipeOp::Transform {
+            items: transformations,
+            ..
         } => {
-            walk_function(function, refs);
-            for col in columns {
-                walk_domain(col, refs);
+            for item in transformations {
+                if let Some(value) = item.expr.domain() {
+                    walk_domain(value, refs);
+                }
             }
         }
-        UnaryRelationalOperator::ProjectOut { expressions, .. } => {
-            for expr in expressions {
-                walk_domain(expr, refs);
-            }
-        }
-        UnaryRelationalOperator::RenameCover { specs } => {
-            for spec in specs {
-                walk_domain(&spec.from, refs);
-            }
-        }
-        UnaryRelationalOperator::Transform {
-            transformations, ..
-        } => {
-            for (expr, _, _) in transformations {
-                walk_domain(expr, refs);
-            }
-        }
-        UnaryRelationalOperator::AggregatePipe { aggregations } => {
-            for agg in aggregations {
-                walk_domain(agg, refs);
-            }
-        }
-        UnaryRelationalOperator::Reposition { moves } => {
-            for mv in moves {
-                walk_domain(&mv.column, refs);
-            }
-        }
-        UnaryRelationalOperator::EmbedMapCover { function, .. } => {
-            walk_function(function, refs);
-        }
-        UnaryRelationalOperator::MetaIze { .. } => {}
-        UnaryRelationalOperator::Witness { .. } => {}
-        UnaryRelationalOperator::Qualify => {}
-        UnaryRelationalOperator::Using { .. } => {}
-        UnaryRelationalOperator::UsingAll => {}
-        UnaryRelationalOperator::DmlTerminal { .. } => {}
-        UnaryRelationalOperator::InteriorDrillDown { .. } => {}
-        UnaryRelationalOperator::NarrowingDestructure { .. } => {}
-        UnaryRelationalOperator::HoViewApplication { .. }
-        | UnaryRelationalOperator::DirectiveTerminal { .. } => {}
-        // Signed witness has no expressions; the two-paren pipe invocation's
-        // relational argument may reference entities (returning_other!'s
-        // other relation) — walk it.
-        UnaryRelationalOperator::SignedWitness => {}
-        UnaryRelationalOperator::DirectivePipeInvocation { argument, .. } => {
-            walk_relational(argument, refs);
+        PipeOp::EmbedMapCover(EmbedMapCover {
+            callable: function, ..
+        }) => {
+            walk_callable(function, refs);
         }
     }
 }
@@ -661,12 +651,28 @@ fn namespace_from_path(path: &NamespacePath) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ddl::body_parser;
+    use crate::ddl::reconstruct;
+    use crate::pipeline::asts::ddl::DdlBody;
+
+    /// The clause a stored definition reconstructs to, by body position.
+    fn scalar(source: &str) -> crate::pipeline::asts::unresolved::DomainExpression {
+        match reconstruct::clauses(source).unwrap().remove(0).body {
+            DdlBody::Scalar(expr) => expr.into_domain().expect("a value body"),
+            other => panic!("expected a value body, got {other:?}"),
+        }
+    }
+
+    fn relational(source: &str) -> crate::pipeline::asts::unresolved::Query {
+        match reconstruct::clauses(source).unwrap().remove(0).body {
+            DdlBody::Relational(query) => query,
+            other => panic!("expected a relational body, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_function_body_no_references() {
         // x * 2 has no entity references (just parameter lvars and literals)
-        let expr = body_parser::parse_function_body("x * 2").unwrap();
+        let expr = scalar("f:(x) :- x * 2");
         let refs = extract_references_from_domain(&expr);
         assert!(
             refs.is_empty(),
@@ -678,7 +684,7 @@ mod tests {
     #[test]
     fn test_view_body_table_reference() {
         // users(*), balance > 1000 references the "users" table
-        let query = body_parser::parse_view_body("users(*), balance > 1000").unwrap();
+        let query = relational("v(*) :- users(*), balance > 1000");
         let refs = extract_references_from_query(&query);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "users");
@@ -689,7 +695,7 @@ mod tests {
     #[test]
     fn test_view_body_multiple_references() {
         // users(*), orders(*) references both tables
-        let query = body_parser::parse_view_body("users(*), orders(*)").unwrap();
+        let query = relational("v(*) :- users(*), orders(*)");
         let refs = extract_references_from_query(&query);
         assert_eq!(refs.len(), 2);
         let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
@@ -700,7 +706,7 @@ mod tests {
     #[test]
     fn test_view_body_with_pipe_preserves_table_ref() {
         // users(*) |> (first_name, last_name) still references "users"
-        let query = body_parser::parse_view_body("users(*) |> (first_name, last_name)").unwrap();
+        let query = relational("v(*) :- users(*) |> (first_name, last_name)");
         let refs = extract_references_from_query(&query);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "users");
@@ -708,11 +714,10 @@ mod tests {
 
     #[test]
     fn test_function_body_with_nested_function_call() {
-        // round:(x * 2) — if round: is a curried call, it's a reference
-        // But round(x * 2) — if round() is a regular SQL function, it's NOT a reference
-        // The parser produces Curried for `:()` and Regular for `()`
-        // For our test: x * 2 has no references (both x and 2 are leaves)
-        let expr = body_parser::parse_function_body("x + 10").unwrap();
+        // `round:(x)` is a curried call and IS a reference; `round(x)` is a
+        // regular SQL function and is not. Neither stands here: `x + 10` is
+        // two leaves.
+        let expr = scalar("f:(x) :- x + 10");
         let refs = extract_references_from_domain(&expr);
         assert!(refs.is_empty());
     }

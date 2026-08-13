@@ -275,9 +275,6 @@ impl From<delightql_types::error::DelightQLError> for ExecutionError {
             } => {
                 ExecutionError::validation_error(message, None).with_context(context)
             }
-            CoreError::TreeSitterError(ts_error) => {
-                ExecutionError::parse_error_simple(format!("Tree-sitter error: {}", ts_error))
-            }
             CoreError::IoError(io_error) => ExecutionError::configuration_error(
                 format!("IO error: {}", io_error),
                 Some("Check file permissions and paths".to_string()),

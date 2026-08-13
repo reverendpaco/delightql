@@ -13,6 +13,7 @@ pub mod coprocess;
 pub mod connection;
 pub mod error;
 pub mod introspect;
+pub(crate) mod metadata;
 pub mod parse;
 pub mod profile;
 pub mod schema;

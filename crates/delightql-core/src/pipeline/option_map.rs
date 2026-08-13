@@ -4,8 +4,8 @@
 // type names retain "option" until a cosmetic rename batch).
 //
 // Strategy/preference selection. Each config is identified by a badge-form
-// URI (e.g. "delightql-config://generation/rule/inlining/view",
-// URI-DESIGN.md §2) and controls which code path the compiler uses when
+// URI (e.g. "delightql-config://generation/rule/inlining/view")
+// and controls which code path the compiler uses when
 // multiple paths lead to the same result. Annotations and flags carry the
 // bare hierarchy; canonical_config_uri() normalizes.
 
@@ -19,7 +19,7 @@ const KNOWN_OPTIONS: &[(&str, OptionState)] = &[
     ("delightql-config://generation/rule/inlining/fact", OptionState::Off),
 ];
 
-/// The config badge scheme (URI-DESIGN.md §2).
+/// The config badge scheme.
 pub const CONFIG_URI_SCHEME: &str = "delightql-config://";
 
 /// Canonicalize a config URI: bare hierarchy gains the badge scheme.

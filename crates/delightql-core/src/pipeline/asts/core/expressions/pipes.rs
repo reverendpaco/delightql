@@ -1,36 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Pipe expressions and sigma conditions
+//! Destructure vocabularies.
+//!
+//! The comma member's three kinds are `Continuation` variants (see `chain`);
+//! what remains here is the shared data those kinds carry.
 
-use super::super::{
-    Addressed, CprSchema, PhaseBox, Refined, Resolved, TupleOrdinalClause, UnaryRelationalOperator,
-    Unresolved,
-};
-use super::boolean::BooleanExpression;
-use super::domain::DomainExpression;
-use super::functions::FunctionExpression;
-use super::relational::RelationalExpression;
-use crate::{lispy::ToLispy, PhaseConvert, ToLispy};
-use serde::{Deserialize, Serialize};
+use crate::lispy::ToLispy;
 
 /// Mapping from JSON key to output column name
 /// Used in destructuring to support renaming: {"json_key": column_name}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DestructureMapping {
     /// Key in the JSON object (used in json_extract path)
     pub json_key: String,
-    /// Name of the column in the result (used in AS alias)
-    pub column_name: String,
+    /// Output column occurrence for this extracted value.
+    pub column: crate::names::ColId,
 }
 
 impl ToLispy for DestructureMapping {
     fn to_lispy(&self) -> String {
-        format!("(mapping {} {})", self.json_key, self.column_name)
+        format!("(mapping {} {:?})", self.json_key, self.column)
     }
 }
 
 /// Destructuring operation mode
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DestructureMode {
     /// Scalar: ~= {pattern}
     /// Generates: json_extract(col, '$.field') for each field
@@ -50,86 +44,4 @@ impl ToLispy for DestructureMode {
             DestructureMode::Aggregate => "aggregate".to_string(),
         }
     }
-}
-
-/// Direction of a value-pipe step: `/->` threads the current value as the
-/// first argument; `/->>` threads it as the last argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToLispy)]
-pub enum PipeDirection {
-    /// `/->` — current value becomes argument 0 (Elixir-style)
-    First,
-    /// `/->>` — current value becomes the final argument (F#-style)
-    Last,
-}
-
-impl PipeDirection {
-    /// Build the argument list for a piped call by inserting `threaded`
-    /// (the current pipe value) at the position dictated by this direction.
-    pub fn thread<T>(self, threaded: T, rest: impl IntoIterator<Item = T>) -> Vec<T> {
-        match self {
-            PipeDirection::First => {
-                let mut out = Vec::with_capacity(1);
-                out.push(threaded);
-                out.extend(rest);
-                out
-            }
-            PipeDirection::Last => {
-                let mut out: Vec<T> = rest.into_iter().collect();
-                out.push(threaded);
-                out
-            }
-        }
-    }
-}
-
-/// Pipe transformation: relation |> operator
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-#[lispy("pipe")]
-pub struct PipeExpression<Phase = Unresolved> {
-    pub source: RelationalExpression<Phase>,
-    pub operator: UnaryRelationalOperator<Phase>,
-    // PhaseBox enforces compile-time schema access patterns
-    pub cpr_schema: PhaseBox<CprSchema, Phase>,
-}
-
-/// Conditions in sigma expressions
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum SigmaCondition<Phase = Unresolved> {
-    /// Boolean predicate (WHERE/ON/HAVING conditions)
-    Predicate(BooleanExpression<Phase>),
-    /// Tuple ordinal: #<5, #>10
-    TupleOrdinal(TupleOrdinalClause),
-    /// Tree group destructuring: json_col ~= ~> {pattern}
-    /// Extracts columns from JSON using tree group pattern
-    #[lispy("sigma_condition:destructure")]
-    Destructure {
-        /// Source JSON column
-        json_column: Box<DomainExpression<Phase>>,
-        /// Destructuring pattern (must be Curly function)
-        pattern: Box<FunctionExpression<Phase>>,
-        /// Destructuring mode (strict vs permissive, scalar vs aggregate)
-        mode: DestructureMode,
-        /// Schema of columns produced by destructuring
-        /// - Unresolved: empty/phantom
-        /// - Resolved: filled with JSON key → column name mappings
-        /// - Refined: preserved from resolved
-        destructured_schema: PhaseBox<Vec<DestructureMapping>, Phase>,
-    },
-    /// Sigma predicate call: +like(arg1, arg2) or \+like(arg1, arg2)
-    /// Constraint predicates that represent conceptually infinite relations
-    #[lispy("sigma_condition:sigma_call")]
-    SigmaCall {
-        /// Functor name (e.g., "like", "=", "<")
-        functor: String,
-        /// Namespace qualifier (`+HL.h(v)`, `+a::b.h(v)`): the alias or
-        /// path text as WRITTEN — resolved alias- and scope-aware by the
-        /// resolver's sigma arm. Empty = unqualified. (Review qmqwqlms
-        /// round 3: the builder used to DROP the qualifier silently.)
-        #[serde(default)]
-        namespace: crate::pipeline::asts::core::metadata::NamespacePath,
-        /// Arguments to the predicate
-        arguments: Vec<DomainExpression<Phase>>,
-        /// True for EXISTS (+), false for NOT EXISTS (\+)
-        exists: bool,
-    },
 }

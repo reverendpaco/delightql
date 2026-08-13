@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! `dql target list` — the passive face of the adapter machinery
-//! (JOE-EVERYBODY-DISTRIBUTION.md §3.1). Reports each known adapter
-//! and where it resolves from, by walking exactly the chain
-//! query-time resolution walks (`fatboy_exec::locate_fatboy`) — the
+//! `dql target list` — the passive face of the adapter machinery. Reports
+//! each known adapter and where it resolves from, by walking exactly the
+//! chain query-time resolution walks (`fatboy_exec::locate_fatboy`) — the
 //! list and the behavior cannot disagree.
 //!
-//! `install` and `verify` arrive with the release pipeline
-//! (deviations 3+4 in the proposal): they need published artifacts
-//! and embedded digests. `list` needs neither, so it ships first.
+//! `install` and `verify` need published artifacts and embedded digests,
+//! which `list` does not — so `list` ships alone first.
 
 use anyhow::Result;
 
@@ -65,9 +63,9 @@ pub fn handle_target_list() -> Result<()> {
 }
 
 /// `dql target install <profile> --from <dir>` — the store's write
-/// path (§3.1/§3.4 of the proposal). Local-directory source only, by
-/// design: no artifact host exists yet, and when one does, download
-/// becomes another source in front of the same verification gate.
+/// path. Local-directory source only, by design: no artifact host
+/// exists yet, and when one does, download becomes another source in
+/// front of the same verification gate.
 ///
 /// The gate: a release dql verifies the artifact against its burned
 /// digest BEFORE anything touches the store — a mismatch installs
@@ -202,10 +200,10 @@ fn find_artifact(dir: &std::path::Path, profile: &str) -> Result<std::path::Path
     }
 }
 
-/// The installed-profiles record (§3.3's restore-on-upgrade nicety):
-/// one profile per line in `<data>/fatboys/installed`, version-
-/// independent, so a freshly upgraded dql can offer to restore the
-/// set. Written on every install, deduplicated.
+/// The installed-profiles record (a restore-on-upgrade nicety): one
+/// profile per line in `<data>/fatboys/installed`, version-independent,
+/// so a freshly upgraded dql can offer to restore the set. Written on
+/// every install, deduplicated.
 fn record_installed(store_version_dir: &std::path::Path, profile: &str) -> Result<()> {
     let Some(root) = store_version_dir.parent() else {
         return Ok(());
@@ -226,10 +224,10 @@ fn record_installed(store_version_dir: &std::path::Path, profile: &str) -> Resul
 }
 
 /// `dql target verify` — re-hash whatever the lookup chain resolves
-/// against the digests burned in at release time (§3.4 of the
-/// proposal: the CLI carries its own manifest). Answers "do my
-/// adapters match what this dql was released with?" — a question a
-/// dev build cannot answer, so it refuses rather than pretending.
+/// against the digests burned in at release time (the CLI carries its
+/// own manifest). Answers "do my adapters match what this dql was
+/// released with?" — a question a dev build cannot answer, so it
+/// refuses rather than pretending.
 pub fn handle_target_verify() -> Result<()> {
     if delightql_buildinfo::FATBOY_DIGESTS.is_none() {
         anyhow::bail!(

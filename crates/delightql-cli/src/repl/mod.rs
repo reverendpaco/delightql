@@ -21,61 +21,60 @@ use std::sync::{Arc, Mutex};
 
 use crate::output_format::OutputFormat;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tree_sitter::{Language, Parser};
+use delightql_cst::cst::{self, TypedNode};
+use delightql_cst::{Parser, SyntaxTree};
 
 use self::commands::{handle_dot_command, is_dot_command, process_query, CommandResult, ReplState};
 use self::completions::DotCommandCompleter;
 use self::multi_pane_tui::run_multi_pane_tui;
 
-extern "C" {
-    fn tree_sitter_delightql_v2() -> Language;
+/// The DelightQL language, for the highlighting substrate.
+///
+/// `tree-sitter-highlight` is grammar-agnostic and takes a raw `Language`; it
+/// is the one place a runtime handle is still the right currency. Everything
+/// else in the prompt reads the typed CST.
+///
+/// Lives here rather than in `syntax_highlighter` because that module is behind
+/// the optional `prettify` feature while the prompt's well-formedness probe is
+/// not — `--no-default-features --features repl` must still build.
+pub(crate) fn dql_language() -> tree_sitter::Language {
+    delightql_cst::language()
 }
 
-/// Parse the line with tree-sitter and return the tree
-fn parse_line(line: &str) -> Option<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    let language = unsafe { tree_sitter_delightql_v2() };
-
-    if parser.set_language(&language).is_err() {
-        return None;
-    }
-
-    parser.parse(line, None)
+/// Read one prompt line.
+///
+/// The REPL's line is an interactive submission, so it takes the same entrance
+/// the compiler gives one: the prompt wrap. Reading it any other way would let
+/// the prompt disagree with the road that will actually run the line.
+fn parse_line(line: &str) -> SyntaxTree {
+    Parser::new().parse_prompt(line)
 }
 
-/// Find all stop points (continuation operators + relational_expression starts) as char positions
+/// Every CONTINUATION ANCHOR in the line, as char positions.
+///
+/// A continuation anchor is where the text to the left is already a relational
+/// expression and a continuation may replace what follows — which is exactly
+/// what a reader jumping through a chain wants to land on. The chain's own
+/// start is one, and so is every continuation within it.
 fn find_stop_points(line: &str) -> Vec<usize> {
-    let tree = match parse_line(line) {
-        Some(tree) => tree,
-        None => return Vec::new(),
-    };
-    let mut byte_positions = Vec::new();
-    collect_stop_points(tree.root_node(), &mut byte_positions);
+    let tree = parse_line(line);
+    let mut byte_positions: Vec<usize> = delightql_cst::walk(&tree)
+        .filter(|node| {
+            // `Continuation` is a supertype, so the cast is how its whole
+            // family is named at once — a member added to the grammar becomes
+            // an anchor here without this line changing.
+            cst::Continuation::cast(node.node()).is_some()
+                || cst::Relex::cast(node.node()).is_some()
+                || cst::Effrelex::cast(node.node()).is_some()
+        })
+        .filter_map(|node| tree.byte_range(node).map(|range| range.start))
+        .collect();
     byte_positions.sort_unstable();
     byte_positions.dedup();
     byte_positions
         .iter()
         .map(|&bp| byte_to_char_pos(line, bp))
         .collect()
-}
-
-/// Recursively collect stop-point byte positions from the CST
-fn collect_stop_points(node: tree_sitter::Node, positions: &mut Vec<usize>) {
-    match node.kind() {
-        "comma_operator"
-        | "pipe_operator"
-        | "aggregate_pipe_operator"
-        | "materialize_pipe_operator"
-        | "relational_expression" => {
-            positions.push(node.start_byte());
-        }
-        _ => {}
-    }
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_stop_points(child, positions);
-        }
-    }
 }
 
 /// Convert byte position to character position
@@ -273,9 +272,17 @@ impl ConditionalEventHandler for MultiLineHandler {
 }
 
 /// Custom event handler for Tab to display schema (META-IZE) of current expression
+///
+/// Meta-izes the prefix LEFT OF THE CURSOR, which is the same span the prompt
+/// reports well-formedness for. The prompt says whether that prefix runs; Tab
+/// says what it publishes. Tab on a prefix the prompt marks `?>` falls through
+/// rather than interrupting the line to print a parse error.
 struct SchemaDisplayHandler {
     trigger_schema_display: Arc<Mutex<bool>>,
     current_line: Arc<Mutex<String>>,
+    /// Cursor byte offset at the moment Tab was pressed, so the span meta-ized
+    /// and the cursor restored afterwards are both the ones the user saw.
+    schema_cursor: Arc<Mutex<usize>>,
 }
 
 impl ConditionalEventHandler for SchemaDisplayHandler {
@@ -295,14 +302,23 @@ impl ConditionalEventHandler for SchemaDisplayHandler {
                     return None;
                 }
 
-                // Skip empty or whitespace-only lines
-                if line.trim().is_empty() {
+                let (left, _right) = self::completions::split_at_cursor(line, ctx.pos());
+
+                // Meta-izing a prefix that does not parse builds `<junk> ^` and
+                // prints a parse error, having already torn down the line to do
+                // it. Fall through instead: no interrupt, no error, and Tab
+                // stays available to the completer.
+                if !self::completions::is_well_formed(left) {
                     return None;
                 }
 
-                // Save line and trigger schema display
+                // Save the line AND the cursor: the trigger block meta-izes the
+                // prefix and restores the cursor to this offset.
                 if let Ok(mut stored) = self.current_line.lock() {
                     *stored = line.to_string();
+                }
+                if let Ok(mut at) = self.schema_cursor.lock() {
+                    *at = ctx.pos();
                 }
                 if let Ok(mut trigger) = self.trigger_schema_display.lock() {
                     *trigger = true;
@@ -521,9 +537,11 @@ pub fn run_interactive_with_connection(
 
     // Add custom event handler for Tab (schema display via META-IZE)
     let trigger_schema_display = Arc::new(Mutex::new(false));
+    let schema_cursor = Arc::new(Mutex::new(0usize));
     let schema_handler = SchemaDisplayHandler {
         trigger_schema_display: trigger_schema_display.clone(),
         current_line: current_line_storage.clone(),
+        schema_cursor: schema_cursor.clone(),
     };
     rl.bind_sequence(
         KeyEvent(KeyCode::Tab, Modifiers::NONE),
@@ -594,20 +612,34 @@ pub fn run_interactive_with_connection(
         }
     }
 
-    // Main REPL loop
-    let mut preserved_line: Option<String> = None;
+    // Main REPL loop.
+    //
+    // A restored line carries its cursor: `(before, after)` is exactly
+    // `readline_with_initial`'s tuple, so an interrupt-and-restore round trip
+    // (Tab's meta-ize, the TUI toggle) puts the caret back where the user left
+    // it. Storing only the text forces it to end-of-line.
+    let mut preserved_line: Option<(String, String)> = None;
     let mut multiline_buffer: Vec<String> = vec![];
 
     loop {
+        // A REPL prompt is a recovery boundary: never present an ordinary
+        // DQL prompt backed by a quarantined session. The check reads the
+        // typed health report; a failed recovery is a terminal connection
+        // failure, not another prompt.
+        if let CommandResult::Exit = commands::prompt_recovery_boundary(&mut repl_state) {
+            break;
+        }
+
         // Show continuation prompt when buffer has content or preserved line has newlines
         let is_continuation = !multiline_buffer.is_empty()
-            || preserved_line.as_ref().map_or(false, |p| p.contains('\n'));
+            || preserved_line
+                .as_ref()
+                .map_or(false, |(l, r)| l.contains('\n') || r.contains('\n'));
         let prompt = get_prompt(repl_state.sql_mode, is_continuation);
 
         // Use readline_with_initial if we have a preserved line
-        let result = if let Some(initial) = preserved_line.take() {
-            // Put cursor at the end of the line (all text before cursor, nothing after)
-            rl.readline_with_initial(prompt, (&initial, ""))
+        let result = if let Some((before, after)) = preserved_line.take() {
+            rl.readline_with_initial(prompt, (&before, &after))
         } else {
             rl.readline(prompt)
         };
@@ -719,8 +751,9 @@ pub fn run_interactive_with_connection(
                             run_multi_pane_tui(repl_state.shared_info.clone(), handle, connection)?;
                         repl_state.shared_info.last_window_position = Some(final_window_position);
 
-                        // Preserve the line for the next iteration
-                        preserved_line = Some(saved_line);
+                        // Preserve the line for the next iteration. The TUI
+                        // toggle records no cursor, so it restores at end.
+                        preserved_line = Some((saved_line, String::new()));
                         continue;
                     }
                 }
@@ -739,12 +772,20 @@ pub fn run_interactive_with_connection(
                             String::new()
                         };
 
-                        // Execute "<line> ^" to get schema
-                        let schema_query = format!("{} ^", saved_line.trim());
+                        let at = schema_cursor.lock().map(|g| *g).unwrap_or(saved_line.len());
+                        let (left, right) = self::completions::split_at_cursor(&saved_line, at);
+
+                        // Meta-ize the prefix the cursor stood after — the same
+                        // span the prompt was reporting on. The handler already
+                        // established it is well-formed.
+                        let schema_query = format!("{} ^", left.trim());
                         let _ = process_input(&schema_query, &mut repl_state, &QUERY_INTERRUPTED);
 
-                        // Restore the original line
-                        preserved_line = Some(saved_line);
+                        // Restore with the cursor where it was. `(left, right)`
+                        // is readline_with_initial's (before-cursor,
+                        // after-cursor); passing "" on the right — as this did —
+                        // silently jumps the cursor to end of line.
+                        preserved_line = Some((left.to_string(), right.to_string()));
                         continue;
                     }
                 }
@@ -897,7 +938,7 @@ pub fn process_piped_input(
         // mount! the user database as "main" if specified
         if let Some(ref path) = db_path {
             crate::exec_ng::run_dql_query(
-                &format!("mount!(\"{}\", \"main\")", path),
+                &format!("mount!(\"{}\", \"main\")(*)", path),
                 &mut *session,
             )?;
         }

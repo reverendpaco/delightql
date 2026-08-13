@@ -7,79 +7,84 @@
 // but will eventually handle additional refinements and optimizations.
 //
 // Key additions over ast_unresolved:
-// 1. CprSchema enum for tracking column resolution state
-// 2. ColumnMetadata for rich column information
-// 3. cpr_schema fields on all relation-producing nodes
+// 1. a scope on every relation-producing node, naming what it publishes
+// 2. settled correlations and chosen strategies
 
 // Type aliases for refined phase
 pub type Query = crate::pipeline::asts::core::Query<crate::pipeline::asts::core::Refined>;
 pub type CteBinding = crate::pipeline::asts::core::CteBinding<crate::pipeline::asts::core::Refined>;
-pub type RelationalExpression =
-    crate::pipeline::asts::core::RelationalExpression<crate::pipeline::asts::core::Refined>;
+pub type Chain = crate::pipeline::asts::core::Chain<crate::pipeline::asts::core::Refined>;
+pub type Grelex = crate::pipeline::asts::core::Grelex<crate::pipeline::asts::core::Refined>;
+pub type Continuation =
+    crate::pipeline::asts::core::Continuation<crate::pipeline::asts::core::Refined>;
+pub type StructuralStep =
+    crate::pipeline::asts::core::StructuralStep<crate::pipeline::asts::core::Refined>;
+pub type StructuralForm =
+    crate::pipeline::asts::core::StructuralForm<crate::pipeline::asts::core::Refined>;
+pub type AnonTable = crate::pipeline::asts::core::AnonTable<crate::pipeline::asts::core::Refined>;
+pub type AnonRelation =
+    crate::pipeline::asts::core::AnonRelation<crate::pipeline::asts::core::Refined>;
+pub type Datum = crate::pipeline::asts::core::Datum<crate::pipeline::asts::core::Refined>;
+pub type TabularRow<T> = crate::pipeline::asts::core::TabularRow<T>;
+pub type WholeHeading =
+    crate::pipeline::asts::core::WholeHeading<crate::pipeline::asts::core::Refined>;
+pub type CorrPred = crate::pipeline::asts::core::CorrPred<crate::pipeline::asts::core::Refined>;
+pub type MemberCorrelation =
+    crate::pipeline::asts::core::MemberCorrelation<crate::pipeline::asts::core::Refined>;
+pub type BagCorrelation =
+    crate::pipeline::asts::core::BagCorrelation<crate::pipeline::asts::core::Refined>;
 pub type Relation = crate::pipeline::asts::core::Relation<crate::pipeline::asts::core::Refined>;
-pub type PipeExpression =
-    crate::pipeline::asts::core::PipeExpression<crate::pipeline::asts::core::Refined>;
-pub type SigmaCondition =
-    crate::pipeline::asts::core::SigmaCondition<crate::pipeline::asts::core::Refined>;
 pub type DomainExpression =
     crate::pipeline::asts::core::DomainExpression<crate::pipeline::asts::core::Refined>;
-pub type FunctionExpression =
-    crate::pipeline::asts::core::FunctionExpression<crate::pipeline::asts::core::Refined>;
-pub type CurlyMember =
-    crate::pipeline::asts::core::CurlyMember<crate::pipeline::asts::core::Refined>;
-pub type BooleanExpression =
-    crate::pipeline::asts::core::BooleanExpression<crate::pipeline::asts::core::Refined>;
-pub type UnaryRelationalOperator =
-    crate::pipeline::asts::core::UnaryRelationalOperator<crate::pipeline::asts::core::Refined>;
+pub type FunctionApplication =
+    crate::pipeline::asts::core::FunctionApplication<crate::pipeline::asts::core::Refined>;
+pub type TreePattern =
+    crate::pipeline::asts::core::TreePattern<crate::pipeline::asts::core::Refined>;
+pub type RecordPattern =
+    crate::pipeline::asts::core::RecordPattern<crate::pipeline::asts::core::Refined>;
+pub type MetadataGroup =
+    crate::pipeline::asts::core::MetadataGroup<crate::pipeline::asts::core::Refined>;
+pub type FunctorCall =
+    crate::pipeline::asts::core::FunctorCall<crate::pipeline::asts::core::Refined>;
+pub type SealedCall = crate::pipeline::asts::core::SealedCall<crate::pipeline::asts::core::Refined>;
+pub type PureCall = crate::pipeline::asts::core::PureCall<crate::pipeline::asts::core::Refined>;
+pub type Callable = crate::pipeline::asts::core::Callable<crate::pipeline::asts::core::Refined>;
+pub type Access = crate::pipeline::asts::core::Access<crate::pipeline::asts::core::Refined>;
+pub type TruthExpression =
+    crate::pipeline::asts::core::TruthExpression<crate::pipeline::asts::core::Refined>;
+pub type ArgumentValue =
+    crate::pipeline::asts::core::ArgumentValue<crate::pipeline::asts::core::Refined>;
+pub type OutValue = crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Refined>;
 pub type OrderingSpec =
     crate::pipeline::asts::core::OrderingSpec<crate::pipeline::asts::core::Refined>;
-pub type DelegateSpec =
-    crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Refined>;
-pub type OutputDomainExpression =
-    crate::pipeline::asts::core::OutputDomainExpression<crate::pipeline::asts::core::Refined>;
 pub type WindowFrame =
     crate::pipeline::asts::core::WindowFrame<crate::pipeline::asts::core::Refined>;
-pub type FrameBound = crate::pipeline::asts::core::FrameBound<crate::pipeline::asts::core::Refined>;
-pub type CaseArm =
-    crate::pipeline::asts::core::expressions::CaseArm<crate::pipeline::asts::core::Refined>;
+pub type CaseExpression =
+    crate::pipeline::asts::core::expressions::CaseExpression<crate::pipeline::asts::core::Refined>;
+pub type GroupSpec = crate::pipeline::asts::core::GroupSpec<crate::pipeline::asts::core::Refined>;
+pub type ReductionPlan =
+    crate::pipeline::asts::core::ReductionPlan<crate::pipeline::asts::core::Refined>;
+pub type DelegateSpec =
+    crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Refined>;
+pub type OutItem = crate::pipeline::asts::core::OutItem<crate::pipeline::asts::core::Refined>;
+pub type ReductionItem =
+    crate::pipeline::asts::core::ReductionItem<crate::pipeline::asts::core::Refined>;
+pub type Reference = crate::pipeline::asts::core::Reference<crate::pipeline::asts::core::Refined>;
+pub type NamedOutItem =
+    crate::pipeline::asts::core::NamedOutItem<crate::pipeline::asts::core::Refined>;
+pub type AppliedCell =
+    crate::pipeline::asts::core::operators::AppliedCell<crate::pipeline::asts::core::Refined>;
+pub type RenameSpec = crate::pipeline::asts::core::RenameSpec<crate::pipeline::asts::core::Refined>;
+pub type SelectorItem =
+    crate::pipeline::asts::core::SelectorItem<crate::pipeline::asts::core::Refined>;
+pub type Path = crate::pipeline::asts::core::Path;
+pub type PathStep = crate::pipeline::asts::core::PathStep;
+pub type ScalarArgument =
+    crate::pipeline::asts::core::operators::ScalarArgument<crate::pipeline::asts::core::Refined>;
 pub type InnerRelationPattern = crate::pipeline::asts::core::expressions::InnerRelationPattern<
     crate::pipeline::asts::core::Refined,
 >;
-pub type StringTemplatePart = crate::pipeline::asts::core::expressions::StringTemplatePart<
-    crate::pipeline::asts::core::Refined,
->;
-pub use crate::pipeline::asts::core::expressions::domain::LvarProvenance;
 pub use crate::pipeline::asts::core::{
-    ContainmentSemantic, JoinType, LiteralValue, PhaseBox, QualifiedName, Refined, ScopedSchema,
-    SetOperator, UsingColumn,
+    DestructureMapping, DestructureMode, FilterOrigin, JoinType, LiteralValue, OrderDirection,
+    Refined, SetOperator, TreeGroupLocation,
 };
-
-// ============================================================================
-// Resolution Types (NEW in ast_resolved)
-// ============================================================================
-
-// ============================================================================
-// NOTE: Test helpers removed to prevent invalid states
-// ============================================================================
-// Test helpers that created ast_resolved structures with fake CprSchema values
-// have been removed. The ast_resolved structures should only be created by
-// the resolver, not manually constructed with invalid states.
-//
-// Once the resolver is implemented, tests should:
-// 1. Create ast_unresolved structures (which don't have cpr_schema)
-// 2. Pass them through the resolver
-// 3. Get properly resolved ast_resolved structures
-//
-// This ensures we're testing real states, not fake ones.
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Tests removed: These were creating invalid states with incorrect field names
-    // after the ColumnMetadata refactoring.
-}

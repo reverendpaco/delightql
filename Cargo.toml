@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["grammar_dql", "devtools/fn-lengths"]
+exclude = ["devtools/fn-lengths"]
 # delightql-duckdb is NOT a default member: cargo's per-invocation
 # feature unification would otherwise link libduckdb (backends/duckdb)
 # into every binary built alongside it — including dql itself, which
@@ -21,9 +21,13 @@ default-members = [
     "crates/tree-sitter-highlight",
     "crates/delightql-cabi",
 ]
+# delightql-cst is a member but NOT a default member: its build script runs the
+# pinned tree-sitter CLI, so building it requires that CLI on PATH. Build it
+# explicitly: `cargo build -p delightql-cst`.
 members = [
     "crates/delightql-buildinfo",
     "crates/delightql-core",
+    "crates/delightql-cst",
     "crates/delightql-cli",
     "crates/delightql-formatter",
     "crates/delightql-macros",
@@ -51,7 +55,7 @@ serde_json = "1.0"
 rmp-serde = "1.3"
 
 # Databases
-rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "serialize"] }
+rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "serialize", "hooks"] }
 
 # Tree-sitter parsing
 # Using tree-sitter-c2rust - pure Rust port of tree-sitter that works seamlessly with WASM
@@ -76,6 +80,12 @@ zstd = "0.13"
 
 
 tempfile = "3.8"
+
+# Full DWARF costs generation time, link time, and target/ size for a debugger
+# this workflow does not run. Line tables keep file:line in panic backtraces;
+# variable and type inspection is what is given up.
+[profile.dev]
+debug = "line-tables-only"
 
 # Custom profile: optimize for maximum speed
 [profile.release-fast]

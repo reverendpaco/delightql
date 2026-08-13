@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use crate::pipeline::ast_resolved::{
-    DomainExpression, FunctionExpression, LiteralValue, Resolved, StringTemplatePart,
+    DomainExpression, FunctionApplication, LiteralValue, ValueTemplatePart,
 };
-use delightql_types::SqlIdentifier;
 
 /// Build a concat chain from string template parts
 ///
@@ -16,70 +15,40 @@ use delightql_types::SqlIdentifier;
 /// Returns a DomainExpression that can be either:
 /// - A single Literal (for templates with only text)
 /// - A Function with nested Infix concat operations (for templates with interpolations)
-pub fn build_concat_chain(
-    parts: Vec<StringTemplatePart<Resolved>>,
-    alias: Option<SqlIdentifier>,
-) -> DomainExpression {
+pub fn build_concat_chain(parts: Vec<ValueTemplatePart>) -> DomainExpression {
     let mut parts_iter = parts.into_iter();
 
     // Start with first part
     let mut result = match parts_iter.next() {
-        Some(StringTemplatePart::Text(text)) => DomainExpression::Literal {
-            value: LiteralValue::String(text),
-            alias: None,
-        },
-        Some(StringTemplatePart::Interpolation(expr)) => *expr,
+        Some(ValueTemplatePart::Text(text)) => {
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(text)))
+        }
+        Some(ValueTemplatePart::Interpolation(expr)) => *expr,
         None => {
             // Empty template - return empty string
-            return DomainExpression::Literal {
-                value: LiteralValue::String(String::new()),
-                alias,
-            };
+            return DomainExpression::Application(FunctionApplication::Ground(
+                LiteralValue::String(String::new()),
+            ));
         }
     };
 
     // Chain rest with concat operations
     for part in parts_iter {
         let next_expr = match part {
-            StringTemplatePart::Text(text) => DomainExpression::Literal {
-                value: LiteralValue::String(text),
-                alias: None,
-            },
-            StringTemplatePart::Interpolation(expr) => *expr,
+            ValueTemplatePart::Text(text) => DomainExpression::Application(
+                FunctionApplication::Ground(LiteralValue::String(text)),
+            ),
+            ValueTemplatePart::Interpolation(expr) => *expr,
         };
 
-        result = DomainExpression::Function(FunctionExpression::Infix {
-            operator: "concat".to_string(), // DelightQL's concat operator (same as ++)
-            left: Box::new(result),
-            right: Box::new(next_expr),
-            alias: None,
-        });
+        result = DomainExpression::Application(FunctionApplication::Infix(
+            crate::pipeline::asts::core::InfixApplication {
+                operator: crate::pipeline::asts::vocabulary::BinOp::Concat,
+                left: Box::new(result),
+                right: Box::new(next_expr),
+            },
+        ));
     }
 
-    // Add the final alias to the outermost expression
-    apply_alias_to_expression(result, alias)
-}
-
-/// Apply an alias to the outermost level of an expression
-fn apply_alias_to_expression(
-    expr: DomainExpression,
-    alias: Option<SqlIdentifier>,
-) -> DomainExpression {
-    match expr {
-        DomainExpression::Function(FunctionExpression::Infix {
-            operator,
-            left,
-            right,
-            alias: _,
-        }) => DomainExpression::Function(FunctionExpression::Infix {
-            operator,
-            left,
-            right,
-            alias,
-        }),
-        DomainExpression::Literal { value, alias: _ } => DomainExpression::Literal { value, alias },
-        // For other expression types, return as-is
-        // In practice, build_concat_chain only produces Literal or Infix
-        _ => expr,
-    }
+    result
 }

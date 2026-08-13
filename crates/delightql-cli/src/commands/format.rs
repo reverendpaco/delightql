@@ -135,12 +135,6 @@ fn format_with_library(
         anyhow::bail!("Must provide source code, file path, or pipe input to format");
     };
 
-    // Format
-    extern "C" {
-        fn tree_sitter_delightql_v2() -> tree_sitter::Language;
-    }
-    let language = unsafe { tree_sitter_delightql_v2() };
-
     // Resolution order: frozen defaults, then the selected style
     // bundle (sys::format.bundle row, NULL = inherit), then the
     // .dql-format file overriding individual knobs.
@@ -151,7 +145,7 @@ fn format_with_library(
     for warning in delightql_formatter::apply_config_file(&mut config, None) {
         eprintln!("warning: {warning}");
     }
-    let outcome = delightql_formatter::format_outcome(&input, &language, &config)?;
+    let outcome = delightql_formatter::format_outcome(&input, &config)?;
 
     // Pass-through is safe but must be LOUD: the formatter could not
     // fully determine the input and returned it unchanged. "Cannot
@@ -160,21 +154,30 @@ fn format_with_library(
     if let delightql_formatter::FormatOutcome::PassedThrough { ref reason, .. } = outcome {
         use delightql_formatter::PassReason;
         match reason {
-            PassReason::ParseError => {
-                // A rules/DDL library is not a formatter bug in the
-                // input — it is a formatter limitation. Say which.
-                extern "C" {
-                    fn tree_sitter_delightql_rules() -> tree_sitter::Language;
+            PassReason::DefinitionFile => {
+                eprintln!(
+                    "warning: this is a definition library — `dql format` \
+                     speaks the query grammar only and cannot format rule \
+                     definitions yet; returned unchanged"
+                );
+                if !fail_if_not_formatted {
+                    print!("{}", outcome.text());
                 }
-                let rules_language = unsafe { tree_sitter_delightql_rules() };
-                let mut parser = tree_sitter::Parser::new();
-                let is_rules_file = parser.set_language(&rules_language).is_ok()
-                    && parser
-                        .parse(&input, None)
-                        .is_some_and(|tree| !tree.root_node().has_error());
-                if is_rules_file {
+                std::process::exit(2);
+            }
+            PassReason::ParseError => {
+                // THE TOOL'S ACCOMMODATION, not a second semantics. `dql
+                // format` names the utility entrance; a submission the
+                // canonical entrance reads cleanly is a definition library,
+                // which is a formatter limitation rather than a defect in the
+                // input. Asking is how the warning gets worded — the entrance
+                // was already chosen and this cannot change it.
+                let is_definition_file = !delightql_cst::Parser::new()
+                    .parse_definition_file(&input)
+                    .has_defects();
+                if is_definition_file {
                     eprintln!(
-                        "warning: this is a rules/DDL library — `dql format` \
+                        "warning: this is a definition library — `dql format` \
                          speaks the query grammar only and cannot format rule \
                          definitions yet; returned unchanged"
                     );
@@ -219,9 +222,7 @@ fn format_with_library(
     let use_colors = match color {
         ColorMode::Always => true,
         ColorMode::Never => false,
-        ColorMode::Auto => {
-            io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-        }
+        ColorMode::Auto => io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     };
 
     // Highlighting lives behind "repl"; without it, `always` is a

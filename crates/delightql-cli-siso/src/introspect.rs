@@ -2,9 +2,12 @@
 // Copyright 2026 Daniel Eklund
 use std::sync::Arc;
 
-use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
+use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 
 use crate::coprocess::SharedCoprocess;
+use crate::metadata::{
+    decode_discovery, decode_relation_columns, decode_single_query, PipeMetadataSource,
+};
 use crate::profile::IntrospectionMode;
 
 /// Introspector that discovers tables and columns through a pipe coprocess.
@@ -13,84 +16,46 @@ use crate::profile::IntrospectionMode;
 /// - `SingleQuery`: one SQL returns all tables + columns (e.g. sqlite3)
 /// - `TwoPhase`: discovery query + per-table PRAGMA (e.g. osqueryi)
 /// - `None`: returns empty
-pub struct PipeIntrospector {
-    shared: Arc<SharedCoprocess>,
+pub struct PipeIntrospector<S = SharedCoprocess> {
+    source: Arc<S>,
+    introspection: IntrospectionMode,
 }
 
-impl PipeIntrospector {
+impl PipeIntrospector<SharedCoprocess> {
     pub fn new(shared: Arc<SharedCoprocess>) -> Self {
-        Self { shared }
+        Self {
+            introspection: shared.profile().introspection.clone(),
+            source: shared,
+        }
+    }
+}
+
+impl<S> PipeIntrospector<S> {
+    #[cfg(test)]
+    pub(crate) fn with_source(source: Arc<S>, introspection: IntrospectionMode) -> Self {
+        Self {
+            source,
+            introspection,
+        }
     }
 
     /// SingleQuery mode: one SQL returns (table_name, table_type, cid, col_name, col_type, notnull).
-    fn introspect_single_query(
-        &self,
-        sql: &str,
-    ) -> delightql_types::Result<Vec<DiscoveredEntity>> {
-        let (_columns, rows) = self.shared.execute_query_raw(sql).map_err(|e| {
+    fn introspect_single_query(&self, sql: &str) -> delightql_types::Result<Vec<DiscoveredEntity>>
+    where
+        S: PipeMetadataSource,
+    {
+        let raw = self.source.query_metadata(sql).map_err(|e| {
             delightql_types::error::DelightQLError::database_error(
                 "Pipe introspection query failed",
                 e.to_string(),
             )
         })?;
-
-        if rows.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Expected columns: table_name(0), table_type(1), cid(2), col_name(3), col_type(4), notnull(5)
-        let mut entities: Vec<DiscoveredEntity> = Vec::new();
-        let mut current_name: Option<String> = None;
-        let mut current_attrs: Vec<DiscoveredAttribute> = Vec::new();
-        let mut current_type_id: i32 = 10;
-
-        for row in &rows {
-            let table_name = row.get(0).cloned().unwrap_or_default();
-            let table_type = row.get(1).cloned().unwrap_or_default();
-            let cid: i32 = row
-                .get(2)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let col_name = row.get(3).cloned().unwrap_or_default();
-            let col_type = row.get(4).cloned().unwrap_or_default();
-            let notnull: bool = row
-                .get(5)
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-
-            let type_id = if table_type.eq_ignore_ascii_case("view") { 11 } else { 10 };
-
-            if current_name.as_deref() != Some(&table_name) {
-                // Flush previous entity
-                if let Some(name) = current_name.take() {
-                    entities.push(DiscoveredEntity {
-                        name: name.into(),
-                        entity_type_id: current_type_id,
-                        attributes: std::mem::take(&mut current_attrs),
-                    });
-                }
-                current_name = Some(table_name);
-                current_type_id = type_id;
-            }
-
-            current_attrs.push(DiscoveredAttribute {
-                name: col_name.into(),
-                data_type: col_type,
-                position: cid,
-                is_nullable: !notnull,
-            });
-        }
-
-        // Flush last entity
-        if let Some(name) = current_name {
-            entities.push(DiscoveredEntity {
-                name: name.into(),
-                entity_type_id: current_type_id,
-                attributes: current_attrs,
-            });
-        }
-
-        Ok(entities)
+        decode_single_query(&raw).map_err(|e| {
+            delightql_types::error::DelightQLError::database_error(
+                "Pipe introspection metadata is malformed",
+                e.to_string(),
+            )
+        })
     }
 
     /// TwoPhase mode: discovery query lists table names, then PRAGMA table_info per table.
@@ -98,85 +63,53 @@ impl PipeIntrospector {
         &self,
         discovery_sql: &str,
         has_type_column: bool,
-    ) -> delightql_types::Result<Vec<DiscoveredEntity>> {
-        let (_columns, rows) = self.shared.execute_query_raw(discovery_sql).map_err(|e| {
+    ) -> delightql_types::Result<Vec<DiscoveredEntity>>
+    where
+        S: PipeMetadataSource,
+    {
+        let raw = self.source.query_metadata(discovery_sql).map_err(|e| {
             delightql_types::error::DelightQLError::database_error(
                 "Pipe introspection discovery query failed",
                 e.to_string(),
             )
         })?;
-
-        if rows.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut entities = Vec::new();
-
-        for row in &rows {
-            let table_name = row.get(0).cloned().unwrap_or_default();
-            let entity_type_id = if has_type_column {
-                let table_type = row.get(1).cloned().unwrap_or_default();
-                if table_type.eq_ignore_ascii_case("view") { 11 } else { 10 }
-            } else {
-                10 // default to table
-            };
-
-            // Query columns via PRAGMA
+        let tables = decode_discovery(&raw, has_type_column).map_err(|e| {
+            delightql_types::error::DelightQLError::database_error(
+                "Pipe introspection discovery metadata is malformed",
+                e.to_string(),
+            )
+        })?;
+        let mut entities = Vec::with_capacity(tables.len());
+        for (table_name, entity_type_id) in tables {
             let pragma_sql = format!("PRAGMA table_info({})", table_name);
-            let (pragma_cols, pragma_rows) =
-                self.shared.execute_query_raw(&pragma_sql).map_err(|e| {
-                    delightql_types::error::DelightQLError::database_error(
-                        format!(
-                            "Pipe introspection PRAGMA table_info({}) failed",
-                            table_name
-                        ),
-                        e.to_string(),
-                    )
-                })?;
-
-            // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-            let name_idx = pragma_cols.iter().position(|c| c == "name").unwrap_or(1);
-            let type_idx = pragma_cols.iter().position(|c| c == "type").unwrap_or(2);
-            let notnull_idx = pragma_cols.iter().position(|c| c == "notnull").unwrap_or(3);
-            let cid_idx = pragma_cols.iter().position(|c| c == "cid").unwrap_or(0);
-
-            let attributes: Vec<DiscoveredAttribute> = pragma_rows
-                .iter()
-                .map(|prow| {
-                    let col_name = prow.get(name_idx).cloned().unwrap_or_default();
-                    let col_type = prow.get(type_idx).cloned().unwrap_or_default();
-                    let notnull = prow
-                        .get(notnull_idx)
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
-                    let cid: i32 = prow
-                        .get(cid_idx)
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-
-                    DiscoveredAttribute {
-                        name: col_name.into(),
-                        data_type: col_type,
-                        position: cid,
-                        is_nullable: !notnull,
-                    }
-                })
-                .collect();
-
+            let columns = self.source.query_metadata(&pragma_sql).map_err(|e| {
+                delightql_types::error::DelightQLError::database_error(
+                    format!("Pipe introspection table metadata query failed for '{table_name}'"),
+                    e.to_string(),
+                )
+            })?;
+            let attributes = decode_relation_columns(&columns, &table_name).map_err(|e| {
+                delightql_types::error::DelightQLError::database_error(
+                    format!("Pipe introspection table metadata is malformed for '{table_name}'"),
+                    e.to_string(),
+                )
+            })?;
             entities.push(DiscoveredEntity {
                 name: table_name.into(),
                 entity_type_id,
                 attributes,
             });
         }
-
         Ok(entities)
     }
 }
 
-impl DatabaseIntrospector for PipeIntrospector {
+impl<S> DatabaseIntrospector for PipeIntrospector<S>
+where
+    S: PipeMetadataSource,
+{
     fn introspect_entities(&self) -> delightql_types::Result<Vec<DiscoveredEntity>> {
-        match &self.shared.profile().introspection {
+        match &self.introspection {
             IntrospectionMode::None => Ok(vec![]),
             IntrospectionMode::SingleQuery(sql) => self.introspect_single_query(sql),
             IntrospectionMode::TwoPhase {
@@ -195,6 +128,110 @@ impl DatabaseIntrospector for PipeIntrospector {
     }
 }
 
-// Safety: PipeIntrospector holds Arc<SharedCoprocess> which is Send+Sync
-unsafe impl Send for PipeIntrospector {}
-unsafe impl Sync for PipeIntrospector {}
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::error::{PipeError, Result};
+    use crate::metadata::RawPipeTable;
+
+    struct CannedMetadataSource {
+        answers: Mutex<Vec<(String, RawPipeTable)>>,
+    }
+
+    impl CannedMetadataSource {
+        fn new(answers: Vec<(&str, RawPipeTable)>) -> Self {
+            Self {
+                answers: Mutex::new(
+                    answers
+                        .into_iter()
+                        .map(|(sql, table)| (sql.to_string(), table))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    impl PipeMetadataSource for CannedMetadataSource {
+        fn query_metadata(&self, sql: &str) -> Result<RawPipeTable> {
+            let mut answers = self.answers.lock().unwrap();
+            let index = answers
+                .iter()
+                .position(|(expected, _)| expected == sql)
+                .ok_or_else(|| PipeError::QueryFailed(format!("unexpected metadata SQL: {sql}")))?;
+            Ok(answers.swap_remove(index).1)
+        }
+    }
+
+    fn raw(columns: &[&str], rows: Vec<Vec<&str>>) -> RawPipeTable {
+        RawPipeTable {
+            columns: columns.iter().map(|value| (*value).to_string()).collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(str::to_string).collect())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn canned_source_exercises_two_phase_introspection_without_a_child_process() {
+        let discovery_sql = "SELECT name FROM registry";
+        let pragma_sql = "PRAGMA table_info(users)";
+        let source = Arc::new(CannedMetadataSource::new(vec![
+            (discovery_sql, raw(&["name"], vec![vec!["users"]])),
+            (
+                pragma_sql,
+                raw(
+                    &["cid", "name", "type", "notnull"],
+                    vec![vec!["0", "id", "INTEGER", "1"]],
+                ),
+            ),
+        ]));
+        let introspector = PipeIntrospector::with_source(
+            source,
+            IntrospectionMode::TwoPhase {
+                discovery_sql: discovery_sql.to_string(),
+                has_type_column: false,
+            },
+        );
+
+        let entities = introspector.introspect_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name.as_str(), "users");
+        assert_eq!(entities[0].attributes[0].name.as_str(), "id");
+        assert_eq!(entities[0].attributes[0].position, 0);
+        assert!(!entities[0].attributes[0].is_nullable);
+    }
+
+    #[test]
+    fn canned_source_exercises_single_query_introspection_without_a_child_process() {
+        let sql = "SELECT metadata";
+        let source = Arc::new(CannedMetadataSource::new(vec![(
+            sql,
+            raw(
+                &[
+                    "table_name",
+                    "table_type",
+                    "cid",
+                    "col_name",
+                    "col_type",
+                    "notnull",
+                ],
+                vec![
+                    vec!["users", "BASE TABLE", "0", "id", "INTEGER", "1"],
+                    vec!["users", "BASE TABLE", "1", "name", "VARCHAR", "0"],
+                ],
+            ),
+        )]));
+        let introspector =
+            PipeIntrospector::with_source(source, IntrospectionMode::SingleQuery(sql.to_string()));
+
+        let entities = introspector.introspect_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_type_id, 10);
+        assert_eq!(entities[0].attributes.len(), 2);
+        assert_eq!(entities[0].attributes[1].name.as_str(), "name");
+        assert!(entities[0].attributes[1].is_nullable);
+    }
+}

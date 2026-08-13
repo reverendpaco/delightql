@@ -2,93 +2,256 @@
 // Copyright 2026 Daniel Eklund
 //! Unary operators and pipe operations
 
-use super::metadata::{GroundedPath, NamespacePath};
 use super::{
-    Addressed, BooleanExpression, ContainmentSemantic, DomainExpression, DomainSpec,
-    FunctionExpression, ModuloSpec, OrderingSpec, Refined, RenameSpec, RepositionSpec, Resolved,
+    DomainExpression, GroupSpec, NamedOutItem, OutItem, Phase, RenameSpec, TruthExpression,
     Unresolved,
 };
-use crate::{lispy::ToLispy, PhaseConvert, ToLispy};
-use serde::{Deserialize, Serialize};
+use crate::{lispy::ToLispy, ToLispy};
 
-/// DML operation kind
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-pub enum DmlKind {
-    #[lispy("dml_kind:update")]
-    Update,
-    #[lispy("dml_kind:delete")]
-    Delete,
-    #[lispy("dml_kind:insert")]
-    Insert,
-}
-
-/// A single &-separated parameter group in an HO call.
+/// A call's argument group, by the stratum the grammar gives it.
 ///
-/// Contains one or more ;-separated rows of comma-separated values.
-/// For simple calls like `ho_view(users)`, this is one group with one row of one value.
-/// For multi-row calls like `ho_view(1, "a"; 2, "b")`, this is one group with two rows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-#[lispy("ho_call_group")]
-pub struct HoCallGroup {
-    /// ;-separated rows, each being comma-separated values (as text)
-    pub rows: Vec<Vec<String>>,
+/// THE STRATA ARE DISTINCT BY TYPE: a scalar application's argument row
+/// (`f:(…)`) and a functor's first-parens group (`g(…)(…)`) admit different
+/// members, so a consumer of one cannot be handed the other. `None` is a
+/// functor form that wrote no group — an empty `ho_part` is unspellable, so
+/// the higher-order stratum is nonempty by construction.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum CallArguments<P: Phase = Unresolved> {
+    #[lispy("call_arguments:none")]
+    None,
+    #[lispy("call_arguments:scalar")]
+    Scalar(Vec<ScalarArgument<P>>),
+    #[lispy("call_arguments:higher_order")]
+    HigherOrder(HoPart<P>),
 }
 
-impl HoCallGroup {
-    /// Create a group with a single row of values.
-    pub fn single_row(values: Vec<String>) -> Self {
-        Self { rows: vec![values] }
+/// The nonempty first-parens group of a higher-order call.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("ho_part")]
+pub struct HoPart<P: Phase = Unresolved> {
+    pub members: Box<crate::pipeline::asts::vocabulary::Vec1<HoArgument<P>>>,
+    /// THE LANDING, until the resolver judges it: the member index a piped
+    /// relation was substituted at — the first formal, or the one authored
+    /// `@`. One slot, so a second source is unrepresentable rather than
+    /// counted.
+    pub landing: P::HoLanding,
+}
+
+/// One member of a higher-order argument group: a relation, or the value an
+/// identifier or ground supplies. Which relations bind relation formals and
+/// which stand in lifted scalar slots is the callee descriptor's decision at
+/// resolution, never a mark on the argument.
+///
+/// THE POSITION IS THE FORMAL. A pipe substitutes its relation into the
+/// formal that receives it — the landing hole's own index, or the formal the
+/// callee's category appoints when no hole is written — so a direct call and
+/// a piped one are indistinguishable here, and no argument carries a source
+/// role for anything to count.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum HoArgument<P: Phase = Unresolved> {
+    #[lispy("ho_argument:relation")]
+    Relation(super::Chain<P>),
+    #[lispy("ho_argument:value")]
+    Value(super::expressions::ArgumentValue<P>),
+    /// `@` — the formal that receives the piped relation. Structural
+    /// argument-row information, never a value: the invocation that reads it
+    /// substitutes its relation there, and the payload is uninhabited after
+    /// resolution, so an unspent landing cannot survive into a closed query.
+    #[lispy("ho_argument:landing")]
+    Landing(P::Placeholder),
+    /// `_` — a disregarded argument position. The callee's descriptor judges
+    /// what the position means at resolution; the mark itself binds nothing
+    /// and computes nothing.
+    #[lispy("ho_argument:skip")]
+    Skip,
+}
+
+/// One member of a scalar application's argument row.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum ScalarArgument<P: Phase = Unresolved> {
+    /// The argument's VALUE: a domain expression, or the licensed truth
+    /// crossing. DISTINCT is argument data and lives on the value, so
+    /// `%expr` cannot be manufactured outside an argument row.
+    #[lispy("scalar_argument:value")]
+    Value(super::expressions::ArgumentValue<P>),
+    /// A CALLABLE HANDED TO A FORMAL. `f:(:(@ * 2), x)` supplies a form
+    /// with an open slot, and that slot is the CALLEE's to supply where the
+    /// body applies it. An outer landing walking this call reaches the
+    /// argument and stops, because the slot beneath belongs to the callable.
+    #[lispy("scalar_argument:callable")]
+    Callable(super::expressions::Callable<P>),
+    /// An AUTHORED enumeration: `f:(t.*)`, `f:(/re/)`. It stands for the
+    /// several values it covers, so it is not one scalar and cannot be
+    /// mistaken for one. Resolution spends it — the payload is uninhabited
+    /// afterwards.
+    #[lispy("scalar_argument:spread")]
+    Spread(super::expressions::Spread<P>),
+    /// `count:(*)` — the whole operand, named rather than addressed.
+    #[lispy("scalar_argument:star")]
+    Star,
+    /// `..` — the context calling mode of a context-aware definition. An
+    /// argument-row position, never a value: instantiation consumes it, and
+    /// the payload is uninhabited after resolution, so a marker cannot be
+    /// manufactured outside an argument row or survive into a closed query.
+    #[lispy("scalar_argument:context")]
+    Context(P::ContextMarker),
+}
+
+impl<P: Phase> HoArgument<P> {
+    /// The DOMAIN value this argument supplies. A relation, a crossed
+    /// truth, or a structural mark answers `None`.
+    pub fn scalar_domain(&self) -> Option<&super::DomainExpression<P>> {
+        match self {
+            Self::Value(value) => value.domain(),
+            Self::Relation(_) | Self::Landing(_) | Self::Skip => None,
+        }
     }
 
-    /// Flatten to a single flat list of values (for legacy single-row, single-value groups).
-    pub fn flat_values(&self) -> Vec<&str> {
-        self.rows
-            .iter()
-            .flat_map(|row| row.iter().map(|s| s.as_str()))
-            .collect()
+    pub fn scalar_domain_mut(&mut self) -> Option<&mut super::DomainExpression<P>> {
+        match self {
+            Self::Value(value) => value.domain_mut(),
+            Self::Relation(_) | Self::Landing(_) | Self::Skip => None,
+        }
     }
 
-    /// Returns true if this is a single value (one row, one column).
-    pub fn is_single_value(&self) -> bool {
-        self.rows.len() == 1 && self.rows[0].len() == 1
+    pub fn relation(&self) -> Option<&super::Chain<P>> {
+        match self {
+            Self::Relation(relation) => Some(relation),
+            Self::Value(_) | Self::Landing(_) | Self::Skip => None,
+        }
     }
 
-    /// Get the single value if this is a single-value group.
-    pub fn as_single_value(&self) -> Option<&str> {
-        if self.is_single_value() {
-            Some(&self.rows[0][0])
-        } else {
-            None
+    pub fn relation_mut(&mut self) -> Option<&mut super::Chain<P>> {
+        match self {
+            Self::Relation(relation) => Some(relation),
+            Self::Value(_) | Self::Landing(_) | Self::Skip => None,
+        }
+    }
+
+    pub fn into_relation(self) -> Option<super::Chain<P>> {
+        match self {
+            Self::Relation(relation) => Some(relation),
+            Self::Value(_) | Self::Landing(_) | Self::Skip => None,
         }
     }
 }
 
-/// A single argument in an HO view invocation.
-///
-/// Each position in the first-parens of `ho_view(arg1, arg2)(output)` is either:
-/// - A table argument: `users(*)`, `users(, age < 30)`, `users(|> (a, b))`
-/// - A scalar argument: `"active"`, `42`, or a domain expression
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum HoArgument<Phase = Unresolved> {
-    /// Table argument — a full relational expression (may include interior filters, projections, pipes)
-    #[lispy("ho_argument:table")]
-    Table(super::RelationalExpression<Phase>),
-    /// Scalar argument — a domain expression (literal, lvar, function call, etc.)
-    #[lispy("ho_argument:scalar")]
-    Scalar(super::DomainExpression<Phase>),
+impl<P: Phase> ScalarArgument<P> {
+    /// An undecorated value argument — the ordinary road for a compiler-built
+    /// or normalized scalar.
+    pub fn plain(value: super::DomainExpression<P>) -> Self {
+        Self::Value(super::expressions::ArgumentValue::plain(value))
+    }
+
+    /// The DOMAIN value this argument supplies. A crossed truth, callable,
+    /// spread, star or context marker answers `None`.
+    pub fn scalar_domain(&self) -> Option<&super::DomainExpression<P>> {
+        match self {
+            Self::Value(value) => value.domain(),
+            Self::Callable(_) | Self::Spread(_) | Self::Star | Self::Context(_) => None,
+        }
+    }
+
+    pub fn scalar_domain_mut(&mut self) -> Option<&mut super::DomainExpression<P>> {
+        match self {
+            Self::Value(value) => value.domain_mut(),
+            Self::Callable(_) | Self::Spread(_) | Self::Star | Self::Context(_) => None,
+        }
+    }
+}
+
+impl<P: Phase> CallArguments<P> {
+    /// A higher-order group from the members a builder collected: nonempty
+    /// members make the group, and none make `None` — an empty `ho_part` is
+    /// unspellable, so nothing can construct one here either.
+    pub fn higher_order(members: Vec<HoArgument<P>>) -> Self {
+        match crate::pipeline::asts::vocabulary::Vec1::try_from_vec(members) {
+            Some(part) => Self::HigherOrder(HoPart {
+                members: Box::new(part),
+                landing: P::HoLanding::default(),
+            }),
+            None => Self::None,
+        }
+    }
+
+    /// Whether the call was handed no argument at all. A higher-order
+    /// group is nonempty by construction, so only `None` and an empty
+    /// scalar row answer yes.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Scalar(members) => members.is_empty(),
+            Self::HigherOrder(_) => false,
+        }
+    }
+
+    /// The higher-order group, when the call has one.
+    pub fn ho(&self) -> Option<&HoPart<P>> {
+        match self {
+            Self::HigherOrder(part) => Some(part),
+            Self::None | Self::Scalar(_) => None,
+        }
+    }
+
+    pub fn ho_mut(&mut self) -> Option<&mut HoPart<P>> {
+        match self {
+            Self::HigherOrder(part) => Some(part),
+            Self::None | Self::Scalar(_) => None,
+        }
+    }
+
+    /// The higher-order stratum's members, in argument order; empty when the
+    /// call has no such group.
+    pub fn ho_members(&self) -> impl Iterator<Item = &HoArgument<P>> {
+        self.ho().into_iter().flat_map(|part| part.members.iter())
+    }
+
+    pub fn ho_members_mut(&mut self) -> impl Iterator<Item = &mut HoArgument<P>> {
+        self.ho_mut()
+            .into_iter()
+            .flat_map(|part| part.members.iter_mut())
+    }
+
+    /// The relations the higher-order group supplies, in argument order.
+    pub fn relations(&self) -> impl Iterator<Item = &super::Chain<P>> {
+        self.ho_members().filter_map(HoArgument::relation)
+    }
+
+    /// Every VALUE the argument group supplies, in order: the scalar row's
+    /// domain values, or the higher-order group's identifier and ground
+    /// values. Relations, crossings, callables and enumerations are not
+    /// values and do not appear.
+    pub fn value_domains(&self) -> impl Iterator<Item = &super::DomainExpression<P>> {
+        self.ho_members()
+            .filter_map(HoArgument::scalar_domain)
+            .chain(
+                self.scalar_members()
+                    .iter()
+                    .filter_map(ScalarArgument::scalar_domain),
+            )
+    }
+
+    /// The scalar stratum's members; empty when the call is not a scalar
+    /// application.
+    pub fn scalar_members(&self) -> &[ScalarArgument<P>] {
+        match self {
+            Self::Scalar(members) => members.as_slice(),
+            Self::None | Self::HigherOrder(_) => &[],
+        }
+    }
 }
 
 /// Window frame specification for window functions
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("window_frame")]
-pub struct WindowFrame<Phase = Unresolved> {
+pub struct WindowFrame<P: Phase = Unresolved> {
     pub mode: FrameMode,
-    pub start: FrameBound<Phase>,
-    pub end: FrameBound<Phase>,
+    pub start: FrameBound<P>,
+    pub end: FrameBound<P>,
 }
 
 /// Frame mode for window functions
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum FrameMode {
     #[lispy("frame_mode:groups")]
     Groups,
@@ -99,48 +262,20 @@ pub enum FrameMode {
 }
 
 /// Frame bound for window functions
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum FrameBound<Phase = Unresolved> {
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum FrameBound<P: Phase = Unresolved> {
     #[lispy("frame_bound:unbounded")]
     Unbounded,
     #[lispy("frame_bound:current_row")]
     CurrentRow,
     #[lispy("frame_bound:preceding")]
-    Preceding(Box<DomainExpression<Phase>>),
+    Preceding(Box<DomainExpression<P>>),
     #[lispy("frame_bound:following")]
-    Following(Box<DomainExpression<Phase>>),
-}
-
-/// Column selector for map operations - supports various selection patterns
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum ColumnSelector<Phase = Unresolved> {
-    /// Explicit columns: (col1, col2)
-    #[lispy("column_selector:explicit")]
-    Explicit(Vec<DomainExpression<Phase>>),
-    /// Regex pattern: (/pattern/) - only in Unresolved phase
-    #[lispy("column_selector:regex")]
-    #[phase_convert(unreachable)]
-    Regex(String),
-    /// All columns: (*)
-    #[lispy("column_selector:all")]
-    All,
-    /// Positional range: (|2:5|)
-    #[lispy("column_selector:positional")]
-    Positional { start: usize, end: usize },
-    /// Multiple regex patterns: (/pattern1/, /pattern2/) - only in Unresolved phase
-    #[lispy("column_selector:multi_regex")]
-    #[phase_convert(unreachable)]
-    MultipleRegex(Vec<String>),
-    /// Resolved columns: final list of column names after resolution
-    #[lispy("column_selector:resolved")]
-    Resolved {
-        columns: Vec<String>,
-        original_selector: Box<ColumnSelector<Unresolved>>,
-    },
+    Following(Box<DomainExpression<P>>),
 }
 
 /// Column alias for embed map cover operations
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum ColumnAlias {
     /// Literal alias: "foo"
     #[lispy("column_alias:literal")]
@@ -151,14 +286,14 @@ pub enum ColumnAlias {
 }
 
 /// Column name template containing @ placeholders
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 pub struct ColumnNameTemplate {
     /// Template string containing {@} placeholders
     pub template: String,
 }
 
 // Re-cored from refined.rs
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum JoinType {
     /// Regular inner join (comma without markers)
     Inner,
@@ -170,211 +305,115 @@ pub enum JoinType {
     FullOuter,
 }
 
-/// Operations applied through pipes
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum UnaryRelationalOperator<Phase = Unresolved> {
-    /// General projection/selection: [...] or (...)
-    #[lispy("unary_relational_operator:general")]
-    General {
-        containment_semantic: ContainmentSemantic,
-        expressions: Vec<DomainExpression<Phase>>,
-    },
-    /// Modulo (distinct/group): %(...)
-    #[lispy("unary_relational_operator:modulo")]
-    Modulo {
-        containment_semantic: ContainmentSemantic,
-        spec: ModuloSpec<Phase>,
-    },
-    /// Tuple ordering: #(...) or #[...]
-    #[lispy("unary_relational_operator:tuple_ordering")]
-    TupleOrdering {
-        containment_semantic: ContainmentSemantic,
-        specs: Vec<OrderingSpec<Phase>>,
-    },
-    /// Map cover: $(f:(...))(...) or $(f:(...))[...]
-    #[lispy("unary_relational_operator:map_cover")]
-    MapCover {
-        function: FunctionExpression<Phase>,
-        columns: Vec<DomainExpression<Phase>>,
-        containment_semantic: ContainmentSemantic,
-        conditioned_on: Option<Box<BooleanExpression<Phase>>>,
-    },
-    /// Project out: -(...)
-    #[lispy("unary_relational_operator:project_out")]
-    ProjectOut {
-        containment_semantic: ContainmentSemantic,
-        expressions: Vec<DomainExpression<Phase>>,
-    },
-    /// Rename cover: *(...)
-    #[lispy("unary_relational_operator:rename_cover")]
-    RenameCover { specs: Vec<RenameSpec<Phase>> },
-    /// Transform: $$(...) - many-to-many column transformations
-    #[lispy("unary_relational_operator:transform")]
+/// THE SEMANTIC PIPE-OPERATOR PRODUCTION: what an anonymous `|>` step can
+/// be. The normalizer knows which spelling it read and constructs that
+/// exact member; no classifier recovers one from another later. Chain
+/// structure — ordering, bounds, access, witnesses, drills, narrowing,
+/// stage naming — is `Continuation`'s, not a member here.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum PipeOp<P: Phase = Unresolved> {
+    /// `( … )` — projection: the heading is what the items publish, and
+    /// nothing else.
+    #[lispy("pipe_op:project")]
+    Project(crate::pipeline::asts::vocabulary::Vec1<OutItem<P>>),
+    /// `+( … )` — embed: EXTENSION rather than replacement. The items are
+    /// the ADDED columns only; the operand's whole heading rides in front
+    /// of them, supplied by the one shared projection algorithm rather
+    /// than a synthesized leading glob a consumer could mistake for
+    /// authored.
+    #[lispy("pipe_op:embed")]
+    Embed(crate::pipeline::asts::vocabulary::Vec1<OutItem<P>>),
+    /// `%( … )` — group: distinct or reduce, the spec says which.
+    #[lispy("pipe_op:group")]
+    Group(GroupSpec<P>),
+    /// `$(f:(...))(...)` — map cover.
+    #[lispy("pipe_op:map_cover")]
+    MapCover(MapCover<P>),
+    /// `-( … )` — project out. The payload admits what the GRAMMAR admits
+    /// (selector items, including regex and glob spreads) while SEMANTICS
+    /// writes `'-(' reference+ ')'`; which one governs is the owner's
+    /// pending call, so the wider carrier is kept and no site narrows it.
+    #[lispy("pipe_op:project_out")]
+    ProjectOut(Vec<super::expressions::SelectorItem<P>>),
+    /// `*( … )` — rename cover.
+    #[lispy("pipe_op:rename")]
+    Rename(crate::pipeline::asts::vocabulary::Vec1<RenameSpec<P>>),
+    /// `$$( … )` — transform: many-to-many column redefinition.
+    #[lispy("pipe_op:transform")]
     Transform {
-        transformations: Vec<(DomainExpression<Phase>, String, Option<String>)>, // (expression, alias, qualifier)
-        conditioned_on: Option<Box<BooleanExpression<Phase>>>,
+        /// Every item names the slot it writes, by type. The grammar
+        /// refuses `$$()`, and the carrier says it too.
+        items: crate::pipeline::asts::vocabulary::Vec1<NamedOutItem<P>>,
+        guard: Option<Box<TruthExpression<P>>>,
     },
-    /// Aggregate pipe: |~>
-    #[lispy("unary_relational_operator:aggregate_pipe")]
-    AggregatePipe {
-        aggregations: Vec<DomainExpression<Phase>>,
-    },
-    /// Reposition: |column as position| - move columns to specific positions
-    #[lispy("unary_relational_operator:reposition")]
-    Reposition { moves: Vec<RepositionSpec<Phase>> },
-    /// Combined embed + map cover: +$(f)(...) - transform and add columns
-    #[lispy("unary_relational_operator:embed_map_cover")]
-    EmbedMapCover {
-        function: FunctionExpression<Phase>,
-        selector: ColumnSelector<Phase>,
-        alias_template: Option<ColumnAlias>,
-        containment_semantic: ContainmentSemantic,
-    },
-    /// Piped higher-order view application: source |> ho_view(cols) or source |> ho_view(args)(cols)
-    ///
-    /// Unresolved-only: the pipe handler inlines this into the expanded HO view body
-    /// before resolution. It never appears in Resolved or Refined phase. Rust cannot
-    /// express phase-conditional enum variants, so downstream match sites pay the
-    /// exhaustive-match tax with unreachable!() arms.
-    #[lispy("unary_relational_operator:ho_view_application")]
-    #[phase_convert(unreachable)]
-    HoViewApplication {
-        function: String,
-        arguments: Vec<HoCallGroup>,
-        /// First-parens as parsed AST (for PatternResolver unification).
-        first_parens_spec: Option<DomainSpec<Phase>>,
-        domain_spec: DomainSpec<Phase>,
-        namespace: Option<NamespacePath>,
-        /// Full `data^library` qualification for a grounded invocation. It is
-        /// semantically distinct from an ordinary namespace and must survive
-        /// the surface-to-AST boundary intact.
-        #[serde(default)]
-        grounding: Option<GroundedPath>,
-    },
-    /// Meta-ize: ^ - reifies relation schema as queryable data
-    /// with the fixed heading (scope, column_name, ordinal).
-    ///
-    /// `^^` is not a distinct operator: the builder lowers it as two
-    /// stacked applications of this one (the shape of the shape). A
-    /// detailed variant carrying declared types/nullability is a
-    /// tempting regression: meta-ize is shape-only, and declaration
-    /// echoes misreport derived columns.
-    /// Compile-time only: resolved during schema synthesis, produces virtual relation.
-    #[lispy("unary_relational_operator:meta_ize")]
-    MetaIze,
-    /// Witness: + or \+ — reifies existence as 1-row, 1-column relation
-    ///
-    /// ExistsWitness (`+`): SELECT EXISTS(SELECT 1 FROM source) AS "met"
-    /// DoesNotExistWitness (`\+`): SELECT NOT EXISTS(SELECT 1 FROM source) AS "met"
-    /// Always produces exactly 1 row. Column `met` = 1 (condition met) or 0 (not met).
-    #[lispy("unary_relational_operator:witness")]
-    Witness {
-        /// True for `+` (ExistsWitness), false for `\+` (DoesNotExistWitness)
-        exists: bool,
-    },
-    /// Signed witness: postfix `+-` (EFFECT-ALGEBRA §3;
-    /// book/reference/dql/witness.md). Keeps the relation's schema and adds
-    /// `met` = 1/0 — a total-ledger arm contributes a full-schema row fired
-    /// or not (a NO arm contributes one all-NULL proxy row with met = 0).
-    ///
-    /// A plain-pipeline citizen: resolved by `resolve_signed_witness`
-    /// (schema = source + `met` appended LAST), lowered as the one-row-unit
-    /// LEFT-JOIN wrap by `r_lower_signed_witness` (transformer_v4) and, in
-    /// effect-body value position, by `witness_wrap` (effect_transformer).
-    /// Pinned by the effects ball's compose--65/70…76.
-    #[lispy("unary_relational_operator:signed_witness")]
-    SignedWitness,
-    /// Qualify: * - marks all columns as qualified (table-prefixed)
-    ///
-    /// Qualified columns don't unify implicitly with same-named columns from other tables.
-    /// This is the opposite of empty parens `()` which introduces unqualified names.
-    #[lispy("unary_relational_operator:qualify")]
-    Qualify,
-    /// Using: .(cols) - USING semantics (leftward search, unify, dedupe)
-    ///
-    /// Replaces *{cols} syntax. Performs:
-    /// 1. Leftward search: find rightmost column matching each name in accumulated result
-    /// 2. Unification: create join condition
-    /// 3. Deduplication: remove one copy of unified column (USING semantics, not ON)
-    #[lispy("unary_relational_operator:using")]
-    Using { columns: Vec<String> },
-    /// Using all shared columns: .* - USING all columns shared between left and right
-    ///
-    /// Resolved at join time by computing the column-name intersection.
-    /// After resolution, expanded into explicit GlobWithUsing/Using.
-    #[lispy("unary_relational_operator:using_all")]
-    UsingAll,
-    /// DML terminal: update!(table)(*), delete!(table)(*), insert!(table)(*)
-    ///
-    /// The final pipe operator in a DML pipeline. Converts the upstream query
-    /// into a SQL DML statement (DELETE, UPDATE, INSERT INTO ... SELECT).
-    #[lispy("unary_relational_operator:dml_terminal")]
-    DmlTerminal {
-        kind: DmlKind,
-        target: String,
-        target_namespace: Option<String>,
-        domain_spec: DomainSpec<Phase>,
-    },
-    /// Interior drill-down: .column_name(*) or .column_name(col1, col2)
-    ///
-    /// Explodes an interior relation (tree group) column into rows.
-    /// Context columns are carried forward (lateral-join semantics).
-    /// The interior_schema is None in the unresolved phase, populated by the resolver.
-    /// Groundings: pairs of (schema_column_name, literal_value) for positional
-    /// literal grounding — generates WHERE json_extract(value, '$.col') = 'val'.
-    #[lispy("unary_relational_operator:interior_drill_down")]
-    InteriorDrillDown {
-        column: String,
-        glob: bool,
-        columns: Vec<String>,
-        interior_schema: Option<Vec<InteriorColumnDef>>,
-        #[serde(default)]
-        groundings: Vec<(String, String)>,
-    },
-    /// Narrowing destructure: .column_name{.field1, .field2}
-    ///
-    /// Iterates a JSON array column via json_each, extracts named fields
-    /// from each element via json_extract. No context carry-forward --
-    /// the output schema contains only the named fields.
-    #[lispy("unary_relational_operator:narrowing_destructure")]
-    NarrowingDestructure { column: String, fields: Vec<String> },
-    /// Directive pipe terminal: source |> directive!(args)
-    ///
-    /// Phase 1.X only — consumed by effect executor before resolution.
-    /// The source directive produces rows; this terminal executes per-row.
-    #[lispy("unary_relational_operator:directive_terminal")]
-    #[phase_convert(unreachable)]
-    DirectiveTerminal {
-        /// Directive name (includes `!` suffix, e.g., "enlist!")
-        name: String,
-        /// Arguments from the call site. A glob (*) means "bind all upstream columns."
-        arguments: Vec<DomainExpression<Phase>>,
-    },
-    /// Two-paren directive invocation in pipe-terminal position with a
-    /// relational higher-order argument: `source |> name!(Rel(*))(spec)`
-    /// (EFFECT-ALGEBRA §1: first parens = parameters, trailing parens =
-    /// access/reshape of the return table). Distinct from `DmlTerminal`
-    /// (insert!/update!/delete! keep their dedicated machinery) and from
-    /// `DirectiveTerminal` (the one-paren pipe form).
-    ///
-    /// Unresolved-only: the effect transformer consumes it.
-    #[lispy("unary_relational_operator:directive_pipe_invocation")]
-    #[phase_convert(unreachable)]
-    DirectivePipeInvocation {
-        /// Directive name (includes `!` suffix, e.g., "returning_other!")
-        name: String,
-        /// The relational HO argument written in the first parens.
-        argument: Box<super::RelationalExpression<Phase>>,
-        /// The trailing access-parens spec over the return table.
-        domain_spec: DomainSpec<Phase>,
-    },
+    /// `+$(f)(...)` — combined embed + map cover.
+    #[lispy("pipe_op:embed_map_cover")]
+    EmbedMapCover(EmbedMapCover<P>),
 }
 
-/// Definition of a column within an interior relation (tree group).
-/// Used by InteriorDrillDown to know the schema of the interior relation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-#[lispy("interior_column_def")]
-pub struct InteriorColumnDef {
-    pub name: String,
-    pub child_interior: Option<Vec<InteriorColumnDef>>,
+/// The map cover's payload: the callable as AUTHORED, the columns it
+/// covers, the guard that conditions the cover — and, once resolution has
+/// applied the callable per covered cell, the applied cells themselves.
+/// The callable is spent by that application, so a bound cover carries
+/// cells and no callable at all.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("map_cover")]
+pub struct MapCover<P: Phase = Unresolved> {
+    pub callable: P::CoverCallable,
+    pub selector: Vec<super::expressions::SelectorItem<P>>,
+    pub guard: Option<Box<TruthExpression<P>>>,
+    /// One applied expression per covered cell — empty before resolution.
+    pub cells: Vec<AppliedCell<P>>,
+}
+
+/// The embed-map-cover's payload: the callable as AUTHORED, the naming
+/// template for the added columns, and the columns it covers. As with the
+/// map cover, resolution applies the callable per cell and spends it.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("embed_map_cover")]
+pub struct EmbedMapCover<P: Phase = Unresolved> {
+    pub callable: P::CoverCallable,
+    pub naming: Option<ColumnAlias>,
+    pub selector: Vec<super::expressions::SelectorItem<P>>,
+    /// One applied expression per covered cell — empty before resolution.
+    pub cells: Vec<AppliedCell<P>>,
+}
+
+/// ONE COVERED CELL, applied: the occurrence the cover selected and the
+/// closed expression the application produced for it. The open leaf was
+/// spent producing `expr`, which is why this carrier exists — a closed
+/// phase holds the application's RESULT, never its unapplied body.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("applied_cell")]
+pub struct AppliedCell<P: Phase = Unresolved> {
+    pub column: crate::names::ColId,
+    pub expr: DomainExpression<P>,
+}
+
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("resolved_interior_grounding")]
+pub struct ResolvedInteriorGrounding {
+    pub column: crate::names::ColId,
+    pub value: String,
+}
+
+/// The drill as AUTHORED: the interior column and selections by name,
+/// groundings as literal pairs.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("authored_drill")]
+pub struct AuthoredDrill {
+    pub column: String,
+    pub glob: bool,
+    pub columns: Vec<String>,
+    pub groundings: Vec<(String, String)>,
+}
+
+/// The drill, BOUND: the interior column and selections as occurrences.
+/// The glob is spent at binding — what remains is what it selected.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("bound_drill")]
+pub struct BoundDrill {
+    pub column: crate::names::ColId,
+    pub columns: Vec<crate::names::ColId>,
+    pub groundings: Vec<ResolvedInteriorGrounding>,
 }

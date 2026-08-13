@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! DelightQL self-diagnostics — see DIAGNOSTICS-DESIGN.md.
+//! DelightQL self-diagnostics.
 //!
 //! One provider ships today (`autoloads`), but the finding shape is the
 //! design's `DiagnosticFinding` so that `doctor`, `adapters`, `catalog`,
@@ -58,7 +58,7 @@ pub struct DiagnosticFinding {
 /// the real loader and report each [`StdlibLoad::Failed`] as an `Error`.
 /// Stronger than the build-time parse test — it exercises consult too, so a
 /// module that parses but fails to register is caught here.
-pub fn run_autoloads(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
+pub(crate) fn run_autoloads(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
     let mut findings = Vec::new();
     for (ns, _src) in crate::stdlib_manifest::STDLIB_MODULES {
         if let StdlibLoad::Failed { phase, error } = system.ensure_stdlib_loaded(ns) {
@@ -98,7 +98,7 @@ pub fn run_autoloads(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
 /// fallback. Doctrine: everything the compiler/runtime uses is dogfood-
 /// exposed — no intentional hidden internals. An un-activated system table
 /// is reported as a `Warn` (it is still queryable, just un-namespaced).
-pub fn run_catalog(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
+pub(crate) fn run_catalog(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
     let conn_arc = system.get_bootstrap_connection();
     let conn = match conn_arc.lock() {
         Ok(c) => c,
@@ -118,7 +118,7 @@ pub fn run_catalog(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
         let mut stmt = match conn.prepare(
             // DISTINCT: a table name with two un-activated entity rows is
             // one orphan, not two (guards the name-dedup false positive
-            // SYS-NAMESPACE-TAXONOMY.md flags in the naive check).
+            // a naive check flags).
             "SELECT DISTINCT e.name FROM entity e
              JOIN entity_type_enum t ON e.type = t.id
              WHERE t.variant = 'DBPermanentTable'
@@ -165,7 +165,7 @@ pub fn run_catalog(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
 
 /// Run every diagnostic provider. Today: `autoloads`, `catalog`. Future
 /// providers (`adapters`, `identity`, `connectivity`) append here.
-pub fn run_selftest(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
+pub(crate) fn run_selftest(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
     let mut findings = Vec::new();
     findings.extend(run_autoloads(system));
     findings.extend(run_catalog(system));

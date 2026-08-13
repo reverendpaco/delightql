@@ -6,9 +6,9 @@
 //! property — the object must survive the process that created it and be
 //! visible to a second `dql` invocation reopening the same `--db` FILE. A
 //! ball runs inside one session; it structurally cannot observe what the
-//! file holds after exit (REPORT-3R-FIX-BATCH discovery 1: `table!`
-//! answered success while the file held nothing — the CTAS landed in the
-//! ephemeral `:memory:` primary, not the mounted file). The cross-kind
+//! file holds after exit, so a ball cannot catch a `table!` that answers
+//! success while the CTAS lands in the ephemeral `:memory:` primary rather
+//! than the mounted file. The cross-kind
 //! tests need the SESSION CATALOG between two plans on one session
 //! (`--sequential`), which run-one ball statements also exercise; the
 //! raw engine error ("use DROP TABLE to delete table …") is only
@@ -85,10 +85,13 @@ fn table_bang_persists_to_the_db_file_across_sessions() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         db_str,
-        "orders(*), region = \"EU\" |> table!(archived)",
+        "orders(*), region = \"EU\" |> table!(archived(*))(*)",
         false,
     );
-    assert!(ok, "table! should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        ok,
+        "table! should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("table!"),
         "expected a table! receipt.\nstdout:\n{stdout}"
@@ -107,7 +110,7 @@ fn table_bang_persists_to_the_db_file_across_sessions() {
         assert_eq!(
             n, 1,
             "the db FILE must hold 'archived' after exit (durable placement, \
-             materialize-pipe §2/§3) — the pre-fix binary left it in the \
+             materialize-pipe §2/§3) — placing it in the \
              ephemeral :memory: primary"
         );
         let rows: i64 = conn
@@ -141,8 +144,8 @@ fn temp_view_over_temp_table_replaces_the_table() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         db.to_str().unwrap(),
-        "orders(*) |> temp_table!(sw)\n\n\
-         orders(*), region = \"EU\" |> temp_view!(sw)\n\n\
+        "orders(*) |> temp_table!(sw(*))(*)\n\n\
+         orders(*), region = \"EU\" |> temp_view!(sw(*))(*)\n\n\
          sw(*)",
         true,
     );
@@ -166,8 +169,8 @@ fn temp_table_over_temp_view_replaces_the_view() {
     let (ok, stdout, stderr) = run_dql(
         dir.path(),
         db.to_str().unwrap(),
-        "orders(*) |> temp_view!(sw)\n\n\
-         orders(*), region = \"US\" |> temp_table!(sw)\n\n\
+        "orders(*) |> temp_view!(sw(*))(*)\n\n\
+         orders(*), region = \"US\" |> temp_table!(sw(*))(*)\n\n\
          sw(*)",
         true,
     );

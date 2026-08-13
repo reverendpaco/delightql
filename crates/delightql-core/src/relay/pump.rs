@@ -8,7 +8,7 @@
 //! handle_query → the pump"). It is a NEW path: nothing routes plain
 //! queries through it (pinned at corpus scale — the full suite is
 //! outcome-identical with the pump present). Its production callers are the
-//! Epic-3.3 entry points (`relay/entry.rs`: `run!` / `run_namespace!` /
+//! effect-chain entry points (`relay/entry.rs`: `run!` / `run_namespace!` /
 //! query-position directives); also exercised by `relay/pump_tests.rs` over
 //! hand-constructed plans.
 //!
@@ -19,14 +19,13 @@
 //! (`RelayHooks::on_ship`), the same machinery emit streams already ride.
 //! No wire-protocol change.
 
-use delightql_protocol::{ErrorKind, QueryResponse, ServerTerm, Transport};
+use delightql_protocol::{Cell, ErrorKind, QueryResponse, ServerTerm, Transport};
 
 use super::{EagerBuffer, RelayParty};
 use crate::pipeline::{
     compiled_query::{CompiledPlan, PlanEntry},
     verdict,
 };
-
 
 /// An engine-side execution failure: compilation succeeded and the
 /// database refused the SQL (or a transaction statement) at run time.
@@ -87,7 +86,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// - Assertions abort the run on failure exactly as `handle_query` does
     ///   today — same verdict hooks, same error identity and message shape
     ///   (`assertion_failure_mid_plan_aborts_and_rolls_back`).
-    /// - Shipped result sets, per the Epic-3 protocol ruling: non-final
+    /// - Shipped result sets: non-final
     ///   `ShippedStatement`s deliver live through `on_ship` in execution
     ///   order; the FINAL one is the run's return value. It streams through
     ///   `sql_session` (today's primary-SQL path) when it is the plan's
@@ -100,7 +99,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     ///   the exit flag — answers with the empty header
     ///   (`plan_with_no_shipped_entry_returns_empty_header`).
     pub fn handle_plan(&mut self, plan: &CompiledPlan) -> ServerTerm {
-        // THE ONE TYPED PROGRAM (review finding 3): a typed plan is walked
+        // THE ONE TYPED PROGRAM: a typed plan is walked
         // directly — setup, control, effect, return, and cleanup are all
         // steps, so the D5 trace covers control failures too. The flat
         // entry list is only ever a projection; the pump never
@@ -146,8 +145,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// action when any edge is closed; execute the action otherwise.
     /// exit! is an ordinary Absent edge on later body steps (Q-D7); ONE
     /// pre-COMMIT latch read decides whether the Cleanup step runs
-    /// (graceful exit: brackets always run, exit-taken residue is
-    /// drop_plan_scratch's job). The run's return value is the LAST ship
+    /// (graceful exit: brackets always run; a later run replaces any
+    /// skipped-cleanup residue before recreating its shell). The run's return value is the LAST ship
     /// across all steps — the Return step's when present, else the
     /// body-ending stdout ship (body_ending_in_stdout_ships_once) — and
     /// is always buffered eagerly (COMMIT follows every ship by
@@ -163,14 +162,11 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         let mut open_bracket: Option<Option<i64>> = None;
         let mut final_response: Option<ServerTerm> = None;
         let mut exited = false;
-        let last_ship = typed
-            .steps
-            .iter()
-            .rposition(|s| s.action.ship().is_some());
+        let last_ship = typed.steps.iter().rposition(|s| s.action.ship().is_some());
 
         for (idx, step) in typed.steps.iter().enumerate() {
             // "Brackets ALWAYS run" is enforced HERE, not merely by the
-            // builder's discipline (review round 3): a Begin/Commit step
+            // builder's discipline: a Begin/Commit step
             // never samples edges, so no construction can gate the
             // bracket closed and strand an open transaction.
             let bracket = matches!(
@@ -185,10 +181,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         continue;
                     }
                     Err(msg) => {
-                        // Review finding 3 (attribution): a guard-sampling
-                        // failure IS the step's failure — never "pending".
-                        trace[idx] =
-                            Some(("error", Some(format!("guard sampling failed: {msg}"))));
+                        // Attribution: a guard-sampling failure IS the
+                        // step's failure — never "pending".
+                        trace[idx] = Some(("error", Some(format!("guard sampling failed: {msg}"))));
                         self.rollback_open_bracket(&mut open_bracket);
                         return connection_error(msg);
                     }
@@ -211,8 +206,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     // ON COMMIT DROP shells vanish at COMMIT — so this is
                     // the one moment the tail decision can be read.
                     if !exited {
-                        if let Some(table) = plan.exit_table.as_deref() {
-                            exited = self.exit_flag_set(table, *connection_id);
+                        if let Some(sql) = plan.exit_probe_sql.as_deref() {
+                            exited = self.exit_flag_set(sql, *connection_id);
                         }
                     }
                     match self.execute_sql_routed("COMMIT", *connection_id) {
@@ -223,17 +218,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         }
                     }
                 }
-                // Phase 10 slice b: annotation steps in the typed program —
+                // Annotation steps in the typed program —
                 // the same verdict/abort and notify-never-abort contracts
                 // as the untyped entries (play_entries below).
-                EffectAction::Assertion { statement, .. } => {
+                EffectAction::Assertion {
+                    statement, refusal, ..
+                } => {
                     match self.execute_sql_routed(&statement.sql, statement.connection_id) {
                         Ok((_cols, rows)) => {
-                            let passed = rows
-                                .first()
-                                .and_then(|row| row.first())
-                                .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
-                                .unwrap_or(false);
+                            let passed = super::cell_says_yes(rows.first());
                             if let Some(ref mut hook) = self.hooks.on_verdict {
                                 let v = verdict::Verdict {
                                     outcome: if passed {
@@ -242,34 +235,37 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                         verdict::VerdictOutcome::Fail
                                     },
                                     identity: verdict::VerdictIdentity {
-                                        _name: None,
-                                        _source_location: None,
+                                        name: None,
                                         body_text: statement.sql.clone(),
                                     },
                                     detail: if passed {
                                         None
                                     } else {
-                                        Some(format!(
-                                            "Assertion failed\n  SQL: {}",
-                                            statement.sql
-                                        ))
+                                        Some(format!("Assertion failed\n  SQL: {}", statement.sql))
                                     },
-                                    _intent: None,
                                 };
                                 hook(&v);
                             }
                             if !passed {
-                                trace[idx] =
-                                    Some(("error", Some("assertion failed".to_string())));
+                                // A compiler-written check reports the
+                                // refusal it stands for; a program's own
+                                // assertion reports an assertion failure.
+                                let (identity, message) = match refusal {
+                                    Some(refusal) => (
+                                        format!("delightql-error://{}", refusal.identity),
+                                        refusal.message.clone(),
+                                    ),
+                                    None => (
+                                        "delightql-error://runtime/assertion".to_string(),
+                                        format!("Assertion failed\n  SQL: {}", statement.sql),
+                                    ),
+                                };
+                                trace[idx] = Some(("error", Some(message.clone())));
                                 self.rollback_open_bracket(&mut open_bracket);
                                 return ServerTerm::Error {
                                     kind: ErrorKind::Permission,
-                                    identity: b"delightql-error://runtime/assertion".to_vec(),
-                                    message: format!(
-                                        "Assertion failed\n  SQL: {}",
-                                        statement.sql
-                                    )
-                                    .into_bytes(),
+                                    identity: identity.into_bytes(),
+                                    message: message.into_bytes(),
                                 };
                             }
                         }
@@ -284,10 +280,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     if exited {
                         trace[idx] = Some((
                             "skipped",
-                            Some(
-                                "exit! taken: cleanup residue is drop_plan_scratch's job"
-                                    .to_string(),
-                            ),
+                            Some("exit! taken: the next shell create replaces residue".to_string()),
                         ));
                         continue;
                     }
@@ -309,8 +302,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         match self.execute_sql_routed(&ship.sql, ship.connection_id) {
                             Ok((columns, rows)) => {
                                 if Some(idx) == last_ship {
-                                    final_response =
-                                        Some(self.eager_header(&columns, &rows));
+                                    final_response = Some(self.eager_header(&columns, rows));
                                 } else if let Some(ref mut hook) = self.hooks.on_ship {
                                     hook(&columns, &rows);
                                 }
@@ -326,7 +318,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             trace[idx] = Some(("done", None));
         }
 
-        // F5 (Phase 6 slice 6): the receipt binder reads whether this
+        // F5: the receipt binder reads whether this
         // run answered NO — the exit! latch decides the EMPTY receipt.
         self.last_run_exited = exited;
         final_response.unwrap_or_else(|| self.empty_header_response())
@@ -392,9 +384,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 return connection_error(msg);
                             }
                         }
-                    } else if idx + 1 == plan.entries.len()
-                        && st.connection_id.unwrap_or(2) == 2
-                    {
+                    } else if idx + 1 == plan.entries.len() && st.connection_id.unwrap_or(2) == 2 {
                         // The run's return value, in the position today's
                         // primary SQL occupies: stream through the backend
                         // protocol, exactly like handle_query's primary path.
@@ -434,7 +424,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         // eagerly, answer once the plan finishes.
                         match self.execute_sql_routed(&st.sql, st.connection_id) {
                             Ok((columns, rows)) => {
-                                final_response = Some(self.eager_header(&columns, &rows));
+                                final_response = Some(self.eager_header(&columns, rows));
                             }
                             Err(msg) => {
                                 self.rollback_open_bracket(&mut open_bracket);
@@ -444,15 +434,31 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     }
                 }
 
-                PlanEntry::Assertion { statement, .. } => {
+                PlanEntry::Assertion {
+                    statement, name, ..
+                } => {
                     assertion_no += 1;
+                    // The verdict's identity IS the message's source: the
+                    // authored name says WHICH assertion failed (the ordinal
+                    // is the fallback, not the answer) and the body text is
+                    // what ran.
+                    let identity = verdict::VerdictIdentity {
+                        name: name.clone(),
+                        body_text: statement.sql.clone(),
+                    };
+                    let failure = || {
+                        format!(
+                            "Assertion {} failed\n  SQL: {}",
+                            match &identity.name {
+                                Some(name) => format!("'{name}'"),
+                                None => assertion_no.to_string(),
+                            },
+                            identity.body_text
+                        )
+                    };
                     match self.execute_sql_routed(&statement.sql, statement.connection_id) {
                         Ok((_cols, rows)) => {
-                            let passed = rows
-                                .first()
-                                .and_then(|row| row.first())
-                                .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
-                                .unwrap_or(false);
+                            let passed = super::cell_says_yes(rows.first());
 
                             if let Some(ref mut hook) = self.hooks.on_verdict {
                                 let v = verdict::Verdict {
@@ -461,20 +467,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     } else {
                                         verdict::VerdictOutcome::Fail
                                     },
-                                    identity: verdict::VerdictIdentity {
-                                        _name: None,
-                                        _source_location: None,
-                                        body_text: statement.sql.clone(),
-                                    },
-                                    detail: if passed {
-                                        None
-                                    } else {
-                                        Some(format!(
-                                            "Assertion {} failed\n  SQL: {}",
-                                            assertion_no, statement.sql
-                                        ))
-                                    },
-                                    _intent: None,
+                                    detail: if passed { None } else { Some(failure()) },
+                                    identity: identity.clone(),
                                 };
                                 hook(&v);
                             }
@@ -484,11 +478,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 return ServerTerm::Error {
                                     kind: ErrorKind::Permission,
                                     identity: b"delightql-error://runtime/assertion".to_vec(),
-                                    message: format!(
-                                        "Assertion {} failed\n  SQL: {}",
-                                        assertion_no, statement.sql
-                                    )
-                                    .into_bytes(),
+                                    message: failure().into_bytes(),
                                 };
                             }
                         }
@@ -506,7 +496,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         }
                     }
                 }
-
             }
         }
 
@@ -531,12 +520,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         use crate::pipeline::compiled_query::GuardPolarity;
         for req in &step.requirements {
             let guard = &guards[req.guard_id];
-            let sql = format!("SELECT count(*) FROM ({}) AS __g", guard.sql);
-            let (_cols, rows) = self.execute_sql_routed(&sql, step.route)?;
-            let present = rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(|v| v.trim().parse::<i64>().ok())
+            let (_cols, rows) = self.execute_sql_routed(&guard.sql, step.route)?;
+            let present = super::cell_count(rows.first())
                 .map(|n| n > 0)
                 .unwrap_or(false);
             let (polarity, open) = match req.polarity {
@@ -553,16 +538,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         Ok(None)
     }
 
-    /// Read the exit latch (the pre-COMMIT tail decision — D3a retired
-    /// the per-entry peek window; requirement edges cover the body). The
-    /// table name interpolates VERBATIM: the planner spells it
-    /// schema-qualified in the DIALECT's spelling (`temp.__exit`,
-    /// `pg_temp.__exit` — E-T2, pinned by
-    /// `pg_exit_table_and_wrap_guard_spell_pg_temp`), so the read
-    /// structurally cannot false-latch on a user's physical `main.__exit`
-    /// (review F3; pinned by the effects ball's
-    /// scratch--53_user_exit_table_survives_run).
-    fn exit_flag_set(&mut self, exit_table: &str, connection_id: Option<i64>) -> bool {
+    /// Read the exit latch using the planner's complete scalar probe.
+    fn exit_flag_set(&mut self, sql: &str, connection_id: Option<i64>) -> bool {
         // The peek asks for the exit table's CARDINALITY, not for a
         // row's presence. `SELECT count(*)` ALWAYS returns exactly one
         // row carrying a real integer, so the flag reads the same on
@@ -579,12 +556,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // `pg_exit_taken_and_not_taken`
         // (crates/delightql-cli/tests/effects_on_targets.rs); the
         // in-process backend path by `exit_peek_skips_remaining_data_entries`.
-        let sql = format!("SELECT count(*) FROM {}", exit_table);
-        match self.execute_sql_routed(&sql, connection_id) {
-            Ok((_cols, rows)) => rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(|v| v.trim().parse::<i64>().ok())
+        match self.execute_sql_routed(sql, connection_id) {
+            Ok((_cols, rows)) => super::cell_count(rows.first())
                 .map(|n| n > 0)
                 .unwrap_or(false),
             Err(_) => false,
@@ -602,14 +575,14 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 
     /// Buffer an eagerly-executed result set and answer with its Header —
     /// the same shape as handle_query's eager primary path.
-    pub(super) fn eager_header(&mut self, columns: &[String], rows: &[Vec<String>]) -> ServerTerm {
-        let (dimensions, cells) = Self::strings_to_eager_buffer(columns, rows);
+    pub(super) fn eager_header(&mut self, columns: &[String], rows: Vec<Vec<Cell>>) -> ServerTerm {
+        let dimensions = Self::eager_dimensions(columns);
         let handle = self.next_handle();
         self.eager_buffers.insert(
             handle.clone(),
             EagerBuffer {
                 dimensions: dimensions.clone(),
-                rows: cells,
+                rows,
                 cursor: 0,
             },
         );

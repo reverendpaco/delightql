@@ -5,25 +5,24 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+# The source formatter. Its substrate is the typed CST, so it links the one
+# consolidated language through `delightql-cst` and compiles no parser of its
+# own.
+
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
 name = "dql-fmt"
 path = "src/main.rs"
-required-features = ["bundled-parser"]
+required-features = ["cli"]
 
 [features]
 default = []
-bundled-parser = ["dep:cc", "dep:clap"]
+cli = ["dep:clap"]
 
 [dependencies]
+delightql-cst = { path = "../delightql-cst" }
 tree-sitter.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, optional = true }
-
-[dev-dependencies]
-serde_json.workspace = true
-
-[build-dependencies]
-cc = { version = "1.0", optional = true }

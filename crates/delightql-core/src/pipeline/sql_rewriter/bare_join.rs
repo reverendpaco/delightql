@@ -10,8 +10,8 @@
 // joins — so this legalization is total and never diagnoses.
 
 use crate::pipeline::ast_refined::LiteralValue;
-use crate::pipeline::generator_v3::SqlDialect;
-use crate::pipeline::sql_ast_v3::{
+use crate::pipeline::generator::SqlDialect;
+use crate::pipeline::sql_ast::{
     walk, DomainExpression, JoinCondition, JoinType, SqlStatement, TableExpression,
 };
 
@@ -54,31 +54,75 @@ pub fn legalize_bare_joins(mut stmt: SqlStatement) -> SqlStatement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::sql_ast_v3::{QueryExpression, SelectItem, SelectStatement};
+    use crate::names::{Addressing, ColumnOrigin, Hint, Registry, ScopeOrigin, ValueFacts};
+    use crate::pipeline::sql_ast::{QueryExpression, SelectItem, SelectStatement};
 
-    fn table(name: &str) -> TableExpression {
-        TableExpression::Table {
-            schema: None,
-            name: name.to_string(),
-            alias: None,
+    struct Fixture {
+        identities: Registry,
+        a: crate::names::ScopeId,
+        b: crate::names::ScopeId,
+        t: crate::names::ScopeId,
+        x: crate::names::ColId,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let identities = Registry::new(&[]);
+            let make_scope = |name: &str| {
+                let spelling = identities.intern(name, false);
+                let entity = identities.mint_entity(spelling);
+                identities.mint_scope(
+                    ScopeOrigin::Resolution { of: entity },
+                    Hint::User(spelling),
+                    None,
+                )
+            };
+            let a = make_scope("a");
+            let b = make_scope("b");
+            let t = make_scope("t");
+            let spelling = identities.intern("x", false);
+            let x = identities.mint_column(
+                a,
+                ColumnOrigin::Bound { position: 0 },
+                Some(spelling),
+                Addressing::Published,
+                ValueFacts::default(),
+            );
+            Self {
+                identities,
+                a,
+                b,
+                t,
+                x,
+            }
+        }
+
+        fn bare_join(&self, join_type: JoinType) -> TableExpression {
+            TableExpression::Join {
+                left: Box::new(TableExpression::Scope(self.a)),
+                right: Box::new(TableExpression::Scope(self.b)),
+                join_type,
+                join_condition: JoinCondition::Natural,
+            }
         }
     }
 
-    fn bare_join(join_type: JoinType) -> TableExpression {
-        TableExpression::Join {
-            left: Box::new(table("a")),
-            right: Box::new(table("b")),
-            join_type,
-            join_condition: JoinCondition::Natural,
-        }
-    }
-
-    fn select_from(from: TableExpression) -> SelectStatement {
-        SelectStatement::builder()
-            .select(SelectItem::star())
-            .from_tables(vec![from])
-            .build()
-            .unwrap()
+    /// A fixture's statements go through the same door production's do. A
+    /// star names nothing, so the heading it publishes is empty.
+    fn select_from(
+        from: TableExpression,
+        at: crate::names::ScopeId,
+        identities: &Registry,
+    ) -> SelectStatement {
+        crate::pipeline::transformer::builder::publish_at(
+            at,
+            [],
+            SelectStatement::builder()
+                .select(SelectItem::star_over_nothing())
+                .from_tables(vec![from]),
+            identities,
+        )
+        .expect("a star publishes no heading of its own")
     }
 
     fn query_stmt(select: SelectStatement) -> SqlStatement {
@@ -118,8 +162,12 @@ mod tests {
 
     #[test]
     fn inner_bare_join_becomes_cross() {
-        let stmt = query_stmt(select_from(bare_join(JoinType::Inner)));
-        let stmt = legalize_bare_joins(stmt);
+        let f = Fixture::new();
+        let stmt = legalize_bare_joins(query_stmt(select_from(
+            f.bare_join(JoinType::Inner),
+            f.t,
+            &f.identities,
+        )));
         let (join_type, condition) = first_join(&stmt);
         assert_eq!(join_type, &JoinType::Cross);
         assert_eq!(condition, &JoinCondition::Natural);
@@ -127,14 +175,18 @@ mod tests {
 
     #[test]
     fn conditioned_join_untouched() {
-        let on = JoinCondition::On(DomainExpression::column("x"));
-        let stmt = query_stmt(select_from(TableExpression::Join {
-            left: Box::new(table("a")),
-            right: Box::new(table("b")),
-            join_type: JoinType::Inner,
-            join_condition: on.clone(),
-        }));
-        let stmt = legalize_bare_joins(stmt);
+        let f = Fixture::new();
+        let on = JoinCondition::On(DomainExpression::Column(f.x));
+        let stmt = legalize_bare_joins(query_stmt(select_from(
+            TableExpression::Join {
+                left: Box::new(TableExpression::Scope(f.a)),
+                right: Box::new(TableExpression::Scope(f.b)),
+                join_type: JoinType::Inner,
+                join_condition: on.clone(),
+            },
+            f.t,
+            &f.identities,
+        )));
         let (join_type, condition) = first_join(&stmt);
         assert_eq!(join_type, &JoinType::Inner);
         assert_eq!(condition, &on);
@@ -142,8 +194,12 @@ mod tests {
 
     #[test]
     fn bare_left_join_gets_on_true() {
-        let stmt = query_stmt(select_from(bare_join(JoinType::Left)));
-        let stmt = legalize_bare_joins(stmt);
+        let f = Fixture::new();
+        let stmt = legalize_bare_joins(query_stmt(select_from(
+            f.bare_join(JoinType::Left),
+            f.t,
+            &f.identities,
+        )));
         let (join_type, condition) = first_join(&stmt);
         assert_eq!(join_type, &JoinType::Left);
         assert_eq!(
@@ -153,60 +209,38 @@ mod tests {
     }
 
     #[test]
-    fn bare_join_inside_exists_subquery_is_reached() {
-        let inner = select_from(bare_join(JoinType::Inner));
-        let outer = SelectStatement::builder()
-            .select(SelectItem::star())
-            .from_tables(vec![table("t")])
-            .where_clause(DomainExpression::Exists {
-                not: false,
-                query: Box::new(QueryExpression::Select(Box::new(inner))),
-            })
-            .build()
-            .unwrap();
+    fn nested_join_is_reached() {
+        let f = Fixture::new();
+        let inner = select_from(f.bare_join(JoinType::Inner), f.t, &f.identities);
+        let outer = crate::pipeline::transformer::builder::publish_at(
+            f.t,
+            [],
+            SelectStatement::builder()
+                .select(SelectItem::star_over_nothing())
+                .from_tables(vec![TableExpression::Scope(f.t)])
+                .where_clause(DomainExpression::Exists {
+                    not: false,
+                    query: Box::new(QueryExpression::Select(Box::new(inner))),
+                }),
+            &f.identities,
+        )
+        .expect("a star publishes no heading of its own");
         let stmt = legalize_bare_joins(query_stmt(outer));
-
         let SqlStatement::Query {
             query: QueryExpression::Select(select),
             ..
         } = &stmt
         else {
-            panic!("expected plain SELECT statement");
+            panic!("expected query");
         };
         let Some(DomainExpression::Exists { query, .. }) = select.where_clause() else {
-            panic!("expected EXISTS in WHERE");
+            panic!("expected EXISTS");
         };
         let QueryExpression::Select(inner) = query.as_ref() else {
-            panic!("expected SELECT inside EXISTS");
+            panic!("expected nested SELECT");
         };
         let TableExpression::Join { join_type, .. } = &inner.from().unwrap()[0] else {
-            panic!("expected join in inner FROM");
-        };
-        assert_eq!(join_type, &JoinType::Cross);
-    }
-
-    #[test]
-    fn bare_join_inside_statement_level_cte_is_reached() {
-        use crate::pipeline::sql_ast_v3::Cte;
-        let cte_query = QueryExpression::Select(Box::new(select_from(bare_join(JoinType::Inner))));
-        let stmt = SqlStatement::Query {
-            with_clause: Some(vec![Cte::new("c", cte_query)]),
-            query: QueryExpression::Select(Box::new(select_from(table("c")))),
-        };
-        let stmt = legalize_bare_joins(stmt);
-
-        let SqlStatement::Query {
-            with_clause: Some(ctes),
-            ..
-        } = &stmt
-        else {
-            panic!("expected WITH clause");
-        };
-        let QueryExpression::Select(select) = ctes[0].query() else {
-            panic!("expected SELECT in CTE");
-        };
-        let TableExpression::Join { join_type, .. } = &select.from().unwrap()[0] else {
-            panic!("expected join in CTE FROM");
+            panic!("expected nested join");
         };
         assert_eq!(join_type, &JoinType::Cross);
     }

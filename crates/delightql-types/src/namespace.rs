@@ -43,6 +43,12 @@ impl NamespacePath {
         }
     }
 
+    /// Rehydrate a persisted fully-qualified namespace through one named
+    /// boundary instead of duplicating string splitting at each consumer.
+    pub fn from_fq_string(fq: &str) -> Self {
+        Self::from_parts(fq.split("::").map(str::to_owned).collect())
+    }
+
     /// Get items as slice
     pub fn items(&self) -> &[NamespaceItem] {
         &self.items

@@ -60,9 +60,9 @@ impl SqlIdentifier {
     }
 
     /// Identifier equality between raw spellings, both treated as
-    /// UNSTROPPED (they fold). Marks a site whose operands have not yet
-    /// been lifted to SqlIdentifier — when stroppedness threads through
-    /// the pipeline, str_eq call sites are the migration worklist.
+    /// UNSTROPPED (they fold). A call here marks a site whose operands are
+    /// not `SqlIdentifier`s and therefore carry no stropping bit — the
+    /// comparison cannot honour one it was never given.
     pub fn str_eq(a: &str, b: &str) -> bool {
         a.eq_ignore_ascii_case(b)
     }
@@ -205,11 +205,11 @@ impl From<SqlIdentifier> for String {
     }
 }
 
-// Serde keeps the STRING format for artifact compatibility: an unstropped
-// identifier serializes as its plain text; a stropped one as its text wrapped
-// in backticks. Deserialize detects a backtick-delimited string as stropped.
-// No stropped values exist in the wild yet (the bit was erased at the CST
-// border until now), so every legacy artifact reads back identically.
+// An identifier serializes as ONE string, never as a struct: unstropped is
+// the plain text, stropped is the text wrapped in backticks, and deserialize
+// reads the backticks back as the stropping bit. Backticks are not admitted
+// inside an identifier's text, so the delimiter cannot be confused with
+// content.
 impl Serialize for SqlIdentifier {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if self.stropped {
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_legacy_plain_string_deserializes_unstropped() {
+    fn test_serde_plain_string_deserializes_unstropped() {
         let back: SqlIdentifier = serde_json::from_str("\"users\"").unwrap();
         assert!(!back.is_stropped());
         assert_eq!(back.as_str(), "users");

@@ -93,7 +93,7 @@ struct DdlResource {
 ///
 /// Handles:
 /// - `file://path/to/file` → `path/to/file`
-/// - `pipe://backend/path/to/file` → `path/to/file`
+/// - `delightql-siso://profile/path/to/file` → `path/to/file`
 /// - Other schemes (`bootstrap://`, `catalog://`, `sys://`, `embedded://`) → None
 fn extract_file_path(uri: &str) -> Option<PathBuf> {
     if let Some(path_str) = uri.strip_prefix("file://") {
@@ -101,8 +101,8 @@ fn extract_file_path(uri: &str) -> Option<PathBuf> {
         if path.exists() {
             return Some(path);
         }
-    } else if let Some(rest) = uri.strip_prefix("pipe://") {
-        // pipe://backend/path → extract path after the backend component
+    } else if let Some(rest) = uri.strip_prefix("delightql-siso://") {
+        // delightql-siso://profile/path → the path after the profile component
         if let Some(slash_pos) = rest.find('/') {
             let path_str = &rest[slash_pos + 1..];
             if !path_str.is_empty() {

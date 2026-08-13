@@ -166,8 +166,9 @@ impl SqlParty {
             // columns each elects its descriptor from its FIRST NON-NULL
             // value — the engine's own storage class for that value, not a
             // parsing heuristic. NULL declares nothing, so a NULL-leading
-            // column no longer inherits "" from row 0 (the row-order M8 bug:
-            // `_(x @ 5; null)` and `_(x @ null; 5)` used to type differently).
+            // column does not inherit "" from row 0. Electing on row 0
+            // regardless would make `_(x @ 5; null)` and `_(x @ null; 5)`
+            // type differently — the same relation, typed by row order.
             //
             // Election is bounded: buffer at most DESCRIPTOR_PEEK_ROWS rows
             // looking for each undeclared column's first non-NULL; a column

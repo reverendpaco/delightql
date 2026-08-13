@@ -58,11 +58,9 @@ impl BinEntity for MountTreePredicate {
                 },
             ],
             // The receipt heading is the DESCRIPTOR's declaration
-            // (Phase 6 slice 3): core + `path, namespace` echoes +
+            // Core + `path, namespace` echoes +
             // the `returned` tree of created sub-namespaces.
-            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
-                "mount_tree",
-            )),
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("mount_tree")),
         }
     }
 
@@ -131,10 +129,7 @@ impl EffectExecutable for MountTreePredicate {
 /// Extract a string literal value from a DomainExpression
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
         _ => Err(DelightQLError::database_error(
             format!("mount_tree!() {} must be a string literal", arg_name),
             "Invalid argument type",

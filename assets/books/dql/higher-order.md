@@ -70,7 +70,7 @@ invocation implies no early evaluation or materialization.
 
 Directive (bang) invocations share this exact shape and law: the first
 parentheses hold the parameters, the trailing parentheses access the
-return table — for a directive, its RECEIPT (`EFFECT-ALGEBRA.md` §1,
+return table — for a directive, its RECEIPT (`SEMANTICS/effect-algebra-law.md` §1,
 §3). The first group is never an inline input table; a relational
 input arrives through the pipe, by the same insertion law shown
 above.

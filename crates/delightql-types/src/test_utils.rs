@@ -55,8 +55,8 @@
 //! );
 //!
 //! // Use in resolution/validation logic
-//! assert!(schema.table_exists(None, "users"));
-//! let columns = schema.get_table_columns(None, "users").unwrap();
+//! assert!(schema.table_exists(None, "users").unwrap());
+//! let columns = schema.get_table_columns(None, "users").unwrap().unwrap();
 //! assert_eq!(columns.len(), 2);
 //! ```
 //!
@@ -427,14 +427,14 @@ impl DatabaseSchema for MockSchemaProvider {
         &self,
         schema: Option<&str>,
         table_name: &str,
-    ) -> Option<Vec<SchemaColumnInfo>> {
+    ) -> crate::error::Result<Option<Vec<SchemaColumnInfo>>> {
         let key = (schema.map(|s| s.to_string()), table_name.to_string());
-        self.tables.lock().unwrap().get(&key).cloned()
+        Ok(self.tables.lock().unwrap().get(&key).cloned())
     }
 
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool {
+    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> crate::error::Result<bool> {
         let key = (schema.map(|s| s.to_string()), table_name.to_string());
-        self.tables.lock().unwrap().contains_key(&key)
+        Ok(self.tables.lock().unwrap().contains_key(&key))
     }
 }
 
@@ -516,11 +516,11 @@ mod tests {
         );
 
         // Test table exists
-        assert!(schema.table_exists(None, "users"));
-        assert!(!schema.table_exists(None, "missing"));
+        assert!(schema.table_exists(None, "users").unwrap());
+        assert!(!schema.table_exists(None, "missing").unwrap());
 
         // Test get columns
-        let columns = schema.get_table_columns(None, "users").unwrap();
+        let columns = schema.get_table_columns(None, "users").unwrap().unwrap();
         assert_eq!(columns.len(), 2);
         assert_eq!(columns[0].name, "id");
         assert_eq!(columns[1].name, "name");

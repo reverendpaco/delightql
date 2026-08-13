@@ -5,12 +5,13 @@
 
 mod aggregation;
 pub(in crate::pipeline::resolver) mod helpers;
-mod ordering;
+pub(in crate::pipeline::resolver) mod ordering;
 mod projection;
-mod schema_ops;
+pub(in crate::pipeline::resolver) mod schema_ops;
 mod transformation;
 
 use crate::error::Result;
+use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
@@ -20,196 +21,52 @@ use crate::pipeline::{ast_resolved, ast_unresolved};
 /// goes through the fold's transform hooks instead of free functions + registry.
 pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
     fold: &mut ResolverFold,
-    operator: ast_unresolved::UnaryRelationalOperator,
-    available: &[ast_resolved::ColumnMetadata],
-    pivot_in_values: &std::collections::HashMap<String, Vec<String>>,
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
+    operator: ast_unresolved::PipeOp,
+    available: &[crate::names::ColId],
+    pivot_in_values: &std::collections::HashMap<crate::names::Sym, Vec<String>>,
+) -> Result<(ast_resolved::PipeOp, Vec<crate::names::ColId>)> {
     match operator {
-        ast_unresolved::UnaryRelationalOperator::General {
-            containment_semantic,
-            expressions,
-        } => {
-            projection::resolve_general_via_fold(fold, containment_semantic, expressions, available)
+        ast_unresolved::PipeOp::Project(items) => {
+            projection::resolve_general_via_fold(fold, items, available)
         }
 
-        ast_unresolved::UnaryRelationalOperator::Modulo {
-            containment_semantic,
-            spec,
-        } => aggregation::resolve_modulo_via_fold(
-            fold,
-            containment_semantic,
-            spec,
-            available,
-            pivot_in_values,
-        ),
-
-        ast_unresolved::UnaryRelationalOperator::TupleOrdering {
-            containment_semantic,
-            specs,
-        } => {
-            ordering::resolve_tuple_ordering_via_fold(fold, containment_semantic, specs, available)
+        ast_unresolved::PipeOp::Embed(items) => {
+            projection::resolve_embed_via_fold(fold, items, available)
         }
 
-        ast_unresolved::UnaryRelationalOperator::MapCover {
-            function,
-            columns,
-            containment_semantic,
-            conditioned_on,
-        } => transformation::resolve_map_cover_via_fold(
-            fold,
-            function,
-            columns,
-            containment_semantic,
-            conditioned_on,
-            available,
-        ),
+        ast_unresolved::PipeOp::Group(spec) => {
+            aggregation::resolve_group_via_fold(fold, spec, available, pivot_in_values)
+        }
 
-        ast_unresolved::UnaryRelationalOperator::ProjectOut {
-            containment_semantic,
-            expressions,
-        } => schema_ops::resolve_project_out(fold, containment_semantic, expressions, available),
+        // An authored cover carries no cells yet; resolution mints them.
+        ast_unresolved::PipeOp::MapCover(MapCover {
+            callable,
+            selector,
+            guard,
+            cells: _,
+        }) => {
+            transformation::resolve_map_cover_via_fold(fold, callable, selector, guard, available)
+        }
 
-        ast_unresolved::UnaryRelationalOperator::RenameCover { specs } => {
+        ast_unresolved::PipeOp::ProjectOut(selector) => {
+            schema_ops::resolve_project_out(fold, selector, available)
+        }
+
+        ast_unresolved::PipeOp::Rename(specs) => {
             schema_ops::resolve_rename_cover(fold, specs, available)
         }
 
-        ast_unresolved::UnaryRelationalOperator::Transform {
-            transformations,
-            conditioned_on,
-        } => transformation::resolve_transform_via_fold(
-            fold,
-            transformations,
-            conditioned_on,
-            available,
-        ),
-
-        ast_unresolved::UnaryRelationalOperator::AggregatePipe { aggregations } => {
-            aggregation::resolve_aggregate_pipe_via_fold(fold, aggregations, available)
+        ast_unresolved::PipeOp::Transform { items, guard } => {
+            transformation::resolve_transform_via_fold(fold, items, guard, available)
         }
 
-        ast_unresolved::UnaryRelationalOperator::Reposition { moves } => {
-            schema_ops::resolve_reposition(fold, moves, available)
-        }
-
-        ast_unresolved::UnaryRelationalOperator::EmbedMapCover {
-            function,
+        ast_unresolved::PipeOp::EmbedMapCover(EmbedMapCover {
+            callable,
+            naming,
             selector,
-            alias_template,
-            containment_semantic,
-        } => transformation::resolve_embed_map_cover_via_fold(
-            fold,
-            function,
-            selector,
-            alias_template,
-            containment_semantic,
-            available,
+            cells: _,
+        }) => transformation::resolve_embed_map_cover_via_fold(
+            fold, callable, selector, naming, available,
         ),
-        ast_unresolved::UnaryRelationalOperator::MetaIze => {
-            schema_ops::resolve_meta_ize(available)
-        }
-        ast_unresolved::UnaryRelationalOperator::Witness { exists } => {
-            schema_ops::resolve_witness(exists, available)
-        }
-        ast_unresolved::UnaryRelationalOperator::Qualify => schema_ops::resolve_qualify(available),
-        ast_unresolved::UnaryRelationalOperator::Using { columns } => {
-            schema_ops::resolve_using(columns, available)
-        }
-        ast_unresolved::UnaryRelationalOperator::UsingAll => {
-            schema_ops::resolve_using_all(available)
-        }
-        ast_unresolved::UnaryRelationalOperator::DmlTerminal {
-            kind,
-            target,
-            target_namespace,
-            domain_spec,
-        } => schema_ops::resolve_dml_terminal_via_fold(
-            fold,
-            kind,
-            target,
-            target_namespace,
-            domain_spec,
-            available,
-        ),
-        ast_unresolved::UnaryRelationalOperator::InteriorDrillDown {
-            column,
-            glob,
-            columns,
-            interior_schema,
-            groundings,
-        } => schema_ops::resolve_interior_drill_down(
-            column,
-            glob,
-            columns,
-            interior_schema,
-            groundings,
-            available,
-        ),
-
-        ast_unresolved::UnaryRelationalOperator::NarrowingDestructure { column, fields } => {
-            schema_ops::resolve_narrowing_destructure(column, fields, available)
-        }
-
-        ast_unresolved::UnaryRelationalOperator::SignedWitness => {
-            schema_ops::resolve_signed_witness(available)
-        }
-
-        // Constructed by builder 2.2 (IMPLEMENTATION-PLAN §2.2); its
-        // lowering is the effect transformer. Clean refusal, not a panic:
-        // an `x |> f!(r(*))(*)` outside an effect plan reaches here.
-        //
-        // EXCEPTION — the DML designator form (Phase 6 slice 5): since the
-        // builder preserves DML targets as designators, statements the
-        // relay conservatively leaves on this path (annotated or
-        // multi-query DML) interpret the SAME designator here and resolve
-        // through the SAME DML machinery the stringly operator used —
-        // identical semantics on both routes, never a string from the
-        // parser.
-        ast_unresolved::UnaryRelationalOperator::DirectivePipeInvocation {
-            name,
-            argument,
-            domain_spec,
-        } => {
-            use crate::pipeline::asts::core::operators::DmlKind;
-            let kind = match name.trim_end_matches('!') {
-                "insert" => Some(DmlKind::Insert),
-                "update" => Some(DmlKind::Update),
-                "delete" => Some(DmlKind::Delete),
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                let (target, target_namespace) =
-                    crate::pipeline::asts::effects::target_designator(
-                        name.trim_end_matches('!'),
-                        "effect/dml/target_designator",
-                        "naming where to write",
-                        &argument,
-                    )?;
-                return schema_ops::resolve_dml_terminal_via_fold(
-                    fold,
-                    kind,
-                    target,
-                    target_namespace,
-                    domain_spec,
-                    available,
-                );
-            }
-            Err(crate::error::DelightQLError::transformation_error(
-                format!(
-                    "the piped directive invocation '|> {}(…)(…)' is not implemented \
-                     yet: directive invocations compile through the effect transformer \
-                     (EFFECT-ALGEBRA §1; IMPLEMENTATION-PLAN Epic 3)",
-                    name
-                ),
-                "directive pipe invocation not yet implemented",
-            ))
-        }
-        // Exhaustive-match tax: Unresolved-only variants, consumed before resolution.
-        ast_unresolved::UnaryRelationalOperator::HoViewApplication { .. }
-        | ast_unresolved::UnaryRelationalOperator::DirectiveTerminal { .. } => {
-            unreachable!("HoViewApplication/DirectiveTerminal consumed before operator resolution")
-        }
     }
 }

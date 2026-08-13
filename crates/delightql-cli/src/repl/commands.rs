@@ -67,7 +67,7 @@ impl ReplState {
         if let Some(ref path) = db_path {
             let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
             crate::exec_ng::run_dql_query(
-                &format!("mount!(\"{}\", \"main\")", path),
+                &format!("mount!(\"{}\", \"main\")(*)", path),
                 &mut *session,
             )?;
         }
@@ -119,6 +119,112 @@ impl ReplState {
 pub enum CommandResult {
     Continue,
     Exit,
+}
+
+/// What the prompt's recovery boundary decided.
+///
+/// A REPL prompt is a recovery boundary: an ordinary DQL prompt is never
+/// presented backed by a quarantined session. The decision is taken over the
+/// TYPED health report — never by matching error text.
+pub enum ReplRecovery {
+    /// The session is healthy; present the prompt.
+    NotNeeded,
+    /// The session was quarantined and has been replaced. The strings are
+    /// the report the host prints: the incident, and what the reset rebuilt,
+    /// lost, and retained.
+    Recovered {
+        incident: String,
+        rebuilt: String,
+        lost: String,
+        retained: String,
+    },
+    /// Recovery failed. The session remains quarantined; the host must
+    /// report a terminal connection failure instead of presenting a prompt.
+    Terminal { incident: String, failure: String },
+}
+
+/// The recovery decision, over the typed API alone. Re-mounting the host's
+/// database after a successful reset is part of "replace the session": a
+/// prompt over an unmounted main is not the session the user was in, and a
+/// failed re-mount is a failed recovery.
+pub fn recover_repl_session(
+    handle: &mut dyn delightql_core::api::DqlHandle,
+    db_path: Option<&str>,
+) -> ReplRecovery {
+    use delightql_core::api::SessionHealthReport;
+    let (operation, message) = match handle.session_health() {
+        SessionHealthReport::Healthy => return ReplRecovery::NotNeeded,
+        SessionHealthReport::Quarantined { operation, message } => (operation, message),
+    };
+    let incident = format!("{operation}: {message}");
+    let recovery = match handle.recover_session() {
+        Ok(recovery) => recovery,
+        Err(failure) => return ReplRecovery::Terminal { incident, failure },
+    };
+    let mut lost = recovery.lost;
+    if let Some(path) = db_path {
+        let remount = handle
+            .session()
+            .map_err(|e| e.to_string())
+            .and_then(|mut session| {
+                crate::exec_ng::run_dql_query(
+                    &format!("mount!(\"{}\", \"main\")(*)", path),
+                    &mut *session,
+                )
+                .map_err(|e| e.to_string())
+            });
+        match remount {
+            Ok(_) => lost.push_str(&format!("; '{path}' was re-mounted as main")),
+            Err(failure) => {
+                return ReplRecovery::Terminal {
+                    incident,
+                    failure: format!("the session was reset but '{path}' failed to re-mount: {failure}"),
+                }
+            }
+        }
+    }
+    ReplRecovery::Recovered {
+        incident,
+        rebuilt: recovery.rebuilt,
+        lost,
+        retained: recovery.retained,
+    }
+}
+
+/// Run the recovery boundary before a prompt is presented: report, recover
+/// or terminate, and reset the REPL bookkeeping that lived in the replaced
+/// session. Returns `Exit` exactly when recovery failed.
+pub fn prompt_recovery_boundary(repl_state: &mut ReplState) -> CommandResult {
+    let decision = {
+        let mut handle = repl_state.dql_handle.lock().unwrap_or_else(|e| e.into_inner());
+        recover_repl_session(&mut **handle, repl_state.db_path.as_deref())
+    };
+    match decision {
+        ReplRecovery::NotNeeded => CommandResult::Continue,
+        ReplRecovery::Recovered {
+            incident,
+            rebuilt,
+            lost,
+            retained,
+        } => {
+            eprintln!("!! the session was quarantined after {incident}");
+            eprintln!("!! the session was reset before this prompt:");
+            eprintln!("!!   rebuilt:  {rebuilt}");
+            eprintln!("!!   lost:     {lost}");
+            eprintln!("!!   retained: {retained}");
+            // The repl:: capture namespace and its views lived in the
+            // replaced session's catalog.
+            repl_state.repl_namespace_initialized = false;
+            repl_state.captures.clear();
+            CommandResult::Continue
+        }
+        ReplRecovery::Terminal { incident, failure } => {
+            eprintln!("!! the session was quarantined after {incident}");
+            eprintln!("!! session recovery failed: {failure}");
+            eprintln!("!! terminal connection failure — the session remains quarantined; closing this REPL");
+            CommandResult::Exit
+        }
+    }
 }
 
 /// Check if input is a dot command
@@ -472,11 +578,8 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
                         Some(Stage::Hash) => println!("Current output stage: Hash"),
                         Some(Stage::ByteHash) => println!("Current output stage: ByteHash"),
                         Some(Stage::TotalHash) => println!("Current output stage: TotalHash"),
-                        Some(Stage::RecursionDepth) => {
-                            println!("Current output stage: RecursionDepth")
-                        }
                     }
-                    println!("Available stages: cst, ast-unresolved, ast-resolved, ast-refined, sql-ast, sql, results, hash, bhash, totalhash, fingerprint, recursion-depth");
+                    println!("Available stages: cst, ast-unresolved, ast-resolved, ast-refined, sql-ast, sql, results, hash, bhash, totalhash, fingerprint");
                 }
             }
             Ok(CommandResult::Continue)
@@ -534,8 +637,10 @@ fn handle_enlist_command(cmd: &str, repl_state: &ReplState) -> Result<()> {
     let namespace = parts[1].trim_matches('"');
 
     // Route through the session protocol — enlist!() is a DQL pseudo-predicate
-    // handled by the effect executor.
-    let dql = format!("enlist!(\"{}\")", namespace);
+    // handled by the effect executor. A higher-order directive writes both
+    // groups: `(arguments)(receipt access)`. A lone group is receipt access by
+    // position, so dropping the `(*)` binds zero arguments and refuses on arity.
+    let dql = format!("enlist!(\"{}\")(*)", namespace);
     let mut handle = repl_state.dql_handle.lock().unwrap();
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     crate::exec_ng::run_dql_query(&dql, &mut *session)?;
@@ -569,8 +674,10 @@ fn handle_delist_command(cmd: &str, repl_state: &ReplState) -> Result<()> {
     let namespace = parts_vec[1].trim_matches('"');
 
     // Route through the session protocol — delist!() is a DQL pseudo-predicate
-    // handled by the effect executor.
-    let dql = format!("delist!(\"{}\")", namespace);
+    // handled by the effect executor. A higher-order directive writes both
+    // groups: `(arguments)(receipt access)`. A lone group is receipt access by
+    // position, so dropping the `(*)` binds zero arguments and refuses on arity.
+    let dql = format!("delist!(\"{}\")(*)", namespace);
     let mut handle = repl_state.dql_handle.lock().unwrap();
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     crate::exec_ng::run_dql_query(&dql, &mut *session)?;
@@ -1237,5 +1344,179 @@ mod registry_tests {
             registered_not_arms
         );
         assert!(!registry.is_empty(), "registry must not be empty");
+    }
+}
+
+/// The prompt recovery boundary's host decision, pinned over a scripted
+/// handle. What the core latch does is pinned in core (relay pump tests);
+/// what is pinned HERE is the REPL's ruled behavior on top of the typed
+/// report: healthy → no recovery; quarantined + reset ok → session replaced
+/// and the host's database re-mounted; quarantined + reset failure →
+/// terminal, never another prompt.
+#[cfg(test)]
+mod recovery_boundary_tests {
+    use super::*;
+    use delightql_core::api::{
+        DqlHandle, DqlSession, FetchResult, QueryResult, ServerRelay, SessionHealthReport,
+        SessionRecovery, SessionHooks,
+    };
+    use std::sync::{Arc, Mutex};
+
+    struct ScriptedSession {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DqlSession for ScriptedSession {
+        fn query(&mut self, text: &str) -> Result<QueryResult, String> {
+            self.queries.lock().unwrap().push(text.to_string());
+            Err("scripted session: no results".to_string())
+        }
+        fn fetch(
+            &mut self,
+            _handle: &delightql_core::api::QueryHandle,
+            _count: u64,
+        ) -> Result<FetchResult, String> {
+            Err("scripted".to_string())
+        }
+        fn close(&mut self, _handle: delightql_core::api::QueryHandle) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct ScriptedHandle {
+        health: SessionHealthReport,
+        recover_fails: bool,
+        recover_calls: Arc<Mutex<u32>>,
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DqlHandle for ScriptedHandle {
+        fn session(&mut self) -> Result<Box<dyn DqlSession + '_>, String> {
+            Ok(Box::new(ScriptedSession {
+                queries: Arc::clone(&self.queries),
+            }))
+        }
+        fn session_with_hooks(
+            &mut self,
+            _hooks: SessionHooks,
+        ) -> Result<Box<dyn DqlSession + '_>, String> {
+            self.session()
+        }
+        fn create_relay(&mut self) -> Result<Box<dyn ServerRelay + '_>, String> {
+            Err("scripted".to_string())
+        }
+        fn session_health(&self) -> SessionHealthReport {
+            self.health.clone()
+        }
+        fn recover_session(&mut self) -> Result<SessionRecovery, String> {
+            *self.recover_calls.lock().unwrap() += 1;
+            if self.recover_fails {
+                Err("reset could not complete pending compensation".to_string())
+            } else {
+                self.health = SessionHealthReport::Healthy;
+                Ok(SessionRecovery {
+                    rebuilt: "the session catalog".to_string(),
+                    lost: "session-local state".to_string(),
+                    retained: "the connected database".to_string(),
+                })
+            }
+        }
+    }
+
+    fn quarantined() -> SessionHealthReport {
+        SessionHealthReport::Quarantined {
+            operation: "created-object registration".to_string(),
+            message: "registration failed".to_string(),
+        }
+    }
+
+    /// Healthy session: no recovery is attempted, no reset is issued.
+    #[test]
+    fn a_healthy_session_needs_no_recovery() {
+        let recover_calls = Arc::new(Mutex::new(0));
+        let mut handle = ScriptedHandle {
+            health: SessionHealthReport::Healthy,
+            recover_fails: false,
+            recover_calls: Arc::clone(&recover_calls),
+            queries: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert!(matches!(
+            recover_repl_session(&mut handle, Some("db.sqlite")),
+            ReplRecovery::NotNeeded
+        ));
+        assert_eq!(*recover_calls.lock().unwrap(), 0);
+    }
+
+    /// Quarantined + reset succeeds: the report carries the incident and the
+    /// reset's rebuilt/lost/retained account, and the host's database is
+    /// re-mounted into the replaced session.
+    #[test]
+    fn a_quarantined_session_is_replaced_and_the_database_remounted() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut handle = ScriptedHandle {
+            health: quarantined(),
+            recover_fails: false,
+            recover_calls: Arc::new(Mutex::new(0)),
+            queries: Arc::clone(&queries),
+        };
+        // The scripted session refuses the re-mount query (it returns no
+        // results), so a real recovery over THIS handle is terminal; what the
+        // no-db path pins is the decision itself.
+        match recover_repl_session(&mut handle, None) {
+            ReplRecovery::Recovered {
+                incident,
+                rebuilt,
+                lost,
+                retained,
+            } => {
+                assert!(incident.contains("created-object registration"));
+                assert!(!rebuilt.is_empty());
+                assert!(!lost.is_empty());
+                assert!(!retained.is_empty());
+            }
+            _ => panic!("a successful reset over no database is a recovery"),
+        }
+        assert!(queries.lock().unwrap().is_empty(), "no database, no re-mount");
+
+        // With a database, the re-mount is issued into the replaced session;
+        // the scripted session refuses it, and a failed re-mount is a failed
+        // recovery — terminal, not a prompt over a half-replaced session.
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let mut handle = ScriptedHandle {
+            health: quarantined(),
+            recover_fails: false,
+            recover_calls: Arc::new(Mutex::new(0)),
+            queries: Arc::clone(&queries),
+        };
+        match recover_repl_session(&mut handle, Some("db.sqlite")) {
+            ReplRecovery::Terminal { failure, .. } => {
+                assert!(failure.contains("failed to re-mount"));
+            }
+            _ => panic!("a refused re-mount is a failed recovery"),
+        }
+        assert_eq!(
+            queries.lock().unwrap().as_slice(),
+            ["mount!(\"db.sqlite\", \"main\")(*)"],
+            "the re-mount is the same mount the REPL opened with"
+        );
+    }
+
+    /// Quarantined + reset fails: terminal. The incident and the failure both
+    /// reach the report; no prompt may follow.
+    #[test]
+    fn a_failed_reset_is_terminal() {
+        let mut handle = ScriptedHandle {
+            health: quarantined(),
+            recover_fails: true,
+            recover_calls: Arc::new(Mutex::new(0)),
+            queries: Arc::new(Mutex::new(Vec::new())),
+        };
+        match recover_repl_session(&mut handle, Some("db.sqlite")) {
+            ReplRecovery::Terminal { incident, failure } => {
+                assert!(incident.contains("created-object registration"));
+                assert!(failure.contains("pending compensation"));
+            }
+            _ => panic!("a failed reset must be terminal"),
+        }
     }
 }

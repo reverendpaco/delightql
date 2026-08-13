@@ -10,18 +10,19 @@
 // This module provides shared functionality to avoid code duplication across these features.
 
 use crate::error::Result;
-use crate::pipeline::asts::{resolved as ast_resolved, unresolved as ast_unresolved};
+use crate::pipeline::asts::unresolved as ast_unresolved;
 use crate::pipeline::resolver::unification::ColumnReference;
 use crate::pipeline::resolver::{DatabaseSchema, ResolutionConfig};
 use crate::resolution::EntityRegistry;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Information returned from bubbling an inner-CPR subquery
 pub struct InnerCprBubbleResult {
     /// The dependencies that the subquery needs (i_need)
     pub dependencies: Vec<ColumnReference>,
     /// Updated CTE context after resolving the subquery
-    pub updated_cte_context: HashMap<String, ast_resolved::CprSchema>,
+    pub updated_cte_context: HashMap<delightql_types::SqlIdentifier, crate::names::ScopeId>,
 }
 
 /// Resolve an inner-CPR subquery during the bubbling phase
@@ -49,17 +50,18 @@ pub struct InnerCprBubbleResult {
 /// Returns the dependencies and updated CTE context. The resolved subquery itself
 /// is discarded by the caller.
 pub(in crate::pipeline::resolver) fn resolve_inner_cpr_during_bubbling(
-    subquery: ast_unresolved::RelationalExpression,
+    subquery: ast_unresolved::Chain,
     schema: &dyn DatabaseSchema,
     system: Option<&crate::system::DelightQLSystem>,
-    cte_context: &HashMap<String, ast_resolved::CprSchema>,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    cte_context: &HashMap<delightql_types::SqlIdentifier, crate::names::ScopeId>,
+    outer_context: Option<&[crate::names::ColId]>,
+    identities: &Rc<crate::names::Registry>,
 ) -> Result<InnerCprBubbleResult> {
     // Create temporary registry for resolution, preserving system reference
     // so consulted namespaces (std::math, etc.) remain visible.
     let mut temp_registry = match system {
-        Some(sys) => EntityRegistry::new_with_system(schema, sys),
-        None => EntityRegistry::new(schema),
+        Some(sys) => EntityRegistry::new_with_system(schema, sys, Rc::clone(identities)),
+        None => EntityRegistry::new(schema, Rc::clone(identities)),
     };
 
     // Copy CTE context to temporary registry

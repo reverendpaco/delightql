@@ -73,7 +73,7 @@ impl BinEntity for LikePredicate {
 impl SqlGeneratable for LikePredicate {
     fn generate_sql<'a>(
         &self,
-        args: &[crate::pipeline::sql_ast_v3::DomainExpression],
+        args: &[crate::pipeline::sql_ast::DomainExpression],
         context: &GeneratorContext<'a>,
         negated: bool,
     ) -> Result<String> {
@@ -84,9 +84,9 @@ impl SqlGeneratable for LikePredicate {
             ));
         }
 
-        // Use the render function provided by the transformer
-        let left_sql = (context.render_expr)(&args[0]);
-        let right_sql = (context.render_expr)(&args[1]);
+        // Use the render function provided by the generator.
+        let left_sql = (context.render_expr)(&args[0])?;
+        let right_sql = (context.render_expr)(&args[1])?;
 
         // Generate the LIKE expression
         let operator = if negated { "NOT LIKE" } else { "LIKE" };

@@ -9,8 +9,9 @@
 // rebuilder/transformer already lower correctly (correlation hoists to
 // JOIN ON; the windowed subquery materializes naturally).
 //
-// This implements the Fork-1 path of LIMIT-PLACEMENT-PLAN.md: refined AST
-// is descriptive, not prescriptive (P0').
+// The refiner does the rewriting, not the transformer: refined AST is
+// descriptive of the target SQL shape, not prescriptive input the
+// transformer has to reinterpret.
 //
 // Input shape (resolved phase):
 //
@@ -28,18 +29,19 @@
 // The TupleOrdinal filter is consumed into the rn comparison.
 
 use crate::error::Result;
-use crate::pipeline::asts::core::ProjectionExpr;
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::Comparison;
+use crate::pipeline::asts::core::OutValue;
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved::{
-    self, BooleanExpression, ContainmentSemantic, CprSchema, DomainExpression, FilterOrigin,
-    FunctionExpression, LiteralValue, NamespacePath, PhaseBox, RelationalExpression,
-    SigmaCondition, TupleOrdinalClause, TupleOrdinalOperator, UnaryRelationalOperator,
+    self, Chain, DomainExpression, FilterOrigin, FunctionApplication, LiteralValue, PipeOp,
+    TruthExpression, TupleOrdinalClause, TupleOrdinalOperator,
 };
-use delightql_types::SqlIdentifier;
+use std::rc::Rc;
 
 type OrderingSpec = crate::pipeline::asts::core::OrderingSpec<resolved::Resolved>;
 
 /// Synthetic column name for the row_number() window output.
-const RN_COLUMN: &str = "__dql_rn";
 
 /// Flatten one correlation filter through `and` into its conjunct
 /// comparisons, PROVING each conjunct is an equality. Anything not
@@ -48,32 +50,33 @@ const RN_COLUMN: &str = "__dql_rn";
 /// outer row), and every unrecognized predicate form. The flattened
 /// list is what partition-key extraction consumes, so compound
 /// equalities partition identically to comma-separated ones.
-fn prove_equality_conjunction(
-    f: &BooleanExpression,
-    out: &mut Vec<BooleanExpression>,
-) -> Result<()> {
+fn prove_equality_conjunction(f: &TruthExpression, out: &mut Vec<TruthExpression>) -> Result<()> {
     match f {
-        BooleanExpression::And { left, right } => {
-            prove_equality_conjunction(left, out)?;
-            prove_equality_conjunction(right, out)
+        TruthExpression::Conjunction(parts) => {
+            for part in parts.iter() {
+                prove_equality_conjunction(part, out)?;
+            }
+            Ok(())
         }
-        BooleanExpression::Comparison { operator, .. }
+        TruthExpression::Comparison(Comparison { operator, .. })
             if matches!(
-                operator.as_str(),
-                "null_safe_eq" | "traditional_eq" | "eq" | "="
+                operator,
+                crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual
+                    | crate::pipeline::asts::vocabulary::CmpOp::Equal
             ) =>
         {
             out.push(f.clone());
             Ok(())
         }
-        BooleanExpression::Comparison { operator, .. } => {
-            let spelled = match operator.as_str() {
-                "less_than" => "<",
-                "less_than_eq" => "<=",
-                "greater_than" => ">",
-                "greater_than_eq" => ">=",
-                "traditional_ne" | "null_safe_ne" => "!=",
-                other => other,
+        TruthExpression::Comparison(Comparison { operator, .. }) => {
+            let spelled = match operator {
+                crate::pipeline::asts::vocabulary::CmpOp::LessThan => "<",
+                crate::pipeline::asts::vocabulary::CmpOp::LessThanOrEqual => "<=",
+                crate::pipeline::asts::vocabulary::CmpOp::GreaterThan => ">",
+                crate::pipeline::asts::vocabulary::CmpOp::GreaterThanOrEqual => ">=",
+                crate::pipeline::asts::vocabulary::CmpOp::NotEqual
+                | crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual => "!=",
+                other => other.sql_name(),
             };
             Err(crate::error::DelightQLError::validation_error_categorized(
                 "interior/topn/noneq_correlation",
@@ -89,8 +92,8 @@ fn prove_equality_conjunction(
             format!(
                 "interior top-N requires equality correlation, provable as a conjunction of equalities — this correlation contains {}",
                 match other {
-                    BooleanExpression::Or { .. } => "an `or`",
-                    BooleanExpression::Not { .. } => "a `not`",
+                    TruthExpression::Disjunction(_) => "an `or`",
+                    TruthExpression::Not { .. } => "a `not`",
                     _ => "a predicate form the pre-ranked lowering cannot prove sound",
                 }
             ),
@@ -107,14 +110,15 @@ fn prove_equality_conjunction(
 /// hygienic injection adds them back under synthetic names — those names are
 /// what the window function's PARTITION BY references.
 ///
-/// Returns (rewritten_subquery, hygienic_injections). The caller builds a
-/// `CorrelatedScalarJoin` pattern directly with these — bypassing the
-/// recursive classifier path so injections survive.
+/// The caller builds a `CorrelatedScalarJoin` pattern directly with the
+/// result, bypassing the recursive classifier path so the injection is not
+/// re-run on a shape that no longer matches its trigger.
 pub fn rewrite_window_join_subquery(
-    subquery: RelationalExpression,
-    correlation_filters: &[BooleanExpression],
-    table_identifier: &resolved::QualifiedName,
-) -> Result<(RelationalExpression, Vec<(String, String)>)> {
+    subquery: Chain,
+    correlation_filters: &[TruthExpression],
+    identities: &Rc<crate::names::Registry>,
+) -> Result<Chain> {
+    let inner_scope = super::pattern_classifier::relational_scope(&subquery)?;
     // This lowering pre-ranks per correlation-key group and joins AFTER —
     // sound only when the correlation is a CONJUNCTION OF EQUALITIES,
     // because then each outer row sees exactly one child group and
@@ -125,11 +129,11 @@ pub fn rewrite_window_join_subquery(
     // known-bad shapes is not enough — an `and`-compound once slipped a
     // top-level-only check and emitted an UNPARTITIONED ranking,
     // wronger than the phantom-row bug this guards against.
-    let mut flat_conjuncts: Vec<BooleanExpression> = Vec::new();
+    let mut flat_conjuncts: Vec<TruthExpression> = Vec::new();
     for f in correlation_filters {
         prove_equality_conjunction(f, &mut flat_conjuncts)?;
     }
-    let correlation_filters: &[BooleanExpression] = &flat_conjuncts;
+    let correlation_filters: &[TruthExpression] = &flat_conjuncts;
 
     // The second half of the proof, BEFORE any rewriting: every proved
     // equality conjunct must contribute exactly one directly
@@ -139,8 +143,10 @@ pub fn rewrite_window_join_subquery(
     // family the flattening guard above closes.
     let original_partition_columns = correlation_filters
         .iter()
-        .map(|f| super::correlation_analyzer::prove_partition_key(f, table_identifier))
-        .collect::<Result<Vec<String>>>()?;
+        .map(|filter| {
+            super::correlation_analyzer::prove_partition_key(filter, inner_scope, identities)
+        })
+        .collect::<Result<Vec<crate::names::ColId>>>()?;
 
     // Capture limit value and the inner expression (without the TupleOrdinal filter).
     let (subquery_no_limit, limit_value) = strip_limit(subquery)?;
@@ -151,114 +157,121 @@ pub fn rewrite_window_join_subquery(
     // If the user's projection strips correlation columns, hygienic-inject
     // them so the window function (placed above the projection) can still
     // reference them via synthetic names.
-    let (injected_subquery, injections) = super::pattern_classifier::inject_hygienic_columns_if_needed(
+    let injected_subquery = super::pattern_classifier::inject_hygienic_columns_if_needed(
         subquery_no_order,
         correlation_filters,
-        table_identifier,
+        identities,
     )?;
 
     // Map partition keys through hygienic injection: if a correlation
     // column was injected, the synthetic alias is used; otherwise the
-    // original name (because no projection stripped it).
-    let injection_lookup: std::collections::HashMap<&str, &str> = injections
-        .iter()
-        .map(|(orig, hyg)| (orig.as_str(), hyg.as_str()))
-        .collect();
+    // original name (because no projection stripped it). The carriers are
+    // read back off the subquery that now publishes them — the same question
+    // the flattener asks later, answered the same way.
+    let injection_lookup: std::collections::HashMap<crate::names::ColId, crate::names::ColId> =
+        super::pattern_classifier::correlation_carriers(&injected_subquery, identities)?
+            .into_iter()
+            .collect();
 
     let partition_by: Vec<DomainExpression> = original_partition_columns
         .iter()
-        .map(|name| {
-            let resolved_name = injection_lookup
-                .get(name.as_str())
-                .copied()
-                .unwrap_or(name.as_str());
-            make_lvar(resolved_name)
+        .map(|column| {
+            DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
+                column: injection_lookup.get(column).copied().unwrap_or(*column),
+                explicit_qualifier: false,
+            })))
         })
         .collect();
 
-    // Build the window function expression: row_number() OVER (PARTITION BY ... ORDER BY ...) AS __dql_rn.
-    let window_expr = DomainExpression::Function(FunctionExpression::Window {
-        name: SqlIdentifier::from("row_number"),
-        arguments: vec![],
-        partition_by,
-        order_by: order_specs,
-        frame: None,
-        alias: Some(SqlIdentifier::from(RN_COLUMN)),
+    let row_number_scope = match injected_subquery.continuations.last() {
+        Some(resolved::Continuation::Pipe { cpr_schema, .. }) => Some(*cpr_schema),
+        _ => None,
+    }
+    .unwrap_or_else(|| {
+        identities.mint_scope(
+            crate::names::ScopeOrigin::AnonRelation,
+            crate::names::Hint::None,
+            None,
+        )
+    });
+    let row_number_column = identities.mint_column(
+        row_number_scope,
+        crate::names::ColumnOrigin::Minted {
+            by: crate::names::MintReason::RowNumber,
+        },
+        None,
+        crate::names::Addressing::Hygienic,
+        crate::names::ValueFacts::default(),
+    );
+    let window_item = resolved::OutItem::One(resolved::OneOut {
+        expr: OutValue::Domain(DomainExpression::Application(
+            FunctionApplication::Standard(crate::pipeline::asts::core::StandardApplication {
+                call: crate::pipeline::asts::core::PureCall::from_inner(
+                    crate::pipeline::asts::core::FunctorCall::<resolved::Resolved> {
+                        callee: identities
+                            .mint_function(identities.intern("row_number", false), Vec::new()),
+                        arguments: crate::pipeline::asts::core::operators::CallArguments::Scalar(
+                            Vec::new(),
+                        ),
+                        marks: Default::default(),
+                    },
+                ),
+                guard: None,
+                window: Some(crate::pipeline::asts::core::WindowSpec {
+                    partition: partition_by,
+                    ordering: order_specs,
+                    frame: None,
+                }),
+            }),
+        )),
+        // A compiler-minted witness answers to no authored name.
+        naming: None,
+        output: Some(row_number_column),
     });
 
     // Wrap with a General projection: (*, row_number(...) as __dql_rn).
-    let projected = wrap_with_projection(injected_subquery, window_expr);
+    let projected = wrap_with_projection(injected_subquery, window_item);
 
     // Wrap with WHERE __dql_rn <= N.
-    let limited = wrap_with_rn_filter(projected, limit_value);
+    let limited = wrap_with_rn_filter(projected, row_number_column, limit_value);
 
-    Ok((limited, injections))
+    Ok(limited)
 }
 
 /// Walk the expression to find the (single) TupleOrdinal limit filter,
 /// return (expression with that filter removed, captured limit value).
-fn strip_limit(expr: RelationalExpression) -> Result<(RelationalExpression, i64)> {
+fn strip_limit(expr: Chain) -> Result<(Chain, i64)> {
     use crate::error::DelightQLError;
 
-    fn walk(expr: RelationalExpression) -> (RelationalExpression, Option<i64>) {
-        match expr {
-            RelationalExpression::Filter {
-                source,
-                condition,
-                origin,
-                cpr_schema,
-            } => {
-                if let SigmaCondition::TupleOrdinal(TupleOrdinalClause {
-                    operator: TupleOrdinalOperator::LessThan,
-                    value,
-                    offset: _,
-                }) = &condition
-                {
-                    let captured = *value;
-                    // Drop this filter; recurse to keep walking inner.
-                    return (*source, Some(captured));
-                }
-                let (inner, found) = walk(*source);
-                (
-                    RelationalExpression::Filter {
-                        source: Box::new(inner),
-                        condition,
-                        origin,
-                        cpr_schema,
+    // The bound lives in the shaping run above the relation: this scans that
+    // run and DELIBERATELY does not descend a member's chain, a bag arm, or a
+    // condition's subquery — the boundary is where the shaping stops.
+    let mut stripped = expr;
+    let mut found = None;
+    for index in (0..stripped.continuations.len()).rev() {
+        match &stripped.continuations[index] {
+            resolved::Continuation::Bound {
+                bound:
+                    TupleOrdinalClause {
+                        operator: TupleOrdinalOperator::LessThan,
+                        value,
+                        offset: _,
                     },
-                    found,
-                )
+                ..
+            } => {
+                found = Some(*value);
+                stripped.continuations.remove(index);
+                break;
             }
-            RelationalExpression::Pipe(pipe) => {
-                let pipe = pipe.into_inner();
-                let (inner_source, found) = walk(pipe.source);
-                (
-                    RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                        resolved::PipeExpression {
-                            source: inner_source,
-                            operator: pipe.operator,
-                            cpr_schema: pipe.cpr_schema,
-                        },
-                    ))),
-                    found,
-                )
-            }
-            // STOP at the WHOLE node: limits live in the linear Filter/Pipe chain
-            // above the Join/Relation/SetOperation/IntersectCorresponding/ER, so
-            // those are returned WHOLESALE — we deliberately do NOT descend a Join
-            // arm or a SetOperation operand. Returning the whole node drops no
-            // recursive field (the node IS the boundary), so this catch-all is
-            // R-I3-safe; the boundary is stated by this comment. (The Filter arm
-            // above preserves `condition` wholesale — it peels the limit off the
-            // spine without recursing into the condition, the base-spine contract.)
-            other => (other, None),
+            resolved::Continuation::Restrict { .. }
+            | resolved::Continuation::Bound { .. }
+            | resolved::Continuation::Pipe { .. } => {}
+            _ => break,
         }
     }
 
-    let (stripped, found) = walk(expr);
     let value = found.ok_or_else(|| DelightQLError::ParseError {
-        message: "rewrite_window_join_subquery: expected TupleOrdinal limit but found none"
-            .to_string(),
+        message: "rewrite_window_join_subquery: expected a row bound but found none".to_string(),
         source: None,
         subcategory: None,
     })?;
@@ -270,138 +283,76 @@ fn strip_limit(expr: RelationalExpression) -> Result<(RelationalExpression, i64)
 /// is present, returns the expression unchanged with an empty spec list —
 /// row_number() with no ORDER BY is legal SQL though deterministic only
 /// per-partition, mirroring DQL's "limit without order" semantics.
-fn strip_order_by(expr: RelationalExpression) -> (RelationalExpression, Vec<OrderingSpec>) {
-    fn walk(
-        expr: RelationalExpression,
-    ) -> (RelationalExpression, Option<Vec<OrderingSpec>>) {
-        match expr {
-            RelationalExpression::Pipe(pipe) => {
-                let pipe = pipe.into_inner();
-                if let UnaryRelationalOperator::TupleOrdering { specs, .. } = &pipe.operator {
-                    let captured = specs.clone();
-                    // Drop this pipe; continue walking inner for completeness.
-                    let (inner, _) = walk(pipe.source);
-                    return (inner, Some(captured));
-                }
-                let (inner_source, found) = walk(pipe.source);
-                (
-                    RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                        resolved::PipeExpression {
-                            source: inner_source,
-                            operator: pipe.operator,
-                            cpr_schema: pipe.cpr_schema,
-                        },
-                    ))),
-                    found,
-                )
+fn strip_order_by(expr: Chain) -> (Chain, Vec<OrderingSpec>) {
+    let mut stripped = expr;
+    let mut found: Option<Vec<OrderingSpec>> = None;
+    for index in (0..stripped.continuations.len()).rev() {
+        match &stripped.continuations[index] {
+            resolved::Continuation::Structural(resolved::StructuralStep {
+                form: resolved::StructuralForm::Ordering { specs },
+                ..
+            }) => {
+                found = Some(specs.clone());
+                stripped.continuations.remove(index);
+                break;
             }
-            RelationalExpression::Filter {
-                source,
-                condition,
-                origin,
-                cpr_schema,
-            } => {
-                let (inner, found) = walk(*source);
-                (
-                    RelationalExpression::Filter {
-                        source: Box::new(inner),
-                        condition,
-                        origin,
-                        cpr_schema,
-                    },
-                    found,
-                )
-            }
-            other => (other, None),
+            resolved::Continuation::Restrict { .. }
+            | resolved::Continuation::Pipe { .. }
+            | resolved::Continuation::Structural(_) => {}
+            _ => break,
         }
     }
-
-    let (stripped, found) = walk(expr);
     (stripped, found.unwrap_or_default())
 }
 
-/// Wrap an expression with a General projection that adds `Glob, window_expr`.
-fn wrap_with_projection(
-    source: RelationalExpression,
-    window_expr: DomainExpression,
-) -> RelationalExpression {
-    let glob = DomainExpression::Projection(ProjectionExpr::Glob {
-        qualifier: None,
-        namespace_path: NamespacePath::empty(),
-    });
-
+/// Wrap an expression with a General projection carrying the whole operand
+/// and then the window item.
+///
+/// A RESOLVED PROJECTION HOLDS NO AUTHORED SPREAD. What this needs is not
+/// the expansion of a glob but the operand ITSELF: the subquery's hygienic
+/// columns have to ride through, and a column named in a select list
+/// cannot be hygienic. `Whole` is that meaning, and it is also why the
+/// schema below can stay the placeholder the FAR cycle recomputes — there
+/// is no heading to read here.
+fn wrap_with_projection(source: Chain, window_item: resolved::OutItem) -> Chain {
     // Carry the source's cpr_schema as the operator's schema. The FAR cycle
     // recomputes schemas during rebuild, so this is a placeholder.
-    let source_schema = extract_cpr_box(&source);
+    let source_schema = crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&source);
 
-    let pipe = resolved::PipeExpression {
-        source,
-        operator: UnaryRelationalOperator::General {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            expressions: vec![glob, window_expr],
-        },
+    source.then(resolved::Continuation::Pipe {
+        operator: PipeOp::Project(
+            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
+                resolved::OutItem::Whole,
+                window_item,
+            ])
+            .expect("the window projection carries the whole and the window item"),
+        ),
+        named: (),
         cpr_schema: source_schema,
-    };
-    RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(pipe)))
+    })
 }
 
-/// Wrap an expression with a Filter `__dql_rn <= N`.
-fn wrap_with_rn_filter(source: RelationalExpression, limit: i64) -> RelationalExpression {
-    let rn_lvar = make_lvar(RN_COLUMN);
-    let limit_literal = DomainExpression::Literal {
-        value: LiteralValue::Number(limit.to_string()),
-        alias: None,
-    };
+/// Wrap an expression with a filter over the generated row-number occurrence.
+fn wrap_with_rn_filter(source: Chain, row_number_column: crate::names::ColId, limit: i64) -> Chain {
+    let rn_lvar = DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
+        column: row_number_column,
+        explicit_qualifier: false,
+    })));
+    let limit_literal = DomainExpression::Application(FunctionApplication::Ground(
+        LiteralValue::Number(limit.to_string()),
+    ));
 
-    let comparison = BooleanExpression::Comparison {
-        operator: "<=".to_string(),
+    let comparison = TruthExpression::Comparison(Comparison {
+        operator: crate::pipeline::asts::vocabulary::CmpOp::LessThanOrEqual,
         left: Box::new(rn_lvar),
         right: Box::new(limit_literal),
-    };
+    });
 
-    let source_schema = extract_cpr_box(&source);
+    let source_schema = crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&source);
 
-    RelationalExpression::Filter {
-        source: Box::new(source),
-        condition: SigmaCondition::Predicate(comparison),
+    source.then(resolved::Continuation::Restrict {
+        condition: comparison,
         origin: FilterOrigin::Generated,
         cpr_schema: source_schema,
-    }
-}
-
-/// Build an unqualified Lvar referring to a synthetic column.
-fn make_lvar(name: &str) -> DomainExpression {
-    DomainExpression::Lvar {
-        name: SqlIdentifier::from(name),
-        qualifier: None,
-        namespace_path: NamespacePath::empty(),
-        alias: None,
-        provenance: PhaseBox::phantom(),
-    }
-}
-
-/// Extract the cpr_schema PhaseBox from a relational expression, cloning it
-/// so we can reuse it as a placeholder for newly constructed wrapping nodes.
-/// FAR rebuild recomputes schemas, so any reasonable carrier is fine.
-fn extract_cpr_box(expr: &RelationalExpression) -> PhaseBox<CprSchema, resolved::Resolved> {
-    match expr {
-        RelationalExpression::Relation(rel) => match rel {
-            resolved::Relation::Ground { cpr_schema, .. }
-            | resolved::Relation::Anonymous { cpr_schema, .. }
-            | resolved::Relation::TVF { cpr_schema, .. }
-            | resolved::Relation::InnerRelation { cpr_schema, .. } => cpr_schema.clone(),
-            resolved::Relation::ConsultedView { scoped, .. } => {
-                PhaseBox::new(scoped.get().schema().clone())
-            }
-            resolved::Relation::PseudoPredicate { .. } => PhaseBox::new(CprSchema::Unknown),
-        },
-        RelationalExpression::Filter { cpr_schema, .. }
-        | RelationalExpression::Join { cpr_schema, .. }
-        | RelationalExpression::SetOperation { cpr_schema, .. } => cpr_schema.clone(),
-        RelationalExpression::Pipe(pipe) => pipe.cpr_schema.clone(),
-        RelationalExpression::IntersectCorresponding { cpr_schema, .. } => cpr_schema.clone(),
-        RelationalExpression::ErJoinChain { .. } | RelationalExpression::ErTransitiveJoin { .. } => {
-            PhaseBox::new(CprSchema::Unknown)
-        }
-    }
+    })
 }

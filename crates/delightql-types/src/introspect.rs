@@ -44,6 +44,40 @@ pub trait DatabaseIntrospector: Send {
     /// * `Ok(Vec<DiscoveredEntity>)` - List of discovered tables/views with columns in that schema
     /// * `Err(DelightQLError)` - If introspection fails
     fn introspect_entities_in_schema(&self, schema: &str) -> Result<Vec<DiscoveredEntity>>;
+
+    /// Introspect one relation by name, including backend-owned relations
+    /// omitted from ordinary catalog enumeration.
+    ///
+    /// The default is sufficient for backends whose complete relation set is
+    /// enumerable. Backends with addressable system catalogs override this to
+    /// ask for the named relation directly.
+    fn introspect_relation(
+        &self,
+        schema: Option<&str>,
+        relation_name: &str,
+    ) -> Result<Option<DiscoveredRelation>> {
+        let entities = match schema {
+            Some(schema) => self.introspect_entities_in_schema(schema)?,
+            None => self.introspect_entities()?,
+        };
+        Ok(entities
+            .into_iter()
+            .find(|entity| entity.name.as_str() == relation_name)
+            .map(|entity| DiscoveredRelation {
+                entity,
+                backend_schema: schema.map(str::to_owned),
+            }))
+    }
+}
+
+/// One directly addressable relation and the schema that must qualify its
+/// execution. A backend may answer a different schema than the one requested:
+/// connection-local catalogs, for example, are introspected from and executed
+/// in no persistent schema.
+#[derive(Debug, Clone)]
+pub struct DiscoveredRelation {
+    pub entity: DiscoveredEntity,
+    pub backend_schema: Option<String>,
 }
 
 /// Discovered entity from database introspection

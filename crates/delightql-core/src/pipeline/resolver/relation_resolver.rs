@@ -2,13 +2,13 @@
 // Copyright 2026 Daniel Eklund
 //! Relation resolution logic
 //!
-//! This module handles the resolution of Relation nodes (Ground, Anonymous, TVF)
+//! This module handles the resolution of base relations and relational calls.
 //! and pattern application for positional patterns.
+use crate::pipeline::asts::core::literals::column_ordinal_text;
+use crate::pipeline::asts::core::{AuthoredColumn, ColumnOccurrence};
 
 use super::tvf::get_tvf_schema;
-use super::type_conversion::{
-    convert_domain_expression, convert_qualified_name, preserve_domain_spec,
-};
+use super::type_conversion::{convert_domain_expression, convert_qualified_name};
 use super::{BubbledState, JoinContext, PatternResolver, ResolutionConfig};
 use crate::enums::EntityType as BootstrapEntityType;
 use crate::error::{DelightQLError, Result};
@@ -16,119 +16,177 @@ use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_resolved::NamespacePath;
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::ast_unresolved;
+use crate::pipeline::asts::core::Comparison;
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use delightql_types::SqlIdentifier;
 
-/// Generate a unique resolver-phase alias paired with an opaque ResolverId.
-fn resolver_alias_with_id(
-    counter: &super::ResolverAliasCounter,
-) -> (String, crate::pipeline::asts::core::provenance::ResolverId) {
-    counter.next_alias_with_id()
+pub(super) fn bind_physical_relation(
+    scope: crate::names::ScopeId,
+    canonical: Option<&SqlIdentifier>,
+    backend_schema: Option<&str>,
+    identities: &crate::names::Registry,
+) -> Result<()> {
+    let Some(entity) = identities.entity_of_scope(scope) else {
+        return Err(DelightQLError::parse_error(
+            "A physical relation heading has no catalog entity identity",
+        ));
+    };
+    let canonical = canonical.map(|name| identities.intern(name.as_str(), name.is_stropped()));
+    let backend_schema = backend_schema.map(|name| identities.intern(name, false));
+    identities.bind_entity_physical(entity, canonical, backend_schema);
+    Ok(())
 }
 
-/// Compute an effective alias: use the user-supplied alias if present,
-/// otherwise generate a fresh resolver alias with an associated ResolverId.
-fn compute_effective_alias(
-    alias: &Option<SqlIdentifier>,
-    alias_counter: &super::ResolverAliasCounter,
-) -> (
-    SqlIdentifier,
-    Option<crate::pipeline::asts::core::provenance::ResolverId>,
-) {
-    if let Some(a) = alias.clone() {
-        (a, None)
-    } else {
-        let (alias_str, rid) = resolver_alias_with_id(alias_counter);
-        (alias_str.into(), Some(rid))
+/// Resolve a relation-access shape that has no heading available for binding.
+///
+/// Glob shapes carry no slot expressions. A positional shape needs a source
+/// heading so each authored slot can become the occurrence it binds.
+pub(super) fn resolve_schema_free_access(
+    spec: &ast_unresolved::Access,
+) -> Result<ast_resolved::Access> {
+    match spec {
+        ast_unresolved::Access::All => Ok(ast_resolved::Access::All),
+        ast_unresolved::Access::Unasked => Ok(ast_resolved::Access::Unasked),
+        ast_unresolved::Access::Dequalify(columns) => {
+            Ok(ast_resolved::Access::Dequalify(columns.clone()))
+        }
+        ast_unresolved::Access::DequalifyAll => Ok(ast_resolved::Access::DequalifyAll),
+        ast_unresolved::Access::Slots(_) => Err(DelightQLError::validation_error(
+            "A positional relation access requires a resolved heading",
+            "Positional pattern resolution",
+        )),
     }
 }
 
-/// The access-boundary export for a consulted view/fact. A view's
-/// lvars are a function of how it is CALLED, not how its body spelled
-/// them: the columns ANSWER TO the access name (the user's alias, or
-/// the bare view name) for full-name unification, and export nothing
-/// bare — declared_bare belongs to the caller's own argumentative
-/// bindings; it never leaks through the entity boundary. The SQL
-/// alias stays synthetic (hygiene: self-joins need distinct aliases),
-/// so the access name rides the metadata, not the alias.
+/// Mint a distinct resolver-phase occurrence for an unaliased access.
+fn resolver_scope(identities: &crate::names::Registry, entity_name: &str) -> crate::names::ScopeId {
+    let spelling = identities.intern(entity_name, false);
+    let entity = identities.mint_entity(spelling);
+    identities.mint_derived_scope(
+        crate::names::ScopeOrigin::Resolution { of: entity },
+        crate::names::Hint::Prefix("resolver"),
+    )
+}
+
+/// Compute an effective alias: use the user-supplied alias if present,
+/// otherwise retain the authored access spelling while a fresh structural
+/// occurrence provides SQL alias hygiene at baptism.
+fn compute_effective_alias(
+    alias: &Option<SqlIdentifier>,
+    identities: &crate::names::Registry,
+    entity_name: &str,
+) -> (SqlIdentifier, Option<crate::names::ScopeId>) {
+    if let Some(a) = alias.clone() {
+        (a, None)
+    } else {
+        let scope = resolver_scope(identities, entity_name);
+        (entity_name.into(), Some(scope))
+    }
+}
+
+/// The access-boundary export for a consulted view/fact.
+///
+/// A view's lvars are a function of how it is CALLED, not of how its body
+/// spelled them, and the access name — the user's alias, or the bare view name
+/// — is what qualifies them. But the name a column answers to and the name it
+/// is published under are two facts, not one: exporting a column that answers
+/// ONLY to the access name makes `v(*), name = "x"` unaddressable, because
+/// nothing published `name` any more. So the export is `BareAnswering`: the
+/// column keeps its published name and is ALSO reachable under the access
+/// name, which is the pairing full-name unification needs.
+///
+/// What still does not cross is the caller's own argumentative binding —
+/// `declared_bare` belongs to the call site and never leaks through the entity
+/// boundary. The SQL occurrence stays distinct (hygiene: self-joins need
+/// distinct aliases), while the access name rides the metadata rather than
+/// naming that occurrence.
+/// Say where a consulted body failed WITHOUT taking its badge away.
+///
+/// A body is compiled by the ordinary machinery, so its refusals are the
+/// ordinary ones and they already carry the identifier that names them. Only
+/// an UNBADGED failure gains the view's context here: re-wrapping a
+/// categorized refusal as a runtime database error renames a semantic
+/// refusal after the fact, and an annotation matching on its badge stops
+/// matching (badge hygiene).
+fn wrap_view_body_error(
+    error: DelightQLError,
+    doing: &str,
+    view_name: &str,
+    view_ns: &str,
+) -> DelightQLError {
+    if error.error_uri() != "delightql-error://runtime" {
+        return error;
+    }
+    DelightQLError::database_error(
+        format!("Error while {doing} pre-grounded view '{view_name}' (from namespace '{view_ns}'): {error}"),
+        error.to_string(),
+    )
+}
+
 fn access_boundary_export(
     alias: &Option<SqlIdentifier>,
     entity_name: &str,
-    body_schema: &ast_resolved::CprSchema,
-    alias_counter: &super::ResolverAliasCounter,
-) -> (
-    SqlIdentifier,
-    Option<crate::pipeline::asts::core::provenance::ResolverId>,
-    ast_resolved::CprSchema,
-) {
-    let (effective, resolver_id) = compute_effective_alias(alias, alias_counter);
+    input: crate::names::ScopeId,
+    identities: &crate::names::Registry,
+) -> (SqlIdentifier, crate::names::ScopeId) {
+    let (effective, resolver_id) = compute_effective_alias(alias, identities, entity_name);
     let access_name: SqlIdentifier = match alias.clone() {
         Some(a) => a,
         None => entity_name.into(),
     };
-    let export = match body_schema.clone() {
-        ast_resolved::CprSchema::Resolved(mut cols) => {
-            for col in &mut cols {
-                col.export_answering_to(access_name.clone());
-            }
-            ast_resolved::CprSchema::Resolved(cols)
+    let scope = resolver_id.unwrap_or_else(|| {
+        let hint = identities.intern(access_name.as_str(), access_name.is_stropped());
+        identities.mint_derived_scope(
+            crate::names::ScopeOrigin::UserAlias { of: input },
+            crate::names::Hint::User(hint),
+        )
+    });
+    let access =
+        identities.canonical(identities.intern(access_name.as_str(), access_name.is_stropped()));
+    for column in identities.heading(input).columns_seen() {
+        crate::probe::probe!(
+            reconcile,
+            "boundary export {:?} {:?} -> {:?}",
+            column,
+            identities.addressing(column),
+            scope
+        );
+        // A hygienic carrier stops at the boundary. The slot it stands
+        // for introduced no name — a ground term, a repeat, `_` — so
+        // it publishes nothing, and it exists only to be read by a
+        // WHERE inside the body it came from. Exporting it hands it
+        // the access name, which publishes an internal column AND
+        // puts a target in the heading that no inner column can
+        // answer. A head that names its columns already drops it
+        // before this point; a glob head must reach the same heading.
+        if identities.addressing(column) == crate::names::Addressing::Hygienic {
+            continue;
         }
-        other => other,
-    };
-    (effective, resolver_id, export)
-}
-
-/// Derive a DomainSpec from ho_arguments (replaces the former `first_parens_spec` field).
-/// Table arguments → Lvar with the table name.
-/// Scalar arguments → the domain expression directly.
-fn ho_arguments_to_domain_spec(
-    ho_args: &[ast_unresolved::HoArgument],
-) -> ast_unresolved::DomainSpec {
-    let exprs: Vec<ast_unresolved::DomainExpression> = ho_args
-        .iter()
-        .map(|arg| match arg {
-            crate::pipeline::asts::core::operators::HoArgument::Table(rel) => {
-                // Extract table name as Lvar
-                match rel {
-                    ast_unresolved::RelationalExpression::Relation(
-                        ast_unresolved::Relation::Ground { identifier, .. },
-                    ) => {
-                        ast_unresolved::DomainExpression::lvar_builder(identifier.name.to_string())
-                            .build()
-                    }
-                    _ => ast_unresolved::DomainExpression::lvar_builder("_ho_derived_").build(),
-                }
-            }
-            crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => dom.clone(),
-        })
-        .collect();
-
-    // Single glob → DomainSpec::Glob
-    if exprs.len() == 1 {
-        if let ast_unresolved::DomainExpression::Projection(
-            ast_unresolved::ProjectionExpr::Glob { .. },
-        ) = &exprs[0]
-        {
-            return ast_unresolved::DomainSpec::Glob;
-        }
+        identities.republish_column(
+            column,
+            scope,
+            crate::names::Republish::BoundaryExport,
+            identities.published(column),
+            crate::names::Addressing::BareAnswering(access),
+            |_| {},
+        );
     }
-
-    if exprs.is_empty() {
-        ast_unresolved::DomainSpec::Glob
-    } else {
-        ast_unresolved::DomainSpec::Positional(exprs)
-    }
+    (effective, scope)
 }
 
 /// Helper to apply PatternResolver for column selection
 pub(super) fn apply_pattern_resolver(
-    domain_spec: &ast_unresolved::DomainSpec,
-    base_cols: &[ast_resolved::ColumnMetadata],
+    access: &ast_unresolved::Access,
+    base_cols: &[crate::names::ColId],
     table_name: &str,
-    _registry: &crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    // VALIDATE: Positional pattern length must match table columns
-    if let ast_unresolved::DomainSpec::Positional(patterns) = domain_spec {
+    registry: &crate::resolution::EntityRegistry,
+    outer_context: Option<&[crate::names::ColId]>,
+    formal_frame: Option<&super::FormalFrame>,
+    resolution_scope: Option<&str>,
+    instantiation_depth: &super::InstantiationDepth,
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    // VALIDATE: slot pattern length must match table columns
+    if let ast_unresolved::Access::Slots(patterns) = access {
         if patterns.len() != base_cols.len() {
             return Err(DelightQLError::validation_error(
                 format!(
@@ -140,15 +198,21 @@ pub(super) fn apply_pattern_resolver(
         }
     }
 
-    // GlobWithUsingAll: no per-column validation needed (shared cols computed at join time)
+    // DequalifyAll: no per-column validation needed (shared cols computed at join time)
     // — just proceed to pattern resolver which treats it like Glob
 
-    // VALIDATE: GlobWithUsing columns must exist in the table
-    if let ast_unresolved::DomainSpec::GlobWithUsing(using_cols) = domain_spec {
+    // VALIDATE: Dequalify columns must exist in the table
+    if let ast_unresolved::Access::Dequalify(using_cols) = access {
         for col_name in using_cols {
+            // As written: the dequalifying step names the column the author
+            // spelled, and this is the read that decides whether it is there.
+            let spelling = registry
+                .identities
+                .intern(col_name.as_str(), col_name.is_stropped());
+            let name = registry.identities.canonical(spelling);
             let exists = base_cols
                 .iter()
-                .any(|c| delightql_types::SqlIdentifier::str_eq(c.name(), col_name));
+                .any(|column| registry.identities.published_sym(*column) == Some(name));
             if !exists {
                 return Err(DelightQLError::column_not_found_error(
                     col_name.clone(),
@@ -162,93 +226,40 @@ pub(super) fn apply_pattern_resolver(
     }
 
     // Use the actual PatternResolver
-    let pattern_resolver = PatternResolver::new();
+    let pattern_resolver = PatternResolver::with_formals(
+        formal_frame,
+        Some(super::SlotInstantiation {
+            scoped_cfes: &registry.query_local.scoped_cfes,
+            consult: &registry.consult,
+            lookup_scope: resolution_scope,
+            depth: instantiation_depth,
+        }),
+    );
 
     // Convert outer_context to JoinContext if present
     let join_context = outer_context.map(JoinContext::from);
 
     match pattern_resolver.resolve_pattern(
-        domain_spec,
+        access,
         base_cols,
         table_name,
         join_context.as_ref(),
+        &registry.identities,
     ) {
         Ok(pattern_result) => {
-            let output_columns = pattern_result.output_columns;
-            let filtered_schema = ast_resolved::CprSchema::Resolved(output_columns.clone());
+            let output_scope = pattern_result.output_scope;
+            let resolved_spec = pattern_result.resolved_spec(access)?;
+            let output_columns = pattern_result.output_columns.into_vec();
 
-            // Create the base relation
-            let base_relation = ast_resolved::Relation::Ground {
-                identifier: ast_resolved::QualifiedName {
-                    name: table_name.into(),
-                    namespace_path: NamespacePath::empty(),
-                    grounding: None,
-                },
-                canonical_name: ast_resolved::PhaseBox::new(None),
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                domain_spec: preserve_domain_spec(domain_spec)?,
-                alias: None, // Will be set by caller
-                outer: false,
-                mutation_target: false,
-                passthrough: false,
-                cpr_schema: ast_resolved::PhaseBox::new(filtered_schema),
-                hygienic_injections: Vec::new(),
-            };
+            // Create the base read. Outerness is the caller's to set:
+            // this road resolves the pattern, not the call site.
+            let final_expr = super::pattern_resolver::apply_local_constraints(
+                ast_resolved::Relation::ground_read(resolved_spec, false, output_scope),
+                pattern_result.where_constraints,
+                output_scope,
+            );
 
-            let mut final_expr = ast_resolved::RelationalExpression::Relation(base_relation);
-
-            // Apply WHERE constraints if any literals were found
-            if !pattern_result.where_constraints.is_empty() {
-                // Combine multiple constraints with AND
-                let combined_condition = if pattern_result.where_constraints.len() == 1 {
-                    pattern_result
-                        .where_constraints
-                        .into_iter()
-                        .next()
-                        .expect("Checked len==1 above")
-                } else {
-                    // Create AND chain for multiple constraints
-                    pattern_result
-                        .where_constraints
-                        .into_iter()
-                        .reduce(|left, right| ast_resolved::BooleanExpression::And {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        })
-                        .expect("Checked non-empty above, reduce must succeed")
-                };
-
-                let sigma_condition = ast_resolved::SigmaCondition::Predicate(combined_condition);
-
-                final_expr = ast_resolved::RelationalExpression::Filter {
-                    source: Box::new(final_expr),
-                    condition: sigma_condition,
-                    origin: ast_resolved::FilterOrigin::PositionalLiteral {
-                        source_table: table_name.to_string(),
-                    },
-                    cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                        output_columns.clone(),
-                    )),
-                };
-            }
-
-            // Store join conditions for later application during JOIN operations
-            // For positional patterns like (user_id, o.user_id), these become JOIN conditions
-            if !pattern_result.join_conditions.is_empty() {
-                // For now, log the join conditions - they'll be applied by the JOIN resolver
-                // In a full implementation, these would be stored in the resolved relation
-                // and retrieved during JOIN processing
-                log::debug!(
-                    "Storing {} join conditions from positional pattern for table {}",
-                    pattern_result.join_conditions.len(),
-                    table_name
-                );
-
-                // TODO: Integrate with JOIN resolver to apply these conditions
-                // The JOIN resolver should check for stored join conditions when processing JOINs
-            }
-
-            let mut state = BubbledState::resolved(output_columns);
+            let mut state = BubbledState::resolved(output_columns.to_vec(), &registry.identities);
             // A relation pattern controls what the relation contributes to
             // the result, but its source columns remain addressable while the
             // surrounding relational expression is being formed. This is
@@ -256,44 +267,176 @@ pub(super) fn apply_pattern_resolver(
             // attached join predicate without leaking `id` into the output.
             // A following pipe remains the scope barrier and discards these
             // source qualifiers.
-            state.qualifier_scope = base_cols.to_vec();
+            state.qualifier_scope.clear();
+            for column in base_cols {
+                let scope = registry.identities.scope_of(*column);
+                if !state.qualifier_scope.contains(&scope) {
+                    state.qualifier_scope.push(scope);
+                }
+            }
             Ok((final_expr, state))
         }
-        Err(e) => {
-            // If PatternResolver fails, fall back to original behavior
-            // Use debug level since fallback is expected for unsupported patterns
-            log::debug!(
-                "PatternResolver not applicable for table {} ({}), using fallback",
-                table_name,
-                e
-            );
-            let schema = ast_resolved::CprSchema::Resolved(base_cols.to_vec());
-            let relation = ast_resolved::Relation::Ground {
-                identifier: ast_resolved::QualifiedName {
-                    name: table_name.into(),
-                    namespace_path: NamespacePath::empty(),
-                    grounding: None,
-                },
-                canonical_name: ast_resolved::PhaseBox::new(None),
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                domain_spec: preserve_domain_spec(domain_spec)?,
-                alias: None,
-                outer: false,
-                mutation_target: false,
-                passthrough: false,
-                cpr_schema: ast_resolved::PhaseBox::new(schema),
-                hygienic_injections: Vec::new(),
-            };
-            Ok((
-                ast_resolved::RelationalExpression::Relation(relation),
-                BubbledState::resolved(base_cols.to_vec()),
-            ))
-        }
+        // A pattern that cannot be resolved REFUSES. It must never widen to
+        // the full base schema: the pattern is the user's statement of what
+        // the relation contributes, so publishing every column instead
+        // returns wrong data for a query that looks correct — the one
+        // failure mode this family is named for.
+        Err(e) => Err(e),
     }
 }
 
 // resolve_relation_with_registry — DELETED (Step 0f). Dispatch absorbed into
 // ResolverFold::resolve_relation_impl (resolver_fold.rs).
+
+/// Resolve a compiler-owned relation read by identity. Its producer has
+/// already published the heading, so no query-local spelling lookup
+/// participates.
+pub(super) fn resolve_plan_scope(
+    rel: ast_unresolved::Relation,
+    access: ast_unresolved::Access,
+    registry: &crate::resolution::EntityRegistry,
+    outer_context: Option<&[crate::names::ColId]>,
+    formal_frame: Option<&super::FormalFrame>,
+    config: &ResolutionConfig,
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    let ast_unresolved::Relation::Ground {
+        mention:
+            ast_unresolved::GroundMention::Plan {
+                scope,
+                authored_name,
+                alias,
+            },
+        outer,
+        cpr_schema: _,
+    } = rel
+    else {
+        unreachable!("resolve_plan_scope called with a different relation")
+    };
+    if !matches!(
+        registry.identities.origin_of(scope),
+        crate::names::ScopeOrigin::Scratch { .. } | crate::names::ScopeOrigin::HoCarrier { .. }
+    ) {
+        return Err(DelightQLError::validation_error(
+            "A plan-scope relation must refer to compiler-owned storage",
+            "compiler relation identity",
+        ));
+    }
+    let source_columns = registry.identities.known_heading(scope)?;
+    if source_columns.is_empty() {
+        return Err(DelightQLError::validation_error(
+            "A plan-scope relation was read before its heading was published",
+            "compiler relation identity",
+        ));
+    }
+    let source_expr = ast_resolved::Relation::ground_read(ast_resolved::Access::All, false, scope);
+
+    let Some(authored_name) = authored_name else {
+        if !matches!(access, ast_unresolved::Access::All) || alias.is_some() || outer {
+            return Err(DelightQLError::validation_error(
+                "A direct plan-scope read cannot carry user access metadata",
+                "effect plan identity",
+            ));
+        }
+        return Ok((
+            source_expr,
+            BubbledState::resolved(source_columns.to_vec(), &registry.identities),
+        ));
+    };
+
+    // An argumentative declaration states exact width, and a positional
+    // pattern on a carrier is that declaration applied — so a width mismatch
+    // refuses under the same param-arity category the by-name binding road
+    // uses, before any occurrence is minted.
+    if let ast_unresolved::Access::Slots(patterns) = &access {
+        if matches!(
+            registry.identities.origin_of(scope),
+            crate::names::ScopeOrigin::HoCarrier { .. }
+        ) {
+            let visible = registry
+                .identities
+                .known_heading(scope)?
+                .iter()
+                .filter(|column| {
+                    registry.identities.addressing(**column) != crate::names::Addressing::Hygienic
+                })
+                .count();
+            if patterns.len() != visible {
+                return Err(DelightQLError::validation_error_categorized(
+                    "constraint/ho_param/argumentative_functor/arity",
+                    format!(
+                        "Positional pattern incomplete - rule '{}' has {} columns but pattern specifies {} elements",
+                        authored_name,
+                        visible,
+                        patterns.len(),
+                    ),
+                    "HO parameter arity mismatch",
+                ));
+            }
+        }
+    }
+
+    // A redirected authored access has two identities: the scratch object
+    // in the inner FROM and the caller-facing occurrence outside it. Keeping
+    // them as nested relations prevents pattern resolution from replacing
+    // the physical scratch scope with an authored alias scope.
+    let access_name = alias.clone().unwrap_or_else(|| authored_name.clone());
+    let access_spelling = registry
+        .identities
+        .intern(access_name.as_str(), access_name.is_stropped());
+    let access_sym = registry.identities.canonical(access_spelling);
+    let access_scope = registry.identities.mint_derived_scope(
+        crate::names::ScopeOrigin::UserAlias { of: scope },
+        crate::names::Hint::User(access_spelling),
+    );
+    for column in source_columns {
+        registry.identities.republish_column(
+            column,
+            access_scope,
+            crate::names::Republish::BoundaryExport,
+            registry.identities.published(column),
+            crate::names::Addressing::BareAnswering(access_sym),
+            |_| {},
+        );
+    }
+    let access_expr = ast_resolved::Chain::relation(ast_resolved::Relation::InnerRelation {
+        pattern: ast_resolved::InnerRelationPattern::Indeterminate {
+            identifier: ast_resolved::QualifiedName {
+                namespace_path: NamespacePath::empty(),
+                name: authored_name.clone(),
+            },
+            subquery: Box::new(source_expr),
+        },
+        preminted_scope: Some(access_scope),
+        alias: Some(access_name.clone()),
+        outer,
+        cpr_schema: access_scope,
+    });
+
+    if matches!(access, ast_unresolved::Access::All) {
+        let columns = registry.identities.known_heading(access_scope)?;
+        return Ok((
+            access_expr,
+            BubbledState::resolved(columns.to_vec(), &registry.identities),
+        ));
+    }
+
+    apply_call_site_pattern(
+        &access,
+        access_expr,
+        access_scope,
+        access_name.as_str(),
+        authored_name.as_str(),
+        outer_context,
+        &registry.identities,
+        formal_frame,
+        Some(super::SlotInstantiation {
+            scoped_cfes: &registry.query_local.scoped_cfes,
+            consult: &registry.consult,
+            lookup_scope: config.resolution_namespace.as_deref(),
+            depth: &config.instantiation_depth,
+        }),
+    )
+}
 
 /// Resolve a Ground relation variant (named table, view, CTE, or consulted entity).
 ///
@@ -301,284 +444,62 @@ pub(super) fn apply_pattern_resolver(
 /// unqualified tables, CTEs, consulted views/facts, and unknown entities.
 pub(super) fn resolve_ground(
     rel: ast_unresolved::Relation,
+    access: ast_unresolved::Access,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+) -> Result<(ast_resolved::Chain, BubbledState)> {
     use crate::resolution::{resolve_entity_with_alias, EntityDefinition, ResolutionResult};
 
     let ast_unresolved::Relation::Ground {
-        identifier,
-        canonical_name: _,
-        backend_schema: _,
-        domain_spec,
-        alias,
+        mention:
+            ast_unresolved::GroundMention::Named {
+                identifier,
+                alias,
+                mutation_target,
+                passthrough,
+            },
         outer,
-        mutation_target: _,
-        passthrough,
         cpr_schema: _,
-        hygienic_injections: _,
     } = rel
     else {
         unreachable!("resolve_ground called with non-Ground variant");
     };
 
+    // `!!` is evidence about the relation this access reads, and it belongs
+    // to the occurrence the access publishes — recorded below, once the
+    // relation kind has been settled and before anything is built on it.
+    // Every relation built from that occurrence afterwards carries the
+    // evidence, so a name, an alias, a CTE binding or a join arm hands it on
+    // instead of leaving a later reader to walk the syntax back to a ground
+    // name it may no longer have.
+    let marked_relation = mutation_target.then(|| {
+        registry
+            .identities
+            .intern(identifier.name.as_str(), identifier.name.is_stropped())
+    });
+
     // PASSTHROUGH: skip entity catalog, use schema introspector directly.
     if passthrough {
-        return r_resolve_passthrough(
+        let resolved = r_resolve_passthrough(
             identifier,
-            domain_spec,
+            access,
             alias,
             outer,
             registry,
             outer_context,
             config,
-        );
+        )?;
+        note_mutation_mark(marked_relation, &resolved.0, &registry.identities);
+        return Ok(resolved);
     }
 
     // Check for namespace-qualified tables FIRST
     // Bypass resolve_entity_with_alias for namespace-qualified tables
     // CTEs can't have namespace paths (they're query-local), so this is safe
-    let resolution = if let Some(ref grounding) = identifier.grounding {
-        // F^S.e(*) — only entities in S are visible. Never look in F.
-        let mut found_entity: Option<(String, crate::enums::EntityType, String)> = None;
-        for ns in &grounding.grounded_ns {
-            let fq = super::grounding::namespace_path_to_fq(ns);
-            if let Some(entity) = registry
-                .consult
-                .lookup_entity(&identifier.name, &fq, config.resolution_namespace.as_deref()) {
-                if entity.entity_type == BootstrapEntityType::DqlTemporaryViewExpression
-                    || entity.entity_type == BootstrapEntityType::DqlFactExpression
-                {
-                    log::debug!(
-                        "Expanding consulted entity '{}' from namespace '{}'",
-                        identifier.name,
-                        fq
-                    );
-                    found_entity = Some((entity.definition.clone(), entity.entity_type, fq));
-                    break;
-                }
-            }
-        }
-
-        if let Some((body_source, entity_type, matched_fq)) = found_entity {
-            // Cycle guard (RECURSION-CONTRACT.md B5): re-expanding a name
-            // already in flight means its self-reference did NOT resolve as
-            // the in-progress CTE (recursive clause before base, or an
-            // indirect cycle) — refuse with the teaching error instead of
-            // spinning. The frame pops on every return path.
-            let _expansion_frame = config.expansion_guard.enter(
-                format!("{}::{}", matched_fq, identifier.name),
-                "resolver::consulted_expansion",
-            )?;
-            // Capture view name and namespace for error context — the
-            // namespace the entity was actually FOUND in, not the first
-            // grounded namespace (they differ whenever the match came
-            // from a later namespace in the grounding list).
-            let view_name = identifier.name.clone();
-            let view_ns = matched_fq.clone();
-
-            if entity_type == BootstrapEntityType::DqlFactExpression {
-                // Fact: parse all clauses and merge into one anonymous table
-                let expanded = expand_fact_body(&body_source, &view_name).map_err(|e| {
-                    DelightQLError::database_error(
-                        format!(
-                            "Error while expanding fact '{}' (from namespace '{}'): {}",
-                            view_name, view_ns, e
-                        ),
-                        e.to_string(),
-                    )
-                })?;
-
-                // Sealed like every rule body — see the view road below.
-                let saved_ctes = registry.query_local.ctes.clone();
-                let resolve_result =
-                    super::resolve_relational_expression_with_registry(
-                        expanded,
-                        registry,
-                        None,
-                        config,
-                        Some(grounding),
-                    );
-                registry.query_local.ctes = saved_ctes;
-                let (resolved_body, body_bubbled) = resolve_result
-                    .map_err(|e| {
-                        DelightQLError::database_error(
-                            format!(
-                                "Error while resolving fact '{}' (from namespace '{}'): {}",
-                                view_name, view_ns, e
-                            ),
-                            e.to_string(),
-                        )
-                    })?;
-
-                let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_body)?;
-                let (effective_alias, _resolver_id) = {
-                    let (a, r) = compute_effective_alias(&alias, &config.alias_counter);
-                    (Some(a), r)
-                };
-
-                let effective_name = effective_alias.as_deref().unwrap_or(&view_name);
-
-                let base_expr = ast_resolved::RelationalExpression::Relation(
-                    ast_resolved::Relation::InnerRelation {
-                        pattern: ast_resolved::InnerRelationPattern::UncorrelatedDerivedTable {
-                            identifier: ast_resolved::QualifiedName {
-                                namespace_path: NamespacePath::empty(),
-                                name: view_name.clone().into(),
-                                grounding: None,
-                            },
-                            subquery: Box::new(resolved_body),
-                            is_consulted_view: false,
-                        },
-                        alias: effective_alias.clone(),
-                        outer,
-                        cpr_schema: ast_resolved::PhaseBox::new(body_schema.clone()),
-                    },
-                );
-
-                if !matches!(domain_spec, ast_unresolved::DomainSpec::Glob) {
-                    let (final_expr, final_bubbled) = apply_call_site_pattern(
-                        &domain_spec,
-                        base_expr,
-                        &body_schema,
-                        effective_name,
-                        &view_name,
-                        outer_context,
-                    )?;
-                    return Ok((final_expr, final_bubbled));
-                } else {
-                    // The lvar law: the columns answer to the ACCESS name — the
-                    // user's alias, or the bare entity name of an unaliased access.
-                    let __access = alias
-                        .clone()
-                        .unwrap_or_else(|| view_name.clone().into());
-                    let body_bubbled = relabel_bubbled_with_alias(body_bubbled, effective_name, BoundaryAnswering::AnswersTo(__access));
-                    return Ok((base_expr, body_bubbled));
-                }
-            } else {
-                // View: parse and patch the view body as a full Query (preserves CTEs)
-                let query = super::grounding::expand_consulted_view(&body_source, grounding)
-                    .map_err(|e| {
-                        // Preserve validation errors (e.g., head form mismatches)
-                        // so error assertions can match on the subcategory URI.
-                        if matches!(e, DelightQLError::ValidationError { .. }) {
-                            return e;
-                        }
-                        DelightQLError::database_error(
-                            format!(
-                                "Error while expanding view '{}' (from namespace '{}'): {}",
-                                view_name, view_ns, e
-                            ),
-                            e.to_string(),
-                        )
-                    })?;
-
-                // A rule body is SEALED: its meaning cannot depend on the
-                // call site's scope. Passing the caller's columns here let
-                // a body's own positional rebind be captured as an outer
-                // correlation when the caller had same-named columns — the
-                // rebind silently vanished and the body resolved as a
-                // glob. Correlation into a subquery is the call-site
-                // condition's business, never the body's.
-                let saved_ctes = registry.query_local.ctes.clone();
-                let resolve_result = super::resolve_query_inline(
-                    query,
-                    registry,
-                    None,
-                    config,
-                    Some(grounding),
-                );
-                registry.query_local.ctes = saved_ctes;
-                let (resolved_query, body_bubbled) = resolve_result.map_err(|e| {
-                    DelightQLError::database_error(
-                        format!(
-                            "Error while resolving view '{}' (from namespace '{}'): {}",
-                            view_name, view_ns, e
-                        ),
-                        e.to_string(),
-                    )
-                })?;
-
-                let body_schema =
-                    super::helpers::extraction::extract_cpr_schema_from_query(&resolved_query)?;
-                let (effective_alias, resolver_id, export_schema) =
-                    access_boundary_export(&alias, &view_name, &body_schema, &config.alias_counter);
-
-                let effective_name = effective_alias.to_string();
-
-                let scoped = ast_resolved::ScopedSchema::bind(
-                    export_schema,
-                    effective_alias.clone(),
-                    resolver_id,
-                );
-
-                let base_expr = ast_resolved::RelationalExpression::Relation(
-                    ast_resolved::Relation::ConsultedView {
-                        identifier: ast_resolved::QualifiedName {
-                            namespace_path: NamespacePath::empty(),
-                            name: view_name.clone().into(),
-                            grounding: None,
-                        },
-                        body: Box::new(resolved_query),
-                        scoped: ast_resolved::PhaseBox::new(scoped),
-                        outer,
-                    },
-                );
-
-                if !matches!(domain_spec, ast_unresolved::DomainSpec::Glob) {
-                    let (final_expr, final_bubbled) = apply_call_site_pattern(
-                        &domain_spec,
-                        base_expr,
-                        &body_schema,
-                        &effective_name,
-                        &view_name,
-                        outer_context,
-                    )?;
-                    return Ok((final_expr, final_bubbled));
-                } else {
-                    // The lvar law: the columns answer to the ACCESS name — the
-                    // user's alias, or the bare entity name of an unaliased access.
-                    let __access = alias
-                        .clone()
-                        .unwrap_or_else(|| view_name.clone().into());
-                    let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name, BoundaryAnswering::AnswersTo(__access));
-                    return Ok((base_expr, body_bubbled));
-                }
-            }
-        }
-
-        // Entity not in any grounded namespace S — check the data namespace F.
-        // F^S.table_name(*) should resolve table_name from F when it's not a view in S.
-        let data_ns_path = identifier.namespace_path.clone();
-        match registry
-            .database
-            .lookup_table_with_namespace_qualified(&data_ns_path, &identifier.name)
-        {
-            Ok(Some((table_schema, connection_id, canonical_name, bs_opt))) => {
-                // Table found in data namespace F. Grounding is NOT propagated
-                // to pipe operators — functions from S require enlist!() (see test 302).
-                // Track connection_id for cross-connection join validation
-                registry.track_connection_id(connection_id);
-                ResolutionResult::DatabaseEntity(crate::resolution::EntityInfo {
-                    name: identifier.name.clone(),
-                    canonical_name: Some(canonical_name),
-                    resolved_namespace: Some(data_ns_path.clone()),
-                    backend_schema: bs_opt,
-                    entity_type: crate::resolution::ResolvedEntityKind::Relation,
-                    registry_source: crate::resolution::RegistrySource::Database,
-                    schema_source: crate::resolution::SchemaSource::DatabaseCatalog,
-                    definition: EntityDefinition::RelationSchema(table_schema),
-                })
-            }
-            Ok(None) => {
-                // Not found in data namespace either
-                ResolutionResult::Unknown(identifier.namespace_path.with_table(&identifier.name))
-            }
-            Err(e) => return Err(e),
-        }
-    } else if !identifier.namespace_path.is_empty() {
+    let mut serve_bootstrap: Option<ServedBootstrapRead> = None;
+    let resolution = if !identifier.namespace_path.is_empty() {
         // Namespace-qualified table (no grounding) - use bootstrap resolution
         match registry
             .database
@@ -586,8 +507,21 @@ pub(super) fn resolve_ground(
         {
             Ok(Some((table_schema, connection_id, canonical_name, bs_opt))) => {
                 // Found table at namespace location
-                // Track connection_id for cross-connection join validation
-                registry.track_connection_id(connection_id);
+                // THE BOOTSTRAP IS A SOURCE, NEVER A TARGET
+                // (materialization-law §2): while a materialization source
+                // resolves, a bootstrap read is answered as a literal
+                // snapshot, and connection 1 never enters the attribution
+                // set — exemption is ABSENCE, not a tie-break.
+                if connection_id == 1 && config.serve_bootstrap_reads {
+                    serve_bootstrap = Some(ServedBootstrapRead {
+                        canonical: canonical_name.clone(),
+                        backend_schema: bs_opt.clone(),
+                        namespace_fq: identifier.namespace_path.fq_string(),
+                    });
+                } else {
+                    // Track connection_id for cross-connection join validation
+                    registry.track_connection_id(connection_id);
+                }
                 ResolutionResult::DatabaseEntity(crate::resolution::EntityInfo {
                     name: identifier.name.clone(),
                     canonical_name: Some(canonical_name),
@@ -601,78 +535,36 @@ pub(super) fn resolve_ground(
             }
             Ok(None) => {
                 // Not a database table — check consult registry for consulted views
-                let fq = super::grounding::namespace_path_to_fq(&identifier.namespace_path);
-                if let Some(entity) = registry
-                .consult
-                .lookup_entity(&identifier.name, &fq, config.resolution_namespace.as_deref()) {
-                    if entity.entity_type
-                        == BootstrapEntityType::DqlTemporaryViewExpression
-                    {
-                        ResolutionResult::ConsultedView {
-                            name: entity.name.clone(),
-                            body_source: entity.definition.clone(),
-                            // Use the entity's RESOLVED namespace, not the typed
-                            // qualifier: a §IV plain-qualifier miss expands
-                            // `chz` → `home::chz` inside lookup_entity, and the
-                            // view body must resolve against the real fq. In the
-                            // non-expanded case entity.namespace == fq, so this
-                            // is behaviour-preserving.
-                            namespace: entity.namespace.clone(),
-                        }
-                    } else if entity.entity_type == BootstrapEntityType::DqlFactExpression
-                    {
-                        ResolutionResult::ConsultedFact {
-                            name: entity.name.clone(),
-                            body_source: entity.definition.clone(),
-                        }
-                    } else if matches!(
-                        entity.entity_type,
-                        BootstrapEntityType::DqlFunctionExpression
-                            | BootstrapEntityType::DqlContextAwareFunctionExpression
-                    ) {
-                        // The name IS defined — as a function, not a relation. A bare
-                        // `fn(*)` in relation position (e.g. a named case function's
-                        // deferred relation face `style_of(*)`) would otherwise surface
-                        // the misleading "Table not found". Point at the call form.
-                        return Err(DelightQLError::validation_error(
-                            format!(
-                                "'{name}' is a function, not a relation — call it as \
-                                 `{name}:(args)`. (A case/scalar function has no relation \
-                                 face `{name}(*)`.)",
-                                name = entity.name,
-                            ),
-                            format!("'{}' resolved to a function entity", entity.name),
-                        ));
-                    } else {
-                        ResolutionResult::Unknown(
-                            identifier.namespace_path.with_table(&identifier.name),
-                        )
-                    }
+                let fq = identifier.namespace_path.fq_string();
+                if let Some(entity) = registry.consult.lookup_entity(
+                    &identifier.name,
+                    identifier.name.is_stropped(),
+                    &fq,
+                    config.resolution_namespace.as_deref(),
+                ) {
+                    crate::resolution::classify_consulted_relation(entity)
                 } else if let Some(grounding) = grounding {
                     // Fallback: entity not in patched namespace, search grounded namespaces.
                     // Handles inline DDL views referencing sibling entities: DataNsPatcher
                     // rewrites sample(*) → main::sample(*), but fact lives in scratch ("home").
                     let mut fallback_result = None;
                     for ns in &grounding.grounded_ns {
-                        let gfq = super::grounding::namespace_path_to_fq(ns);
-                        if let Some(entity) = registry
-                    .consult
-                    .lookup_entity(&identifier.name, &gfq, config.resolution_namespace.as_deref())
-                        {
-                            if entity.entity_type
-                                == BootstrapEntityType::DqlTemporaryViewExpression
-                            {
+                        let gfq = ns.fq_string();
+                        if let Some(entity) = registry.consult.lookup_entity(
+                            &identifier.name,
+                            identifier.name.is_stropped(),
+                            &gfq,
+                            config.resolution_namespace.as_deref(),
+                        ) {
+                            if matches!(
+                                entity.entity_type,
+                                BootstrapEntityType::DqlTemporaryViewExpression
+                                    | BootstrapEntityType::DqlFactExpression
+                            ) {
                                 fallback_result = Some(ResolutionResult::ConsultedView {
                                     name: entity.name.clone(),
                                     body_source: entity.definition.clone(),
                                     namespace: gfq,
-                                });
-                            } else if entity.entity_type
-                                == BootstrapEntityType::DqlFactExpression
-                            {
-                                fallback_result = Some(ResolutionResult::ConsultedFact {
-                                    name: entity.name.clone(),
-                                    body_source: entity.definition.clone(),
                                 });
                             }
                             break;
@@ -700,17 +592,27 @@ pub(super) fn resolve_ground(
         let entity_name = identifier.name.clone();
         resolve_entity_with_alias(
             &entity_name,
-            alias.as_deref(),
+            alias.as_ref(),
             registry,
             config.resolution_namespace.as_deref(),
-        )
+        )?
     };
 
-    match resolution {
+    let resolved = match resolution {
         ResolutionResult::CTE(entity_info) => r_resolve_cte(
             entity_info,
             identifier,
-            domain_spec,
+            access,
+            alias,
+            outer,
+            registry,
+            outer_context,
+            config,
+        ),
+        ResolutionResult::MaterializedRelation(entity_info) => r_resolve_cte(
+            entity_info,
+            identifier,
+            access,
             alias,
             outer,
             registry,
@@ -720,7 +622,7 @@ pub(super) fn resolve_ground(
         ResolutionResult::DatabaseEntity(entity_info) => r_resolve_database_entity(
             entity_info,
             identifier,
-            domain_spec,
+            access,
             alias,
             outer,
             registry,
@@ -735,26 +637,25 @@ pub(super) fn resolve_ground(
             view_name,
             body_source,
             view_ns,
-            domain_spec,
+            access,
             alias,
             outer,
             registry,
             outer_context,
             config,
         ),
-        ResolutionResult::ConsultedFact {
-            name: fact_name,
-            body_source,
-        } => r_resolve_consulted_fact(
-            fact_name,
-            body_source,
-            domain_spec,
-            alias,
-            outer,
-            registry,
-            outer_context,
-            config,
-        ),
+        ResolutionResult::DefinedNonRelation { name, entity_type } => {
+            Err(defined_non_relation_error(&name, entity_type))
+        }
+        // THE CATEGORY IS RIGHT AND THE ROAD IS MISSING. Reaching this arm
+        // means the executable boundary — which runs before resolution, over
+        // the submission's own chains — did not see this occurrence, so the
+        // rows were never produced. Refusing here is what keeps a known
+        // relation out of the generic-TVF fallback, where its namespace would
+        // be stripped and SQL generated against a table that does not exist.
+        ResolutionResult::RuntimeServedRelation { name, entity_type } => {
+            Err(runtime_served_unreached_error(&name, entity_type))
+        }
         ResolutionResult::Unknown(ref msg) if msg.contains("Ambiguous entity") => {
             // Ambiguity error from resolve_unqualified_entity —
             // entity exists in multiple engaged namespaces.
@@ -764,21 +665,324 @@ pub(super) fn resolve_ground(
                 "Ambiguous unqualified entity resolution",
             ))
         }
-        _ => r_resolve_unknown(identifier, domain_spec, alias, outer, config),
+        _ => r_resolve_unknown(identifier),
+    }?;
+    note_mutation_mark(marked_relation, &resolved.0, &registry.identities);
+    let resolved = match serve_bootstrap {
+        Some(served) => serve_bootstrap_relation(resolved, served, registry)?,
+        None => resolved,
+    };
+    Ok(resolved)
+}
+
+/// A bootstrap read a materialization source resolves: served as rows.
+struct ServedBootstrapRead {
+    canonical: delightql_types::SqlIdentifier,
+    backend_schema: Option<String>,
+    namespace_fq: String,
+}
+
+/// SERVE THE SNAPSHOT the directive already promises: the catalog rows are
+/// read HERE, at plan build, on the bootstrap connection — no engine
+/// connection reads another's tables — and the resolved read's head becomes
+/// a literal table PUBLISHING THE SAME SCOPE, so every downstream binding,
+/// pattern restriction and continuation stands unchanged. The compiled
+/// source then executes whole on whatever connection attribution selects,
+/// in that connection's own dialect.
+#[cfg(not(target_arch = "wasm32"))]
+fn serve_bootstrap_relation(
+    resolved: (ast_resolved::Chain, BubbledState),
+    served: ServedBootstrapRead,
+    registry: &mut crate::resolution::EntityRegistry,
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    use crate::pipeline::asts::core::{
+        AnonRelation, AnonTable, Datum, Grelex, LiteralValue, TabularBody, TabularRow,
+    };
+    let (mut chain, bubbled) = resolved;
+    let Grelex::Reference(ast_resolved::Relation::Ground {
+        outer, cpr_schema, ..
+    }) = &chain.head
+    else {
+        return Err(internal_serving_error(
+            "a served bootstrap read stands on a ground relation",
+        ));
+    };
+    let outer = *outer;
+    let scope = *cpr_schema;
+
+    // The registered column set, in the order the catalog heading was
+    // minted from — the same source, so the literal rows align with the
+    // scope's own heading. The Arena keeps characters out of reach; the
+    // physical names come from the catalog, where they are data.
+    let columns: Vec<String> = registry
+        .database
+        .schema()
+        .get_table_columns(Some(&served.namespace_fq), served.canonical.as_str())?
+        .ok_or_else(|| {
+            internal_serving_error("a served bootstrap table answers its registered columns")
+        })?
+        .into_iter()
+        .map(|column| column.name.to_string())
+        .collect();
+    let heading = registry.identities.known_heading(scope)?;
+    if heading.len() != columns.len() {
+        return Err(internal_serving_error(
+            "a served bootstrap read publishes the registered heading whole",
+        ));
     }
+
+    let Some(system) = registry.database.system else {
+        return Err(internal_serving_error(
+            "a served bootstrap read resolves with the system present",
+        ));
+    };
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let from = match &served.backend_schema {
+        Some(schema) => format!("{}.{}", quoted(schema), quoted(served.canonical.as_str())),
+        None => quoted(served.canonical.as_str()),
+    };
+    let select = format!(
+        "SELECT {} FROM {}",
+        columns
+            .iter()
+            .map(|name| quoted(name))
+            .collect::<Vec<_>>()
+            .join(", "),
+        from
+    );
+
+    let connection = system.bootstrap_connection();
+    let guard = connection.lock().map_err(|e| {
+        DelightQLError::connection_poison_error(
+            "Failed to acquire bootstrap lock for a served materialization source",
+            format!("Connection was poisoned: {}", e),
+        )
+    })?;
+    let mut statement = guard
+        .prepare(&select)
+        .map_err(|e| internal_serving_error(&format!("bootstrap-source prepare failed: {e}")))?;
+    let width = columns.len();
+    let mut literal_rows: Vec<TabularRow<Datum<crate::pipeline::asts::core::Resolved>>> =
+        Vec::new();
+    let mut rows = statement
+        .query([])
+        .map_err(|e| internal_serving_error(&format!("bootstrap-source execution failed: {e}")))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| internal_serving_error(&format!("bootstrap-source read failed: {e}")))?
+    {
+        let mut cells = Vec::with_capacity(width);
+        for index in 0..width {
+            let value = row.get_ref(index).map_err(|e| {
+                internal_serving_error(&format!("bootstrap-source cell read failed: {e}"))
+            })?;
+            cells.push(Datum::Value(ast_resolved::DomainExpression::Application(
+                ast_resolved::FunctionApplication::Ground(served_literal(value)?),
+            )));
+        }
+        literal_rows.push(TabularRow(Box::new(
+            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(cells)
+                .expect("a catalog table has at least one column"),
+        )));
+    }
+    drop(rows);
+    drop(statement);
+    drop(guard);
+
+    // ZERO ROWS: the literal geometry is nonempty by type, so an empty
+    // snapshot is one all-NULL row behind a false restriction — the same
+    // zero-row relation, with its heading intact.
+    let empty = literal_rows.is_empty();
+    if empty {
+        let cells: Vec<_> = (0..width)
+            .map(|_| {
+                Datum::Value(ast_resolved::DomainExpression::Application(
+                    ast_resolved::FunctionApplication::Ground(LiteralValue::Null),
+                ))
+            })
+            .collect();
+        literal_rows.push(TabularRow(Box::new(
+            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(cells)
+                .expect("a catalog table has at least one column"),
+        )));
+    }
+
+    chain.head = Grelex::Literal(AnonRelation {
+        table: AnonTable {
+            body: TabularBody {
+                header: None,
+                rows: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(literal_rows)
+                    .expect("the empty snapshot was given its NULL row above"),
+            },
+            cpr_schema: scope,
+        },
+        alias: None,
+        outer,
+    });
+    if empty {
+        let falsehood = ast_resolved::TruthExpression::Comparison(Comparison {
+            operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+            left: Box::new(ast_resolved::DomainExpression::Application(
+                ast_resolved::FunctionApplication::Ground(LiteralValue::Number("0".to_string())),
+            )),
+            right: Box::new(ast_resolved::DomainExpression::Application(
+                ast_resolved::FunctionApplication::Ground(LiteralValue::Number("1".to_string())),
+            )),
+        });
+        // The head's own read (a leading access) stays the head's; the
+        // false restriction stands right behind it.
+        let position = usize::from(matches!(
+            chain.continuations.first(),
+            Some(ast_resolved::Continuation::Access { .. })
+        ));
+        chain.continuations.insert(
+            position,
+            ast_resolved::Continuation::Restrict {
+                condition: falsehood,
+                origin: crate::pipeline::asts::core::FilterOrigin::Generated,
+                cpr_schema: scope,
+            },
+        );
+    }
+    Ok((chain, bubbled))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn serve_bootstrap_relation(
+    resolved: (ast_resolved::Chain, BubbledState),
+    _served: ServedBootstrapRead,
+    _registry: &mut crate::resolution::EntityRegistry,
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    Ok(resolved)
+}
+
+fn internal_serving_error(message: &str) -> DelightQLError {
+    DelightQLError::transformation_error(message, "bootstrap_serving")
+}
+
+/// One engine value as the literal it spells. The catalog's declared
+/// schemas carry no BLOB columns; meeting one is a teaching, not a panic.
+#[cfg(not(target_arch = "wasm32"))]
+fn served_literal(
+    value: rusqlite::types::ValueRef<'_>,
+) -> Result<crate::pipeline::asts::core::LiteralValue> {
+    use crate::pipeline::asts::core::LiteralValue;
+    use rusqlite::types::ValueRef;
+    Ok(match value {
+        ValueRef::Null => LiteralValue::Null,
+        ValueRef::Integer(value) => LiteralValue::Number(value.to_string()),
+        // `{:?}` round-trips an f64: it always writes a decimal point or
+        // an exponent, so the literal keeps REAL affinity.
+        ValueRef::Real(value) => LiteralValue::Number(format!("{value:?}")),
+        ValueRef::Text(bytes) => LiteralValue::String(String::from_utf8_lossy(bytes).into_owned()),
+        ValueRef::Blob(_) => {
+            return Err(DelightQLError::validation_error_categorized(
+                "materialization/bootstrap_blob",
+                "a bootstrap BLOB column has no literal spelling to serve",
+                "project the column out of the materialization source",
+            ))
+        }
+    })
+}
+
+/// Record `!!` on the occurrence a resolved access publishes.
+///
+/// One place, whatever kind of relation the name turned out to name: a
+/// catalog table, a temporary one an earlier step created, a CTE. The mark
+/// belongs to this occurrence and not to the definition behind it, so a
+/// second, unmarked reference to the same name carries nothing.
+fn note_mutation_mark(
+    relation: Option<crate::names::Spelling>,
+    resolved: &ast_resolved::Chain,
+    identities: &crate::names::Registry,
+) {
+    if let Some(relation) = relation {
+        identities.mark_mutation_target(
+            super::helpers::extraction::extract_cpr_schema(resolved),
+            relation,
+        );
+    }
+}
+
+/// Explain a resolved consulted functor that cannot occupy relation position.
+///
+/// Kind lookup is centralized before this point, so a defined name never falls
+/// through to the absence diagnostic merely because its invocation form is
+/// non-relational.
+fn defined_non_relation_error(
+    name: &SqlIdentifier,
+    entity_type: BootstrapEntityType,
+) -> DelightQLError {
+    let message = match entity_type {
+        BootstrapEntityType::DqlFunctionExpression
+        | BootstrapEntityType::DqlHoFunctionExpression
+        | BootstrapEntityType::DqlContextAwareFunctionExpression => format!(
+            "'{name}' is a function, not a relation — call it as \
+             `{name}:(args)`. (A case/scalar function has no relation face \
+             `{name}(*)`.)"
+        ),
+        BootstrapEntityType::DqlHoTemporaryViewExpression => format!(
+            "'{name}' is a higher-order view, not a relation — supply its \
+             relation argument, for example `{name}(source(*))(*)`"
+        ),
+        BootstrapEntityType::DqlTemporarySigmaRule | BootstrapEntityType::BinSigmaPredicate => {
+            format!(
+                "'{name}' is a sigma predicate, not a relation — use it in a \
+                 condition rather than accessing `{name}(*)`"
+            )
+        }
+        BootstrapEntityType::BinPseudoPredicate | BootstrapEntityType::DqlEffectRule => format!(
+            "'{name}' is a directive, not a relation — invoke the directive \
+             rather than accessing `{name}(*)`"
+        ),
+        BootstrapEntityType::DqlErContextRule => format!(
+            "'{name}' is an ER-context rule, not a relation — select it through \
+             its declared ER context"
+        ),
+        other => format!(
+            "'{name}' is defined as {}, not a relation",
+            other.variant_name()
+        ),
+    };
+    DelightQLError::validation_error(
+        message,
+        format!("'{name}' resolved to {}", entity_type.variant_name()),
+    )
+}
+
+/// A runtime-served relation that resolution reached before execution did.
+///
+/// This is not a statement about the entity's category: it names a relation
+/// and publishes a heading, and every position that reaches it through the
+/// executable boundary works. What it reports is that this OCCURRENCE was
+/// not on a chain the boundary walks — today, a consulted rule's body, whose
+/// expansion happens during resolution, after that boundary has run.
+fn runtime_served_unreached_error(
+    name: &SqlIdentifier,
+    entity_type: BootstrapEntityType,
+) -> DelightQLError {
+    DelightQLError::validation_error(
+        format!(
+            "'{name}' is a bin relation served by the runtime, and this \
+             occurrence escaped the executable boundary that produces its \
+             rows — a compiler fence, not a semantic outcome; the direct, \
+             bound and consulted spellings all execute"
+        ),
+        format!("'{name}' resolved to {}", entity_type.variant_name()),
+    )
 }
 
 /// Handle PASSTHROUGH resolution: skip entity catalog, use schema introspector directly.
 /// Best-effort: try to get columns from backend, fall back to opaque glob if not found.
 pub(super) fn r_resolve_passthrough(
     identifier: ast_unresolved::QualifiedName,
-    domain_spec: ast_unresolved::DomainSpec,
+    access: ast_unresolved::Access,
     alias: Option<SqlIdentifier>,
     outer: bool,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+) -> Result<(ast_resolved::Chain, BubbledState)> {
     if identifier.namespace_path.is_empty() {
         return Err(DelightQLError::validation_error(
             "Passthrough table access requires a namespace path (e.g., main/table_name(*))"
@@ -787,106 +991,65 @@ pub(super) fn r_resolve_passthrough(
         ));
     }
 
-    // Try schema introspector for column info (best-effort)
-    let (table_schema, canonical_name, resolved_namespace, passthrough_backend_schema) =
-        match registry
-            .database
-            .lookup_table_with_namespace_qualified(&identifier.namespace_path, &identifier.name)
-        {
-            Ok(Some((schema, connection_id, canon, passthrough_backend_schema))) => {
-                registry.track_connection_id(connection_id);
-                (
-                    Some(schema),
-                    Some(canon),
-                    Some(identifier.namespace_path.clone()),
-                    passthrough_backend_schema,
-                )
-            }
-            Ok(None) | Err(_) => {
-                // Best-effort: table not found in introspector — fall back to opaque
-                (None, None, Some(identifier.namespace_path.clone()), None)
-            }
-        };
+    // Prefer the mounted catalog, then ask the target introspector for a
+    // backend-owned relation that the catalog does not enumerate.
+    let (table_schema, canonical_name, passthrough_backend_schema) = match registry
+        .database
+        .lookup_passthrough_table_with_namespace(&identifier.namespace_path, &identifier.name)
+    {
+        Ok(Some((schema, connection_id, canon, passthrough_backend_schema))) => {
+            registry.track_connection_id(connection_id);
+            (Some(schema), Some(canon), passthrough_backend_schema)
+        }
+        Ok(None) | Err(_) => {
+            // Best-effort: table not found in introspector — fall back to opaque
+            (None, None, None)
+        }
+    };
 
     if let Some(schema) = table_schema {
+        bind_physical_relation(
+            schema,
+            canonical_name.as_ref(),
+            passthrough_backend_schema.as_deref(),
+            &registry.identities,
+        )?;
         // Got columns from backend — resolve normally with pattern resolver
-        if let ast_resolved::CprSchema::Resolved(ref base_cols) = schema {
-            let table_name_str = alias.as_deref().unwrap_or(&identifier.name);
+        let table_name_str = alias.as_deref().unwrap_or(&identifier.name);
 
-            // Relabel columns with alias if present
-            let relabeled_cols = relabel_columns_with_alias(base_cols, &alias);
+        // Relabel columns with alias if present
+        let relabeled_cols = relabel_columns_with_alias(schema, &alias, &registry.identities);
 
-            let (mut final_expr, state) = apply_pattern_resolver(
-                &domain_spec,
-                &relabeled_cols,
-                table_name_str,
-                registry,
-                outer_context,
-            )?;
+        let (mut final_expr, state) = apply_pattern_resolver(
+            &access,
+            &relabeled_cols,
+            table_name_str,
+            registry,
+            outer_context,
+            config.cfe_formal_frame.as_deref(),
+            config.resolution_namespace.as_deref(),
+            &config.instantiation_depth,
+        )?;
 
-            // Patch the relation with correct identifier, canonical name, alias
-            if let ast_resolved::RelationalExpression::Relation(ref mut r) = final_expr {
-                if let ast_resolved::Relation::Ground {
-                    identifier: ref mut rel_id,
-                    canonical_name: ref mut rel_canonical,
-                    backend_schema: ref mut rel_backend_schema,
-                    alias: ref mut rel_alias,
-                    outer: ref mut rel_outer,
-                    passthrough: ref mut rel_passthrough,
-                    ..
-                } = r
-                {
-                    *rel_id = convert_qualified_name(identifier);
-                    if let Some(ref ns) = resolved_namespace {
-                        rel_id.namespace_path = ns.clone();
-                    }
-                    *rel_canonical = ast_resolved::PhaseBox::new(canonical_name);
-                    *rel_backend_schema =
-                        ast_resolved::PhaseBox::from_optional_schema(passthrough_backend_schema);
-                    *rel_alias = alias;
-                    *rel_outer = outer;
-                    *rel_passthrough = true;
-                }
-            } else if let ast_resolved::RelationalExpression::Filter { ref mut source, .. } =
-                final_expr
-            {
-                if let ast_resolved::RelationalExpression::Relation(ref mut r) = source.as_mut() {
-                    if let ast_resolved::Relation::Ground {
-                        identifier: ref mut rel_id,
-                        canonical_name: ref mut rel_canonical,
-                        backend_schema: ref mut rel_backend_schema,
-                        alias: ref mut rel_alias,
-                        outer: ref mut rel_outer,
-                        passthrough: ref mut rel_passthrough,
-                        ..
-                    } = r
-                    {
-                        *rel_id = convert_qualified_name(identifier);
-                        if let Some(ref ns) = resolved_namespace {
-                            rel_id.namespace_path = ns.clone();
-                        }
-                        *rel_canonical = ast_resolved::PhaseBox::new(canonical_name);
-                        *rel_backend_schema = ast_resolved::PhaseBox::from_optional_schema(
-                            passthrough_backend_schema,
-                        );
-                        *rel_alias = alias;
-                        *rel_outer = outer;
-                        *rel_passthrough = true;
-                    }
-                }
-            }
-
-            return Ok((final_expr, state));
+        // Outerness is the only thing the call site still contributes: the
+        // backend lookup that got here IS the passthrough decision, and the
+        // spelling it was made from is spent on the scope the pattern
+        // resolver published.
+        if let ast_resolved::Grelex::Reference(ast_resolved::Relation::Ground {
+            outer: ref mut rel_outer,
+            ..
+        }) = final_expr.head
+        {
+            *rel_outer = outer;
         }
-        // Non-resolved schema — treat as opaque fallback below
+
+        return Ok((final_expr, state));
     }
 
-    // Opaque fallback: no column info available
-    // Only glob domain_spec is allowed in opaque mode
-    if !matches!(
-        domain_spec,
-        ast_unresolved::DomainSpec::Glob | ast_unresolved::DomainSpec::Bare
-    ) {
+    // Opaque fallback: no column info available. Only an access that names
+    // no dimensions can be answered without a heading, and which accesses
+    // those are is the access type's own answer.
+    if !access.is_whole() {
         return Err(DelightQLError::validation_error(
             format!(
                 "Passthrough table '{}/{}' schema not available — only (*) is allowed, not positional binding",
@@ -896,72 +1059,32 @@ pub(super) fn r_resolve_passthrough(
         ));
     }
 
-    let resolved = ast_resolved::Relation::Ground {
-        identifier: convert_qualified_name(identifier),
-        canonical_name: ast_resolved::PhaseBox::new(None),
-        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-        domain_spec: ast_resolved::DomainSpec::Glob,
-        alias,
-        outer,
-        mutation_target: false,
-        passthrough: true,
-        cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Unknown),
-        hygienic_injections: Vec::new(),
-    };
+    // A passthrough reads a backend table the entity catalog does not
+    // describe. It is a relation — it has an identity — and its heading is
+    // the target's to publish. The scope travels upward so a reference
+    // standing over it learns that nothing was enumerated, rather than being
+    // told the name is absent.
+    let scope = registry.identities.mint_opaque_scope(
+        crate::names::ScopeOrigin::AnonRelation,
+        crate::names::Hint::None,
+    );
     Ok((
-        ast_resolved::RelationalExpression::Relation(resolved),
-        BubbledState::empty(),
+        ast_resolved::Relation::ground_read(ast_resolved::Access::All, outer, scope),
+        BubbledState::opaque(scope),
     ))
 }
 
-/// Patch identifier, canonical_name, backend_schema, alias, and outer on a Ground relation.
-/// Handles both direct Relation and Filter-wrapping-Relation cases.
-fn patch_ground_relation_fields(
-    expr: &mut ast_resolved::RelationalExpression,
-    resolved_id: ast_resolved::QualifiedName,
-    canonical_name: Option<SqlIdentifier>,
-    backend_schema: Option<String>,
-    alias: Option<SqlIdentifier>,
-    outer: bool,
-) {
-    // Try direct Relation
-    if let ast_resolved::RelationalExpression::Relation(ref mut r) = expr {
-        if let ast_resolved::Relation::Ground {
-            identifier: ref mut rel_id,
-            canonical_name: ref mut rel_canonical,
-            backend_schema: ref mut rel_backend_schema,
-            alias: ref mut rel_alias,
-            outer: ref mut rel_outer,
-            ..
-        } = r
-        {
-            *rel_id = resolved_id;
-            *rel_canonical = ast_resolved::PhaseBox::new(canonical_name);
-            *rel_backend_schema = ast_resolved::PhaseBox::from_optional_schema(backend_schema);
-            *rel_alias = alias;
-            *rel_outer = outer;
-        }
-        return;
-    }
-    // Try Filter-wrapping-Relation
-    if let ast_resolved::RelationalExpression::Filter { ref mut source, .. } = expr {
-        if let ast_resolved::RelationalExpression::Relation(ref mut r) = source.as_mut() {
-            if let ast_resolved::Relation::Ground {
-                identifier: ref mut rel_id,
-                canonical_name: ref mut rel_canonical,
-                backend_schema: ref mut rel_backend_schema,
-                alias: ref mut rel_alias,
-                outer: ref mut rel_outer,
-                ..
-            } = r
-            {
-                *rel_id = resolved_id;
-                *rel_canonical = ast_resolved::PhaseBox::new(canonical_name);
-                *rel_backend_schema = ast_resolved::PhaseBox::from_optional_schema(backend_schema);
-                *rel_alias = alias;
-                *rel_outer = outer;
-            }
-        }
+/// Mark a resolved ground relation as an outer-join operand.
+///
+/// The head is where a ground relation lives; the continuations that may sit
+/// above it (a generated restriction) do not carry outerness.
+fn patch_ground_outer(expr: &mut ast_resolved::Chain, outer: bool) {
+    if let ast_resolved::Grelex::Reference(ast_resolved::Relation::Ground {
+        outer: ref mut rel_outer,
+        ..
+    }) = expr.head
+    {
+        *rel_outer = outer;
     }
 }
 
@@ -969,200 +1092,148 @@ fn patch_ground_relation_fields(
 pub(super) fn r_resolve_cte(
     entity_info: crate::resolution::EntityInfo,
     identifier: ast_unresolved::QualifiedName,
-    domain_spec: ast_unresolved::DomainSpec,
+    access: ast_unresolved::Access,
     alias: Option<SqlIdentifier>,
     outer: bool,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+) -> Result<(ast_resolved::Chain, BubbledState)> {
     use crate::resolution::EntityDefinition;
 
+    let canonical_name = entity_info.canonical_name.clone();
+    let backend_schema = entity_info.backend_schema.clone();
     // Extract the CTE schema
     let EntityDefinition::RelationSchema(cte_schema) = entity_info.definition;
-    match &cte_schema {
-        ast_resolved::CprSchema::Resolved(cols) => {
-            // The consult of a USER-DEFINED CTE is an access boundary,
-            // same regime as a consulted view: the caller reaches the
-            // EXPORTED heading, which answers to the access name (the
-            // user's alias, or the CTE name) — bare declarations never
-            // leak through, and the export re-roots so a body-internal
-            // column spelling cannot reach the SQL (it breaks when the
-            // CTE head renames). Compiler-generated CTEs (HO expansion,
-            // pipe materialization) are the caller-pattern seam's
-            // channel: the seam names their positional columns through
-            // the identity stack, so they keep their identity untouched
-            // — the boundary law for seam shapes lands with the seam
-            // rework, not by breaking it. Argumentative access still
-            // declares its own bare lvars either way: the pattern
-            // resolver re-declares on selection.
-            let access: SqlIdentifier = alias.clone().unwrap_or_else(|| identifier.name.clone());
-            let base_cols: Vec<ast_resolved::ColumnMetadata> = cols
-                .iter()
-                .map(|col| {
-                    let user_defined = matches!(
-                        col.info.identity_stack().first().map(|i| &i.context),
-                        Some(ast_resolved::IdentityContext::CteRegistration {
-                            origin: ast_resolved::CteOrigin::UserDefined,
-                            ..
-                        })
-                    );
-                    if user_defined {
-                        let prov = ast_resolved::ColumnProvenance::from_table_column(
-                            col.name().to_string(),
-                            ast_resolved::TableName::Named(access.clone().into()),
-                            ast_resolved::QualificationSource::None,
-                        );
-                        let mut out = ast_resolved::ColumnMetadata::carrying(
-                            col,
-                            prov,
-                            ast_resolved::TableName::Named(access.clone().into()),
-                            col.table_position,
-                        );
-                        out.export_answering_to(access.clone());
-                        out
-                    } else {
-                        let mut c = col.clone();
-                        if let Some(alias_name) = &alias {
-                            // Push SubqueryAlias so the provenance stack
-                            // carries the alias for qualifier resolution
-                            let prev = match col.qualifier() {
-                                ast_resolved::TableName::Named(t) => t.to_string(),
-                                ast_resolved::TableName::Fresh => "_".to_string(),
-                            };
-                            c.push_scope(
-                                ast_resolved::TableName::Named(alias_name.clone().into()),
-                                ast_resolved::IdentityContext::SubqueryAlias {
-                                    alias: alias_name.to_string(),
-                                    previous_context: prev,
-                                    resolver_id: None,
-                                },
-                            );
-                        }
-                        c
-                    }
-                })
-                .collect();
-
-            // Use PatternResolver for column selection
-            let (mut final_expr, state) = apply_pattern_resolver(
-                &domain_spec,
-                &base_cols,
-                alias.as_deref().unwrap_or(&identifier.name),
-                registry,
-                outer_context,
-            )?;
-
-            // Update the relation with proper identifier and alias (CTEs have no canonical name)
-            patch_ground_relation_fields(
-                &mut final_expr,
-                convert_qualified_name(identifier),
-                None,
-                None,
-                alias,
-                outer,
-            );
-
-            Ok((final_expr, state))
-        }
-        _ => {
-            // Fallback for non-resolved schemas
-            let resolved = ast_resolved::Relation::Ground {
-                identifier: convert_qualified_name(identifier),
-                canonical_name: ast_resolved::PhaseBox::new(None),
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                domain_spec: preserve_domain_spec(&domain_spec)?,
-                alias,
-                outer,
-                mutation_target: false,
-                passthrough: false,
-                cpr_schema: ast_resolved::PhaseBox::new(cte_schema.clone()),
-                hygienic_injections: Vec::new(),
-            };
-            Ok((
-                ast_resolved::RelationalExpression::Relation(resolved),
-                BubbledState::empty(),
-            ))
-        }
+    if canonical_name.is_some() {
+        bind_physical_relation(
+            cte_schema,
+            canonical_name.as_ref(),
+            backend_schema.as_deref(),
+            &registry.identities,
+        )?;
     }
+    if matches!(
+        registry.identities.origin_of(cte_schema),
+        crate::names::ScopeOrigin::Scratch { .. }
+    ) {
+        return Err(DelightQLError::validation_error(
+            "Plan scratch must be referenced by scope identity",
+            "effect plan identity",
+        ));
+    }
+    // The consult of a USER-DEFINED CTE is an access boundary,
+    // same regime as a consulted view: the caller reaches the
+    // EXPORTED heading, which answers to the access name (the
+    // user's alias, or the CTE name) — bare declarations never
+    // leak through, and the export re-roots so a body-internal
+    // column spelling cannot reach the SQL (it breaks when the
+    // CTE head renames). Compiler-generated CTEs (HO expansion,
+    // pipe materialization) are the caller-pattern seam's
+    // channel: the seam names their positional columns through
+    // the identity stack, so they keep their identity untouched
+    // — the boundary law for seam shapes lands with the seam
+    // rework, not by breaking it. Argumentative access still
+    // declares its own bare lvars either way: the pattern
+    // resolver re-declares on selection.
+    let source_scope = cte_schema;
+    let base_cols: Vec<crate::names::ColId> = {
+        let access: SqlIdentifier = alias.clone().unwrap_or_else(|| identifier.name.clone());
+        let access_spelling = registry
+            .identities
+            .intern(access.as_str(), access.is_stropped());
+        let scope = registry.identities.mint_scope(
+            crate::names::ScopeOrigin::UserAlias { of: source_scope },
+            crate::names::Hint::User(access_spelling),
+            None,
+        );
+        let access_name = registry.identities.canonical(access_spelling);
+        // A hygienic carrier stops at this boundary for the same
+        // reason it stops at a view access: it stands for a slot
+        // that introduced no name, and the constraint reading it
+        // was applied inside the body the CTE materialized.
+        // Exporting it as BareAnswering hands an internal column
+        // the access name and puts a target in the heading that
+        // the CTE's own output no longer offers.
+        registry
+            .identities
+            .known_heading(source_scope)?
+            .into_iter()
+            .filter(|column| {
+                registry.identities.addressing(*column) != crate::names::Addressing::Hygienic
+            })
+            .map(|column| {
+                registry.identities.republish_column(
+                    column,
+                    scope,
+                    crate::names::Republish::BoundaryExport,
+                    registry.identities.published(column),
+                    crate::names::Addressing::BareAnswering(access_name),
+                    |_| {},
+                )
+            })
+            .collect()
+    };
+
+    // Use PatternResolver for column selection
+    let (mut final_expr, state) = apply_pattern_resolver(
+        &access,
+        &base_cols,
+        alias.as_deref().unwrap_or(&identifier.name),
+        registry,
+        outer_context,
+        config.cfe_formal_frame.as_deref(),
+        config.resolution_namespace.as_deref(),
+        &config.instantiation_depth,
+    )?;
+
+    patch_ground_outer(&mut final_expr, outer);
+
+    Ok((final_expr, state))
 }
 
 /// Handle DatabaseEntity resolution result.
 pub(super) fn r_resolve_database_entity(
     entity_info: crate::resolution::EntityInfo,
     identifier: ast_unresolved::QualifiedName,
-    domain_spec: ast_unresolved::DomainSpec,
+    access: ast_unresolved::Access,
     alias: Option<SqlIdentifier>,
     outer: bool,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+) -> Result<(ast_resolved::Chain, BubbledState)> {
     use crate::resolution::EntityDefinition;
 
     // Extract fields before entity_info is consumed
     let canonical_name = entity_info.canonical_name.clone();
-    let resolved_namespace = entity_info.resolved_namespace.clone();
     let entity_backend_schema = entity_info.backend_schema.clone();
     // Extract the table schema
     let EntityDefinition::RelationSchema(table_schema) = entity_info.definition;
-    match &table_schema {
-        ast_resolved::CprSchema::Resolved(cols) => {
-            // Apply alias if present
-            let base_cols = relabel_columns_with_alias(cols, &alias);
+    bind_physical_relation(
+        table_schema,
+        canonical_name.as_ref(),
+        entity_backend_schema.as_deref(),
+        &registry.identities,
+    )?;
+    // Apply alias if present
+    let base_cols = relabel_columns_with_alias(table_schema, &alias, &registry.identities);
 
-            // Use PatternResolver for column selection
-            let (mut final_expr, state) = apply_pattern_resolver(
-                &domain_spec,
-                &base_cols,
-                alias.as_deref().unwrap_or(&identifier.name),
-                registry,
-                outer_context,
-            )?;
+    // Use PatternResolver for column selection
+    let (mut final_expr, state) = apply_pattern_resolver(
+        &access,
+        &base_cols,
+        alias.as_deref().unwrap_or(&identifier.name),
+        registry,
+        outer_context,
+        config.cfe_formal_frame.as_deref(),
+        config.resolution_namespace.as_deref(),
+        &config.instantiation_depth,
+    )?;
 
-            // Build the resolved identifier, using the discovered
-            // namespace path so the transformer can emit schema-qualified SQL.
-            let mut resolved_id = convert_qualified_name(identifier.clone());
-            if let Some(ref ns) = resolved_namespace {
-                resolved_id.namespace_path = ns.clone();
-            }
+    patch_ground_outer(&mut final_expr, outer);
 
-            // Update the relation with proper identifier, alias, and canonical name
-            patch_ground_relation_fields(
-                &mut final_expr,
-                resolved_id,
-                canonical_name,
-                entity_backend_schema,
-                alias,
-                outer,
-            );
-
-            Ok((final_expr, state))
-        }
-        _ => {
-            // Fallback for non-resolved schemas
-            let mut fallback_id = convert_qualified_name(identifier);
-            if let Some(ref ns) = resolved_namespace {
-                fallback_id.namespace_path = ns.clone();
-            }
-            let resolved = ast_resolved::Relation::Ground {
-                identifier: fallback_id,
-                canonical_name: ast_resolved::PhaseBox::new(canonical_name.clone()),
-                backend_schema: ast_resolved::PhaseBox::from_optional_schema(entity_backend_schema),
-                domain_spec: preserve_domain_spec(&domain_spec)?,
-                alias,
-                outer,
-                mutation_target: false,
-                passthrough: false,
-                cpr_schema: ast_resolved::PhaseBox::new(table_schema.clone()),
-                hygienic_injections: Vec::new(),
-            };
-            Ok((
-                ast_resolved::RelationalExpression::Relation(resolved),
-                BubbledState::empty(),
-            ))
-        }
-    }
+    Ok((final_expr, state))
 }
 
 /// Handle ConsultedView resolution result.
@@ -1170,151 +1241,65 @@ pub(super) fn r_resolve_consulted_view(
     view_name: SqlIdentifier,
     body_source: String,
     view_ns: String,
-    domain_spec: ast_unresolved::DomainSpec,
+    access: ast_unresolved::Access,
     alias: Option<SqlIdentifier>,
     outer: bool,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    // Cycle guard (RECURSION-CONTRACT.md B5): re-expanding a view already
-    // in flight means its self-reference did NOT resolve as the in-progress
-    // CTE (recursive clause before base, or an indirect cycle through
-    // another view) — refuse with the teaching error instead of spinning.
-    // The frame pops on every return path.
-    let _expansion_frame = config.expansion_guard.enter(
-        format!("{}::{}", view_ns, view_name),
-        "resolver::consulted_view_expansion",
-    )?;
-
-    // Consulted view — expand the body and resolve recursively.
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    // Consulted view — normalize the stored bytes EXACTLY ONCE into a
+    // typed query, then delegate to the typed entrance below.
     //
     // Check if this view comes from a pre-grounded namespace
-    // (created by ground_into!). If so, apply data namespace patching
+    // (created by ground!). If so, apply data namespace patching
     // so unqualified table references resolve to the bound data namespace.
     let auto_grounding = registry
         .consult
         .get_namespace_default_data_ns(&view_ns)
         .and_then(|data_ns_fq| {
-            let parts: Vec<String> = data_ns_fq.split("::").map(|s| s.to_string()).collect();
-            let data_ns = ast_unresolved::NamespacePath::from_parts(parts).ok()?;
-            let ns_parts: Vec<String> = view_ns.split("::").map(|s| s.to_string()).collect();
-            let grounded_ns = ast_unresolved::NamespacePath::from_parts(ns_parts).ok()?;
+            let data_ns = ast_unresolved::NamespacePath::from_fq_string(&data_ns_fq).ok()?;
+            let grounded_ns = ast_unresolved::NamespacePath::from_fq_string(&view_ns).ok()?;
             Some(ast_unresolved::GroundedPath {
                 data_ns,
                 grounded_ns: vec![grounded_ns],
             })
         });
 
-    if let Some(ref grounding) = auto_grounding {
+    if let Some(grounding) = auto_grounding {
         // Pre-grounded namespace: expand view as full Query (preserves CTEs)
-        let query =
-            super::grounding::expand_consulted_view(&body_source, grounding).map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Error while expanding pre-grounded view '{}' (from namespace '{}'): {}",
-                        view_name, view_ns, e
-                    ),
-                    e.to_string(),
-                )
-            })?;
-
-        // A rule body is SEALED: its meaning cannot depend on the call
-        // site's scope. With the caller's columns in reach, a body's own
-        // positional rebind was captured as an outer correlation whenever
-        // the caller had same-named columns — the rebind silently
-        // vanished and the body resolved as a glob. Correlation into a
-        // subquery is the call-site condition's business, never the
-        // body's.
-        let saved_ctes = registry.query_local.ctes.clone();
-        let resolve_result =
-            super::resolve_query_inline(query, registry, None, config, Some(grounding));
-        registry.query_local.ctes = saved_ctes;
-        let (resolved_query, body_bubbled) = resolve_result
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!(
-                        "Error while resolving pre-grounded view '{}' (from namespace '{}'): {}",
-                        view_name, view_ns, e
-                    ),
-                        e.to_string(),
-                    )
-                })?;
-
-        let body_schema =
-            super::helpers::extraction::extract_cpr_schema_from_query(&resolved_query)?;
-
-        let (effective_alias, resolver_id, export_schema) =
-            access_boundary_export(&alias, &view_name, &body_schema, &config.alias_counter);
-
-        let effective_name = effective_alias.to_string();
-
-        let scoped = ast_resolved::ScopedSchema::bind(
-            export_schema,
-            effective_alias.clone(),
-            resolver_id,
+        let query = super::grounding::expand_consulted_view(&body_source, &grounding)
+            .map_err(|e| wrap_view_body_error(e, "expanding", &view_name, &view_ns))?;
+        return r_resolve_view_query(
+            view_name,
+            query,
+            view_ns,
+            access,
+            alias,
+            outer,
+            registry,
+            outer_context,
+            config,
+            Some(&grounding),
         );
-
-        let base_expr =
-            ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::ConsultedView {
-                identifier: ast_resolved::QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: view_name.clone().into(),
-                    grounding: None,
-                },
-                body: Box::new(resolved_query),
-                scoped: ast_resolved::PhaseBox::new(scoped),
-                outer,
-            });
-
-        if !matches!(domain_spec, ast_unresolved::DomainSpec::Glob) {
-            let (final_expr, final_bubbled) = apply_call_site_pattern(
-                &domain_spec,
-                base_expr,
-                &body_schema,
-                &effective_name,
-                &view_name,
-                outer_context,
-            )?;
-            return Ok((final_expr, final_bubbled));
-        } else {
-            // The lvar law: the columns answer to the ACCESS name — the
-            // user's alias, or the bare entity name of an unaliased access.
-            let __access = alias
-                .clone()
-                .unwrap_or_else(|| view_name.clone().into());
-            let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name, BoundaryAnswering::AnswersTo(__access));
-            return Ok((base_expr, body_bubbled));
-        }
     }
 
     // Normal consulted view (not pre-grounded) — parse as full Query
-    // to preserve CTEs, then resolve through the full pipeline.
-    // Uses build_ddl_file to handle multi-clause (disjunctive) views.
-    let defs = crate::ddl::ddl_builder::build_ddl_file(&body_source).map_err(|e| {
+    // to preserve CTEs. The one door assembles the group's clause heads;
+    // a declared heading is then enforced by the shared desugar law.
+    let group = crate::ddl::reconstruct::group(&body_source).map_err(|e| {
         DelightQLError::database_error(
             format!("Error while parsing borrowed view '{}': {}", view_name, e),
             e.to_string(),
         )
     })?;
-    // Enforce argumentative head contracts (translate to glob heads with projections)
-    let has_arg = defs.iter().any(|d| {
-        matches!(
-            d.head,
-            crate::pipeline::asts::ddl::DdlHead::ArgumentativeView { .. }
-        )
-    });
-    let defs = if has_arg {
-        super::grounding::desugar_argumentative_defs(defs)?
-    } else {
-        defs
-    };
-    let query = if defs.len() <= 1 {
+    let mut clauses = group.spend_heads()?;
+    let query = if clauses.len() <= 1 {
         // Single clause: same as before
-        let ddl_def = defs.into_iter().next().ok_or_else(|| {
+        let clause = clauses.pop().ok_or_else(|| {
             DelightQLError::parse_error(format!("No definition found for view '{}'", view_name))
         })?;
-        ddl_def.into_query().ok_or_else(|| {
+        clause.into_query().ok_or_else(|| {
             DelightQLError::parse_error(format!(
                 "Expected relational body for view '{}', got scalar",
                 view_name
@@ -1323,7 +1308,7 @@ pub(super) fn r_resolve_consulted_view(
     } else {
         // Multi-clause: synthesize disjunctive CTEs (no data_ns patching
         // since this is a non-grounded borrowed view)
-        super::grounding::expand_multi_clause_view(defs, None).map_err(|e| {
+        super::grounding::expand_multi_clause_view(&view_name, clauses, None).map_err(|e| {
             DelightQLError::database_error(
                 format!(
                     "Error while expanding disjunctive view '{}': {}",
@@ -1334,46 +1319,54 @@ pub(super) fn r_resolve_consulted_view(
         })?
     };
 
-    // Inline sibling functions from the consult registry before resolution.
-    // Without this, function calls like `double:(b)` in the view body
-    // would pass through to SQL as unresolved function names.
-    let (query, view_ccafe_cfes) =
-        super::grounding::inline_in_query_borrowed(query, &registry.consult, None, Some(&view_ns))
-            .map_err(
-            |e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Error while inlining functions in view '{}': {}",
-                        view_name, e
-                    ),
-                    e.to_string(),
-                )
-            },
-        )?;
+    r_resolve_view_query(
+        view_name,
+        query,
+        view_ns,
+        access,
+        alias,
+        outer,
+        registry,
+        outer_context,
+        config,
+        None,
+    )
+}
 
-    // If any context-aware DDL functions were discovered in the view body,
-    // precompile them and wrap the query with WithPrecompiledCfes.
-    let query = if !view_ccafe_cfes.is_empty() {
-        let precompiled: Vec<_> = view_ccafe_cfes
-            .into_iter()
-            .map(|cfe| {
-                crate::pipeline::cfe_precompiler::definition::precompile_cfe_definition(
-                    cfe,
-                    registry.database.schema(),
-                    registry.database.system,
-                )
-            })
-            .collect::<crate::error::Result<_>>()?;
-        ast_unresolved::Query::WithPrecompiledCfes {
-            cfes: precompiled,
-            query: Box::new(query),
-        }
-    } else {
-        query
-    };
+/// The TYPED consulted-view entrance: resolve an ALREADY-BUILT body query
+/// as `view_name`'s access boundary, inside the causing compilation's
+/// registry and config. The text roads above normalize their stored bytes
+/// exactly once and land here; a compiler-built wrapper (the liminal
+/// ledger) constructs its query directly and enters the same door, so no
+/// resolver road mints DQL text to reach a relation it can build.
+pub(super) fn r_resolve_view_query(
+    view_name: SqlIdentifier,
+    query: ast_unresolved::Query,
+    view_ns: String,
+    access: ast_unresolved::Access,
+    alias: Option<SqlIdentifier>,
+    outer: bool,
+    registry: &mut crate::resolution::EntityRegistry,
+    outer_context: Option<&[crate::names::ColId]>,
+    config: &ResolutionConfig,
+    grounding: Option<&ast_unresolved::GroundedPath>,
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    // Cycle guard (CYCLES THROUGH OTHER DEFINITIONS REFUSE): re-expanding a view already
+    // in flight means its self-reference did NOT resolve as the in-progress
+    // CTE (recursive clause before base, or an indirect cycle through
+    // another view) — refuse with the teaching error instead of spinning.
+    // The frame pops on every return path.
+    let _expansion_frame = config.expansion_guard.enter(
+        format!("{}::{}", view_ns, view_name),
+        "resolver::consulted_view_expansion",
+    )?;
 
-    // Scope ER-rule lookups to the view's namespace for qualified access
-    let body_config = if !view_ns.is_empty() && view_ns != "main" {
+    // Scope ER-rule lookups to the view's namespace for qualified access.
+    // A pre-grounded body keeps the caller's namespace: its
+    // data-namespace patching was already applied when the query was
+    // built. Sealed against the instantiation too: a caller-side formal
+    // must not substitute inside foreign body text.
+    let mut body_config = if grounding.is_none() && !view_ns.is_empty() && view_ns != "main" {
         ResolutionConfig {
             resolution_namespace: Some(view_ns.clone()),
             ..config.clone()
@@ -1381,24 +1374,28 @@ pub(super) fn r_resolve_consulted_view(
     } else {
         config.clone()
     };
+    body_config.cfe_formal_frame = None;
 
-    // Phase 10 slice c: the alias dance is gone from the view-body path —
     // lookup_entity's alias clause is SCOPE-AWARE (a definition's
     // qualifier alias resolves through its OWN namespace_local_alias
     // rows, never the caller's session set).
 
-    // Sealed like every rule body (see the pre-grounded branch above):
-    // the caller's scope must never reach a body's binding positions.
-    // Body-INTERNAL CTE registrations (a recursive rule registers itself
-    // so its self-reference resolves) are scoped to this expansion: a
-    // sibling clause's later reference must re-expand the view whole,
-    // not resolve against a WITH that only exists inside this branch.
-    let saved_ctes = registry.query_local.ctes.clone();
-    let resolve_result = super::resolve_query_inline(query, registry, None, &body_config, None);
-    registry.query_local.ctes = saved_ctes;
+    // A rule body is SEALED: its meaning cannot depend on the call
+    // site's scope. With the caller's columns in reach, a body's own
+    // positional rebind was captured as an outer correlation whenever
+    // the caller had same-named columns — the rebind silently
+    // vanished and the body resolved as a glob. Correlation into a
+    // subquery is the call-site condition's business, never the body's.
+    // Body-introduced BINDINGS end with the body — the inline entrance's
+    // own extent: a recursive rule's self-registration must not answer a
+    // sibling clause's later reference, and a view-local CFE definition
+    // must not replace the caller's same-named binding.
+    let resolve_result = super::resolve_query_inline(query, registry, None, &body_config, grounding);
 
-
-    let (resolved_query, body_bubbled) = resolve_result.map_err(|e| {
+    let (resolved_query, _body_bubbled) = resolve_result.map_err(|e| {
+        if grounding.is_some() {
+            return wrap_view_body_error(e, "resolving", &view_name, &view_ns);
+        }
         // Preserve validation errors (e.g., the B5 expansion-cycle refusal)
         // so their subcategory URI survives to the user and to error
         // assertions.
@@ -1413,160 +1410,42 @@ pub(super) fn r_resolve_consulted_view(
 
     let body_schema = super::helpers::extraction::extract_cpr_schema_from_query(&resolved_query)?;
 
-    // Seal provenance at the ConsultedView boundary: the view's output
-    // column names ARE the subquery's output column names. Inner provenance
-    // (UserAliases from the view body's internal CTEs/pipes) must not leak
-    // through, or downstream operators (RenameCover, etc.) will see stale
-    // source_name() values and generate SQL referencing inner column names
-    // that don't exist in the subquery output.
-    fn seal_column_provenance(col: &mut ast_resolved::ColumnMetadata) {
-        let display_name = col.info.name().unwrap_or("?").to_string();
-        // Honest Fresh: the seal deliberately resets to the bare display name; the
-        // view-table qualifier is (re)applied downstream at the ConsultedView relabel.
-        col.info = ast_resolved::ColumnProvenance::from_column(display_name);
-    }
-
-    let body_schema = match body_schema {
-        ast_resolved::CprSchema::Resolved(cols) => {
-            let sealed = cols
-                .into_iter()
-                .map(|mut col| {
-                    seal_column_provenance(&mut col);
-                    col
-                })
-                .collect();
-            ast_resolved::CprSchema::Resolved(sealed)
-        }
-        other => other,
-    };
-
-    // Also seal the bubbled state — pipe operators get input columns
-    // from the bubbled state, not the scoped schema.
-    let body_bubbled = {
-        let mut bubbled = body_bubbled;
-        for col in &mut bubbled.i_provide {
-            seal_column_provenance(col);
-        }
-        bubbled
-    };
-
-    let (effective_alias, resolver_id, export_schema) =
-        access_boundary_export(&alias, &view_name, &body_schema, &config.alias_counter);
+    let (effective_alias, access_scope) =
+        access_boundary_export(&alias, &view_name, body_schema, &registry.identities);
 
     let effective_name = effective_alias.to_string();
 
-    let scoped =
-        ast_resolved::ScopedSchema::bind(export_schema, effective_alias.clone(), resolver_id);
+    let base_expr = ast_resolved::Chain::relation(ast_resolved::Relation::ConsultedView {
+        body: Box::new(resolved_query),
+        scoped: access_scope,
+        outer,
+    });
 
-    let base_expr =
-        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::ConsultedView {
-            identifier: ast_resolved::QualifiedName {
-                namespace_path: NamespacePath::empty(),
-                name: view_name.clone().into(),
-                grounding: None,
-            },
-            body: Box::new(resolved_query),
-            scoped: ast_resolved::PhaseBox::new(scoped),
-            outer,
-        });
-
-    if !matches!(domain_spec, ast_unresolved::DomainSpec::Glob) {
+    if !matches!(access, ast_unresolved::Access::All) {
         let (final_expr, final_bubbled) = apply_call_site_pattern(
-            &domain_spec,
+            &access,
             base_expr,
-            &body_schema,
+            access_scope,
             &effective_name,
             &view_name,
             outer_context,
+            &registry.identities,
+            config.cfe_formal_frame.as_deref(),
+            Some(super::SlotInstantiation {
+                scoped_cfes: &registry.query_local.scoped_cfes,
+                consult: &registry.consult,
+                lookup_scope: config.resolution_namespace.as_deref(),
+                depth: &config.instantiation_depth,
+            }),
         )?;
         Ok((final_expr, final_bubbled))
     } else {
         // The lvar law: the columns answer to the ACCESS name — the
         // user's alias, or the bare entity name of an unaliased access.
-        let __access = alias
-            .clone()
-            .unwrap_or_else(|| view_name.clone().into());
-        let body_bubbled = relabel_bubbled_with_alias(body_bubbled, &effective_name, BoundaryAnswering::AnswersTo(__access));
-        Ok((base_expr, body_bubbled))
-    }
-}
-
-/// Handle ConsultedFact resolution result.
-pub(super) fn r_resolve_consulted_fact(
-    fact_name: SqlIdentifier,
-    body_source: String,
-    domain_spec: ast_unresolved::DomainSpec,
-    alias: Option<SqlIdentifier>,
-    outer: bool,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
-    config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    // Consulted fact — parse all clauses, merge rows into one
-    // anonymous table, resolve, and wrap as a subquery.
-    let body = expand_fact_body(&body_source, &fact_name).map_err(|e| {
-        DelightQLError::database_error(
-            format!("Error while expanding borrowed fact '{}': {}", fact_name, e),
-            e.to_string(),
-        )
-    })?;
-
-    let (resolved_body, body_bubbled) = super::resolve_relational_expression_with_registry(
-        body,
-        registry,
-        outer_context,
-        config,
-        None,
-    )
-    .map_err(|e| {
-        DelightQLError::database_error(
-            format!("Error while resolving borrowed fact '{}': {}", fact_name, e),
-            e.to_string(),
-        )
-    })?;
-
-    let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_body)?;
-
-    let (effective_alias, _resolver_id) = {
-        let (a, r) = compute_effective_alias(&alias, &config.alias_counter);
-        (Some(a), r)
-    };
-
-    let effective_name = effective_alias.as_deref().unwrap_or(&fact_name);
-
-    let base_expr =
-        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::InnerRelation {
-            pattern: ast_resolved::InnerRelationPattern::UncorrelatedDerivedTable {
-                identifier: ast_resolved::QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: fact_name.clone().into(),
-                    grounding: None,
-                },
-                subquery: Box::new(resolved_body),
-                is_consulted_view: false,
-            },
-            alias: effective_alias.clone(),
-            outer,
-            cpr_schema: ast_resolved::PhaseBox::new(body_schema.clone()),
-        });
-
-    if !matches!(domain_spec, ast_unresolved::DomainSpec::Glob) {
-        let (final_expr, final_bubbled) = apply_call_site_pattern(
-            &domain_spec,
-            base_expr,
-            &body_schema,
-            effective_name,
-            &fact_name,
-            outer_context,
-        )?;
-        Ok((final_expr, final_bubbled))
-    } else {
-        // The lvar law: the columns answer to the ACCESS name — the
-        // user's alias, or the bare entity name of an unaliased access.
-        let __access = alias
-            .clone()
-            .unwrap_or_else(|| fact_name.clone().into());
-        let body_bubbled = relabel_bubbled_with_alias(body_bubbled, effective_name, BoundaryAnswering::AnswersTo(__access));
+        let body_bubbled = BubbledState::resolved(
+            registry.identities.known_heading(access_scope)?.to_vec(),
+            &registry.identities,
+        );
         Ok((base_expr, body_bubbled))
     }
 }
@@ -1574,66 +1453,34 @@ pub(super) fn r_resolve_consulted_fact(
 /// Handle Unknown (or unmatched) resolution result.
 pub(super) fn r_resolve_unknown(
     identifier: ast_unresolved::QualifiedName,
-    domain_spec: ast_unresolved::DomainSpec,
-    alias: Option<SqlIdentifier>,
-    outer: bool,
-    config: &ResolutionConfig,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    // Unknown entity - error out unless in transpile-only mode
-    // This represents a table/entity that couldn't be resolved
-
-    // Check if we're in transpile-only mode
-    if config.transpile_only {
-        // In transpile-only mode, allow unknown tables with Unknown schema
-        let resolved_relation = ast_resolved::Relation::Ground {
-            identifier: convert_qualified_name(identifier),
-            canonical_name: ast_resolved::PhaseBox::new(None),
-            backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-            domain_spec: preserve_domain_spec(&domain_spec)?,
-            alias,
-            outer,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Unknown),
-            hygienic_injections: Vec::new(),
-        };
-
-        let state = BubbledState::empty();
-
-        Ok((
-            ast_resolved::RelationalExpression::Relation(resolved_relation),
-            state,
-        ))
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    let (table_name, context) = if !identifier.namespace_path.is_empty() {
+        // Construct namespace path string using :: separator (DelightQL
+        // format). NOTE: storage order, not iter_reversed — the old
+        // context string used iter_reversed and rendered multi-segment
+        // paths BACKWARDS (sys::meta as "meta::sys"), invisibly, because
+        // the context field is never displayed.
+        let ns_str = identifier.namespace_path.fq_string();
+        // Report the FULL path the user wrote, never the bare leaf: the
+        // leaf-only "Table not found: orders" for `sales.orders(*)`
+        // hid the actual mistake (an under-qualified namespace), sent
+        // readers hunting for a missing TABLE, and manufactured a
+        // false "mount! is broken" diagnosis.
+        (
+            format!("{}.{}", ns_str, identifier.name),
+            format!("Entity '{}' not found in namespace '{}'. The namespace prefix as written did not resolve — check it against your mounts (sys::ns.namespace(*) lists them; a mount under 'data::{}' is reached as 'data::{}.{}'). Other causes: entity not activated, or missing backend schema configuration.", identifier.name, ns_str, ns_str, ns_str, identifier.name)
+        )
     } else {
-        // In normal mode, error out for unknown tables
-        let (table_name, context) = if !identifier.namespace_path.is_empty() {
-            // Construct namespace path string using :: separator (DelightQL
-            // format). NOTE: storage order, not iter_reversed — the old
-            // context string used iter_reversed and rendered multi-segment
-            // paths BACKWARDS (sys::meta as "meta::sys"), invisibly, because
-            // the context field is never displayed.
-            let ns_str = super::grounding::namespace_path_to_fq(&identifier.namespace_path);
-            // Report the FULL path the user wrote, never the bare leaf: the
-            // leaf-only "Table not found: orders" for `sales.orders(*)`
-            // hid the actual mistake (an under-qualified namespace), sent
-            // readers hunting for a missing TABLE, and manufactured a
-            // false "mount! is broken" diagnosis.
-            (
-                format!("{}.{}", ns_str, identifier.name),
-                format!("Entity '{}' not found in namespace '{}'. The namespace prefix as written did not resolve — check it against your mounts (sys::ns.namespace(*) lists them; a mount under 'data::{}' is reached as 'data::{}.{}'). Other causes: entity not activated, or missing backend schema configuration.", identifier.name, ns_str, ns_str, ns_str, identifier.name)
-            )
-        } else {
-            (
-                identifier.name.to_string(),
-                "Table or view does not exist in the database".to_string(),
-            )
-        };
+        (
+            identifier.name.to_string(),
+            "Table or view does not exist in the database".to_string(),
+        )
+    };
 
-        Err(DelightQLError::TableNotFoundError {
-            table_name,
-            context,
-        })
-    }
+    Err(DelightQLError::TableNotFoundError {
+        table_name,
+        context,
+    })
 }
 
 /// Infer a `declared_type` for each anonymous-table column from its literal
@@ -1642,21 +1489,24 @@ pub(super) fn r_resolve_unknown(
 /// INTEGER unifies with REAL as REAL). Any non-literal cell (melt patterns
 /// reference outer columns), boolean, or text/numeric mix yields None —
 /// that's sqlite-dynamic data with no honest single type. First consumer:
-/// corresponding-union NULL pads (`ColumnMetadata::pad_type`), where an
-/// untyped pad inside a subquery collapses to text at the pg subquery
-/// boundary before the union can resolve it against the typed branch.
-fn infer_anon_column_types(rows: &[ast_resolved::Row]) -> Vec<Option<String>> {
-    let num_cols = rows.first().map(|r| r.values.len()).unwrap_or(0);
+/// corresponding-union NULL pads, whose type comes from the Registry value
+/// facts. An untyped pad inside a subquery collapses to text at the pg
+/// subquery boundary before the union can resolve it against the typed branch.
+fn infer_anon_column_types(
+    rows: &crate::pipeline::asts::vocabulary::Vec1<ast_resolved::TabularRow<ast_resolved::Datum>>,
+) -> Vec<Option<String>> {
+    let num_cols = rows.first().len();
     (0..num_cols)
         .map(|idx| {
             let mut unified: Option<&str> = None;
             for row in rows {
-                let Some(ast_resolved::DomainExpression::Literal { value, .. }) =
-                    row.values.get(idx)
+                let Some(ast_resolved::DomainExpression::Application(
+                    ast_resolved::FunctionApplication::Ground(value),
+                )) = row.0.get(idx).map(ast_resolved::Datum::value)
                 else {
                     return None;
                 };
-                let cell = match value {
+                let cell = match &value {
                     ast_resolved::LiteralValue::Null => continue,
                     ast_resolved::LiteralValue::String(_)
                     | ast_resolved::LiteralValue::Symbol(_)
@@ -1682,6 +1532,40 @@ fn infer_anon_column_types(rows: &[ast_resolved::Row]) -> Vec<Option<String>> {
         .collect()
 }
 
+fn infer_anon_column_shapes(
+    rows: &crate::pipeline::asts::vocabulary::Vec1<ast_resolved::TabularRow<ast_resolved::Datum>>,
+) -> Vec<crate::names::ValueShape> {
+    use crate::pipeline::asts::core::Enclyph;
+    (0..rows.first().len())
+        .map(|idx| {
+            let mut shape = None;
+            for row in rows {
+                let Some(datum) = row.0.get(idx) else {
+                    return crate::names::ValueShape::Unknown;
+                };
+                let current = match datum.value() {
+                    ast_resolved::DomainExpression::Application(
+                        ast_resolved::FunctionApplication::Enclyph(Enclyph::Record(_)),
+                    ) => crate::names::ValueShape::Record,
+                    ast_resolved::DomainExpression::Application(
+                        ast_resolved::FunctionApplication::Enclyph(Enclyph::EmptyRecord(_)),
+                    ) => crate::names::ValueShape::Record,
+                    ast_resolved::DomainExpression::Application(
+                        ast_resolved::FunctionApplication::Enclyph(Enclyph::Tuple(_)),
+                    ) => crate::names::ValueShape::Tuple,
+                    _ => return crate::names::ValueShape::Unknown,
+                };
+                match shape {
+                    None => shape = Some(current),
+                    Some(existing) if existing == current => {}
+                    Some(_) => return crate::names::ValueShape::Unknown,
+                }
+            }
+            shape.unwrap_or_default()
+        })
+        .collect()
+}
+
 /// Loud where knowable: narrowing (`|> .col{...}`) iterates an ARRAY,
 /// and when the narrowed column is an anonymous-table column whose
 /// every row is a literal OBJECT constructor, the mistake is provable
@@ -1691,35 +1575,25 @@ fn infer_anon_column_types(rows: &[ast_resolved::Row]) -> Vec<Option<String>> {
 /// non-array behavior is an open ruling.
 pub(super) fn refuse_knowable_object_narrowing(
     column: &str,
-    source: &ast_resolved::RelationalExpression,
+    source: &ast_resolved::Chain,
+    identities: &crate::names::Registry,
 ) -> Result<()> {
-    let ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::Anonymous {
-        rows,
-        cpr_schema,
-        ..
-    }) = source
-    else {
-        return Ok(());
-    };
-    let ast_resolved::CprSchema::Resolved(cols) = cpr_schema.get() else {
-        return Ok(());
-    };
-    let Some(idx) = cols
+    let scope = super::helpers::extraction::extract_cpr_schema(source);
+    let sought = identities.canonical(identities.intern(column, false));
+    let Some(idx) = identities
+        .known_heading(scope)?
         .iter()
-        .position(|c| delightql_types::SqlIdentifier::str_eq(c.name(), column))
+        .position(|candidate| identities.published_sym(*candidate) == Some(sought))
     else {
         return Ok(());
     };
-    let every_row_is_object = !rows.is_empty()
-        && rows.iter().all(|r| {
-            matches!(
-                r.values.get(idx),
-                Some(ast_resolved::DomainExpression::Function(
-                    ast_resolved::FunctionExpression::Curly { .. }
-                ))
-            )
-        });
-    if every_row_is_object {
+    let occurrence = identities
+        .known_heading(scope)?
+        .in_order()
+        .nth(idx)
+        .copied()
+        .expect("the named position came from this exhaustive heading");
+    if identities.facts(occurrence).shape == crate::names::ValueShape::Record {
         return Err(DelightQLError::validation_error_categorized(
             "narrowing/object_literal",
             format!(
@@ -1736,97 +1610,146 @@ pub(super) fn refuse_knowable_object_narrowing(
 /// Resolve an Anonymous relation variant (inline table with rows/headers).
 ///
 /// Handles header resolution, row value resolution, and QUA schema conformance.
+/// Resolve an expression written inside an anonymous table against the row
+/// that ENCLOSES it.
+///
+/// A header and a data cell both reach out of the anonymous relation for the
+/// names they use — the anonymous relation has no heading of its own until
+/// these are resolved. The context swap is one act, so a header and a cell
+/// cannot come to disagree about which columns were in scope.
+fn resolve_against_outer_context(
+    fold: &mut super::resolver_fold::ResolverFold<'_, '_>,
+    outer_context: Option<&[crate::names::ColId]>,
+    expression: ast_unresolved::DomainExpression,
+) -> Result<ast_resolved::DomainExpression> {
+    let saved_available = std::mem::take(&mut fold.available);
+    let saved_local_available = std::mem::take(&mut fold.local_available);
+    let saved_qualifier_scope = std::mem::take(&mut fold.qualifier_scope);
+    let saved_in_correlation = fold.in_correlation;
+    fold.available = outer_context.unwrap_or(&[]).to_vec();
+    fold.local_available = fold.available.clone();
+    fold.qualifier_scope = outer_context
+        .unwrap_or(&[])
+        .iter()
+        .map(|column| fold.registry.identities.scope_of(*column))
+        .fold(Vec::new(), |mut scopes, scope| {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+            scopes
+        });
+    fold.in_correlation = false;
+    let result = fold.transform_domain(expression);
+    fold.available = saved_available;
+    fold.local_available = saved_local_available;
+    fold.qualifier_scope = saved_qualifier_scope;
+    fold.in_correlation = saved_in_correlation;
+    result
+}
+
 pub(super) fn resolve_anonymous(
-    rel: ast_unresolved::Relation,
+    anon: ast_unresolved::AnonRelation,
     fold: &mut super::resolver_fold::ResolverFold,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
-    let ast_unresolved::Relation::Anonymous {
-        column_headers,
-        rows,
+    outer_context: Option<&[crate::names::ColId]>,
+) -> Result<(ast_resolved::Chain, BubbledState)> {
+    let ast_unresolved::AnonRelation {
+        table:
+            ast_unresolved::AnonTable {
+                body: ast_unresolved::TabularBody { header, rows },
+                cpr_schema: _,
+            },
         alias: relation_alias,
         outer,
-        exists_mode,
-        negated,
-        qua_target,
-        cpr_schema: _,
-    } = rel
-    else {
-        unreachable!("resolve_anonymous called with non-Anonymous variant");
-    };
+    } = anon;
+    let column_headers = header
+        .as_ref()
+        .map(|row| {
+            row.iter()
+                .map(|item| {
+                    item.term().ok_or_else(|| {
+                        DelightQLError::parse_error("a tabular header slot has a domain term")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
 
-    // Assign a synthetic table name for unaliased anonymous tables so their
-    // columns get a qualifier (e.g., _1, _2) for disambiguation.
-    static ANON_TABLE_COUNTER: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(1);
-    let anon_table_id = if relation_alias.is_none() {
-        ANON_TABLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    } else {
-        0 // unused when alias is present
-    };
-
-    // P10 FIX: Anonymous relations now support DomainExpression headers for unification
+    let scope_hint = relation_alias
+        .as_ref()
+        .map(|alias| {
+            crate::names::Hint::User(
+                fold.registry
+                    .identities
+                    .intern(alias.as_str(), alias.is_stropped()),
+            )
+        })
+        .unwrap_or(crate::names::Hint::None);
+    let anonymous_scope = fold.registry.identities.mint_scope(
+        crate::names::ScopeOrigin::AnonRelation,
+        scope_hint,
+        None,
+    );
 
     // Convert rows from unresolved to resolved format
-    // EPOCH 7: Resolve anonymous table data rows with outer_context for melt/unpivot
-    let resolved_rows: Result<Vec<ast_resolved::Row>> = rows
-        .iter()
-        .map(|row| {
-            // Row is a struct with values field, not an enum
-            let resolved_values: Result<Vec<ast_resolved::DomainExpression>> = row
-                .values
-                .clone()
-                .into_iter()
-                .map(|val| {
-                    match val {
-                        ast_unresolved::DomainExpression::Literal { value, alias } => {
-                            // Literals pass through unchanged
-                            Ok(ast_resolved::DomainExpression::Literal { value, alias })
-                        }
-                        // EPOCH 7: Resolve column references and other expressions
-                        // This enables melt/unpivot patterns like:
-                        // _(attr, val @ "name", first_name; "id", user_id)
-                        //                       ^^^^^^^^^^      ^^^^^^^
-                        _ => {
-                            // Use outer_context to resolve column references from joined tables
-                            let saved_available = std::mem::take(&mut fold.available);
-                            let saved_qualifier_scope = std::mem::take(&mut fold.qualifier_scope);
-                            let saved_in_correlation = fold.in_correlation;
-                            fold.available = outer_context.unwrap_or(&[]).to_vec();
-                            fold.qualifier_scope = outer_context.unwrap_or(&[]).to_vec();
-                            fold.in_correlation = false;
-                            let result = fold.transform_domain(val);
-                            fold.available = saved_available;
-                            fold.qualifier_scope = saved_qualifier_scope;
-                            fold.in_correlation = saved_in_correlation;
-                            result
-                        }
-                    }
-                })
-                .collect();
-
-            Ok(ast_resolved::Row {
-                values: resolved_values?,
-            })
-        })
-        .collect();
-
-    let resolved_rows = resolved_rows?;
+    // Resolve anonymous table data rows with outer_context for melt/unpivot
+    let resolved_rows = rows.clone().try_map(|row| {
+        let resolved_values = (*row.0).try_map(|datum| {
+            let sparse_column = match &datum {
+                ast_unresolved::Datum::SparseFill { column, .. } => Some(column.clone()),
+                ast_unresolved::Datum::Value(_) => None,
+            };
+            let val = datum.into_value();
+            match val {
+                ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Ground(value),
+                ) => {
+                    let value = ast_resolved::DomainExpression::Application(
+                        ast_resolved::FunctionApplication::Ground(value),
+                    );
+                    Ok(match sparse_column {
+                        Some(column) => ast_resolved::Datum::SparseFill {
+                            column,
+                            fallback: match value {
+                                ast_resolved::DomainExpression::Application(
+                                    ast_resolved::FunctionApplication::Ground(ref value),
+                                ) => value.clone(),
+                                _ => unreachable!(),
+                            },
+                        },
+                        None => ast_resolved::Datum::Value(value),
+                    })
+                }
+                // Resolve column references and other expressions.
+                // This enables melt/unpivot patterns like:
+                // _(attr, val @ "name", first_name; "id", user_id)
+                //                       ^^^^^^^^^^      ^^^^^^^
+                _ => resolve_against_outer_context(fold, outer_context, val)
+                    .map(ast_resolved::Datum::Value),
+            }
+        })?;
+        Ok::<_, DelightQLError>(crate::pipeline::asts::core::TabularRow(Box::new(
+            resolved_values,
+        )))
+    })?;
 
     // An lvar cannot appear both in a header and in the data rows of
-    // the same anonymous table (lvars.md): the header is the probe,
+    // the same anonymous table: the header is the probe,
     // a row lvar is a candidate — the same name in both makes the
     // membership vacuously true, and in the relational forms it
     // collides the declaration with the reference.
     if let Some(headers) = &column_headers {
         for header in headers {
-            let ast_unresolved::DomainExpression::Lvar { name, .. } = header else {
+            let ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn { name, .. },
+            ))) = header
+            else {
                 continue;
             };
-            let repeated = resolved_rows.iter().any(|row| {
-                row.values.iter().any(|cell| {
+            let repeated = rows.iter().any(|row| {
+                row.iter().any(|datum| {
+                    let cell = datum.value();
                     matches!(cell,
-                        ast_resolved::DomainExpression::Lvar { name: cell_name, .. }
+                        ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(AuthoredColumn { name: cell_name, .. })))
                             if delightql_types::SqlIdentifier::str_eq(cell_name.as_str(), name))
                 })
             });
@@ -1845,355 +1768,161 @@ pub(super) fn resolve_anonymous(
 
     // Literal-grid type inference: the rows are the columns' declaration.
     let inferred_types = infer_anon_column_types(&resolved_rows);
+    let inferred_shapes = infer_anon_column_shapes(&resolved_rows);
 
-    // P10 FIX: Process DomainExpression headers and resolve them
-    // Headers can now contain references that need resolution for unification
+    // Headers are declarations into the anonymous relation's one scope.
     let (resolved_headers, resolved_schema) = if let Some(headers) = &column_headers {
         let mut resolved_headers = Vec::new();
-        let mut columns = Vec::new();
 
         for (idx, header) in headers.iter().enumerate() {
             match header {
-                ast_unresolved::DomainExpression::Lvar {
-                    name,
-                    qualifier,
-                    namespace_path,
-                    alias,
-                    provenance: _,
-                } => {
-                    // This is a column reference - could be simple or qualified
-                    // For unification, we need to track what it references
-                    resolved_headers.push(ast_resolved::DomainExpression::Lvar {
-                        name: name.clone(),
-                        qualifier: qualifier.clone(),
-                        namespace_path: namespace_path.clone(),
-                        alias: alias.clone(),
-                        provenance: ast_resolved::PhaseBox::phantom(),
-                    });
-
-                    // Create column metadata
-                    // If this is a qualified reference (e.g., o.status), we need to track it
-                    let col_name = if qualifier.is_some() {
-                        // Qualified - this creates a unification constraint
-                        name.clone()
-                    } else {
-                        // Simple identifier - use as column name
-                        name.clone()
+                ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                    AuthoredColumn { name, .. },
+                ))) => {
+                    let published = fold
+                        .registry
+                        .identities
+                        .intern(name.as_str(), name.is_stropped());
+                    let addressing = match &relation_alias {
+                        Some(relation_alias) => {
+                            let alias_spelling = fold
+                                .registry
+                                .identities
+                                .intern(relation_alias.as_str(), relation_alias.is_stropped());
+                            crate::names::Addressing::BareAnswering(
+                                fold.registry.identities.canonical(alias_spelling),
+                            )
+                        }
+                        None => crate::names::Addressing::Bare,
                     };
-
-                    let table_name = if let Some(alias_name) = &relation_alias {
-                        ast_resolved::TableName::Named(alias_name.clone().into())
-                    } else {
-                        ast_resolved::TableName::Fresh
-                    };
-                    let mut prov = ast_resolved::ColumnProvenance::from_table_column(
-                        col_name.clone(),
-                        table_name.clone(),
-                        if qualifier.is_some() {
-                            ast_resolved::QualificationSource::User
-                        } else {
-                            ast_resolved::QualificationSource::None
+                    let column = fold.registry.identities.mint_column(
+                        anonymous_scope,
+                        crate::names::ColumnOrigin::Bound {
+                            position: idx as u32,
+                        },
+                        Some(published),
+                        addressing,
+                        crate::names::ValueFacts {
+                            declared_type: inferred_types.get(idx).cloned().flatten(),
+                            shape: inferred_shapes.get(idx).copied().unwrap_or_default(),
+                            ..Default::default()
                         },
                     );
-                    if let Some(alias_str) = &alias {
-                        prov = prov.with_alias(alias_str.clone());
-                    }
-                    // An anon-table header DECLARES a bare lvar — the
-                    // other declarer besides positional binding; both
-                    // participate in full-name-identity unification.
-                    // An alias adds an ACCESS NAME: the export answers
-                    // to it (x.city), and the anon-header scans treat
-                    // an access-named column as non-bare — same regime
-                    // as a glob export. declared_bare itself stays,
-                    // because the caller-pattern seam routes DDL facts
-                    // and param carriers through this construction and
-                    // names their columns through bare declarations.
-                    let mut header_col = ast_resolved::ColumnMetadata::new_with_name_flag(
-                        prov,
-                        table_name,
-                        Some(idx + 1),
-                        true, // Explicit headers are user-provided names
-                    )
-                    .with_declared_type(inferred_types.get(idx).cloned().flatten());
-                    match &relation_alias {
-                        Some(alias_name) => {
-                            header_col.declare_bare_answering(alias_name.clone())
-                        }
-                        None => header_col.declare_bare(),
-                    }
-                    columns.push(header_col);
+                    resolved_headers.push(ast_resolved::DomainExpression::Reference(
+                        Reference::Named(NamedReference(ColumnOccurrence {
+                            column,
+                            explicit_qualifier: false,
+                        })),
+                    ));
                 }
                 _ => {
-                    // Preserve all other expression types (functions, literals, etc.)
-                    // Use simple conversion without schema validation since anonymous table
-                    // headers may reference tables that will be joined later
-                    let resolved_expr = convert_domain_expression(header)?;
+                    // A computed header names a column of the ENCLOSING row —
+                    // `_(upper:(description) @ …)` probes the outer relation's
+                    // `description`. It resolves against the same context the
+                    // data rows do, because it is a reference out of the same
+                    // place.
+                    let resolved_expr =
+                        resolve_against_outer_context(fold, outer_context, header.clone())?;
                     resolved_headers.push(resolved_expr.clone());
 
-                    // Generate column metadata based on expression type
-                    // Track hygienic column counter for anonymous tables
-                    static ANON_HYGIENIC_COUNTER: std::sync::atomic::AtomicUsize =
-                        std::sync::atomic::AtomicUsize::new(0);
-
-                    let (col_name, needs_hygienic) = match &resolved_expr {
-                        ast_resolved::DomainExpression::Function(_func) => {
-                            // Function expressions in anonymous table headers that reference
-                            // columns (for unification) should be hidden from output
-                            // Use hygienic name directly
-                            let hygienic_id = ANON_HYGIENIC_COUNTER
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let name = format!("__dql_anon_{}", hygienic_id);
-                            (name, true)
-                        }
-                        ast_resolved::DomainExpression::Literal { value, .. } => {
-                            // Sanitization protocol: headerless anonymous columns
-                            // get |N| (unaliased) or <alias>|N| (aliased)
-                            let ordinal = idx + 1;
-                            let name = match value {
-                                ast_resolved::LiteralValue::String(s)
-                                    if s.starts_with("column") =>
-                                {
-                                    s.clone()
-                                }
-                                _ => {
-                                    if let Some(alias_name) = &relation_alias {
-                                        format!("{}|{}|", alias_name, ordinal)
-                                    } else {
-                                        format!("|{}|", ordinal)
-                                    }
-                                }
-                            };
-                            (name, false)
-                        }
+                    let (origin, addressing) = match &resolved_expr {
+                        ast_resolved::DomainExpression::Application(
+                            ast_resolved::FunctionApplication::Ground(_),
+                        ) => (
+                            crate::names::ColumnOrigin::Computed {
+                                via: crate::names::Computation::Literal,
+                            },
+                            crate::names::Addressing::Published,
+                        ),
+                        ast_resolved::DomainExpression::Application(_) => (
+                            crate::names::ColumnOrigin::Computed {
+                                via: crate::names::Computation::Function,
+                            },
+                            crate::names::Addressing::Hygienic,
+                        ),
                         other => panic!("catch-all hit in relation_resolver.rs resolve_inline_relation (DomainExpression column name): {:?}", other),
                     };
-
-                    let table_name = if let Some(alias_name) = &relation_alias {
-                        ast_resolved::TableName::Named(alias_name.clone().into())
-                    } else {
-                        // Use the same synthetic name as the headerless path
-                        // so all columns from this anonymous table share a qualifier.
-                        ast_resolved::TableName::Named(format!("_{}", anon_table_id).into())
-                    };
-                    let mut col_meta = ast_resolved::ColumnMetadata::new_with_name_flag(
-                        ast_resolved::ColumnProvenance::from_table_column(
-                            col_name,
-                            table_name.clone(),
-                            ast_resolved::QualificationSource::None,
-                        ),
-                        table_name,
-                        Some(idx + 1),
-                        false, // Anonymous table columns don't have user names
-                    )
-                    .with_declared_type(inferred_types.get(idx).cloned().flatten());
-                    col_meta.needs_hygienic_alias = needs_hygienic;
-                    columns.push(col_meta);
-                }
-            }
-        }
-
-        (
-            Some(resolved_headers),
-            ast_resolved::CprSchema::Resolved(columns),
-        )
-    } else {
-        // No headers - generate automatic column names col1, col2, etc.
-        let num_cols = if let Some(first_row) = resolved_rows.first() {
-            first_row.values.len()
-        } else {
-            0
-        };
-        let columns = (0..num_cols)
-            .map(|idx| {
-                let ordinal = idx + 1;
-                let table_name = if let Some(alias_name) = &relation_alias {
-                    ast_resolved::TableName::Named(alias_name.clone().into())
-                } else {
-                    ast_resolved::TableName::Named(format!("_{}", anon_table_id).into())
-                };
-                // Sanitization protocol: headerless anonymous columns get
-                // |N| (unaliased) or <alias>|N| (aliased)
-                let col_name = if let Some(alias_name) = &relation_alias {
-                    format!("{}|{}|", alias_name, ordinal)
-                } else {
-                    format!("|{}|", ordinal)
-                };
-                ast_resolved::ColumnMetadata::new_with_name_flag(
-                    ast_resolved::ColumnProvenance::from_table_column(
-                        col_name,
-                        table_name.clone(),
-                        ast_resolved::QualificationSource::None,
-                    ),
-                    table_name,
-                    Some(ordinal),
-                    false, // Anonymous table columns don't have user names
-                )
-                .with_declared_type(inferred_types.get(idx).cloned().flatten())
-            })
-            .collect();
-        (None, ast_resolved::CprSchema::Resolved(columns))
-    };
-
-    // QUA: Schema conformance — reorder + pad to match target table
-    let (resolved_headers, resolved_rows, resolved_schema) = if let Some(ref target_name) =
-        qua_target
-    {
-        // 1. Must have headers (positional data can't map to named columns)
-        let source_headers = match &resolved_headers {
-            Some(h) => h,
-            None => {
-                return Err(DelightQLError::parse_error(format!(
-                    "qua {}: anonymous table must have column headers (positional data cannot conform to a schema)",
-                    target_name
-                )));
-            }
-        };
-
-        // 2. Lookup target table in database registry
-        let target_schema = match fold.registry.database.lookup_table(target_name.as_str()) {
-            Some(schema) => schema,
-            None => {
-                return Err(DelightQLError::TableNotFoundError {
-                    table_name: target_name.to_string(),
-                    context: format!("qua target table '{}' not found in database", target_name),
-                });
-            }
-        };
-
-        // 3. Extract target column names
-        let target_cols: Vec<String> = match &target_schema {
-            ast_resolved::CprSchema::Resolved(cols) => cols
-                .iter()
-                .filter_map(|c| c.info.name().map(|s| s.to_string()))
-                .collect(),
-            _ => {
-                return Err(DelightQLError::parse_error(format!(
-                    "qua {}: target table schema not resolved",
-                    target_name
-                )));
-            }
-        };
-
-        // 4. Extract source column names from headers
-        let source_names: Vec<String> = source_headers
-            .iter()
-            .map(|h| {
-                match h {
-                    ast_resolved::DomainExpression::Lvar { name, .. } => name.to_string(),
-                    other => panic!("catch-all hit in relation_resolver.rs resolve_qua_pipe (DomainExpression source_names): {:?}", other),
-                }
-            })
-            .collect();
-
-        // 5. Validate: every source column must exist in target
-        for src_name in &source_names {
-            if !target_cols.iter().any(|tc| tc == src_name) {
-                return Err(DelightQLError::parse_error(format!(
-                    "qua {}: column '{}' does not exist in target table (available: {})",
-                    target_name,
-                    src_name,
-                    target_cols.join(", ")
-                )));
-            }
-        }
-
-        // 6. Build mapping: for each target col, find source position or None
-        let mapping: Vec<Option<usize>> = target_cols
-            .iter()
-            .map(|tc| source_names.iter().position(|sn| sn == tc))
-            .collect();
-
-        // 7. Rebuild headers in target column order
-        let table_name_for_schema = if let Some(alias_name) = &relation_alias {
-            ast_resolved::TableName::Named(alias_name.clone().into())
-        } else {
-            ast_resolved::TableName::Fresh
-        };
-
-        let new_headers: Vec<ast_resolved::DomainExpression> = target_cols
-            .iter()
-            .map(|tc| ast_resolved::DomainExpression::Lvar {
-                name: tc.clone().into(),
-                qualifier: None,
-                namespace_path: NamespacePath::empty(),
-                alias: None,
-                provenance: ast_resolved::PhaseBox::phantom(),
-            })
-            .collect();
-
-        // 8. Rebuild rows: reorder values per mapping, insert NULL for missing
-        let new_rows: Vec<ast_resolved::Row> = resolved_rows
-            .into_iter()
-            .map(|row| {
-                let new_values: Vec<ast_resolved::DomainExpression> = mapping
-                    .iter()
-                    .map(|src_idx| match src_idx {
-                        Some(idx) => row.values[*idx].clone(),
-                        None => ast_resolved::DomainExpression::Literal {
-                            value: ast_resolved::LiteralValue::Null,
-                            alias: None,
+                    fold.registry.identities.mint_column(
+                        anonymous_scope,
+                        origin,
+                        None,
+                        addressing,
+                        crate::names::ValueFacts {
+                            declared_type: inferred_types.get(idx).cloned().flatten(),
+                            shape: inferred_shapes.get(idx).copied().unwrap_or_default(),
+                            ..Default::default()
                         },
-                    })
-                    .collect();
-                ast_resolved::Row { values: new_values }
-            })
-            .collect();
+                    );
+                }
+            }
+        }
 
-        // 9. Rebuild schema from target columns
-        let new_schema_cols: Vec<ast_resolved::ColumnMetadata> = target_cols
-            .iter()
-            .enumerate()
-            .map(|(idx, col_name)| {
-                ast_resolved::ColumnMetadata::new_with_name_flag(
-                    ast_resolved::ColumnProvenance::from_table_column(
-                        col_name.clone(),
-                        table_name_for_schema.clone(),
-                        ast_resolved::QualificationSource::None,
-                    ),
-                    table_name_for_schema.clone(),
-                    Some(idx + 1),
-                    true,
-                )
-            })
-            .collect();
-
-        (
-            Some(new_headers),
-            new_rows,
-            ast_resolved::CprSchema::Resolved(new_schema_cols),
-        )
+        (Some(resolved_headers), anonymous_scope)
     } else {
-        (resolved_headers, resolved_rows, resolved_schema)
+        let num_cols = resolved_rows.first().len();
+        for idx in 0..num_cols {
+            fold.registry.identities.mint_column(
+                anonymous_scope,
+                crate::names::ColumnOrigin::Minted {
+                    by: crate::names::MintReason::AnonHeader,
+                },
+                None,
+                crate::names::Addressing::Published,
+                crate::names::ValueFacts {
+                    declared_type: inferred_types.get(idx).cloned().flatten(),
+                    shape: inferred_shapes.get(idx).copied().unwrap_or_default(),
+                    ..Default::default()
+                },
+            );
+        }
+        (None, anonymous_scope)
     };
 
-    let resolved_relation = ast_resolved::Relation::Anonymous {
-        column_headers: resolved_headers,
-        rows: resolved_rows,
+    let resolved_header = resolved_headers.map(|headers| {
+        let sparse = header
+            .as_ref()
+            .expect("resolved headers preserve an authored header");
+        crate::pipeline::asts::core::TabularRow(Box::new(
+            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(
+                headers
+                    .into_iter()
+                    .zip(sparse.iter())
+                    .map(|(term, authored)| ast_resolved::HeaderItem {
+                        slot: ast_resolved::Slot::classify(term),
+                        sparse: authored.sparse,
+                    })
+                    .collect(),
+            )
+            .expect("a tabular header is nonempty"),
+        ))
+    });
+    let resolved_relation = ast_resolved::AnonRelation {
+        table: ast_resolved::AnonTable {
+            body: ast_resolved::TabularBody {
+                header: resolved_header,
+                rows: resolved_rows,
+            },
+            cpr_schema: resolved_schema,
+        },
         alias: relation_alias,
         outer,
-        exists_mode,
-        negated,
-        qua_target: None,
-        cpr_schema: ast_resolved::PhaseBox::new(resolved_schema.clone()),
     };
 
     // Create bubbled state with the schema columns
-    let state = match &resolved_schema {
-        ast_resolved::CprSchema::Resolved(cols) => BubbledState::resolved(cols.clone()),
-        other => panic!(
-            "catch-all hit in relation_resolver.rs resolve_tvf (CprSchema): {:?}",
-            other
-        ),
-    };
+    let state = BubbledState::resolved(
+        fold.registry
+            .identities
+            .known_heading(resolved_schema)?
+            .to_vec(),
+        &fold.registry.identities,
+    );
 
     Ok((
-        ast_resolved::RelationalExpression::Relation(resolved_relation),
+        ast_resolved::Chain::ground(ast_resolved::Grelex::Literal(resolved_relation)),
         state,
     ))
 }
 
-/// Resolve a TVF (Table-Valued Function) variant.
-///
 /// The data world a pre-grounded namespace is bound to, as a path.
 /// Namespaces created by ground! carry default_data_ns; anything else
 /// answers None and grounds against the empty path.
@@ -2204,57 +1933,79 @@ fn pre_grounded_data_ns(
     registry
         .consult
         .get_namespace_default_data_ns(namespace_fq)
-        .and_then(|data_ns_fq| {
-            let parts: Vec<String> = data_ns_fq.split("::").map(|s| s.to_string()).collect();
-            ast_unresolved::NamespacePath::from_parts(parts).ok()
-        })
+        .and_then(|data_ns_fq| ast_unresolved::NamespacePath::from_fq_string(&data_ns_fq).ok())
 }
 
-/// Handles HO view expansion (grounded, namespace-qualified, and unqualified via enlist!),
-/// as well as normal TVF resolution with schema lookup.
-pub(super) fn resolve_tvf(
-    rel: ast_unresolved::Relation,
+/// Handles higher-order view expansion and ordinary relational calls through
+/// the shared call carrier.
+pub(super) fn resolve_functor_call(
+    call: ast_unresolved::FunctorCall,
+    // The name the READ answers to, from the relation occurrence the call
+    // stands in. Call identity carries none.
+    alias: Option<delightql_types::SqlIdentifier>,
+    access: ast_unresolved::Access,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
-    mut join_input: Option<ast_unresolved::RelationalExpression>,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState, bool)> {
-    let ast_unresolved::Relation::TVF {
-        function,
-        argument_groups,
-        domain_spec,
-        alias,
-        namespace,
-        grounding,
-        ho_arguments,
-        ..
-    } = rel
-    else {
-        unreachable!("resolve_tvf called with non-TVF variant");
+    mut join_input: Option<ast_unresolved::Chain>,
+    join_input_columns: Option<&[crate::names::ColId]>,
+    mut pipe_source: Option<ast_unresolved::Chain>,
+) -> Result<(ast_resolved::Chain, BubbledState, bool)> {
+    let reference = call.callee;
+    let ast_unresolved::FunctorCall {
+        marks, arguments, ..
+    } = call;
+    let function = reference.name_text().to_string();
+    let function_stropped = reference.name_identifier().is_stropped();
+    let namespace = (!reference.namespace_texts().is_empty()).then(|| reference.namespace_texts());
+    let grounding: Option<ast_unresolved::GroundedPath> = None;
+
+    // THE LANDING IS THE GROUP'S ONE SLOT, still unjudged: the member at
+    // that index is the piped relation, standing at the formal R8 names.
+    // Judging it — the first formal or the one authored `@`, a relation
+    // formal and nothing else, never a search, never a displacement — is
+    // the higher-order road's, below; the slot is spent there.
+    let landing_index = arguments.ho().and_then(|part| part.landing);
+    if let Some(index) = landing_index {
+        if let Some(source) = arguments
+            .ho_members()
+            .nth(index)
+            .and_then(|member| member.relation())
+        {
+            pipe_source.get_or_insert_with(|| source.clone());
+        }
+    }
+    // The authored arguments are the members the author wrote: the landed
+    // relation is the pipe's, not one of them.
+    let authored_arguments = match landing_index {
+        Some(index) => ast_unresolved::CallArguments::higher_order(
+            arguments
+                .ho_members()
+                .enumerate()
+                .filter(|(position, _)| *position != index)
+                .map(|(_, member)| member.clone())
+                .collect(),
+        ),
+        None => arguments.clone(),
     };
-
-    // Derive first_parens_spec from ho_arguments.
-    let first_parens_spec = ho_arguments_to_domain_spec(&ho_arguments);
-
-    let groups_ref = argument_groups.as_deref();
 
     // Check if this TVF is actually a higher-order view invocation
     if let Some(ref grounding) = grounding {
         for ns in &grounding.grounded_ns {
-            let fq = super::grounding::namespace_path_to_fq(ns);
-            if let Some(entity) = registry
-                .consult
-                .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
-                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
-                {
+            let fq = ns.fq_string();
+            if let Some(entity) = registry.consult.lookup_entity(
+                &function,
+                function_stropped,
+                &fq,
+                config.resolution_namespace.as_deref(),
+            ) {
+                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression {
                     let (table_bindings, scalar_spec, _pipe_idx) =
                         super::grounding::split_ho_first_parens(
-                            &first_parens_spec,
                             &entity,
-                            None,
-                            groups_ref,
-                            &ho_arguments,
-                            &config.alias_counter,
+                            pipe_source.as_ref(),
+                            &authored_arguments,
+                            landing_index,
                             registry,
                             config.resolution_namespace.as_deref(),
                         )?;
@@ -2262,10 +2013,11 @@ pub(super) fn resolve_tvf(
                         &function,
                         &entity,
                         &scalar_spec,
-                        &domain_spec,
+                        &access,
                         table_bindings,
-                        None,
+                        pipe_source.take(),
                         join_input.take(),
+                        join_input_columns,
                         Some(&grounding.data_ns),
                         grounding,
                         registry,
@@ -2281,12 +2033,14 @@ pub(super) fn resolve_tvf(
     // Namespace-qualified HO view (ns.ho_view(args)(*))
     if grounding.is_none() {
         if let Some(ref ns) = namespace {
-            let fq = super::grounding::namespace_path_to_fq(ns);
-            if let Some(entity) = registry
-                .consult
-                .lookup_entity(&function, &fq, config.resolution_namespace.as_deref()) {
-                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression
-                {
+            let fq = ns.join("::");
+            if let Some(entity) = registry.consult.lookup_entity(
+                &function,
+                function_stropped,
+                &fq,
+                config.resolution_namespace.as_deref(),
+            ) {
+                if entity.entity_type == BootstrapEntityType::DqlHoTemporaryViewExpression {
                     // A pre-grounded namespace (created by ground!)
                     // carries its bound data world in default_data_ns —
                     // the same lookup the plain consulted-view path
@@ -2294,19 +2048,19 @@ pub(super) fn resolve_tvf(
                     // table references resolve against nothing.
                     let data_ns = pre_grounded_data_ns(registry, &fq);
                     let ho_grounding = ast_unresolved::GroundedPath {
-                        data_ns: data_ns.clone().unwrap_or_else(ast_unresolved::NamespacePath::empty),
-                        grounded_ns: vec![ns.clone()],
+                        data_ns: data_ns
+                            .clone()
+                            .unwrap_or_else(ast_unresolved::NamespacePath::empty),
+                        grounded_ns: vec![NamespacePath::from_parts(ns.clone())
+                            .expect("canonical reference namespace is nonempty")],
                     };
-
 
                     let (table_bindings, scalar_spec, _pipe_idx) =
                         super::grounding::split_ho_first_parens(
-                            &first_parens_spec,
                             &entity,
-                            None,
-                            groups_ref,
-                            &ho_arguments,
-                            &config.alias_counter,
+                            pipe_source.as_ref(),
+                            &authored_arguments,
+                            landing_index,
                             registry,
                             config.resolution_namespace.as_deref(),
                         )?;
@@ -2314,10 +2068,11 @@ pub(super) fn resolve_tvf(
                         &function,
                         &entity,
                         &scalar_spec,
-                        &domain_spec,
+                        &access,
                         table_bindings,
-                        None,
+                        pipe_source.take(),
                         join_input.take(),
+                        join_input_columns,
                         data_ns.is_some().then_some(&ho_grounding.data_ns),
                         &ho_grounding,
                         registry,
@@ -2332,32 +2087,33 @@ pub(super) fn resolve_tvf(
 
     // Fallback: unqualified HO view via enlist!
     if grounding.is_none() {
-        if let Some(entity) = registry
-            .consult
-            .lookup_enlisted_ho_view(&function, config.resolution_namespace.as_deref())?
-        {
-            let ns_parts: Vec<String> = entity.namespace.split("::").map(String::from).collect();
-            let entity_ns = ast_unresolved::NamespacePath::from_parts(ns_parts).map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Invalid namespace for HO view '{}': {:?}", function, e),
-                    format!("{:?}", e),
-                )
-            })?;
+        if let Some(entity) = registry.consult.lookup_enlisted_ho_view(
+            &function,
+            function_stropped,
+            config.resolution_namespace.as_deref(),
+        )? {
+            let entity_ns = ast_unresolved::NamespacePath::from_fq_string(&entity.namespace)
+                .map_err(|e| {
+                    DelightQLError::database_error(
+                        format!("Invalid namespace for HO view '{}': {:?}", function, e),
+                        format!("{:?}", e),
+                    )
+                })?;
             // An enlisted namespace can be pre-grounded too — same
             // default_data_ns lookup as the qualified path above.
             let data_ns = pre_grounded_data_ns(registry, &entity.namespace);
             let ho_grounding = ast_unresolved::GroundedPath {
-                data_ns: data_ns.clone().unwrap_or_else(ast_unresolved::NamespacePath::empty),
+                data_ns: data_ns
+                    .clone()
+                    .unwrap_or_else(ast_unresolved::NamespacePath::empty),
                 grounded_ns: vec![entity_ns],
             };
 
             let (table_bindings, scalar_spec, _pipe_idx) = super::grounding::split_ho_first_parens(
-                &first_parens_spec,
                 &entity,
-                None,
-                groups_ref,
-                &ho_arguments,
-                &config.alias_counter,
+                pipe_source.as_ref(),
+                &authored_arguments,
+                landing_index,
                 registry,
                 config.resolution_namespace.as_deref(),
             )?;
@@ -2365,10 +2121,11 @@ pub(super) fn resolve_tvf(
                 &function,
                 &entity,
                 &scalar_spec,
-                &domain_spec,
+                &access,
                 table_bindings,
-                None,
+                pipe_source.take(),
                 join_input.take(),
+                join_input_columns,
                 data_ns.is_some().then_some(&ho_grounding.data_ns),
                 &ho_grounding,
                 registry,
@@ -2379,32 +2136,94 @@ pub(super) fn resolve_tvf(
         }
     }
 
-    // Resolve column ordinals in TVF arguments against outer context.
-    // Ordinals like |1| in `json_each(|1|)` must be resolved to actual column
-    // names before SQL generation, since SQL doesn't understand ordinal syntax.
-    // Mutate ho_arguments in place, replacing ColumnOrdinal with resolved Lvar.
-    let mut ho_arguments = ho_arguments;
+    // A glob-only relation access is the table spelling, not a zero-argument
+    // TVF.  Keep this decision after the higher-order lookup roads so names
+    // such as `exists(*)` still expand as views, while CTE labels and ordinary
+    // tables retain the established `name(*)` default.
+    let table_default = arguments.is_empty()
+        || matches!(
+            arguments.scalar_members(),
+            [
+                crate::pipeline::asts::core::operators::ScalarArgument::Spread(
+                    crate::pipeline::asts::core::Spread::Glob(_)
+                )
+            ]
+        );
+    if table_default && !function.ends_with('!') {
+        let identifier = ast_unresolved::QualifiedName {
+            namespace_path: ast_unresolved::NamespacePath::from_parts(
+                namespace.unwrap_or_default(),
+            )
+            .map_err(|error| {
+                DelightQLError::parse_error(format!(
+                    "invalid namespace on relation '{}': {:?}",
+                    function, error
+                ))
+            })?,
+            name: function.clone().into(),
+        };
+        return resolve_ground(
+            ast_unresolved::Relation::Ground {
+                mention: ast_unresolved::GroundMention::Named {
+                    identifier,
+                    alias,
+                    mutation_target: false,
+                    passthrough: false,
+                },
+                outer: false,
+                cpr_schema: (),
+            },
+            access,
+            registry,
+            outer_context,
+            config,
+            grounding.as_ref(),
+        )
+        .map(|(relation, state)| (relation, state, false));
+    }
+
+    // A TVF argument that names a column of the enclosing row is resolved
+    // HERE, where that row's columns are in hand: `json_each(|1|)` and
+    // `json_each(data)` both have to reach an occurrence before generation,
+    // and SQL has no ordinal syntax to fall back on.
+    //
+    // What comes back is a RESOLVED expression, kept beside the authored
+    // list. Writing an occurrence back into the authored argument would put
+    // a resolved state in a tree nobody has resolved.
+    let member_domains: Vec<Option<&ast_unresolved::DomainExpression>> = match &arguments {
+        crate::pipeline::asts::core::operators::CallArguments::None => Vec::new(),
+        crate::pipeline::asts::core::operators::CallArguments::HigherOrder(part) => part
+            .members
+            .iter()
+            .map(|argument| argument.scalar_domain())
+            .collect(),
+        crate::pipeline::asts::core::operators::CallArguments::Scalar(members) => members
+            .iter()
+            .map(|member| member.scalar_domain())
+            .collect(),
+    };
+    let mut bound_arguments: Vec<Option<ast_resolved::DomainExpression>> =
+        vec![None; member_domains.len()];
     if let Some(context) = outer_context {
-        for ho_arg in ho_arguments.iter_mut() {
-            if let crate::pipeline::asts::core::operators::HoArgument::Scalar(
-                ast_unresolved::DomainExpression::ColumnOrdinal(ref ordinal_box),
-            ) = ho_arg
+        for (index, domain) in member_domains.iter().enumerate() {
+            if let Some(ast_unresolved::DomainExpression::Reference(Reference::Ordinal(
+                ref ordinal,
+            ))) = domain
             {
-                let ordinal = ordinal_box.get();
-                let candidates: Vec<_> = if let Some(ref qual) = ordinal.qualifier {
-                    context
-                        .iter()
-                        .filter(|col| {
-                            matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
-                        })
-                        .collect()
+                let candidates = if let Some(ref qualifier) = ordinal.qualifier {
+                    let spelling = registry
+                        .identities
+                        .intern(qualifier.as_str(), qualifier.is_stropped());
+                    registry
+                        .identities
+                        .qualified_glob(registry.identities.canonical(spelling), context)
                 } else {
-                    context.iter().collect()
+                    crate::names::Candidates::from_vec(context.to_vec())
                 };
 
                 if candidates.is_empty() {
                     return Err(DelightQLError::ColumnNotFoundError {
-                        column: format!("|{}|", ordinal.position),
+                        column: column_ordinal_text(ordinal.position, false),
                         context: "No columns available for ordinal resolution in TVF argument"
                             .to_string(),
                     });
@@ -2413,7 +2232,7 @@ pub(super) fn resolve_tvf(
                 let idx = if ordinal.reverse {
                     if ordinal.position as usize > candidates.len() {
                         return Err(DelightQLError::ColumnNotFoundError {
-                            column: format!("|-{}|", ordinal.position),
+                            column: column_ordinal_text(ordinal.position, true),
                             context: format!(
                                 "Position {} from end exceeds {} available columns",
                                 ordinal.position,
@@ -2425,14 +2244,14 @@ pub(super) fn resolve_tvf(
                 } else {
                     if ordinal.position == 0 {
                         return Err(DelightQLError::ColumnNotFoundError {
-                            column: "|0|".to_string(),
+                            column: column_ordinal_text(0, false),
                             context: "Column positions start at 1".to_string(),
                         });
                     }
                     let pos = (ordinal.position - 1) as usize;
                     if pos >= candidates.len() {
                         return Err(DelightQLError::ColumnNotFoundError {
-                            column: format!("|{}|", ordinal.position),
+                            column: column_ordinal_text(ordinal.position, false),
                             context: format!(
                                 "Position {} exceeds {} available columns",
                                 ordinal.position,
@@ -2443,41 +2262,111 @@ pub(super) fn resolve_tvf(
                     pos
                 };
 
-                let column = candidates[idx];
-                let col_name = column.name().to_string();
-                let qualifier = if let Some(ref qual) = ordinal.qualifier {
-                    Some(qual.clone())
-                } else if let ast_resolved::TableName::Named(t) = column.qualifier() {
-                    Some(t.to_string())
-                } else {
-                    None
+                bound_arguments[index] = Some(ast_resolved::DomainExpression::Reference(
+                    Reference::Named(NamedReference(ColumnOccurrence {
+                        column: *candidates
+                            .in_order()
+                            .nth(idx)
+                            .expect("validated ordinal index is in candidate order"),
+                        explicit_qualifier: false,
+                    })),
+                ));
+            } else if let Some(ast_unresolved::DomainExpression::Reference(Reference::Named(
+                NamedReference(AuthoredColumn {
+                    name, qualifier, ..
+                }),
+            ))) = domain
+            {
+                // A named argument is a reference and resolves as one. An
+                // ordinal beside it already does, and leaving the name alone
+                // carries an authored lvar past the phase that ends them —
+                // the lowering then has a spelling where it needs a column.
+                use super::unification::{unify_columns, ColumnReference, UnificationResult};
+                let reference = ColumnReference::Named {
+                    name: name.clone(),
+                    qualifier: qualifier.clone(),
                 };
-
-                let mut builder = ast_unresolved::DomainExpression::lvar_builder(col_name);
-                if let Some(q) = qualifier {
-                    builder = builder.with_qualifier(q);
+                let explicit_qualifier = qualifier.is_some();
+                let visible = context.iter().fold(Vec::new(), |mut scopes, column| {
+                    let scope = registry.identities.scope_of(*column);
+                    if !scopes.contains(&scope) {
+                        scopes.push(scope);
+                    }
+                    scopes
+                });
+                let resolved =
+                    unify_columns(vec![reference], context, &visible, &registry.identities)
+                        .into_iter()
+                        .next()
+                        .expect("one reference produces one unification result");
+                match resolved {
+                    UnificationResult::Resolved(column) => {
+                        bound_arguments[index] = Some(ast_resolved::DomainExpression::Reference(
+                            Reference::Named(NamedReference(ColumnOccurrence {
+                                column,
+                                explicit_qualifier,
+                            })),
+                        ));
+                    }
+                    UnificationResult::Opaque => {
+                        return Err(crate::pipeline::resolver::opaque_reference_refusal())
+                    }
+                    UnificationResult::Unresolved(column) => {
+                        return Err(DelightQLError::column_not_found_error(
+                            column,
+                            "in TVF argument",
+                        ))
+                    }
+                    UnificationResult::Refused(refusal) => return Err(refusal.into_error()),
+                    UnificationResult::Ambiguous { column, tables } => {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "resolution/ambiguous",
+                            format!(
+                                "Ambiguous column '{}' exists in scopes: {}",
+                                column,
+                                tables.join(", ")
+                            ),
+                            "in TVF argument",
+                        ))
+                    }
                 }
-                *ho_arg =
-                    crate::pipeline::asts::core::operators::HoArgument::Scalar(builder.build());
             }
         }
     }
 
-    // Normal TVF resolution.
-    // Known TVFs (json_each, pragma_table_info) get hardcoded schemas.
-    // Unknown TVFs get CprSchema::Unknown — columns discovered at runtime.
-    let schema = get_tvf_schema(&function, alias.as_deref());
-
-    // Handle unknown TVFs based on config
-    if matches!(schema, ast_resolved::CprSchema::Unknown) {
-        if config.permissive || config.transpile_only {
-            // Generate warning (unless transpile-only)
-            if config.permissive && !config.transpile_only {
-                eprintln!(
-                    "WARNING: Unknown TVF '{}' - treating as generic table function",
-                    function
-                );
+    // A bin relation the catalog knows must not fall through to the TVF
+    // road: the fallback strips its namespace and compiles a phantom table
+    // reference under the bare name. It is refused HERE with its identity —
+    // execution for this entity lives at the effect boundary, which only
+    // reaches the submission's own chain and its bindings.
+    if let Some(ref ns) = namespace {
+        let fq = ns.join("::");
+        if let Some(entity) = registry.consult.lookup_entity(
+            &function,
+            function_stropped,
+            &fq,
+            config.resolution_namespace.as_deref(),
+        ) {
+            if entity.entity_type == BootstrapEntityType::BinRelation {
+                return Err(runtime_served_unreached_error(
+                    &entity.name,
+                    entity.entity_type,
+                ));
             }
+        }
+    }
+
+    // A TVF the catalog describes publishes a known heading; one it does
+    // not is the default-transpilation case, and its heading is the
+    // target's until a caller pattern declares one.
+    let described = get_tvf_schema(&function, alias.as_deref(), &registry.identities);
+
+    if described.is_none() {
+        if config.permissive {
+            eprintln!(
+                "WARNING: Unknown TVF '{}' - treating as generic table function",
+                function
+            );
             // Keep Unknown schema
         } else {
             return Err(DelightQLError::parse_error(format!(
@@ -2487,19 +2376,209 @@ pub(super) fn resolve_tvf(
         }
     }
 
-    let state = match &schema {
-        ast_resolved::CprSchema::Resolved(cols) => BubbledState::resolved(cols.clone()),
-        ast_resolved::CprSchema::Unknown => BubbledState::empty(), // Unknown schema means no columns for validation
-        other => panic!(
-            "catch-all hit in relation_resolver.rs resolve_ground_relation (CprSchema): {:?}",
-            other
-        ),
+    // A TVF heading — the ampersand form's tail or a second parens — is
+    // heading-shaped: each slot NAMES a published column of the function's
+    // schema, an ordered projection, never a slot-by-slot binding (the
+    // function's arity lives in its argument list, not its heading).
+    // Binding happens here because resolution is where authored characters
+    // stop: the refiner reads occurrences and refuses an authored lvar.
+    let (resolved_spec, schema) = match (&access, described) {
+        (ast_unresolved::Access::Slots(slots), Some(scope)) => {
+            let source_heading = registry.identities.known_heading(scope)?;
+            let (table_name, stropped) = match &alias {
+                Some(alias) => (alias.as_str(), alias.is_stropped()),
+                None => (function.as_str(), false),
+            };
+            let hint = registry.identities.intern(table_name, stropped);
+            let output_scope = registry.identities.mint_derived_scope(
+                crate::names::ScopeOrigin::UserAlias { of: scope },
+                crate::names::Hint::User(hint),
+            );
+            let mut occurrences = Vec::with_capacity(slots.len());
+            let mut bound: Vec<crate::names::Sym> = Vec::new();
+            for slot in slots {
+                let ast_unresolved::Slot::Bind(crate::pipeline::asts::core::WrittenBinder {
+                    name,
+                    ..
+                }) = slot
+                else {
+                    return Err(DelightQLError::validation_error(
+                        format!(
+                            "the heading of TVF '{}' is an ordered projection of \
+                             the function's columns — each slot must be a bare \
+                             column name",
+                            table_name
+                        ),
+                        "in TVF heading",
+                    ));
+                };
+                let sym = registry
+                    .identities
+                    .canonical(registry.identities.intern(name, name.is_stropped()));
+                // A heading's names are programmer-authored, so they obey the
+                // uniqueness a projection's do. Without this the second slot
+                // is published as `name_2` and then READ as though the
+                // function offered a column by that name.
+                if bound.contains(&sym) {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "constraint",
+                        format!(
+                            "Duplicate column '{name}' in the heading of TVF \
+                             '{table_name}': programmer-authored names must be \
+                             unique. Rename one with 'as' to disambiguate"
+                        ),
+                        "in TVF heading",
+                    ));
+                }
+                bound.push(sym);
+                // Every carrier is enumerated, never the first: the hard-coded
+                // schemas happen to publish unique names, but the contract
+                // here is a published schema and runtime introspection does
+                // not establish that.
+                let mut carriers = source_heading
+                    .iter()
+                    .copied()
+                    .filter(|column| registry.identities.published_sym(*column) == Some(sym));
+                let source = match (carriers.next(), carriers.next()) {
+                    (Some(source), None) => source,
+                    (None, _) => {
+                        return Err(DelightQLError::column_not_found_error(
+                            name.to_string(),
+                            format!("in the heading of TVF '{}'", table_name),
+                        ))
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "resolution/ambiguous",
+                            format!(
+                                "TVF '{table_name}' publishes '{name}' more than \
+                                 once, so a heading slot naming it reaches no \
+                                 single column"
+                            ),
+                            "in TVF heading",
+                        ))
+                    }
+                };
+                let column = registry.identities.republish_column(
+                    source,
+                    output_scope,
+                    crate::names::Republish::Passthrough,
+                    registry.identities.published(source),
+                    crate::names::Addressing::Published,
+                    |_| {},
+                );
+                // A heading slot NAMES a dimension, which is what a binding
+                // slot is. It stays one across the phase edge: only the
+                // payload changes, from the written name to the column.
+                occurrences.push(ast_resolved::Slot::Bind(column));
+            }
+            let occurrences = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(occurrences)
+                .expect("a TVF heading with slots binds at least one");
+            (ast_resolved::Access::Slots(occurrences), output_scope)
+        }
+        // The target published nothing to project FROM, so the caller
+        // pattern is not a projection of a heading — it IS the heading. One
+        // slot per dimension of the full width, declared at the mention.
+        // Nothing checks it against the target, for the same reason nothing
+        // checks `upper:(x)`: a name this compiler cannot verify is the
+        // target's to disagree with.
+        (ast_unresolved::Access::Slots(slots), None) => {
+            let (table_name, stropped) = match &alias {
+                Some(alias) => (alias.as_str(), alias.is_stropped()),
+                None => (function.as_str(), false),
+            };
+            let hint = registry.identities.intern(table_name, stropped);
+            let declared_scope = registry.identities.mint_scope(
+                crate::names::ScopeOrigin::AnonRelation,
+                crate::names::Hint::User(hint),
+                None,
+            );
+            let mut occurrences = Vec::with_capacity(slots.len());
+            let mut bound: Vec<crate::names::Sym> = Vec::new();
+            for (position, slot) in slots.iter().enumerate() {
+                // A named slot publishes; a slot that names nothing is a
+                // dimension all the same, and holds its place latently.
+                let declared = match slot {
+                    ast_unresolved::Slot::Bind(crate::pipeline::asts::core::WrittenBinder {
+                        name,
+                        ..
+                    }) => Some((
+                        name.as_str(),
+                        registry.identities.intern(name, name.is_stropped()),
+                    )),
+                    _ => None,
+                };
+                let published = declared.map(|(_, spelling)| spelling);
+                if let Some((name, spelling)) = declared {
+                    let sym = registry.identities.canonical(spelling);
+                    if bound.contains(&sym) {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "constraint",
+                            format!(
+                                "Duplicate column '{}' in the declared heading of \
+                                 '{table_name}': programmer-authored names must be \
+                                 unique. Rename one with 'as' to disambiguate",
+                                name
+                            ),
+                            "in TVF heading",
+                        ));
+                    }
+                    bound.push(sym);
+                }
+                let column = registry.identities.mint_column(
+                    declared_scope,
+                    crate::names::ColumnOrigin::Bound {
+                        position: position as u32,
+                    },
+                    published,
+                    if published.is_some() {
+                        crate::names::Addressing::Published
+                    } else {
+                        crate::names::Addressing::Latent
+                    },
+                    crate::names::ValueFacts::default(),
+                );
+                // A heading slot NAMES a dimension, which is what a binding
+                // slot is. It stays one across the phase edge: only the
+                // payload changes, from the written name to the column.
+                occurrences.push(ast_resolved::Slot::Bind(column));
+            }
+            let occurrences = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(occurrences)
+                .expect("a declared heading has at least one dimension");
+            (ast_resolved::Access::Slots(occurrences), declared_scope)
+        }
+        // Nothing was declared and nothing is published: the relation still
+        // has an identity, and only its heading is unknown.
+        (_, None) => {
+            let opaque_scope = registry.identities.mint_scope(
+                crate::names::ScopeOrigin::AnonRelation,
+                crate::names::Hint::None,
+                None,
+            );
+            registry.identities.mark_heading_opaque(opaque_scope);
+            (resolve_schema_free_access(&access)?, opaque_scope)
+        }
+        (_, Some(scope)) => (resolve_schema_free_access(&access)?, scope),
+    };
+
+    // What this access offers upward for validation. An opaque relation
+    // offers nothing to enumerate — and that is not the claim that it has
+    // no dimensions. A name used against it refuses where the name is
+    // resolved, not here.
+    let state = match registry.identities.heading(schema) {
+        crate::names::HeadingKnowledge::Known(heading) => {
+            BubbledState::resolved(heading.to_vec(), &registry.identities)
+        }
+        crate::names::HeadingKnowledge::Opaque => BubbledState::opaque(schema),
     };
 
     // Resolve namespace to physical backend schema + connection routing.
     // Same logic as Ground passthrough: resolve namespace, track connection_id,
     // replace DQL namespace path with physical schema name for SQL generation.
-    let resolved_namespace = if let Some(ref ns) = namespace {
+    let namespace_path = namespace.as_ref().map(|parts| {
+        NamespacePath::from_parts(parts.clone()).expect("canonical reference namespace is nonempty")
+    });
+    let resolved_namespace = if let Some(ref ns) = namespace_path {
         if !ns.is_empty() {
             match registry.database.resolve_namespace(ns) {
                 Ok(Some((physical_schema, conn_id))) => {
@@ -2507,44 +2586,69 @@ pub(super) fn resolve_tvf(
                     // physical_schema=None means tables are in `main` of that connection
                     physical_schema.map(|s| NamespacePath::single(&*s))
                 }
-                _ => namespace,
+                _ => namespace_path.clone(),
             }
         } else {
-            namespace
+            namespace_path.clone()
         }
     } else {
         None
     };
 
     // Convert ho_arguments from Unresolved to Resolved phase for non-HO TVFs.
+    // An argument the binder above already resolved travels as itself; the
+    // rest are names nothing here can look up, and drop as they always have.
     let resolved_ho_arguments: Vec<
         crate::pipeline::asts::core::operators::HoArgument<crate::pipeline::asts::core::Resolved>,
-    > = ho_arguments
+    > = member_domains
         .iter()
-        .filter_map(|arg| match arg {
-            crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => {
-                convert_domain_expression(dom)
-                    .ok()
-                    .map(crate::pipeline::asts::core::operators::HoArgument::Scalar)
-            }
-            crate::pipeline::asts::core::operators::HoArgument::Table(_) => None, // HO table args consumed by expand_ho_view
+        .zip(bound_arguments)
+        .filter_map(|(domain, bound)| {
+            bound
+                .or_else(|| convert_domain_expression((*domain)?, &registry.identities).ok())
+                .map(|value| {
+                    crate::pipeline::asts::core::operators::HoArgument::Value(
+                        crate::pipeline::asts::core::ArgumentValue::plain(value),
+                    )
+                })
         })
         .collect();
 
-    let resolved = ast_resolved::Relation::TVF {
-        function,
-        backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-        domain_spec: preserve_domain_spec(&domain_spec)?,
-        alias,
-        namespace: resolved_namespace,
-        grounding: None,
-        cpr_schema: ast_resolved::PhaseBox::new(schema),
-        argument_groups: None,
-        ho_arguments: resolved_ho_arguments,
+    let function_spelling = registry.identities.intern(function.as_str(), false);
+    let function_namespace = resolved_namespace
+        .as_ref()
+        .map(|path| {
+            path.iter()
+                .map(|item| {
+                    registry
+                        .identities
+                        .intern(item.name.as_str(), item.name.is_stropped())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let function = registry
+        .identities
+        .mint_function(function_spelling, function_namespace);
+    let resolved = ast_resolved::Relation::FunctorCall {
+        alias: (),
+        call: ast_resolved::SealedCall::from_inner(
+            ast_resolved::FunctorCall {
+                callee: function,
+                arguments: crate::pipeline::asts::core::operators::CallArguments::higher_order(
+                    resolved_ho_arguments,
+                ),
+                marks,
+            },
+            false,
+        ),
+        cpr_schema: schema,
     };
 
+    // The access travels beside the call, in the position it was written:
+    // after it, on what the call publishes.
     Ok((
-        ast_resolved::RelationalExpression::Relation(resolved),
+        ast_resolved::Chain::read(resolved, resolved_spec, schema),
         state,
         false,
     ))
@@ -2558,16 +2662,13 @@ pub(super) fn resolve_tvf(
 pub(super) fn resolve_inner_relation(
     rel: ast_unresolved::Relation,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
     grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(
-    ast_resolved::RelationalExpression,
-    BubbledState,
-    Vec<crate::pipeline::asts::unresolved::CfeDefinition>,
-)> {
+) -> Result<(ast_resolved::Chain, BubbledState)> {
     let ast_unresolved::Relation::InnerRelation {
         pattern,
+        preminted_scope,
         alias,
         outer,
         ..
@@ -2594,49 +2695,128 @@ pub(super) fn resolve_inner_relation(
 
     // Resolve the inner subquery, also collecting any pipe-level CFEs
     // from the sub-fold so the caller can propagate them to the outer fold.
-    let (resolved_subquery, bubbled, inner_pipe_cfes) =
-        super::resolve_relational_expression_with_pipe_cfes(
-            (*subquery).clone(),
-            registry,
-            outer_context,
-            config,
-            grounding,
-        )?;
+    // The interior resolves under the access's self-name — the alias when
+    // authored, the access name otherwise — so its spine stages keep that
+    // name answering for the CURRENT heading.
+    let interior_self = {
+        let (text, stropped) = match &alias {
+            Some(alias) => (alias.as_str(), alias.is_stropped()),
+            None => (identifier.name.as_str(), identifier.name.is_stropped()),
+        };
+        registry
+            .identities
+            .canonical(registry.identities.intern(text, stropped))
+    };
+    let (resolved_subquery, _bubbled) = super::resolve_interior_expression(
+        (*subquery).clone(),
+        registry,
+        outer_context,
+        config,
+        grounding,
+        Some(interior_self),
+    )?;
 
     // Extract schema from resolved subquery
-    let schema = super::helpers::extraction::extract_cpr_schema(&resolved_subquery)?;
+    let schema = super::helpers::extraction::extract_cpr_schema(&resolved_subquery);
 
     // Relabel columns with the inner relation's effective name (alias if present, otherwise identifier)
     // This ensures qualified globs like `users.*` or `u.*` can match these columns
-    let effective_name = alias.as_deref().unwrap_or(&identifier.name);
-    let schema = super::helpers::extraction::transform_schema_table_names(
-        schema,
-        effective_name,
-        // The effective name is the USER's alias or identifier text.
-        ast_resolved::CteOrigin::UserDefined,
-    );
+    let schema_columns = schema;
+    let input = schema_columns;
+    let inner_scope = match preminted_scope {
+        Some(scope) => {
+            crate::probe::probe!(
+                preminted,
+                "consume {scope:?} as {} origin={:?} heading={} input={input:?}",
+                identifier.name,
+                registry.identities.origin_of(scope),
+                registry.identities.known_heading(scope)?.len()
+            );
+            let compatible = match registry.identities.origin_of(scope) {
+                crate::names::ScopeOrigin::AnonRelation => true,
+                crate::names::ScopeOrigin::UserAlias { of }
+                | crate::names::ScopeOrigin::PipeStage { input: of }
+                | crate::names::ScopeOrigin::Wrap { input: of, .. }
+                | crate::names::ScopeOrigin::Cte { input: of, .. }
+                | crate::names::ScopeOrigin::SetArm { of, .. } => of == input,
+                crate::names::ScopeOrigin::ErHop { chain, .. } => chain == input,
+                crate::names::ScopeOrigin::Interior { of } => {
+                    registry.identities.scope_of(of) == input
+                }
+                crate::names::ScopeOrigin::BaseTable { .. }
+                | crate::names::ScopeOrigin::Join { .. }
+                | crate::names::ScopeOrigin::Resolution { .. }
+                | crate::names::ScopeOrigin::HoCarrier { .. }
+                | crate::names::ScopeOrigin::Scratch { .. } => false,
+            };
+            if !compatible {
+                return Err(DelightQLError::validation_error(
+                    format!(
+                        "pre-minted inner-relation scope {scope:?} is incompatible with \
+                         resolved input {input:?}"
+                    ),
+                    "internal inner-relation identity invariant",
+                ));
+            }
+            if !registry.identities.known_heading(scope)?.is_empty() {
+                return Err(DelightQLError::validation_error(
+                    format!("pre-minted inner-relation scope {scope:?} is already populated"),
+                    "internal inner-relation identity invariant",
+                ));
+            }
+            scope
+        }
+        None => {
+            let (scope_origin, scope_hint) = if let Some(authored_alias) = &alias {
+                let spelling = registry
+                    .identities
+                    .intern(authored_alias.as_str(), authored_alias.is_stropped());
+                (
+                    crate::names::ScopeOrigin::UserAlias { of: input },
+                    crate::names::Hint::User(spelling),
+                )
+            } else {
+                // The wrap is the compiler's, but the access is authored and
+                // named: `purchases(…interior…)` answers to `purchases` from
+                // outside exactly as `purchases(*)` does. Only an alias
+                // replaces that name; the wrap must not consume it.
+                let spelling = registry
+                    .identities
+                    .intern(identifier.name.as_str(), identifier.name.is_stropped());
+                (
+                    crate::names::ScopeOrigin::Wrap {
+                        input,
+                        why: crate::names::WrapReason::Projection,
+                    },
+                    crate::names::Hint::User(spelling),
+                )
+            };
+            registry
+                .identities
+                .mint_derived_scope(scope_origin, scope_hint)
+        }
+    };
+    let scope_columns = |columns: &[crate::names::ColId]| {
+        columns
+            .iter()
+            .map(|column| {
+                registry.identities.republish_column(
+                    *column,
+                    inner_scope,
+                    crate::names::Republish::BoundaryExport,
+                    registry.identities.published(*column),
+                    crate::names::Addressing::Published,
+                    |_| {},
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let input_columns = registry.identities.known_heading(input)?;
+    let relabeled_i_provide = scope_columns(&input_columns.to_vec());
+    let schema = inner_scope;
 
     // Also relabel the bubbled state's i_provide columns so the join sees the correct table names
-    let relabeled_i_provide: Vec<ast_resolved::ColumnMetadata> = bubbled
-        .i_provide
-        .into_iter()
-        .map(|mut col| {
-            let prev = match col.qualifier() {
-                ast_resolved::TableName::Named(t) => t.to_string(),
-                ast_resolved::TableName::Fresh => "_".to_string(),
-            };
-            col.push_scope(
-                ast_resolved::TableName::Named(effective_name.to_string().into()),
-                ast_resolved::IdentityContext::SubqueryAlias {
-                    alias: effective_name.to_string(),
-                    previous_context: prev,
-                    resolver_id: None,
-                },
-            );
-            col
-        })
-        .collect();
-    let bubbled = super::BubbledState::resolved(relabeled_i_provide);
+    let bubbled = super::BubbledState::resolved(relabeled_i_provide, &registry.identities);
 
     // Create resolved InnerRelation with Indeterminate pattern
     // Refiner will classify this later
@@ -2645,16 +2825,13 @@ pub(super) fn resolve_inner_relation(
             identifier: convert_qualified_name(identifier),
             subquery: Box::new(resolved_subquery),
         },
+        preminted_scope,
         alias,
         outer,
-        cpr_schema: ast_resolved::PhaseBox::new(schema),
+        cpr_schema: schema,
     };
 
-    Ok((
-        ast_resolved::RelationalExpression::Relation(resolved),
-        bubbled,
-        inner_pipe_cfes,
-    ))
+    Ok((ast_resolved::Chain::relation(resolved), bubbled))
 }
 
 /// Relabel the `i_provide` columns of a BubbledState with a new table name.
@@ -2663,9 +2840,9 @@ pub(super) fn resolve_inner_relation(
 /// columns with the entity's original table name. When the entity is aliased
 /// (e.g., `country_tier(*) as ct`), downstream pipes need `i_provide` columns
 /// to carry the alias so qualified refs like `ct.Country` can match.
-/// Relabel a CprSchema's column table names with an alias.
+/// Relabel a scope's column table names with an alias.
 ///
-/// Convert a resolved Query back to a RelationalExpression for HO view expansion.
+/// Convert a resolved Query back to a Chain for HO view expansion.
 ///
 /// When the HO view body has no CTEs, the Query is unwrapped transparently.
 /// When it has CTEs, it's wrapped in a ConsultedView to provide a subquery boundary.
@@ -2674,41 +2851,38 @@ pub(super) fn ho_view_query_to_relational(
     bubbled: super::BubbledState,
     view_name: &str,
     user_alias: Option<SqlIdentifier>,
-    config: &ResolutionConfig,
-) -> crate::error::Result<(ast_resolved::RelationalExpression, super::BubbledState)> {
-    match resolved_query {
-        ast_resolved::Query::Relational(expr) => {
+    identities: &crate::names::Registry,
+) -> crate::error::Result<(ast_resolved::Chain, super::BubbledState)> {
+    match resolved_query.into_bare_body() {
+        Ok(expr) => {
             if let Some(ref alias) = user_alias {
-                let bubbled = relabel_bubbled_with_alias(bubbled, alias, BoundaryAnswering::Silent);
+                let bubbled = relabel_bubbled_with_alias(
+                    bubbled,
+                    alias,
+                    BoundaryAnswering::Silent,
+                    identities,
+                );
                 Ok((expr, bubbled))
             } else {
                 Ok((expr, bubbled))
             }
         }
-        query_with_ctes => {
+        Err(query_with_ctes) => {
+            let query_with_ctes = *query_with_ctes;
             let body_schema =
                 super::helpers::extraction::extract_cpr_schema_from_query(&query_with_ctes)?;
-            let (alias, resolver_id) = compute_effective_alias(&user_alias, &config.alias_counter);
-            // The lvar law: the columns answer to the ACCESS name — the
-            // user's alias, or the bare entity name of an unaliased access.
-            let __access = user_alias
-                .clone()
-                .unwrap_or_else(|| view_name.to_string().clone().into());
-            let bubbled = relabel_bubbled_with_alias(bubbled, &alias, BoundaryAnswering::AnswersTo(__access));
-            let scoped = ast_resolved::ScopedSchema::bind(body_schema, alias.clone(), resolver_id);
+            let (_alias, access_scope) =
+                access_boundary_export(&user_alias, view_name, body_schema, identities);
+            let bubbled = BubbledState::resolved(
+                identities.known_heading(access_scope)?.to_vec(),
+                identities,
+            );
             Ok((
-                ast_resolved::RelationalExpression::Relation(
-                    ast_resolved::Relation::ConsultedView {
-                        identifier: ast_resolved::QualifiedName {
-                            namespace_path: NamespacePath::empty(),
-                            name: view_name.to_string().into(),
-                            grounding: None,
-                        },
-                        body: Box::new(query_with_ctes),
-                        scoped: ast_resolved::PhaseBox::new(scoped),
-                        outer: false,
-                    },
-                ),
+                ast_resolved::Chain::relation(ast_resolved::Relation::ConsultedView {
+                    body: Box::new(query_with_ctes),
+                    scoped: access_scope,
+                    outer: false,
+                }),
                 bubbled,
             ))
         }
@@ -2724,7 +2898,7 @@ pub(super) enum BoundaryAnswering {
     #[allow(dead_code)]
     AnswersTo(SqlIdentifier),
     /// No answering channel: only the pushed qualifier (often a
-    /// synthetic `_rN`) reaches presence, so surface-name-qualified
+    /// compiler-owned occurrence) reaches presence, so surface-name-qualified
     /// references refuse. This is the known gap on the consulted-view
     /// roads — unaliased `pv(*), pv.a == 1` refuses while
     /// `pv(*) as p, p.a == 1` works. Kept until the presence-tier fix
@@ -2736,62 +2910,78 @@ pub(super) fn relabel_bubbled_with_alias(
     bubbled: super::BubbledState,
     effective_name: &str,
     answering: BoundaryAnswering,
+    identities: &crate::names::Registry,
 ) -> super::BubbledState {
-    let relabeled: Vec<ast_resolved::ColumnMetadata> = bubbled
+    let input = identities
+        .common_scope(&bubbled.i_provide)
+        .unwrap_or_else(|| {
+            identities.mint_scope(
+                crate::names::ScopeOrigin::AnonRelation,
+                crate::names::Hint::None,
+                None,
+            )
+        });
+    let spelling = identities.intern(effective_name, false);
+    let scope = identities.mint_derived_scope(
+        crate::names::ScopeOrigin::UserAlias { of: input },
+        crate::names::Hint::User(spelling),
+    );
+    let access = match answering {
+        BoundaryAnswering::AnswersTo(access) => {
+            let spelling = identities.intern(access.as_str(), access.is_stropped());
+            Some(identities.canonical(spelling))
+        }
+        BoundaryAnswering::Silent => None,
+    };
+    let relabeled: Vec<crate::names::ColId> = bubbled
         .i_provide
         .into_iter()
-        .map(|mut col| {
-            let prev = match col.qualifier() {
-                ast_resolved::TableName::Named(t) => t.to_string(),
-                ast_resolved::TableName::Fresh => "_".to_string(),
-            };
-            col.push_scope(
-                ast_resolved::TableName::Named(effective_name.to_string().into()),
-                ast_resolved::IdentityContext::SubqueryAlias {
-                    alias: effective_name.to_string(),
-                    previous_context: prev,
-                    resolver_id: None,
-                },
-            );
-            match &answering {
-                BoundaryAnswering::AnswersTo(access) => {
-                    col.export_answering_to(access.clone())
-                }
-                BoundaryAnswering::Silent => {}
-            }
-            col
+        .map(|column| {
+            identities.republish_column(
+                column,
+                scope,
+                crate::names::Republish::BoundaryExport,
+                identities.published(column),
+                access
+                    .map(crate::names::Addressing::AnsweringTo)
+                    .unwrap_or(crate::names::Addressing::Published),
+                |_| {},
+            )
         })
         .collect();
-    super::BubbledState::resolved(relabeled)
+    super::BubbledState::resolved(relabeled, identities)
 }
 
 /// Relabel column metadata with an alias: if an alias is present, update the
 /// table_name on each column to reflect the alias. Otherwise return a clone.
 fn relabel_columns_with_alias(
-    cols: &[ast_resolved::ColumnMetadata],
+    input: crate::names::ScopeId,
     alias: &Option<SqlIdentifier>,
-) -> Vec<ast_resolved::ColumnMetadata> {
+    identities: &crate::names::Registry,
+) -> Vec<crate::names::ColId> {
     if let Some(alias_name) = alias {
-        cols.iter()
-            .map(|col| {
-                let mut new_col = col.clone();
-                let prev = match col.qualifier() {
-                    ast_resolved::TableName::Named(t) => t.to_string(),
-                    ast_resolved::TableName::Fresh => "_".to_string(),
-                };
-                new_col.push_scope(
-                    ast_resolved::TableName::Named(alias_name.clone().into()),
-                    ast_resolved::IdentityContext::SubqueryAlias {
-                        alias: alias_name.to_string(),
-                        previous_context: prev,
-                        resolver_id: None,
-                    },
-                );
-                new_col
+        let spelling = identities.intern(alias_name.as_str(), alias_name.is_stropped());
+        let scope = identities.mint_derived_scope(
+            crate::names::ScopeOrigin::UserAlias { of: input },
+            crate::names::Hint::User(spelling),
+        );
+        identities
+            .heading(input)
+            .columns_seen()
+            .into_iter()
+            .map(|column| {
+                identities.republish_column(
+                    column,
+                    scope,
+                    crate::names::Republish::BoundaryExport,
+                    identities.published(column),
+                    crate::names::Addressing::Published,
+                    |_| {},
+                )
             })
             .collect()
     } else {
-        cols.to_vec()
+        identities.heading(input).columns_seen()
     }
 }
 
@@ -2805,7 +2995,7 @@ fn relabel_columns_with_alias(
 /// not unbound identifiers. MixedGround positions have free variables in some
 /// clauses — the caller must provide a literal or expression, not a bare lvar.
 fn validate_scalar_spec_mixed_ground(
-    scalar_spec: &ast_unresolved::DomainSpec,
+    scalar_spec: &ast_unresolved::Access,
     positions: &[crate::pipeline::asts::ddl::HoPositionInfo],
     function: &str,
     has_outer_context: bool,
@@ -2813,8 +3003,8 @@ fn validate_scalar_spec_mixed_ground(
     use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
 
     let exprs = match scalar_spec {
-        ast_unresolved::DomainSpec::Positional(exprs) => exprs,
-        ast_unresolved::DomainSpec::Glob => return Ok(()),
+        ast_unresolved::Access::Slots(exprs) => exprs,
+        ast_unresolved::Access::All => return Ok(()),
         _ => return Ok(()),
     };
 
@@ -2825,7 +3015,7 @@ fn validate_scalar_spec_mixed_ground(
         .filter(|(_, p)| matches!(p.column_kind, HoColumnKind::Scalar))
         .collect();
 
-    for (idx, expr) in exprs.iter().enumerate() {
+    for (idx, slot) in exprs.iter().enumerate() {
         let Some((abs_pos, pos_info)) = scalar_positions.get(idx) else {
             continue;
         };
@@ -2833,10 +3023,18 @@ fn validate_scalar_spec_mixed_ground(
             continue;
         }
         // Check if the expression is a bare identifier (lvar) — not a literal
+        // A crossed slot constrains with a truth read as a value; it is not
+        // a bare lvar, so it counts as ground for this judgment.
+        let Some(expr) = slot.term() else {
+            continue;
+        };
         let is_ground = match expr {
-            ast_unresolved::DomainExpression::Literal { .. } => true,
-            ast_unresolved::DomainExpression::Lvar { .. } => false,
-            ast_unresolved::DomainExpression::Projection(_) => false,
+            ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Ground(_),
+            ) => true,
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn { .. },
+            ))) => false,
             // Function calls, expressions, etc. are considered ground
             _ => true,
         };
@@ -2871,22 +3069,19 @@ fn validate_scalar_spec_mixed_ground(
 pub(super) fn expand_ho_view(
     function: &str,
     entity: &crate::resolution::registry::ConsultedEntity,
-    scalar_spec: &ast_unresolved::DomainSpec,
-    access_spec: &ast_unresolved::DomainSpec,
+    scalar_spec: &ast_unresolved::Access,
+    access_spec: &ast_unresolved::Access,
     table_bindings: crate::pipeline::query_features::HoParamBindings,
-    pipe_source: Option<ast_unresolved::RelationalExpression>,
-    join_input: Option<ast_unresolved::RelationalExpression>,
+    pipe_source: Option<ast_unresolved::Chain>,
+    join_input: Option<ast_unresolved::Chain>,
+    join_input_columns: Option<&[crate::names::ColId]>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
     grounding: &ast_unresolved::GroundedPath,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
     user_alias: Option<SqlIdentifier>,
-) -> Result<(
-    ast_resolved::RelationalExpression,
-    super::BubbledState,
-    bool,
-)> {
+) -> Result<(ast_resolved::Chain, super::BubbledState, bool)> {
     let (expr, bubbled, absorbed_join_input) = expand_ho_view_body(
         function,
         entity,
@@ -2894,6 +3089,7 @@ pub(super) fn expand_ho_view(
         table_bindings,
         pipe_source,
         join_input,
+        join_input_columns,
         data_ns,
         grounding,
         registry,
@@ -2901,8 +3097,14 @@ pub(super) fn expand_ho_view(
         config,
         user_alias.clone(),
     )?;
-    let (expr, bubbled) =
-        apply_ho_access_pattern(access_spec, expr, bubbled, function, &user_alias)?;
+    let (expr, bubbled) = apply_ho_access_pattern(
+        access_spec,
+        expr,
+        bubbled,
+        function,
+        &user_alias,
+        &registry.identities,
+    )?;
     Ok((expr, bubbled, absorbed_join_input))
 }
 
@@ -2914,34 +3116,24 @@ pub(super) fn expand_ho_view(
 /// hidden. WHERE constraints use unqualified column references because
 /// HO ConsultedViews get CTE-wrapped and a qualifier would be wrong.
 fn apply_ho_access_pattern(
-    access_spec: &ast_unresolved::DomainSpec,
-    expr: ast_resolved::RelationalExpression,
+    access_spec: &ast_unresolved::Access,
+    expr: ast_resolved::Chain,
     bubbled: super::BubbledState,
     function: &str,
     user_alias: &Option<SqlIdentifier>,
-) -> Result<(
-    ast_resolved::RelationalExpression,
-    super::BubbledState,
-)> {
-    let ast_unresolved::DomainSpec::Positional(pattern_exprs) = access_spec else {
+    identities: &crate::names::Registry,
+) -> Result<(ast_resolved::Chain, super::BubbledState)> {
+    let ast_unresolved::Access::Slots(pattern_exprs) = access_spec else {
         // Glob access stays payload-transparent.
         return Ok((expr, bubbled));
     };
 
-    let body_schema = super::helpers::extraction::extract_cpr_schema(&expr)?;
-    let ast_resolved::CprSchema::Resolved(schema_cols) = &body_schema else {
-        return Err(DelightQLError::validation_error(
-            format!(
-                "Cannot apply positional access to '{}': schema not resolved",
-                function
-            ),
-            "Pattern application".to_string(),
-        ));
-    };
+    let body_schema = super::helpers::extraction::extract_cpr_schema(&expr);
+    let schema_cols = identities.known_heading(body_schema)?;
 
     let visible_count = schema_cols
         .iter()
-        .filter(|c| !c.needs_hygienic_alias)
+        .filter(|column| identities.addressing(**column) != crate::names::Addressing::Hygienic)
         .count();
     if pattern_exprs.len() != visible_count {
         return Err(DelightQLError::validation_error(
@@ -2954,114 +3146,160 @@ fn apply_ho_access_pattern(
     }
 
     let mut where_constraints = Vec::new();
-    let mut output_columns = Vec::new();
-    // First column bound by each bare name: a later repeat of the same
-    // name is one variable bound twice — an equality, not a second
-    // binding (mirrors PatternResolver's SelfUnify).
-    let mut first_col_of: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let unqualified_ref = |name: &str| ast_resolved::DomainExpression::Lvar {
-        name: name.into(),
-        qualifier: None,
-        namespace_path: ast_resolved::NamespacePath::empty(),
-        alias: None,
-        provenance: ast_resolved::PhaseBox::phantom(),
+    let output_scope = identities.mint_derived_scope(
+        crate::names::ScopeOrigin::Wrap {
+            input: body_schema,
+            why: crate::names::WrapReason::Projection,
+        },
+        crate::names::Hint::None,
+    );
+    let resolved_ref = |column| {
+        ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence {
+                column,
+                // The access constraint is evaluated against the expanded relation's
+                // published row. Preserve qualification so a surrounding EXISTS
+                // cannot reinterpret the same column as an outer or unqualified
+                // reference after the consulted body is wrapped.
+                explicit_qualifier: true,
+            },
+        )))
     };
 
-    let mut pattern_iter = pattern_exprs.iter();
-    for col in schema_cols {
-        if col.needs_hygienic_alias {
-            output_columns.push(col.clone());
+    // The access law is classified in ONE place — PatternResolver's
+    // positional_to_selections — and lowered here. This road differs from
+    // the bare-table road only in lowering: an HO body is CTE-wrapped, so
+    // a slot that publishes nothing must still ride the inner projection
+    // for the WHERE to reference it, where a bare table can simply omit
+    // the column.
+    let visible: Vec<crate::names::ColId> = schema_cols
+        .iter()
+        .filter(|column| identities.addressing(**column) != crate::names::Addressing::Hygienic)
+        .copied()
+        .collect();
+    let selections =
+        super::PatternResolver::new().positional_to_selections(pattern_exprs, &visible)?;
+
+    let mut sel_iter = selections.into_iter();
+    let mut output_for_input = std::collections::HashMap::new();
+    for column in schema_cols {
+        if identities.addressing(column) == crate::names::Addressing::Hygienic {
+            let output = identities.republish_column(
+                column,
+                output_scope,
+                crate::names::Republish::Passthrough,
+                identities.published(column),
+                crate::names::Addressing::Hygienic,
+                |_| {},
+            );
+            output_for_input.insert(column, output);
             continue;
         }
-        let pat = pattern_iter
+        let sel = sel_iter
             .next()
-            .expect("arity checked above: one pattern element per visible column");
-        let source_name = col.name().to_string();
-        match pat {
-            ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
-                let mut hidden = col.clone();
-                hidden.needs_hygienic_alias = true;
-                output_columns.push(hidden);
+            .expect("arity checked above: one selection per visible column");
+        match sel.constraint {
+            // Introduces no name: publishes nothing, contributes nothing.
+            Some(super::pattern_resolver::PatternConstraint::Skip) => {
+                let output = identities.republish_column(
+                    column,
+                    output_scope,
+                    crate::names::Republish::Passthrough,
+                    identities.published(column),
+                    crate::names::Addressing::Hygienic,
+                    |_| {},
+                );
+                output_for_input.insert(column, output);
             }
-            ast_unresolved::DomainExpression::Lvar {
-                name,
-                qualifier: None,
-                ..
-            } => {
-                if let Some(first_source) = first_col_of.get(name.as_str()) {
-                    // One variable bound twice is self-unification: a
-                    // within-row selection bit where null is a VALUE — a
-                    // both-null row instances the pattern, matching
-                    // create_self_unification_condition. SQL `=` here
-                    // silently drops both-null rows. The column stays
-                    // visible under its original name, as consulted
-                    // plain-rule access keeps it (the base-table road
-                    // hides its duplicate — the heading question across
-                    // those roads is open and not decided here).
-                    where_constraints.push(ast_resolved::BooleanExpression::Comparison {
-                        operator: "null_safe_eq".to_string(),
-                        left: Box::new(unqualified_ref(first_source)),
-                        right: Box::new(unqualified_ref(&source_name)),
-                    });
-                    output_columns.push(col.clone());
-                } else {
-                    first_col_of.insert(name.to_string(), source_name);
-                    let mut renamed = col.clone();
-                    renamed.info = renamed.info.with_alias(name.to_string());
-                    renamed.needs_sql_rename = true;
-                    output_columns.push(renamed);
-                }
+            // Introduces no name: publishes nothing, contributes a filter.
+            Some(super::pattern_resolver::PatternConstraint::Literal(value)) => {
+                let output = identities.republish_column(
+                    column,
+                    output_scope,
+                    crate::names::Republish::Passthrough,
+                    identities.published(column),
+                    crate::names::Addressing::Hygienic,
+                    |_| {},
+                );
+                output_for_input.insert(column, output);
+                where_constraints.push(ast_resolved::TruthExpression::Comparison(Comparison {
+                    operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                    left: Box::new(resolved_ref(output)),
+                    right: Box::new(ast_resolved::DomainExpression::Application(
+                        ast_resolved::FunctionApplication::Ground(value),
+                    )),
+                }));
             }
-            ast_unresolved::DomainExpression::Literal { value, .. } => {
-                // Literal → WHERE constraint; the column stays visible —
-                // the filtered value is part of the logical result, the
-                // consulted-view rule.
-                where_constraints.push(ast_resolved::BooleanExpression::Comparison {
-                    operator: "traditional_eq".to_string(),
-                    left: Box::new(unqualified_ref(&source_name)),
-                    right: Box::new(ast_resolved::DomainExpression::Literal {
-                        value: value.clone(),
-                        alias: None,
-                    }),
-                });
-                output_columns.push(col.clone());
+            // Introduces no name: publishes nothing, contributes an
+            // equality. Null-safe — a within-row selection cannot
+            // multiply rows, so a both-null row instances the pattern.
+            Some(super::pattern_resolver::PatternConstraint::SelfUnify { first_position }) => {
+                let output = identities.republish_column(
+                    column,
+                    output_scope,
+                    crate::names::Republish::Passthrough,
+                    identities.published(column),
+                    crate::names::Addressing::Hygienic,
+                    |_| {},
+                );
+                output_for_input.insert(column, output);
+                let first = output_for_input
+                    .get(&visible[first_position])
+                    .copied()
+                    .unwrap_or(visible[first_position]);
+                where_constraints.push(ast_resolved::TruthExpression::Comparison(Comparison {
+                    operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
+                    left: Box::new(resolved_ref(first)),
+                    right: Box::new(resolved_ref(output)),
+                }));
+            }
+            // Introduces a name: publishes under it.
+            None => {
+                let published = identities.intern(&sel.output_name, false);
+                let output = identities.republish_column(
+                    column,
+                    output_scope,
+                    crate::names::Republish::Rename,
+                    Some(published),
+                    crate::names::Addressing::Bare,
+                    |_| {},
+                );
+                output_for_input.insert(column, output);
             }
             other => {
                 return Err(DelightQLError::validation_error_categorized(
                     "resolution/ho_access/pattern_shape",
                     format!(
-                        "'{function}' access pattern position for column '{source_name}': \
+                        "'{function}' access pattern position {}: \
                          only bare names, `_`, and literals bind on a parameterized-rule \
                          access pattern for now. Got: {other:?}. Bind the column to a name \
-                         and constrain it with an explicit predicate instead."
+                         and constrain it with an explicit predicate instead.",
+                        sel.source_position + 1,
                     ),
                     "parameterized-rule access pattern",
                 ));
             }
         }
     }
+    let output_columns = identities.known_heading(output_scope)?;
 
     let mut expr = expr;
-    update_relation_cpr_schema(&mut expr, &output_columns);
+    update_relation_cpr_schema(&mut expr, output_scope);
 
     if !where_constraints.is_empty() {
         let combined = combine_where_constraints(where_constraints);
-        expr = ast_resolved::RelationalExpression::Filter {
-            source: Box::new(expr),
-            condition: ast_resolved::SigmaCondition::Predicate(combined),
+        expr = expr.then(ast_resolved::Continuation::Restrict {
+            condition: combined,
             origin: ast_resolved::FilterOrigin::PositionalLiteral {
-                source_table: function.to_string(),
+                source: output_scope,
             },
-            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                output_columns.clone(),
-            )),
-        };
+            cpr_schema: output_scope,
+        });
     }
 
-    let final_bubbled = super::BubbledState::resolved(output_columns);
+    let final_bubbled = super::BubbledState::resolved(output_columns.to_vec(), identities);
     let final_bubbled = if let Some(alias) = user_alias {
-        relabel_bubbled_with_alias(final_bubbled, alias, BoundaryAnswering::Silent)
+        relabel_bubbled_with_alias(final_bubbled, alias, BoundaryAnswering::Silent, identities)
     } else {
         final_bubbled
     };
@@ -3071,50 +3309,50 @@ fn apply_ho_access_pattern(
 fn expand_ho_view_body(
     function: &str,
     entity: &crate::resolution::registry::ConsultedEntity,
-    scalar_spec: &ast_unresolved::DomainSpec,
-    mut table_bindings: crate::pipeline::query_features::HoParamBindings,
-    pipe_source: Option<ast_unresolved::RelationalExpression>,
-    join_input: Option<ast_unresolved::RelationalExpression>,
+    scalar_spec: &ast_unresolved::Access,
+    table_bindings: crate::pipeline::query_features::HoParamBindings,
+    pipe_source: Option<ast_unresolved::Chain>,
+    join_input: Option<ast_unresolved::Chain>,
+    join_input_columns: Option<&[crate::names::ColId]>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
     grounding: &ast_unresolved::GroundedPath,
     registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
+    outer_context: Option<&[crate::names::ColId]>,
     config: &ResolutionConfig,
     user_alias: Option<SqlIdentifier>,
-) -> Result<(
-    ast_resolved::RelationalExpression,
-    super::BubbledState,
-    bool,
-)> {
+) -> Result<(ast_resolved::Chain, super::BubbledState, bool)> {
     log::debug!(
         "Expanding HO view '{}' (unified) from namespace '{}'",
         function,
         entity.namespace,
     );
+    let had_pipe_source = pipe_source.is_some();
 
     // Validate arity for argumentative params that received table references.
     super::grounding::validate_argumentative_arity(&table_bindings, registry)?;
 
     // Build remap from argumentative lvar names to actual column names.
     // E.g., V(k, l) bound to refs(key, label) → {k → key, l → label}.
-    table_bindings.argumentative_column_remap =
-        super::grounding::build_argumentative_column_remap(&table_bindings, registry);
 
     // Validate mixed ground params from position analysis.
-    let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
+    let group = crate::ddl::reconstruct::group(&entity.definition).ok();
     let positions = if !entity.positions.is_empty() {
         entity.positions.clone()
     } else {
-        super::grounding::build_ho_position_analysis(&defs)
+        group
+            .as_ref()
+            .map(super::grounding::build_ho_position_analysis)
+            .unwrap_or_default()
     };
-    let positions = super::grounding::ensure_position_column_names(positions, &defs);
+    let defs: &[crate::pipeline::asts::ddl::Clause] = group.as_ref().map_or(&[], |g| g.clauses());
+    let positions = super::grounding::ensure_position_column_names(positions, defs);
 
     // Validate scalar_spec against positions: reject unbound identifiers at MixedGround positions.
     validate_scalar_spec_mixed_ground(
         scalar_spec,
         &positions,
         function,
-        pipe_source.is_some() || outer_context.is_some(),
+        had_pipe_source || outer_context.is_some(),
     )?;
 
     // A provable miss is an error, not an empty relation: a call-site
@@ -3122,19 +3360,39 @@ fn expand_ho_view_body(
     // with the declared spellings.
     super::grounding::refuse_provable_ground_miss(function, scalar_spec, &positions)?;
 
-    // Build pipe source CTE if piped
-    let pipe_source_cte = pipe_source.map(|source| ("_ho_pipe_src".to_string(), source));
+    let pipe_source_cte = match (pipe_source, table_bindings.pipe_carrier.clone()) {
+        (Some(source), Some((formal, scope)))
+            if table_bindings.table_scope_params.get(&formal) == Some(&scope) =>
+        {
+            Some((formal, scope, source))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(DelightQLError::parse_error(
+                "a higher-order pipe source and its structural landing disagree",
+            ))
+        }
+    };
 
-    // Detect free scalar params: call-site Lvar expressions at Scalar positions.
-    // These need the inverted CTE strategy — the caller's join input is hoisted
-    // into the view body's CTE scope so free vars can resolve.
-    let has_free_scalars = table_bindings
-        .scalar_params
-        .values()
-        .any(|expr| matches!(expr, ast_unresolved::DomainExpression::Lvar { .. }));
+    // A call-site lvar makes the caller input a structural carrier inside
+    // every clause, where free heads bind it and ground heads constrain it.
+    let has_free_scalars = table_bindings.scalar_params.values().any(|expr| {
+        matches!(
+            expr,
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn { .. }
+            )))
+        )
+    });
     let (join_input_cte, absorbed_join_input) = if has_free_scalars {
         if let Some(input_expr) = join_input {
-            (Some(("_ho_scalar_input".to_string(), input_expr)), true)
+            let scope = registry.identities.mint_derived_scope(
+                crate::names::ScopeOrigin::HoCarrier {
+                    role: crate::names::HoRole::ScalarInput,
+                },
+                crate::names::Hint::Prefix("ho"),
+            );
+            (Some((scope, input_expr)), true)
         } else {
             (None, false)
         }
@@ -3142,33 +3400,19 @@ fn expand_ho_view_body(
         (None, false)
     };
 
-    // Collect free scalar column mapping: (param_name_in_squished, lvar_name_in_input)
-    // for injecting a correlation filter after resolution.
-    let free_scalar_join_cols: Vec<(String, String)> = if absorbed_join_input {
-        table_bindings
-            .scalar_params
-            .iter()
-            .filter_map(|(param_name, expr)| {
-                if let ast_unresolved::DomainExpression::Lvar {
-                    name: lvar_name, ..
-                } = expr
-                {
-                    Some((param_name.clone(), lvar_name.to_string()))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     // Capture which scalar params are literal-bound BEFORE table_bindings is moved.
     // Used later to mark ground scalar columns as hygienic in glob call-sites.
     let ground_literal_scalar_names: Vec<String> = table_bindings
         .scalar_params
         .iter()
-        .filter(|(_, expr)| matches!(expr, ast_unresolved::DomainExpression::Literal { .. }))
+        .filter(|(_, expr)| {
+            matches!(
+                expr,
+                ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Ground(_)
+                )
+            )
+        })
         .map(|(name, _)| name.clone())
         .collect();
 
@@ -3196,25 +3440,29 @@ fn expand_ho_view_body(
             ..config.clone()
         }
     };
+    let retained_outer;
+    let body_outer_context = if absorbed_join_input {
+        let absorbed_columns = join_input_columns.unwrap_or_default();
+        retained_outer = outer_context.map(|columns| {
+            columns
+                .iter()
+                .copied()
+                .filter(|column| !absorbed_columns.contains(column))
+                .collect::<Vec<_>>()
+        });
+        retained_outer.as_deref()
+    } else {
+        outer_context
+    };
     let resolve_result = super::resolve_query_inline(
         squished_query,
         registry,
-        outer_context,
+        body_outer_context,
         &entity_config,
         Some(grounding),
     );
 
     let (resolved_query, bubbled) = resolve_result?;
-
-    // Inverted CTE correlation: inject a semi-join filter into the resolved query
-    // to correlate the squished CTE with _ho_scalar_input.
-    // This filters out clauses whose hardcoded scalar values don't match the input.
-    // Done here (before ConsultedView wrapping) so _ho_scalar_input is still in scope.
-    let resolved_query = if !free_scalar_join_cols.is_empty() {
-        inject_ho_scalar_correlation(resolved_query, function, &free_scalar_join_cols)
-    } else {
-        resolved_query
-    };
 
     // Convert to ConsultedView relation
     let (resolved_expr, bubbled) = ho_view_query_to_relational(
@@ -3222,7 +3470,7 @@ fn expand_ho_view_body(
         bubbled,
         function,
         user_alias.clone(),
-        config,
+        &registry.identities,
     )?;
 
     // Hygienic binders (clause-head-catechism item 14a): a plain scalar param
@@ -3240,15 +3488,9 @@ fn expand_ho_view_body(
     // column (e.g. tagged("young", T(*))(*)).
     {
         use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
-        let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr)?;
-        let body_cols: &[ast_resolved::ColumnMetadata] = match &body_schema {
-            ast_resolved::CprSchema::Resolved(cols)
-            | ast_resolved::CprSchema::Unresolved(cols) => cols,
-            ast_resolved::CprSchema::Failed {
-                resolved_columns, ..
-            } => resolved_columns,
-            ast_resolved::CprSchema::Unknown => &[],
-        };
+        let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr);
+        let body_cols: Vec<crate::names::ColId> =
+            registry.identities.known_heading(body_schema)?.to_vec();
         for pos in &positions {
             if !matches!(pos.column_kind, HoColumnKind::Scalar)
                 || pos.ground_mode != HoGroundMode::PureUnbound
@@ -3258,29 +3500,60 @@ fn expand_ho_view_body(
             let Some(param_name) = pos.column_name.as_deref() else {
                 continue;
             };
-            if let Some(col) = body_cols.iter().find(|c| c.name() == param_name) {
-                // Prefer the original source table (before the view's own CTE
-                // re-qualified the column) so the message names `users`, not the
-                // enclosing view CTE.
-                let source_qualifier = col
-                    .info
-                    .original_table_qualifier()
-                    .or_else(|| Some(col.qualifier()));
-                let relation = match source_qualifier {
-                    Some(crate::pipeline::asts::core::TableName::Named(id)) => id.to_string(),
-                    _ => format!("the body of HO view '{}'", function),
-                };
+            let spelling = registry.identities.intern(param_name, false);
+            let param = registry.identities.canonical(spelling);
+            let collisions: Vec<String> = body_cols
+                .iter()
+                .filter_map(|column| {
+                    if registry.identities.published_sym(*column) != Some(param) {
+                        return None;
+                    }
+                    let mut occurrence = *column;
+                    loop {
+                        if matches!(
+                            registry
+                                .identities
+                                .origin_of(registry.identities.scope_of(occurrence)),
+                            crate::names::ScopeOrigin::HoCarrier {
+                                role: crate::names::HoRole::ScalarInput
+                            }
+                        ) {
+                            return None;
+                        }
+                        match registry.identities.origin_of_col(occurrence) {
+                            crate::names::ColumnOrigin::Republished { from, .. } => {
+                                occurrence = from;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let source = registry.identities.progenitor(*column);
+                    Some(match registry.identities.origin_of_col(source) {
+                        crate::names::ColumnOrigin::CatalogColumn { entity, .. } => {
+                            let mut relation = String::new();
+                            registry
+                                .identities
+                                .write_entity(entity, &mut crate::names::Teaching(&mut relation));
+                            format!(
+                                "column '{param_name}' of relation '{relation}' in the view body"
+                            )
+                        }
+                        _ => format!("column '{param_name}' in the view body"),
+                    })
+                })
+                .collect();
+            if !collisions.is_empty() {
                 return Err(crate::error::DelightQLError::validation_error_categorized(
                     "ho/param_shadows_column",
                     format!(
                         "Scalar parameter '{param}' of higher-order view '{func}' collides with \
-                         column '{param}' of relation '{rel}' in the view body. The parameter would \
+                         {collisions}. The parameter would \
                          silently capture the column: body constraints on '{param}' tautologize and \
                          the column drops from the output. Rename the parameter (e.g. '{param}_arg') \
                          so it no longer shadows the column.",
                         param = param_name,
                         func = function,
-                        rel = relation,
+                        collisions = collisions.join(", "),
                     ),
                     "HO parameter validation",
                 ));
@@ -3288,15 +3561,15 @@ fn expand_ho_view_body(
         }
     }
 
-    // Apply PatternResolver to first-parens (scalar positions) via combined DomainSpec.
+    // Apply PatternResolver to first-parens (scalar positions) via combined Access.
     //
     // The squished relation has schema [output_cols..., scalar_cols...] (glob-head)
     // or [scalar_cols..., output_cols...] (argumentative-head).
-    // We build a combined DomainSpec covering ALL columns:
+    // We build a combined Access covering ALL columns:
     //   - Scalar positions: expressions from scalar_spec (Literal → WHERE, Lvar → rename)
     //   - Output positions: pass-through Lvars (keep original name)
     // One PatternResolver call handles everything.
-    if matches!(scalar_spec, ast_unresolved::DomainSpec::Glob) {
+    if matches!(scalar_spec, ast_unresolved::Access::All) {
         // For glob call-sites, mark ground-bound scalar columns as hygienic
         // so they don't leak into the output (e.g., `label` from `tagged("young", T(*))(*)`).
         // Only hide columns where the call-site bound a LITERAL, not a free variable.
@@ -3319,16 +3592,47 @@ fn expand_ho_view_body(
             .collect();
 
         if !ground_scalar_col_names.is_empty() {
-            let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr)?;
-            if let ast_resolved::CprSchema::Resolved(cols) = &body_schema {
-                let mut updated_cols = cols.clone();
-                for col in &mut updated_cols {
-                    if ground_scalar_col_names.contains(&col.name()) {
-                        col.needs_hygienic_alias = true;
-                    }
+            let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr);
+            {
+                let input_scope = &body_schema;
+                let ground_names: Vec<_> = ground_scalar_col_names
+                    .iter()
+                    .map(|name| {
+                        let spelling = registry.identities.intern(name, false);
+                        registry.identities.canonical(spelling)
+                    })
+                    .collect();
+                let output_scope = registry.identities.mint_derived_scope(
+                    crate::names::ScopeOrigin::Wrap {
+                        input: *input_scope,
+                        why: crate::names::WrapReason::Projection,
+                    },
+                    crate::names::Hint::None,
+                );
+                for column in registry.identities.known_heading(*input_scope)? {
+                    let hide = registry
+                        .identities
+                        .published_sym(column)
+                        .is_some_and(|name| ground_names.contains(&name));
+                    registry.identities.republish_column(
+                        column,
+                        output_scope,
+                        crate::names::Republish::Passthrough,
+                        registry.identities.published(column),
+                        if hide {
+                            crate::names::Addressing::Hygienic
+                        } else {
+                            registry.identities.addressing(column)
+                        },
+                        |_| {},
+                    );
                 }
                 let mut expr = resolved_expr;
-                update_relation_cpr_schema(&mut expr, &updated_cols);
+                update_relation_cpr_schema(&mut expr, output_scope);
+                let bubbled = BubbledState::resolved(
+                    registry.identities.known_heading(output_scope)?.to_vec(),
+                    &registry.identities,
+                );
                 return Ok((expr, bubbled, absorbed_join_input));
             }
         }
@@ -3336,9 +3640,9 @@ fn expand_ho_view_body(
         return Ok((resolved_expr, bubbled, absorbed_join_input));
     }
 
-    let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr)?;
+    let body_schema = super::helpers::extraction::extract_cpr_schema(&resolved_expr);
     let scalar_exprs = match scalar_spec {
-        ast_unresolved::DomainSpec::Positional(exprs) => exprs,
+        ast_unresolved::Access::Slots(exprs) => exprs,
         _ => return Ok((resolved_expr, bubbled, absorbed_join_input)),
     };
 
@@ -3357,96 +3661,184 @@ fn expand_ho_view_body(
     // Build WHERE constraints and column filtering for scalar positions.
     // We construct the filter directly rather than going through apply_call_site_pattern,
     // because HO ConsultedViews get CTE-wrapped and the qualifier would be wrong.
-    let schema_cols = match &body_schema {
-        ast_resolved::CprSchema::Resolved(cols) => cols,
-        _ => return Ok((resolved_expr, bubbled, absorbed_join_input)),
-    };
+    let input_scope = body_schema;
+    let schema_cols = registry.identities.known_heading(input_scope)?;
+    let output_scope = registry.identities.mint_derived_scope(
+        crate::names::ScopeOrigin::Wrap {
+            input: input_scope,
+            why: crate::names::WrapReason::Projection,
+        },
+        crate::names::Hint::None,
+    );
+    let scalar_col_names: Vec<_> = scalar_col_names
+        .into_iter()
+        .map(|name| {
+            name.map(|name| {
+                let spelling = registry.identities.intern(name, false);
+                registry.identities.canonical(spelling)
+            })
+        })
+        .collect();
 
     let mut where_constraints = Vec::new();
-    let mut output_columns = Vec::new();
     let mut scalar_idx = 0;
 
-    for col in schema_cols {
-        let col_name = col.name();
-        let is_scalar = scalar_col_names
-            .iter()
-            .any(|n| n.map_or(false, |n| n == col_name));
+    for col in schema_cols.iter().copied() {
+        let col_name = registry.identities.published_sym(col);
+        let is_scalar = scalar_col_names.iter().any(|name| *name == col_name);
         if is_scalar && scalar_idx < scalar_exprs.len() {
-            let scalar_expr = &scalar_exprs[scalar_idx];
+            let scalar_expr = scalar_exprs[scalar_idx].term();
             scalar_idx += 1;
+            let Some(scalar_expr) = scalar_expr else {
+                continue;
+            };
             match scalar_expr {
-                ast_unresolved::DomainExpression::Literal { value, .. } => {
+                ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Ground(value),
+                ) => {
                     // Literal → WHERE constraint + hide column (hygienic)
                     // Use unqualified column ref to avoid qualifier mismatch with CTE wrapping
-                    let col_ref = ast_resolved::DomainExpression::Lvar {
-                        name: col_name.into(),
-                        qualifier: None,
-                        namespace_path: ast_resolved::NamespacePath::empty(),
-                        alias: None,
-                        provenance: ast_resolved::PhaseBox::phantom(),
-                    };
-                    let lit_val = ast_resolved::DomainExpression::Literal {
-                        value: value.clone(),
-                        alias: None,
-                    };
-                    where_constraints.push(ast_resolved::BooleanExpression::Comparison {
-                        operator: "traditional_eq".to_string(),
+                    let col_ref = ast_resolved::DomainExpression::Reference(Reference::Named(
+                        NamedReference(ColumnOccurrence {
+                            column: col,
+                            explicit_qualifier: false,
+                        }),
+                    ));
+                    let lit_val = ast_resolved::DomainExpression::Application(
+                        ast_resolved::FunctionApplication::Ground(value.clone()),
+                    );
+                    where_constraints.push(ast_resolved::TruthExpression::Comparison(Comparison {
+                        operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
                         left: Box::new(col_ref),
                         right: Box::new(lit_val),
-                    });
-                    // Hide scalar column (don't add to output)
-                    let mut hidden = col.clone();
-                    hidden.needs_hygienic_alias = true;
-                    output_columns.push(hidden);
+                    }));
+                    registry.identities.republish_column(
+                        col,
+                        output_scope,
+                        crate::names::Republish::Passthrough,
+                        registry.identities.published(col),
+                        crate::names::Addressing::Hygienic,
+                        |_| {},
+                    );
                 }
-                ast_unresolved::DomainExpression::Lvar { name, .. } => {
-                    // Lvar → rename column (project with new name)
-                    let mut renamed = col.clone();
-                    renamed.info = renamed.info.with_alias(name.to_string());
-                    renamed.needs_sql_rename = true;
-                    output_columns.push(renamed);
+                ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                    AuthoredColumn { name, .. },
+                ))) => {
+                    let published = registry
+                        .identities
+                        .intern(name.as_str(), name.is_stropped());
+                    let existing: Vec<_> = if absorbed_join_input {
+                        schema_cols
+                            .iter()
+                            .copied()
+                            .filter(|candidate| {
+                                *candidate != col
+                                    && registry.identities.published_sym(*candidate)
+                                        == Some(registry.identities.canonical(published))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    match existing.as_slice() {
+                        // The scalar slot is a dispatch witness for the caller
+                        // lvar already carried in the body. It constrains that
+                        // occurrence and publishes no second column.
+                        [_] => {
+                            registry.identities.republish_column(
+                                col,
+                                output_scope,
+                                crate::names::Republish::Passthrough,
+                                registry.identities.published(col),
+                                crate::names::Addressing::Hygienic,
+                                |_| {},
+                            );
+                        }
+                        [] => {
+                            registry.identities.republish_column(
+                                col,
+                                output_scope,
+                                crate::names::Republish::Rename,
+                                Some(published),
+                                crate::names::Addressing::Bare,
+                                |_| {},
+                            );
+                        }
+                        _ => {
+                            return Err(DelightQLError::validation_error_categorized(
+                                "resolution/ambiguous",
+                                format!(
+                                    "Higher-order scalar '{}' matches more than one published caller column",
+                                    name
+                                ),
+                                "in higher-order scalar output",
+                            ));
+                        }
+                    }
                 }
-                ast_unresolved::DomainExpression::NonUnifiyingUnderscore => {
-                    // Underscore → skip (hide) column
-                    let mut hidden = col.clone();
-                    hidden.needs_hygienic_alias = true;
-                    output_columns.push(hidden);
+                ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Open(
+                        ast_unresolved::DomainHole::Disregarded,
+                    ),
+                ) => {
+                    registry.identities.republish_column(
+                        col,
+                        output_scope,
+                        crate::names::Republish::Passthrough,
+                        registry.identities.published(col),
+                        crate::names::Addressing::Hygienic,
+                        |_| {},
+                    );
                 }
                 _ => {
-                    // Pass through
-                    output_columns.push(col.clone());
+                    registry.identities.republish_column(
+                        col,
+                        output_scope,
+                        crate::names::Republish::Passthrough,
+                        registry.identities.published(col),
+                        registry.identities.addressing(col),
+                        |_| {},
+                    );
                 }
             }
         } else {
-            output_columns.push(col.clone());
+            registry.identities.republish_column(
+                col,
+                output_scope,
+                crate::names::Republish::Passthrough,
+                registry.identities.published(col),
+                registry.identities.addressing(col),
+                |_| {},
+            );
         }
     }
+    let output_columns = registry.identities.known_heading(output_scope)?;
 
     // Update schema on the inner relation
     let mut expr = resolved_expr;
-    update_relation_cpr_schema(&mut expr, &output_columns);
+    update_relation_cpr_schema(&mut expr, output_scope);
 
     // Wrap in Filter if there are WHERE constraints
     if !where_constraints.is_empty() {
         let combined = combine_where_constraints(where_constraints);
-        expr = ast_resolved::RelationalExpression::Filter {
-            source: Box::new(expr),
-            condition: ast_resolved::SigmaCondition::Predicate(combined),
-            origin: ast_resolved::FilterOrigin::HoGroundScalar {
-                source_table: function.to_string(),
-            },
-            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                output_columns.clone(),
-            )),
-        };
+        expr = expr.then(ast_resolved::Continuation::Restrict {
+            condition: combined,
+            origin: ast_resolved::FilterOrigin::HoGroundScalar,
+            cpr_schema: output_scope,
+        });
     }
 
-    let final_bubbled = BubbledState::resolved(output_columns);
+    let final_bubbled = BubbledState::resolved(output_columns.to_vec(), &registry.identities);
     // The transparent (no-CTE) HO path carries a call-site alias only in the
     // bubbled lexical state; rebuilding that state after applying scalar
     // arguments must not silently discard the alias.
     let final_bubbled = if let Some(alias) = user_alias {
-        relabel_bubbled_with_alias(final_bubbled, &alias, BoundaryAnswering::Silent)
+        relabel_bubbled_with_alias(
+            final_bubbled,
+            &alias,
+            BoundaryAnswering::Silent,
+            &registry.identities,
+        )
     } else {
         final_bubbled
     };
@@ -3454,158 +3846,38 @@ fn expand_ho_view_body(
     Ok((expr, final_bubbled, absorbed_join_input))
 }
 
-/// Inject a correlation filter into a resolved squished query to correlate
-/// the squished CTE with _ho_scalar_input on the free scalar columns.
-///
-/// Transforms:
-///   WITH _ho_scalar_input AS (...), tagged AS (...) SELECT * FROM tagged
-/// Into:
-///   WITH _ho_scalar_input AS (...), tagged AS (...)
-///   SELECT * FROM tagged INNER JOIN _ho_scalar_input
-///   ON tagged.param_name = _ho_scalar_input.lvar_name
-///
-/// This filters out clauses whose hardcoded scalar values don't match the input,
-/// and naturally correlates free clauses row-by-row (multi-row JOIN semantics).
-fn inject_ho_scalar_correlation(
-    query: ast_resolved::Query,
-    function: &str,
-    join_cols: &[(String, String)],
-) -> ast_resolved::Query {
-    if join_cols.is_empty() {
-        return query;
-    }
-
-    match query {
-        ast_resolved::Query::WithCtes {
-            ctes,
-            query: main_expr,
-        } => {
-            // Build _ho_scalar_input(*) reference as a resolved Ground table
-            let input_table =
-                ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::Ground {
-                    identifier: ast_resolved::QualifiedName {
-                        namespace_path: ast_resolved::NamespacePath::empty(),
-                        name: "_ho_scalar_input".into(),
-                        grounding: None,
-                    },
-                    canonical_name: ast_resolved::PhaseBox::phantom(),
-                    backend_schema: ast_resolved::PhaseBox::from_optional_schema(None),
-                    domain_spec: ast_resolved::DomainSpec::Glob,
-                    alias: None,
-                    outer: false,
-                    mutation_target: false,
-                    passthrough: false,
-                    cpr_schema: ast_resolved::PhaseBox::phantom(),
-                    hygienic_injections: Vec::new(),
-                });
-
-            // Build ON condition: param_name = lvar_name for each free scalar.
-            // Use qualified references so the resolver knows which table each belongs to.
-            let conditions: Vec<ast_resolved::BooleanExpression> = join_cols
-                .iter()
-                .map(|(param_name, lvar_name)| {
-                    let left = ast_resolved::DomainExpression::Lvar {
-                        name: param_name.as_str().into(),
-                        qualifier: Some(function.into()),
-                        namespace_path: ast_resolved::NamespacePath::empty(),
-                        alias: None,
-                        provenance: ast_resolved::PhaseBox::phantom(),
-                    };
-                    let right = ast_resolved::DomainExpression::Lvar {
-                        name: lvar_name.as_str().into(),
-                        qualifier: Some("_ho_scalar_input".into()),
-                        namespace_path: ast_resolved::NamespacePath::empty(),
-                        alias: None,
-                        provenance: ast_resolved::PhaseBox::phantom(),
-                    };
-                    ast_resolved::BooleanExpression::Comparison {
-                        operator: "null_safe_eq".to_string(),
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }
-                })
-                .collect();
-
-            let join_condition = conditions
-                .into_iter()
-                .reduce(|acc, cond| ast_resolved::BooleanExpression::And {
-                    left: Box::new(acc),
-                    right: Box::new(cond),
-                })
-                .unwrap();
-
-            // Join: tagged(*) INNER JOIN _ho_scalar_input ON condition
-            let joined = ast_resolved::RelationalExpression::Join {
-                left: Box::new(main_expr),
-                right: Box::new(input_table),
-                join_condition: Some(join_condition),
-                join_type: Some(crate::pipeline::asts::core::JoinType::Inner),
-                cpr_schema: ast_resolved::PhaseBox::phantom(),
-            };
-
-            ast_resolved::Query::WithCtes {
-                ctes,
-                query: joined,
-            }
-        }
-        other => other, // Non-CTE queries: pass through unchanged
-    }
-}
-
 /// Apply call-site positional patterns to an already-resolved consulted entity expression.
 ///
 /// When a consulted view/fact is invoked with positional args (e.g., `active_users(1, fn, ln, ...)`),
-/// the call-site domain_spec specifies column selection, renaming, and literal filtering.
+/// the call-site access specifies column selection, renaming, and literal filtering.
 /// This function applies those patterns on top of the resolved body expression — the same
 /// work that `apply_pattern_resolver` does for Ground tables, but for ConsultedView/InnerRelation.
 fn apply_call_site_pattern(
-    domain_spec: &ast_unresolved::DomainSpec,
-    expr: ast_resolved::RelationalExpression,
-    body_schema: &ast_resolved::CprSchema,
+    access: &ast_unresolved::Access,
+    expr: ast_resolved::Chain,
+    body_schema: crate::names::ScopeId,
     entity_name: &str,
     display_name: &str,
-    outer_context: Option<&[ast_resolved::ColumnMetadata]>,
-) -> Result<(ast_resolved::RelationalExpression, BubbledState)> {
+    outer_context: Option<&[crate::names::ColId]>,
+    identities: &crate::names::Registry,
+    formal_frame: Option<&super::FormalFrame>,
+    instantiation: Option<super::SlotInstantiation<'_>>,
+) -> Result<(ast_resolved::Chain, BubbledState)> {
     // Get base columns and relabel with entity_name so WHERE constraints
     // reference the correct alias (e.g., "t0"."id" = 1)
-    let base_cols = match body_schema {
-        ast_resolved::CprSchema::Resolved(cols) => cols
-            .iter()
-            .map(|col| {
-                let mut relabeled = col.clone();
-                let prev = match col.qualifier() {
-                    ast_resolved::TableName::Named(t) => t.to_string(),
-                    ast_resolved::TableName::Fresh => "_".to_string(),
-                };
-                relabeled.push_scope(
-                    ast_resolved::TableName::Named(entity_name.to_string().into()),
-                    ast_resolved::IdentityContext::SubqueryAlias {
-                        alias: entity_name.to_string(),
-                        previous_context: prev,
-                        resolver_id: None,
-                    },
-                );
-                relabeled
-            })
-            .collect::<Vec<_>>(),
-        _ => {
-            return Err(DelightQLError::validation_error(
-                format!(
-                    "Cannot apply positional pattern to '{}': schema not resolved",
-                    entity_name
-                ),
-                "Pattern application".to_string(),
-            ));
-        }
-    };
+    let base_cols = relabel_columns_with_alias(
+        body_schema,
+        &Some(entity_name.to_string().into()),
+        identities,
+    );
 
     // Exact arity, same as base tables: a short pattern must never bind
     // a prefix and silently drop the tail. Hygienic carriers are not
     // part of the declared heading.
-    if let ast_unresolved::DomainSpec::Positional(patterns) = domain_spec {
+    if let ast_unresolved::Access::Slots(patterns) = access {
         let visible = base_cols
             .iter()
-            .filter(|c| !c.needs_hygienic_alias)
+            .filter(|column| identities.addressing(**column) != crate::names::Addressing::Hygienic)
             .count();
         if patterns.len() != visible {
             return Err(DelightQLError::validation_error(
@@ -3618,122 +3890,58 @@ fn apply_call_site_pattern(
         }
     }
 
-    let pattern_resolver = PatternResolver::new();
+    let pattern_resolver = PatternResolver::with_formals(formal_frame, instantiation);
     let join_context = outer_context.map(JoinContext::from);
 
     let pattern_result = pattern_resolver.resolve_pattern(
-        domain_spec,
+        access,
         &base_cols,
         entity_name,
         join_context.as_ref(),
+        identities,
     )?;
 
-    let mut output_columns = pattern_result.output_columns;
+    let output_scope = pattern_result.output_scope;
+    let output_columns = pattern_result.output_columns.into_vec();
 
-    // For ConsultedViews, literal-constrained columns should remain in the output —
-    // the filtered value (e.g. "young" in `_col1`) is part of the logical result.
-    // Un-mark `needs_hygienic_alias` for any column that was NOT already hygienic
-    // in the source schema. Columns that were hygienic in the source (e.g. `_label_N`
-    // for HO scalar params) remain hidden.
-    for col in &mut output_columns {
-        if col.needs_hygienic_alias {
-            let was_hygienic_in_source = base_cols
-                .iter()
-                .any(|bc| bc.name() == col.name() && bc.needs_hygienic_alias);
-            if !was_hygienic_in_source {
-                col.needs_hygienic_alias = false;
-            }
-        }
-    }
-
-    // Mark columns that were renamed by this call-site pattern.
-    // This distinguishes call-site renames (need SELECT wrapper in transformer)
-    // from body-internal renames (already baked into body SQL).
-    // Compare against base_cols to detect only NEW renames from the call-site.
-    for col in &mut output_columns {
-        if col.needs_hygienic_alias {
-            continue;
-        }
-        if let (Some(orig), Some(alias)) = (col.info.original_name(), col.info.alias_name()) {
-            if orig != alias {
-                // Only flag if this rename is NEW — not already present in body schema
-                let was_already_renamed = base_cols.iter().any(|bc| {
-                    bc.info.original_name() == Some(orig) && bc.info.alias_name() == Some(alias)
-                });
-                if !was_already_renamed {
-                    col.needs_sql_rename = true;
-                }
-            }
-        }
-    }
-
-    // Update cpr_schema on the inner relation to reflect column selection/renaming
     let mut expr = expr;
-    update_relation_cpr_schema(&mut expr, &output_columns);
+    update_relation_cpr_schema(&mut expr, output_scope);
 
     // Wrap in Filter if there are WHERE constraints from literal patterns
     if !pattern_result.where_constraints.is_empty() {
         let combined = combine_where_constraints(pattern_result.where_constraints);
-        expr = ast_resolved::RelationalExpression::Filter {
-            source: Box::new(expr),
-            condition: ast_resolved::SigmaCondition::Predicate(combined),
+        expr = expr.then(ast_resolved::Continuation::Restrict {
+            condition: combined,
             origin: ast_resolved::FilterOrigin::PositionalLiteral {
-                source_table: entity_name.to_string(),
+                source: output_scope,
             },
-            cpr_schema: ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                output_columns.clone(),
-            )),
-        };
+            cpr_schema: output_scope,
+        });
     }
 
-    if !pattern_result.join_conditions.is_empty() {
-        log::debug!(
-            "Storing {} join conditions from positional pattern for consulted entity {}",
-            pattern_result.join_conditions.len(),
-            entity_name
-        );
-    }
-
-    Ok((expr, BubbledState::resolved(output_columns)))
+    Ok((
+        expr,
+        BubbledState::resolved(output_columns.to_vec(), identities),
+    ))
 }
 
 /// Combine multiple WHERE constraints into a single AND chain.
 fn combine_where_constraints(
-    constraints: Vec<ast_resolved::BooleanExpression>,
-) -> ast_resolved::BooleanExpression {
-    debug_assert!(!constraints.is_empty());
-    if constraints.len() == 1 {
-        constraints.into_iter().next().unwrap()
-    } else {
-        constraints
-            .into_iter()
-            .reduce(|left, right| ast_resolved::BooleanExpression::And {
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-            .unwrap()
-    }
+    constraints: Vec<ast_resolved::TruthExpression>,
+) -> ast_resolved::TruthExpression {
+    ast_resolved::TruthExpression::all(constraints)
+        .expect("caller only combines a non-empty constraint list")
 }
 
 /// Update the cpr_schema on a relation expression (ConsultedView or InnerRelation).
-fn update_relation_cpr_schema(
-    expr: &mut ast_resolved::RelationalExpression,
-    new_columns: &[ast_resolved::ColumnMetadata],
-) {
-    if let ast_resolved::RelationalExpression::Relation(rel) = expr {
+fn update_relation_cpr_schema(expr: &mut ast_resolved::Chain, new_scope: crate::names::ScopeId) {
+    if let ast_resolved::Grelex::Reference(rel) = &mut expr.head {
         match rel {
             ast_resolved::Relation::ConsultedView { scoped, .. } => {
-                let new_schema = ast_resolved::CprSchema::Resolved(new_columns.to_vec());
-                let alias = scoped.get().alias().clone();
-                let rid = scoped.get().resolver_id();
-                *scoped = ast_resolved::PhaseBox::new(ast_resolved::ScopedSchema::bind(
-                    new_schema, alias, rid,
-                ));
+                *scoped = new_scope;
             }
             ast_resolved::Relation::InnerRelation { cpr_schema, .. } => {
-                *cpr_schema = ast_resolved::PhaseBox::new(ast_resolved::CprSchema::Resolved(
-                    new_columns.to_vec(),
-                ));
+                *cpr_schema = new_scope;
             }
             other => panic!(
                 "catch-all hit in relation_resolver.rs update_scoped_schema: {:?}",
@@ -3743,63 +3951,3 @@ fn update_relation_cpr_schema(
     }
 }
 
-/// Parse a fact's body_source (which may contain multiple fact clauses joined
-/// by newlines) and merge all rows into a single anonymous table expression.
-fn expand_fact_body(
-    body_source: &str,
-    fact_name: &str,
-) -> Result<ast_unresolved::RelationalExpression> {
-    use crate::pipeline::asts::core::expressions::relational::Relation;
-    use crate::pipeline::asts::core::phase_box::PhaseBox;
-
-    let defs = crate::ddl::ddl_builder::build_ddl_file(body_source)?;
-    if defs.is_empty() {
-        return Err(DelightQLError::parse_error(format!(
-            "No definitions found for fact '{}'",
-            fact_name
-        )));
-    }
-
-    let mut all_rows = Vec::new();
-    let mut headers = None;
-
-    for def in defs {
-        let rel_expr = def.into_flat_relational_expr().ok_or_else(|| {
-            DelightQLError::parse_error(format!(
-                "Expected relational body for fact '{}', got scalar",
-                fact_name
-            ))
-        })?;
-
-        // Extract the Anonymous relation from the relational expression
-        if let ast_unresolved::RelationalExpression::Relation(Relation::Anonymous {
-            column_headers,
-            rows,
-            ..
-        }) = rel_expr
-        {
-            if headers.is_none() {
-                headers = column_headers;
-            }
-            all_rows.extend(rows);
-        } else {
-            return Err(DelightQLError::parse_error(format!(
-                "Expected anonymous table body for fact '{}', got other expression",
-                fact_name
-            )));
-        }
-    }
-
-    Ok(ast_unresolved::RelationalExpression::Relation(
-        Relation::Anonymous {
-            column_headers: headers,
-            rows: all_rows,
-            alias: Some(fact_name.into()),
-            outer: false,
-            exists_mode: false,
-            negated: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        },
-    ))
-}

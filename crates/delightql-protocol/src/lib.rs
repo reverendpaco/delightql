@@ -12,7 +12,8 @@ pub mod manifest;
 pub mod socket;
 pub mod stdio;
 
-// Re-export layer0 for backward compat (existing code uses `delightql_protocol::ClientTerm`)
+// Layer 0's vocabulary IS the crate's public vocabulary; the module split
+// is an authoring boundary, not a namespace consumers must spell.
 pub use layer0::*;
 
 // Re-export layer1 control types

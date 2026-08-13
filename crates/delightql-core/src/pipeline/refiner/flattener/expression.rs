@@ -6,415 +6,241 @@ use super::context::FlattenContext;
 use super::predicates::extract_references;
 use super::types::{
     AnonymousTableData, FlatOperator, FlatOperatorKind, FlatPredicate, FlatSegment, FlatTable,
-    OperationContext, TvfData,
+    TvfData,
 };
 use crate::error::Result;
-use crate::pipeline::asts::refined::QualifiedName;
 use crate::pipeline::asts::resolved;
-use crate::pipeline::asts::unresolved::NamespacePath;
-
-/// Convert a resolved scalar domain expression to a string for SQL generation.
-fn ho_argument_scalar_to_string(dom: &resolved::DomainExpression) -> String {
-    match dom {
-        resolved::DomainExpression::Literal {
-            value: resolved::LiteralValue::String(s),
-            ..
-        } => format!("\"{}\"", s),
-        resolved::DomainExpression::Literal {
-            value: resolved::LiteralValue::Number(n),
-            ..
-        } => n.clone(),
-        resolved::DomainExpression::Lvar {
-            name,
-            qualifier: Some(ref qual),
-            ..
-        } => format!("{}.{}", qual, name),
-        resolved::DomainExpression::Lvar { name, .. } => name.to_string(),
-        _ => format!("{:?}", dom),
-    }
-}
 
 /// Recursively flatten an expression
 #[stacksafe::stacksafe]
 pub(super) fn flatten_expression(
-    expr: resolved::RelationalExpression,
+    expr: resolved::Chain,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
-    match expr {
-        resolved::RelationalExpression::Relation(rel) => {
-            flatten_relation(rel, segment, ctx)?;
+    // A chain standing on a bag step is opaque here: the bag road owns its
+    // arms and the correlation among them, and the rebuilder refines it
+    // whole through `refine_internal`.
+    if expr.stands_on_bag_step() {
+        return flatten_opaque(expr, segment, ctx);
+    }
+
+    let mut expr = expr;
+    let last = expr.pop_step();
+    match last {
+        None => {
+            let (head, access, _) = expr.split_head_access();
+            match head {
+                resolved::Grelex::Reference(rel) => {
+                    flatten_read(rel, access, segment, ctx)?;
+                }
+                resolved::Grelex::Literal(anon) => {
+                    flatten_anon_table(anon, segment, ctx)?;
+                }
+            }
         }
 
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            ..
-        } => {
+        // A dimension access on the relation the chain has built publishes
+        // its own heading, exactly as a pipe stage does; the rebuilder
+        // refines the stored chain.
+        Some(step @ resolved::Continuation::Access { .. }) => {
+            flatten_opaque(expr.then(step), segment, ctx)?;
+        }
+
+        // A whole-heading correlation relates two ARMS of a set operation.
+        // A chain standing on a bag step is opaque above, so reaching here
+        // means there is no run for it to correlate.
+        Some(resolved::Continuation::Correlate { .. }) => {
+            return Err(crate::error::DelightQLError::validation_error_categorized(
+                "resolution/setop/correlation_owner",
+                "a whole-heading correlation relates two operands of a set operation, \
+                 and this one stands on no set operation",
+                "correlate the arms of a `;`, `|;|`, `||` or `-` step: \
+                 `x(*) as a ; y(*) as b, a.* = b.*`",
+            ));
+        }
+
+        Some(resolved::Continuation::Member {
+            rhs, correlation, ..
+        }) => {
+            let left = expr;
+            let right = rhs;
             // Flatten left side
             let left_start = segment.tables.len();
-            flatten_expression(*left, segment, ctx)?;
+            flatten_expression(left, segment, ctx)?;
             let left_end = segment.tables.len();
 
             // Flatten right side
             let right_start = segment.tables.len();
-            flatten_expression(*right, segment, ctx)?;
+            flatten_expression(right, segment, ctx)?;
             let right_end = segment.tables.len();
 
             // Record the join operator
-            let left_tables: Vec<String> = segment.tables[left_start..left_end]
+            let left_tables = segment.tables[left_start..left_end]
                 .iter()
-                .map(|t| {
-                    t.alias
-                        .clone()
-                        .unwrap_or_else(|| t.identifier.name.to_string())
-                })
+                .map(|table| table.identity)
                 .collect();
 
-            let right_tables: Vec<String> = segment.tables[right_start..right_end]
+            let right_tables = segment.tables[right_start..right_end]
                 .iter()
-                .map(|t| {
-                    t.alias
-                        .clone()
-                        .unwrap_or_else(|| t.identifier.name.to_string())
-                })
+                .map(|table| table.identity)
                 .collect();
 
-            // Extract USING columns if the join condition carries them
-            // (e.g. from positional pattern unification: shared lvar names)
-            let using_columns = match &join_condition {
-                Some(resolved::BooleanExpression::Using { columns }) => Some(
-                    columns
-                        .iter()
-                        .map(|col| match col {
-                            resolved::UsingColumn::Regular(qname) => qname.name.to_string(),
-                            resolved::UsingColumn::Negated(qname) => qname.name.to_string(),
-                        })
-                        .collect(),
-                ),
-                // Explicit ON conditions (Comparison, And, Or, etc.) and cross joins (None)
-                // don't carry USING columns — only the Using variant does.
-                Some(resolved::BooleanExpression::Comparison { .. })
-                | Some(resolved::BooleanExpression::And { .. })
-                | Some(resolved::BooleanExpression::Or { .. })
-                | Some(resolved::BooleanExpression::Not { .. })
-                | Some(resolved::BooleanExpression::InnerExists { .. })
-                | Some(resolved::BooleanExpression::In { .. })
-                | Some(resolved::BooleanExpression::InRelational { .. })
-                | Some(resolved::BooleanExpression::BooleanLiteral { .. })
-                | Some(resolved::BooleanExpression::Sigma { .. })
-                | Some(resolved::BooleanExpression::GlobCorrelation { .. })
-                | Some(resolved::BooleanExpression::OrdinalGlobCorrelation { .. })
-                | None => None,
-            };
+            // The member's correlation says which of the two it is. A
+            // correspondence belongs to the operator; a condition becomes a
+            // predicate below.
+            let correspondence = correlation
+                .as_ref()
+                .and_then(resolved::MemberCorrelation::correspondence)
+                .cloned();
 
             // Store the join operator
             segment.operators.push(FlatOperator {
                 position: ctx.position,
-                kind: FlatOperatorKind::Join { using_columns },
+                kind: FlatOperatorKind::Join { correspondence },
                 left_tables,
                 right_tables,
             });
 
             // Add join condition as predicate (skips USING — already handled above)
-            add_join_condition(join_condition, segment, ctx);
+            add_correlation(correlation, segment, ctx);
 
             ctx.position += 1;
         }
 
-        resolved::RelationalExpression::SetOperation {
-            operator, operands, ..
-        } => {
-            // For SetOperations, flatten each operand but track them.
-            // Operands that are simple Relations are flattened normally.
-            // Complex operands (Filters, Pipes, etc.) are treated as opaque
-            // to prevent their predicates from being extracted and pooled
-            // at the segment level — each UNION branch keeps its own filters.
-            //
-            // Nested same-type SetOps are un-nested: (A ; B) ; C → A ; B ; C.
-            // This ensures correlation predicates between any pair of operands
-            // are visible to the analyzer for FIC classification.
-            let mut flat_operands: Vec<resolved::RelationalExpression> = Vec::new();
-            fn unnest_setop(
-                op: resolved::SetOperator,
-                operands: Vec<resolved::RelationalExpression>,
-                out: &mut Vec<resolved::RelationalExpression>,
-            ) {
-                for operand in operands {
-                    if let resolved::RelationalExpression::SetOperation {
-                        operator: inner_op,
-                        operands: inner_operands,
-                        ..
-                    } = &operand
-                    {
-                        if *inner_op == op {
-                            unnest_setop(op, inner_operands.clone(), out);
-                            continue;
-                        }
-                    }
-                    out.push(operand);
-                }
-            }
-            unnest_setop(operator, operands, &mut flat_operands);
-
-            let mut operand_tables = Vec::new();
-
-            for (i, operand) in flat_operands.into_iter().enumerate() {
-                let start = segment.tables.len();
-
-                let saved_context = ctx.scope_id;
-                ctx.scope_id = ctx.position * 100 + i; // Unique scope per operand
-
-                let is_simple_relation =
-                    matches!(operand, resolved::RelationalExpression::Relation(_));
-
-                if is_simple_relation {
-                    // Simple relation: flatten normally (table entry, no predicates)
-                    flatten_expression(operand, segment, ctx)?;
-                } else {
-                    // Complex operand (Filter, Pipe, Join, etc.): treat as opaque.
-                    // Store the full expression in pipe_expr so the rebuilder
-                    // refines it independently, preserving its internal predicates.
-                    let operand_schema = match &operand {
-                        resolved::RelationalExpression::Filter { cpr_schema, .. }
-                        | resolved::RelationalExpression::Join { cpr_schema, .. }
-                        | resolved::RelationalExpression::SetOperation { cpr_schema, .. } => {
-                            cpr_schema.get().clone()
-                        }
-                        resolved::RelationalExpression::Pipe(pipe) => {
-                            pipe.cpr_schema.get().clone()
-                        }
-                        other => panic!("catch-all hit in flattener/expression.rs flatten_expression (operand_schema): {:?}", other),
-                    };
-                    segment.tables.push(FlatTable {
-                        identifier: QualifiedName {
-                            namespace_path: NamespacePath::empty(),
-                            name: "__SETOP_OPERAND__".into(),
-                            grounding: None,
-                        },
-                        canonical_name: None,
-                        backend_schema: None,
-                        alias: None,
-                        position: ctx.position,
-                        _scope_id: ctx.scope_id,
-                        domain_spec: resolved::DomainSpec::Glob,
-                        operation_context: OperationContext::Direct,
-                        schema: operand_schema,
-                        outer: false,
-                        anonymous_data: None,
-                        correlation_refs: Vec::new(),
-                        inner_relation_pattern: None,
-                        pipe_expr: Some(Box::new(operand)),
-                        consulted_view_query: None,
-                        _table_filters: vec![],
-                        tvf_data: None,
-                        subquery_segment: None,
-                    });
-                }
-
-                // Mark all tables from this operand
-                for j in start..segment.tables.len() {
-                    segment.tables[j].operation_context = OperationContext::FromSetOp;
-                }
-
-                let end = segment.tables.len();
-                let tables: Vec<String> = segment.tables[start..end]
-                    .iter()
-                    .map(|t| {
-                        t.alias
-                            .clone()
-                            .unwrap_or_else(|| t.identifier.name.to_string())
-                    })
-                    .collect();
-
-                operand_tables.push(tables);
-                ctx.scope_id = saved_context;
-            }
-
-            // Record the SetOp operator
-            if operand_tables.len() >= 2 {
-                for i in 1..operand_tables.len() {
-                    segment.operators.push(FlatOperator {
-                        position: ctx.position,
-                        kind: FlatOperatorKind::SetOp { operator },
-                        left_tables: if i == 1 {
-                            operand_tables[0].clone()
-                        } else {
-                            vec![] // Already combined in previous iteration
-                        },
-                        right_tables: operand_tables[i].clone(),
-                    });
-                }
-            }
-
-            ctx.position += 1;
+        Some(resolved::Continuation::BagOp { .. }) => {
+            unreachable!("a chain standing on a bag step is opaque to flattening")
         }
 
-        resolved::RelationalExpression::Filter {
-            source,
+        Some(resolved::Continuation::Restrict {
             condition,
             origin,
             cpr_schema,
-        } => {
+        }) => {
+            let source = expr;
             // HoGroundScalar filters must stay bound to their source ConsultedView.
             // Don't pool them into the segment's global predicates — that would
             // lose which ConsultedView each _label_0 constraint belongs to,
             // causing qualifier mismatches when multiple HO views are joined.
-            if matches!(origin, resolved::FilterOrigin::HoGroundScalar { .. }) {
-                if let resolved::SigmaCondition::Predicate(pred) = condition {
-                    flatten_expression(*source, segment, ctx)?;
-                    // Attach the filter to the last-added table (the ConsultedView)
-                    if let Some(last_table) = segment.tables.last_mut() {
-                        last_table._table_filters.push((pred, origin));
-                        last_table.schema = cpr_schema.get().clone();
-                    }
-                    return Ok(());
+            if matches!(origin, resolved::FilterOrigin::HoGroundScalar) {
+                flatten_expression(source.clone(), segment, ctx)?;
+                // Attach the filter to the last-added table (the ConsultedView)
+                if let Some(last_table) = segment.tables.last_mut() {
+                    last_table._table_filters.push((condition, origin));
+                    last_table.schema = cpr_schema;
                 }
-            }
-
-            // TupleOrdinal (LIMIT/OFFSET) must stay with its source as a unit
-            // Don't flatten through it - treat it as a derived table
-            // This preserves CPR LTR semantics: users(*), #<5, products(*)
-            // should keep the limit as a separate stage
-            if !matches!(condition, resolved::SigmaCondition::Predicate(_)) {
-                // Wrap the entire Filter expression as a special table
-                // The rebuilder will recognize this and refine it separately
-                segment.tables.push(FlatTable {
-                    identifier: QualifiedName {
-                        namespace_path: NamespacePath::empty(),
-                        name: "__LIMIT__".into(),
-                        grounding: None,
-                    },
-                    canonical_name: None,
-                    backend_schema: None,
-                    alias: None,
-                    position: ctx.position,
-                    _scope_id: ctx.scope_id,
-                    domain_spec: resolved::DomainSpec::Glob,
-                    operation_context: OperationContext::Direct,
-                    schema: cpr_schema.get().clone(),
-                    outer: false,
-                    anonymous_data: None,
-                    correlation_refs: Vec::new(),
-                    inner_relation_pattern: None,
-                    pipe_expr: Some(Box::new(resolved::RelationalExpression::Filter {
-                        source,
-                        condition,
-                        origin,
-                        cpr_schema,
-                    })),
-                    consulted_view_query: None,
-                    _table_filters: vec![],
-                    tvf_data: None,
-                    subquery_segment: None,
-                });
-                ctx.position += 1;
                 return Ok(());
             }
 
-            flatten_expression(*source, segment, ctx)?;
-            let condition =
-                super::rewrite::apply_scope_aliases_to_sigma(condition, &ctx.scope_aliases);
-            add_sigma_condition(condition, origin, segment, ctx);
+            flatten_expression(source.clone(), segment, ctx)?;
+            add_predicate(condition, origin, segment, ctx);
         }
 
-        resolved::RelationalExpression::Pipe(pipe) => {
-            // Store pipes as special table entries with __PIPE__ marker
-            // Design rationale:
-            // 1. Pipes produce table-like results (they ARE tables from join's perspective)
-            // 2. Storing in tables list allows uniform iteration and position tracking
-            // 3. The rebuilder recognizes __PIPE__ and recursively refines the pipe_expr
-            // 4. Alternative (separate pipes list) would complicate position tracking
-            // This is a pragmatic choice - slightly hacky but keeps code simple
-            //
-            // SCOPE FIX: When inside a scope context (flatten_with_scope), pre-resolve
-            // ancestor scope aliases in the Pipe's AST. The rebuilder refines pipe_expr
-            // independently with refine_internal (which starts with empty scope), so
-            // ancestor aliases must be resolved before storing.
-            let pipe_as_expr = resolved::RelationalExpression::Pipe(pipe);
-            let pipe_as_expr =
-                super::rewrite::apply_scope_aliases_to_expr(pipe_as_expr, &ctx.scope_aliases);
-            let schema = match &pipe_as_expr {
-                resolved::RelationalExpression::Pipe(p) => p.cpr_schema.get().clone(),
-                _ => unreachable!(),
-            };
+        // A bound and a destructure must stay with their source as a UNIT.
+        // Flattening through either loses left-to-right meaning:
+        // `users(*), #<5, products(*)` bounds the users read, not the join,
+        // and a destructure's added columns belong to the relation it
+        // expanded. Both are stored whole and refined as their own stage.
+        Some(
+            step @ (resolved::Continuation::Bound { .. }
+            | resolved::Continuation::Destructure { .. }),
+        ) => {
+            let cpr_schema = *step
+                .cpr_schema()
+                .expect("a bound or destructure carries its heading");
             segment.tables.push(FlatTable {
-                identifier: QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: "__PIPE__".into(),
-                    grounding: None,
-                },
-                canonical_name: None,
-                backend_schema: None,
-                alias: None,
+                identity: cpr_schema,
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
-                domain_spec: resolved::DomainSpec::Glob,
-                operation_context: OperationContext::Direct,
-                schema,
+                access: resolved::Access::All,
+                schema: cpr_schema,
                 outer: false,
                 anonymous_data: None,
-                correlation_refs: Vec::new(),
                 inner_relation_pattern: None,
-                pipe_expr: Some(Box::new(pipe_as_expr)),
+                preminted_scope: None,
+                pipe_expr: Some(Box::new(expr.then(step))),
                 consulted_view_query: None,
                 _table_filters: vec![],
                 tvf_data: None,
                 subquery_segment: None,
             });
             ctx.position += 1;
+            return Ok(());
         }
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
+
+        Some(
+            step @ (resolved::Continuation::Pipe { .. } | resolved::Continuation::Structural(_)),
+        ) => {
+            // A pipe stage and the structural forms each publish their own
+            // heading, so the segment sees only the relation produced. The
+            // rebuilder refines the stored chain.
+            flatten_opaque(expr.then(step), segment, ctx)?;
+        }
+        Some(resolved::Continuation::ErJoin(_)) => {
             unreachable!("ER-join consumed by resolver")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 
     Ok(())
 }
 
-/// Flatten a relation (table)
-pub(super) fn flatten_relation(
+/// Record a chain the segment reads only as the relation it publishes.
+///
+/// Storing the whole chain in `pipe_expr` is what keeps its interior out of
+/// the segment's table and predicate pools: the rebuilder refines it
+/// independently, so its own filters, arms, and correlations stay its own.
+fn flatten_opaque(
+    expr: resolved::Chain,
+    segment: &mut FlatSegment,
+    ctx: &mut FlattenContext,
+) -> Result<()> {
+    let schema = *expr
+        .continuations
+        .last()
+        .and_then(resolved::Continuation::cpr_schema)
+        .unwrap_or_else(|| panic!("an opaque chain reached flattening without a heading"));
+    segment.tables.push(FlatTable {
+        identity: schema,
+        position: ctx.position,
+        _scope_id: ctx.scope_id,
+        access: resolved::Access::All,
+        schema,
+        outer: false,
+        anonymous_data: None,
+        inner_relation_pattern: None,
+        preminted_scope: None,
+        pipe_expr: Some(Box::new(expr)),
+        consulted_view_query: None,
+        _table_filters: vec![],
+        tvf_data: None,
+        subquery_segment: None,
+    });
+    ctx.position += 1;
+    Ok(())
+}
+
+/// Flatten a READ: a relation, and what its parens asked of it.
+pub(super) fn flatten_read(
     rel: resolved::Relation,
+    access: Option<resolved::Access>,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
     match rel {
         resolved::Relation::Ground {
-            identifier,
-            canonical_name,
-            backend_schema,
-            domain_spec,
-            alias,
-            cpr_schema,
-            outer,
-            mutation_target: _,
-            passthrough: _,
-            hygienic_injections: _,
+            cpr_schema, outer, ..
         } => {
-            let table_name = alias
-                .as_ref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| identifier.name.to_string());
-
+            let access = access.unwrap_or(resolved::Access::All);
             segment.tables.push(FlatTable {
-                identifier: identifier.clone(),
-                canonical_name: canonical_name.get().cloned(),
-                backend_schema: backend_schema.get().clone(),
-                alias: alias.map(|s| s.to_string()),
+                identity: cpr_schema,
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
-                domain_spec: domain_spec.clone(),
-                operation_context: OperationContext::Direct,
-                schema: cpr_schema.get().clone(),
+                access: access.clone(),
+                schema: cpr_schema,
                 outer,
                 anonymous_data: None,
-                correlation_refs: Vec::new(),
                 inner_relation_pattern: None,
+                preminted_scope: None,
                 pipe_expr: None,
                 consulted_view_query: None,
                 _table_filters: vec![],
@@ -422,132 +248,98 @@ pub(super) fn flatten_relation(
                 subquery_segment: None,
             });
 
-            ctx.tables_in_scope.insert(table_name);
-            ctx.position += 1;
-        }
-
-        resolved::Relation::Anonymous {
-            column_headers,
-            rows,
-            alias,
-            qua_target: _,
-            cpr_schema,
-            outer,
-            exists_mode,
-            negated: _,
-        } => {
-            log::debug!(
-                "Flattening anonymous table with {} headers",
-                column_headers.as_ref().map_or(0, |h| h.len())
+            ctx.tables_in_scope.insert(
+                segment
+                    .tables
+                    .last()
+                    .expect("the ground relation was just flattened")
+                    .identity,
             );
-            let anon_name = format!("_anon_{}", ctx.anon_counter);
-            ctx.anon_counter += 1;
-            segment.tables.push(FlatTable {
-                identifier: QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: anon_name.into(),
-                    grounding: None,
-                },
-                canonical_name: None,
-                backend_schema: None,
-                alias: alias.map(|s| s.to_string()),
-                position: ctx.position,
-                _scope_id: ctx.scope_id,
-                domain_spec: resolved::DomainSpec::Glob,
-                operation_context: OperationContext::Direct,
-                schema: cpr_schema.get().clone(),
-                outer,
-                anonymous_data: Some(AnonymousTableData {
-                    column_headers,
-                    rows,
-                    exists_mode,
-                }),
-                correlation_refs: Vec::new(),
-                inner_relation_pattern: None,
-                pipe_expr: None,
-                consulted_view_query: None,
-                _table_filters: vec![],
-                tvf_data: None,
-                subquery_segment: None,
-            });
             ctx.position += 1;
         }
 
-        resolved::Relation::TVF {
-            function,
-            ho_arguments,
-            domain_spec,
-            alias,
-            namespace,
-            backend_schema,
-            grounding,
-            cpr_schema,
-            ..
+        resolved::Relation::FunctorCall {
+            call,
+            alias: (),
+            cpr_schema: published,
         } => {
-            // Derive flat string arguments from ho_arguments for TvfData.
-            // INVARIANT: Only non-HO (SQL-native) TVFs reach the flattener — HO TVFs
-            // are consumed by grounding and replaced with the rule body. SQL-native TVFs
-            // (json_each, generate_series, etc.) only have Scalar arguments, so the
-            // string round-trip through TvfData is lossless. The Table arm is defensive.
-            let arguments: Vec<String> = ho_arguments
-                .iter()
-                .map(|arg| match arg {
-                    crate::pipeline::asts::core::operators::HoArgument::Scalar(dom) => {
-                        ho_argument_scalar_to_string(dom)
-                    }
-                    crate::pipeline::asts::core::operators::HoArgument::Table(rel) => match rel {
-                        resolved::RelationalExpression::Relation(resolved::Relation::Ground {
-                            identifier,
-                            ..
-                        }) => identifier.name.to_string(),
-                        _ => "_unknown_".to_string(),
-                    },
-                })
-                .collect();
-            let tvf_backend_schema = backend_schema.get().clone();
+            let function = call.call().callee;
+            let arguments: Vec<Option<resolved::DomainExpression>> = match &call.call().arguments {
+                crate::pipeline::asts::core::operators::CallArguments::None => Vec::new(),
+                crate::pipeline::asts::core::operators::CallArguments::HigherOrder(part) => part
+                    .members
+                    .iter()
+                    .map(|arg| match arg {
+                        crate::pipeline::asts::core::operators::HoArgument::Value(value) => {
+                            value.domain().cloned()
+                        }
+                        crate::pipeline::asts::core::operators::HoArgument::Skip => None,
+                        crate::pipeline::asts::core::operators::HoArgument::Relation(_) => {
+                            unreachable!("a higher-order table argument survived grounding")
+                        }
+                        crate::pipeline::asts::core::operators::HoArgument::Landing(landing) => {
+                            match *landing {}
+                        }
+                    })
+                    .collect(),
+                crate::pipeline::asts::core::operators::CallArguments::Scalar(members) => members
+                    .iter()
+                    .map(|member| match member {
+                        crate::pipeline::asts::core::operators::ScalarArgument::Value(value) => {
+                            value.domain().cloned()
+                        }
+                        // A callable's BODY is what the callee applies, so
+                        // that is the term this position hands it.
+                        crate::pipeline::asts::core::operators::ScalarArgument::Callable(
+                            crate::pipeline::asts::core::Callable::Lambda(lambda),
+                        ) => Some((*lambda.body).clone()),
+                        crate::pipeline::asts::core::operators::ScalarArgument::Callable(_) => {
+                            unreachable!("only a lambda is written as a callable argument")
+                        }
+                        crate::pipeline::asts::core::operators::ScalarArgument::Spread(_)
+                        | crate::pipeline::asts::core::operators::ScalarArgument::Star => None,
+                        crate::pipeline::asts::core::operators::ScalarArgument::Context(marker) => {
+                            match *marker {}
+                        }
+                    })
+                    .collect(),
+            };
+            let access = access.clone().unwrap_or(resolved::Access::All);
+            let cpr_schema = published;
             segment.tables.push(FlatTable {
-                identifier: QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: function.clone().into(),
-                    grounding: None,
-                },
-                canonical_name: None,
-                backend_schema: tvf_backend_schema.clone(),
-                alias: alias.map(|s| s.to_string()),
+                identity: cpr_schema,
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
-                domain_spec: domain_spec.clone(),
-                operation_context: OperationContext::Direct,
-                schema: cpr_schema.get().clone(),
-                outer: false,
+                access: access.clone(),
+                schema: cpr_schema,
+                outer: call.call().marks.outer(),
                 anonymous_data: None,
-                correlation_refs: Vec::new(),
                 inner_relation_pattern: None,
+                preminted_scope: None,
                 pipe_expr: None,
                 consulted_view_query: None,
                 _table_filters: vec![],
                 tvf_data: Some(TvfData {
-                    function: function.to_string(),
+                    function,
                     arguments,
-                    domain_spec: domain_spec.clone(),
-                    namespace: namespace.clone(),
-                    backend_schema: tvf_backend_schema,
-                    grounding: grounding.clone(),
+                    access,
                 }),
                 subquery_segment: None,
             });
             ctx.position += 1;
         }
+
         resolved::Relation::InnerRelation {
             pattern,
-            alias,
+            preminted_scope,
+            alias: _,
             outer,
             cpr_schema,
         } => {
             // This is handled in inner_relation.rs
             super::inner_relation::flatten_inner_relation(
                 pattern,
-                alias.map(|s| s.to_string()),
+                preminted_scope,
                 outer,
                 cpr_schema,
                 segment,
@@ -556,7 +348,6 @@ pub(super) fn flatten_relation(
         }
 
         resolved::Relation::ConsultedView {
-            identifier,
             body,
             scoped,
             outer,
@@ -564,21 +355,16 @@ pub(super) fn flatten_relation(
             // Store the resolved Query as-is for the rebuilder to refine independently.
             // The body is a self-contained subquery — it doesn't participate in the
             // outer segment's FAR cycle. The rebuilder will call refine_query() on it.
-            let scoped_data = scoped.get();
             segment.tables.push(FlatTable {
-                identifier,
-                canonical_name: None,
-                backend_schema: None,
-                alias: Some(scoped_data.alias().to_string()),
+                identity: scoped,
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
-                domain_spec: resolved::DomainSpec::Glob,
-                operation_context: OperationContext::Direct,
-                schema: scoped_data.schema().clone(),
+                access: resolved::Access::All,
+                schema: scoped,
                 outer,
                 anonymous_data: None,
-                correlation_refs: Vec::new(),
                 inner_relation_pattern: None,
+                preminted_scope: None,
                 subquery_segment: None,
                 pipe_expr: None,
                 consulted_view_query: Some(body),
@@ -587,59 +373,77 @@ pub(super) fn flatten_relation(
             });
             ctx.position += 1;
         }
-
-        resolved::Relation::PseudoPredicate { .. } => {
-            panic!(
-                "INTERNAL ERROR: PseudoPredicate should not exist in this phase. \
-                 Pseudo-predicates are executed and replaced during Phase 1.X (Effect Executor)."
-            )
-        }
     }
 
     Ok(())
 }
 
 /// Add a join condition to the segment
-pub(super) fn add_join_condition(
-    cond: Option<resolved::BooleanExpression>,
+pub(super) fn add_correlation(
+    correlation: Option<resolved::MemberCorrelation>,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) {
-    if let Some(expr) = cond {
-        if matches!(expr, resolved::BooleanExpression::Using { .. }) {
-            return;
-        }
+    // Only a CONDITION is a predicate. A correspondence was taken by the
+    // operator above — it tests no row, so pooling it here would classify a
+    // non-predicate against the table pool.
+    if let Some(expr) = correlation.and_then(resolved::MemberCorrelation::into_condition) {
         add_predicate(expr, resolved::FilterOrigin::UserWritten, segment, ctx);
     }
 }
 
 /// Add a sigma condition to the segment
-pub(super) fn add_sigma_condition(
-    cond: resolved::SigmaCondition,
-    origin: resolved::FilterOrigin,
-    segment: &mut FlatSegment,
-    ctx: &mut FlattenContext,
-) {
-    if let resolved::SigmaCondition::Predicate(expr) = cond {
-        add_predicate(expr, origin, segment, ctx);
-    }
-}
-
 /// Add a predicate to the segment
 pub(super) fn add_predicate(
-    expr: resolved::BooleanExpression,
+    expr: resolved::TruthExpression,
     origin: resolved::FilterOrigin,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) {
-    let (qualified, unqualified) = extract_references(&expr);
+    let references = extract_references(&expr);
 
     segment.predicates.push(FlatPredicate {
         expr,
         position: ctx.position,
-        qualified_refs: qualified,
-        unqualified_refs: unqualified,
+        references,
         _scope_id: ctx.scope_id,
         origin,
     });
+}
+
+/// Flatten an anonymous table into the segment.
+pub(super) fn flatten_anon_table(
+    anon: resolved::AnonRelation,
+    segment: &mut FlatSegment,
+    ctx: &mut FlattenContext,
+) -> Result<()> {
+    let resolved::AnonRelation {
+        table,
+        alias: _alias,
+        outer,
+    } = anon;
+    let cpr_schema = table.cpr_schema;
+
+    log::debug!(
+        "Flattening anonymous table with {} headers",
+        table.body.header.as_ref().map_or(0, |h| h.len())
+    );
+    segment.tables.push(FlatTable {
+        identity: cpr_schema,
+        position: ctx.position,
+        _scope_id: ctx.scope_id,
+        access: resolved::Access::All,
+        schema: cpr_schema,
+        outer,
+        anonymous_data: Some(AnonymousTableData { body: table.body }),
+        inner_relation_pattern: None,
+        preminted_scope: None,
+        pipe_expr: None,
+        consulted_view_query: None,
+        _table_filters: vec![],
+        tvf_data: None,
+        subquery_segment: None,
+    });
+    ctx.position += 1;
+    Ok(())
 }

@@ -8,15 +8,11 @@ use crate::pipeline::{ast_resolved, ast_unresolved};
 ///
 /// Same semantics as `resolve_tuple_ordering`, but expression resolution
 /// goes through the fold's transform hooks instead of free functions + registry.
-pub(super) fn resolve_tuple_ordering_via_fold(
+pub(in crate::pipeline::resolver) fn resolve_tuple_ordering_via_fold(
     fold: &mut ResolverFold,
-    containment_semantic: ast_unresolved::ContainmentSemantic,
     specs: Vec<ast_unresolved::OrderingSpec>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
+    available: &[crate::names::ColId],
+) -> Result<(Vec<ast_resolved::OrderingSpec>, Vec<crate::names::ColId>)> {
     // Resolve ORDER BY specs
     let resolved_specs = specs
         .into_iter()
@@ -25,7 +21,6 @@ pub(super) fn resolve_tuple_ordering_via_fold(
                 fold,
                 vec![spec.column],
                 available,
-                false,
             )
             .map(|mut exprs| ast_resolved::OrderingSpec {
                 column: exprs
@@ -38,14 +33,6 @@ pub(super) fn resolve_tuple_ordering_via_fold(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let resolved_op = ast_resolved::UnaryRelationalOperator::TupleOrdering {
-        containment_semantic:
-            super::super::super::helpers::converters::convert_containment_semantic(
-                containment_semantic,
-            ),
-        specs: resolved_specs,
-    };
-
     // ORDER BY doesn't change columns
-    Ok((resolved_op, available.to_vec()))
+    Ok((resolved_specs, available.to_vec()))
 }

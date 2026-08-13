@@ -10,37 +10,30 @@
 mod exists_handler;
 mod join_builder;
 mod schema_computation;
-mod setop_builder;
 
 use self::exists_handler::nest_interdependent_exists;
-use self::join_builder::{create_join, process_single_join, rebuild_join_segment};
-use self::schema_computation::{compute_filter_schema, compute_setop_schema};
-use self::setop_builder::{extract_fic_correlation, rebuild_setop_segment};
+use self::join_builder::rebuild_join_segment;
+use self::schema_computation::compute_filter_schema;
 use super::analyzer::AnalyzedSegment;
 use super::flattener::FlatTable;
 use super::types::*;
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::asts::refined::{LiteralValue, PhaseBox, Refined, SetOperator};
-use crate::pipeline::asts::resolved::{CprSchema, InnerRelationPattern, Resolved};
+use crate::pipeline::asts::core::{Comparison, Existence, RelationalMembership};
+use crate::pipeline::asts::refined::{LiteralValue, Refined};
+use crate::pipeline::asts::resolved::{InnerRelationPattern, Resolved};
 use crate::pipeline::asts::{refined, resolved};
-use delightql_types::SqlIdentifier;
 use std::collections::HashMap;
-
-/// Strategy for handling set operation column alignment
-enum SetOperatorStrategy {
-    Correspondence,     // UC (;) - align by name
-    SameColumnsReorder, // SUA (|;|) and SIC (|^|) - same columns, reorder
-}
+use std::rc::Rc;
 
 /// Main entry point - rebuild an analyzed segment into refined AST
 pub(super) fn rebuild_internal(
     analyzed: AnalyzedSegment,
     is_top_level: bool,
-    min_multiplicity: bool,
-) -> Result<refined::RelationalExpression> {
+    danger_gates: &crate::pipeline::danger_gates::DangerGateMap,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
     log::debug!(
-        "rebuild: segment_type={:?}, {} tables, {} operators, {} predicates, is_top_level={}",
-        analyzed.segment_type,
+        "rebuild: {} tables, {} operators, {} predicates, is_top_level={}",
         analyzed.tables.len(),
         analyzed.operators.len(),
         analyzed.predicates.len(),
@@ -61,23 +54,20 @@ pub(super) fn rebuild_internal(
     let mut op_predicates = group_predicates_by_operator(&analyzed.predicates);
 
     // Handle interdependent EXISTS predicates by nesting them
-    nest_interdependent_exists(&mut op_predicates, &analyzed.exists_dependencies)?;
+    nest_interdependent_exists(
+        &mut op_predicates,
+        &analyzed.exists_dependencies,
+        identities,
+    )?;
 
-    // Build the expression tree based on segment type
-    match analyzed.segment_type {
-        SegmentType::Join => {
-            log::debug!("Calling rebuild_join_segment");
-            rebuild_join_segment(analyzed, op_predicates, is_top_level)
-        }
-        SegmentType::SetOperation => {
-            log::debug!("Calling rebuild_setop_segment");
-            rebuild_setop_segment(analyzed, op_predicates, min_multiplicity)
-        }
-        SegmentType::Mixed => {
-            log::debug!("Calling rebuild_mixed_segment");
-            rebuild_mixed_segment(analyzed, op_predicates, is_top_level)
-        }
-    }
+    log::debug!("Calling rebuild_join_segment");
+    rebuild_join_segment(
+        analyzed,
+        op_predicates,
+        is_top_level,
+        danger_gates,
+        identities,
+    )
 }
 
 /// Group predicates by which operator they modify
@@ -98,23 +88,25 @@ fn group_predicates_by_operator(
 
 /// Apply top-level filters to the result
 fn apply_top_level_filters(
-    result: refined::RelationalExpression,
+    result: refined::Chain,
     op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
-) -> Result<refined::RelationalExpression> {
-    apply_filter_predicates(result, op_predicates, OperatorRef::TopLevel)
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
+    apply_filter_predicates(result, op_predicates, OperatorRef::TopLevel, identities)
 }
 
 /// Apply filter predicates for a given operator reference
 fn apply_filter_predicates(
-    mut result: refined::RelationalExpression,
+    mut result: refined::Chain,
     op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
     op_ref: OperatorRef,
-) -> Result<refined::RelationalExpression> {
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
     if let Some(preds) = op_predicates.remove(&op_ref) {
         for pred in preds {
             match pred.class {
                 PredicateClass::F { .. } | PredicateClass::Fx => {
-                    result = wrap_with_filter(result, pred)?;
+                    result = wrap_with_filter(result, pred, identities)?;
                 }
                 other => panic!(
                     "catch-all hit in rebuilder.rs apply_filter_predicates: {:?}",
@@ -128,177 +120,60 @@ fn apply_filter_predicates(
 
 /// Wrap an expression with a filter
 fn wrap_with_filter(
-    source: refined::RelationalExpression,
+    source: refined::Chain,
     pred: AnalyzedPredicate,
-) -> Result<refined::RelationalExpression> {
-    Ok(refined::RelationalExpression::Filter {
-        source: Box::new(source.clone()),
-        condition: refined::SigmaCondition::Predicate(refine_predicate_boolean(pred.expr.clone())?),
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
+    let cpr_schema = compute_filter_schema(&source, identities);
+    Ok(source.then(refined::Continuation::Restrict {
+        condition: refine_predicate_boolean(pred.expr.clone(), identities)?,
         origin: pred.origin,
-        cpr_schema: compute_filter_schema(&source),
-    })
-}
-
-/// Rebuild a mixed segment (joins and set operations)
-fn rebuild_mixed_segment(
-    analyzed: AnalyzedSegment,
-    mut op_predicates: HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
-    is_top_level: bool,
-) -> Result<refined::RelationalExpression> {
-    // Mixed segments require careful left-to-right processing
-    // respecting CPR-ltr semantics from PRINCIPLED-RELOOK-AT-REFINER.md
-
-    if analyzed.tables.is_empty() {
-        return Err(DelightQLError::parse_error("No tables in mixed segment"));
-    }
-
-    // TODO: Add validation for mixed segments if needed (is_top_level can be used here)
-    let _ = is_top_level; // Suppress unused warning for now
-
-    // Start with the first table
-    let mut result = table_to_refined(&analyzed.tables[0], &mut op_predicates)?;
-    let mut table_idx = 1;
-
-    // Process operators left to right, building the expression incrementally
-    for (op_idx, op) in analyzed.operators.iter().enumerate() {
-        let (new_result, new_table_idx) =
-            process_mixed_operator(result, &analyzed, table_idx, op_idx, op, &mut op_predicates)?;
-        result = new_result;
-        table_idx = new_table_idx;
-    }
-
-    // Apply any top-level filters
-    result = apply_top_level_filters(result, &mut op_predicates)?;
-
-    Ok(result)
-}
-
-/// Process a single operator in a mixed segment
-fn process_mixed_operator(
-    result: refined::RelationalExpression,
-    analyzed: &AnalyzedSegment,
-    table_idx: usize,
-    op_idx: usize,
-    op: &super::flattener::FlatOperator,
-    op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
-) -> Result<(refined::RelationalExpression, usize)> {
-    match &op.kind {
-        super::flattener::FlatOperatorKind::Join { using_columns } => {
-            // Reuse join processing logic
-            process_single_join(
-                result,
-                analyzed,
-                table_idx,
-                op_idx,
-                using_columns,
-                op_predicates,
-            )
-        }
-
-        super::flattener::FlatOperatorKind::SetOp { operator } => process_mixed_setop(
-            result,
-            analyzed,
-            table_idx,
-            op_idx,
-            *operator,
-            op_predicates,
-        ),
-    }
-}
-
-/// Process a set operation in a mixed segment
-fn process_mixed_setop(
-    result: refined::RelationalExpression,
-    analyzed: &AnalyzedSegment,
-    table_idx: usize,
-    op_idx: usize,
-    operator: SetOperator,
-    op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
-) -> Result<(refined::RelationalExpression, usize)> {
-    // Handle set operation - consume exactly one table as right operand
-    if table_idx >= analyzed.tables.len() {
-        return Err(DelightQLError::parse_error(
-            "Not enough tables for set operation",
-        ));
-    }
-    let right_operand = table_to_refined(&analyzed.tables[table_idx], op_predicates)?;
-    let new_table_idx = table_idx + 1;
-
-    // Get FIC predicates for correlation
-    let op_ref = OperatorRef::SetOp {
-        position: op_idx,
-        operator,
-    };
-    let correlation = extract_fic_correlation(&op_ref, op_predicates);
-
-    // Create set operation expression
-    let operands = vec![result.clone(), right_operand.clone()];
-    let setop_expr = refined::RelationalExpression::SetOperation {
-        operands: operands.clone(),
-        operator,
-        correlation: <PhaseBox<Option<refined::BooleanExpression>, Refined>>::with_correlation(
-            correlation,
-        ),
-        cpr_schema: compute_setop_schema(operator, &operands),
-    };
-
-    Ok((setop_expr, new_table_idx))
+        cpr_schema,
+    }))
 }
 
 /// Convert a flat table to a refined relation
 fn table_to_refined(
     table: &FlatTable,
     op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
-) -> Result<refined::RelationalExpression> {
+    danger_gates: &crate::pipeline::danger_gates::DangerGateMap,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
     // Check if this is a consulted view (stored as opaque resolved Query)
     if let Some(ref query) = table.consulted_view_query {
-        let refined_body = crate::pipeline::refiner::refine_query(query.as_ref().clone())?;
-        let alias: SqlIdentifier = table
-            .alias
-            .clone()
-            .unwrap_or_else(|| table.identifier.name.to_string())
-            .into();
-        let scoped = refined::ScopedSchema::from_parts(alias, table.schema.clone());
-        let mut result =
-            refined::RelationalExpression::Relation(refined::Relation::ConsultedView {
-                identifier: table.identifier.clone(),
-                body: Box::new(refined_body),
-                scoped: PhaseBox::new(scoped).into_refined(),
-                outer: table.outer,
-            });
+        let refined_body =
+            crate::pipeline::refiner::refine_query(query.as_ref().clone(), Rc::clone(identities))?;
+        let result = refined::Chain::relation(refined::Relation::ConsultedView {
+            body: Box::new(refined_body),
+            scoped: table.schema,
+            outer: table.outer,
+        });
 
-        // Apply table-specific filters (e.g., HoGroundScalar _label_0 constraints).
-        // These were kept bound to this table during flattening to preserve
-        // the association between each filter and its source ConsultedView.
-        for (filter_expr, origin) in &table._table_filters {
-            let refined_condition = refine_predicate_boolean(filter_expr.clone())?;
-            result = refined::RelationalExpression::Filter {
-                source: Box::new(result),
-                condition: refined::SigmaCondition::Predicate(refined_condition),
-                origin: origin.clone(),
-                cpr_schema: PhaseBox::new(table.schema.clone()).into_refined(),
-            };
-        }
-
-        return Ok(result);
+        return apply_table_filters(result, table, identities);
     }
 
     // Check if this is a pipe expression
     if let Some(ref pipe_expr) = table.pipe_expr {
         // Recursively refine the pipe expression
         // Pass is_top_level=false to skip outer join validation (this is an inner context)
+        // The gates travel with the recursion: a danger the writer armed
+        // on the query is armed inside the relation it stands on.
         return crate::pipeline::refiner::refine_internal(
             pipe_expr.as_ref().clone(),
             false,
-            crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+            danger_gates.clone(),
+            Rc::clone(identities),
         );
     }
 
-    let mut result = build_base_relation(table)?;
+    let result = build_base_relation(table, danger_gates, identities)?;
+    // A filter kept local by the flattener belongs to the table it was
+    // attached to regardless of relation kind. Applying these only to
+    // consulted views silently discarded the same constraint on a structural
+    // higher-order carrier.
+    let mut result = apply_table_filters(result, table, identities)?;
 
-    let table_name = table.alias.as_deref().unwrap_or(&table.identifier.name);
-
-    log::debug!("table_to_refined: Processing table '{}'", table_name);
+    log::debug!("table_to_refined: Processing {:?}", table.identity);
     log::debug!(
         "Available operator refs: {:?}",
         op_predicates.keys().collect::<Vec<_>>()
@@ -315,45 +190,23 @@ fn table_to_refined(
         }
     }
 
-    let mut fic_filters_to_apply = Vec::new();
-
-    for (_, preds) in op_predicates.iter() {
-        for pred in preds {
-            if let PredicateClass::FIC { left, right } = &pred.class {
-                if left == table_name || right == table_name {
-                    log::debug!(
-                        "Table '{}' is mentioned in FIC predicate: {:?}",
-                        table_name,
-                        pred.expr
-                    );
-                    fic_filters_to_apply.push(pred.clone());
-                }
-            }
-        }
-    }
-
-    for fic_pred in fic_filters_to_apply {
-        log::debug!(
-            "Applying FIC predicate to table '{}': {:?}",
-            table_name,
-            fic_pred.expr
-        );
-    }
-
     let mut filters_to_apply = Vec::new();
 
     for (op_ref, preds) in op_predicates.iter_mut() {
         let mut remaining = Vec::new();
         for pred in preds.drain(..) {
             if let PredicateClass::F { table: target } = &pred.class {
-                if target == table_name {
-                    if let resolved::FilterOrigin::PositionalLiteral { source_table } = &pred.origin
-                    {
-                        log::debug!("      Checking PositionalLiteral: source_table='{}', table_name='{}', op_ref={:?}",
-                                   source_table, table_name, op_ref);
+                if *target == table.identity {
+                    if let resolved::FilterOrigin::PositionalLiteral { source } = &pred.origin {
                         log::debug!(
-                            "      Applying PositionalLiteral filter to table '{}'",
-                            table_name
+                            "      Checking PositionalLiteral: source={:?}, table={:?}, op_ref={:?}",
+                            source,
+                            table.identity,
+                            op_ref
+                        );
+                        log::debug!(
+                            "      Applying PositionalLiteral filter to table {:?}",
+                            table.identity
                         );
                         filters_to_apply.push(pred);
                         continue;
@@ -366,27 +219,42 @@ fn table_to_refined(
     }
 
     for filter_pred in filters_to_apply {
-        result = wrap_with_filter(result, filter_pred)?;
+        result = wrap_with_filter(result, filter_pred, identities)?;
     }
 
     Ok(result)
 }
 
+fn apply_table_filters(
+    mut result: refined::Chain,
+    table: &FlatTable,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
+    for (filter_expr, origin) in &table._table_filters {
+        let refined_condition = refine_predicate_boolean(filter_expr.clone(), identities)?;
+        result = result.then(refined::Continuation::Restrict {
+            condition: refined_condition,
+            origin: origin.clone(),
+            cpr_schema: table.schema,
+        });
+    }
+    Ok(result)
+}
+
 /// Build the base relation from a flat table
-fn build_base_relation(table: &FlatTable) -> Result<refined::RelationalExpression> {
-    let schema_box = PhaseBox::new(table.schema.clone()).into_refined();
+fn build_base_relation(
+    table: &FlatTable,
+    danger_gates: &crate::pipeline::danger_gates::DangerGateMap,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
+    let schema_box = table.schema;
 
     if let Some(ref tvf_data) = table.tvf_data {
-        return Ok(build_tvf_relation(tvf_data, &table.alias, schema_box));
+        return build_tvf_relation(tvf_data, schema_box);
     }
 
     if let Some(ref anon_data) = table.anonymous_data {
-        return Ok(build_anonymous_relation(
-            anon_data,
-            &table.alias,
-            table.outer,
-            schema_box,
-        ));
+        return build_anonymous_relation(anon_data, table.outer, schema_box);
     }
 
     if let Some(ref inner_pattern) = table.inner_relation_pattern {
@@ -395,105 +263,103 @@ fn build_base_relation(table: &FlatTable) -> Result<refined::RelationalExpressio
             return build_inner_relation_from_flattened(
                 inner_pattern,
                 subquery_segment,
-                &table.alias,
+                table.preminted_scope,
                 table.outer,
                 schema_box,
+                danger_gates,
+                identities,
             );
         } else {
             // Fallback: Old behavior (re-process AST)
-            return build_inner_relation(inner_pattern, &table.alias, table.outer, schema_box);
+            return build_inner_relation(
+                inner_pattern,
+                table.preminted_scope,
+                table.outer,
+                schema_box,
+            );
         }
     }
 
-    Ok(build_ground_relation(table, schema_box))
+    build_ground_relation(table, schema_box)
 }
 
 /// Build a TVF relation
 fn build_tvf_relation(
     tvf_data: &super::flattener::TvfData,
-    alias: &Option<String>,
-    schema_box: PhaseBox<CprSchema, refined::Refined>,
-) -> refined::RelationalExpression {
-    // Reconstruct ho_arguments from TvfData string arguments.
-    // Only non-HO (SQL-native) TVFs reach this point, so all args are Scalar.
-    // See flattener INVARIANT comment for why this string round-trip is safe.
+    schema_box: crate::names::ScopeId,
+) -> Result<refined::Chain> {
     let ho_arguments = tvf_data
         .arguments
         .iter()
-        .map(|s| {
-            let dom_expr = if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-                refined::DomainExpression::Literal {
-                    value: refined::LiteralValue::String(s[1..s.len() - 1].to_string()),
-                    alias: None,
-                }
-            } else if s.parse::<f64>().is_ok() {
-                refined::DomainExpression::Literal {
-                    value: refined::LiteralValue::Number(s.clone()),
-                    alias: None,
-                }
-            } else if let Some(dot_pos) = s.find('.') {
-                let qualifier = s[..dot_pos].to_string();
-                let name = &s[dot_pos + 1..];
-                refined::DomainExpression::lvar_builder(name)
-                    .with_qualifier(qualifier)
-                    .build()
-            } else {
-                refined::DomainExpression::lvar_builder(s.as_str()).build()
-            };
-            crate::pipeline::asts::core::operators::HoArgument::Scalar(dom_expr)
+        .map(|argument| {
+            Ok(match argument {
+                Some(argument) => crate::pipeline::asts::core::operators::HoArgument::Value(
+                    crate::pipeline::asts::core::ArgumentValue::plain(super::carry::domain(
+                        argument.clone(),
+                    )?),
+                ),
+                // A valueless position rides back as the skip it is.
+                None => crate::pipeline::asts::core::operators::HoArgument::Skip,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
-    refined::RelationalExpression::Relation(refined::Relation::TVF {
-        function: tvf_data.function.clone().into(),
-        domain_spec: tvf_data.domain_spec.clone().into(),
-        alias: alias.clone().map(|s| s.into()),
-        namespace: tvf_data.namespace.clone(),
-        grounding: tvf_data.grounding.clone(),
-        cpr_schema: schema_box,
-        argument_groups: None,
-        ho_arguments,
-        backend_schema: PhaseBox::from_optional_schema(tvf_data.backend_schema.clone())
-            .into_refined(),
-    })
+    // A TVF is a READ like any other: the relation and what its parens asked
+    // of it. Rebuilding the callable alone drops the access between the
+    // resolved and refined trees, where nothing downstream can recover it.
+    Ok(refined::Chain::read(
+        refined::Relation::FunctorCall {
+            alias: (),
+            call: refined::SealedCall::from_inner(
+                refined::FunctorCall {
+                    callee: tvf_data.function,
+                    arguments:
+                        crate::pipeline::asts::core::operators::CallArguments::higher_order(
+                            ho_arguments,
+                        ),
+                    marks: Default::default(),
+                },
+                false,
+            ),
+            cpr_schema: schema_box,
+        },
+        super::carry::access(tvf_data.access.clone())?,
+        schema_box,
+    ))
 }
 
 /// Build an anonymous table relation
 fn build_anonymous_relation(
     anon_data: &super::flattener::AnonymousTableData,
-    alias: &Option<String>,
     outer: bool,
-    schema_box: PhaseBox<CprSchema, refined::Refined>,
-) -> refined::RelationalExpression {
-    refined::RelationalExpression::Relation(refined::Relation::Anonymous {
-        column_headers: anon_data
-            .column_headers
-            .as_ref()
-            .map(|headers| headers.iter().map(|e| e.clone().into()).collect()),
-        rows: anon_data.rows.iter().map(|r| r.clone().into()).collect(),
-        alias: alias.clone().map(|s| s.into()),
-        outer,
-        exists_mode: anon_data.exists_mode,
-        negated: false,
-        qua_target: None,
+    schema_box: crate::names::ScopeId,
+) -> Result<refined::Chain> {
+    let table = super::carry::anon_table(resolved::AnonTable {
+        body: anon_data.body.clone(),
         cpr_schema: schema_box,
-    })
+    })?;
+    Ok(refined::Chain::ground(refined::Grelex::Literal(
+        refined::AnonRelation {
+            table,
+            alias: None,
+            outer,
+        },
+    )))
 }
 
 /// Build an INNER-RELATION
 fn build_inner_relation(
     pattern: &InnerRelationPattern<Resolved>,
-    alias: &Option<String>,
+    preminted_scope: Option<crate::names::ScopeId>,
     outer: bool,
-    schema_box: PhaseBox<CprSchema, refined::Refined>,
-) -> Result<refined::RelationalExpression> {
+    schema_box: crate::names::ScopeId,
+) -> Result<refined::Chain> {
     // For CDT-SJ and CDT-GJ: Remove correlation filters from subquery since they've been hoisted to JOIN ON
     let cleaned_pattern = match pattern {
         InnerRelationPattern::CorrelatedScalarJoin {
             identifier,
             correlation_filters,
             subquery,
-            hygienic_injections,
         } => {
             // Remove the correlation filters from inside the subquery
             let cleaned_subquery =
@@ -505,7 +371,6 @@ fn build_inner_relation(
                 identifier: identifier.clone(),
                 correlation_filters: correlation_filters.clone(),
                 subquery: Box::new(cleaned_subquery),
-                hygienic_injections: hygienic_injections.clone(),
             }
         }
         InnerRelationPattern::CorrelatedGroupJoin {
@@ -513,7 +378,6 @@ fn build_inner_relation(
             correlation_filters,
             aggregations,
             subquery,
-            hygienic_injections,
         } => {
             // For CDT-GJ: Remove correlation filters from subquery, just like CDT-SJ!
             //
@@ -533,7 +397,6 @@ fn build_inner_relation(
                 correlation_filters: correlation_filters.clone(),
                 aggregations: aggregations.clone(),
                 subquery: Box::new(cleaned_subquery),
-                hygienic_injections: hygienic_injections.clone(),
             }
         }
         other => panic!(
@@ -542,17 +405,16 @@ fn build_inner_relation(
         ),
     };
 
-    // Convert pattern from Resolved to Refined phase
-    let refined_pattern: InnerRelationPattern<Refined> = cleaned_pattern.into();
+    let refined_pattern: InnerRelationPattern<Refined> =
+        super::carry::inner_relation(cleaned_pattern)?;
 
-    Ok(refined::RelationalExpression::Relation(
-        refined::Relation::InnerRelation {
-            pattern: refined_pattern,
-            alias: alias.clone().map(|s| s.into()),
-            outer,
-            cpr_schema: schema_box,
-        },
-    ))
+    Ok(refined::Chain::relation(refined::Relation::InnerRelation {
+        pattern: refined_pattern,
+        preminted_scope,
+        alias: None,
+        outer,
+        cpr_schema: schema_box,
+    }))
 }
 
 /// Build INNER-RELATION from flattened subquery segment (PHASE 5: Recursive FAR)
@@ -560,52 +422,53 @@ fn build_inner_relation(
 fn build_inner_relation_from_flattened(
     pattern: &InnerRelationPattern<Resolved>,
     subquery_segment: &super::flattener::FlatSegment,
-    alias: &Option<String>,
+    preminted_scope: Option<crate::names::ScopeId>,
     outer: bool,
-    schema_box: PhaseBox<CprSchema, refined::Refined>,
-) -> Result<refined::RelationalExpression> {
+    schema_box: crate::names::ScopeId,
+    danger_gates: &crate::pipeline::danger_gates::DangerGateMap,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
     // The subquery segment has already been flattened
     // Correlation filters have already been hoisted
     // We need to: analyze it, then rebuild it
 
     // Analyze the flattened subquery segment
-    let analyzed_subquery = super::analyzer::analyze(subquery_segment.clone())?;
+    let analyzed_subquery = super::analyzer::analyze(subquery_segment.clone(), identities)?;
 
     // Recursively rebuild the analyzed segment into a Refined AST
     // Pass is_top_level=false to skip outer join validation (this is an inner context)
-    let rebuilt_subquery = rebuild_internal(analyzed_subquery, false, false)?;
+    let rebuilt_subquery = rebuild_internal(analyzed_subquery, false, danger_gates, identities)?;
 
     // Convert pattern from Resolved to Refined, replacing the subquery with the rebuilt one
     let refined_pattern: InnerRelationPattern<Refined> = match pattern {
         InnerRelationPattern::CorrelatedScalarJoin {
             identifier,
             correlation_filters,
-            hygienic_injections,
             ..
         } => InnerRelationPattern::CorrelatedScalarJoin {
             identifier: identifier.clone(),
             correlation_filters: correlation_filters
                 .iter()
-                .map(|f| f.clone().into())
-                .collect(),
+                .map(|f| super::carry::boolean(f.clone()))
+                .collect::<Result<Vec<_>>>()?,
             subquery: Box::new(rebuilt_subquery),
-            hygienic_injections: hygienic_injections.clone(),
         },
         InnerRelationPattern::CorrelatedGroupJoin {
             identifier,
             correlation_filters,
             aggregations,
-            hygienic_injections,
             ..
         } => InnerRelationPattern::CorrelatedGroupJoin {
             identifier: identifier.clone(),
             correlation_filters: correlation_filters
                 .iter()
-                .map(|f| f.clone().into())
-                .collect(),
-            aggregations: aggregations.iter().map(|a| a.clone().into()).collect(),
+                .map(|f| super::carry::boolean(f.clone()))
+                .collect::<Result<Vec<_>>>()?,
+            aggregations: aggregations
+                .iter()
+                .map(|a| super::carry::domain(a.clone()))
+                .collect::<Result<Vec<_>>>()?,
             subquery: Box::new(rebuilt_subquery),
-            hygienic_injections: hygienic_injections.clone(),
         },
         InnerRelationPattern::UncorrelatedDerivedTable {
             identifier,
@@ -624,89 +487,86 @@ fn build_inner_relation_from_flattened(
         }
     };
 
-    Ok(refined::RelationalExpression::Relation(
-        refined::Relation::InnerRelation {
-            pattern: refined_pattern,
-            alias: alias.clone().map(|s| s.into()),
-            outer,
-            cpr_schema: schema_box,
-        },
-    ))
+    Ok(refined::Chain::relation(refined::Relation::InnerRelation {
+        pattern: refined_pattern,
+        preminted_scope,
+        alias: None,
+        outer,
+        cpr_schema: schema_box,
+    }))
 }
 /// Remove correlation filters from a relational expression
 /// Public wrapper for use by flattener when recursively flattening INNER-RELATIONs
 pub fn remove_correlation_filters_from_expr(
-    expr: &resolved::RelationalExpression,
-    filters_to_remove: &[resolved::BooleanExpression],
-) -> resolved::RelationalExpression {
-    match expr {
-        resolved::RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema,
-        } => {
-            // Check if this filter is one of the correlation filters to remove
-            if let resolved::SigmaCondition::Predicate(pred) = condition {
-                if filters_to_remove.contains(pred) {
-                    // Skip this filter - it's been hoisted to JOIN ON
-                    return remove_correlation_filters_from_expr(source, filters_to_remove);
+    expr: &resolved::Chain,
+    filters_to_remove: &[resolved::TruthExpression],
+) -> resolved::Chain {
+    // Only the shaping run and the members carry hoistable correlation
+    // filters; a bag arm and the head are cleaned through their own roads.
+    let mut cleaned = resolved::Chain {
+        head: expr.head.clone(),
+        continuations: Vec::with_capacity(expr.continuations.len()),
+    };
+    if let resolved::Grelex::Reference(rel) = &expr.head {
+        cleaned.head = resolved::Grelex::Reference(remove_correlation_filters_from_relation(
+            rel,
+            filters_to_remove,
+        ));
+    }
+    for continuation in &expr.continuations {
+        match continuation {
+            resolved::Continuation::Restrict {
+                condition,
+                origin,
+                cpr_schema,
+            } => {
+                if filters_to_remove.contains(condition) {
+                    // Hoisted to the join's ON clause; it does not stand twice.
+                    continue;
                 }
+                cleaned
+                    .continuations
+                    .push(resolved::Continuation::Restrict {
+                        condition: condition.clone(),
+                        origin: origin.clone(),
+                        cpr_schema: cpr_schema.clone(),
+                    });
             }
+            resolved::Continuation::Member {
+                rhs,
+                correlation,
+                join_type,
+                cpr_schema,
+            } => {
+                cleaned.continuations.push(resolved::Continuation::Member {
+                    rhs: remove_correlation_filters_from_expr(rhs, filters_to_remove),
+                    correlation: correlation.clone(),
+                    join_type: join_type.clone(),
+                    cpr_schema: cpr_schema.clone(),
+                });
+            }
+            other => cleaned.continuations.push(other.clone()),
+        }
+    }
+    cleaned
+}
 
-            // Keep this filter, but recursively clean the source
-            resolved::RelationalExpression::Filter {
-                source: Box::new(remove_correlation_filters_from_expr(
-                    source,
-                    filters_to_remove,
-                )),
-                condition: condition.clone(),
-                origin: origin.clone(),
-                cpr_schema: cpr_schema.clone(),
-            }
-        }
-        resolved::RelationalExpression::Pipe(pipe_expr) => {
-            // Recursively clean the source
-            resolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                resolved::PipeExpression {
-                    source: remove_correlation_filters_from_expr(
-                        &pipe_expr.source,
-                        filters_to_remove,
-                    ),
-                    operator: pipe_expr.operator.clone(),
-                    cpr_schema: pipe_expr.cpr_schema.clone(),
-                },
-            )))
-        }
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            join_type,
-            cpr_schema,
-        } => {
-            // Recursively clean both sides of the join
-            resolved::RelationalExpression::Join {
-                left: Box::new(remove_correlation_filters_from_expr(
-                    left,
-                    filters_to_remove,
-                )),
-                right: Box::new(remove_correlation_filters_from_expr(
-                    right,
-                    filters_to_remove,
-                )),
-                join_condition: join_condition.clone(),
-                join_type: join_type.clone(),
-                cpr_schema: cpr_schema.clone(),
-            }
-        }
-        resolved::RelationalExpression::Relation(rel) => {
+/// Clean the correlation filters a relation HEAD carries in its own
+/// subqueries: a nested inner relation can hold a filter the outer segment
+/// hoisted.
+fn remove_correlation_filters_from_relation(
+    rel: &resolved::Relation,
+    filters_to_remove: &[resolved::TruthExpression],
+) -> resolved::Relation {
+    {
+        {
             // Handle nested INNER-RELATIONs - correlation filters from outer relations
             // might be inside nested INNER-RELATION subqueries
             match rel {
                 resolved::Relation::InnerRelation {
                     pattern,
-                    alias,
+                    preminted_scope,
+                    alias: _,
                     outer,
                     cpr_schema,
                 } => {
@@ -716,7 +576,6 @@ pub fn remove_correlation_filters_from_expr(
                             identifier,
                             correlation_filters,
                             subquery,
-                            hygienic_injections,
                         } => resolved::InnerRelationPattern::CorrelatedScalarJoin {
                             identifier: identifier.clone(),
                             correlation_filters: correlation_filters.clone(),
@@ -724,14 +583,12 @@ pub fn remove_correlation_filters_from_expr(
                                 subquery,
                                 filters_to_remove,
                             )),
-                            hygienic_injections: hygienic_injections.clone(),
                         },
                         resolved::InnerRelationPattern::CorrelatedGroupJoin {
                             identifier,
                             correlation_filters,
                             aggregations,
                             subquery,
-                            hygienic_injections,
                         } => resolved::InnerRelationPattern::CorrelatedGroupJoin {
                             identifier: identifier.clone(),
                             correlation_filters: correlation_filters.clone(),
@@ -740,7 +597,6 @@ pub fn remove_correlation_filters_from_expr(
                                 subquery,
                                 filters_to_remove,
                             )),
-                            hygienic_injections: hygienic_injections.clone(),
                         },
                         resolved::InnerRelationPattern::UncorrelatedDerivedTable {
                             identifier,
@@ -758,172 +614,118 @@ pub fn remove_correlation_filters_from_expr(
                         resolved::InnerRelationPattern::Indeterminate { .. } => pattern.clone(),
                     };
 
-                    resolved::RelationalExpression::Relation(resolved::Relation::InnerRelation {
+                    resolved::Relation::InnerRelation {
                         pattern: cleaned_pattern,
-                        alias: alias.clone(),
+                        preminted_scope: *preminted_scope,
+                        alias: None,
                         outer: *outer,
                         cpr_schema: cpr_schema.clone(),
-                    })
+                    }
                 }
                 // Other relation types: no subqueries with correlation filters to clean
-                other => resolved::RelationalExpression::Relation(other.clone()),
+                other => other.clone(),
             }
-        }
-        // SetOperation: recurse into operands
-        resolved::RelationalExpression::SetOperation {
-            operator,
-            operands,
-            correlation,
-            cpr_schema,
-        } => resolved::RelationalExpression::SetOperation {
-            operator: operator.clone(),
-            operands: operands
-                .iter()
-                .map(|op| remove_correlation_filters_from_expr(op, filters_to_remove))
-                .collect(),
-            correlation: correlation.clone(),
-            cpr_schema: cpr_schema.clone(),
-        },
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains consumed before correlation filter removal")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
         }
     }
 }
-
 
 fn build_ground_relation(
     table: &FlatTable,
-    schema_box: PhaseBox<CprSchema, refined::Refined>,
-) -> refined::RelationalExpression {
-    let domain_spec = match &table.domain_spec {
-        // GlobWithUsing/GlobWithUsingAll: USING columns already extracted into join
+    schema_box: crate::names::ScopeId,
+) -> Result<refined::Chain> {
+    let access = match &table.access {
+        // Dequalify/DequalifyAll: USING columns already extracted into join
         // predicates by analyzer. Revert to plain Glob for SQL generation.
-        resolved::DomainSpec::GlobWithUsing(_) | resolved::DomainSpec::GlobWithUsingAll => {
-            resolved::DomainSpec::Glob
-        }
+        resolved::Access::Dequalify(_) | resolved::Access::DequalifyAll => resolved::Access::All,
         // Glob/Positional/Bare: pass through unchanged.
         // Positional must survive — transformer uses it to generate column renames.
-        resolved::DomainSpec::Glob => resolved::DomainSpec::Glob,
-        resolved::DomainSpec::Positional(exprs) => resolved::DomainSpec::Positional(exprs.clone()),
-        resolved::DomainSpec::Bare => resolved::DomainSpec::Bare,
+        resolved::Access::All => resolved::Access::All,
+        resolved::Access::Slots(exprs) => resolved::Access::Slots(exprs.clone()),
+        resolved::Access::Unasked => resolved::Access::Unasked,
     };
 
-    refined::RelationalExpression::Relation(refined::Relation::Ground {
-        identifier: table.identifier.clone(),
-        canonical_name: PhaseBox::new(table.canonical_name.clone()).into_refined(),
-        domain_spec: domain_spec.into(),
-        alias: table.alias.clone().map(|s| s.into()),
-        outer: table.outer,
-        mutation_target: false,
-        passthrough: false,
-        cpr_schema: schema_box,
-        hygienic_injections: Vec::new(),
-        backend_schema: PhaseBox::from_optional_schema(table.backend_schema.clone()).into_refined(),
-    })
+    Ok(refined::Relation::ground_read(
+        super::carry::access(access)?,
+        table.outer,
+        schema_box,
+    ))
 }
 
 fn combine_predicates_with_and(
-    predicates: Vec<refined::BooleanExpression>,
-) -> refined::BooleanExpression {
-    if predicates.is_empty() {
-        create_true_literal()
-    } else if predicates.len() == 1 {
-        predicates.into_iter().next().unwrap()
-    } else {
-        predicates
-            .into_iter()
-            .reduce(|acc, pred| refined::BooleanExpression::And {
-                left: Box::new(acc),
-                right: Box::new(pred),
-            })
-            .unwrap()
-    }
+    predicates: Vec<refined::TruthExpression>,
+) -> refined::TruthExpression {
+    refined::TruthExpression::all(predicates).unwrap_or_else(create_true_literal)
 }
 
-fn create_true_literal() -> refined::BooleanExpression {
-    refined::BooleanExpression::Comparison {
-        operator: "=".to_string(),
-        left: Box::new(refined::DomainExpression::Literal {
-            value: LiteralValue::Number("1".to_string()),
-            alias: None,
-        }),
-        right: Box::new(refined::DomainExpression::Literal {
-            value: LiteralValue::Number("1".to_string()),
-            alias: None,
-        }),
-    }
+fn create_true_literal() -> refined::TruthExpression {
+    refined::TruthExpression::Comparison(Comparison {
+        operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+        left: Box::new(refined::DomainExpression::Application(
+            refined::FunctionApplication::Ground(LiteralValue::Number("1".to_string())),
+        )),
+        right: Box::new(refined::DomainExpression::Application(
+            refined::FunctionApplication::Ground(LiteralValue::Number("1".to_string())),
+        )),
+    })
 }
 
 /// Convert a resolved boolean expression to refined, refining InnerExists/InRelational
 /// subqueries through the full refiner pipeline. Without this, InnerRelation patterns
 /// inside InnerExists stay as Indeterminate and the transformer can't handle them.
 pub(super) fn refine_predicate_boolean(
-    expr: resolved::BooleanExpression,
-) -> Result<refined::BooleanExpression> {
+    expr: resolved::TruthExpression,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::TruthExpression> {
     match expr {
-        resolved::BooleanExpression::InnerExists {
-            exists,
-            identifier,
-            subquery,
-            alias,
-            using_columns,
-        } => {
+        resolved::TruthExpression::Existence(Existence {
+            polarity,
+            relation: subquery,
+            ..
+        }) => {
             // Refine the InnerExists subquery through the full refiner pipeline
             let refined_subquery = crate::pipeline::refiner::refine_internal(
                 *subquery,
                 false,
                 crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+                Rc::clone(identities),
             )?;
-            Ok(refined::BooleanExpression::InnerExists {
-                exists,
-                identifier,
-                subquery: Box::new(refined_subquery),
-                alias,
-                using_columns,
-            })
+            Ok(refined::TruthExpression::Existence(Existence {
+                polarity,
+                relation: Box::new(refined_subquery),
+                addressing: (),
+            }))
         }
-        resolved::BooleanExpression::InRelational {
-            value,
-            subquery,
-            identifier,
+        resolved::TruthExpression::RelationalMembership(RelationalMembership {
+            probe,
+            relation: subquery,
             negated,
-        } => {
+            ..
+        }) => {
             let refined_subquery = crate::pipeline::refiner::refine_internal(
                 *subquery,
                 false,
                 crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+                Rc::clone(identities),
             )?;
-            Ok(refined::BooleanExpression::InRelational {
-                value: Box::new((*value).into()),
-                subquery: Box::new(refined_subquery),
-                identifier,
-                negated,
-            })
+            Ok(refined::TruthExpression::RelationalMembership(
+                RelationalMembership {
+                    probe: super::carry::probe(probe)?,
+                    relation: Box::new(refined_subquery),
+                    negated,
+                    addressing: (),
+                },
+            ))
         }
-        resolved::BooleanExpression::And { left, right } => Ok(refined::BooleanExpression::And {
-            left: Box::new(refine_predicate_boolean(*left)?),
-            right: Box::new(refine_predicate_boolean(*right)?),
+        resolved::TruthExpression::Conjunction(parts) => Ok(refined::TruthExpression::Conjunction(
+            Box::new((*parts).try_map(|part| refine_predicate_boolean(part, identities))?),
+        )),
+        resolved::TruthExpression::Disjunction(parts) => Ok(refined::TruthExpression::Disjunction(
+            Box::new((*parts).try_map(|part| refine_predicate_boolean(part, identities))?),
+        )),
+        resolved::TruthExpression::Not { expr: inner } => Ok(refined::TruthExpression::Not {
+            expr: Box::new(refine_predicate_boolean(*inner, identities)?),
         }),
-        resolved::BooleanExpression::Or { left, right } => Ok(refined::BooleanExpression::Or {
-            left: Box::new(refine_predicate_boolean(*left)?),
-            right: Box::new(refine_predicate_boolean(*right)?),
-        }),
-        resolved::BooleanExpression::Not { expr: inner } => Ok(refined::BooleanExpression::Not {
-            expr: Box::new(refine_predicate_boolean(*inner)?),
-        }),
-        // All other variants: mechanical phase conversion
-        other => Ok(other.into()),
-    }
-}
-
-fn collect_columns_from_schema(schema: &CprSchema, columns: &mut indexmap::IndexSet<String>) {
-    if let CprSchema::Resolved(cols) = schema {
-        for col in cols {
-            columns.insert(col.name().to_string());
-        }
+        // Everything else: nothing to refine, so it is carried.
+        other => super::carry::boolean(other),
     }
 }

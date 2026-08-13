@@ -34,9 +34,7 @@
 //! # Relationship to `walk_transform_*`
 //!
 //! The walk reaches every recursive edge `walk_transform_*` reaches, including
-//! `SetOperation.correlation` (borrowed here and consumed through the transform
-//! walk's payload-specific map; INVENTORY §5 finding 9). The
-//! `WithCfes.cfes` / `WithPrecompiledCfes.cfes`
+//! a bag operation's correlation predicate. The `WithCfes.cfes`
 //! bodies are NOT auto-descended (they live in a non-phase-parameterized,
 //! Unresolved-pinned side structure the generic walk cannot type); a caller
 //! that wants a CFE body walks it by ROOTING a fresh visit at the body, which
@@ -51,16 +49,21 @@
 //! forced into a third recursion scheme now.
 
 use crate::error::Result;
-use crate::pipeline::asts::core::expressions::functions::{CaseArm, StringTemplatePart};
+use crate::pipeline::asts::core::expressions::functions::{
+    CaseExpression, FunctorCall, ValueTemplatePart,
+};
 use crate::pipeline::asts::core::expressions::metadata_types::CteRequirements;
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
-use crate::pipeline::asts::core::operators::{
-    ColumnSelector, FrameBound, HoArgument, WindowFrame,
+use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
+use crate::pipeline::asts::core::operators::{FrameBound, HoArgument, WindowFrame};
+use crate::pipeline::asts::core::{
+    Access, AnonTable, Chain, Continuation, CteBinding, Datum, DomainExpression, Enclyph,
+    FunctionApplication, Grelex, GroupSpec, MemberCorrelation, MetadataGroup, MetadataTarget,
+    OrderingSpec, Phase, PipeOp, Query, RecordMember, ReductionItem, Relation, TabularRow,
+    TruthExpression,
 };
 use crate::pipeline::asts::core::{
-    ArrayMember, BooleanExpression, CteBinding, CurlyMember, DomainExpression, DomainSpec,
-    FunctionExpression, ModuloSpec, OrderingSpec, PipeExpression, Query, Relation,
-    RelationalExpression, RenameSpec, RepositionSpec, Row, SigmaCondition, UnaryRelationalOperator,
+    Comparison, Existence, Membership, RelationalMembership, SigmaApplication,
 };
 
 // =============================================================================
@@ -137,7 +140,7 @@ macro_rules! exit {
 /// `AstTransform` implementors override `transform_*` and lean on
 /// `walk_transform_*`.
 #[allow(unused_variables)]
-pub trait AstVisit<P> {
+pub trait AstVisit<P: Phase> {
     fn enter_query(&mut self, q: &Query<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
@@ -145,10 +148,17 @@ pub trait AstVisit<P> {
         Ok(Descent::Continue)
     }
 
-    fn enter_relational(&mut self, e: &RelationalExpression<P>) -> Result<Descent> {
+    fn enter_relational(&mut self, e: &Chain<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
-    fn exit_relational(&mut self, e: &RelationalExpression<P>) -> Result<Descent> {
+    fn exit_relational(&mut self, e: &Chain<P>) -> Result<Descent> {
+        Ok(Descent::Continue)
+    }
+
+    fn enter_callable(&mut self, c: &crate::pipeline::asts::core::Callable<P>) -> Result<Descent> {
+        Ok(Descent::Continue)
+    }
+    fn exit_callable(&mut self, c: &crate::pipeline::asts::core::Callable<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
 
@@ -159,10 +169,10 @@ pub trait AstVisit<P> {
         Ok(Descent::Continue)
     }
 
-    fn enter_boolean(&mut self, e: &BooleanExpression<P>) -> Result<Descent> {
+    fn enter_boolean(&mut self, e: &TruthExpression<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
-    fn exit_boolean(&mut self, e: &BooleanExpression<P>) -> Result<Descent> {
+    fn exit_boolean(&mut self, e: &TruthExpression<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
 
@@ -173,31 +183,40 @@ pub trait AstVisit<P> {
         Ok(Descent::Continue)
     }
 
-    fn enter_function(&mut self, f: &FunctionExpression<P>) -> Result<Descent> {
+    fn enter_function(&mut self, f: &FunctionApplication<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
-    fn exit_function(&mut self, f: &FunctionExpression<P>) -> Result<Descent> {
-        Ok(Descent::Continue)
-    }
-
-    fn enter_operator(&mut self, o: &UnaryRelationalOperator<P>) -> Result<Descent> {
-        Ok(Descent::Continue)
-    }
-    fn exit_operator(&mut self, o: &UnaryRelationalOperator<P>) -> Result<Descent> {
+    fn exit_function(&mut self, f: &FunctionApplication<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
 
-    fn enter_sigma(&mut self, s: &SigmaCondition<P>) -> Result<Descent> {
-        Ok(Descent::Continue)
-    }
-    fn exit_sigma(&mut self, s: &SigmaCondition<P>) -> Result<Descent> {
+    /// A publication item: the value, the name the author gave it, and the
+    /// occurrence it publishes, together. A visitor that needs the name a
+    /// value publishes under reads it HERE — the value itself does not carry
+    /// one.
+    fn enter_out_item(&mut self, i: &crate::pipeline::asts::core::OutItem<P>) -> Result<Descent> {
+        let _ = i;
         Ok(Descent::Continue)
     }
 
-    fn enter_pipe(&mut self, p: &PipeExpression<P>) -> Result<Descent> {
+    fn enter_operator(&mut self, o: &PipeOp<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
-    fn exit_pipe(&mut self, p: &PipeExpression<P>) -> Result<Descent> {
+    fn exit_operator(&mut self, o: &PipeOp<P>) -> Result<Descent> {
+        Ok(Descent::Continue)
+    }
+
+    fn enter_continuation(&mut self, c: &Continuation<P>) -> Result<Descent> {
+        Ok(Descent::Continue)
+    }
+    fn exit_continuation(&mut self, c: &Continuation<P>) -> Result<Descent> {
+        Ok(Descent::Continue)
+    }
+
+    fn enter_anon_table(&mut self, a: &AnonTable<P>) -> Result<Descent> {
+        Ok(Descent::Continue)
+    }
+    fn exit_anon_table(&mut self, a: &AnonTable<P>) -> Result<Descent> {
         Ok(Descent::Continue)
     }
 
@@ -213,30 +232,24 @@ pub trait AstVisit<P> {
 // Walk functions — top-level
 // =============================================================================
 
-pub fn walk_visit_query<P, F: AstVisit<P> + ?Sized>(v: &mut F, query: &Query<P>) -> Result<Descent> {
+pub fn walk_visit_query<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    query: &Query<P>,
+) -> Result<Descent> {
     enter!(v.enter_query(query));
-    match query {
-        Query::Relational(expr) => child!(walk_visit_relational(v, expr)),
-        Query::WithCtes { ctes, query } => {
-            for c in ctes {
-                child!(walk_visit_cte_binding(v, c));
-            }
-            child!(walk_visit_relational(v, query));
-        }
-        // `cfes` bodies live in a non-phase-parameterized, Unresolved-pinned side
-        // structure the generic walk cannot type — mirror walk_transform_query
-        // (which passes `cfes` through) and descend only the main query. A caller
-        // wanting a CFE body roots a fresh visit at it (the W12 pattern).
-        Query::WithCfes { query, .. }
-        | Query::WithPrecompiledCfes { query, .. }
-        | Query::ReplTempTable { query, .. }
-        | Query::WithErContext { query, .. }
-        | Query::ReplTempView { query, .. } => child!(walk_visit_query(v, query)),
+    // `cfes` bodies live in a non-phase-parameterized, Unresolved-pinned side
+    // structure the generic walk cannot type — mirror walk_transform_query
+    // (which carries `cfes` through the phase door) and descend the bindings
+    // and the body. A caller wanting a CFE body roots a fresh visit at it
+    // (the W12 pattern).
+    for c in &query.ctes {
+        child!(walk_visit_cte_binding(v, c));
     }
+    child!(walk_visit_relational(v, &query.body));
     exit!(v.exit_query(query));
 }
 
-pub fn walk_visit_cte_binding<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_cte_binding<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     cte: &CteBinding<P>,
 ) -> Result<Descent> {
@@ -248,126 +261,126 @@ pub fn walk_visit_cte_binding<P, F: AstVisit<P> + ?Sized>(
 // =============================================================================
 
 #[stacksafe::stacksafe]
-pub fn walk_visit_relational<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_relational<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    expr: &RelationalExpression<P>,
+    expr: &Chain<P>,
 ) -> Result<Descent> {
     enter!(v.enter_relational(expr));
-    match expr {
-        RelationalExpression::Relation(rel) => child!(walk_visit_relation(v, rel)),
-        RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            ..
-        } => {
-            child!(walk_visit_relational(v, left));
-            child!(walk_visit_relational(v, right));
-            if let Some(c) = join_condition {
-                child!(walk_visit_boolean(v, c));
-            }
-        }
-        RelationalExpression::Filter {
-            source, condition, ..
-        } => {
-            child!(walk_visit_relational(v, source));
-            child!(walk_visit_sigma(v, condition));
-        }
-        RelationalExpression::Pipe(pipe) => {
-            let pipe: &PipeExpression<P> = pipe;
-            child!(walk_visit_pipe(v, pipe));
-        }
-        RelationalExpression::SetOperation {
-            operands,
-            correlation,
-            ..
-        } => {
-            for e in operands {
-                child!(walk_visit_relational(v, e));
-            }
-            // `correlation()` is the payload-specific
-            // borrow (not a phase-generic one — see PhaseBox::correlation).
-            if let Some(c) = correlation.correlation() {
-                child!(walk_visit_boolean(v, c));
-            }
-        }
-        RelationalExpression::IntersectCorresponding {
-            operands,
-            correlation,
-            ..
-        } => {
-            for e in operands {
-                child!(walk_visit_relational(v, e));
-            }
-            child!(walk_visit_boolean(v, correlation));
-        }
-        RelationalExpression::ErJoinChain { relations, .. } => {
-            for r in relations {
-                child!(walk_visit_relation(v, r));
-            }
-        }
-        RelationalExpression::ErTransitiveJoin { left, right, .. } => {
-            child!(walk_visit_relational(v, left));
-            child!(walk_visit_relational(v, right));
-        }
+    match &expr.head {
+        Grelex::Reference(rel) => child!(walk_visit_relation(v, rel)),
+        Grelex::Literal(anon) => child!(walk_visit_anon_table(v, &anon.table)),
+    }
+    for continuation in &expr.continuations {
+        child!(walk_visit_continuation(v, continuation));
     }
     exit!(v.exit_relational(expr));
 }
 
-pub fn walk_visit_relation<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_anon_table<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    anon: &AnonTable<P>,
+) -> Result<Descent> {
+    enter!(v.enter_anon_table(anon));
+    if let Some(headers) = &anon.body.header {
+        for header in headers.iter() {
+            child!(walk_visit_slot(v, &header.slot));
+        }
+    }
+    for row in &anon.body.rows {
+        child!(walk_visit_tabular_row(v, row));
+    }
+    exit!(v.exit_anon_table(anon));
+}
+
+#[stacksafe::stacksafe]
+pub fn walk_visit_continuation<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    continuation: &Continuation<P>,
+) -> Result<Descent> {
+    enter!(v.enter_continuation(continuation));
+    match continuation {
+        Continuation::Access { access, .. } => {
+            child!(walk_visit_access(v, access));
+        }
+        Continuation::Restrict { condition, .. } => {
+            child!(walk_visit_boolean(v, condition));
+        }
+        // A correlation names two arms by scope; there is no expression
+        // beneath it to visit.
+        Continuation::Bound { .. } | Continuation::Correlate { .. } => {}
+        // A PATTERN HOLDS NO EXPRESSION. Its members bind names and reach
+        // with paths, so a walk over the destructure's children reaches the
+        // source and stops.
+        Continuation::Destructure { source, .. } => {
+            child!(walk_visit_domain(v, source));
+        }
+        Continuation::Member {
+            rhs, correlation, ..
+        } => {
+            child!(walk_visit_relational(v, rhs));
+            // A correspondence holds names, not expressions: there is no
+            // child to descend into.
+            if let Some(c) = correlation.as_ref().and_then(MemberCorrelation::condition) {
+                child!(walk_visit_boolean(v, c));
+            }
+        }
+        Continuation::BagOp {
+            arm, correlation, ..
+        } => {
+            child!(walk_visit_relational(v, arm));
+            if let Some(correlation) = P::correlation(correlation) {
+                // A whole-heading correlation names arms, not expressions:
+                // there is no truth beneath it to visit.
+                if let Some(predicate) = correlation.predicate.expression() {
+                    child!(walk_visit_boolean(v, predicate));
+                }
+            }
+        }
+        Continuation::Pipe { operator, .. } => {
+            child!(walk_visit_operator(v, operator));
+        }
+        Continuation::ErJoin(carried) => {
+            child!(walk_visit_relational(v, &P::er_join(carried).rhs));
+        }
+        Continuation::Structural(step) => match &step.form {
+            crate::pipeline::asts::core::StructuralForm::Ordering { specs } => {
+                for s in specs {
+                    child!(walk_visit_ordering_spec(v, s));
+                }
+            }
+            // A reposition addresses columns; the fixed-heading forms, the
+            // drill's occurrences and the narrowing's pattern hold no
+            // expression child to reach.
+            crate::pipeline::asts::core::StructuralForm::Reposition { .. }
+            | crate::pipeline::asts::core::StructuralForm::Meta
+            | crate::pipeline::asts::core::StructuralForm::Witness { .. }
+            | crate::pipeline::asts::core::StructuralForm::SignedWitness
+            | crate::pipeline::asts::core::StructuralForm::Drill { .. }
+            | crate::pipeline::asts::core::StructuralForm::Narrow { .. } => {}
+        },
+    }
+    exit!(v.exit_continuation(continuation));
+}
+
+pub fn walk_visit_relation<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     rel: &Relation<P>,
 ) -> Result<Descent> {
     enter!(v.enter_relation(rel));
     match rel {
-        Relation::Ground { domain_spec, .. } => child!(walk_visit_domain_spec(v, domain_spec)),
-        Relation::Anonymous {
-            column_headers,
-            rows,
-            ..
-        } => {
-            if let Some(headers) = column_headers {
-                for h in headers {
-                    child!(walk_visit_domain(v, h));
-                }
-            }
-            for r in rows {
-                child!(walk_visit_row(v, r));
-            }
-        }
-        Relation::TVF {
-            domain_spec,
-            ho_arguments,
-            ..
-        } => {
-            child!(walk_visit_domain_spec(v, domain_spec));
-            for a in ho_arguments {
-                match a {
-                    HoArgument::Table(r) => child!(walk_visit_relational(v, r)),
-                    HoArgument::Scalar(d) => child!(walk_visit_domain(v, d)),
-                }
-            }
-        }
+        Relation::FunctorCall { call, .. } => child!(walk_visit_functor_call(v, call.call())),
+        // A ground read names a relation and nothing else: what was asked of
+        // it is the access continuation beside it, walked in its own right.
+        Relation::Ground { .. } => {}
         Relation::InnerRelation { pattern, .. } => child!(walk_visit_inner_relation(v, pattern)),
-        Relation::ConsultedView { body, .. } => child!(walk_visit_query(v, body)),
-        Relation::PseudoPredicate {
-            arguments, access, ..
-        } => {
-            for e in arguments {
-                child!(walk_visit_domain(v, e));
-            }
-            // The receipt-access spec is a recursive field: a demand or
-            // subquery embedded in it must be visible to every AstVisit
-            // tenant (effect discipline, R9 discovery, compile purity).
-            // A recursive field without its walker edge is the historical
-            // bug class the inductive-traversal work exists to prevent.
-            child!(walk_visit_domain_spec(v, access));
+        Relation::ConsultedView { body, .. } => {
+            child!(walk_visit_query(v, body))
         }
     }
     exit!(v.exit_relation(rel));
 }
 
-pub fn walk_visit_inner_relation<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_inner_relation<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     pattern: &InnerRelationPattern<P>,
 ) -> Result<Descent> {
@@ -409,350 +422,355 @@ pub fn walk_visit_inner_relation<P, F: AstVisit<P> + ?Sized>(
 // Walk functions — pipe / operator / sigma
 // =============================================================================
 
-pub fn walk_visit_pipe<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_operator<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    pipe: &PipeExpression<P>,
-) -> Result<Descent> {
-    enter!(v.enter_pipe(pipe));
-    child!(walk_visit_relational(v, &pipe.source));
-    child!(walk_visit_operator(v, &pipe.operator));
-    exit!(v.exit_pipe(pipe));
-}
-
-pub fn walk_visit_operator<P, F: AstVisit<P> + ?Sized>(
-    v: &mut F,
-    op: &UnaryRelationalOperator<P>,
+    op: &PipeOp<P>,
 ) -> Result<Descent> {
     enter!(v.enter_operator(op));
     match op {
-        UnaryRelationalOperator::General { expressions, .. }
-        | UnaryRelationalOperator::ProjectOut { expressions, .. } => {
-            for e in expressions {
-                child!(walk_visit_domain(v, e));
+        PipeOp::Project(items) | PipeOp::Embed(items) => {
+            for item in items {
+                child!(walk_visit_out_item(v, item));
             }
         }
-        UnaryRelationalOperator::Modulo { spec, .. } => child!(walk_visit_modulo_spec(v, spec)),
-        UnaryRelationalOperator::TupleOrdering { specs, .. } => {
-            for s in specs {
-                child!(walk_visit_ordering_spec(v, s));
-            }
-        }
-        UnaryRelationalOperator::MapCover {
-            function,
-            columns,
-            conditioned_on,
+        // A selector ADDRESSES columns: references and spreads, with no
+        // expression child to reach.
+        PipeOp::ProjectOut(_) => {}
+        PipeOp::Group(spec) => child!(walk_visit_group_spec(v, spec)),
+        PipeOp::MapCover(MapCover {
+            callable,
+            guard,
+            cells,
             ..
+        }) => {
+            if let Some(function) = P::cover_callable(callable) {
+                child!(walk_visit_callable(v, function));
+            }
+            for cell in cells {
+                child!(walk_visit_domain(v, &cell.expr));
+            }
+            if let Some(c) = guard {
+                child!(walk_visit_boolean(v, c));
+            }
+        }
+        // A rename ADDRESSES columns and names them; neither side is an
+        // expression.
+        PipeOp::Rename(_) => {}
+        PipeOp::Transform {
+            items: transformations,
+            guard: conditioned_on,
         } => {
-            child!(walk_visit_function(v, function));
-            for c in columns {
-                child!(walk_visit_domain(v, c));
+            for item in transformations {
+                child!(walk_visit_out_value(v, &item.expr));
             }
             if let Some(c) = conditioned_on {
                 child!(walk_visit_boolean(v, c));
             }
         }
-        UnaryRelationalOperator::RenameCover { specs } => {
-            for s in specs {
-                child!(walk_visit_rename_spec(v, s));
+        // A reposition's spec is a reference and a position: an address,
+        // with no expression child to reach.
+        PipeOp::EmbedMapCover(EmbedMapCover {
+            callable, cells, ..
+        }) => {
+            if let Some(function) = P::cover_callable(callable) {
+                child!(walk_visit_callable(v, function));
             }
-        }
-        UnaryRelationalOperator::Transform {
-            transformations,
-            conditioned_on,
-        } => {
-            for (expr, _alias, _qual) in transformations {
-                child!(walk_visit_domain(v, expr));
+            for cell in cells {
+                child!(walk_visit_domain(v, &cell.expr));
             }
-            if let Some(c) = conditioned_on {
-                child!(walk_visit_boolean(v, c));
-            }
-        }
-        UnaryRelationalOperator::AggregatePipe { aggregations } => {
-            for e in aggregations {
-                child!(walk_visit_domain(v, e));
-            }
-        }
-        UnaryRelationalOperator::Reposition { moves } => {
-            for m in moves {
-                child!(walk_visit_reposition_spec(v, m));
-            }
-        }
-        UnaryRelationalOperator::EmbedMapCover {
-            function, selector, ..
-        } => {
-            child!(walk_visit_function(v, function));
-            child!(walk_visit_column_selector(v, selector));
-        }
-        UnaryRelationalOperator::HoViewApplication {
-            first_parens_spec,
-            domain_spec,
-            ..
-        } => {
-            if let Some(s) = first_parens_spec {
-                child!(walk_visit_domain_spec(v, s));
-            }
-            child!(walk_visit_domain_spec(v, domain_spec));
-        }
-        UnaryRelationalOperator::DmlTerminal { domain_spec, .. } => {
-            child!(walk_visit_domain_spec(v, domain_spec));
-        }
-        UnaryRelationalOperator::DirectiveTerminal { arguments, .. } => {
-            for e in arguments {
-                child!(walk_visit_domain(v, e));
-            }
-        }
-        UnaryRelationalOperator::DirectivePipeInvocation {
-            argument,
-            domain_spec,
-            ..
-        } => {
-            child!(walk_visit_relational(v, argument));
-            child!(walk_visit_domain_spec(v, domain_spec));
-        }
-        // Leaf operators — no recursive children.
-        UnaryRelationalOperator::MetaIze
-        | UnaryRelationalOperator::Witness { .. }
-        | UnaryRelationalOperator::Qualify
-        | UnaryRelationalOperator::Using { .. }
-        | UnaryRelationalOperator::UsingAll
-        | UnaryRelationalOperator::InteriorDrillDown { .. }
-        | UnaryRelationalOperator::NarrowingDestructure { .. }
-        | UnaryRelationalOperator::SignedWitness => {}
+        } // Leaf operators — no recursive children.
     }
     exit!(v.exit_operator(op));
-}
-
-pub fn walk_visit_sigma<P, F: AstVisit<P> + ?Sized>(
-    v: &mut F,
-    cond: &SigmaCondition<P>,
-) -> Result<Descent> {
-    enter!(v.enter_sigma(cond));
-    match cond {
-        SigmaCondition::Predicate(pred) => child!(walk_visit_boolean(v, pred)),
-        SigmaCondition::TupleOrdinal(_) => {}
-        SigmaCondition::Destructure {
-            json_column,
-            pattern,
-            ..
-        } => {
-            child!(walk_visit_domain(v, json_column));
-            child!(walk_visit_function(v, pattern));
-        }
-        SigmaCondition::SigmaCall { arguments, .. } => {
-            for e in arguments {
-                child!(walk_visit_domain(v, e));
-            }
-        }
-    }
-    exit!(v.exit_sigma(cond));
 }
 
 // =============================================================================
 // Walk functions — core expressions
 // =============================================================================
 
-pub fn walk_visit_boolean<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_boolean<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    expr: &BooleanExpression<P>,
+    expr: &TruthExpression<P>,
 ) -> Result<Descent> {
     enter!(v.enter_boolean(expr));
     match expr {
-        BooleanExpression::Comparison { left, right, .. } => {
+        TruthExpression::Comparison(Comparison { left, right, .. }) => {
             child!(walk_visit_domain(v, left));
             child!(walk_visit_domain(v, right));
         }
-        BooleanExpression::And { left, right } | BooleanExpression::Or { left, right } => {
-            child!(walk_visit_boolean(v, left));
-            child!(walk_visit_boolean(v, right));
-        }
-        BooleanExpression::Not { expr } => child!(walk_visit_boolean(v, expr)),
-        BooleanExpression::InnerExists { subquery, .. } => {
+        TruthExpression::Not { expr } => child!(walk_visit_boolean(v, expr)),
+        TruthExpression::Existence(Existence {
+            relation: subquery, ..
+        }) => {
             child!(walk_visit_relational(v, subquery));
         }
-        BooleanExpression::In { value, set, .. } => {
-            child!(walk_visit_domain(v, value));
-            for e in set {
-                child!(walk_visit_domain(v, e));
+        TruthExpression::Membership(Membership { probe, rows, .. }) => {
+            for value in probe.values() {
+                child!(walk_visit_domain(v, value));
+            }
+            for row in rows {
+                for value in &row.0 {
+                    child!(walk_visit_domain(v, value));
+                }
             }
         }
-        BooleanExpression::InRelational {
-            value, subquery, ..
-        } => {
-            child!(walk_visit_domain(v, value));
+        TruthExpression::RelationalMembership(RelationalMembership {
+            probe,
+            relation: subquery,
+            ..
+        }) => {
+            for value in probe.values() {
+                child!(walk_visit_domain(v, value));
+            }
             child!(walk_visit_relational(v, subquery));
         }
-        BooleanExpression::Sigma { condition } => child!(walk_visit_sigma(v, condition)),
-        // Leaf variants.
-        BooleanExpression::Using { .. }
-        | BooleanExpression::BooleanLiteral { .. }
-        | BooleanExpression::GlobCorrelation { .. }
-        | BooleanExpression::OrdinalGlobCorrelation { .. } => {}
+        TruthExpression::Sigma(SigmaApplication {
+            proof: crate::pipeline::asts::core::NamedProof::Body(body),
+            ..
+        }) => child!(walk_visit_boolean(v, P::sigma_body(body))),
+        TruthExpression::Sigma(SigmaApplication {
+            proof: crate::pipeline::asts::core::NamedProof::Call(call),
+            ..
+        }) => {
+            child!(walk_visit_functor_call(v, call.call()))
+        }
+        TruthExpression::Conjunction(parts) | TruthExpression::Disjunction(parts) => {
+            for part in parts.iter() {
+                child!(walk_visit_boolean(v, part));
+            }
+        }
     }
     exit!(v.exit_boolean(expr));
 }
 
-pub fn walk_visit_domain<P, F: AstVisit<P> + ?Sized>(
+/// An argument's value: the domain road, or the crossing's truth. Both are
+/// reached, so a subquery beneath a crossed argument is not lost.
+pub fn walk_visit_argument_value<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    value: &crate::pipeline::asts::core::ArgumentValue<P>,
+) -> Result<Descent> {
+    match value {
+        crate::pipeline::asts::core::ArgumentValue::Domain { value, .. } => {
+            walk_visit_domain(v, value)
+        }
+        crate::pipeline::asts::core::ArgumentValue::Truth(crossing) => {
+            walk_visit_boolean(v, crossing.truth())
+        }
+    }
+}
+
+/// A published value: the domain road, or the crossing's truth. The walk
+/// reaches BOTH, so a subquery beneath a published existence is not lost to
+/// the recursion-closure matrix.
+pub fn walk_visit_out_value<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    value: &crate::pipeline::asts::core::OutValue<P>,
+) -> Result<Descent> {
+    match value {
+        crate::pipeline::asts::core::OutValue::Domain(domain) => walk_visit_domain(v, domain),
+        crate::pipeline::asts::core::OutValue::Truth(crossing) => {
+            walk_visit_boolean(v, crossing.truth())
+        }
+    }
+}
+
+pub fn walk_visit_domain<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     expr: &DomainExpression<P>,
 ) -> Result<Descent> {
     enter!(v.enter_domain(expr));
     match expr {
-        DomainExpression::Function(f) => child!(walk_visit_function(v, f)),
-        DomainExpression::Predicate { expr, .. } => child!(walk_visit_boolean(v, expr)),
-        DomainExpression::PipedExpression {
-            value, transforms, ..
-        } => {
-            child!(walk_visit_domain(v, value));
-            for (_dir, f) in transforms {
-                child!(walk_visit_function(v, f));
-            }
-        }
-        DomainExpression::Parenthesized { inner, .. } => child!(walk_visit_domain(v, inner)),
-        DomainExpression::Tuple { elements, .. } => {
-            for e in elements {
-                child!(walk_visit_domain(v, e));
-            }
-        }
-        DomainExpression::ScalarSubquery { subquery, .. } => {
-            child!(walk_visit_relational(v, subquery));
-        }
-        DomainExpression::PivotOf {
-            value_column,
-            pivot_key,
-            ..
-        } => {
-            child!(walk_visit_domain(v, value_column));
-            child!(walk_visit_domain(v, pivot_key));
-        }
+        DomainExpression::Application(f) => child!(walk_visit_function(v, f)),
         // Leaf variants — `Projection` has only non-recursive members (mirror
         // walk_transform_domain, which never recurses into it).
-        DomainExpression::Lvar { .. }
-        | DomainExpression::Literal { .. }
-        | DomainExpression::Projection(_)
-        | DomainExpression::NonUnifiyingUnderscore
-        | DomainExpression::ValuePlaceholder { .. }
-        | DomainExpression::Substitution(_)
-        | DomainExpression::ColumnOrdinal(_) => {}
+        DomainExpression::Reference(_) => {}
     }
     exit!(v.exit_domain(expr));
 }
 
-pub fn walk_visit_function<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_function<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    func: &FunctionExpression<P>,
+    func: &FunctionApplication<P>,
 ) -> Result<Descent> {
     enter!(v.enter_function(func));
     match func {
-        FunctionExpression::Regular {
-            arguments,
-            conditioned_on,
-            ..
+        crate::pipeline::asts::core::FunctionApplication::Ground(_)
+        | crate::pipeline::asts::core::FunctionApplication::Open(_) => {}
+        crate::pipeline::asts::core::FunctionApplication::Standard(application) => {
+            child!(walk_visit_standard_application(v, application))
         }
-        | FunctionExpression::Curried {
-            arguments,
-            conditioned_on,
-            ..
-        } => {
-            for e in arguments {
-                child!(walk_visit_domain(v, e));
-            }
-            if let Some(c) = conditioned_on {
-                child!(walk_visit_boolean(v, c));
-            }
+        crate::pipeline::asts::core::FunctionApplication::Enclyph(enclyph) => {
+            child!(walk_visit_enclyph(v, enclyph))
         }
-        FunctionExpression::HigherOrder {
-            curried_arguments,
-            regular_arguments,
-            conditioned_on,
-            ..
-        } => {
-            for e in curried_arguments {
-                child!(walk_visit_domain(v, e));
-            }
-            for e in regular_arguments {
-                child!(walk_visit_domain(v, e));
-            }
-            if let Some(c) = conditioned_on {
-                child!(walk_visit_boolean(v, c));
+        crate::pipeline::asts::core::FunctionApplication::ClauseSelection(selection) => {
+            for arm in &selection.arms {
+                if let Some(guard) = &arm.guard {
+                    child!(walk_visit_boolean(v, guard));
+                }
+                child!(walk_visit_out_value(v, &arm.result));
             }
         }
-        FunctionExpression::Bracket { arguments, .. } => {
-            for e in arguments {
-                child!(walk_visit_domain(v, e));
+        crate::pipeline::asts::core::FunctionApplication::Infix(infix) => {
+            child!(walk_visit_domain(v, &infix.left));
+            child!(walk_visit_domain(v, &infix.right));
+        }
+        crate::pipeline::asts::core::FunctionApplication::Template(template) => {
+            for p in template.parts() {
+                child!(walk_visit_value_template_part(v, p));
             }
         }
-        FunctionExpression::Curly {
-            members,
-            inner_grouping_keys,
-            cte_requirements,
-            ..
-        } => {
-            for m in members {
-                child!(walk_visit_curly_member(v, m));
-            }
-            for e in inner_grouping_keys {
-                child!(walk_visit_domain(v, e));
-            }
-            if let Some(r) = cte_requirements {
-                child!(walk_visit_cte_requirements(v, r));
+        crate::pipeline::asts::core::FunctionApplication::Case(case) => {
+            child!(walk_visit_case(v, case));
+        }
+        crate::pipeline::asts::core::FunctionApplication::Scalarized(relation) => {
+            child!(walk_visit_scalarized(v, relation.body()));
+        }
+        // The call is the pick's one child value. The declaration beneath it
+        // is the CALLEE's, reached through the phase's witness so a walk
+        // written for one phase cannot descend into a payload another has.
+        crate::pipeline::asts::core::FunctionApplication::FieldSelect(select) => {
+            child!(walk_visit_standard_application(v, &select.application));
+            if let Some(witness) = P::mode_witness(&select.dependency) {
+                child!(walk_visit_mode(v, &witness.mode));
             }
         }
-        FunctionExpression::Array { members, .. } => {
-            for m in members {
-                child!(walk_visit_array_member(v, m));
-            }
-        }
-        FunctionExpression::MetadataTreeGroup {
-            constructor,
-            cte_requirements,
-            ..
-        } => {
-            child!(walk_visit_function(v, constructor));
-            if let Some(r) = cte_requirements {
-                child!(walk_visit_cte_requirements(v, r));
-            }
-        }
-        FunctionExpression::Lambda { body, .. } => child!(walk_visit_domain(v, body)),
-        FunctionExpression::Infix { left, right, .. } => {
-            child!(walk_visit_domain(v, left));
-            child!(walk_visit_domain(v, right));
-        }
-        FunctionExpression::StringTemplate { parts, .. } => {
-            for p in parts {
-                child!(walk_visit_string_template_part(v, p));
-            }
-        }
-        FunctionExpression::CaseExpression { arms, .. } => {
-            for a in arms {
-                child!(walk_visit_case_arm(v, a));
-            }
-        }
-        FunctionExpression::Window {
-            arguments,
-            partition_by,
-            order_by,
-            frame,
-            ..
-        } => {
-            for e in arguments {
-                child!(walk_visit_domain(v, e));
-            }
-            for e in partition_by {
-                child!(walk_visit_domain(v, e));
-            }
-            for o in order_by {
-                child!(walk_visit_ordering_spec(v, o));
-            }
-            if let Some(f) = frame {
-                child!(walk_visit_window_frame(v, f));
-            }
-        }
-        FunctionExpression::JsonPath { source, path, .. } => {
-            child!(walk_visit_domain(v, source));
-            child!(walk_visit_domain(v, path));
+        // The path is a spec, not a child value: there is nothing under
+        // it for a walk to reach.
+        crate::pipeline::asts::core::FunctionApplication::JsonAccess(access) => {
+            child!(walk_visit_domain(v, &access.source));
         }
     }
     exit!(v.exit_function(func));
+}
+
+/// AN APPLICATION'S WHOLE PAYLOAD: the call's argument row, the window it is
+/// modified by, and the guard it is filtered by. A reader asking what values
+/// an application contains asks HERE, so no reader hand-picks a subset of
+/// them.
+/// A CALLABLE OWNS ITS OWN SLOT.
+///
+/// A visitor reaches a callable through its own hook, so a walk that is
+/// counting or spending an OUTER landing draws its boundary here by
+/// returning `SkipSubtree` — the slot beneath belongs to this callable, and
+/// nothing above it may consume one.
+/// A DECLARED MODE: every arm's output row, and the default's.
+pub fn walk_visit_mode<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    mode: &crate::pipeline::asts::core::FactFunctionMode<P>,
+) -> Result<Descent> {
+    for arm in &mode.arms {
+        for output in &arm.outputs {
+            child!(walk_visit_domain(v, output));
+        }
+    }
+    if let Some(default) = &mode.default {
+        for output in default {
+            child!(walk_visit_domain(v, output));
+        }
+    }
+    Ok(Descent::Continue)
+}
+
+/// A RELATION MADE ONE VALUE: the body it compresses, and the compression.
+pub fn walk_visit_scalarized<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    body: &crate::pipeline::asts::core::ScalarizedRelation<P>,
+) -> Result<Descent> {
+    use crate::pipeline::asts::core::Scalarization;
+    child!(walk_visit_relational(v, &body.body));
+    match &body.scalarization {
+        Scalarization::ZeroKeyReduction(items) => {
+            for item in items.iter() {
+                child!(walk_visit_reduction_item(v, item));
+            }
+        }
+        Scalarization::BoundToOne { ordering } => {
+            for spec in ordering {
+                child!(walk_visit_ordering_spec(v, spec));
+            }
+        }
+    }
+    Ok(Descent::Continue)
+}
+
+pub fn walk_visit_callable<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    callable: &crate::pipeline::asts::core::Callable<P>,
+) -> Result<Descent> {
+    enter!(v.enter_callable(callable));
+    match callable {
+        crate::pipeline::asts::core::Callable::Functor(application) => {
+            child!(walk_visit_standard_application(v, application))
+        }
+        crate::pipeline::asts::core::Callable::String(template) => {
+            for part in template.parts() {
+                child!(walk_visit_value_template_part(v, part));
+            }
+        }
+        crate::pipeline::asts::core::Callable::Lambda(lambda) => {
+            child!(walk_visit_domain(v, &lambda.body))
+        }
+    }
+    exit!(v.exit_callable(callable));
+}
+
+pub fn walk_visit_standard_application<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    application: &crate::pipeline::asts::core::StandardApplication<P>,
+) -> Result<Descent> {
+    child!(walk_visit_functor_call(v, application.call()));
+    if let Some(window) = &application.window {
+        for expr in &window.partition {
+            child!(walk_visit_domain(v, expr));
+        }
+        for ordering in &window.ordering {
+            child!(walk_visit_ordering_spec(v, ordering));
+        }
+        if let Some(frame) = &window.frame {
+            child!(walk_visit_window_frame(v, frame));
+        }
+    }
+    if let Some(guard) = &application.guard {
+        child!(walk_visit_boolean(v, guard));
+    }
+    Ok(Descent::Continue)
+}
+
+/// A CALL'S OWN PAYLOAD: the argument row. A guard and a window are the
+/// scalar POSITION's context and are reached through the application that
+/// owns them.
+pub fn walk_visit_functor_call<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    call: &FunctorCall<P>,
+) -> Result<Descent> {
+    use crate::pipeline::asts::core::operators::{CallArguments, ScalarArgument};
+    match &call.call().arguments {
+        CallArguments::None => {}
+        CallArguments::HigherOrder(part) => {
+            for argument in part.members.iter() {
+                match argument {
+                    HoArgument::Relation(relation) => child!(walk_visit_relational(v, relation)),
+                    HoArgument::Value(value) => child!(walk_visit_argument_value(v, value)),
+                    // Structural row marks: nothing beneath to reach.
+                    HoArgument::Landing(_) | HoArgument::Skip => {}
+                }
+            }
+        }
+        CallArguments::Scalar(members) => {
+            for member in members {
+                match member {
+                    ScalarArgument::Value(value) => child!(walk_visit_argument_value(v, value)),
+                    // A spread enumerates, a star names the whole, and a
+                    // context marker selects a calling mode: none evaluates,
+                    // so none has a child to reach.
+                    ScalarArgument::Callable(_)
+                    | ScalarArgument::Spread(_)
+                    | ScalarArgument::Star
+                    | ScalarArgument::Context(_) => {}
+                }
+            }
+        }
+    }
+    Ok(Descent::Continue)
 }
 
 // =============================================================================
@@ -760,106 +778,103 @@ pub fn walk_visit_function<P, F: AstVisit<P> + ?Sized>(
 // mirroring the corresponding walk_transform_* helpers edge-for-edge)
 // =============================================================================
 
-pub fn walk_visit_domain_spec<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_access<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    spec: &DomainSpec<P>,
+    spec: &Access<P>,
 ) -> Result<Descent> {
     match spec {
-        DomainSpec::Positional(exprs) => {
-            for e in exprs {
-                child!(walk_visit_domain(v, e));
+        Access::Slots(slots) => {
+            for slot in slots {
+                child!(walk_visit_slot(v, slot));
             }
         }
-        DomainSpec::Glob
-        | DomainSpec::GlobWithUsing(_)
-        | DomainSpec::GlobWithUsingAll
-        | DomainSpec::Bare => {}
+        Access::All | Access::Dequalify(_) | Access::DequalifyAll | Access::Unasked => {}
     }
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_ordering_spec<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_slot<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    slot: &crate::pipeline::asts::core::Slot<P>,
+) -> Result<Descent> {
+    match slot {
+        crate::pipeline::asts::core::Slot::Constraint(
+            crate::pipeline::asts::core::SlotConstraint::Truth { value, .. },
+        ) => child!(walk_visit_boolean(v, value.truth())),
+        other => {
+            if let Some(term) = other.term() {
+                child!(walk_visit_domain(v, &term));
+            }
+        }
+    }
+    Ok(Descent::Continue)
+}
+
+pub fn walk_visit_ordering_spec<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     spec: &OrderingSpec<P>,
 ) -> Result<Descent> {
     walk_visit_domain(v, &spec.column)
 }
 
-pub fn walk_visit_modulo_spec<P, F: AstVisit<P> + ?Sized>(
+/// A publication item's children are its value's. A spread enumerates and
+/// evaluates nothing, so there is no scalar child under it to visit.
+pub fn walk_visit_out_item<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    spec: &ModuloSpec<P>,
+    item: &crate::pipeline::asts::core::OutItem<P>,
+) -> Result<Descent> {
+    enter!(v.enter_out_item(item));
+    match item {
+        crate::pipeline::asts::core::OutItem::One(one) => walk_visit_out_value(v, &one.expr),
+        // Neither of the other two computes a value, so neither has a
+        // child to reach.
+        crate::pipeline::asts::core::OutItem::Many(_)
+        | crate::pipeline::asts::core::OutItem::Whole => Ok(Descent::Continue),
+    }
+}
+
+pub fn walk_visit_group_spec<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    spec: &GroupSpec<P>,
 ) -> Result<Descent> {
     match spec {
-        ModuloSpec::Columns(columns) => {
-            for e in columns {
-                child!(walk_visit_domain(v, e));
+        GroupSpec::Distinct { keys } => {
+            for item in keys.iter() {
+                child!(walk_visit_out_item(v, item));
             }
         }
-        ModuloSpec::GroupBy {
-            reducing_by,
-            reducing_on,
-            delegates,
+        GroupSpec::Reduce {
+            keys,
+            reductions,
+            plan,
         } => {
-            for ode in reducing_by {
-                child!(walk_visit_domain(v, &ode.expr));
+            for item in keys {
+                child!(walk_visit_out_item(v, item));
             }
-            for ode in reducing_on {
-                child!(walk_visit_domain(v, &ode.expr));
+            for item in reductions.iter() {
+                child!(walk_visit_reduction_item(v, item));
             }
-            for w in delegates {
-                for ode in &w.payload {
-                    child!(walk_visit_domain(v, &ode.expr));
-                }
-                for o in &w.order {
-                    child!(walk_visit_ordering_spec(v, o));
-                }
+            for group in &plan.tree_groups {
+                child!(walk_visit_cte_requirements(v, &group.requirements));
             }
         }
     }
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_rename_spec<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_tabular_row<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    spec: &RenameSpec<P>,
+    row: &TabularRow<Datum<P>>,
 ) -> Result<Descent> {
-    walk_visit_domain(v, &spec.from)
-}
-
-pub fn walk_visit_reposition_spec<P, F: AstVisit<P> + ?Sized>(
-    v: &mut F,
-    spec: &RepositionSpec<P>,
-) -> Result<Descent> {
-    walk_visit_domain(v, &spec.column)
-}
-
-pub fn walk_visit_row<P, F: AstVisit<P> + ?Sized>(v: &mut F, row: &Row<P>) -> Result<Descent> {
-    for e in &row.values {
-        child!(walk_visit_domain(v, e));
-    }
-    Ok(Descent::Continue)
-}
-
-pub fn walk_visit_column_selector<P, F: AstVisit<P> + ?Sized>(
-    v: &mut F,
-    selector: &ColumnSelector<P>,
-) -> Result<Descent> {
-    match selector {
-        ColumnSelector::Explicit(exprs) => {
-            for e in exprs {
-                child!(walk_visit_domain(v, e));
-            }
+    for datum in row.iter() {
+        if let Datum::Value(value) = datum {
+            child!(walk_visit_domain(v, value));
         }
-        ColumnSelector::Regex(_)
-        | ColumnSelector::All
-        | ColumnSelector::Positional { .. }
-        | ColumnSelector::MultipleRegex(_)
-        | ColumnSelector::Resolved { .. } => {}
     }
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_window_frame<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_window_frame<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     frame: &WindowFrame<P>,
 ) -> Result<Descent> {
@@ -868,7 +883,7 @@ pub fn walk_visit_window_frame<P, F: AstVisit<P> + ?Sized>(
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_frame_bound<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_frame_bound<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     bound: &FrameBound<P>,
 ) -> Result<Descent> {
@@ -881,66 +896,120 @@ pub fn walk_visit_frame_bound<P, F: AstVisit<P> + ?Sized>(
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_string_template_part<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_value_template_part<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    part: &StringTemplatePart<P>,
+    part: &ValueTemplatePart<P>,
 ) -> Result<Descent> {
     match part {
-        StringTemplatePart::Interpolation(expr) => child!(walk_visit_domain(v, expr)),
-        StringTemplatePart::Text(_) => {}
+        ValueTemplatePart::Interpolation(expr) => child!(walk_visit_domain(v, expr)),
+        ValueTemplatePart::Text(_) => {}
     }
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_array_member<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_enclyph<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    member: &ArrayMember<P>,
+    enclyph: &Enclyph<P>,
+) -> Result<Descent> {
+    match enclyph {
+        Enclyph::Record(record) => {
+            for m in record.members.iter() {
+                child!(walk_visit_record_member(v, m));
+            }
+        }
+        Enclyph::EmptyRecord(_) => {}
+        Enclyph::Tuple(tuple) => {
+            for e in tuple.elements.iter() {
+                child!(walk_visit_domain(v, e));
+            }
+        }
+    }
+    Ok(Descent::Continue)
+}
+
+pub fn walk_visit_record_member<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    member: &RecordMember<P>,
 ) -> Result<Descent> {
     match member {
-        ArrayMember::Index { path, .. } => child!(walk_visit_domain(v, path)),
+        RecordMember::Keyed { value, .. } => child!(walk_visit_domain(v, value)),
+        RecordMember::Induced { value, .. } => child!(walk_visit_enclyph(v, value)),
+        RecordMember::Spread(_) | RecordMember::SelfKeyed(_) => {}
     }
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_curly_member<P, F: AstVisit<P> + ?Sized>(
+/// A REDUCTION PUBLISHES ONE COLUMN, and the two things that publish one
+/// have different children to reach.
+pub fn walk_visit_reduction_item<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    member: &CurlyMember<P>,
+    item: &ReductionItem<P>,
 ) -> Result<Descent> {
-    match member {
-        CurlyMember::Comparison { condition } => child!(walk_visit_boolean(v, condition)),
-        CurlyMember::KeyValue { value, .. } => child!(walk_visit_domain(v, value)),
-        CurlyMember::PathLiteral { path, .. } => child!(walk_visit_domain(v, path)),
-        CurlyMember::Shorthand { .. }
-        | CurlyMember::Glob
-        | CurlyMember::Pattern { .. }
-        | CurlyMember::OrdinalRange { .. }
-        | CurlyMember::Placeholder => {}
+    match item {
+        ReductionItem::Out(item) => child!(walk_visit_out_item(v, item)),
+        ReductionItem::Metadata(metadata) => child!(walk_visit_metadata_group(v, &metadata.group)),
+        ReductionItem::Pivot(pivot) => {
+            child!(walk_visit_domain(v, &pivot.value_column));
+            child!(walk_visit_domain(v, &pivot.pivot_key));
+        }
+        ReductionItem::Delegate(delegate) => {
+            for item in &delegate.payload {
+                child!(walk_visit_out_item(v, item));
+            }
+            for o in &delegate.order {
+                child!(walk_visit_ordering_spec(v, o));
+            }
+        }
     }
     Ok(Descent::Continue)
 }
 
-pub fn walk_visit_case_arm<P, F: AstVisit<P> + ?Sized>(
+pub fn walk_visit_metadata_group<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
-    arm: &CaseArm<P>,
+    group: &MetadataGroup<P>,
 ) -> Result<Descent> {
-    match arm {
-        CaseArm::Simple {
-            test_expr, result, ..
+    match &group.target {
+        MetadataTarget::Enclyph(enclyph) => child!(walk_visit_enclyph(v, enclyph)),
+        MetadataTarget::Group(nested) => child!(walk_visit_metadata_group(v, nested)),
+    }
+    if let Some(r) = &group.cte_requirements {
+        child!(walk_visit_cte_requirements(v, r));
+    }
+    Ok(Descent::Continue)
+}
+
+/// The anchor is the CASE's, reached once; the arms are its own.
+pub fn walk_visit_case<P: Phase, F: AstVisit<P> + ?Sized>(
+    v: &mut F,
+    case: &CaseExpression<P>,
+) -> Result<Descent> {
+    let default = match case {
+        CaseExpression::Anchored {
+            anchor,
+            arms,
+            default,
         } => {
-            child!(walk_visit_domain(v, test_expr));
-            child!(walk_visit_domain(v, result));
+            child!(walk_visit_domain(v, anchor));
+            for arm in arms.iter() {
+                child!(walk_visit_domain(v, &arm.result));
+            }
+            default
         }
-        CaseArm::CurriedSimple { result, .. } => child!(walk_visit_domain(v, result)),
-        CaseArm::Searched { condition, result } => {
-            child!(walk_visit_boolean(v, condition));
-            child!(walk_visit_domain(v, result));
+        CaseExpression::Searched { arms, default } => {
+            for arm in arms.iter() {
+                child!(walk_visit_boolean(v, &arm.condition));
+                child!(walk_visit_domain(v, &arm.result));
+            }
+            default
         }
-        CaseArm::Default { result } => child!(walk_visit_domain(v, result)),
+    };
+    if let Some(result) = default {
+        child!(walk_visit_domain(v, result));
     }
     Ok(Descent::Continue)
 }
 
-fn walk_visit_cte_requirements<P, F: AstVisit<P> + ?Sized>(
+fn walk_visit_cte_requirements<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     reqs: &CteRequirements<P>,
 ) -> Result<Descent> {

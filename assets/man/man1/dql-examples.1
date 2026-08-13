@@ -178,6 +178,50 @@ $ dql query --db app.db --sequential '
 consult!("job.dql", "job")
 run_namespace!(job)(*)'
 .EE
+.SH MENTIONS, GROUNDED HEADS, AND ER EDGES
+A rule head grounds on what has a literal spelling \(em the switch.
+Two clauses of one head, selected by a symbol at the call site. Given
+\fBspeed.dql\fR:
+.EX
+speed(::fast, y)(*) :- _(m @ "f1") |> (m, y as bound)
+speed(::slow, y)(*) :- _(m @ "s1") |> (m, y as bound)
+.EE
+.EX
+$ dql query --db app.db --sequential '
+consult!("speed.dql", "ns")
+enlist!("ns")
+speed(::fast, "z")(*)'
+m   bound
+f1  z
+.EE
+A symbol nobody declared refuses at compile time, listing the declared
+spellings \(em a provable miss is an error, not an empty relation.
+.PP
+A \fBmention\fR names a relation-access term as a value. Two
+spellings, one thing: light \fB::people(*)\fR and delimited
+\fB:`people(*)`\fR \(em both canonicalize, so whitespace never
+matters and a head declared with one is selected by the other.
+.PP
+\fBER edges\fR are declared ground-instance clauses; the context is a
+symbol on the operator. Given \fBer.dql\fR:
+.EX
+people(*) &(::normal) orders(*) :-
+  people(*), orders(*), people.pid = orders.o_pid
+.EE
+.EX
+people(*) &(::normal) orders(*)         direct edge: reduces to its join
+users(*) &&(::normal) items(*)          transitive walk: endpoints only
+people(*) as p &(::normal) orders(*)    alias is OUTSIDE the term
+.EE
+Selection is by the term''s exact canonical spelling; an unknown
+context or an undeclared pair is a hard error naming what IS declared.
+.PP
+\fBPipe landing is strict\fR: a piped relation lands at the FIRST
+parameter of a parameterized rule, or at exactly one explicit \fB@\fR:
+.EX
+_(x @ 1; 2) |> first_table("young")(*)   lands at T(*), first param
+_(x @ 1; 2) |> tagged("young", @)(*)     @ says where the pipe goes
+.EE
 .SH THE FIVE TRAPS
 The mistakes every newcomer makes, in one place:
 .IP 1. 3

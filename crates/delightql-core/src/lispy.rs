@@ -50,6 +50,13 @@ impl ToLispy for delightql_types::SqlIdentifier {
     }
 }
 
+/// A slot the phase gives no value: nothing to render, rendered as nothing.
+impl ToLispy for () {
+    fn to_lispy(&self) -> String {
+        "()".to_string()
+    }
+}
+
 impl ToLispy for bool {
     fn to_lispy(&self) -> String {
         if *self {

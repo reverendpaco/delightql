@@ -3,6 +3,7 @@ _(target, doc ----
   "sys::entities.entity_attribute",            "A column belonging to an entity, with its declared type and ordinal position." ;
   "sys::entities.entity_clause",               "One clause of an entity's definition; multi-clause entities (disjunctive functions, facts) have several." ;
   "sys::entities.join_edge",                    "A declared ER edge: the context symbol and the two ground terms as naked canonical spellings; derived from consulted edge declarations." ;
+  "sys::entities.functional_dependency",       "A declared fact-function mode: the ordered input and output attributes one entity's `->` declares, with each authored identifier's stropping. The declaration that makes an inspectable relation callable." ;
   "sys::entities::ho.ho_param",                 "A parameter of a higher-order entity (a parameterized table or function)." ;
   "sys::entities::interior.interior_entity",    "An interior relation nested within a parent entity — a tree-group column, e.g. from `~> {...}`." ;
   "sys::ns.namespace",                          "A namespace: a named scope that groups activated entities under a fully-qualified path." ;
@@ -14,4 +15,4 @@ _(target, doc ----
   "sys::targeting.dialect_form_rule",           "A form-selection rule: which DelightQL form a target chooses for a given construct." ;
   "sys::targeting.dialect_capability",          "A capability flag describing whether a target supports a given feature." ;
   "sys::execution.compilation",                 "A compilation record: one DQL-to-SQL transpilation, retained for inspection."
-) |> doc!(target, doc)
+) |> doc!(target, doc)(*)

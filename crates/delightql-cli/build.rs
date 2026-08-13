@@ -9,6 +9,7 @@ use rusqlite::Connection;
 
 const BOOK_APPLICATION_ID: i64 = 0x4451_4c42; // DQLB
 const MAN_APPLICATION_ID: i64 = 0x4451_4c4d; // DQLM
+const EDITOR_APPLICATION_ID: i64 = 0x4451_4c45; // DQLE
 const DOC_SCHEMA_VERSION: i64 = 1;
 
 fn main() {
@@ -19,9 +20,11 @@ fn main() {
         .expect("repository root");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    run_asset_front_door(&repo_root);
+    let target = env::var("TARGET").expect("TARGET");
+    run_asset_front_door(&repo_root, &target);
     build_book_database(&repo_root, &out_dir.join("book.sqlite"));
     build_man_database(&repo_root, &out_dir.join("man.sqlite"));
+    build_editor_database(&repo_root, &out_dir.join("editor.sqlite"), &target);
 
     // Capture version from Cargo.toml
     let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
@@ -136,34 +139,52 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-/// The assets front door (BOOK-NEXT-GEN.md §7): one make invocation
+/// The assets front door: one make invocation
 /// produces every embedded database; build.rs synthesizes nothing. It
 /// knows two things — how to ask for the files (this function) and how
 /// to refuse them (the verifications below). *Assume existence, verify
 /// compliance* — the bundler is trusted for nothing.
-fn run_asset_front_door(repo_root: &Path) {
+fn run_asset_front_door(repo_root: &Path, target: &str) {
     let assets_dir = repo_root.join("assets");
+    // TARGET pins the platform recorded in the editor bundle's
+    // parser_artifact; build_editor_database refuses a mismatch, so a
+    // cross-compile without a target-capable cc fails here, loudly.
     let status = Command::new("make")
         .arg("-C")
         .arg(&assets_dir)
+        .arg(format!("TARGET={target}"))
         .status()
-        .expect("run the assets front door (needs make + uv; the bundler declares its own python deps)");
+        .expect("run the assets front door (needs make + uv + tree-sitter + cc; the bundler declares its own python deps)");
     assert!(
         status.success(),
         "asset bundling failed: make -C {}",
         assets_dir.display()
     );
     // Watch the inputs, not the products: rerun-if-changed on bundled/
-    // would re-trigger cargo after every make run.
+    // (or on grammar/src, grammar/delightql.so) would re-trigger cargo
+    // after every make run.
     for input in ["books", "man", "bin/bundle.py", "Makefile"] {
         println!(
             "cargo:rerun-if-changed={}",
             assets_dir.join(input).display()
         );
     }
+    for input in [
+        "grammar/grammar.js",
+        "grammar/tokens.js",
+        "grammar/conflicts.js",
+        "grammar/package.json",
+        "grammar/tree-sitter.json",
+        "grammar/queries",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            repo_root.join(input).display()
+        );
+    }
 }
 
-/// The book bundle's side of the seam: verify the §6 contract, embed.
+/// The book bundle's side of the seam: verify the contract, embed.
 fn build_book_database(repo_root: &Path, output: &Path) {
     let bundled = repo_root.join("assets/bundled/books.sqlite");
     let conn = Connection::open(&bundled)
@@ -338,6 +359,115 @@ fn build_man_database(repo_root: &Path, output: &Path) {
     let temp = output.with_extension("sqlite.tmp");
     let _ = fs::remove_file(&temp);
     fs::copy(&bundled, &temp).unwrap_or_else(|e| panic!("stage bundled man into OUT_DIR: {e}"));
+    publish(&temp, output);
+}
+
+/// The editor bundle's side of the seam: same ask-and-refuse shape as
+/// book and man, plus the platform check no other bundle needs — the
+/// compiled parser is target-specific, so the artifact's recorded triple
+/// must be the one this binary is being built for.
+fn build_editor_database(repo_root: &Path, output: &Path, target: &str) {
+    let bundled = repo_root.join("assets/bundled/editor.sqlite");
+    let conn = Connection::open(&bundled)
+        .unwrap_or_else(|e| panic!("open bundled editor {}: {e}", bundled.display()));
+    validate_database(
+        &conn,
+        EDITOR_APPLICATION_ID,
+        &["bundle_meta", "editor_query", "grammar_source", "parser_artifact"],
+    );
+    expect_table_shape(
+        &conn,
+        "bundle_meta",
+        &[
+            ("singleton", "INTEGER", 1),
+            ("schema_version", "INTEGER", 0),
+            ("content_version", "TEXT", 0),
+            ("source_digest", "TEXT", 0),
+        ],
+    );
+    expect_table_shape(
+        &conn,
+        "grammar_source",
+        &[
+            ("path", "TEXT", 1),
+            ("content", "TEXT", 0),
+            ("content_digest", "TEXT", 0),
+        ],
+    );
+    expect_table_shape(
+        &conn,
+        "editor_query",
+        &[
+            ("name", "TEXT", 1),
+            ("content", "TEXT", 0),
+            ("content_digest", "TEXT", 0),
+        ],
+    );
+    expect_table_shape(
+        &conn,
+        "parser_artifact",
+        &[
+            ("target", "TEXT", 1),
+            ("abi_version", "INTEGER", 0),
+            ("content", "BLOB", 0),
+            ("content_digest", "TEXT", 0),
+        ],
+    );
+    let meta_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM bundle_meta", [], |row| row.get(0))
+        .expect("count editor bundle_meta rows");
+    assert_eq!(meta_rows, 1, "editor bundle_meta must hold exactly one row");
+    let (singleton, schema_version): (i64, i64) = conn
+        .query_row(
+            "SELECT singleton, schema_version FROM bundle_meta",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read editor bundle_meta");
+    assert_eq!(singleton, 1, "editor bundle_meta singleton");
+    assert_eq!(
+        schema_version, DOC_SCHEMA_VERSION,
+        "editor bundle_meta schema_version"
+    );
+    let grammar_js: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM grammar_source WHERE path = 'grammar.js'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("look for grammar.js");
+    assert_eq!(grammar_js, 1, "editor bundle carries no grammar.js");
+    let queries: i64 = conn
+        .query_row("SELECT COUNT(*) FROM editor_query", [], |row| row.get(0))
+        .expect("count editor queries");
+    assert!(queries > 0, "editor bundle contains no queries");
+    let artifacts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM parser_artifact", [], |row| row.get(0))
+        .expect("count parser artifacts");
+    assert_eq!(artifacts, 1, "exactly one parser artifact per binary");
+    let (artifact_target, abi_version, magic): (String, i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT target, abi_version, substr(content, 1, 4) FROM parser_artifact",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read parser artifact");
+    assert_eq!(
+        artifact_target, target,
+        "parser artifact was compiled for a different platform than this binary"
+    );
+    assert!(abi_version >= 1, "parser artifact abi_version");
+    let is_shared_lib = magic.starts_with(b"\x7fELF")
+        || magic.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+        || magic.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
+        || magic.starts_with(b"MZ");
+    assert!(is_shared_lib, "parser artifact is not a shared library");
+    drop(conn);
+
+    let temp = output.with_extension("sqlite.tmp");
+    let _ = fs::remove_file(&temp);
+    fs::copy(&bundled, &temp)
+        .unwrap_or_else(|e| panic!("stage bundled editor into OUT_DIR: {e}"));
     publish(&temp, output);
 }
 

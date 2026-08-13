@@ -14,109 +14,62 @@
 //! `data::test^lib::views.high_balance(*)` to expand into the view body with
 //! unqualified table references patched to use the data namespace.
 
-use crate::ddl::ddl_builder;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::{
-    walk_transform_domain, walk_transform_inner_relation, walk_transform_operator,
-    walk_transform_relation, AstTransform,
+    walk_transform_domain, walk_transform_inner_relation, walk_transform_relation, AstTransform,
 };
 use crate::pipeline::ast_unresolved;
-use crate::pipeline::asts::core::expressions::pipes::PipeDirection;
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
 use crate::pipeline::asts::core::metadata::GroundedPath;
+use crate::pipeline::asts::core::AuthoredColumn;
 use crate::pipeline::asts::core::{
-    CfeDefinition, ContextMode, DomainExpression, FunctionExpression, PipeExpression, Relation,
-    UnaryRelationalOperator, Unresolved,
+    CfeDefinition, DomainExpression, FunctionApplication, Relation, Unresolved,
 };
-use crate::pipeline::asts::ddl::{DdlDefinition, DdlHead, ViewHeadItem};
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::asts::ddl::{Clause, DefKind, HeadItem, HeadItems, HoParam};
+use crate::pipeline::asts::vocabulary::Vec1;
 use crate::resolution::registry::ConsultRegistry;
-use delightql_types::SqlIdentifier;
-use log::debug;
 use std::collections::HashMap;
-
-/// Convert a NamespacePath to a namespace FQ string for ConsultRegistry lookup
-pub(crate) fn namespace_path_to_fq(ns: &ast_unresolved::NamespacePath) -> String {
-    let parts: Vec<&str> = ns.iter().map(|i| i.name.as_str()).collect();
-    parts.join("::")
-}
-
-/// Inline consulted functions in a unary relational operator (grounded path).
-///
-/// Walks the operator's domain expressions, collecting DDL function definitions
-/// as CfeDefinitions for precompilation. Returns the operator and collected CFEs.
-pub(super) fn inline_consulted_functions_in_operator(
-    operator: ast_unresolved::UnaryRelationalOperator,
-    grounding: &GroundedPath,
-    consult: &ConsultRegistry,
-) -> Result<(ast_unresolved::UnaryRelationalOperator, Vec<CfeDefinition>)> {
-    let mut inliner = GroundedInliner {
-        grounding,
-        consult,
-        collected_cfes: vec![],
-    };
-    let op = inliner.transform_operator(operator)?;
-    Ok((op, inliner.collected_cfes))
-}
-
-/// Extract function name and namespace from a Curried function with empty arguments.
-/// Returns None if the function isn't a zero-arg Curried expression.
-fn extract_empty_curried_name(
-    func: &ast_unresolved::FunctionExpression,
-) -> Option<(String, Option<ast_unresolved::NamespacePath>)> {
-    match func {
-        ast_unresolved::FunctionExpression::Curried {
-            name,
-            namespace,
-            arguments,
-            ..
-        } if arguments.is_empty() => Some((name.to_string(), namespace.clone())),
-        // Non-Curried or non-empty-args: not a zero-arg curried call
-        // (Regular, Bracket, Infix, Lambda, StringTemplate, CaseExpression,
-        //  HigherOrder, Window, Curly, MetadataTreeGroup, Array, JsonPath,
-        //  or Curried with non-empty args)
-        _ => None,
-    }
-}
 
 /// Look up a function entity by name: if namespace is specified, look in that
 /// namespace; otherwise search across all borrowed namespaces.
-fn lookup_borrowed_function(
-    name: &str,
-    namespace: Option<&ast_unresolved::NamespacePath>,
+pub(super) fn lookup_borrowed_function(
+    name: &delightql_types::SqlIdentifier,
+    namespace: Option<&str>,
     consult: &ConsultRegistry,
     scope: Option<&str>,
 ) -> Result<Option<crate::resolution::registry::ConsultedEntity>> {
     if let Some(ns) = namespace {
-        let fq = namespace_path_to_fq(ns);
-        // Blueprint inertness, loud door for the function route (M2,
-        // companion_linear--74): a qualified call into an archived blueprint
+        let fq = ns.to_string();
+        // Blueprint inertness, loud door for the function route
+        // (companion_linear--74): a qualified call into an archived blueprint
         // gets the badged refusal, not a confusing "no such function".
         consult.refuse_if_blueprint_fq(&fq)?;
         Ok(consult
-            .lookup_entity(name, &fq, scope)
+            .lookup_entity(name.as_str(), name.is_stropped(), &fq, scope)
             .filter(|e| e.entity_type == EntityType::DqlFunctionExpression))
     } else {
-        consult.lookup_enlisted_function(name, scope)
+        consult.lookup_enlisted_function(name.as_str(), name.is_stropped(), scope)
     }
 }
 
 /// Look up a context-aware function entity (type=3) by name.
-fn lookup_borrowed_context_aware_function(
-    name: &str,
-    namespace: Option<&ast_unresolved::NamespacePath>,
+pub(super) fn lookup_borrowed_context_aware_function(
+    name: &delightql_types::SqlIdentifier,
+    namespace: Option<&str>,
     consult: &ConsultRegistry,
     scope: Option<&str>,
 ) -> Result<Option<crate::resolution::registry::ConsultedEntity>> {
     if let Some(ns) = namespace {
-        let fq = namespace_path_to_fq(ns);
-        // Blueprint inertness, loud door (M2, --74) — see lookup_borrowed_function.
+        let fq = ns.to_string();
+        // Blueprint inertness, loud door (--74) — see lookup_borrowed_function.
         consult.refuse_if_blueprint_fq(&fq)?;
         Ok(consult
-            .lookup_entity(name, &fq, scope)
+            .lookup_entity(name.as_str(), name.is_stropped(), &fq, scope)
             .filter(|e| e.entity_type == EntityType::DqlContextAwareFunctionExpression))
     } else {
-        consult.lookup_enlisted_context_aware_function(name, scope)
+        consult.lookup_enlisted_context_aware_function(name.as_str(), name.is_stropped(), scope)
     }
 }
 
@@ -130,61 +83,59 @@ pub(super) fn pre_grounded_data_ns_path(
 ) -> Option<ast_unresolved::NamespacePath> {
     consult
         .get_namespace_default_data_ns(namespace_fq)
-        .and_then(|fq| {
-            let parts: Vec<String> = fq.split("::").map(|s| s.to_string()).collect();
-            ast_unresolved::NamespacePath::from_parts(parts).ok()
-        })
+        .and_then(|fq| ast_unresolved::NamespacePath::from_fq_string(&fq).ok())
 }
 
-/// Convert a consulted entity (type=1 or type=3) into a CfeDefinition for
-/// precompilation.
+/// Convert a consulted entity (type=1 or type=3) into the CfeDefinition the
+/// instantiation road spends at its call sites.
 ///
-/// Re-parses the stored definition text to extract the context_mode and body,
-/// then assembles a CfeDefinition that the CFE precompiler can process.
-/// For multi-clause definitions (disjunctive functions), synthesizes a CASE
-/// expression with parameter Lvars intact for the precompiler.
+/// Re-parses the stored definition text to extract the context_mode and body.
+/// For multi-clause definitions (disjunctive functions), the clauses assemble
+/// into one selection whose arms carry what each clause computes.
 pub(crate) fn consulted_entity_to_cfe_definition(
     entity: &crate::resolution::registry::ConsultedEntity,
 ) -> Result<CfeDefinition> {
-    let ddl_defs = ddl_builder::build_ddl_file(&entity.definition)?;
-    if ddl_defs.is_empty() {
-        return Err(DelightQLError::parse_error(format!(
-            "No definition found for function '{}'",
+    let group = crate::ddl::reconstruct::group(&entity.definition).map_err(|e| {
+        DelightQLError::parse_error(format!(
+            "No definition found for function '{}': {e}",
             entity.name
-        )));
-    }
+        ))
+    })?;
 
-    // Split params into curried (callable) and regular based on FunctionParam.callable
-    let (curried_params, parameters) = match &ddl_defs[0].head {
-        DdlHead::Function { params, .. } => {
-            let curried: Vec<String> = params
-                .iter()
-                .filter(|p| p.callable)
-                .map(|p| p.name.clone())
-                .collect();
-            let regular: Vec<String> = params
-                .iter()
-                .filter(|p| !p.callable)
-                .map(|p| p.name.clone())
-                .collect();
-            (curried, regular)
+    // The declared parameters, in BINDING order: a call site supplies code
+    // first, so the callable formals stand before the scalar ones whatever
+    // order the declaration interleaved them in. The carrier's group door
+    // makes a misordering unwritable.
+    use crate::pipeline::asts::core::CfeFormals;
+    let formals: CfeFormals = if group.kind() == DefKind::Function {
+        let mut callable: Vec<delightql_types::SqlIdentifier> = Vec::new();
+        let mut scalar: Vec<delightql_types::SqlIdentifier> = Vec::new();
+        for param in group.params() {
+            let HoParam::Scalar {
+                name,
+                callable: is_code,
+                ..
+            } = param
+            else {
+                continue;
+            };
+            if *is_code {
+                callable.push(name.clone());
+            } else {
+                scalar.push(name.clone());
+            }
         }
-        _ => (
-            vec![],
-            entity.params.iter().map(|p| p.name.clone()).collect(),
-        ),
+        CfeFormals::from_role_groups(callable, scalar)
+    } else {
+        CfeFormals::from_role_groups([], entity.params.iter().map(|p| p.name().clone()))
     };
+    let context_mode = group.context().clone();
+    let mut clauses = group.into_clauses();
 
-    if ddl_defs.len() == 1 {
-        let def = ddl_defs.into_iter().next().unwrap();
+    if clauses.len() == 1 {
+        let clause = clauses.pop().expect("length checked above");
 
-        // Extract context_mode BEFORE consuming def
-        let context_mode = match &def.head {
-            DdlHead::Function { context_mode, .. } => context_mode.clone(),
-            _ => ContextMode::None,
-        };
-
-        let body = def.into_domain_expr().ok_or_else(|| {
+        let body = clause.into_out_value().ok_or_else(|| {
             DelightQLError::parse_error(format!(
                 "Expected scalar body for function '{}', got relational",
                 entity.name
@@ -192,25 +143,22 @@ pub(crate) fn consulted_entity_to_cfe_definition(
         })?;
 
         Ok(CfeDefinition {
-            name: entity.name.to_string(),
-            curried_params,
-            parameters,
+            name: entity.name.clone(),
+            formals,
             context_mode,
             body,
             source_namespace: Some(entity.namespace.clone()),
         })
     } else {
         // Multi-clause: synthesize CASE expression with parameter Lvars intact
-        let context_mode = match &ddl_defs[0].head {
-            DdlHead::Function { context_mode, .. } => context_mode.clone(),
-            _ => ContextMode::None,
-        };
-        let body = build_case_body_from_clauses(ddl_defs)?;
+        let body = crate::pipeline::asts::core::OutValue::Domain(build_case_body_from_clauses(
+            &entity.name,
+            clauses,
+        )?);
 
         Ok(CfeDefinition {
-            name: entity.name.to_string(),
-            curried_params,
-            parameters,
+            name: entity.name.clone(),
+            formals,
             context_mode,
             body,
             source_namespace: Some(entity.namespace.clone()),
@@ -219,752 +167,52 @@ pub(crate) fn consulted_entity_to_cfe_definition(
 }
 
 // ============================================================================
-// Recursive discovery of nested function references in CFE bodies
+// Multi-clause selection synthesis
 // ============================================================================
 
-/// Walk a domain expression looking for function calls to consulted entities.
-/// For each found, create a CfeDefinition and recursively discover in that
-/// entity's body too. Returns all transitively discovered CfeDefinitions.
-///
-/// This lets us collect `double` when `doubled_value:(x) :- double:(x)` is
-/// collected — even though `double` isn't directly referenced in the user query.
-fn discover_nested_cfes(
-    body: &DomainExpression<Unresolved>,
-    source_ns: &str,
-    consult: &ConsultRegistry,
-    data_ns: Option<&ast_unresolved::NamespacePath>,
-    already_collected: &[CfeDefinition],
-) -> Result<Vec<CfeDefinition>> {
-    let mut seen: std::collections::HashSet<String> =
-        already_collected.iter().map(|c| c.name.clone()).collect();
-    let mut result = Vec::new();
-    discover_nested_cfes_inner(body, source_ns, consult, data_ns, &mut seen, &mut result)?;
-    Ok(result)
-}
-
-fn discover_nested_cfes_inner(
-    body: &DomainExpression<Unresolved>,
-    source_ns: &str,
-    consult: &ConsultRegistry,
-    data_ns: Option<&ast_unresolved::NamespacePath>,
-    seen: &mut std::collections::HashSet<String>,
-    out: &mut Vec<CfeDefinition>,
-) -> Result<()> {
-    match body {
-        DomainExpression::Function(func) => {
-            match func {
-                FunctionExpression::Regular {
-                    name,
-                    namespace,
-                    arguments,
-                    ..
-                }
-                | FunctionExpression::Curried {
-                    name,
-                    namespace,
-                    arguments,
-                    ..
-                } => {
-                    let name_str = name.to_string();
-                    if !seen.contains(&name_str) {
-                        // STRICT definition independence (Phase 7 stage 2,
-                        // owner-ratified): the lookup is SCOPED to the source
-                        // namespace — its own edges (namespace_local_enlist)
-                        // and itself — never the caller's session. The old
-                        // activate-into-scope dance is gone; the scoped seed
-                        // reads the namespace-owned edges directly.
-                        let entity = lookup_borrowed_function(
-                            &name_str,
-                            namespace.as_ref(),
-                            consult,
-                            Some(source_ns),
-                        );
-                        // Also try context-aware functions
-                        let ccafe_entity =
-                            if entity.as_ref().ok().and_then(|e| e.as_ref()).is_none() {
-                                lookup_borrowed_context_aware_function(
-                                    &name_str,
-                                    namespace.as_ref(),
-                                    consult,
-                                    Some(source_ns),
-                                )
-                            } else {
-                                Ok(None)
-                            };
-
-                        let entity = entity?.or(ccafe_entity?);
-                        if let Some(entity) = entity {
-                            seen.insert(name_str);
-                            let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
-                            if let Some(ns) = data_ns {
-                                cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
-                            } else if let Some(ns) =
-                                pre_grounded_data_ns_path(consult, &entity.namespace)
-                            {
-                                cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, &ns);
-                            }
-                            // Recurse into this entity's body
-                            discover_nested_cfes_inner(
-                                &cfe_def.body,
-                                &entity.namespace,
-                                consult,
-                                data_ns,
-                                seen,
-                                out,
-                            )?;
-                            out.push(cfe_def);
-                        }
-                    }
-                    // Recurse into arguments
-                    for arg in arguments {
-                        discover_nested_cfes_inner(arg, source_ns, consult, data_ns, seen, out)?;
-                    }
-                }
-                FunctionExpression::CaseExpression { arms, .. } => {
-                    for arm in arms {
-                        match arm {
-                            ast_unresolved::CaseArm::Searched { result, .. } => {
-                                discover_nested_cfes_inner(
-                                    result, source_ns, consult, data_ns, seen, out,
-                                )?;
-                            }
-                            ast_unresolved::CaseArm::Simple {
-                                test_expr, result, ..
-                            } => {
-                                discover_nested_cfes_inner(
-                                    test_expr, source_ns, consult, data_ns, seen, out,
-                                )?;
-                                discover_nested_cfes_inner(
-                                    result, source_ns, consult, data_ns, seen, out,
-                                )?;
-                            }
-                            ast_unresolved::CaseArm::Default { result } => {
-                                discover_nested_cfes_inner(
-                                    result, source_ns, consult, data_ns, seen, out,
-                                )?;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                FunctionExpression::Infix { left, right, .. } => {
-                    discover_nested_cfes_inner(left, source_ns, consult, data_ns, seen, out)?;
-                    discover_nested_cfes_inner(right, source_ns, consult, data_ns, seen, out)?;
-                }
-                FunctionExpression::Window { arguments, .. } => {
-                    for arg in arguments {
-                        discover_nested_cfes_inner(arg, source_ns, consult, data_ns, seen, out)?;
-                    }
-                }
-                _ => {}
-            }
-        }
-        DomainExpression::PipedExpression { value, .. } => {
-            discover_nested_cfes_inner(value, source_ns, consult, data_ns, seen, out)?;
-        }
-        DomainExpression::Parenthesized { inner, .. } => {
-            discover_nested_cfes_inner(inner, source_ns, consult, data_ns, seen, out)?;
-        }
-        DomainExpression::ScalarSubquery { .. } => {
-            // Scalar subqueries reference tables — we still collect nested function refs
-            // but the subquery itself will be resolved by the precompiler with the real schema.
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-// ============================================================================
-// Borrowed inlining — BorrowedInliner fold
-// ============================================================================
-
-/// Collects consulted functions as CfeDefinitions for precompilation.
-/// Overrides transform_domain for function collection and piped-expression chain
-/// processing, transform_operator for MapCover/EmbedMapCover conversion, and
-/// transform_pipe for conditional operator processing (skip when data_ns is None).
-struct BorrowedInliner<'a> {
-    consult: &'a ConsultRegistry,
-    data_ns: Option<&'a ast_unresolved::NamespacePath>,
-    /// STRICT definition scope (Phase 7/9): inside a consulted view body
-    /// the sibling-function lookups resolve against the OWNING namespace
-    /// (its own edges), never the caller's session. None = the prompt.
-    scope: Option<&'a str>,
-    /// Functions discovered during fold, to be precompiled and injected
-    /// as WithPrecompiledCfes by the resolver.
-    collected_ccafe_cfes: Vec<CfeDefinition>,
-    /// When true, skip type=1 collection but still discover type=3 CCAFEs.
-    /// Used inside pipe operators when data_ns is None: we need to discover
-    /// CCAFEs for precompilation but can't collect type=1 functions without
-    /// data_ns patching (that's handled by the per-pipe handler in mod.rs).
-    discovery_only: bool,
-}
-
-impl AstTransform<Unresolved, Unresolved> for BorrowedInliner<'_> {
-    fn transform_domain(
-        &mut self,
-        expr: DomainExpression<Unresolved>,
-    ) -> Result<DomainExpression<Unresolved>> {
-        match expr {
-            DomainExpression::Function(func) => {
-                // Extract name/namespace/arguments from Regular/Curried
-                let (name_str, namespace) = match &func {
-                    FunctionExpression::Regular {
-                        name, namespace, ..
-                    } => (name.to_string(), namespace.clone()),
-                    FunctionExpression::Curried {
-                        name, namespace, ..
-                    } => (name.to_string(), namespace.clone()),
-                    _ => {
-                        // Non-Regular/Curried: recurse into children
-                        return Ok(DomainExpression::Function(self.transform_function(func)?));
-                    }
-                };
-
-                // Lookup entity in borrowed namespaces (type=1 — regular functions)
-                if !self.discovery_only {
-                    let entity =
-                        lookup_borrowed_function(&name_str, namespace.as_ref(), self.consult, self.scope)?;
-
-                    if let Some(entity) = entity {
-                        debug!(
-                            "Collecting DDL function '{}' from namespace '{}' for precompilation",
-                            name_str, entity.namespace
-                        );
-                        let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
-                        if let Some(ns) = self.data_ns {
-                            cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
-                        } else if let Some(ns) =
-                            pre_grounded_data_ns_path(self.consult, &entity.namespace)
-                        {
-                            cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, &ns);
-                        }
-                        if !self
-                            .collected_ccafe_cfes
-                            .iter()
-                            .any(|c| c.name == cfe_def.name)
-                        {
-                            // Recursively discover nested function refs in the body
-                            let nested = discover_nested_cfes(
-                                &cfe_def.body,
-                                &entity.namespace,
-                                self.consult,
-                                self.data_ns,
-                                &self.collected_ccafe_cfes,
-                            )?;
-                            self.collected_ccafe_cfes.extend(nested);
-                            self.collected_ccafe_cfes.push(cfe_def);
-                        }
-                        // Pass through — will be substituted after precompilation
-                        return Ok(DomainExpression::Function(self.transform_function(func)?));
-                    }
-                }
-
-                // Try context-aware function (type=3) — same treatment
-                let ccafe_entity = lookup_borrowed_context_aware_function(
-                    &name_str,
-                    namespace.as_ref(),
-                    self.consult,
-                    self.scope,
-                )?;
-                if let Some(entity) = ccafe_entity {
-                    debug!(
-                        "Collecting DDL context-aware function '{}' from namespace '{}' for precompilation",
-                        name_str, entity.namespace
-                    );
-                    let cfe_def = consulted_entity_to_cfe_definition(&entity)?;
-                    if !self
-                        .collected_ccafe_cfes
-                        .iter()
-                        .any(|c| c.name == cfe_def.name)
-                    {
-                        self.collected_ccafe_cfes.push(cfe_def);
-                    }
-                    // Don't inline — pass through for CFE substitution after precompilation
-                    return Ok(DomainExpression::Function(self.transform_function(func)?));
-                }
-
-                // Not a consulted function — recurse into children
-                Ok(DomainExpression::Function(self.transform_function(func)?))
-            }
-            DomainExpression::PipedExpression {
-                value,
-                transforms,
-                alias,
-            } => {
-                let mut current_value = self.transform_domain(*value)?;
-                let mut remaining_transforms: Vec<(PipeDirection, FunctionExpression)> = Vec::new();
-
-                for (dir, transform) in transforms {
-                    let transform = self.transform_function(transform)?;
-                    let (name, namespace, args) = match &transform {
-                        FunctionExpression::Curried {
-                            name,
-                            namespace,
-                            arguments,
-                            ..
-                        } => (name.clone(), namespace.clone(), arguments.clone()),
-                        FunctionExpression::Regular {
-                            name,
-                            namespace,
-                            arguments,
-                            ..
-                        } => (name.clone(), namespace.clone(), arguments.clone()),
-                        _ => {
-                            remaining_transforms.push((dir, transform));
-                            continue;
-                        }
-                    };
-
-                    let full_args: Vec<DomainExpression> = dir.thread(current_value.clone(), args);
-                    let synthetic = DomainExpression::Function(FunctionExpression::Regular {
-                        name,
-                        namespace,
-                        arguments: full_args,
-                        alias: None,
-                        conditioned_on: None,
-                    });
-
-                    let inlined = self.transform_domain(synthetic)?;
-                    let was_inlined = !matches!(
-                        &inlined,
-                        DomainExpression::Function(FunctionExpression::Regular { .. })
-                    );
-
-                    if was_inlined {
-                        current_value = inlined;
-                    } else {
-                        remaining_transforms.push((dir, transform));
-                    }
-                }
-
-                if remaining_transforms.is_empty() {
-                    Ok(current_value)
-                } else {
-                    Ok(DomainExpression::PipedExpression {
-                        value: Box::new(current_value),
-                        transforms: remaining_transforms,
-                        alias,
-                    })
-                }
-            }
-            other => walk_transform_domain(self, other),
-        }
-    }
-
-    fn transform_operator(
-        &mut self,
-        op: UnaryRelationalOperator<Unresolved>,
-    ) -> Result<UnaryRelationalOperator<Unresolved>> {
-        // For MapCover/EmbedMapCover: if the function is a consulted entity,
-        // collect its CfeDefinition for precompilation but leave the operator
-        // intact. The resolver's resolve_map_cover_via_fold will handle
-        // function substitution and column expansion (regex, ordinals, etc.)
-        // uniformly — no manual lowering needed here.
-        match &op {
-            UnaryRelationalOperator::MapCover { function, .. }
-            | UnaryRelationalOperator::EmbedMapCover { function, .. } => {
-                if !self.discovery_only {
-                    self.collect_curried_consulted_function(function)?;
-                }
-            }
-            _ => {}
-        }
-        walk_transform_operator(self, op)
-    }
-
-    fn transform_pipe(
-        &mut self,
-        p: PipeExpression<Unresolved>,
-    ) -> Result<PipeExpression<Unresolved>> {
-        let source = self.transform_relational(p.source)?;
-        let operator = if self.data_ns.is_some() {
-            // With data_ns: full processing
-            self.transform_operator(p.operator)?
-        } else {
-            // Without data_ns: discovery-only mode for type=3 CCAFEs.
-            // Type=1 functions in pipe operators are collected by the
-            // per-pipe handler in resolver_fold.rs which has grounding context.
-            let prev = self.discovery_only;
-            self.discovery_only = true;
-            let op = self.transform_operator(p.operator)?;
-            self.discovery_only = prev;
-            op
-        };
-        Ok(PipeExpression {
-            source,
-            operator,
-            cpr_schema: p.cpr_schema,
-        })
-    }
-}
-
-impl BorrowedInliner<'_> {
-    /// Collect a CfeDefinition for a consulted function referenced in curried
-    /// form (e.g., `double:()` in a MapCover/EmbedMapCover function field).
-    /// Does NOT modify the operator — just registers the definition so the CFE
-    /// precompiler can process it before resolution.
-    fn collect_curried_consulted_function(&mut self, function: &FunctionExpression) -> Result<()> {
-        if let Some((name, namespace)) = extract_empty_curried_name(function) {
-            // Type=1: regular consulted function
-            let entity = lookup_borrowed_function(&name, namespace.as_ref(), self.consult, self.scope)?;
-            if let Some(entity) = entity {
-                debug!(
-                    "Collecting DDL function '{}' from namespace '{}' for precompilation (cover operator)",
-                    name, entity.namespace
-                );
-                let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
-                if let Some(ns) = self.data_ns {
-                    cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, ns);
-                } else if let Some(ns) =
-                    pre_grounded_data_ns_path(self.consult, &entity.namespace)
-                {
-                    cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, &ns);
-                }
-                if !self
-                    .collected_ccafe_cfes
-                    .iter()
-                    .any(|c| c.name == cfe_def.name)
-                {
-                    let nested = discover_nested_cfes(
-                        &cfe_def.body,
-                        &entity.namespace,
-                        self.consult,
-                        self.data_ns,
-                        &self.collected_ccafe_cfes,
-                    )?;
-                    self.collected_ccafe_cfes.extend(nested);
-                    self.collected_ccafe_cfes.push(cfe_def);
-                }
-                return Ok(());
-            }
-
-            // Type=3: context-aware consulted function
-            let ccafe_entity =
-                lookup_borrowed_context_aware_function(&name, namespace.as_ref(), self.consult, self.scope)?;
-            if let Some(entity) = ccafe_entity {
-                debug!(
-                    "Collecting DDL context-aware function '{}' from namespace '{}' for precompilation (cover operator)",
-                    name, entity.namespace
-                );
-                let cfe_def = consulted_entity_to_cfe_definition(&entity)?;
-                if !self
-                    .collected_ccafe_cfes
-                    .iter()
-                    .any(|c| c.name == cfe_def.name)
-                {
-                    self.collected_ccafe_cfes.push(cfe_def);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Inline consulted functions from borrowed namespaces in a unary relational operator.
-///
-/// Returns the transformed operator and any collected CfeDefinitions (type=1 and type=3)
-/// that need precompilation before the transformer can substitute them.
-pub(super) fn inline_consulted_functions_in_operator_borrowed(
-    operator: ast_unresolved::UnaryRelationalOperator,
-    consult: &ConsultRegistry,
-    data_ns: Option<&ast_unresolved::NamespacePath>,
-    scope: Option<&str>,
-) -> Result<(ast_unresolved::UnaryRelationalOperator, Vec<CfeDefinition>)> {
-    let mut inliner = BorrowedInliner {
-        consult,
-        data_ns,
-        scope,
-        collected_ccafe_cfes: vec![],
-        discovery_only: false,
-    };
-    let op = inliner.transform_operator(operator)?;
-    Ok((op, inliner.collected_ccafe_cfes))
-}
-
-// ============================================================================
-// GroundedInliner — consulted function inlining (grounded path)
-// ============================================================================
-
-struct GroundedInliner<'a> {
-    grounding: &'a GroundedPath,
-    consult: &'a ConsultRegistry,
-    collected_cfes: Vec<CfeDefinition>,
-}
-
-impl AstTransform<Unresolved, Unresolved> for GroundedInliner<'_> {
-    fn transform_domain(
-        &mut self,
-        expr: DomainExpression<Unresolved>,
-    ) -> Result<DomainExpression<Unresolved>> {
-        match expr {
-            DomainExpression::Function(func) => {
-                let (name, namespace) = match &func {
-                    FunctionExpression::Regular {
-                        name, namespace, ..
-                    } => (name.clone(), namespace.clone()),
-                    FunctionExpression::Curried {
-                        name, namespace, ..
-                    } => (name.clone(), namespace.clone()),
-                    _ => return walk_transform_domain(self, DomainExpression::Function(func)),
-                };
-
-                // Look up consulted entity — explicit namespace or grounded_ns search
-                let entity = if let Some(ns) = &namespace {
-                    let fq = namespace_path_to_fq(ns);
-                    self.consult
-                        .lookup_entity(&name, &fq, None)
-                        .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
-                } else {
-                    self.grounding.grounded_ns.iter().find_map(|ns| {
-                        let fq = namespace_path_to_fq(ns);
-                        self.consult
-                            .lookup_entity(&name, &fq, None)
-                            .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
-                    })
-                };
-
-                if let Some(entity) = entity {
-                    debug!(
-                        "Collecting DDL function '{}' from grounded path for precompilation",
-                        name
-                    );
-                    let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
-                    let data_ns = &self.grounding.data_ns;
-                    cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, data_ns);
-                    if !self.collected_cfes.iter().any(|c| c.name == cfe_def.name) {
-                        let nested = discover_nested_cfes(
-                            &cfe_def.body,
-                            &entity.namespace,
-                            self.consult,
-                            Some(data_ns),
-                            &self.collected_cfes,
-                        )?;
-                        self.collected_cfes.extend(nested);
-                        self.collected_cfes.push(cfe_def);
-                    }
-                    // Pass through — will be substituted after precompilation
-                    Ok(DomainExpression::Function(self.transform_function(func)?))
-                } else {
-                    walk_transform_domain(self, DomainExpression::Function(func))
-                }
-            }
-            other => walk_transform_domain(self, other),
-        }
-    }
-
-    fn transform_operator(
-        &mut self,
-        op: UnaryRelationalOperator<Unresolved>,
-    ) -> Result<UnaryRelationalOperator<Unresolved>> {
-        // For MapCover/EmbedMapCover: if the function is a consulted entity,
-        // collect its CfeDefinition for precompilation but leave the operator
-        // intact. Same treatment as BorrowedInliner.
-        match &op {
-            UnaryRelationalOperator::MapCover { function, .. }
-            | UnaryRelationalOperator::EmbedMapCover { function, .. } => {
-                self.collect_curried_consulted_function(function)?;
-            }
-            _ => {}
-        }
-        walk_transform_operator(self, op)
-    }
-}
-
-impl GroundedInliner<'_> {
-    /// Collect a CfeDefinition for a consulted function referenced in curried
-    /// form (e.g., `double:()` in a MapCover/EmbedMapCover function field).
-    fn collect_curried_consulted_function(&mut self, function: &FunctionExpression) -> Result<()> {
-        if let Some((name, namespace)) = extract_empty_curried_name(function) {
-            let entity = if let Some(ns) = &namespace {
-                let fq = namespace_path_to_fq(ns);
-                self.consult
-                    .lookup_entity(&name, &fq, None)
-                    .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
-            } else {
-                self.grounding.grounded_ns.iter().find_map(|ns| {
-                    let fq = namespace_path_to_fq(ns);
-                    self.consult
-                        .lookup_entity(&name, &fq, None)
-                        .filter(|e| e.entity_type == EntityType::DqlFunctionExpression)
-                })
-            };
-            if let Some(entity) = entity {
-                debug!(
-                    "Collecting DDL function '{}' from grounded path for precompilation (cover operator)",
-                    name
-                );
-                let mut cfe_def = consulted_entity_to_cfe_definition(&entity)?;
-                let data_ns = &self.grounding.data_ns;
-                cfe_def.body = patch_data_ns_in_domain_expr(cfe_def.body, data_ns);
-                if !self.collected_cfes.iter().any(|c| c.name == cfe_def.name) {
-                    let nested = discover_nested_cfes(
-                        &cfe_def.body,
-                        &entity.namespace,
-                        self.consult,
-                        Some(data_ns),
-                        &self.collected_cfes,
-                    )?;
-                    self.collected_cfes.extend(nested);
-                    self.collected_cfes.push(cfe_def);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-// ============================================================================
-// Multi-clause CASE synthesis
-// ============================================================================
-
-/// Unwrap a `DomainExpression::Predicate` to its inner `BooleanExpression`.
-///
-/// Guard expressions like `n % 15 = 0` are parsed by `body_parser` as
-/// `DomainExpression::Predicate { expr }`. This unwraps that wrapper so the
-/// guard can be used as a `CaseArm::Searched` condition.
-fn domain_expr_to_boolean(
-    expr: ast_unresolved::DomainExpression,
-) -> Result<ast_unresolved::BooleanExpression> {
-    match expr {
-        ast_unresolved::DomainExpression::Predicate { expr, .. } => Ok(*expr),
-        other => Err(DelightQLError::parse_error(format!(
-            "Expected boolean guard expression, got: {:?}",
-            other
-        ))),
-    }
-}
-
-/// Synthesize a `CaseExpression` from multiple guarded function clauses,
+/// Assemble a `ClauseSelection` from multiple guarded function clauses,
 /// leaving parameter Lvars intact (no substitution).
 ///
-/// Used when converting multi-clause DDL functions into CfeDefinitions. The
-/// precompiler will handle parameter resolution via fake columns.
+/// THE SYNTHESIZED SELECTION IS ITS OWN SHAPE: the arms carry clause BODIES,
+/// and a value rule's body is one of the crossing's licensed positions. The
+/// authored `CaseExpression` is a different carrier whose arm results are
+/// plain domain expressions, so neither is spelled with the other's type.
+///
+/// Used when converting multi-clause DDL functions into CfeDefinitions; the
+/// formals stand as ordinary named references until the frame answers them.
 fn build_case_body_from_clauses(
-    clauses: Vec<DdlDefinition>,
+    name: &str,
+    clauses: Vec<Clause>,
 ) -> Result<ast_unresolved::DomainExpression> {
-    let mut arms: Vec<ast_unresolved::CaseArm> = Vec::new();
+    let mut arms: Vec<crate::pipeline::asts::core::ClauseArm<Unresolved>> = Vec::new();
 
     for clause in &clauses {
-        let params = match &clause.head {
-            DdlHead::Function { params, .. } => params,
-            _ => {
-                return Err(DelightQLError::parse_error(
-                    "Multi-clause CASE synthesis requires function definitions",
-                ));
-            }
-        };
+        let params = clause.params();
 
-        let body = clause.as_domain_expr().ok_or_else(|| {
+        // A CLAUSE'S BODY IS WHAT IT COMPUTES, crossing included. The
+        // synthesized selection's arms carry the same thing, so a lawful
+        // crossed clause is not narrowed away on the way into one.
+        let body = clause.as_out_value().ok_or_else(|| {
             DelightQLError::parse_error(format!(
-                "Expected scalar body for multi-clause function '{}', got relational",
-                clause.name
+                "Expected scalar body for multi-clause function '{name}', got relational"
             ))
         })?;
 
-        let has_guard = params.iter().any(|p| p.guard.is_some());
-        if has_guard {
-            let guard_expr = params
-                .iter()
-                .find_map(|p| p.guard.as_ref())
-                .unwrap()
-                .clone();
-            let guard_bool = domain_expr_to_boolean(guard_expr)?;
-            arms.push(ast_unresolved::CaseArm::Searched {
-                condition: Box::new(guard_bool),
-                result: Box::new(body.clone()),
-            });
-        } else {
-            arms.push(ast_unresolved::CaseArm::Default {
-                result: Box::new(body.clone()),
-            });
-        }
+        let guard = params.iter().find_map(|p| match p {
+            HoParam::Scalar { guard, .. } => guard.as_ref(),
+            _ => None,
+        });
+        arms.push(crate::pipeline::asts::core::ClauseArm {
+            guard: guard.cloned(),
+            result: body.clone(),
+        });
     }
 
-    Ok(ast_unresolved::DomainExpression::Function(
-        ast_unresolved::FunctionExpression::CaseExpression { arms, alias: None },
-    ))
-}
-
-// ============================================================================
-// Alias application
-// ============================================================================
-
-/// Apply an alias to a domain expression.
-fn apply_alias(expr: &mut ast_unresolved::DomainExpression, alias: SqlIdentifier) {
-    match expr {
-        ast_unresolved::DomainExpression::Lvar {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::DomainExpression::Literal {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::DomainExpression::Function(func) => {
-            apply_alias_to_func(func, alias);
-        }
-        ast_unresolved::DomainExpression::ScalarSubquery {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::DomainExpression::Parenthesized {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::DomainExpression::Predicate {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        // For other expression types, alias is lost (shouldn't happen in practice)
-        other => panic!("catch-all hit in grounding.rs apply_alias: {:?}", other),
-    }
-}
-
-fn apply_alias_to_func(func: &mut ast_unresolved::FunctionExpression, alias: SqlIdentifier) {
-    match func {
-        ast_unresolved::FunctionExpression::Regular {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::FunctionExpression::Infix {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::FunctionExpression::Curried { .. } => {
-            // Curried doesn't have alias — this shouldn't happen after inlining
-        }
-        ast_unresolved::FunctionExpression::HigherOrder {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::FunctionExpression::Bracket {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::FunctionExpression::Lambda {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        ast_unresolved::FunctionExpression::CaseExpression {
-            alias: ref mut a, ..
-        } => {
-            *a = Some(alias);
-        }
-        other => panic!(
-            "catch-all hit in grounding.rs apply_alias_to_func: {:?}",
-            other
+    Ok(ast_unresolved::DomainExpression::Application(
+        ast_unresolved::FunctionApplication::ClauseSelection(
+            crate::pipeline::asts::core::ClauseSelection { arms },
         ),
-    }
+    ))
 }
 
 // ============================================================================
@@ -979,24 +227,26 @@ struct ParamSubstituter<'a> {
 }
 
 impl AstTransform<Unresolved, Unresolved> for ParamSubstituter<'_> {
+    crate::pipeline::ast_transform::same_phase_payload_folds!(Unresolved);
+
+    // Stack-safe: one descent per nesting level, and the walk a
+    // parenthesis ladder actually reaches.
+    #[stacksafe::stacksafe]
     fn transform_domain(
         &mut self,
         expr: DomainExpression<Unresolved>,
     ) -> Result<DomainExpression<Unresolved>> {
         match expr {
-            DomainExpression::Lvar {
+            DomainExpression::Reference(Reference::Named(NamedReference(AuthoredColumn {
                 ref name,
-                ref alias,
                 ..
-            } => {
-                if let Some(&replacement) = self.param_map.get(name.as_str()) {
-                    let mut result = replacement.clone();
-                    if let Some(a) = alias.clone() {
-                        apply_alias(&mut result, a);
-                    }
-                    Ok(result)
-                } else {
-                    Ok(expr)
+            }))) => {
+                match self.param_map.get(name.as_str()) {
+                    // The substituted value stands where the formal stood.
+                    // What the position publishes it as is the position's
+                    // question, and this is not one.
+                    Some(&replacement) => Ok(replacement.clone()),
+                    None => Ok(expr),
                 }
             }
             other => walk_transform_domain(self, other),
@@ -1004,14 +254,13 @@ impl AstTransform<Unresolved, Unresolved> for ParamSubstituter<'_> {
     }
 }
 
-/// Substitute parameter Lvars in a domain expression with argument expressions.
-/// Used by sigma predicate inlining in predicates.rs.
-pub(crate) fn substitute_in_domain_expr(
-    expr: ast_unresolved::DomainExpression,
+/// Parameter substitution over a TRUTH body — a sigma rule's.
+pub(crate) fn substitute_in_truth_expr(
+    expr: ast_unresolved::TruthExpression,
     param_map: &HashMap<&str, &ast_unresolved::DomainExpression>,
-) -> ast_unresolved::DomainExpression {
+) -> ast_unresolved::TruthExpression {
     ParamSubstituter { param_map }
-        .transform_domain(expr)
+        .transform_boolean(expr)
         .expect("substitution is infallible")
 }
 
@@ -1023,7 +272,7 @@ pub(crate) fn substitute_in_domain_expr(
 ///
 /// Parses the view body source and patches all unqualified table references
 /// to use the data namespace from the grounding context. Returns a full Query
-/// (not just RelationalExpression) to preserve CTEs in view definitions.
+/// (not just Chain) to preserve CTEs in view definitions.
 ///
 /// For multi-clause (disjunctive) view definitions, synthesizes same-name CTEs
 /// so the resolver's CTE merge infrastructure produces UNION ALL automatically.
@@ -1031,27 +280,18 @@ pub(super) fn expand_consulted_view(
     body_source: &str,
     grounding: &GroundedPath,
 ) -> Result<ast_unresolved::Query> {
-    let defs = ddl_builder::build_ddl_file(body_source)?;
-    if defs.is_empty() {
-        return Err(DelightQLError::parse_error(
-            "No definition found in view body source",
-        ));
-    }
+    let group = crate::ddl::reconstruct::group(body_source)?;
+    let view_name = group.name();
+    // The head declares a CLOSED schema; each clause satisfies it by
+    // carrying the projection its own head declares. No text is
+    // regenerated and nothing is re-parsed: the bodies that come out are
+    // the ones that went in, with one continuation appended.
+    let mut clauses = group.spend_heads()?;
 
-    // Enforce argumentative head contracts by translating to glob heads with projections
-    let has_argumentative = defs
-        .iter()
-        .any(|d| matches!(d.head, DdlHead::ArgumentativeView { .. }));
-    let defs = if has_argumentative {
-        desugar_argumentative_defs(defs)?
-    } else {
-        defs
-    };
-
-    if defs.len() == 1 {
+    if clauses.len() == 1 {
         // Fast path: single clause (existing behavior)
-        let ddl_def = defs.into_iter().next().unwrap();
-        let query = ddl_def.into_query().ok_or_else(|| {
+        let clause = clauses.pop().expect("length checked above");
+        let query = clause.into_query().ok_or_else(|| {
             DelightQLError::parse_error("Expected relational body for view, got scalar")
         })?;
         return Ok(patch_data_ns_query(
@@ -1062,7 +302,7 @@ pub(super) fn expand_consulted_view(
     }
 
     // Multi-clause: synthesize disjunctive CTEs
-    expand_multi_clause_view(defs, Some(&grounding.data_ns))
+    expand_multi_clause_view(&view_name, clauses, Some(&grounding.data_ns))
 }
 
 /// Synthesize a disjunctive view from multiple clause definitions.
@@ -1071,13 +311,14 @@ pub(super) fn expand_consulted_view(
 /// in a `Query::WithCtes` with a `view_name(*)` main query. The resolver's
 /// CTE merge infrastructure groups same-name CTEs into UNION ALL.
 pub(super) fn expand_multi_clause_view(
-    defs: Vec<crate::pipeline::asts::ddl::DdlDefinition>,
+    view_name: &str,
+    clauses: Vec<crate::pipeline::asts::ddl::Clause>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
 ) -> Result<ast_unresolved::Query> {
-    let view_name = defs[0].name.clone();
+    let view_name = view_name.to_string();
     let mut all_ctes = Vec::new();
 
-    for def in defs {
+    for def in clauses {
         let query = def.into_query().ok_or_else(|| {
             DelightQLError::parse_error(
                 "Expected relational body for disjunctive view clause, got scalar",
@@ -1089,392 +330,714 @@ pub(super) fn expand_multi_clause_view(
             query
         };
 
-        match patched {
-            ast_unresolved::Query::Relational(expr) => {
-                all_ctes.push(ast_unresolved::CteBinding {
-                    name: view_name.clone(),
-                    origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-                    resolution_owner:
-                        crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
-                    expression: expr,
-                    effect_label: false,
-            is_recursive: ast_unresolved::PhaseBox::phantom(),
-                });
-            }
-            ast_unresolved::Query::WithCtes {
-                ctes,
-                query: main_expr,
-            } => {
-                // Clause body has its own CTEs — hoist them into outer list first,
-                // then add the main expression as the disjunctive CTE.
-                for cte in ctes {
-                    all_ctes.push(cte);
-                }
-                all_ctes.push(ast_unresolved::CteBinding {
-                    name: view_name.clone(),
-                    origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-                    resolution_owner:
-                        crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
-                    expression: main_expr,
-                    effect_label: false,
-            is_recursive: ast_unresolved::PhaseBox::phantom(),
-                });
-            }
-            other => {
-                // WithCfes or other variants — extract as best we can
-                return Err(DelightQLError::parse_error(format!(
-                    "Unsupported query form in disjunctive view clause: {:?}",
-                    std::mem::discriminant(&other)
-                )));
-            }
+        let ast_unresolved::Query { cfes, ctes, body } = patched;
+        if !cfes.is_empty() {
+            return Err(DelightQLError::parse_error(
+                "Unsupported query form in disjunctive view clause: a query-scoped \
+                 function definition"
+                    .to_string(),
+            ));
         }
+        // Clause body's own CTEs hoist into the outer list first, then the
+        // body becomes the disjunctive CTE.
+        for cte in ctes {
+            all_ctes.push(cte);
+        }
+        all_ctes.push(ast_unresolved::CteBinding {
+            subject: crate::pipeline::asts::core::CteSubject::Authored {
+                name: delightql_types::SqlIdentifier::new(view_name.clone()),
+                effect: crate::pipeline::asts::core::CteEffectDeclaration::Pure,
+            },
+            authority: crate::pipeline::asts::core::CteAuthority {
+                head: crate::pipeline::asts::core::definitions::Head::glob(),
+                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                resolution_owner: crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
+            },
+            expression: body,
+            recursion: (),
+        });
     }
 
     // Main query: view_name(*) — a ground relation referencing the CTE
-    let main_query =
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier: ast_unresolved::QualifiedName {
-                namespace_path: ast_unresolved::NamespacePath::empty(),
-                name: view_name.into(),
-                grounding: None,
+    let main_query = ast_unresolved::Chain::read(
+        ast_unresolved::Relation::Ground {
+            mention: ast_unresolved::GroundMention::Named {
+                identifier: ast_unresolved::QualifiedName {
+                    namespace_path: ast_unresolved::NamespacePath::empty(),
+                    name: view_name.into(),
+                },
+                alias: None,
+                mutation_target: false,
+                passthrough: false,
             },
-            canonical_name: ast_unresolved::PhaseBox::phantom(),
-            backend_schema: ast_unresolved::PhaseBox::phantom(),
-            domain_spec: ast_unresolved::DomainSpec::Glob,
-            alias: None,
             outer: false,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: ast_unresolved::PhaseBox::phantom(),
-            hygienic_injections: Vec::new(),
-        });
+            cpr_schema: (),
+        },
+        ast_unresolved::Access::All,
+        (),
+    );
 
-    Ok(ast_unresolved::Query::WithCtes {
+    Ok(ast_unresolved::Query {
+        cfes: Vec::new(),
         ctes: all_ctes,
-        query: main_query,
+        body: main_query,
     })
 }
 
-// ============================================================================
-// Argumentative Head Contract Enforcement
-//
-// Argumentative heads declare a closed schema contract: the entity exposes
-// exactly the named columns, in order. This is semantically different from
-// glob heads, which are open (inherit schema from body, corresponding union).
-//
-// The compiler enforces the contract by translating each clause to a glob-head
-// definition with an appended projection. This is the enforcement mechanism,
-// not the semantics. The head IS the schema declaration; the projection is
-// how we apply it to the body.
-// ============================================================================
+/// How many leading argument positions of this callee take CODE — the
+/// curried formals of a consulted higher-order function. Zero for
+/// everything else, including names the catalog does not know.
+pub(super) fn curried_code_positions(
+    callee: &crate::pipeline::asts::vocabulary::Ref,
+    registry: &crate::resolution::EntityRegistry,
+    scope: Option<&str>,
+) -> usize {
+    let name = callee.name_identifier();
+    let namespace = callee.namespace_fq();
+    let Ok(Some(entity)) =
+        lookup_borrowed_function(&name, namespace.as_deref(), &registry.consult, scope)
+    else {
+        return 0;
+    };
+    consulted_entity_to_cfe_definition(&entity)
+        .map(|cfe| cfe.callable_formals().len())
+        .unwrap_or(0)
+}
 
-/// Ground-Position Naming Rule.
+/// THE INSTANTIATION ROAD: a consulted value definition is spent at its
+/// call site, before ordinary closed resolution.
 ///
-/// A relational rule-head POSITION that every clause supplies with GROUND terms —
-/// i.e. zero naming offers across all clauses (per `offered_name()` all-None: no
-/// lvar, no `as`-label) — REFUSES loudly. This eliminates the unnamed `_colN` state
-/// for rule heads, and with it the springing-rename evolution trap: an unnamed
-/// position is the only state from which a public name can appear without a contest,
-/// so a later lvar clause would silently name (rename) it. With the rule the position
-/// must already carry a standing name, which the later lvar CONTESTS (name_conflict)
-/// instead of silently displacing.
-///
-/// Applies to single-clause heads too (one clause supplying ground = every clause
-/// abstaining). Does NOT apply to facts (a separate `DdlHead::Fact` path that never
-/// reaches this desugar), HO param positions, or HO output heads (distinct machinery).
-fn validate_ground_position_naming(
-    view_name: &str,
-    heads: &[&Vec<ViewHeadItem>],
-) -> Result<()> {
-    if heads.is_empty() {
-        return Ok(());
+/// The definition environment identifies the formals and substitutes the
+/// supplied values into a copy of the UNRESOLVED body; what resolution then
+/// sees is ordinary closed code in the caller's position, so no parameter
+/// survives as a deferred hole and no later phase re-substitutes. A crossed
+/// body — a truth read as a value — resolves into the licensed
+/// `ClauseSelection` carrier, whose arms are the one position that admits
+/// it.
+pub(super) fn inline_cfe_call(
+    fold: &mut super::resolver_fold::ResolverFold,
+    application: &ast_unresolved::StandardApplication,
+) -> Result<Option<crate::pipeline::asts::resolved::DomainExpression>> {
+    use crate::pipeline::asts::core::operators::ScalarArgument;
+    if fold.cfe_code_suppression > 0 {
+        // The call stands in a CODE position: it is handed to a curried
+        // formal, not invoked here.
+        return Ok(None);
     }
-    let arity = heads[0].len();
-    for pos in 0..arity {
-        let all_abstain = heads
-            .iter()
-            .all(|items| matches!(items.get(pos), Some(it) if it.offered_name().is_none()));
-        if all_abstain {
-            let n = heads.len();
-            let literal = heads[0][pos].supply();
+    let reference = &application.call().callee;
+    let name = reference.name_text();
+    let namespace = reference.namespace_fq();
+    // A CODE FORMAL, INVOKED: the innermost open instantiation bound code
+    // to this bare name, and the invocation spends that binding — before
+    // any catalog is asked, because the formal is not a catalog name.
+    if namespace.is_none() {
+        let key = reference.name_identifier();
+        let binding = fold
+            .config
+            .cfe_formal_frame
+            .as_deref()
+            .and_then(|frame| frame.callables.get(&key))
+            .cloned();
+        if let Some(binding) = binding {
+            return instantiate_callable_site(fold, application, binding, &name).map(Some);
+        }
+    }
+    if application.guard.is_some() || application.window.is_some() {
+        // A guard filters the rows this application sees and a window
+        // modifies an aggregate; neither belongs to a scalar definition's
+        // instantiation.
+        return Ok(None);
+    }
+    let Some(cfe) = lookup_cfe_definition(fold, reference, namespace.as_deref())? else {
+        return Ok(None);
+    };
+    // Nesting is authored and finite (`double:(double:(id))`); only a
+    // definition whose BODY reaches itself spins, and that exhausts the
+    // compilation's ONE allowance instead of a name-based cycle guard that
+    // would refuse lawful nesting.
+    let _instantiation_frame = fold.config.instantiation_depth.enter(&name)?;
+    use crate::pipeline::asts::core::ContextMode;
+    let all_members = application.call().arguments.scalar_members();
+    let is_marker = |member: &ScalarArgument<crate::pipeline::asts::core::Unresolved>| {
+        matches!(member, ScalarArgument::Context(_))
+    };
+    let context_call = all_members.first().is_some_and(is_marker);
+    match (&cfe.context_mode, context_call) {
+        (ContextMode::None, true) => {
+            return Err(DelightQLError::parse_error(format!(
+                "'{name}' is not context-aware: it declares no `..`; supply values positionally"
+            )));
+        }
+        (ContextMode::Implicit, false) => {
+            return Err(DelightQLError::parse_error(format!(
+                "CFE '{name}' uses implicit context and cannot be called positionally — use {name}:(.., args)"
+            )));
+        }
+        _ => {}
+    }
+    let members = if context_call {
+        &all_members[1..]
+    } else {
+        all_members
+    };
+    if members.iter().skip(1).any(|member| is_marker(member))
+        || (!context_call && members.first().is_some_and(is_marker))
+    {
+        return Err(DelightQLError::parse_error(format!(
+            "`..` stands first in a call or not at all; '{name}' received one elsewhere"
+        )));
+    }
+    let (callable_formals, scalar_formals) = cfe.split_formals();
+    let curried_count = callable_formals.len();
+    // Explicit captures called positionally are leading positionals; a
+    // context call binds them by name instead, so they are not counted.
+    let positional_captures = match (&cfe.context_mode, context_call) {
+        (ContextMode::Explicit(captures), false) => captures.len(),
+        _ => 0,
+    };
+    let declared = curried_count + positional_captures + scalar_formals.len();
+    if members.len() != declared {
+        // A context call is lenient like the road it replaces: the capture
+        // that cannot bind is what refuses, below, by name.
+        if !context_call {
+            if positional_captures > 0 {
+                return Err(DelightQLError::parse_error(format!(
+                    "'{name}' expects {declared} positional argument{} (captures first), got {}",
+                    if declared == 1 { "" } else { "s" },
+                    members.len()
+                )));
+            }
             return Err(DelightQLError::validation_error_categorized(
-                "ddl/head/unnamed_ground_position",
+                "cfe/arity",
                 format!(
-                    "Entity '{}': head position {} is supplied only by ground terms — \
-                     every one of its {} {} abstains from naming it (no lvar, no \
-                     `as`-label). A position supplied only by ground terms must carry a \
-                     name — every clause abstained (the Ground-Position Naming Rule, \
-                     clause-head-catechism.md §II). Name it in the head, e.g. `{} as tag`: \
-                     the literal still supplies, the label only names the position. Why \
-                     loud: an unnamed position is the only state from which a public name \
-                     can silently spring into existence — a later lvar clause would rename \
-                     it with no warning; naming it now makes that a caught contest instead \
-                     of a 3am surprise in someone's jq pipeline.",
-                    view_name,
-                    pos + 1,
-                    n,
-                    if n == 1 { "clause" } else { "clauses" },
-                    literal,
+                    "'{name}' expects {declared} argument{}, got {}",
+                    if declared == 1 { "" } else { "s" },
+                    members.len()
                 ),
-                "Unnamed ground position",
+                "supply one argument per declared parameter, code first",
             ));
         }
+    }
+    let mut callables = std::collections::HashMap::new();
+    for (formal, member) in callable_formals.iter().zip(members[..curried_count].iter()) {
+        // The position declares CODE, so what stands in it is code however
+        // spelled: `upper:()` arrives as an ordinary (nullary) application
+        // and the position reads it as the mention it is.
+        let binding = match member {
+            ScalarArgument::Callable(callable) => callable_binding(fold, callable)?,
+            ScalarArgument::Value(value)
+                if matches!(
+                    value.domain(),
+                    Some(ast_unresolved::DomainExpression::Application(
+                        ast_unresolved::FunctionApplication::Standard(_)
+                    ))
+                ) =>
+            {
+                let Some(ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Standard(mention),
+                )) = value.domain()
+                else {
+                    unreachable!("shape checked above");
+                };
+                callable_binding(
+                    fold,
+                    &crate::pipeline::asts::core::Callable::Functor(mention.clone()),
+                )?
+            }
+            _ => {
+                return Err(DelightQLError::validation_error_categorized(
+                    "cfe/code_argument",
+                    format!("'{name}' takes code in its position for '{}'", formal.name),
+                    "write a mention `fn:()`, a lambda `:(…)`, or a template `:\"…\"`",
+                ));
+            }
+        };
+        callables.insert(formal.name.clone(), binding);
+    }
+    let mut values: Vec<ArgumentToBind> = Vec::new();
+    for member in members[curried_count + positional_captures..].iter() {
+        match member {
+            ScalarArgument::Value(value) => match value {
+                crate::pipeline::asts::core::ArgumentValue::Domain { value, .. } => {
+                    values.push(ArgumentToBind::Domain(value.clone()))
+                }
+                // A truth standing in a value position is a value — 0 or 1 —
+                // and binds like one.
+                crate::pipeline::asts::core::ArgumentValue::Truth(truth) => {
+                    values.push(ArgumentToBind::Truth(truth.clone().into_truth()))
+                }
+            },
+            ScalarArgument::Callable(_)
+            | ScalarArgument::Spread(_)
+            | ScalarArgument::Star
+            | ScalarArgument::Context(_) => return Ok(None),
+        }
+    }
+    // Arguments are the CALLER's expressions: they resolve here, in the
+    // caller's scope, before the body opens. The body then resolves with a
+    // formal frame instead of textual substitution — a spliced name never
+    // re-resolves inside the body's probes, so nothing the body opens can
+    // capture it. The frame rides the config because nested resolutions
+    // clone it: a formal reaches into the subqueries the body opens.
+    let mut frame = super::FormalFrame {
+        values: std::collections::HashMap::new(),
+        callables,
+    };
+    if let ContextMode::Explicit(captures) = &cfe.context_mode {
+        if context_call {
+            // `..` binds each declared capture BY NAME, resolved at the
+            // call site. A name the site cannot answer refuses here.
+            for capture in captures {
+                let reference = ast_unresolved::DomainExpression::Reference(
+                    crate::pipeline::asts::core::Reference::Named(
+                        crate::pipeline::asts::core::NamedReference(
+                            crate::pipeline::asts::core::AuthoredColumn {
+                                name: capture.clone(),
+                                qualifier: None,
+                                namespace_path: ast_unresolved::NamespacePath::empty(),
+                            },
+                        ),
+                    ),
+                );
+                frame
+                    .values
+                    .insert(capture.clone(), fold.transform_domain(reference)?);
+            }
+        } else {
+            // Positional: the captures are the leading positions.
+            for (capture, value) in captures.iter().zip(
+                members[curried_count..curried_count + positional_captures]
+                    .iter()
+                    .filter_map(|member| match member {
+                        ScalarArgument::Value(value) => value.domain().cloned(),
+                        _ => None,
+                    }),
+            ) {
+                frame
+                    .values
+                    .insert(capture.clone(), fold.transform_domain(value)?);
+            }
+        }
+    }
+    for (formal, value) in scalar_formals.iter().zip(values) {
+        frame
+            .values
+            .insert(formal.name.clone(), value.resolve(fold)?);
+    }
+    let prior = std::mem::replace(
+        &mut fold.config.cfe_formal_frame,
+        Some(std::sync::Arc::new(frame)),
+    );
+    // A consulted definition's body looks up ITS OWN siblings: nested calls
+    // resolve against the owning namespace's edges, never the caller's
+    // session set.
+    let prior_scope = match &cfe.source_namespace {
+        Some(namespace) => std::mem::replace(
+            &mut fold.config.resolution_namespace,
+            Some(namespace.clone()),
+        ),
+        None => fold.config.resolution_namespace.clone(),
+    };
+    // A definition's body is SEALED: only its formals — and, for a
+    // context-aware definition, its declared captures — reach the call
+    // site's row. Implicit context is the one deliberate unsealing: `..`
+    // DECLARES that free names capture from the caller.
+    let sealed = !matches!(cfe.context_mode, ContextMode::Implicit);
+    let saved_scope = if sealed {
+        Some((
+            std::mem::take(&mut fold.available),
+            std::mem::take(&mut fold.local_available),
+            std::mem::take(&mut fold.qualifier_scope),
+        ))
+    } else {
+        None
+    };
+    let outcome = match cfe.body {
+        ast_unresolved::OutValue::Domain(body) => fold.transform_domain(body).map(Some),
+        ast_unresolved::OutValue::Truth(crossing) => fold
+            .transform_boolean(crossing.into_truth())
+            .map(|resolved| {
+                Some(
+                    crate::pipeline::asts::resolved::DomainExpression::Application(
+                        crate::pipeline::asts::resolved::FunctionApplication::ClauseSelection(
+                            crate::pipeline::asts::core::ClauseSelection {
+                                arms: vec![crate::pipeline::asts::core::ClauseArm {
+                                    guard: None,
+                                    result: crate::pipeline::asts::resolved::OutValue::Truth(
+                                        crate::pipeline::asts::core::TruthAsValue(resolved),
+                                    ),
+                                }],
+                            },
+                        ),
+                    ),
+                )
+            }),
+    };
+    if let Some((available, local, qualifiers)) = saved_scope {
+        fold.available = available;
+        fold.local_available = local;
+        fold.qualifier_scope = qualifiers;
+    }
+    fold.config.resolution_namespace = prior_scope;
+    fold.config.cfe_formal_frame = prior;
+    outcome
+}
+
+/// An argument awaiting binding: the caller's value, or the caller's truth
+/// read as one. Both resolve in the CALLER's scope; the truth resolves into
+/// the licensed ClauseSelection carrier.
+enum ArgumentToBind {
+    Domain(ast_unresolved::DomainExpression),
+    Truth(ast_unresolved::TruthExpression),
+}
+
+impl ArgumentToBind {
+    fn resolve(
+        self,
+        fold: &mut super::resolver_fold::ResolverFold,
+    ) -> Result<crate::pipeline::asts::resolved::DomainExpression> {
+        match self {
+            ArgumentToBind::Domain(value) => fold.transform_domain(value),
+            ArgumentToBind::Truth(truth) => fold.transform_boolean(truth).map(|resolved| {
+                crate::pipeline::asts::resolved::DomainExpression::Application(
+                    crate::pipeline::asts::resolved::FunctionApplication::ClauseSelection(
+                        crate::pipeline::asts::core::ClauseSelection {
+                            arms: vec![crate::pipeline::asts::core::ClauseArm {
+                                guard: None,
+                                result: crate::pipeline::asts::resolved::OutValue::Truth(
+                                    crate::pipeline::asts::core::TruthAsValue(resolved),
+                                ),
+                            }],
+                        },
+                    ),
+                )
+            }),
+        }
+    }
+}
+
+/// The window builtins' signature judgment — the ONE authority, consulted
+/// from the ordinary Standard-application road for authored and rebuilt
+/// invocations alike. The keyword "function" is the refusal's badge.
+pub(super) fn judge_window_row(
+    fold: &super::resolver_fold::ResolverFold,
+    callee_name: &str,
+    supplied: usize,
+) -> Result<()> {
+    let Some((min, max)) = fold.registry.built_in.window_signature(callee_name) else {
+        return Ok(());
+    };
+    if supplied < min as usize || supplied > max as usize {
+        return Err(DelightQLError::parse_error(format!(
+            "the window function '{callee_name}' takes {} argument{}; the invocation hands it {supplied}",
+            if min == max {
+                min.to_string()
+            } else {
+                format!("{min} to {max}")
+            },
+            if max == 1 { "" } else { "s" },
+        )));
     }
     Ok(())
 }
 
-/// Compute canonical column names from argumentative view head items across clauses.
-///
-/// For each position, the canonical name is the position's naming OFFER (see the
-/// naming algebra in clause-head-catechism.md §II): an `as`-label, or an unlabeled
-/// lvar's own name. Ground literals without a label ABSTAIN.
-///
-/// The all-abstain case (every clause a bare ground literal at a position) can no
-/// longer reach this function for rule heads: `validate_ground_position_naming`
-/// refuses it upstream (the Ground-Position Naming Rule). The `_col{pos+1}` fallback
-/// below is therefore defensive/dead for the production desugar path; it survives
-/// only as the pure name-computer's total definition (and is exercised directly by
-/// unit tests). `_colN` is dead as an interface name for rule heads.
-///
-/// Contested offers (two differing names) are rejected earlier by
-/// `desugar_argumentative_defs`; by the time we get here a position's offers are
-/// unanimous, so taking the first offer is safe.
-fn compute_canonical_column_names(heads: &[&Vec<ViewHeadItem>]) -> Vec<String> {
-    if heads.is_empty() {
-        return vec![];
-    }
-    let arity = heads[0].len();
-    (0..arity)
-        .map(|pos| {
-            // Find the first naming offer at this position across all clauses
-            for items in heads {
-                if let Some(name) = items.get(pos).and_then(|it| it.offered_name()) {
-                    return name.to_string();
-                }
-            }
-            // All abstain at this position — synthetic name
-            format!("_col{}", pos + 1)
-        })
-        .collect()
-}
+/// The ONE bound on open instantiations, whichever road opens them: the
+/// ordinary value position and the pattern slot answer identically.
+pub(crate) const INSTANTIATION_DEPTH_LIMIT: usize = 128;
 
-/// Extract the body text from a definition's full source by finding the neck `:-`.
-///
-/// Returns the text after `:-`, trimmed.
-fn extract_body_text(full_source: &str) -> Result<&str> {
-    let neck_pos = full_source.find(":-").ok_or_else(|| {
-        DelightQLError::parse_error("Argumentative view definition missing :- neck")
-    })?;
-    Ok(full_source[neck_pos + 2..].trim())
-}
-
-/// Enforce a single argumentative clause's head contract by generating
-/// glob-head DQL with an appended projection.
-///
-/// Generates `name(*) :- body |> (projection_items)` where:
-/// - Free variables become column references (body must produce them)
-/// - Ground terms become `literal as canonical_name` (injected constants)
-fn desugar_single_clause(
-    name: &str,
-    items: &[ViewHeadItem],
-    canonical_names: &[String],
-    body_text: &str,
-) -> String {
-    // Each clause aliases its SUPPLY (plumbed column or literal) to the position's
-    // canonical name. The `as`-label never appears here directly — it did its work in
-    // `compute_canonical_column_names` by supplying the offer that became `canon_name`.
-    // So `nation as country` (Free { nation, country }) at a `country`-canonical
-    // position projects `nation as country`, exactly like the body cover
-    // `|> *(nation as country)`; and `"VIP" as tag` projects `"VIP" as tag`.
-    let proj_items: Vec<String> = items
-        .iter()
-        .zip(canonical_names.iter())
-        .map(|(item, canon_name)| {
-            let supply = item.supply();
-            if supply == canon_name {
-                supply.to_string()
-            } else {
-                format!("{} as {}", supply, canon_name)
-            }
-        })
-        .collect();
-
-    format!(
-        "{}(*) :- {} |> ({})",
-        name,
-        body_text,
-        proj_items.join(", ")
+/// The one refusal for exhausting it.
+pub(crate) fn instantiation_depth_refusal(name: &str) -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "cfe/recursion",
+        format!(
+            "instantiating '{name}' opened {INSTANTIATION_DEPTH_LIMIT} nested definitions: \
+             a value definition cannot recurse"
+        ),
+        "a scalar definition computes from its inputs; write recursion as a relational rule",
     )
 }
 
-/// Enforce argumentative head contracts by translating to glob-head definitions
-/// with appended projections.
-///
-/// The argumentative head declares a closed schema contract. This function
-/// validates the contract (arity agreement, name consistency across clauses)
-/// and then enforces it by generating glob-head DQL where each clause body
-/// gets `|> (projection)` appended.
-///
-/// Example: `young(first_name, age) :- users(*), age < 30` compiles as
-/// `young(*) :- users(*), age < 30 |> (first_name, age)`
-///
-/// Ground terms inject constants:
-/// `bracket("young", fn, age) :- users(*), age < 30` compiles as
-/// `bracket(*) :- users(*), age < 30 |> ("young" as status, fn, age)`
-pub(super) fn desugar_argumentative_defs(defs: Vec<DdlDefinition>) -> Result<Vec<DdlDefinition>> {
-    let view_name = defs[0].name.clone();
-
-    // Validate: no mixing glob and argumentative head forms
-    let has_glob = defs.iter().any(|d| matches!(d.head, DdlHead::View));
-    let has_argumentative = defs
-        .iter()
-        .any(|d| matches!(d.head, DdlHead::ArgumentativeView { .. }));
-
-    if has_glob && has_argumentative {
-        return Err(DelightQLError::validation_error_categorized(
-            "ddl/head/mixed_forms",
-            format!(
-                "Entity '{}': cannot mix glob (*) and argumentative head forms \
-                 across clauses. Use all glob or all argumentative.",
-                view_name
-            ),
-            "Head form mismatch",
-        ));
-    }
-
-    // Collect all argumentative head items for canonical name computation
-    let arg_heads: Vec<&Vec<ViewHeadItem>> = defs
-        .iter()
-        .filter_map(|d| match &d.head {
-            DdlHead::ArgumentativeView { items } => Some(items),
-            _ => None,
-        })
-        .collect();
-
-    if arg_heads.is_empty() {
-        // No argumentative heads — nothing to desugar
-        return Ok(defs);
-    }
-
-    // Validate: arity agreement and name agreement across clauses
-    if arg_heads.len() >= 2 {
-        let first_items = arg_heads[0];
-        for (i, items) in arg_heads.iter().enumerate().skip(1) {
-            if items.len() != first_items.len() {
-                return Err(DelightQLError::validation_error_categorized(
-                    "ddl/head/arity",
-                    format!(
-                        "Entity '{}': clause {} has {} head item(s) but clause 1 has {}. \
-                         All argumentative clauses must have the same arity.",
-                        view_name,
-                        i + 1,
-                        items.len(),
-                        first_items.len()
-                    ),
-                    "Head arity mismatch",
-                ));
-            }
-        }
-
-        let arity = first_items.len();
-        for pos in 0..arity {
-            // A position's public name is the unanimous OFFER of its clauses. Offers are
-            // `as`-labels and unlabeled lvar names; unlabeled ground literals abstain.
-            // Two DIFFERING offers refuse loudly: this is an interface-naming obligation
-            // (a public name must be singular), not a position-identity/unification claim.
-            let mut first_offer: Option<(&str, usize)> = None; // (name, clause_idx)
-            for (clause_idx, items) in arg_heads.iter().enumerate() {
-                if let Some(name) = items[pos].offered_name() {
-                    if let Some((existing, existing_idx)) = first_offer {
-                        if existing != name {
-                            return Err(DelightQLError::validation_error_categorized(
-                                "ddl/head/name_conflict",
-                                format!(
-                                    "Entity '{}': position {} carries conflicting name offers \
-                                     '{}' (clause {}) and '{}' (clause {}). A position's public \
-                                     name must be singular, deterministic, and independent of \
-                                     clause order. Conform the differing clause in its head with \
-                                     `{} as {}`, or with a body rename-cover `|> *({} as {})`.",
-                                    view_name,
-                                    pos + 1,
-                                    existing,
-                                    existing_idx + 1,
-                                    name,
-                                    clause_idx + 1,
-                                    name,
-                                    existing,
-                                    name,
-                                    existing,
-                                ),
-                                "Head name conflict",
-                            ));
-                        }
-                    } else {
-                        first_offer = Some((name, clause_idx));
-                    }
-                }
-            }
+/// The definition a callee names, if any: query-scoped first, then
+/// consulted (with its data namespace patched in).
+pub(super) fn lookup_cfe_definition(
+    fold: &mut super::resolver_fold::ResolverFold,
+    callee: &crate::pipeline::asts::vocabulary::Ref,
+    namespace: Option<&str>,
+) -> Result<Option<CfeDefinition>> {
+    if namespace.is_none() {
+        let key = callee.name_identifier();
+        if let Some(cfe) = fold.registry.query_local.scoped_cfes.get(&key).cloned() {
+            return Ok(Some(cfe));
         }
     }
-
-    // Ground-Position Naming Rule (catechism §II): refuse any position every clause
-    // supplies with ground terms (all offers absent). Runs for single- AND multi-clause
-    // heads, after the arity check above (so `arg_heads[0]` sets the shared arity).
-    validate_ground_position_naming(&view_name, &arg_heads)?;
-
-    let canonical_names = compute_canonical_column_names(&arg_heads);
-
-    // Build desugared DQL text for each clause
-    let mut desugared_lines = Vec::new();
-    for def in &defs {
-        if let DdlHead::ArgumentativeView { items } = &def.head {
-            let body_text = extract_body_text(&def.full_source)?;
-            desugared_lines.push(desugar_single_clause(
-                &view_name,
-                items,
-                &canonical_names,
-                body_text,
-            ));
-        } else {
-            // Non-argumentative defs pass through (shouldn't happen after validation)
-            desugared_lines.push(def.full_source.clone());
+    let scope = fold.config.resolution_namespace.clone();
+    let callee_ident = callee.name_identifier();
+    let entity = match lookup_borrowed_function(
+        &callee_ident,
+        namespace,
+        &fold.registry.consult,
+        scope.as_deref(),
+    )? {
+        Some(entity) => entity,
+        None => {
+            let Some(entity) = lookup_borrowed_context_aware_function(
+                &callee_ident,
+                namespace,
+                &fold.registry.consult,
+                scope.as_deref(),
+            )?
+            else {
+                return Ok(None);
+            };
+            entity
         }
+    };
+    let mut cfe = consulted_entity_to_cfe_definition(&entity)?;
+    if let Some(ns) = pre_grounded_data_ns_path(&fold.registry.consult, &entity.namespace) {
+        cfe.body = patch_data_ns_in_body(cfe.body, &ns);
     }
-
-    let desugared_source = desugared_lines.join("\n");
-    debug!(
-        "Desugared argumentative view '{}': {}",
-        view_name, desugared_source
-    );
-    ddl_builder::build_ddl_file(&desugared_source)
+    Ok(Some(cfe))
 }
 
-/// Inline consulted functions in a Query.
-///
-/// Returns the folded query and any collected context-aware function definitions
-/// (type=3) that need CFE precompilation before resolution can proceed.
-pub(super) fn inline_in_query_borrowed(
-    query: ast_unresolved::Query,
-    consult: &ConsultRegistry,
-    data_ns: Option<&ast_unresolved::NamespacePath>,
-    scope: Option<&str>,
-) -> Result<(ast_unresolved::Query, Vec<CfeDefinition>)> {
-    let mut inliner = BorrowedInliner {
-        consult,
-        data_ns,
-        scope,
-        collected_ccafe_cfes: vec![],
-        discovery_only: false,
+/// A COVER'S CALLABLE THAT NAMES A DEFINITION, instantiated to the open
+/// lambda it denotes: the FIRST formal is the covered cell — it stays a
+/// slot — and the mention's own arguments fill the rest. What the cover
+/// machinery then spends per cell is ordinary resolved code; no carrier
+/// survives for a later phase to expand.
+pub(super) fn cover_functor_apply_cell(
+    fold: &mut super::resolver_fold::ResolverFold,
+    application: &ast_unresolved::StandardApplication,
+    cell: crate::pipeline::asts::resolved::DomainExpression,
+) -> Result<Option<crate::pipeline::asts::resolved::DomainExpression>> {
+    use crate::pipeline::asts::core::ContextMode;
+    let name = application.call().callee.name_text();
+    let namespace = application.call().callee.namespace_fq();
+    let Some(cfe) = lookup_cfe_definition(fold, &application.call().callee, namespace.as_deref())?
+    else {
+        return Ok(None);
     };
-    let folded = inliner.transform_query(query)?;
-    Ok((folded, inliner.collected_ccafe_cfes))
+    if cfe.context_mode != ContextMode::None || !cfe.callable_formals().is_empty() {
+        // A context or higher-order definition has no one-cell reading;
+        // the ordinary callable road keeps whatever meaning it had.
+        return Ok(None);
+    }
+    let Some((cell_formal, partial_formals)) = cfe.scalar_formals().split_first() else {
+        return Err(DelightQLError::validation_error_categorized(
+            "cfe/cover_arity",
+            format!("'{name}' takes no parameters, so a cover cannot land the cell in one"),
+            "the covered callable's first parameter receives each cell",
+        ));
+    };
+    let partials: Vec<ast_unresolved::DomainExpression> = application
+        .call()
+        .arguments
+        .value_domains()
+        .cloned()
+        .collect();
+    if partials.len() != partial_formals.len() {
+        return Err(DelightQLError::validation_error_categorized(
+            "cfe/cover_arity",
+            format!(
+                "'{name}' has {} parameter{} after the cell; the mention supplies {}",
+                partial_formals.len(),
+                if partial_formals.len() == 1 { "" } else { "s" },
+                partials.len()
+            ),
+            "the cell lands first; supply one value per remaining parameter",
+        ));
+    }
+    let mut frame = super::FormalFrame {
+        values: std::collections::HashMap::new(),
+        callables: std::collections::HashMap::new(),
+    };
+    // THE CELL LANDS IN THE FIRST PARAMETER: the cover is the applying
+    // position, so the formal is the cell itself and the instantiated body
+    // resolves CLOSED — no leaf survives into it.
+    frame.values.insert(cell_formal.name.clone(), cell);
+    for (formal, value) in partial_formals.iter().zip(partials) {
+        frame
+            .values
+            .insert(formal.name.clone(), fold.transform_domain(value)?);
+    }
+    let _instantiation_frame = fold.config.instantiation_depth.enter(&name)?;
+    let prior = std::mem::replace(
+        &mut fold.config.cfe_formal_frame,
+        Some(std::sync::Arc::new(frame)),
+    );
+    let prior_scope = match &cfe.source_namespace {
+        Some(namespace) => std::mem::replace(
+            &mut fold.config.resolution_namespace,
+            Some(namespace.clone()),
+        ),
+        None => fold.config.resolution_namespace.clone(),
+    };
+    let saved_scope = (
+        std::mem::take(&mut fold.available),
+        std::mem::take(&mut fold.local_available),
+        std::mem::take(&mut fold.qualifier_scope),
+    );
+    let outcome = match cfe.body {
+        ast_unresolved::OutValue::Domain(body) => fold.transform_domain(body),
+        ast_unresolved::OutValue::Truth(crossing) => fold
+            .transform_boolean(crossing.into_truth())
+            .map(|resolved| {
+                crate::pipeline::asts::resolved::DomainExpression::Application(
+                    crate::pipeline::asts::resolved::FunctionApplication::ClauseSelection(
+                        crate::pipeline::asts::core::ClauseSelection {
+                            arms: vec![crate::pipeline::asts::core::ClauseArm {
+                                guard: None,
+                                result: crate::pipeline::asts::resolved::OutValue::Truth(
+                                    crate::pipeline::asts::core::TruthAsValue(resolved),
+                                ),
+                            }],
+                        },
+                    ),
+                )
+            }),
+    };
+    let (available, local, qualifiers) = saved_scope;
+    fold.available = available;
+    fold.local_available = local;
+    fold.qualifier_scope = qualifiers;
+    fold.config.resolution_namespace = prior_scope;
+    fold.config.cfe_formal_frame = prior;
+    Ok(Some(outcome?))
+}
+
+/// The code a caller supplies for a curried formal, made a binding.
+///
+/// A mention keeps its authored form — its arguments are replaced where the
+/// formal is invoked. An open body (lambda, template) pre-resolves HERE, in
+/// the caller's scope, with its slots left standing: the interior is the
+/// caller's text, and resolving it later — inside the definition's frame —
+/// would let the definition's formals capture the caller's names.
+fn callable_binding(
+    fold: &mut super::resolver_fold::ResolverFold,
+    callable: &crate::pipeline::asts::core::Callable,
+) -> Result<super::CallableBinding> {
+    use crate::pipeline::asts::core::Callable;
+    match callable {
+        Callable::Functor(application) => {
+            // A mention of an OUTER code formal hands the outer binding on.
+            if application.call().callee.namespace_fq().is_none() {
+                let key = application.call().callee.name_identifier();
+                if let Some(outer) = fold
+                    .config
+                    .cfe_formal_frame
+                    .as_deref()
+                    .and_then(|frame| frame.callables.get(&key))
+                {
+                    return Ok(outer.clone());
+                }
+            }
+            // The mention is judged HERE, where it is handed over: a window
+            // function needs its window and refuses standing bare. The probe
+            // resolves under suppression so a definition's mention is not an
+            // invocation; its resolved form is discarded either way.
+            fold.cfe_code_suppression += 1;
+            let probe = fold.transform_domain(ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Standard(application.clone()),
+            ));
+            fold.cfe_code_suppression -= 1;
+            probe?;
+            Ok(super::CallableBinding::Named(Box::new(application.clone())))
+        }
+        Callable::Lambda(lambda) => open_binding(fold, (*lambda.body).clone()),
+        Callable::String(template) => open_binding(
+            fold,
+            ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Template(template.clone()),
+            ),
+        ),
+    }
+}
+
+/// An invocation of a curried FORMAL, spent against what the caller bound.
+fn instantiate_callable_site(
+    fold: &mut super::resolver_fold::ResolverFold,
+    application: &ast_unresolved::StandardApplication,
+    binding: super::CallableBinding,
+    name: &str,
+) -> Result<crate::pipeline::asts::resolved::DomainExpression> {
+    match binding {
+        super::CallableBinding::Named(mention) => {
+            // The invocation's own arguments replace the mention's, and its
+            // guard wins; the window rides whichever side wrote one.
+            let mut rebuilt = *mention;
+            if !application.call().arguments.scalar_members().is_empty() {
+                rebuilt.call_mut().arguments = application.call().arguments.clone();
+            }
+            rebuilt.guard = application.guard.clone().or(rebuilt.guard);
+            rebuilt.window = application.window.clone().or(rebuilt.window);
+            // The rebuilt invocation resolves through the ordinary road,
+            // where the ONE window-signature authority judges it exactly as
+            // it judges an authored spelling.
+            fold.transform_domain(ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Standard(rebuilt),
+            ))
+        }
+        super::CallableBinding::Open(binding) => {
+            let mut domains = application.call().arguments.value_domains();
+            let (Some(first), None) = (domains.next(), domains.next()) else {
+                return Err(DelightQLError::validation_error_categorized(
+                    "cfe/lambda_arity",
+                    format!("'{name}' is bound to an open body, which has ONE slot"),
+                    "supply exactly one value",
+                ));
+            };
+            let value = fold.transform_domain(first.clone())?;
+            // THE INTERIOR IS THE CALLER'S TEXT: it resolves in the caller's
+            // captured scope, outside the definition's formal frame, with
+            // the supplied value standing in its slots — the applying
+            // position spends the leaf here, and nothing open survives.
+            let saved = (
+                std::mem::replace(&mut fold.available, binding.available.clone()),
+                std::mem::replace(&mut fold.local_available, binding.local_available.clone()),
+                std::mem::replace(&mut fold.qualifier_scope, binding.qualifier_scope.clone()),
+            );
+            let prior_frame = std::mem::take(&mut fold.config.cfe_formal_frame);
+            let prior_cell = fold.cover_cell.replace(value);
+            let outcome = fold.transform_domain(binding.body.clone());
+            fold.cover_cell = prior_cell;
+            fold.config.cfe_formal_frame = prior_frame;
+            fold.available = saved.0;
+            fold.local_available = saved.1;
+            fold.qualifier_scope = saved.2;
+            outcome
+        }
+    }
+}
+
+/// An open body made a binding: judged HERE, in the caller's scope — a bad
+/// reference refuses at the handover even if the formal is never invoked —
+/// and carried authored for the invocation to apply.
+fn open_binding(
+    fold: &mut super::resolver_fold::ResolverFold,
+    body: ast_unresolved::DomainExpression,
+) -> Result<super::CallableBinding> {
+    let probe_cell = crate::pipeline::asts::resolved::DomainExpression::Application(
+        crate::pipeline::asts::resolved::FunctionApplication::Ground(
+            crate::pipeline::asts::core::LiteralValue::Null,
+        ),
+    );
+    let prior = fold.cover_cell.replace(probe_cell);
+    let probe = fold.transform_domain(body.clone());
+    fold.cover_cell = prior;
+    probe?;
+    Ok(super::CallableBinding::Open(Box::new(super::OpenBinding {
+        body,
+        available: fold.available.clone(),
+        local_available: fold.local_available.clone(),
+        qualifier_scope: fold.qualifier_scope.clone(),
+    })))
 }
 
 // ============================================================================
 // Ground scalar expansion for HO views
 // ============================================================================
 
-use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode, HoParam, HoPositionInfo};
+use crate::pipeline::asts::core::Comparison;
+use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode, HoPositionInfo};
 
 /// Compute cross-clause unified position analysis for all HO parameter positions.
 ///
@@ -1487,31 +1050,22 @@ use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode, HoParam, HoPosition
 /// This replaces `extract_ground_scalar_info()` + `validate_mixed_ground_params()`
 /// with a single, complete analysis computed at consult time.
 pub(crate) fn build_ho_position_analysis(
-    defs: &[crate::pipeline::asts::ddl::DdlDefinition],
+    group: &crate::pipeline::asts::ddl::DefinitionGroup,
 ) -> Vec<HoPositionInfo> {
-    use crate::pipeline::asts::ddl::DdlHead;
-
-    let heads: Vec<&Vec<HoParam>> = defs
-        .iter()
-        .filter_map(|d| match &d.head {
-            DdlHead::HoView { params, .. } => Some(params),
-            _ => None,
-        })
-        .collect();
+    if group.kind() != DefKind::HoView {
+        return Vec::new();
+    }
+    let heads: Vec<&[HoParam]> = group.clauses().iter().map(Clause::params).collect();
 
     build_ho_position_analysis_from_heads(&heads)
 }
 
 /// Build position analysis from a set of HO head param lists.
 ///
-/// Accepts pre-extracted heads so callers that only have heads (not full
-/// DdlDefinitions) can use this directly — e.g., the deferred-body HO view
-/// path in system.rs where each clause's head is parsed individually.
-pub(crate) fn build_ho_position_analysis_from_heads(
-    heads: &[&Vec<HoParam>],
-) -> Vec<HoPositionInfo> {
-    use crate::pipeline::asts::ddl::HoParamKind;
-
+/// Accepts pre-extracted heads so callers that only have heads (not whole
+/// clauses) can use this directly — e.g., the deferred-body HO view path in
+/// system.rs where each clause's head is parsed individually.
+pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec<HoPositionInfo> {
     if heads.is_empty() {
         return Vec::new();
     }
@@ -1530,37 +1084,43 @@ pub(crate) fn build_ho_position_analysis_from_heads(
 
         for (clause_ordinal, head) in heads.iter().enumerate() {
             if let Some(param) = head.get(pos) {
-                match &param.kind {
-                    HoParamKind::Glob => {
+                match param {
+                    HoParam::Relation {
+                        name,
+                        cols: HeadItems::Glob,
+                    } => {
                         has_glob = true;
                         // Glob contributes canonical name (table parameter name, e.g., "T")
                         if column_name.is_none() {
-                            column_name = Some(param.name.clone());
+                            column_name = Some(name.to_string());
                         }
                     }
-                    HoParamKind::Argumentative(cols) => {
+                    HoParam::Relation {
+                        name,
+                        cols: HeadItems::Listed(cols),
+                    } => {
                         has_argumentative = true;
                         if arg_columns.is_none() {
-                            arg_columns = Some(cols.clone());
+                            arg_columns = Some(cols.iter().map(|c| c.supply.spelling()).collect());
                         }
                         // Argumentative contributes canonical name (table parameter name)
                         if column_name.is_none() {
-                            column_name = Some(param.name.clone());
+                            column_name = Some(name.to_string());
                         }
                     }
-                    HoParamKind::Scalar => {
+                    HoParam::Scalar { name, .. } => {
                         has_scalar = true;
                         // Free variable — contributes canonical name
                         if column_name.is_none() {
-                            column_name = Some(param.name.clone());
+                            column_name = Some(name.to_string());
                         }
                     }
-                    HoParamKind::GroundScalar(value) => {
+                    HoParam::Ground { text, .. } => {
                         has_ground_scalar = true;
-                        ground_values.push((clause_ordinal, value.clone()));
-                        // GroundScalar doesn't contribute a column name because
-                        // its "name" field is the literal value, not a variable name.
-                        // The canonical name comes from Scalar clauses.
+                        ground_values.push((clause_ordinal, text.clone()));
+                        // A ground position contributes no column NAME: its
+                        // spelling is the literal. The canonical name comes
+                        // from a sibling clause that binds the position.
                     }
                 }
             }
@@ -1610,44 +1170,79 @@ pub(crate) fn build_ho_position_analysis_from_heads(
 /// column too, carrying the CALLER's literal (its own substituted
 /// value) — otherwise the union pads the column NULL and the
 /// call-site filter (`x = 'a' AND y = 'c'`) kills every clause: the
-/// whole entity silently empties. Only literal caller values inject;
-/// an outer-context lvar keeps today's behavior (it cannot resolve
-/// inside the clause body).
+/// whole entity silently empties. A caller lvar is injected too: the
+/// caller-owned carrier is already in the clause body, so the discriminator
+/// can publish the row value that selected this clause.
 ///
 /// If `output_head` is Some, also applies the argumentative output projection.
 pub(super) fn inject_scalar_columns(
     query: ast_unresolved::Query,
     clause_params: &[HoParam],
     positions: &[HoPositionInfo],
-    output_head: Option<&[ViewHeadItem]>,
+    output_head: Option<&[HeadItem]>,
     caller_scalar_params: &std::collections::HashMap<String, ast_unresolved::DomainExpression>,
+    carry_caller_lvars: bool,
 ) -> ast_unresolved::Query {
-    use crate::pipeline::asts::core::{ContainmentSemantic, UnaryRelationalOperator};
+    use crate::pipeline::asts::core::PipeOp;
 
     // Collect ground scalar injections: (column_name, literal_value)
     let mut ground_injections: Vec<(String, String)> = Vec::new();
     // And free-position injections at MixedGround positions:
-    // (column_name, the caller's literal).
-    let mut free_injections: Vec<(String, crate::pipeline::asts::core::LiteralValue)> = Vec::new();
+    // (column_name, the caller's expression).
+    let mut free_injections: Vec<(String, ast_unresolved::DomainExpression)> = Vec::new();
     for pos_info in positions {
         if let Some(clause_param) = clause_params.get(pos_info.position) {
-            match &clause_param.kind {
-                crate::pipeline::asts::ddl::HoParamKind::GroundScalar(clause_val) => {
-                    if let Some(name) = pos_info.column_name.clone() {
-                        ground_injections.push((name, clause_val.clone()));
+            // A glob already republishes an identically named caller lvar.
+            // Ground clauses constrain that occurrence before UNION; free
+            // clauses bind it directly. Neither needs a second scalar column.
+            let glob_already_carries_position = output_head.is_none()
+                && carry_caller_lvars
+                && pos_info.column_name.as_ref().is_some_and(|column_name| {
+                    caller_scalar_params
+                        .get(column_name)
+                        .is_some_and(|expression| {
+                            matches!(
+                                expression,
+                                ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(AuthoredColumn {
+                                    name: caller_name,
+                                    ..
+                                }))) if caller_name == column_name
+                            )
+                        })
+                });
+            match clause_param {
+                HoParam::Ground { text, .. } => {
+                    if !glob_already_carries_position {
+                        if let Some(name) = pos_info.column_name.clone() {
+                            ground_injections.push((name, text.clone()));
+                        }
                     }
                 }
-                crate::pipeline::asts::ddl::HoParamKind::Scalar
-                    if pos_info.ground_mode
-                        == crate::pipeline::asts::ddl::HoGroundMode::MixedGround =>
+                HoParam::Scalar {
+                    name: param_name, ..
+                } if pos_info.ground_mode
+                    == crate::pipeline::asts::ddl::HoGroundMode::MixedGround =>
                 {
-                    if let (Some(name), Some(ast_unresolved::DomainExpression::Literal {
-                        value, ..
-                    })) = (
+                    if let (Some(name), Some(expression)) = (
                         pos_info.column_name.clone(),
-                        caller_scalar_params.get(&clause_param.name),
+                        caller_scalar_params.get(param_name.as_str()),
                     ) {
-                        free_injections.push((name, value.clone()));
+                        if matches!(
+                            expression,
+                            ast_unresolved::DomainExpression::Application(
+                                ast_unresolved::FunctionApplication::Ground(_)
+                            )
+                        ) || (carry_caller_lvars
+                            && matches!(
+                                expression,
+                                ast_unresolved::DomainExpression::Reference(Reference::Named(
+                                    NamedReference(AuthoredColumn { .. })
+                                ))
+                            )
+                            && !glob_already_carries_position)
+                        {
+                            free_injections.push((name, expression.clone()));
+                        }
                     }
                 }
                 _ => {}
@@ -1660,71 +1255,79 @@ pub(super) fn inject_scalar_columns(
     }
 
     // Build the embed expressions
-    let mut embed_exprs: Vec<ast_unresolved::DomainExpression> = Vec::new();
+    let mut embed_items: Vec<ast_unresolved::OutItem> = Vec::new();
+    let named = |expr: ast_unresolved::DomainExpression, name: &String| {
+        ast_unresolved::OutItem::One(ast_unresolved::OneOut {
+            expr: crate::pipeline::asts::core::OutValue::Domain(expr),
+            naming: Some(name.clone().into()),
+            output: (),
+        })
+    };
 
     if output_head.is_some() {
         // When there's an output head, inject ground constants as part of the projection
         // First: ground scalar constants
         for (col_name, literal_val) in &ground_injections {
-            let literal = parse_literal_value(literal_val);
-            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
-                value: literal,
-                alias: Some(col_name.clone().into()),
-            });
+            let literal = crate::pipeline::asts::core::LiteralValue::from_stored_ground(literal_val);
+            embed_items.push(named(
+                ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Ground(literal),
+                ),
+                col_name,
+            ));
         }
-        for (col_name, literal) in &free_injections {
-            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
-                value: literal.clone(),
-                alias: Some(col_name.clone().into()),
-            });
+        for (col_name, expression) in &free_injections {
+            embed_items.push(named(expression.clone(), col_name));
         }
         // Then: output head items
         if let Some(items) = output_head {
             for item in items {
                 // NOTE: HO output-head positions do NOT yet honor `as`-labels. The
                 // label parses (view_head_item is shared with rule heads) and is carried
-                // in the AST, but is ignored here — this is the HO output machinery, out
-                // of scope for the head-`as` change. Head-`as` on HO output positions is
-                // future work (clause-head-catechism Deviations item 13). Behavior here is
-                // deliberately byte-identical to before head-`as`.
-                match item {
-                    ViewHeadItem::Free { name, .. } => {
-                        embed_exprs.push(
+                // in the AST, but is ignored here — a labeled HO output item is refused
+                // earlier, at DDL build time (`ddl/head/ho_label_unsupported`), so this
+                // code never sees one. Head-`as` on HO output positions is future work.
+                match &item.supply {
+                    crate::pipeline::asts::ddl::Supply::Ref(name) => {
+                        embed_items.push(ast_unresolved::OutItem::plain(
                             ast_unresolved::DomainExpression::lvar_builder(name.clone()).build(),
-                        );
+                            (),
+                        ));
                     }
-                    ViewHeadItem::Ground { literal, .. } => {
-                        let val = parse_literal_value(literal);
-                        embed_exprs.push(ast_unresolved::DomainExpression::Literal {
-                            value: val,
-                            alias: Some("_ground".into()),
-                        });
+                    crate::pipeline::asts::ddl::Supply::Ground(value) => {
+                        embed_items.push(ast_unresolved::OutItem::plain(
+                            ast_unresolved::DomainExpression::Application(
+                                ast_unresolved::FunctionApplication::Ground(value.clone()),
+                            ),
+                            (),
+                        ));
                     }
                 }
             }
         }
     } else {
         // No output head (glob) — use embed: (*, "value" as name, ...)
-        embed_exprs.push(ast_unresolved::DomainExpression::glob_builder().build());
+        embed_items.push(ast_unresolved::OutItem::Many(
+            crate::pipeline::asts::core::Spread::Glob(crate::pipeline::asts::core::Glob::whole()),
+        ));
         for (col_name, literal_val) in &ground_injections {
-            let literal = parse_literal_value(literal_val);
-            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
-                value: literal,
-                alias: Some(col_name.clone().into()),
-            });
+            let literal = crate::pipeline::asts::core::LiteralValue::from_stored_ground(literal_val);
+            embed_items.push(named(
+                ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Ground(literal),
+                ),
+                col_name,
+            ));
         }
-        for (col_name, literal) in &free_injections {
-            embed_exprs.push(ast_unresolved::DomainExpression::Literal {
-                value: literal.clone(),
-                alias: Some(col_name.clone().into()),
-            });
+        for (col_name, expression) in &free_injections {
+            embed_items.push(named(expression.clone(), col_name));
         }
     }
 
-    let operator = UnaryRelationalOperator::General {
-        containment_semantic: ContainmentSemantic::Parenthesis,
-        expressions: embed_exprs,
-    };
+    let operator = PipeOp::Project(
+        crate::pipeline::asts::vocabulary::Vec1::try_from_vec(embed_items)
+            .expect("the embed carries the glob it was built around"),
+    );
 
     // Wrap the main query expression with the pipe operator
     wrap_query_with_pipe(query, operator)
@@ -1734,9 +1337,8 @@ pub(super) fn inject_scalar_columns(
 /// `` :`people(*)` ``) into a LiteralValue. Mention ground values
 /// arrive already canonical (the DDL extractor canonicalizes at
 /// consult time), so the wrapper is stripped, never re-parsed.
-/// A provable miss is an error, not an empty relation
-/// (GROUNDING-AND-MENTION.md): a knowable ground argument — a literal
-/// written at the call site — at a position every clause grounds
+/// A provable miss is an error, not an empty relation: a knowable ground
+/// argument — a literal written at the call site — at a position every clause grounds
 /// (PureGround), matching no clause head, is emptiness by absent
 /// DECLARATION. The catalog proves it, so refuse with the declared
 /// spellings instead of emitting a provably-empty query. A free
@@ -1745,12 +1347,12 @@ pub(super) fn inject_scalar_columns(
 /// expression) keeps relational semantics and misses to empty.
 pub(super) fn refuse_provable_ground_miss(
     function: &str,
-    scalar_spec: &ast_unresolved::DomainSpec,
+    scalar_spec: &ast_unresolved::Access,
     positions: &[HoPositionInfo],
 ) -> Result<()> {
     use crate::pipeline::asts::ddl::{HoColumnKind, HoGroundMode};
 
-    let ast_unresolved::DomainSpec::Positional(exprs) = scalar_spec else {
+    let ast_unresolved::Access::Slots(exprs) = scalar_spec else {
         return Ok(());
     };
     let scalar_positions: Vec<&HoPositionInfo> = positions
@@ -1761,20 +1363,16 @@ pub(super) fn refuse_provable_ground_miss(
         if pos.ground_mode != HoGroundMode::PureGround {
             continue;
         }
-        let Some(ast_unresolved::DomainExpression::Literal { value, .. }) = exprs.get(idx)
-        else {
+        let Some(value) = exprs.get(idx).and_then(ast_unresolved::Slot::ground) else {
             continue;
         };
         let any_match = pos
             .ground_values
             .iter()
-            .any(|(_, clause_val)| ground_literals_equal(&parse_literal_value(clause_val), value));
+            .any(|(_, clause_val)| ground_literals_equal(&crate::pipeline::asts::core::LiteralValue::from_stored_ground(clause_val), value));
         if !any_match {
-            let mut spellings: Vec<&str> = pos
-                .ground_values
-                .iter()
-                .map(|(_, s)| s.as_str())
-                .collect();
+            let mut spellings: Vec<&str> =
+                pos.ground_values.iter().map(|(_, s)| s.as_str()).collect();
             spellings.dedup();
             return Err(DelightQLError::validation_error_categorized(
                 "grounding/head/provable_miss",
@@ -1783,7 +1381,7 @@ pub(super) fn refuse_provable_ground_miss(
                      emptiness by absent declaration is an error, not a result. \
                      Declared spellings: {list}. A data-borne value (a column, not \
                      a literal) misses to empty instead.",
-                    arg = render_ground_literal(value),
+                    arg = value.stored_ground(),
                     n = pos.position + 1,
                     list = spellings.join(", "),
                 ),
@@ -1804,14 +1402,32 @@ pub(super) fn refuse_provable_ground_miss(
 /// INTEGER by type ordering, never equal).
 /// R8's strict-landing refusal: the pipe binds position 1, and
 /// something else occupies it.
-fn er_r8_first_param_refusal(entity: &str, first_param: &str) -> DelightQLError {
+/// A relation landed at a formal that cannot receive one.
+///
+/// THE POSITION SAYS WHICH FORMAL, and the position is all that is known: an
+/// implicit landing and an authored `@` written first name the same formal,
+/// so one refusal serves both and neither is told apart by the glyph the
+/// author used. The first position teaches toward `@`, because moving the
+/// landing is the remedy there; a later one was reached by an `@` already and
+/// teaches toward the table parameter it should have named.
+fn er_r8_landing_refusal(entity: &str, param: &str, position: usize) -> DelightQLError {
+    let message = if position == 0 {
+        format!(
+            "the pipe lands at the first parameter of '{entity}', and '{param}' \
+             occupies it — a relation can land only at a table parameter (T(*) \
+             or T(cols)). write @ at the parameter that receives the pipe: \
+             {entity}(…, @)"
+        )
+    } else {
+        format!(
+            "the pipe lands at '{param}', parameter {position} of '{entity}', and \
+             '{param}' is scalar — a relation can land only at a table parameter \
+             (T(*) or T(cols)). Supply the scalar and write @ at a table parameter"
+        )
+    };
     DelightQLError::validation_error_categorized(
         "resolution/ho/pipe_landing",
-        format!(
-            "the pipe lands at the first parameter of '{entity}', and '{first_param}' \
-             occupies it — write @ at the parameter that receives the pipe: \
-             {entity}(…, @)"
-        ),
+        message,
         "R8, strict: a piped relation lands at the first formal parameter, or at \
          exactly one explicit @ — never search, never displace",
     )
@@ -1871,130 +1487,221 @@ fn normalize_number(s: &str) -> Option<(i8, String, i64)> {
     Some((sign, stripped.to_string(), exp))
 }
 
-/// The call-site spelling of a ground literal, for teaching messages.
-fn render_ground_literal(v: &crate::pipeline::asts::core::LiteralValue) -> String {
-    use crate::pipeline::asts::core::LiteralValue::*;
-    match v {
-        Symbol(s) => format!("::{s}"),
-        Mention(m) => format!(":`{m}`"),
-        String(s) => format!("\"{s}\""),
-        Number(n) => n.clone(),
-        Boolean(b) => b.to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
-fn parse_literal_value(s: &str) -> crate::pipeline::asts::core::LiteralValue {
-    use crate::pipeline::asts::core::LiteralValue;
-
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        // Quoted string — strip quotes
-        LiteralValue::String(s[1..s.len() - 1].to_string())
-    } else if let Some(name) = s.strip_prefix("::") {
-        LiteralValue::Symbol(name.to_string())
-    } else if s.starts_with(":`") && s.ends_with('`') && s.len() > 3 {
-        LiteralValue::Mention(s[2..s.len() - 1].to_string())
-    } else if s.parse::<f64>().is_ok() {
-        LiteralValue::Number(s.to_string())
-    } else if s == "true" || s == "false" {
-        LiteralValue::Boolean(s == "true")
-    } else if s == "null" {
-        LiteralValue::Null
-    } else {
-        // Treat as string
-        LiteralValue::String(s.to_string())
-    }
-}
-
 /// Wrap a Query's main expression with a pipe operator.
 ///
-/// For `Query::Relational(expr)`: produces `Query::Relational(Pipe(expr, op))`
-/// For `Query::WithCtes { ctes, query }`: wraps the main query expression
+/// Wrap the query's BODY with a pipe operator; the bindings ride along.
 fn wrap_query_with_pipe(
-    query: ast_unresolved::Query,
-    operator: ast_unresolved::UnaryRelationalOperator,
+    mut query: ast_unresolved::Query,
+    operator: ast_unresolved::PipeOp,
 ) -> ast_unresolved::Query {
-    use crate::pipeline::asts::core::PipeExpression;
-
-    match query {
-        ast_unresolved::Query::Relational(expr) => {
-            ast_unresolved::Query::Relational(ast_unresolved::RelationalExpression::Pipe(Box::new(
-                stacksafe::StackSafe::new(PipeExpression {
-                    source: expr,
-                    operator,
-                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                }),
-            )))
-        }
-        ast_unresolved::Query::WithCtes { ctes, query: main } => {
-            let wrapped_main = ast_unresolved::RelationalExpression::Pipe(Box::new(
-                stacksafe::StackSafe::new(PipeExpression {
-                    source: main,
-                    operator,
-                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                }),
-            ));
-            ast_unresolved::Query::WithCtes {
-                ctes,
-                query: wrapped_main,
-            }
-        }
-        ast_unresolved::Query::WithErContext {
-            context,
-            query: inner,
-        } => {
-            let wrapped_inner = wrap_query_with_pipe(*inner, operator);
-            ast_unresolved::Query::WithErContext {
-                context,
-                query: Box::new(wrapped_inner),
-            }
-        }
-        other => other, // Other query forms pass through unchanged
-    }
+    query.body = query.body.then(ast_unresolved::Continuation::Pipe {
+        operator,
+        named: None,
+        cpr_schema: (),
+    });
+    query
 }
 
-/// Split first-parens DomainSpec into table bindings and scalar DomainSpec.
+/// Split first-parens Access into table bindings and scalar Access.
 ///
 /// For each position in `entity.params`:
 /// - Table param (Glob/Argumentative): extract value from first_parens, put in HoParamBindings
-/// - Scalar param (Scalar/GroundScalar): leave in the scalar DomainSpec for PatternResolver
-/// - @ (ValuePlaceholder): mark that position as pipe target
+/// - Scalar param (Scalar/GroundScalar): leave in the scalar Access for PatternResolver
+/// - @ (PipeLanding): mark that position as pipe target
 ///
-/// Returns: (table_bindings, scalar_domain_spec, pipe_target_index)
+/// Returns: (table_bindings, scalar_access, pipe_target_index)
+/// The terms of a call's FIRST parens, in written order — `None` when the
+/// group supplies no argument to match against a formal (nothing written,
+/// or the whole-operand glob).
+///
+/// A table argument matches by the name it mentions; that is what the
+/// formal is bound to.
+fn relation_term(relation: &ast_unresolved::Chain) -> Option<ast_unresolved::DomainExpression> {
+    match relation.as_read_relation() {
+        Some(ast_unresolved::Relation::Ground {
+            mention: ast_unresolved::GroundMention::Named { identifier, .. },
+            ..
+        }) => Some(
+            ast_unresolved::DomainExpression::lvar_builder(identifier.name.to_string()).build(),
+        ),
+        // A RELATION THAT IS NOT A NAME HAS NO TERM. Saying so is
+        // the whole of what this position knows; inventing an lvar
+        // for it would put a spelling nobody wrote into the body,
+        // where it refuses as a missing column or captures a real
+        // one that happens to share the name.
+        _ => None,
+    }
+}
+
+/// The relation a member supplies, when the group's member at `index` is one.
+fn member_relation(
+    arguments: &ast_unresolved::CallArguments,
+    index: usize,
+) -> Option<&ast_unresolved::Chain> {
+    arguments.ho_members().nth(index)?.relation()
+}
+
+/// One first-parens member as the formal-matching loop reads it: a value
+/// term, a relation that names nothing a formal could bind, or one of the
+/// two structural row marks.
+#[derive(Debug)]
+enum HoTerm {
+    Term(ast_unresolved::DomainExpression),
+    Opaque,
+    Landing,
+    Skip,
+}
+
+impl HoTerm {
+    fn term(&self) -> Option<&ast_unresolved::DomainExpression> {
+        match self {
+            Self::Term(term) => Some(term),
+            Self::Opaque | Self::Landing | Self::Skip => None,
+        }
+    }
+}
+
+fn first_parens_terms(arguments: &ast_unresolved::CallArguments) -> Option<Vec<HoTerm>> {
+    use crate::pipeline::asts::core::operators::{CallArguments, HoArgument, ScalarArgument};
+    let as_term = |term: Option<ast_unresolved::DomainExpression>| match term {
+        Some(term) => HoTerm::Term(term),
+        None => HoTerm::Opaque,
+    };
+    match arguments {
+        CallArguments::None => None,
+        CallArguments::HigherOrder(part) => Some(
+            part.members
+                .iter()
+                .map(|argument| match argument {
+                    HoArgument::Relation(relation) => as_term(relation_term(relation)),
+                    HoArgument::Value(value) => as_term(value.domain().cloned()),
+                    HoArgument::Landing(_) => HoTerm::Landing,
+                    HoArgument::Skip => HoTerm::Skip,
+                })
+                .collect(),
+        ),
+        CallArguments::Scalar(members) => {
+            if members.is_empty() {
+                return None;
+            }
+            // AN ENUMERATION IS NOT A TERM. A lone whole-operand glob is
+            // the group asking for everything, not an argument to match.
+            if matches!(
+                members.as_slice(),
+                [ScalarArgument::Spread(
+                    crate::pipeline::asts::core::Spread::Glob(_)
+                )]
+            ) {
+                return None;
+            }
+            Some(
+                members
+                    .iter()
+                    .map(|member| match member {
+                        ScalarArgument::Value(value) => as_term(value.domain().cloned()),
+                        // A callable's BODY is the term the callee applies.
+                        ScalarArgument::Callable(ast_unresolved::Callable::Lambda(lambda)) => {
+                            as_term(Some((*lambda.body).clone()))
+                        }
+                        ScalarArgument::Callable(_) => HoTerm::Opaque,
+                        ScalarArgument::Spread(_) | ScalarArgument::Star => HoTerm::Opaque,
+                        ScalarArgument::Context(_) => HoTerm::Opaque,
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// The value a lifted group carries, when the group is one row of one column.
+///
+/// `f(t(*) & 3)` is `f(t(*), _(3))` — the lift's own equivalence — so a
+/// scalar formal standing after `&` is supplied by a relation. Only the
+/// single-cell shape answers: a wider or taller relation is a relation, and
+/// a scalar slot that quietly took its first cell would be guessing.
+fn lifted_scalar(
+    relation: Option<&ast_unresolved::Chain>,
+) -> Option<ast_unresolved::DomainExpression> {
+    let relation = relation?;
+    let ast_unresolved::Grelex::Literal(table) = &relation.head else {
+        return None;
+    };
+    if !relation.continuations.is_empty() || table.table.body.header.is_some() {
+        return None;
+    }
+    if table.table.body.rows.len() != 1 || table.table.body.rows.first().len() != 1 {
+        return None;
+    }
+    Some(table.table.body.rows.first().0.first().value())
+}
+
+/// The term a formal needs, or the refusal for the argument that has none.
+///
+/// A relation argument that is not a name — an anonymous table, an inner
+/// relation, a call — has no term, and a skip mark computes nothing. The
+/// formals that read a NAME or a VALUE say so here rather than reading an
+/// invented lvar, which would refuse downstream under a spelling nobody
+/// wrote or, worse, capture a real column that happened to share it.
+fn require_term<'a>(
+    term: &'a HoTerm,
+    param: &crate::pipeline::asts::ddl::HoParam,
+    entity: &str,
+    position: usize,
+) -> Result<&'a ast_unresolved::DomainExpression> {
+    term.term().ok_or_else(|| {
+        DelightQLError::validation_error_categorized(
+            "resolution/ho/relational_argument",
+            format!(
+                "parameter '{}' of '{entity}' is supplied at position {position} by a \
+                 relation expression, which names nothing this position can bind",
+                param.name()
+            ),
+            "pass a named relation, or write the argument the parameter declares",
+        )
+    })
+}
+
 pub(super) fn split_ho_first_parens(
-    first_parens_spec: &ast_unresolved::DomainSpec,
     entity: &crate::resolution::registry::ConsultedEntity,
-    pipe_source: Option<&ast_unresolved::RelationalExpression>,
-    argument_groups: Option<&[crate::pipeline::asts::core::operators::HoCallGroup]>,
-    ho_arguments: &[ast_unresolved::HoArgument],
-    aliases: &super::ResolverAliasCounter,
+    pipe_source: Option<&ast_unresolved::Chain>,
+    arguments: &ast_unresolved::CallArguments,
+    direct_pipe_target: Option<usize>,
     registry: &mut crate::resolution::EntityRegistry,
     caller_scope: Option<&str>,
-) -> Result<(HoParamBindings, ast_unresolved::DomainSpec, Option<usize>)> {
-    use crate::resolution::registry::HoParamKind;
+) -> Result<(HoParamBindings, ast_unresolved::Access, Option<usize>)> {
+    use crate::pipeline::asts::ddl::HoParam as RegParam;
 
     // Compute position analysis for MixedGround detection
     let positions = if !entity.positions.is_empty() {
         entity.positions.clone()
     } else {
-        let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
-        build_ho_position_analysis(&defs)
+        crate::ddl::reconstruct::group(&entity.definition)
+            .as_ref()
+            .map(build_ho_position_analysis)
+            .unwrap_or_default()
     };
 
-    let exprs = match first_parens_spec {
-        ast_unresolved::DomainSpec::Positional(exprs) => exprs,
-        ast_unresolved::DomainSpec::Glob | ast_unresolved::DomainSpec::Bare => {
+    // The FIRST parens are arguments, not dimensions: the terms this
+    // function matches against formals are the ho_arguments themselves.
+    // A group that wrote nothing, or wrote only a glob, supplies no
+    // argument to match.
+    let exprs = first_parens_terms(arguments);
+    let exprs = match exprs {
+        Some(exprs) => exprs,
+        None => {
             // No explicit args — but if piped, bind first table param to pipe source
             let mut bindings = HoParamBindings::default();
             let mut pipe_target_idx = None;
             if pipe_source.is_some() && !entity.params.is_empty() {
-                // R8, STRICT (ratified 2026-07-23): the pipe lands at the
-                // FIRST formal parameter — never a search for a table
-                // parameter elsewhere. A scalar first parameter refuses
-                // toward the explicit spelling.
-                if !entity.params.iter().any(|p| {
-                    matches!(p.kind, HoParamKind::Glob | HoParamKind::Argumentative(_))
-                }) {
+                // STRICT LANDING: the pipe lands at the FIRST formal
+                // parameter — never a search for a table parameter
+                // elsewhere. A scalar first parameter refuses toward the
+                // explicit spelling.
+                if !entity
+                    .params
+                    .iter()
+                    .any(|p| matches!(p, RegParam::Relation { .. }))
+                {
                     return Err(DelightQLError::validation_error(
                         format!(
                             "Higher-order view '{}' has no table-value parameter to receive pipe input \
@@ -2005,61 +1712,18 @@ pub(super) fn split_ho_first_parens(
                          as the target for the pipe input",
                     ));
                 }
-                if !matches!(
-                    entity.params[0].kind,
-                    HoParamKind::Glob | HoParamKind::Argumentative(_)
-                ) {
-                    return Err(er_r8_first_param_refusal(&entity.name, &entity.params[0].name));
+                if !matches!(entity.params[0], RegParam::Relation { .. }) {
+                    return Err(er_r8_landing_refusal(
+                        &entity.name,
+                        &entity.params[0].name(),
+                        0,
+                    ));
                 }
                 pipe_target_idx = Some(0);
                 let first_param = &entity.params[0];
-                let cte_name = "_ho_pipe_src".to_string();
-                match &first_param.kind {
-                    HoParamKind::Argumentative(columns) => {
-                        let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
-                            .iter()
-                            .map(|c| {
-                                ast_unresolved::DomainExpression::lvar_builder(c.clone()).build()
-                            })
-                            .collect();
-                        let cte_rel = ast_unresolved::RelationalExpression::Relation(
-                            ast_unresolved::Relation::Ground {
-                                identifier: ast_unresolved::QualifiedName {
-                                    namespace_path: ast_unresolved::NamespacePath::empty(),
-                                    name: cte_name.into(),
-                                    grounding: None,
-                                },
-                                canonical_name: ast_unresolved::PhaseBox::phantom(),
-                                backend_schema: ast_unresolved::PhaseBox::phantom(),
-                                domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
-                                alias: None,
-                                outer: false,
-                                mutation_target: false,
-                                passthrough: false,
-                                cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                                hygienic_injections: Vec::new(),
-                            },
-                        );
-                        bindings
-                            .table_expr_params
-                            .insert(first_param.name.clone(), cte_rel);
-                    }
-                    _ => {
-                        bindings
-                            .table_params
-                            .insert(first_param.name.clone(), cte_name);
-                    }
-                }
+                bind_pipe_carrier(&mut bindings, first_param, &registry.identities);
             }
-            let spec = if matches!(first_parens_spec, ast_unresolved::DomainSpec::Glob) {
-                ast_unresolved::DomainSpec::Glob
-            } else {
-                ast_unresolved::DomainSpec::Bare
-            };
-            return Ok((bindings, spec, pipe_target_idx));
-        }
-        _ => {
-            return Ok((HoParamBindings::default(), first_parens_spec.clone(), None));
+            return Ok((bindings, ast_unresolved::Access::All, pipe_target_idx));
         }
     };
 
@@ -2067,13 +1731,12 @@ pub(super) fn split_ho_first_parens(
     let mut scalar_exprs = Vec::new();
     let mut pipe_target_idx = None;
     let mut expr_idx = 0;
-    let mut group_idx = 0usize; // tracks which &-group we're in for Argumentative params
 
     // Check if any expression is @. If piped with no @, the first table param
     // gets the pipe source implicitly — we must skip it in the expr-matching loop.
     let at_count = exprs
         .iter()
-        .filter(|e| matches!(e, ast_unresolved::DomainExpression::ValuePlaceholder { .. }))
+        .filter(|e| matches!(e, HoTerm::Landing))
         .count();
     if pipe_source.is_some() && at_count > 1 {
         return Err(DelightQLError::validation_error_categorized(
@@ -2087,80 +1750,72 @@ pub(super) fn split_ho_first_parens(
              exactly one explicit @",
         ));
     }
-    let has_at = at_count > 0;
+    let has_at = at_count > 0 || direct_pipe_target.is_some();
     let implicit_pipe_target = pipe_source.is_some() && !has_at;
 
-    // R8, STRICT (ratified 2026-07-23): the implicit landing is the
-    // FIRST formal parameter, period — a supplied/scalar first parameter
-    // refuses toward the explicit @ spelling; the landing never searches
-    // and never displaces.
+    // NOWHERE TO LAND AT ALL comes first, and does not depend on WHERE the
+    // relation landed: a callee with no table parameter cannot receive one
+    // at any position, and saying which formal it reached instead would
+    // teach toward moving an `@` that has nowhere to move to.
+    if pipe_source.is_some()
+        && !entity.params.is_empty()
+        && !entity
+            .params
+            .iter()
+            .any(|p| matches!(p, RegParam::Relation { .. }))
+    {
+        return Err(DelightQLError::validation_error(
+            format!(
+                "Higher-order view '{}' has no table-value parameter to receive pipe input \
+                 (all parameters are scalar)",
+                entity.name
+            ),
+            "A piped HO view must have at least one table-value parameter (e.g. T(*)) \
+             as the target for the pipe input",
+        ));
+    }
+
+    // STRICT LANDING: the implicit landing is the FIRST formal parameter,
+    // period — a supplied/scalar first parameter refuses toward the
+    // explicit @ spelling; the landing never searches and never
+    // displaces.
     if implicit_pipe_target
         && !entity.params.is_empty()
-        && !matches!(
-            entity.params[0].kind,
-            HoParamKind::Glob | HoParamKind::Argumentative(_)
-        )
+        && !matches!(entity.params[0], RegParam::Relation { .. })
     {
-        if !entity.params.iter().any(|p| {
-            matches!(p.kind, HoParamKind::Glob | HoParamKind::Argumentative(_))
-        }) {
-            return Err(DelightQLError::validation_error(
-                format!(
-                    "Higher-order view '{}' has no table-value parameter to receive pipe input \
-                     (all parameters are scalar)",
-                    entity.name
-                ),
-                "A piped HO view must have at least one table-value parameter (e.g. T(*)) \
-                 as the target for the pipe input",
-            ));
-        }
-        return Err(er_r8_first_param_refusal(&entity.name, &entity.params[0].name));
+        return Err(er_r8_landing_refusal(
+            &entity.name,
+            &entity.params[0].name(),
+            0,
+        ));
     }
 
     for (param_idx, param) in entity.params.iter().enumerate() {
+        // A direct substituted call records an explicit @ as metadata while
+        // omitting the placeholder from its authored argument vector. The
+        // formal still consumes no authored expression; validate its category
+        // at the same typed boundary as the CST placeholder path.
+        if direct_pipe_target == Some(param_idx) {
+            if !matches!(param, RegParam::Relation { .. }) {
+                return Err(er_r8_landing_refusal(
+                    &entity.name,
+                    &param.name(),
+                    param_idx,
+                ));
+            }
+            pipe_target_idx = Some(param_idx);
+            bind_pipe_carrier(&mut bindings, param, &registry.identities);
+            continue;
+        }
+
         // Implicit pipe target (R8): the first parameter, no other.
         if implicit_pipe_target
             && pipe_target_idx.is_none()
             && param_idx == 0
-            && matches!(
-                param.kind,
-                HoParamKind::Glob | HoParamKind::Argumentative(_)
-            )
+            && matches!(param, RegParam::Relation { .. })
         {
             pipe_target_idx = Some(param_idx);
-            let cte_name = "_ho_pipe_src".to_string();
-            match &param.kind {
-                HoParamKind::Argumentative(columns) => {
-                    let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
-                        .iter()
-                        .map(|c| ast_unresolved::DomainExpression::lvar_builder(c.clone()).build())
-                        .collect();
-                    let cte_rel = ast_unresolved::RelationalExpression::Relation(
-                        ast_unresolved::Relation::Ground {
-                            identifier: ast_unresolved::QualifiedName {
-                                namespace_path: ast_unresolved::NamespacePath::empty(),
-                                name: cte_name.into(),
-                                grounding: None,
-                            },
-                            canonical_name: ast_unresolved::PhaseBox::phantom(),
-                            backend_schema: ast_unresolved::PhaseBox::phantom(),
-                            domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
-                            alias: None,
-                            outer: false,
-                            mutation_target: false,
-                            passthrough: false,
-                            cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                            hygienic_injections: Vec::new(),
-                        },
-                    );
-                    bindings
-                        .table_expr_params
-                        .insert(param.name.clone(), cte_rel);
-                }
-                _ => {
-                    bindings.table_params.insert(param.name.clone(), cte_name);
-                }
-            }
+            bind_pipe_carrier(&mut bindings, param, &registry.identities);
             continue; // Don't consume an expr for this param
         }
 
@@ -2168,32 +1823,24 @@ pub(super) fn split_ho_first_parens(
             break;
         }
 
+        // A RELATION WITH NO TERM IS STILL AN ARGUMENT. It reaches the
+        // formal through `ho_arguments`, which holds what the author wrote;
+        // only the roads that need a NAME or a VALUE ask for the term, and
+        // they refuse when there is none rather than reading an invention.
         let expr = &exprs[expr_idx];
 
         // Check for @ (explicit pipe target)
-        if matches!(
-            expr,
-            ast_unresolved::DomainExpression::ValuePlaceholder { .. }
-        ) {
+        if matches!(expr, HoTerm::Landing) {
             // R8 names the LANDING; only a table-valued parameter can
             // receive a relation. An @ at a scalar parameter would bind
             // the pipe nowhere — the carrier CTE emits but nothing
             // references it, the relation silently vanishes — so the
             // shape refuses instead.
-            if !matches!(
-                param.kind,
-                HoParamKind::Glob | HoParamKind::Argumentative(_)
-            ) {
-                return Err(DelightQLError::validation_error_categorized(
-                    "resolution/ho/pipe_landing",
-                    format!(
-                        "@ lands the piped relation at '{}', but '{}' is a scalar \
-                         parameter of '{}' — a relation can land only at a table \
-                         parameter (T(*) or T(cols)). Supply the scalar and write \
-                         @ at a table parameter",
-                        param.name, param.name, entity.name
-                    ),
-                    "R8: @ names the table parameter that receives the pipe",
+            if !matches!(param, RegParam::Relation { .. }) {
+                return Err(er_r8_landing_refusal(
+                    &entity.name,
+                    &param.name(),
+                    param_idx,
                 ));
             }
             if pipe_source.is_none() {
@@ -2209,119 +1856,111 @@ pub(super) fn split_ho_first_parens(
                 ));
             }
             pipe_target_idx = Some(param_idx);
-            if pipe_source.is_some() {
-                let cte_name = "_ho_pipe_src".to_string();
-                match &param.kind {
-                    HoParamKind::Argumentative(columns) => {
-                        let col_exprs: Vec<ast_unresolved::DomainExpression> = columns
-                            .iter()
-                            .map(|c| {
-                                ast_unresolved::DomainExpression::lvar_builder(c.clone()).build()
-                            })
-                            .collect();
-                        let cte_rel = ast_unresolved::RelationalExpression::Relation(
-                            ast_unresolved::Relation::Ground {
-                                identifier: ast_unresolved::QualifiedName {
-                                    namespace_path: ast_unresolved::NamespacePath::empty(),
-                                    name: cte_name.into(),
-                                    grounding: None,
-                                },
-                                canonical_name: ast_unresolved::PhaseBox::phantom(),
-                                backend_schema: ast_unresolved::PhaseBox::phantom(),
-                                domain_spec: ast_unresolved::DomainSpec::Positional(col_exprs),
-                                alias: None,
-                                outer: false,
-                                mutation_target: false,
-                                passthrough: false,
-                                cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                                hygienic_injections: Vec::new(),
-                            },
-                        );
-                        bindings
-                            .table_expr_params
-                            .insert(param.name.clone(), cte_rel);
-                    }
-                    _ => {
-                        bindings.table_params.insert(param.name.clone(), cte_name);
-                    }
-                }
-            }
+            bind_pipe_carrier(&mut bindings, param, &registry.identities);
             expr_idx += 1;
             continue;
         }
 
-        match &param.kind {
-            HoParamKind::Glob => {
+        match param {
+            RegParam::Relation {
+                cols: crate::pipeline::asts::ddl::HeadItems::Glob,
+                ..
+            } => {
                 // EVERY caller-authored Glob argument rides a carrier CTE —
-                // bare references included (review zmvnywzu, P1: the bare
-                // fast path name-substituted the reference INLINE into the
-                // entity's clause bodies, so an enlisted rule or aliased
-                // reference resolved in the ENTITY's scope and missed; it
-                // also dropped a bare reference's namespace qualifier).
+                // bare references included: a fast path that name-substitutes
+                // the reference INLINE into the entity's clause bodies would
+                // resolve an enlisted rule or aliased reference in the
+                // ENTITY's scope instead of the caller's, and would drop a
+                // bare reference's namespace qualifier.
                 // The carrier is Caller-owned, so the caller's scope serves
                 // its own names. Carrier names are counter-uniquified: two
                 // invocations in one query must not UNION-merge through the
                 // same-name CTE machinery.
-                if let Some(ast_unresolved::HoArgument::Table(ref rel_expr)) =
-                    ho_arguments.get(expr_idx)
-                {
-                    let plain_inline_name = match rel_expr {
-                        ast_unresolved::RelationalExpression::Relation(
-                            ast_unresolved::Relation::Ground {
-                                identifier,
-                                domain_spec:
-                                    ast_unresolved::DomainSpec::Glob | ast_unresolved::DomainSpec::Bare,
+                if let Some(rel_expr) = member_relation(arguments, expr_idx) {
+                    let plain_inline_name = match (
+                        rel_expr.as_read_relation(),
+                        rel_expr.head_access(),
+                    ) {
+                        (
+                            Some(ast_unresolved::Relation::Ground {
+                                mention: ast_unresolved::GroundMention::Named { identifier, .. },
                                 ..
-                            },
-                        ) if identifier.namespace_path.is_empty()
-                            && identifier.grounding.is_none() =>
-                        {
-                            let name = identifier.name.to_string();
-                            plain_arg_may_inline(&name, registry, caller_scope).then_some(name)
+                            }),
+                            Some(ast_unresolved::Access::All | ast_unresolved::Access::Unasked),
+                        ) if identifier.namespace_path.is_empty() => {
+                            let name = identifier.name.clone();
+                            plain_arg_may_inline(&name, registry, caller_scope)?
+                                .then_some(name.as_str().to_string())
                         }
                         _ => None,
                     };
                     if let Some(name) = plain_inline_name {
-                        bindings.table_params.insert(param.name.clone(), name);
+                        bindings.table_params.insert(param.name().to_string(), name);
                     } else {
                         // Normalize: unwrap InnerRelation, patch Bare→Glob so
                         // columns are visible for filter/projection resolution.
                         let normalized =
                             normalize_interior_for_cte(patch_bare_to_glob(rel_expr.clone()));
-                        bind_glob_carrier(&mut bindings, &param.name, normalized, aliases);
+                        bind_glob_carrier(
+                            &mut bindings,
+                            param.name().as_str(),
+                            normalized,
+                            &registry.identities,
+                        );
                     }
                 } else {
-                    // Fallback: legacy DomainExpression path (the piped
-                    // invocation forms supply no ho_arguments) — same inline
+                    // The piped invocation forms supply no ho_arguments, so the
+                    // argument arrives as a DomainExpression — same inline
                     // decision; a carried name becomes the reference it
                     // denotes, resolved in the caller's scope.
-                    match expr {
-                        ast_unresolved::DomainExpression::Lvar { name, .. } => {
-                            if plain_arg_may_inline(name.as_str(), registry, caller_scope) {
+                    match require_term(expr, param, &entity.name, param_idx)? {
+                        ast_unresolved::DomainExpression::Reference(Reference::Named(
+                            NamedReference(AuthoredColumn { name, .. }),
+                        )) => {
+                            if plain_arg_may_inline(name, registry, caller_scope)? {
                                 bindings
                                     .table_params
-                                    .insert(param.name.clone(), name.to_string());
+                                    .insert(param.name().to_string(), name.to_string());
                             } else {
                                 let rel = bare_glob_reference(name.as_str());
-                                bind_glob_carrier(&mut bindings, &param.name, rel, aliases);
+                                bind_glob_carrier(
+                                    &mut bindings,
+                                    param.name().as_str(),
+                                    rel,
+                                    &registry.identities,
+                                );
                             }
                         }
-                        ast_unresolved::DomainExpression::Literal {
-                            value: crate::pipeline::asts::core::LiteralValue::String(s),
-                            ..
-                        } => {
-                            if plain_arg_may_inline(s, registry, caller_scope) {
-                                bindings.table_params.insert(param.name.clone(), s.clone());
+                        ast_unresolved::DomainExpression::Application(
+                            ast_unresolved::FunctionApplication::Ground(
+                                crate::pipeline::asts::core::LiteralValue::String(s),
+                            ),
+                        ) => {
+                            if plain_arg_may_inline(
+                                &delightql_types::SqlIdentifier::new(s.clone()),
+                                registry,
+                                caller_scope,
+                            )? {
+                                bindings
+                                    .table_params
+                                    .insert(param.name().to_string(), s.clone());
                             } else {
                                 let rel = bare_glob_reference(s);
-                                bind_glob_carrier(&mut bindings, &param.name, rel, aliases);
+                                bind_glob_carrier(
+                                    &mut bindings,
+                                    param.name().as_str(),
+                                    rel,
+                                    &registry.identities,
+                                );
                             }
                         }
                         _ => {
                             return Err(DelightQLError::validation_error(
                                 format!(
                                     "Expected table name at position {} for param '{}', got {:?}",
-                                    param_idx, param.name, expr
+                                    param_idx,
+                                    param.name(),
+                                    expr
                                 ),
                                 "Glob table parameter must be a table name or variable",
                             ));
@@ -2329,12 +1968,47 @@ pub(super) fn split_ho_first_parens(
                     }
                 }
                 expr_idx += 1;
-                group_idx += 1;
             }
-            HoParamKind::Argumentative(columns) => {
+            RegParam::Relation {
+                cols: crate::pipeline::asts::ddl::HeadItems::Listed(cols),
+                ..
+            } => {
+                let columns: Vec<String> = cols.iter().map(|c| c.supply.spelling()).collect();
+                let columns = &columns;
+                if let Some(rel_expr) = member_relation(arguments, expr_idx) {
+                    // THE LIFT'S ROWS ARE THE ARGUMENT. `f("a"; "b")` is
+                    // `f(_("a"; "b"))` — the lift's own equivalence — and a
+                    // declared-width parameter NAMES that relation's columns,
+                    // so the headerless literal binds inline under the declared
+                    // names. Behind a carrier CTE the rows become a reference,
+                    // and every reader that needs the VALUES — the pivot's IN
+                    // among them — sees a relation it cannot look inside.
+                    if let Some(named) = lifted_rows_under_declared_names(rel_expr, columns) {
+                        bindings
+                            .table_expr_params
+                            .insert(param.name().to_string(), named);
+                        expr_idx += 1;
+                        continue;
+                    }
+                    let normalized =
+                        normalize_interior_for_cte(patch_bare_to_glob(rel_expr.clone()));
+                    bind_glob_carrier(
+                        &mut bindings,
+                        param.name().as_str(),
+                        normalized,
+                        &registry.identities,
+                    );
+                    bindings
+                        .argumentative_patterns
+                        .insert(param.name().to_string(), columns.clone());
+                    expr_idx += 1;
+                    continue;
+                }
                 // Argumentative table param: either a table ref (Lvar) or scalar lift
-                match expr {
-                    ast_unresolved::DomainExpression::Lvar { name, .. } => {
+                match require_term(expr, param, &entity.name, param_idx)? {
+                    ast_unresolved::DomainExpression::Reference(Reference::Named(
+                        NamedReference(AuthoredColumn { name, .. }),
+                    )) => {
                         // Table reference. Same inline-or-carrier decision as
                         // the Glob kind: a query-local CTE or physical table
                         // binds by name (the remap machinery reads its schema
@@ -2344,22 +2018,29 @@ pub(super) fn split_ho_first_parens(
                         // supplies the arity check and column binding that
                         // the by-name remap cannot (it looks the name up as
                         // CTE-or-table and a consulted rule misses both).
-                        if plain_arg_may_inline(name.as_str(), registry, caller_scope) {
+                        if plain_arg_may_inline(name, registry, caller_scope)? {
                             bindings
                                 .table_params
-                                .insert(param.name.clone(), name.to_string());
+                                .insert(param.name().to_string(), name.to_string());
                             bindings.argumentative_table_refs.push((
-                                param.name.clone(),
-                                name.to_string(),
+                                param.name().to_string(),
+                                name.clone(),
                                 columns.len(),
                                 columns.clone(),
                             ));
                         } else {
                             let rel = bare_glob_reference(name.as_str());
-                            bind_glob_carrier(&mut bindings, &param.name, rel, aliases);
+                            bind_glob_carrier(
+                                &mut bindings,
+                                param.name().as_str(),
+                                rel,
+                                &registry.identities,
+                            );
+                            bindings
+                                .argumentative_patterns
+                                .insert(param.name().to_string(), columns.clone());
                         }
                         expr_idx += 1;
-                        group_idx += 1;
                     }
                     _ => {
                         // Scalar lift: consume rows of N exprs each and build anon table.
@@ -2367,20 +2048,18 @@ pub(super) fn split_ho_first_parens(
                         //
                         // Explicit always wins: when scalar parameters FOLLOW the
                         // lifted rows, the row/scalar split is genuinely ambiguous
-                        // and must be marked with `&` — it is never guessed. (The
-                        // guess formerly took exactly one row and let the rest fall
-                        // to the scalars, silently.)
-                        let later_scalar = entity.params[param_idx + 1..].iter().any(|p| {
-                            matches!(p.kind, HoParamKind::Scalar | HoParamKind::GroundScalar(_))
-                        });
-                        let has_boundary =
-                            argument_groups.map_or(false, |g| g.len() > group_idx + 1);
-                        if later_scalar && !has_boundary {
+                        // and must be marked with `&` — it is never guessed: guessing
+                        // would silently take exactly one row and let the rest fall
+                        // to the scalars.
+                        let later_scalar = entity.params[param_idx + 1..]
+                            .iter()
+                            .any(|p| !matches!(p, RegParam::Relation { .. }));
+                        if later_scalar {
                             return Err(DelightQLError::validation_error_categorized(
                                 "resolution/ho/lifted_boundary",
                                 format!(
                                     "ambiguous lifted-relation boundary in '{}': inline rows for parameter '{}' are followed by scalar parameter(s), and the split cannot be guessed",
-                                    entity.name, param.name
+                                    entity.name, param.name()
                                 ),
                                 "mark where the rows end with & — e.g. f(\"a\", 1; \"b\", 2 & \"x\") — or pass a named relation instead of inline rows",
                             ));
@@ -2388,35 +2067,26 @@ pub(super) fn split_ho_first_parens(
                         let n_cols = columns.len();
                         let mut all_rows = Vec::new();
 
-                        // When argument_groups are available, use the group's row count
-                        // to bound consumption. This prevents greedy consumption when
-                        // multiple table params have consecutive scalar lifts (& separator).
-                        let max_rows = argument_groups
-                            .and_then(|groups| groups.get(group_idx))
-                            .map(|g| g.rows.len());
-
                         loop {
                             if expr_idx >= exprs.len() {
                                 break;
                             }
-                            // If we know the exact row count from groups, stop when reached
-                            if let Some(max) = max_rows {
-                                if all_rows.len() >= max {
-                                    break;
-                                }
-                            }
                             // Check if the next expr is a literal (part of this row)
                             // or an Lvar (next param / end of scalar lift)
                             let next = &exprs[expr_idx];
-                            let is_literal =
-                                matches!(next, ast_unresolved::DomainExpression::Literal { .. });
+                            let is_literal = matches!(
+                                next,
+                                HoTerm::Term(ast_unresolved::DomainExpression::Application(
+                                    ast_unresolved::FunctionApplication::Ground(_)
+                                ))
+                            );
                             if !is_literal && all_rows.is_empty() {
                                 // First value is not a literal — error
                                 return Err(DelightQLError::validation_error(
                                     format!(
                                         "Argumentative param '{}' expects literal values for scalar lift, \
                                          got {:?}",
-                                        param.name, next
+                                        param.name(), next
                                     ),
                                     "Scalar lift values must be literals",
                                 ));
@@ -2433,7 +2103,7 @@ pub(super) fn split_ho_first_parens(
                                         format!(
                                             "Argumentative param '{}' expects {} values per row, \
                                              but only {} remain at position {}",
-                                            param.name,
+                                            param.name(),
                                             n_cols,
                                             exprs.len() - expr_idx,
                                             param_idx
@@ -2442,26 +2112,29 @@ pub(super) fn split_ho_first_parens(
                                     ));
                                 }
                                 let val_expr = &exprs[expr_idx + col_idx];
-                                let val_str = match val_expr {
-                                    ast_unresolved::DomainExpression::Literal {
-                                        value: crate::pipeline::asts::core::LiteralValue::String(s),
-                                        ..
-                                    } => format!("\"{}\"", s),
-                                    ast_unresolved::DomainExpression::Literal {
-                                        value: crate::pipeline::asts::core::LiteralValue::Number(n),
-                                        ..
-                                    } => n.clone(),
+                                let value = match require_term(
+                                    val_expr,
+                                    param,
+                                    &entity.name,
+                                    param_idx,
+                                )? {
+                                    ast_unresolved::DomainExpression::Application(ast_unresolved::FunctionApplication::Ground(value @ (crate::pipeline::asts::core::LiteralValue::String(
+                                                _,
+                                            )
+                                            | crate::pipeline::asts::core::LiteralValue::Number(
+                                                _,
+                                            )))) => value.clone(),
                                     other => {
                                         return Err(DelightQLError::validation_error(
                                             format!(
                                                 "Unsupported expression in scalar lift for param '{}' column {}: {:?}",
-                                                param.name, col_idx, other
+                                                param.name(), col_idx, other
                                             ),
                                             "Scalar lift values must be literals",
                                         ));
                                     }
                                 };
-                                row_values.push(val_str);
+                                row_values.push(value);
                             }
                             expr_idx += n_cols;
                             all_rows.push(row_values);
@@ -2471,7 +2144,7 @@ pub(super) fn split_ho_first_parens(
                             return Err(DelightQLError::validation_error(
                                 format!(
                                     "Argumentative param '{}' got no values for scalar lift",
-                                    param.name,
+                                    param.name(),
                                 ),
                                 "No values for argumentative scalar lift",
                             ));
@@ -2480,12 +2153,11 @@ pub(super) fn split_ho_first_parens(
                         let anon_table = lift_scalars_to_anonymous_table(columns, &all_rows)?;
                         bindings
                             .table_expr_params
-                            .insert(param.name.clone(), anon_table);
-                        group_idx += 1;
+                            .insert(param.name().to_string(), anon_table);
                     }
                 }
             }
-            HoParamKind::Scalar => {
+            RegParam::Scalar { .. } => {
                 // Check if this position is MixedGround — needs BOTH text substitution
                 // AND PatternResolver filtering
                 let is_mixed_ground = positions.iter().any(|pi| {
@@ -2493,10 +2165,22 @@ pub(super) fn split_ho_first_parens(
                         && pi.ground_mode == crate::pipeline::asts::ddl::HoGroundMode::MixedGround
                 });
 
+                // THE DESCRIPTOR DECIDES WHAT A LIFTED GROUP IS. `&` bounds
+                // arguments and dissolves into an anonymous relation, so a
+                // scalar written after it arrives here as a one-row, one-column
+                // relation. The formal says it is a scalar, and that is the
+                // set-at-a-time reading: the row IS the value. Left as the
+                // relation, the parameter would carry a placeholder spelling
+                // into the body and refuse there under a name nobody wrote.
+                let expr = match lifted_scalar(member_relation(arguments, expr_idx)) {
+                    Some(value) => value,
+                    None => require_term(expr, param, &entity.name, param_idx)?.clone(),
+                };
+
                 // Text substitution for free-variable clauses
                 bindings
                     .scalar_params
-                    .insert(param.name.clone(), expr.clone());
+                    .insert(param.name().to_string(), expr.clone());
 
                 if is_mixed_ground {
                     // MixedGround: also add to scalar_exprs for PatternResolver
@@ -2504,9 +2188,9 @@ pub(super) fn split_ho_first_parens(
                 }
                 expr_idx += 1;
             }
-            HoParamKind::GroundScalar(_) => {
-                // GroundScalar: goes to PatternResolver via scalar_exprs
-                scalar_exprs.push(expr.clone());
+            RegParam::Ground { .. } => {
+                // A ground position goes to PatternResolver via scalar_exprs
+                scalar_exprs.push(require_term(expr, param, &entity.name, param_idx)?.clone());
                 expr_idx += 1;
             }
         }
@@ -2525,34 +2209,81 @@ pub(super) fn split_ho_first_parens(
         ));
     }
 
-    let scalar_spec = if scalar_exprs.is_empty() {
-        ast_unresolved::DomainSpec::Glob
-    } else {
-        ast_unresolved::DomainSpec::Positional(scalar_exprs)
+    let scalar_spec = match Vec1::try_from_vec(
+        scalar_exprs
+            .into_iter()
+            .map(ast_unresolved::Slot::classify)
+            .collect(),
+    ) {
+        Some(slots) => ast_unresolved::Access::Slots(slots),
+        None => ast_unresolved::Access::All,
     };
 
     Ok((bindings, scalar_spec, pipe_target_idx))
 }
 
-/// Check if a relational expression is a bare table reference (just a table name with Glob or Bare domain spec).
-/// Returns false for InnerRelation, Filter, Pipe, and Ground with Positional domain spec
-/// (which represents a projection that needs CTE materialization).
-/// Bind a Glob param to a fresh Caller-carrier CTE holding `expr`.
-/// One shared implementation for the structured (`ho_arguments`) and the
-/// legacy name-only argument roads (review zmqwqlms-family discipline:
-/// invariants live in shared implementations).
+fn bind_relation_carrier(
+    bindings: &mut crate::pipeline::query_features::HoParamBindings,
+    param_name: &str,
+    expr: ast_unresolved::Chain,
+    role: crate::names::HoRole,
+    identities: &crate::names::Registry,
+) -> crate::names::ScopeId {
+    let scope = identities.mint_derived_scope(
+        crate::names::ScopeOrigin::HoCarrier { role },
+        crate::names::Hint::Prefix("ho"),
+    );
+    bindings
+        .table_scope_params
+        .insert(param_name.to_string(), scope);
+    bindings
+        .interior_ctes
+        .push((param_name.to_string(), scope, expr));
+    scope
+}
+
+/// Bind a table argument to a fresh caller-owned structural CTE.
 fn bind_glob_carrier(
     bindings: &mut crate::pipeline::query_features::HoParamBindings,
     param_name: &str,
-    expr: ast_unresolved::RelationalExpression,
-    aliases: &super::ResolverAliasCounter,
+    expr: ast_unresolved::Chain,
+    identities: &crate::names::Registry,
 ) {
-    let (alias, _) = aliases.next_alias_with_id();
-    let cte_name = format!("_ho_arg_{}{}", param_name, alias);
+    bind_relation_carrier(
+        bindings,
+        param_name,
+        expr,
+        crate::names::HoRole::Argument,
+        identities,
+    );
+}
+
+/// Bind a piped source without creating a query-local character key.
+fn bind_pipe_carrier(
+    bindings: &mut crate::pipeline::query_features::HoParamBindings,
+    param: &crate::resolution::registry::HoParamInfo,
+    identities: &crate::names::Registry,
+) {
+    let scope = identities.mint_derived_scope(
+        crate::names::ScopeOrigin::HoCarrier {
+            role: crate::names::HoRole::PipeSource,
+        },
+        crate::names::Hint::Prefix("ho"),
+    );
     bindings
-        .table_params
-        .insert(param_name.to_string(), cte_name.clone());
-    bindings.interior_ctes.push((cte_name, expr));
+        .table_scope_params
+        .insert(param.name().to_string(), scope);
+    if let crate::pipeline::asts::ddl::HoParam::Relation {
+        cols: crate::pipeline::asts::ddl::HeadItems::Listed(cols),
+        ..
+    } = param
+    {
+        bindings.argumentative_patterns.insert(
+            param.name().to_string(),
+            cols.iter().map(|c| c.supply.spelling()).collect(),
+        );
+    }
+    bindings.pipe_carrier = Some((param.name().to_string(), scope));
 }
 
 /// May a plain HO argument NAME be inlined into the entity's clause bodies,
@@ -2563,45 +2294,51 @@ fn bind_glob_carrier(
 /// identically in the entity's scope by the ambient-data fallback) — or an
 /// unknown (its refusal should keep the caller's spelling too). A consulted
 /// RULE, an alias, any qualified reference, or ANY name authored inside a
-/// definition resolves scope-DEPENDENTLY and must carry the caller's scope
-/// (review zmvnywzu, P1).
+/// definition resolves scope-DEPENDENTLY and must carry the caller's scope.
 fn plain_arg_may_inline(
-    name: &str,
+    name: &delightql_types::SqlIdentifier,
     registry: &mut crate::resolution::EntityRegistry,
     caller_scope: Option<&str>,
-) -> bool {
+) -> Result<bool> {
     if caller_scope.is_some() {
-        return false;
+        return Ok(false);
     }
     use crate::resolution::{resolve_entity_with_alias, ResolutionResult};
-    matches!(
-        resolve_entity_with_alias(name, None, registry, None),
+    Ok(matches!(
+        resolve_entity_with_alias(name, None, registry, None)?,
         ResolutionResult::CTE(_)
+            | ResolutionResult::MaterializedRelation(_)
             | ResolutionResult::DatabaseEntity(_)
             | ResolutionResult::BuiltInFunction { .. }
+            // Both of these REFUSE where they land, and a refusal reads
+            // better under the name the caller wrote than under an internal
+            // carrier's.
+            | ResolutionResult::DefinedNonRelation { .. }
+            | ResolutionResult::RuntimeServedRelation { .. }
             | ResolutionResult::Unknown(_)
-    )
+    ))
 }
 
-/// A `name(*)` reference for a name-only (legacy) HO argument. The name is
-/// the caller's text, so the carrier resolves it in the caller's scope.
-fn bare_glob_reference(name: &str) -> ast_unresolved::RelationalExpression {
-    ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-        identifier: ast_unresolved::QualifiedName {
-            namespace_path: ast_unresolved::NamespacePath::empty(),
-            name: name.into(),
-            grounding: None,
+/// A `name(*)` reference for a name-only HO argument. The name is the
+/// caller's text, so the carrier resolves it in the caller's scope.
+fn bare_glob_reference(name: &str) -> ast_unresolved::Chain {
+    ast_unresolved::Chain::read(
+        ast_unresolved::Relation::Ground {
+            mention: ast_unresolved::GroundMention::Named {
+                identifier: ast_unresolved::QualifiedName {
+                    namespace_path: ast_unresolved::NamespacePath::empty(),
+                    name: name.into(),
+                },
+                alias: None,
+                mutation_target: false,
+                passthrough: false,
+            },
+            outer: false,
+            cpr_schema: (),
         },
-        canonical_name: ast_unresolved::PhaseBox::phantom(),
-        backend_schema: ast_unresolved::PhaseBox::phantom(),
-        domain_spec: ast_unresolved::DomainSpec::Glob,
-        alias: None,
-        outer: false,
-        mutation_target: false,
-        passthrough: false,
-        cpr_schema: ast_unresolved::PhaseBox::phantom(),
-        hygienic_injections: Vec::new(),
-    })
+        ast_unresolved::Access::All,
+        (),
+    )
 }
 
 /// Normalize an interior table expression for use as a CTE source.
@@ -2609,116 +2346,65 @@ fn bare_glob_reference(name: &str) -> ast_unresolved::RelationalExpression {
 /// Handles three cases:
 /// 1. InnerRelation(Indeterminate { subquery }) → the subquery directly,
 ///    patching the innermost Ground from Bare to Glob.
-/// 2. Ground with Positional domain spec → Ground(Glob) piped through
+/// 2. Ground with Positional access → Ground(Glob) piped through
 ///    a projection (SELECT col1, col2 FROM table).
 /// 3. Everything else → pass through unchanged.
-fn normalize_interior_for_cte(
-    expr: ast_unresolved::RelationalExpression,
-) -> ast_unresolved::RelationalExpression {
-    match expr {
-        ast_unresolved::RelationalExpression::Relation(
-            ast_unresolved::Relation::InnerRelation {
-                pattern: ast_unresolved::InnerRelationPattern::Indeterminate { subquery, .. },
-                ..
-            },
-        ) => {
-            // Unwrap the InnerRelation and patch the base to Glob
-            patch_bare_to_glob(*subquery)
-        }
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier,
-            canonical_name,
-            backend_schema,
-            domain_spec: ast_unresolved::DomainSpec::Positional(ref exprs),
-            alias,
-            outer,
-            mutation_target,
-            passthrough,
-            cpr_schema,
-            hygienic_injections,
-        }) => {
-            // Convert Positional to Glob + Projection pipe:
-            // users(first_name, age) → users(*) |> (first_name, age)
-            let projection_exprs = exprs.clone();
-            let base =
-                ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-                    identifier,
-                    canonical_name,
-                    backend_schema,
-                    domain_spec: ast_unresolved::DomainSpec::Glob,
-                    alias,
-                    outer,
-                    mutation_target,
-                    passthrough,
-                    cpr_schema,
-                    hygienic_injections,
-                });
-            ast_unresolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                ast_unresolved::PipeExpression {
-                    source: base,
-                    operator: ast_unresolved::UnaryRelationalOperator::General {
-                        containment_semantic: ast_unresolved::ContainmentSemantic::Parenthesis,
-                        expressions: projection_exprs,
-                    },
-                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                },
-            )))
-        }
-        other => other,
+fn normalize_interior_for_cte(mut expr: ast_unresolved::Chain) -> ast_unresolved::Chain {
+    if expr.has_steps() {
+        return expr;
     }
+    if let ast_unresolved::Grelex::Reference(ast_unresolved::Relation::InnerRelation {
+        pattern: ast_unresolved::InnerRelationPattern::Indeterminate { subquery, .. },
+        ..
+    }) = expr.head
+    {
+        // Unwrap the InnerRelation and patch the base to Glob
+        return patch_bare_to_glob(*subquery);
+    }
+    // Convert a caller pattern to Glob + Projection pipe:
+    // users(first_name, age) → users(*) |> (first_name, age)
+    if !matches!(
+        expr.head,
+        ast_unresolved::Grelex::Reference(ast_unresolved::Relation::Ground { .. })
+    ) {
+        return expr;
+    }
+    let Some(ast_unresolved::Access::Slots(slots)) = expr.head_access() else {
+        return expr;
+    };
+    // A slot's term becomes a publication item that names nothing: the
+    // access already said which columns, and it named none of them.
+    let projection_items: Vec<_> = slots
+        .iter()
+        .filter_map(ast_unresolved::Slot::term)
+        .map(|term| ast_unresolved::OutItem::plain(term, ()))
+        .collect();
+    let Some(ast_unresolved::Continuation::Access { access, .. }) = expr.continuations.first_mut()
+    else {
+        unreachable!("head_access answered with a leading access")
+    };
+    *access = ast_unresolved::Access::All;
+    expr.then(ast_unresolved::Continuation::Pipe {
+        operator: ast_unresolved::PipeOp::Project(
+            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(projection_items)
+                .expect("a receipt projection carries the terms it was built from"),
+        ),
+        named: None,
+        cpr_schema: (),
+    })
 }
 
-/// Recursively patch Ground relations with DomainSpec::Bare to DomainSpec::Glob.
-fn patch_bare_to_glob(
-    expr: ast_unresolved::RelationalExpression,
-) -> ast_unresolved::RelationalExpression {
-    match expr {
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier,
-            canonical_name,
-            backend_schema,
-            domain_spec: ast_unresolved::DomainSpec::Bare,
-            alias,
-            outer,
-            mutation_target,
-            passthrough,
-            cpr_schema,
-            hygienic_injections,
-        }) => ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier,
-            canonical_name,
-            backend_schema,
-            domain_spec: ast_unresolved::DomainSpec::Glob,
-            alias,
-            outer,
-            mutation_target,
-            passthrough,
-            cpr_schema,
-            hygienic_injections,
-        }),
-        ast_unresolved::RelationalExpression::Filter {
-            source,
-            condition,
-            origin,
-            cpr_schema,
-        } => ast_unresolved::RelationalExpression::Filter {
-            source: Box::new(patch_bare_to_glob(*source)),
-            condition,
-            origin,
-            cpr_schema,
-        },
-        ast_unresolved::RelationalExpression::Pipe(pipe) => {
-            let inner = (*pipe).into_inner();
-            ast_unresolved::RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(
-                ast_unresolved::PipeExpression {
-                    source: patch_bare_to_glob(inner.source),
-                    operator: inner.operator,
-                    cpr_schema: inner.cpr_schema,
-                },
-            )))
+/// Patch a read's `Access::Unasked` to `Access::All`. The steps above it are
+/// untouched: the access is the head's own.
+fn patch_bare_to_glob(mut expr: ast_unresolved::Chain) -> ast_unresolved::Chain {
+    if matches!(expr.head_access(), Some(ast_unresolved::Access::Unasked)) {
+        if let Some(ast_unresolved::Continuation::Access { access, .. }) =
+            expr.continuations.first_mut()
+        {
+            *access = ast_unresolved::Access::All;
         }
-        other => other,
     }
+    expr
 }
 
 /// Ensure all HO position infos have column names.
@@ -2726,20 +2412,16 @@ fn patch_bare_to_glob(
 /// For PureGround (all-literal) positions, generate `_label_N`.
 pub(super) fn ensure_position_column_names(
     positions: Vec<HoPositionInfo>,
-    defs: &[crate::pipeline::asts::ddl::DdlDefinition],
+    clauses: &[Clause],
 ) -> Vec<HoPositionInfo> {
     positions
         .into_iter()
         .map(|mut pi| {
             if pi.column_name.is_none() {
-                for def in defs {
-                    if let DdlHead::HoView { params, .. } = &def.head {
-                        if let Some(p) = params.get(pi.position) {
-                            if matches!(p.kind, crate::pipeline::asts::ddl::HoParamKind::Scalar) {
-                                pi.column_name = Some(p.name.clone());
-                                break;
-                            }
-                        }
+                for clause in clauses {
+                    if let Some(HoParam::Scalar { name, .. }) = clause.params().get(pi.position) {
+                        pi.column_name = Some(name.to_string());
+                        break;
                     }
                 }
                 if pi.column_name.is_none() {
@@ -2751,133 +2433,124 @@ pub(super) fn ensure_position_column_names(
         .collect()
 }
 
-/// Extract CTE bindings from a clause query, handling WithErContext by unwrapping.
-/// Returns the CTEs and any ER context that needs to wrap the final output.
+/// Extract CTE bindings from a clause query: the clause's own bindings
+/// hoist into the outer list, its definitions collect, and its body
+/// becomes the squished CTE.
 fn extract_clause_ctes(
     clause_query: ast_unresolved::Query,
     function: &str,
     all_ctes: &mut Vec<ast_unresolved::CteBinding>,
-    er_context: &mut Option<crate::pipeline::asts::core::ErContextSpec>,
     collected_cfes: &mut Vec<ast_unresolved::CfeDefinition>,
-) -> Result<()> {
-    match clause_query {
-        ast_unresolved::Query::Relational(expr) => {
-            all_ctes.push(ast_unresolved::CteBinding {
-                name: function.to_string(),
-                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-                // The ENTITY's own clause body: its terms are the entity
-                // file's text, so its file-local aliases must resolve in
-                // the entity's scope (review qmqwqlms round 3, P1).
-                resolution_owner:
-                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
-                expression: expr,
-                effect_label: false,
-            is_recursive: ast_unresolved::PhaseBox::phantom(),
-            });
-        }
-        ast_unresolved::Query::WithCtes {
-            ctes,
-            query: main_expr,
-        } => {
-            for cte in ctes {
-                all_ctes.push(cte);
-            }
-            all_ctes.push(ast_unresolved::CteBinding {
-                name: function.to_string(),
-                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-                resolution_owner:
-                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
-                expression: main_expr,
-                effect_label: false,
-            is_recursive: ast_unresolved::PhaseBox::phantom(),
-            });
-        }
-        ast_unresolved::Query::WithCfes { cfes, query: inner } => {
-            collected_cfes.extend(cfes);
-            extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
-        }
-        ast_unresolved::Query::WithPrecompiledCfes { query: inner, .. } => {
-            // Already precompiled — just unwrap and recurse
-            extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
-        }
-        ast_unresolved::Query::WithErContext {
-            context,
-            query: inner,
-        } => {
-            // Capture ER context from first clause that has one
-            if er_context.is_none() {
-                *er_context = Some(context);
-            }
-            // Recursively process the inner query
-            extract_clause_ctes(*inner, function, all_ctes, er_context, collected_cfes)?;
-        }
-        other => {
-            return Err(DelightQLError::parse_error(format!(
-                "Unsupported query form in squished HO view clause: {:?}",
-                std::mem::discriminant(&other)
-            )));
-        }
-    }
-    Ok(())
+) {
+    let ast_unresolved::Query { cfes, ctes, body } = clause_query;
+    collected_cfes.extend(cfes);
+    all_ctes.extend(ctes);
+    all_ctes.push(ast_unresolved::CteBinding {
+        subject: crate::pipeline::asts::core::CteSubject::Authored {
+            name: delightql_types::SqlIdentifier::new(function),
+            effect: crate::pipeline::asts::core::CteEffectDeclaration::Pure,
+        },
+        authority: crate::pipeline::asts::core::CteAuthority {
+            head: crate::pipeline::asts::core::definitions::Head::glob(),
+            origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+            // The ENTITY's own clause body: its terms are the entity
+            // file's text, so its file-local aliases must resolve in
+            // the entity's scope.
+            resolution_owner: crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
+        },
+        expression: body,
+        recursion: (),
+    });
 }
 
 /// Inject a cross-join with the input table into a clause body's FROM clause.
-/// Used by the inverted CTE strategy: when a clause body has free scalar params,
-/// the input source (caller's data) must be in the FROM so the free vars resolve.
+/// When an invocation supplies a caller lvar, every clause receives the caller
+/// row: free heads bind it and ground heads filter it before clauses merge.
 ///
-/// Wraps: `body` → `_input(*), body`
+/// Wraps the body with a direct read of the caller input occurrence.
 fn inject_input_table_into_query(
     clause_query: ast_unresolved::Query,
-    input_table_name: &str,
+    input_scope: crate::names::ScopeId,
+    input_condition: Option<ast_unresolved::TruthExpression>,
 ) -> ast_unresolved::Query {
-    let input_table =
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier: ast_unresolved::QualifiedName {
-                namespace_path: ast_unresolved::NamespacePath::empty(),
-                name: input_table_name.into(),
-                grounding: None,
+    let input_table = ast_unresolved::Chain::read(
+        ast_unresolved::Relation::Ground {
+            mention: ast_unresolved::GroundMention::Plan {
+                scope: input_scope,
+                authored_name: None,
+                alias: None,
             },
-            canonical_name: ast_unresolved::PhaseBox::phantom(),
-            backend_schema: ast_unresolved::PhaseBox::phantom(),
-            domain_spec: ast_unresolved::DomainSpec::Glob,
-            alias: None,
             outer: false,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: ast_unresolved::PhaseBox::phantom(),
-            hygienic_injections: Vec::new(),
-        });
+            cpr_schema: (),
+        },
+        ast_unresolved::Access::All,
+        (),
+    );
+    let input_table = if let Some(condition) = input_condition {
+        input_table.then(ast_unresolved::Continuation::Restrict {
+            condition: condition,
+            origin: crate::pipeline::asts::core::FilterOrigin::HoGroundScalar,
+            cpr_schema: (),
+        })
+    } else {
+        input_table
+    };
 
-    match clause_query {
-        ast_unresolved::Query::Relational(expr) => {
-            ast_unresolved::Query::Relational(ast_unresolved::RelationalExpression::Join {
-                left: Box::new(input_table),
-                right: Box::new(expr),
-                join_condition: None,
-                join_type: Some(crate::pipeline::asts::core::JoinType::Inner),
-                cpr_schema: ast_unresolved::PhaseBox::phantom(),
-            })
-        }
-        ast_unresolved::Query::WithCtes { ctes, query } => {
-            // If the body has its own CTEs, inject into the main query part
-            ast_unresolved::Query::WithCtes {
-                ctes,
-                query: ast_unresolved::RelationalExpression::Join {
-                    left: Box::new(input_table),
-                    right: Box::new(query),
-                    join_condition: None,
-                    join_type: Some(crate::pipeline::asts::core::JoinType::Inner),
-                    cpr_schema: ast_unresolved::PhaseBox::phantom(),
-                },
+    let mut clause_query = clause_query;
+    clause_query.body = input_table.then(ast_unresolved::Continuation::Member {
+        rhs: clause_query.body,
+        correlation: None,
+        join_type: Some(crate::pipeline::asts::core::JoinType::Inner),
+        cpr_schema: (),
+    });
+    clause_query
+}
+
+/// Build the constraint for a ground clause head against a caller lvar.
+///
+/// After UNION, a mixed position has one column identity even though one arm
+/// bound the caller value and another arm supplied a ground discriminator.
+/// Applying this predicate per arm preserves that distinction.
+fn ground_scalar_correlation_condition(
+    clause_params: &[HoParam],
+    positions: &[HoPositionInfo],
+    caller_scalar_params: &std::collections::HashMap<String, ast_unresolved::DomainExpression>,
+) -> Option<ast_unresolved::TruthExpression> {
+    let conditions: Vec<_> = positions
+        .iter()
+        .filter_map(|position| {
+            let clause_param = clause_params.get(position.position)?;
+            let HoParam::Ground { text: value, .. } = clause_param else {
+                return None;
+            };
+            let caller = position
+                .column_name
+                .as_ref()
+                .and_then(|name| caller_scalar_params.get(name))?;
+            if !matches!(
+                caller,
+                ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                    AuthoredColumn { .. }
+                )))
+            ) {
+                return None;
             }
-        }
-        other => other, // ErContext etc. — pass through unchanged
-    }
+            Some(ast_unresolved::TruthExpression::Comparison(Comparison {
+                operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                left: Box::new(caller.clone()),
+                right: Box::new(ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Ground(crate::pipeline::asts::core::LiteralValue::from_stored_ground(value)),
+                )),
+            }))
+        })
+        .collect();
+    ast_unresolved::TruthExpression::all(conditions)
 }
 
 /// Build the SQUISHED relation: ALL clauses as a UNION ALL, with scalar
-/// positions injected as columns. No clause pre-filtering — PatternResolver
-/// handles filtering via WHERE constraints after resolution.
+/// positions injected as columns. Ground-head constraints against caller
+/// lvars are applied within their clause; call-site literal filtering remains
+/// a PatternResolver concern after the clauses merge.
 ///
 /// Returns an unresolved Query with CTEs: one per clause (named `function`),
 /// plus an optional pipe source CTE. The main query is `function(*)`.
@@ -2885,165 +2558,128 @@ pub(super) fn build_squished_relation(
     function: &str,
     entity: &crate::resolution::registry::ConsultedEntity,
     table_bindings: crate::pipeline::query_features::HoParamBindings,
-    pipe_source_cte: Option<(String, ast_unresolved::RelationalExpression)>,
-    join_input_cte: Option<(String, ast_unresolved::RelationalExpression)>,
+    pipe_source_cte: Option<(String, crate::names::ScopeId, ast_unresolved::Chain)>,
+    join_input_cte: Option<(crate::names::ScopeId, ast_unresolved::Chain)>,
     data_ns: Option<&ast_unresolved::NamespacePath>,
     caller_resolution_namespace: Option<String>,
 ) -> Result<ast_unresolved::Query> {
-    let defs = crate::ddl::ddl_builder::build_ddl_file(&entity.definition).unwrap_or_default();
+    let group = crate::ddl::reconstruct::group(&entity.definition).ok();
 
     let positions = if !entity.positions.is_empty() {
         entity.positions.clone()
     } else {
-        build_ho_position_analysis(&defs)
+        group
+            .as_ref()
+            .map(build_ho_position_analysis)
+            .unwrap_or_default()
     };
 
-    let positions = ensure_position_column_names(positions, &defs);
+    let defs: &[Clause] = group.as_ref().map_or(&[], |g| g.clauses());
+    let positions = ensure_position_column_names(positions, defs);
 
     let mut all_ctes = Vec::new();
-    let mut er_context: Option<crate::pipeline::asts::core::ErContextSpec> = None;
 
-    // The query-local carrier CTE names — the EXPLICIT exempt set for
-    // data-namespace patching (review qmqwqlms round 3, P2). Collected
-    // up front, before the carriers are consumed into `all_ctes`.
-    let mut local_cte_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some((name, _)) = &pipe_source_cte {
-        local_cte_names.insert(name.clone());
-    }
-    for (name, _) in &table_bindings.interior_ctes {
-        local_cte_names.insert(name.clone());
-    }
-    if let Some((name, _)) = &join_input_cte {
-        local_cte_names.insert(name.clone());
-    }
-
+    // Structural carrier reads carry a plan mention, so no compiler spelling
+    // needs an exemption from data-namespace patching.
+    let local_cte_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Prepend pipe source CTE if present
-    if let Some((cte_name, source_expr)) = pipe_source_cte {
+    if let Some((formal_name, scope, source_expr)) = pipe_source_cte {
+        // The formal's spelling stays diagnostic vocabulary in
+        // `interior_ctes`; the binding itself stands on the carrier scope.
+        let _ = formal_name;
         all_ctes.push(ast_unresolved::CteBinding {
             expression: source_expr,
-            name: cte_name,
-            origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-            // Caller-authored terms (the piped source): resolve under the
-            // CALLER's scope — the 462 weave (review qmqwqlms round 3, P1).
-            resolution_owner:
-                crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
-                    resolution_namespace: caller_resolution_namespace.clone(),
-                },
-            effect_label: false,
-            is_recursive: ast_unresolved::PhaseBox::phantom(),
+            subject: crate::pipeline::asts::core::CteSubject::Structural(scope),
+            authority: crate::pipeline::asts::core::CteAuthority {
+                head: crate::pipeline::asts::core::definitions::Head::glob(),
+                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                // Caller-authored terms (the piped source): resolve under the
+                // CALLER's scope.
+                resolution_owner:
+                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
+                        resolution_namespace: caller_resolution_namespace.clone(),
+                    },
+            },
+            recursion: (),
         });
     }
 
     // Prepend interior CTEs for table arguments with interior conditions.
     // Apply data namespace patching so table refs inside resolve correctly.
-    for (cte_name, source_expr) in &table_bindings.interior_ctes {
+    for (formal_name, scope, source_expr) in &table_bindings.interior_ctes {
         let patched_expr = if let Some(dns) = data_ns {
             patch_data_ns_in_relational_expr(source_expr.clone(), dns, &local_cte_names)
         } else {
             source_expr.clone()
         };
+        let _ = formal_name;
         all_ctes.push(ast_unresolved::CteBinding {
             expression: patched_expr,
-            name: cte_name.clone(),
-            origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-            // Caller-authored HO argument (interior condition at the
-            // call site): the caller's scope owns its names.
-            resolution_owner:
-                crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
-                    resolution_namespace: caller_resolution_namespace.clone(),
-                },
-            effect_label: false,
-            is_recursive: ast_unresolved::PhaseBox::phantom(),
+            subject: crate::pipeline::asts::core::CteSubject::Structural(*scope),
+            authority: crate::pipeline::asts::core::CteAuthority {
+                head: crate::pipeline::asts::core::definitions::Head::glob(),
+                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                // Caller-authored HO argument (interior condition at the
+                // call site): the caller's scope owns its names.
+                resolution_owner:
+                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
+                        resolution_namespace: caller_resolution_namespace.clone(),
+                    },
+            },
+            recursion: (),
         });
     }
 
-    // Prepend join input CTE if present (inverted CTE strategy for free scalar params).
-    // The join_input_cte_name is used to inject a FROM reference into correlated clause bodies.
-    let join_input_cte_name = if let Some((cte_name, source_expr)) = join_input_cte {
-        let name = cte_name.clone();
+    // Prepend the caller-input carrier for free scalar params.
+    // The scope is injected directly into correlated clause bodies.
+    let join_input_scope = if let Some((scope, source_expr)) = join_input_cte {
         all_ctes.push(ast_unresolved::CteBinding {
             expression: source_expr,
-            name: cte_name,
-            origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-            // Caller-authored join input (inverted CTE strategy): the
-            // caller's scope owns its names.
-            resolution_owner:
-                crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
-                    resolution_namespace: caller_resolution_namespace.clone(),
-                },
-            effect_label: false,
-            is_recursive: ast_unresolved::PhaseBox::phantom(),
+            subject: crate::pipeline::asts::core::CteSubject::Structural(scope),
+            authority: crate::pipeline::asts::core::CteAuthority {
+                head: crate::pipeline::asts::core::definitions::Head::glob(),
+                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
+                // The caller's scope owns names in the caller-authored input.
+                resolution_owner:
+                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
+                        resolution_namespace: caller_resolution_namespace.clone(),
+                    },
+            },
+            recursion: (),
         });
-        Some(name)
+        Some(scope)
     } else {
         None
-    };
-
-    // Detect which scalar params are free (Lvar call-site expressions).
-    // These need the _input table injected into correlated clause bodies.
-    // Also collect (param_name, lvar_name) pairs for the correlation JOIN:
-    // param_name = column in the squished CTE, lvar_name = column in _ho_scalar_input.
-    let free_scalar_param_names: Vec<String> = if join_input_cte_name.is_some() {
-        table_bindings
-            .scalar_params
-            .iter()
-            .filter(|(_, expr)| matches!(expr, ast_unresolved::DomainExpression::Lvar { .. }))
-            .map(|(name, _)| name.clone())
-            .collect()
-    } else {
-        Vec::new()
     };
 
     let mut collected_cfes: Vec<ast_unresolved::CfeDefinition> = Vec::new();
 
     if defs.len() > 1 {
         // Multi-clause: each clause becomes a CTE
-        for def in &defs {
-            let clause_params = match &def.head {
-                DdlHead::HoView { params, .. } => params.clone(),
-                _ => Vec::new(),
-            };
-            let output_head = match &def.head {
-                DdlHead::HoView { output_head, .. } => output_head.as_deref(),
-                _ => None,
-            };
+        for def in defs {
+            let clause_params = def.params().to_vec();
+            let output_head = def.head_items();
 
             // Create per-clause bindings: for GroundScalar positions that are Scalar
             // in this clause, bind the ground value as a scalar param.
             let clause_bindings = table_bindings.clone();
-            for (pos, cp) in clause_params.iter().enumerate() {
-                if let crate::pipeline::asts::ddl::HoParamKind::Scalar = &cp.kind {
-                    if !clause_bindings.scalar_params.contains_key(&cp.name) {
-                        if let Some(pos_info) = positions.iter().find(|pi| pi.position == pos) {
-                            if pos_info.ground_mode
-                                == crate::pipeline::asts::ddl::HoGroundMode::MixedGround
-                            {
-                                // MixedGround: handled by caller providing scalar_params in bindings.
-                            }
-                        }
-                    }
-                }
-            }
-
             let clause_query = {
-                let q = crate::ddl::body_parser::parse_view_body_with_bindings(
-                    &def.full_source,
-                    clause_bindings,
-                )?;
-                // Inverted CTE: inject _input table BEFORE inject_scalar_columns,
+                let q = crate::ddl::reconstruct::bound_body(&def.full_source, clause_bindings)?;
+                // Inject the caller input before inject_scalar_columns,
                 // so the embed pipe wraps the join (not vice versa). This ensures
                 // anonymous tables with column refs are on the right side of a join
                 // where the MeltTable/json_each strategy can handle them.
-                let q = if let Some(ref input_name) = join_input_cte_name {
-                    let clause_uses_free_scalar = clause_params.iter().any(|cp| {
-                        matches!(cp.kind, crate::pipeline::asts::ddl::HoParamKind::Scalar)
-                            && free_scalar_param_names.contains(&cp.name)
-                    });
-                    if clause_uses_free_scalar {
-                        inject_input_table_into_query(q, input_name)
-                    } else {
-                        q
-                    }
+                let q = if let Some(input_scope) = join_input_scope {
+                    // Every clause participates in row-by-row dispatch. A
+                    // ground-only clause still needs the caller row so its
+                    // discriminator can be compared without joining the
+                    // carrier a second time above the union.
+                    let condition = ground_scalar_correlation_condition(
+                        &clause_params,
+                        &positions,
+                        &table_bindings.scalar_params,
+                    );
+                    inject_input_table_into_query(q, input_scope, condition)
                 } else {
                     q
                 };
@@ -3053,6 +2689,7 @@ pub(super) fn build_squished_relation(
                     &positions,
                     output_head,
                     &table_bindings.scalar_params,
+                    join_input_scope.is_some(),
                 )
             };
             let clause_query = if let Some(dns) = data_ns {
@@ -3061,13 +2698,7 @@ pub(super) fn build_squished_relation(
                 clause_query
             };
 
-            extract_clause_ctes(
-                clause_query,
-                function,
-                &mut all_ctes,
-                &mut er_context,
-                &mut collected_cfes,
-            )?;
+            extract_clause_ctes(clause_query, function, &mut all_ctes, &mut collected_cfes);
         }
     } else {
         // Single clause — cannot be MixedGround (mixing needs two
@@ -3075,33 +2706,21 @@ pub(super) fn build_squished_relation(
         // parity.
         let caller_scalar_params = table_bindings.scalar_params.clone();
         let clause_query = {
-            let q = crate::ddl::body_parser::parse_view_body_with_bindings(
-                &entity.definition,
-                table_bindings,
-            )?;
+            let q = crate::ddl::reconstruct::bound_body(&entity.definition, table_bindings)?;
             if let Some(def) = defs.first() {
-                let clause_params = match &def.head {
-                    DdlHead::HoView { params, .. } => params.clone(),
-                    _ => Vec::new(),
-                };
-                let output_head = match &def.head {
-                    DdlHead::HoView { output_head, .. } => output_head.as_deref(),
-                    _ => None,
-                };
-                // Inverted CTE: inject _input table BEFORE inject_scalar_columns,
+                let clause_params = def.params().to_vec();
+                let output_head = def.head_items();
+                // Inject the caller input before inject_scalar_columns,
                 // so the embed pipe wraps the join (not vice versa). This ensures
                 // anonymous tables with column refs are on the right side of a join
                 // where the MeltTable/json_each strategy can handle them.
-                let q = if let Some(ref input_name) = join_input_cte_name {
-                    let clause_uses_free_scalar = clause_params.iter().any(|cp| {
-                        matches!(cp.kind, crate::pipeline::asts::ddl::HoParamKind::Scalar)
-                            && free_scalar_param_names.contains(&cp.name)
-                    });
-                    if clause_uses_free_scalar {
-                        inject_input_table_into_query(q, input_name)
-                    } else {
-                        q
-                    }
+                let q = if let Some(input_scope) = join_input_scope {
+                    let condition = ground_scalar_correlation_condition(
+                        &clause_params,
+                        &positions,
+                        &caller_scalar_params,
+                    );
+                    inject_input_table_into_query(q, input_scope, condition)
                 } else {
                     q
                 };
@@ -3111,6 +2730,7 @@ pub(super) fn build_squished_relation(
                     &positions,
                     output_head,
                     &caller_scalar_params,
+                    join_input_scope.is_some(),
                 )
             } else {
                 q
@@ -3122,158 +2742,219 @@ pub(super) fn build_squished_relation(
             clause_query
         };
 
-        extract_clause_ctes(
-            clause_query,
-            function,
-            &mut all_ctes,
-            &mut er_context,
-            &mut collected_cfes,
-        )?;
+        extract_clause_ctes(clause_query, function, &mut all_ctes, &mut collected_cfes);
     }
 
     // Main query: function(*) referencing the CTE
-    let main_query =
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier: ast_unresolved::QualifiedName {
-                namespace_path: ast_unresolved::NamespacePath::empty(),
-                name: function.into(),
-                grounding: None,
+    let main_query = ast_unresolved::Chain::read(
+        ast_unresolved::Relation::Ground {
+            mention: ast_unresolved::GroundMention::Named {
+                identifier: ast_unresolved::QualifiedName {
+                    namespace_path: ast_unresolved::NamespacePath::empty(),
+                    name: function.into(),
+                },
+                alias: None,
+                mutation_target: false,
+                passthrough: false,
             },
-            canonical_name: ast_unresolved::PhaseBox::phantom(),
-            backend_schema: ast_unresolved::PhaseBox::phantom(),
-            domain_spec: ast_unresolved::DomainSpec::Glob,
-            alias: None,
             outer: false,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: ast_unresolved::PhaseBox::phantom(),
-            hygienic_injections: Vec::new(),
-        });
+            cpr_schema: (),
+        },
+        ast_unresolved::Access::All,
+        (),
+    );
 
-    let mut result = ast_unresolved::Query::WithCtes {
+    Ok(ast_unresolved::Query {
+        cfes: collected_cfes,
         ctes: all_ctes,
-        query: main_query,
-    };
-
-    // Wrap with collected CFE definitions from view body
-    if !collected_cfes.is_empty() {
-        result = ast_unresolved::Query::WithCfes {
-            cfes: collected_cfes,
-            query: Box::new(result),
-        };
-    }
-
-    // If any clause had an ER context, wrap the final query with it
-    if let Some(context) = er_context {
-        Ok(ast_unresolved::Query::WithErContext {
-            context,
-            query: Box::new(result),
-        })
-    } else {
-        Ok(result)
-    }
+        body: main_query,
+    })
 }
 
 /// Result of binding call-site arguments to HO view parameters using kind metadata.
 pub(crate) use crate::pipeline::query_features::HoParamBindings;
 
-/// Create synthetic "proffer" bindings for an HO view's parameters.
+fn bind_proffer_scope(
+    bindings: &mut HoParamBindings,
+    param_name: &str,
+    identities: &crate::names::Registry,
+) {
+    let scope = identities.mint_derived_scope(
+        crate::names::ScopeOrigin::HoCarrier {
+            role: crate::names::HoRole::Proffer,
+        },
+        crate::names::Hint::Prefix("ho"),
+    );
+    bindings
+        .table_scope_params
+        .insert(param_name.to_string(), scope);
+}
+
+/// Create structural proffer bindings for an HO view's parameters.
 ///
 /// Used at consult time to parse the view body with placeholder values,
 /// enabling early validation of syntax and structure without real call-site args.
-///
-/// - Glob params get `__proffer__<name>` table names
-/// - Argumentative params get anonymous tables with NULL data
-/// - Scalar params get `Literal(Null)`
 pub(crate) fn create_proffer_bindings(
-    head: &crate::pipeline::asts::ddl::DdlHead,
+    head: &crate::pipeline::asts::ddl::Head,
+    identities: &crate::names::Registry,
 ) -> HoParamBindings {
-    use crate::pipeline::asts::ddl::{DdlHead, HoParamKind};
-    match head {
-        DdlHead::HoView { params, .. } => {
-            let mut bindings = HoParamBindings::default();
-            for param in params {
-                match &param.kind {
-                    HoParamKind::Glob => {
-                        bindings
-                            .table_params
-                            .insert(param.name.clone(), format!("__proffer__{}", param.name));
+    let mut bindings = HoParamBindings::default();
+    for param in head.ho_params.as_deref().unwrap_or_default() {
+        match param {
+            HoParam::Relation {
+                name,
+                cols: HeadItems::Glob,
+            } => {
+                bind_proffer_scope(&mut bindings, name.as_str(), identities);
+            }
+            HoParam::Relation {
+                name,
+                cols: HeadItems::Listed(items),
+            } => {
+                let columns: Vec<String> = items.iter().map(|i| i.supply.spelling()).collect();
+                let null_row: Vec<crate::pipeline::asts::core::LiteralValue> = columns
+                    .iter()
+                    .map(|_| crate::pipeline::asts::core::LiteralValue::Null)
+                    .collect();
+                match lift_scalars_to_anonymous_table(&columns, &[null_row]) {
+                    Ok(anon) => {
+                        bindings.table_expr_params.insert(name.to_string(), anon);
                     }
-                    HoParamKind::Argumentative(columns) => {
-                        let null_row: Vec<String> =
-                            columns.iter().map(|_| "null".to_string()).collect();
-                        match lift_scalars_to_anonymous_table(columns, &[null_row]) {
-                            Ok(anon) => {
-                                bindings.table_expr_params.insert(param.name.clone(), anon);
-                            }
-                            Err(_) => {
-                                // Fallback: treat as glob
-                                bindings.table_params.insert(
-                                    param.name.clone(),
-                                    format!("__proffer__{}", param.name),
-                                );
-                            }
-                        }
-                    }
-                    HoParamKind::Scalar => {
-                        bindings.scalar_params.insert(
-                            param.name.clone(),
-                            ast_unresolved::DomainExpression::Literal {
-                                value: crate::pipeline::asts::core::LiteralValue::Null,
-                                alias: None,
-                            },
-                        );
-                        bindings
-                            .table_params
-                            .insert(param.name.clone(), format!("__proffer__{}", param.name));
-                    }
-                    HoParamKind::GroundScalar(value) => {
-                        // Ground scalars are constants, not parameters — use the literal value
-                        bindings.scalar_params.insert(
-                            param.name.clone(),
-                            ast_unresolved::DomainExpression::Literal {
-                                value: crate::pipeline::asts::core::LiteralValue::Null,
-                                alias: None,
-                            },
-                        );
-                        bindings
-                            .table_params
-                            .insert(param.name.clone(), value.clone());
+                    Err(_) => {
+                        bind_proffer_scope(&mut bindings, name.as_str(), identities);
                     }
                 }
             }
-            bindings
+            HoParam::Scalar { name, .. } => {
+                bindings.scalar_params.insert(
+                    name.to_string(),
+                    ast_unresolved::DomainExpression::Application(
+                        ast_unresolved::FunctionApplication::Ground(
+                            crate::pipeline::asts::core::LiteralValue::Null,
+                        ),
+                    ),
+                );
+                bind_proffer_scope(&mut bindings, name.as_str(), identities);
+            }
+            HoParam::Ground { name, text } => {
+                // A ground position is a constant, not a parameter.
+                bindings.scalar_params.insert(
+                    name.to_string(),
+                    ast_unresolved::DomainExpression::Application(
+                        ast_unresolved::FunctionApplication::Ground(
+                            crate::pipeline::asts::core::LiteralValue::Null,
+                        ),
+                    ),
+                );
+                bindings.table_params.insert(name.to_string(), text.clone());
+            }
         }
-        other => panic!(
-            "catch-all hit in grounding.rs extract_ho_bindings (FunctionExpression): {:?}",
-            other
-        ),
     }
+    bindings
 }
 
 /// Synthesize an anonymous table `_(col1, col2 ---- v1, v2; v3, v4)` from column names and rows.
 ///
 /// Routes through the DQL body parser — no mini-pipeline.
+/// The lift's rows, headed by the names the parameter declares.
+///
+/// `None` for anything that is not a bare headerless literal: a relation the
+/// author named, an interior, a membership form, or a table that already
+/// carries its own header row. Those bind through the carrier, where a
+/// reference has a scope to resolve in; only a self-contained literal can
+/// stand in the body under a heading the DECLARATION supplies.
+///
+/// Widths that disagree are left alone, so the arity check reports the
+/// mismatch against the relation the author wrote rather than against a
+/// silently repaired one.
+fn lifted_rows_under_declared_names(
+    relation: &ast_unresolved::Chain,
+    columns: &[String],
+) -> Option<ast_unresolved::Chain> {
+    if !relation.continuations.is_empty() {
+        return None;
+    }
+    let ast_unresolved::Grelex::Literal(table) = &relation.head else {
+        return None;
+    };
+    if table.table.body.header.is_some() || table.alias.is_some() || table.outer {
+        return None;
+    }
+    if table
+        .table
+        .body
+        .rows
+        .iter()
+        .any(|row| row.len() != columns.len())
+    {
+        return None;
+    }
+    let headers: Vec<ast_unresolved::DomainExpression> = columns
+        .iter()
+        .map(|name| ast_unresolved::DomainExpression::lvar_builder(name.clone()).build())
+        .collect();
+    let mut headed = table.clone();
+    headed.table.body.header = Some(crate::pipeline::asts::core::TabularRow(Box::new(
+        crate::pipeline::asts::vocabulary::Vec1::try_from_vec(
+            headers
+                .into_iter()
+                .map(|term| crate::pipeline::asts::core::HeaderItem {
+                    slot: crate::pipeline::asts::core::Slot::classify(term),
+                    sparse: false,
+                })
+                .collect(),
+        )
+        .expect("a declared heading is nonempty"),
+    )));
+    Some(ast_unresolved::Chain::ground(
+        ast_unresolved::Grelex::Literal(headed),
+    ))
+}
+
+/// The anonymous table a lifted argument becomes: named columns and one row
+/// per supplied tuple.
+///
+/// BUILT, NOT SPELLED. The values arrive as literals and the table is a
+/// carrier; rendering them into `_(col ---- val)` text and parsing that back
+/// would put a round trip through the grammar in the middle of a construction
+/// that already has everything it needs — and would have to re-quote every
+/// value correctly to survive it.
 pub(crate) fn lift_scalars_to_anonymous_table(
     column_names: &[String],
-    rows: &[Vec<String>],
-) -> Result<ast_unresolved::RelationalExpression> {
-    // Build the DQL text: _(col1, col2 ---- v1, v2; v3, v4)
-    let headers = column_names.join(", ");
-    let row_strs: Vec<String> = rows.iter().map(|row| row.join(", ")).collect();
-    let data = row_strs.join("; ");
-    let anon_source = format!("_({} ---- {})", headers, data);
-
-    debug!("Lifting scalars to anonymous table: {}", anon_source);
-
-    let query = crate::ddl::body_parser::parse_view_body(&anon_source)?;
-    match query {
-        ast_unresolved::Query::Relational(expr) => Ok(expr),
-        _ => Err(DelightQLError::parse_error(format!(
-            "Expected relational expression from anonymous table '{}', got CTE",
-            anon_source
-        ))),
+    rows: &[Vec<crate::pipeline::asts::core::LiteralValue>],
+) -> Result<ast_unresolved::Chain> {
+    if let Some(row) = rows.iter().find(|row| row.len() != column_names.len()) {
+        return Err(DelightQLError::parse_error(format!(
+            "a lifted row carries {} value(s); the heading names {}",
+            row.len(),
+            column_names.len()
+        )));
     }
+    let column_headers = Some(
+        column_names
+            .iter()
+            .map(|name| ast_unresolved::DomainExpression::lvar_builder(name.clone()).build())
+            .collect(),
+    );
+    let rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| {
+                    ast_unresolved::DomainExpression::Application(
+                        ast_unresolved::FunctionApplication::Ground(value.clone()),
+                    )
+                })
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    let table = crate::pipeline::asts::core::AnonTable::from_values(column_headers, rows, ())
+        .ok_or_else(|| {
+            DelightQLError::parse_error("a lifted table has a nonempty heading and body")
+        })?;
+    Ok(ast_unresolved::Chain::ground(
+        ast_unresolved::Grelex::Literal(crate::pipeline::asts::core::AnonRelation::plain(table)),
+    ))
 }
 
 /// Validate arity for argumentative params that received table references.
@@ -3285,23 +2966,12 @@ pub(super) fn validate_argumentative_arity(
     bindings: &HoParamBindings,
     registry: &crate::resolution::EntityRegistry,
 ) -> Result<()> {
-    use crate::pipeline::ast_resolved::CprSchema;
-
     for (param_name, table_name, expected_cols, col_names) in &bindings.argumentative_table_refs {
         // Try CTE first, then ground table
-        let actual_cols = if let Some(schema) = registry.query_local.lookup_cte(table_name) {
-            match schema {
-                CprSchema::Resolved(cols) => Some(cols.len()),
-                other => panic!(
-                    "catch-all hit in grounding.rs validate_argumentative_arity (CTE lookup): {:?}",
-                    other
-                ),
-            }
-        } else if let Some(schema) = registry.database.lookup_table(table_name) {
-            match schema {
-                CprSchema::Resolved(cols) => Some(cols.len()),
-                other => panic!("catch-all hit in grounding.rs validate_argumentative_arity (table lookup): {:?}", other),
-            }
+        let actual_cols = if let Some(scope) = registry.query_local.lookup_cte(table_name) {
+            Some(registry.identities.known_heading(*scope)?.len())
+        } else if let Some(scope) = registry.database.lookup_table(table_name.as_str())? {
+            Some(registry.identities.known_heading(scope)?.len())
         } else {
             // Table not found here — will fail during resolution with a "table not found" error
             None
@@ -3328,81 +2998,36 @@ pub(super) fn validate_argumentative_arity(
     Ok(())
 }
 
-/// Build a remap from argumentative lvar names to (table_name, actual_column_name).
-///
-/// For `V(k, l)` bound to `refs(key, label)`, produces `{k → ("refs", "key"), l → ("refs", "label")}`.
-/// This allows the body parser to substitute bare lvars with qualified column references.
-pub(super) fn build_argumentative_column_remap(
-    bindings: &crate::pipeline::query_features::HoParamBindings,
-    registry: &crate::resolution::EntityRegistry,
-) -> HashMap<String, (String, String)> {
-    use crate::pipeline::ast_resolved::CprSchema;
-
-    let mut remap = HashMap::new();
-    for (_param_name, table_name, _expected_cols, col_names) in &bindings.argumentative_table_refs {
-        let actual_col_names = if let Some(schema) = registry.query_local.lookup_cte(table_name) {
-            match schema {
-                CprSchema::Resolved(cols) => Some(
-                    cols.iter()
-                        .map(|c| c.info.name().unwrap_or("?").to_string())
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            }
-        } else if let Some(schema) = registry.database.lookup_table(table_name) {
-            match schema {
-                CprSchema::Resolved(cols) => Some(
-                    cols.iter()
-                        .map(|c| c.info.name().unwrap_or("?").to_string())
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        if let Some(actual_names) = actual_col_names {
-            for (lvar_name, actual_name) in col_names.iter().zip(actual_names.iter()) {
-                remap.insert(lvar_name.clone(), (table_name.clone(), actual_name.clone()));
-            }
-        }
-    }
-    remap
-}
-
 // ============================================================================
 // Namespace patching — DataNsPatcher fold
 // ============================================================================
 
 /// Patches unqualified table references (Ground, TVF, InnerRelation identifiers,
-/// ScalarSubquery identifiers) to use the data namespace. The default walk
+/// a scalarized relation's identifier) to use the data namespace. The default walk
 /// functions recurse into all children, so filter conditions, operator
 /// expressions, and nested domain expressions also get patched.
 struct DataNsPatcher<'a> {
     data_ns: &'a ast_unresolved::NamespacePath,
-    /// Names of the query-local carrier CTEs (`_ho_pipe_src`,
-    /// `_ho_arg_*`, `_ho_scalar_input`) — references to these must not be
-    /// namespace-qualified. An EXPLICIT set from the constructor, never a
-    /// name convention (review qmqwqlms round 3, P2: a user may legally
-    /// write `_ho_*` identifiers, and those SHOULD be patched).
+    /// Authored query-local names that must not be namespace-qualified.
+    /// Compiler carrier reads are structural and never enter this set.
     local_ctes: &'a std::collections::HashSet<String>,
 }
 
 impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
+    crate::pipeline::ast_transform::same_phase_payload_folds!(Unresolved);
+
     fn transform_relation(&mut self, r: Relation<Unresolved>) -> Result<Relation<Unresolved>> {
         match r {
             Relation::Ground {
-                mut identifier,
-                canonical_name,
-                backend_schema,
-                domain_spec,
-                alias,
+                mention:
+                    ast_unresolved::GroundMention::Named {
+                        mut identifier,
+                        alias,
+                        mutation_target,
+                        passthrough,
+                    },
                 outer,
-                mutation_target,
-                passthrough,
                 cpr_schema,
-                hygienic_injections,
             } => {
                 // Skip namespace patching for the query-local carrier CTEs
                 // (an explicit set — see `local_ctes`).
@@ -3411,46 +3036,15 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
                 {
                     identifier.namespace_path = self.data_ns.clone();
                 }
-                // Don't recurse further — Ground's children (domain_spec) don't
-                // contain table references that need patching. Use walk_relation
-                // only if we want full recursion into domain_spec expressions.
                 Ok(Relation::Ground {
-                    identifier,
-                    canonical_name,
-                    backend_schema,
-                    domain_spec,
-                    alias,
+                    mention: ast_unresolved::GroundMention::Named {
+                        identifier,
+                        alias,
+                        mutation_target,
+                        passthrough,
+                    },
                     outer,
-                    mutation_target,
-                    passthrough,
                     cpr_schema,
-                    hygienic_injections,
-                })
-            }
-            Relation::TVF {
-                function,
-                argument_groups,
-                backend_schema,
-                domain_spec,
-                alias,
-                mut namespace,
-                grounding,
-                cpr_schema,
-                ho_arguments,
-            } => {
-                if namespace.is_none() {
-                    namespace = Some(self.data_ns.clone());
-                }
-                Ok(Relation::TVF {
-                    function,
-                    argument_groups,
-                    backend_schema,
-                    domain_spec,
-                    alias,
-                    namespace,
-                    grounding,
-                    cpr_schema,
-                    ho_arguments,
                 })
             }
             // InnerRelation: delegate to transform_inner_relation for identifier patching
@@ -3493,25 +3087,39 @@ impl AstTransform<Unresolved, Unresolved> for DataNsPatcher<'_> {
         }
     }
 
+    // Stack-safe: one descent per nesting level, and the walk a
+    // parenthesis ladder actually reaches.
+    #[stacksafe::stacksafe]
     fn transform_domain(
         &mut self,
         expr: DomainExpression<Unresolved>,
     ) -> Result<DomainExpression<Unresolved>> {
         match expr {
-            DomainExpression::ScalarSubquery {
-                mut identifier,
-                subquery,
-                alias,
-            } => {
+            // A NAMED SCALARIZED RELATION carries the spelling the patch
+            // qualifies; the body is patched as the relation it is.
+            DomainExpression::Application(FunctionApplication::Scalarized(
+                crate::pipeline::asts::core::ScalarRelation::Named {
+                    mut identifier,
+                    body,
+                },
+            )) => {
                 if identifier.namespace_path.is_empty() {
                     identifier.namespace_path = self.data_ns.clone();
                 }
-                let patched_subquery = self.transform_relational(*subquery)?;
-                Ok(DomainExpression::ScalarSubquery {
-                    identifier,
-                    subquery: Box::new(patched_subquery),
-                    alias,
-                })
+                let output = body.output;
+                let patched = self.transform_relational(body.attached())?;
+                Ok(DomainExpression::Application(
+                    FunctionApplication::Scalarized(
+                        crate::pipeline::asts::core::ScalarRelation::Named {
+                            identifier,
+                            body: Box::new(
+                                crate::pipeline::asts::core::ScalarizedRelation::detach(
+                                    patched, output,
+                                )?,
+                            ),
+                        },
+                    ),
+                ))
             }
             other => walk_transform_domain(self, other),
         }
@@ -3525,178 +3133,125 @@ pub(super) fn patch_data_ns_query(
     data_ns: &ast_unresolved::NamespacePath,
     local_ctes: &std::collections::HashSet<String>,
 ) -> ast_unresolved::Query {
-    DataNsPatcher { data_ns, local_ctes }
-        .transform_query(query)
-        .expect("namespace patching is infallible")
+    DataNsPatcher {
+        data_ns,
+        local_ctes,
+    }
+    .transform_query(query)
+    .expect("namespace patching is infallible")
 }
 
 /// Patch data_ns on table references within a relational expression.
 fn patch_data_ns_in_relational_expr(
-    expr: ast_unresolved::RelationalExpression,
+    expr: ast_unresolved::Chain,
     data_ns: &ast_unresolved::NamespacePath,
     local_ctes: &std::collections::HashSet<String>,
-) -> ast_unresolved::RelationalExpression {
-    DataNsPatcher { data_ns, local_ctes }
-        .transform_relational(expr)
-        .expect("namespace patching is infallible")
-}
-
-/// Patch data_ns on ScalarSubquery identifiers within a domain expression.
-/// CFE bodies are entity file text with no carrier CTEs in scope.
-fn patch_data_ns_in_domain_expr(
-    expr: ast_unresolved::DomainExpression,
-    data_ns: &ast_unresolved::NamespacePath,
-) -> ast_unresolved::DomainExpression {
+) -> ast_unresolved::Chain {
     DataNsPatcher {
         data_ns,
-        local_ctes: &std::collections::HashSet::new(),
+        local_ctes,
     }
-    .transform_domain(expr)
+    .transform_relational(expr)
     .expect("namespace patching is infallible")
 }
 
+/// The same patch over a CFE body, entered at whichever category it is.
+pub(super) fn patch_data_ns_in_body(
+    body: ast_unresolved::OutValue,
+    data_ns: &ast_unresolved::NamespacePath,
+) -> ast_unresolved::OutValue {
+    let mut patcher = DataNsPatcher {
+        data_ns,
+        local_ctes: &std::collections::HashSet::new(),
+    };
+    match body {
+        ast_unresolved::OutValue::Domain(value) => ast_unresolved::OutValue::Domain(
+            patcher
+                .transform_domain(value)
+                .expect("namespace patching is infallible"),
+        ),
+        ast_unresolved::OutValue::Truth(crossing) => {
+            ast_unresolved::OutValue::Truth(crate::pipeline::asts::core::TruthAsValue(
+                patcher
+                    .transform_boolean(crossing.into_truth())
+                    .expect("namespace patching is infallible"),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
-mod head_as_naming_tests {
-    //! Unit tests for the defining-head `as` naming algebra
-    //! (clause-head-catechism.md §II). An `as`-label is an OFFER: it contests
-    //! other offers, beats abstention, and agrees with a matching sibling.
-    use super::{compute_canonical_column_names, validate_ground_position_naming};
-    use crate::pipeline::asts::ddl::ViewHeadItem;
+mod clause_selection_tests {
+    //! THE SYNTHESIZED SELECTION IS ITS OWN SHAPE.
+    //!
+    //! A multi-clause value rule assembles into `ClauseSelection`, whose arms
+    //! carry what a CLAUSE computes — and a clause's result is its body,
+    //! which is one of the crossing's licensed positions. The authored CASE
+    //! carrier is a different thing and is pinned separately: its result is a
+    //! `domain_expression` by the grammar, so a crossing has no derivation
+    //! there.
 
-    fn free(name: &str) -> ViewHeadItem {
-        ViewHeadItem::Free {
-            name: name.into(),
-            label: None,
-        }
-    }
-    fn free_as(name: &str, label: &str) -> ViewHeadItem {
-        ViewHeadItem::Free {
-            name: name.into(),
-            label: Some(label.into()),
-        }
-    }
-    fn ground(lit: &str) -> ViewHeadItem {
-        ViewHeadItem::Ground {
-            literal: lit.into(),
-            label: None,
-        }
-    }
-    fn ground_as(lit: &str, label: &str) -> ViewHeadItem {
-        ViewHeadItem::Ground {
-            literal: lit.into(),
-            label: Some(label.into()),
+    use super::build_case_body_from_clauses;
+    use crate::ddl::reconstruct;
+    use crate::pipeline::asts::core::{DomainExpression, OutValue};
+
+    /// The selection a source's clauses assemble into.
+    fn selection(source: &str) -> crate::pipeline::asts::core::ClauseSelection {
+        let group = reconstruct::group(source).expect("the group reconstructs");
+        let body =
+            build_case_body_from_clauses("f", group.into_clauses()).expect("the clauses assemble");
+        match body {
+            DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::ClauseSelection(selection),
+            ) => selection,
+            other => panic!("expected a clause selection, got {other:?}"),
         }
     }
 
-    #[test]
-    fn offered_name_and_supply() {
-        // Free without label: offers its own name (plumbing), supplies the column.
-        assert_eq!(free("country").offered_name(), Some("country"));
-        assert_eq!(free("country").supply(), "country");
-        // Free with label: LABEL is the offer; lvar becomes pure plumbing (supply).
-        assert_eq!(free_as("nation", "country").offered_name(), Some("country"));
-        assert_eq!(free_as("nation", "country").supply(), "nation");
-        // Ground without label: ABSTAINS; supplies the literal.
-        assert_eq!(ground("\"VIP\"").offered_name(), None);
-        assert_eq!(ground("\"VIP\"").supply(), "\"VIP\"");
-        // Ground with label: label is the offer; supplies the literal.
-        assert_eq!(ground_as("\"VIP\"", "tag").offered_name(), Some("tag"));
-        assert_eq!(ground_as("\"VIP\"", "tag").supply(), "\"VIP\"");
+    /// Whether an arm's result crossed.
+    fn crossed(arm: &crate::pipeline::asts::core::ClauseArm) -> bool {
+        matches!(arm.result, OutValue::Truth(_))
     }
 
+    /// BOTH CLAUSES CROSSED. The pre-carved existence spelling is a lawful
+    /// value-rule body, so two of them are a lawful group.
     #[test]
-    fn canonical_lvar_offer_beats_literal_abstention() {
-        // Position 0: literal abstains (clause 1), lvar offers `status` (clause 2).
-        let c1 = vec![ground("\"active\""), free("first_name")];
-        let c2 = vec![free("status"), free("first_name")];
-        let names = compute_canonical_column_names(&[&c1, &c2]);
-        assert_eq!(names, vec!["status".to_string(), "first_name".to_string()]);
-    }
-
-    #[test]
-    fn canonical_label_offer_beats_abstention() {
-        // Position 0: `"x" as tag` offers `tag` (clause 1), bare `"y"` abstains (clause 2).
-        let c1 = vec![ground_as("\"x\"", "tag"), free("last_name")];
-        let c2 = vec![ground("\"y\""), free("last_name")];
-        let names = compute_canonical_column_names(&[&c1, &c2]);
-        assert_eq!(names, vec!["tag".to_string(), "last_name".to_string()]);
-    }
-
-    #[test]
-    fn canonical_label_overrides_lvar_own_name() {
-        // A single-clause `nation as country`: the offer is the LABEL, not `nation`.
-        let c1 = vec![free_as("nation", "country"), free("last_name")];
-        let names = compute_canonical_column_names(&[&c1]);
-        assert_eq!(names, vec!["country".to_string(), "last_name".to_string()]);
-    }
-
-    #[test]
-    fn canonical_label_lvar_agreement() {
-        // Clause 1 lvar `country`; clause 2 `"x" as country`. Unanimous offer `country`.
-        let c1 = vec![free("country"), free("last_name")];
-        let c2 = vec![ground_as("\"x\"", "country"), free("last_name")];
-        let names = compute_canonical_column_names(&[&c1, &c2]);
-        assert_eq!(names, vec!["country".to_string(), "last_name".to_string()]);
-    }
-
-    #[test]
-    fn canonical_all_abstain_pure_computer_still_yields_col_n() {
-        // The PURE name-computer remains total: with no offers it falls back to
-        // `_col1`. Production never calls it in this state for rule heads — the
-        // Ground-Position Naming Rule (`validate_ground_position_naming`) refuses
-        // first (see `ground_position_rule_refuses_*` below). This test pins that
-        // enforcement lives in the validator, not in the name-computer.
-        let c1 = vec![ground("\"a\""), free("first_name")];
-        let c2 = vec![ground("\"b\""), free("first_name")];
-        let names = compute_canonical_column_names(&[&c1, &c2]);
-        assert_eq!(names, vec!["_col1".to_string(), "first_name".to_string()]);
-    }
-
-    // ---- Ground-Position Naming Rule (catechism §II) --------------------------
-
-    #[test]
-    fn ground_position_rule_refuses_multiclause_all_abstain() {
-        // Position 0: both clauses a bare literal -> every clause abstains -> REFUSE.
-        let c1 = vec![ground("\"a\""), free("first_name")];
-        let c2 = vec![ground("\"b\""), free("first_name")];
-        let err = validate_ground_position_naming("label_only", &[&c1, &c2])
-            .expect_err("all-abstain position must refuse");
-        assert!(
-            err.error_uri().contains("ddl/head/unnamed_ground_position"),
-            "category: {}",
-            err.error_uri()
+    fn every_clause_may_compute_a_crossing() {
+        let selection = selection(concat!(
+            "served:(uid | uid > 5) :- +orders(, user_id = uid)\n",
+            "served:(uid) :- +reviews(, user_id = uid)"
+        ));
+        assert_eq!(selection.arms.len(), 2);
+        assert!(selection.arms.iter().all(crossed));
+        // The guardless clause is the group's default, and there is one.
+        assert_eq!(
+            selection.arms.iter().filter(|a| a.guard.is_none()).count(),
+            1
         );
-        let msg = err.to_string();
-        assert!(msg.contains("position 1"), "names position: {msg}");
-        assert!(msg.contains("as tag"), "gives remedy: {msg}");
     }
 
+    /// MIXED IS ADMITTED. A clause computes a value either way, and the
+    /// value-rule law does not tell a crossing from an ordinary value.
     #[test]
-    fn ground_position_rule_refuses_single_clause_all_ground() {
-        // Single-clause head, sole clause a bare literal -> REFUSE
-        // (one clause supplying ground = every clause abstaining).
-        let c1 = vec![ground("\"employee\""), free("first_name"), free("age")];
-        let err = validate_ground_position_naming("labeled_users", &[&c1])
-            .expect_err("single all-ground position must refuse");
-        assert!(err
-            .error_uri()
-            .contains("ddl/head/unnamed_ground_position"));
+    fn clauses_may_mix_crossed_and_domain_results() {
+        let selection = selection(concat!(
+            "mixed:(uid | uid > 5) :- +orders(, user_id = uid)\n",
+            "mixed:(uid) :- false"
+        ));
+        assert_eq!(selection.arms.len(), 2);
+        assert!(crossed(&selection.arms[0]));
+        assert!(!crossed(&selection.arms[1]));
     }
 
+    /// The control: neither clause crossed, and the same shape carries them.
     #[test]
-    fn ground_position_rule_ok_when_one_clause_offers() {
-        // Position 0 rescued by a single lvar offer (the seed-program shape):
-        // an offer exists, so the position is named -> no refusal.
-        let c1 = vec![ground("\"France\""), free("last_name")];
-        let c2 = vec![free("country"), free("last_name")];
-        assert!(validate_ground_position_naming("bracket", &[&c1, &c2]).is_ok());
-    }
-
-    #[test]
-    fn ground_position_rule_ok_when_labeled() {
-        // `"VIP" as tag` turns the abstention into an offer -> named -> ok.
-        let c1 = vec![ground_as("\"VIP\"", "tag"), free("first_name")];
-        assert!(validate_ground_position_naming("tagged", &[&c1]).is_ok());
+    fn a_domain_valued_group_uses_the_same_selection() {
+        let selection = selection(concat!(
+            "plain:(uid | uid > 5) :- \"high\"\n",
+            "plain:(uid) :- \"low\""
+        ));
+        assert_eq!(selection.arms.len(), 2);
+        assert!(!selection.arms.iter().any(crossed));
     }
 }
 
@@ -3741,5 +3296,102 @@ mod ground_number_equality_tests {
         assert!(normalize_number("").is_none());
         assert!(normalize_number("1.2.3").is_none());
         assert!(normalize_number("1e").is_none());
+    }
+
+    /// THE ROW IS THE VALUE, and only when there is one row of one column.
+    ///
+    /// `f(t(*) & 3)` is `f(t(*), _(3))`, so a scalar formal after `&` is
+    /// supplied by a relation. A wider or taller relation is a relation: a
+    /// scalar slot that took its first cell would be guessing which one the
+    /// author meant, and the placeholder it binds instead refuses in the body
+    /// under a spelling nobody wrote.
+    #[test]
+    fn only_a_single_cell_lift_answers_a_scalar_formal() {
+        use super::{ast_unresolved, lifted_scalar};
+        use crate::pipeline::asts::core::{AnonRelation, AnonTable, Chain, Grelex, LiteralValue};
+
+        let literal = |n: &str| {
+            ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Ground(LiteralValue::Number(n.into())),
+            )
+        };
+        let lifted = |rows: Vec<Vec<ast_unresolved::DomainExpression>>| {
+            Chain::ground(Grelex::Literal(AnonRelation::plain(
+                AnonTable::from_values(None, rows, ()).unwrap(),
+            )))
+        };
+
+        let one_cell = lifted(vec![vec![literal("3")]]);
+        assert_eq!(lifted_scalar(Some(&one_cell)), Some(literal("3")));
+
+        let two_columns = lifted(vec![vec![literal("3"), literal("4")]]);
+        let two_rows = lifted(vec![vec![literal("3")], vec![literal("4")]]);
+        for wider in [two_columns, two_rows] {
+            assert_eq!(
+                lifted_scalar(Some(&wider)),
+                None,
+                "a relation with more than one cell is a relation"
+            );
+        }
+        assert_eq!(lifted_scalar(None), None);
+    }
+
+    /// A RELATION THAT IS NOT A NAME HAS NO TERM.
+    ///
+    /// The formals that read a name or a value must be told there is none,
+    /// not handed an invented lvar: a fabricated spelling either refuses in
+    /// the body under a name nobody wrote, or — worse — captures a real
+    /// column that happens to share it.
+    #[test]
+    fn a_relation_that_is_not_a_name_yields_no_term() {
+        use super::{ast_unresolved, first_parens_terms, HoTerm};
+        use crate::pipeline::asts::core::operators::{CallArguments, HoArgument};
+        use crate::pipeline::asts::core::{
+            AnonRelation, AnonTable, Chain, Grelex, LiteralValue, NamedReference, Reference,
+        };
+
+        let anonymous = HoArgument::Relation(Chain::ground(Grelex::Literal(AnonRelation::plain(
+            AnonTable::from_values(
+                None,
+                vec![vec![ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Ground(LiteralValue::Number("3".into())),
+                )]],
+                (),
+            )
+            .unwrap(),
+        ))));
+        let named = HoArgument::Relation(Chain::read(
+            ast_unresolved::Relation::Ground {
+                mention: ast_unresolved::GroundMention::Named {
+                    identifier: ast_unresolved::QualifiedName {
+                        namespace_path: ast_unresolved::NamespacePath::empty(),
+                        name: delightql_types::SqlIdentifier::new("users"),
+                    },
+                    alias: None,
+                    mutation_target: false,
+                    passthrough: false,
+                },
+                outer: false,
+                cpr_schema: (),
+            },
+            ast_unresolved::Access::All,
+            (),
+        ));
+
+        let terms = first_parens_terms(&CallArguments::higher_order(vec![named, anonymous]))
+            .expect("two arguments are terms");
+        assert!(
+            matches!(
+                &terms[0],
+                HoTerm::Term(ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(column)))) if column.name.as_str() == "users"
+            ),
+            "a named relation IS its name: {:?}",
+            terms[0]
+        );
+        assert!(
+            matches!(&terms[1], HoTerm::Opaque),
+            "an anonymous relation names nothing a formal can bind: {:?}",
+            terms[1]
+        );
     }
 }

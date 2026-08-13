@@ -9,8 +9,6 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 /// This module contains the rustyline helper implementations for tab completion
 /// of dot commands and column names in the REPL.
 use rustyline::{Context as RustylineContext, Helper};
-// Temporarily disabled during pipeline migration
-// use delightql_core::schema::Schema;
 
 /// Context for determining what type of completion to provide
 #[derive(Debug, Clone)]
@@ -23,10 +21,77 @@ enum CompletionContext {
     Unknown,
 }
 
+thread_local! {
+    /// One parser per thread, reused. `Parser` is neither `Clone` nor `Sync`,
+    /// and the helper is both, so it cannot live in the struct.
+    static WF_PARSER: std::cell::RefCell<Option<delightql_cst::Parser>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Largest char boundary at or below `i`. rustyline keeps its cursor on a
+/// boundary, but this runs on every redraw and a panic there takes the REPL
+/// down, so it does not rely on that.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Split a line at the cursor into (left-of-cursor, right-of-cursor).
+///
+/// The left half is what the prompt probes and what Tab meta-izes; the pair is
+/// also exactly the shape `Editor::readline_with_initial` wants, so restoring a
+/// line after an interrupt puts the cursor back where it was.
+pub(crate) fn split_at_cursor(line: &str, pos: usize) -> (&str, &str) {
+    let cut = floor_boundary(line, pos);
+    (&line[..cut], &line[cut..])
+}
+
+/// Does `prefix` stand on its own as a complete DQL expression?
+///
+/// Answers "if Enter were pressed now, with everything right of the cursor
+/// discarded, would this run" — NOT "is the user finished". Well-formedness is
+/// not monotonic over prefixes: `users(*)` holds, `users(*) |>` does not,
+/// `users(*) |> (id)` holds again.
+pub(crate) fn is_well_formed(prefix: &str) -> bool {
+    let prefix = prefix.trim();
+    // Dot-commands are REPL directives, not queries.
+    if prefix.is_empty() || prefix.starts_with('.') {
+        return false;
+    }
+    WF_PARSER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(delightql_cst::Parser::new());
+        }
+        let parser = slot.as_mut().expect("initialised above");
+        // The prompt entrance, because that is the road the line will take if
+        // Enter is pressed. Parsing it any other way would answer about a
+        // submission the REPL is not about to make.
+        //
+        // A parse ALWAYS returns a tree: recovery wraps broken input into
+        // valid-LOOKING nodes. Asking for defects is the whole difference
+        // between this and accepting a corrupt parse; asking for a branch is
+        // what keeps a source that declares nothing from reading as complete.
+        let tree = parser.parse_prompt(prefix);
+        !tree.has_defects() && tree.root_branch().is_some()
+    })
+}
+
 /// Completer for dot commands and column names in the REPL
 #[derive(Clone)]
 pub struct DotCommandCompleter {
     commands: Vec<String>,
+    /// Well-formedness of the prefix left of the cursor, for the buffer being
+    /// drawn. Written by `highlight_char`, read by `highlight_prompt` — which
+    /// receives no line buffer of its own. `Cell` because every `Highlighter`
+    /// method takes `&self`.
+    well_formed: std::cell::Cell<bool>,
     // schema: Option<Arc<dyn Schema>>, // Temporarily disabled
 }
 
@@ -39,6 +104,7 @@ impl DotCommandCompleter {
             commands: super::commands::dot_command_spellings()
                 .map(String::from)
                 .collect(),
+            well_formed: std::cell::Cell::new(false),
             // schema: None, // Temporarily disabled
         }
     }
@@ -133,9 +199,10 @@ impl DotCommandCompleter {
         }
     }
 
-    /// Get column completions for the given tables
+    /// Column completions for the given tables. The helper holds no schema —
+    /// `delightql-core`'s public boundary is the handle/session API, and a
+    /// completer is not a session — so there are no column names to offer.
     fn get_column_completions(&self, _tables: &[String], _prefix: &str) -> Vec<Pair> {
-        // Temporarily disabled during migration - schema support removed
         Vec::new()
     }
 }
@@ -203,7 +270,24 @@ impl Highlighter for DotCommandCompleter {
         prompt: &'p str,
         _default: bool,
     ) -> std::borrow::Cow<'b, str> {
-        std::borrow::Cow::Borrowed(prompt)
+        // `highlight_char` ran earlier in this same refresh (rustyline
+        // edit.rs: refresh_line calls it before refresh, and move_cursor calls
+        // it before refreshing) so the stamped verdict is current, not one
+        // keystroke stale. This hook gets no line buffer of its own.
+        //
+        // The substitute MUST keep the display width of `prompt`: `prompt_size`
+        // was computed once from the original and drives cursor positioning.
+        // rustyline measures with `UnicodeWidthStr::width()`, under which `∂`
+        // and `?` are both one column.
+        if self.well_formed.get() {
+            return std::borrow::Cow::Borrowed(prompt);
+        }
+        match prompt {
+            "∂> " => std::borrow::Cow::Borrowed("?> "),
+            // SQL mode is not DQL, and the continuation prompt already means
+            // "not finished" — neither is probed, so neither is swapped.
+            other => std::borrow::Cow::Borrowed(other),
+        }
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
@@ -223,8 +307,23 @@ impl Highlighter for DotCommandCompleter {
         }
     }
 
-    fn highlight_char(&self, _line: &str, _pos: usize) -> bool {
-        // Always refresh to ensure syntax highlighting is up to date
+    fn highlight_char(&self, line: &str, pos: usize) -> bool {
+        // The only Highlighter hook that receives BOTH the line and the cursor,
+        // and rustyline calls it before drawing the prompt on every edit AND
+        // every cursor move. So it is where the verdict is computed.
+        //
+        // Probing `line[..pos]` rather than the whole line is what makes the
+        // cursor an evaluation point: scrub left through `users(*) |> (id)` and
+        // the prompt flips at each boundary where the prefix stops standing
+        // alone.
+        let (left, _right) = split_at_cursor(line, pos);
+        self.well_formed.set(is_well_formed(left));
+
+        // Returning `true` forces a full refresh, which is what redraws the
+        // prompt. Returning `false` lets rustyline take its fast paths — write
+        // the character directly, or move the terminal cursor — and the prompt
+        // would then freeze mid-expression. Syntax highlighting needs the
+        // refresh on edits anyway; the prompt needs it on cursor moves too.
         true
     }
 
@@ -249,222 +348,32 @@ impl Validator for DotCommandCompleter {
 
 impl Helper for DotCommandCompleter {}
 
-/* Temporarily disabled during migration
+// End of temporarily disabled test module
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use delightql_core::schema::{MockSchema, TableInfo, ColumnInfo};
+mod wf_tests {
+    use super::is_well_formed;
 
-    fn create_test_schema() -> Arc<MockSchema> {
-        let mut schema = MockSchema::new();
-
-        // Add users table
-        schema.add_table(TableInfo {
-            name: "users".to_string(),
-            // schema: None, // Temporarily disabled
-            columns: vec![
-                ColumnInfo {
-                    name: "id".to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: false,
-                    is_primary_key: true,
-                    default_value: None,
-                },
-                ColumnInfo {
-                    name: "name".to_string(),
-                    data_type: "TEXT".to_string(),
-                    nullable: false,
-                    is_primary_key: false,
-                    default_value: None,
-                },
-                ColumnInfo {
-                    name: "email".to_string(),
-                    data_type: "TEXT".to_string(),
-                    nullable: false,
-                    is_primary_key: false,
-                    default_value: None,
-                },
-                ColumnInfo {
-                    name: "age".to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: true,
-                    is_primary_key: false,
-                    default_value: None,
-                },
-            ],
-        });
-
-        // Add orders table
-        schema.add_table(TableInfo {
-            name: "orders".to_string(),
-            // schema: None, // Temporarily disabled
-            columns: vec![
-                ColumnInfo {
-                    name: "id".to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: false,
-                    is_primary_key: true,
-                    default_value: None,
-                },
-                ColumnInfo {
-                    name: "user_id".to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: false,
-                    is_primary_key: false,
-                    default_value: None,
-                },
-                ColumnInfo {
-                    name: "total".to_string(),
-                    data_type: "DECIMAL".to_string(),
-                    nullable: false,
-                    is_primary_key: false,
-                    default_value: None,
-                },
-            ],
-        });
-
-        Arc::new(schema)
-    }
-
+    /// Scrubbing the cursor left through a finished query passes through
+    /// well-formed states on the way to other well-formed states. This is the
+    /// property the dynamic prompt renders, and it is deliberately NOT
+    /// monotonic.
     #[test]
-    fn test_detect_dot_command_context() {
-        let completer = DotCommandCompleter::new();
-        let context = completer.detect_context(".hel", 4);
-        match context {
-            CompletionContext::DotCommand => {},
-            _ => panic!("Expected DotCommand context"),
+    fn prefix_wellformedness_is_not_monotonic() {
+        let line = "users(*) |> (id)";
+        let ladder: Vec<(usize, bool)> = (0..=line.len())
+            .filter(|i| line.is_char_boundary(*i))
+            .map(|i| (i, is_well_formed(&line[..i])))
+            .collect();
+
+        for (i, wf) in &ladder {
+            println!("{:>3} {:<20} {}", i, &line[..*i], if *wf { "WF" } else { "--" });
         }
-    }
 
-    #[test]
-    fn test_detect_column_context_after_table() {
-        let completer = DotCommandCompleter::new();
-        let context = completer.detect_context("users(*), ", 10);
-        match context {
-            CompletionContext::ColumnName { tables } => {
-                assert_eq!(tables, vec!["users".to_string()]);
-            },
-            _ => panic!("Expected ColumnName context"),
-        }
-    }
-
-    #[test]
-    fn test_detect_column_context_in_field_list() {
-        let completer = DotCommandCompleter::new();
-        let context = completer.detect_context("users(name, ", 12);
-        match context {
-            CompletionContext::ColumnName { tables } => {
-                assert_eq!(tables, vec!["users".to_string()]);
-            },
-            _ => panic!("Expected ColumnName context"),
-        }
-    }
-
-    #[test]
-    fn test_detect_column_context_after_pipe() {
-        let completer = DotCommandCompleter::new();
-        let context = completer.detect_context("users(*) |> (", 13);
-        match context {
-            CompletionContext::ColumnName { tables } => {
-                assert_eq!(tables, vec!["users".to_string()]);
-            },
-            _ => panic!("Expected ColumnName context"),
-        }
-    }
-
-    #[test]
-    fn test_detect_multiple_tables_context() {
-        let completer = DotCommandCompleter::new();
-        let context = completer.detect_context("orders(*), users(*), ", 21);
-        match context {
-            CompletionContext::ColumnName { tables } => {
-                assert_eq!(tables.len(), 2);
-                assert!(tables.contains(&"orders".to_string()));
-                assert!(tables.contains(&"users".to_string()));
-            },
-            _ => panic!("Expected ColumnName context with multiple tables"),
-        }
-    }
-
-    #[test]
-    fn test_column_completions_single_table() {
-        let schema = create_test_schema();
-        let completer = DotCommandCompleter::with_schema(schema);
-
-        let completions = completer.get_column_completions(&["users".to_string()], "");
-        assert_eq!(completions.len(), 4);
-
-        let names: Vec<String> = completions.iter().map(|p| p.display.clone()).collect();
-        assert!(names.contains(&"id".to_string()));
-        assert!(names.contains(&"name".to_string()));
-        assert!(names.contains(&"email".to_string()));
-        assert!(names.contains(&"age".to_string()));
-    }
-
-    #[test]
-    fn test_column_completions_with_prefix() {
-        let schema = create_test_schema();
-        let completer = DotCommandCompleter::with_schema(schema);
-
-        let completions = completer.get_column_completions(&["users".to_string()], "em");
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].display, "email");
-    }
-
-    #[test]
-    fn test_column_completions_multiple_tables() {
-        let schema = create_test_schema();
-        let completer = DotCommandCompleter::with_schema(schema);
-
-        let completions = completer.get_column_completions(
-            &["users".to_string(), "orders".to_string()],
-            ""
-        );
-
-        // Should have qualified names
-        let names: Vec<String> = completions.iter().map(|p| p.display.clone()).collect();
-        assert!(names.contains(&"users.id".to_string()));
-        assert!(names.contains(&"users.name".to_string()));
-        assert!(names.contains(&"orders.id".to_string()));
-        assert!(names.contains(&"orders.total".to_string()));
-    }
-
-    #[test]
-    fn test_complete_dot_command() {
-        let completer = DotCommandCompleter::new();
-        // For testing, we don't need real history, just need to satisfy the API
-        // Create a mock context without history
-
-        // We can't easily create a Context in tests, so test the methods directly
-        // Test context detection
-        let context = completer.detect_context(".hel", 4);
-        assert!(matches!(context, CompletionContext::DotCommand));
-
-        // Test completion generation for dot commands
-        let mut result = Vec::new();
-        for command in &completer.commands {
-            if command.starts_with(".hel") {
-                result.push(command.clone());
-            }
-        }
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], ".help");
-    }
-
-    #[test]
-    fn test_complete_columns_after_table() {
-        let schema = create_test_schema();
-        let completer = DotCommandCompleter::with_schema(schema);
-
-        // Test context detection
-        let context = completer.detect_context("users(*), em", 12);
-        assert!(matches!(context, CompletionContext::ColumnName { .. }));
-
-        // Test column completion
-        let completions = completer.get_column_completions(&["users".to_string()], "em");
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].replacement, "email");
+        let flips = ladder.windows(2).filter(|w| w[0].1 != w[1].1).count();
+        assert!(flips >= 3, "expected several transitions, saw {flips}");
+        assert!(is_well_formed(line), "the whole line must be well formed");
+        assert!(!is_well_formed(""), "empty is not runnable");
+        assert!(!is_well_formed(".help"), "dot-commands are not queries");
     }
 }
-*/
-// End of temporarily disabled test module

@@ -21,6 +21,7 @@ recursion_stats = ["delightql-core/recursion_stats"]
 delightql-buildinfo = { path = "../delightql-buildinfo" }
 delightql-core = { path = "../delightql-core" }
 delightql-formatter = { path = "../delightql-formatter", optional = true }
+delightql-cst = { path = "../delightql-cst" }
 delightql-backends = { path = "../delightql-backends", default-features = false, features = ["sqlite"] }
 delightql-types = { path = "../delightql-types" }
 delightql-cli-siso = { path = "../delightql-cli-siso" }

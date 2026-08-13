@@ -1,0 +1,27 @@
+[package]
+name = "delightql-cst"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The typed CST boundary for the consolidated grammar.
+#
+# The compiler's syntax front door. `delightql-core` depends on it — the
+# permanent direction — so building core requires the pinned Tree-sitter CLI.
+# Nothing here may depend back on the compiler: no AST, no registry, no
+# resolver, no lowering, no backends.
+
+[dependencies]
+tree-sitter.workspace = true
+
+[build-dependencies]
+cc = "1.0"
+serde_json.workspace = true
+
+[dev-dependencies]
+# The conformance tests assert on Point coordinates directly.
+tree-sitter.workspace = true
+# The slot-ambiguity test reads the same node-types.json the generator does.
+serde_json.workspace = true

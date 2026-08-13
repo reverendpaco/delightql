@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
+use delightql_types::{DelightQLError, Result};
 
 use crate::coprocess::SharedCoprocess;
 use crate::profile::SchemaMode;
@@ -21,20 +22,31 @@ impl PipeSchema {
 }
 
 impl DatabaseSchema for PipeSchema {
-    fn get_table_columns(&self, _schema: Option<&str>, table_name: &str) -> Option<Vec<ColumnInfo>> {
+    fn get_table_columns(
+        &self,
+        _schema: Option<&str>,
+        table_name: &str,
+    ) -> Result<Option<Vec<ColumnInfo>>> {
         let sql = match &self.shared.profile().schema_mode {
             SchemaMode::Pragma => format!("PRAGMA table_info({})", table_name),
             SchemaMode::Query(template) => template.replace("{table}", table_name),
         };
-        let (columns, rows) = self.shared.execute_query_raw(&sql).ok()?;
+        let (columns, rows) = self.shared.execute_query_raw(&sql).map_err(|error| {
+            DelightQLError::database_error("Pipe schema query failed", error.to_string())
+        })?;
 
         if rows.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
         // Find column indices by name
-        let name_idx = columns.iter().position(|c| c.eq_ignore_ascii_case("name"))?;
+        let Some(name_idx) = columns.iter().position(|c| c.eq_ignore_ascii_case("name")) else {
+            return Err(DelightQLError::database_error(
+                "Pipe schema metadata is malformed",
+                "missing required column 'name'",
+            ));
+        };
         let notnull_idx = columns.iter().position(|c| c.eq_ignore_ascii_case("notnull"));
         let cid_idx = columns.iter().position(|c| c.eq_ignore_ascii_case("cid"));
 
@@ -61,11 +73,11 @@ impl DatabaseSchema for PipeSchema {
             })
             .collect();
 
-        Some(column_infos)
+        Ok(Some(column_infos))
     }
 
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool {
-        self.get_table_columns(schema, table_name).is_some()
+    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool> {
+        Ok(self.get_table_columns(schema, table_name)?.is_some())
     }
 }
 

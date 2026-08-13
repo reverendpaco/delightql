@@ -105,7 +105,7 @@ fn mount_via_session(
     db_path: &str,
     namespace: &str,
 ) -> Result<()> {
-    let dql = format!("mount!(\"{}\", \"{}\")", db_path, namespace);
+    let dql = format!("mount!(\"{}\", \"{}\")(*)", db_path, namespace);
     let mut session = handle.session().map_err(|e| anyhow!("{}", e))?;
     crate::exec_ng::run_dql_query(&dql, &mut *session)?;
     Ok(())

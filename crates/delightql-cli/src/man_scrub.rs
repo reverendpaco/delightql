@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! troff → plain text for the HOUSE MAN DIALECT (SYS-HELP-DESIGN.md
-//! phase 3, the `man_page.plain` column).
+//! troff → plain text for the HOUSE MAN DIALECT (feeds the
+//! `man_page.plain` column).
 //!
 //! This is NOT a roff renderer. Roff in general is a Turing tar pit
 //! (macro definitions, conditionals, registers); this module handles

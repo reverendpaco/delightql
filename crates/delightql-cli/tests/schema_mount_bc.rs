@@ -188,7 +188,7 @@ fn pg_mount_fragment_binds_named_schema() {
     let dir = tempfile::tempdir().unwrap();
 
     let q = format!(
-        "mount!(\"{}#sales\", \"rep\")\n\nrep.t(*)",
+        "mount!(\"{}#sales\", \"rep\")(*)\n\nrep.t(*)",
         db.uri()
     );
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), &q, true);
@@ -214,7 +214,7 @@ fn pg_mount_nonexistent_fragment_refuses() {
     pg_two_schema_fixture(&db);
     let dir = tempfile::tempdir().unwrap();
 
-    let q = format!("mount!(\"{}#ghost\", \"g\")", db.uri());
+    let q = format!("mount!(\"{}#ghost\", \"g\")(*)", db.uri());
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), &q, false);
     assert!(!ok, "a nonexistent schema must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
@@ -256,7 +256,7 @@ fn sqlite_fragment_refuses() {
         .execute_batch("CREATE TABLE q (a INTEGER)")
         .unwrap();
     let q = format!(
-        "mount!(\"file://{}#sales\", \"s\")",
+        "mount!(\"file://{}#sales\", \"s\")(*)",
         target.to_str().unwrap()
     );
     let (ok, stdout, stderr) = run_dql(dir.path(), &dummy, &q, false);
@@ -285,9 +285,9 @@ fn pg_mount_tree_creates_persistent_subnamespaces() {
     pg_two_schema_fixture(&db);
     let dir = tempfile::tempdir().unwrap();
 
-    // The one-row receipt (Phase 6 slice 3: core + path/namespace echoes;
+    // The one-row receipt (core + path/namespace echoes;
     // the created sub-namespaces are the `returned` interior tree).
-    let q = format!("mount_tree!(\"{}\", \"allpg\")", db.uri());
+    let q = format!("mount_tree!(\"{}\", \"allpg\")(*)", db.uri());
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), &q, false);
     assert!(ok, "mount_tree! must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     for sub in [
@@ -312,7 +312,7 @@ fn pg_mount_tree_creates_persistent_subnamespaces() {
 
     // A NON-public schema resolves via its sub-namespace.
     let q = format!(
-        "mount_tree!(\"{}\", \"allpg\")\n\nallpg::sales.only_sales(*)",
+        "mount_tree!(\"{}\", \"allpg\")(*)\n\nallpg::sales.only_sales(*)",
         db.uri()
     );
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), &q, true);
@@ -333,7 +333,7 @@ fn pg_mount_tree_cross_schema_single_connection() {
     let dir = tempfile::tempdir().unwrap();
 
     let q = format!(
-        "mount_tree!(\"{}\", \"allpg\")\n\nallpg::public.t(*), allpg::sales.t(*)",
+        "mount_tree!(\"{}\", \"allpg\")(*)\n\nallpg::public.t(*), allpg::sales.t(*)",
         db.uri()
     );
     let (ok, stdout, stderr) = run_dql(dir.path(), &db.uri(), &q, true);
@@ -362,7 +362,7 @@ fn sqlite_mount_tree_refuses() {
         .unwrap()
         .execute_batch("CREATE TABLE q (a INTEGER)")
         .unwrap();
-    let q = format!("mount_tree!(\"{}\", \"tree\")", target.to_str().unwrap());
+    let q = format!("mount_tree!(\"{}\", \"tree\")(*)", target.to_str().unwrap());
     let (ok, stdout, stderr) = run_dql(dir.path(), &dummy, &q, false);
     assert!(!ok, "mount_tree! on SQLite must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
@@ -413,7 +413,7 @@ fn duckdb_mount_fragment_binds_named_schema() {
     let dummy = dummy_sqlite(dir.path());
     let ddb = duckdb_two_schema_fixture(dir.path());
     let q = format!(
-        "mount!(\"file://{}#sales\", \"ds\")\n\nds.s(*)",
+        "mount!(\"file://{}#sales\", \"ds\")(*)\n\nds.s(*)",
         ddb.to_str().unwrap()
     );
     let (ok, stdout, stderr) = run_dql(dir.path(), &dummy, &q, true);
@@ -433,7 +433,7 @@ fn duckdb_mount_tree_creates_subnamespaces() {
     let dummy = dummy_sqlite(dir.path());
     let ddb = duckdb_two_schema_fixture(dir.path());
 
-    let q = format!("mount_tree!(\"{}\", \"duck\")", ddb.to_str().unwrap());
+    let q = format!("mount_tree!(\"{}\", \"duck\")(*)", ddb.to_str().unwrap());
     let (ok, stdout, stderr) = run_dql(dir.path(), &dummy, &q, false);
     assert!(ok, "duckdb mount_tree! must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     for sub in ["duck::main", "duck::sales"] {
@@ -442,7 +442,7 @@ fn duckdb_mount_tree_creates_subnamespaces() {
     assert_eq!(stdout.matches('[').count(), 1, "the receipt is ONE row.\nstdout:\n{stdout}");
 
     let q = format!(
-        "mount_tree!(\"{}\", \"duck\")\n\nduck::sales.s(*)",
+        "mount_tree!(\"{}\", \"duck\")(*)\n\nduck::sales.s(*)",
         ddb.to_str().unwrap()
     );
     let (ok, stdout, stderr) = run_dql(dir.path(), &dummy, &q, true);

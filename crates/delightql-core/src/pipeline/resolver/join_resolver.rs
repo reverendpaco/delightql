@@ -1,542 +1,493 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Join-specific resolution logic
-//!
-//! This module handles JOIN condition creation and anonymous table unification.
+//! Join-specific resolution for anonymous relations.
 
 use crate::error::Result;
+use crate::names::{Addressing, ColId, Registry};
 use crate::pipeline::ast_resolved;
-use crate::pipeline::ast_resolved::NamespacePath;
 use crate::pipeline::ast_unresolved;
+use crate::pipeline::asts::core::ArgumentValue;
+use crate::pipeline::asts::core::{AuthoredColumn, ColumnOccurrence};
+use crate::pipeline::asts::core::{Comparison, Membership};
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::asts::core::{Probe, ValueRow};
+use crate::pipeline::asts::vocabulary::Vec2;
+use delightql_types::SqlIdentifier;
 
-/// A qualified header `q.name` matches a column by its FULL NAME:
-/// the qualifier half matches the column's SQL qualifier, or the
-/// access name it answers to (a consulted view's columns ride under a
-/// synthetic SQL alias for hygiene; the law addresses the access name).
-fn qualified_header_matches(
-    col: &ast_resolved::ColumnMetadata,
-    name: &str,
-    q: &delightql_types::SqlIdentifier,
-) -> bool {
-    if !delightql_types::SqlIdentifier::str_eq(col.name(), name) {
-        return false;
-    }
-    let sql_qualifier = matches!(
-        col.qualifier(),
-        ast_resolved::TableName::Named(t)
-            if delightql_types::SqlIdentifier::str_eq(t.as_str(), q.as_str())
-    );
-    let access = col
-        .access_name()
-        .is_some_and(|a| delightql_types::SqlIdentifier::str_eq(a.as_str(), q.as_str()));
-    sql_qualifier || access
+fn named(registry: &Registry, column: ColId, name: &str) -> bool {
+    let spelling = registry.intern(name, false);
+    registry.published_sym(column) == Some(registry.canonical(spelling))
 }
 
-/// Detect unification opportunities for anonymous tables
-/// When an anonymous table has headers that match columns from the left side of a join,
-/// create a USING clause for implicit unification.
+fn qualified_header_matches(
+    registry: &Registry,
+    column: ColId,
+    name: &str,
+    qualifier: &delightql_types::SqlIdentifier,
+) -> bool {
+    if !named(registry, column, name) {
+        return false;
+    }
+    let spelling = registry.intern(qualifier.as_str(), qualifier.is_stropped());
+    let qualifier = registry.canonical(spelling);
+    !registry.qualified_glob(qualifier, &[column]).is_empty()
+}
+
+fn bare_header_matches(registry: &Registry, column: ColId, name: &str) -> bool {
+    named(registry, column, name) && matches!(registry.addressing(column), Addressing::Bare)
+}
+
 pub(super) fn detect_anonymous_table_unification(
     headers: &[ast_unresolved::DomainExpression],
-    left_columns: &[ast_resolved::ColumnMetadata],
-    right_columns: &[ast_resolved::ColumnMetadata],
-) -> Result<Option<ast_resolved::BooleanExpression>> {
+    left_columns: &[ColId],
+    right_columns: &[ColId],
+    registry: &Registry,
+) -> Result<Option<ast_resolved::MemberCorrelation>> {
     let mut using_columns = Vec::new();
     let mut on_conditions = Vec::new();
-
-    for (idx, header) in headers.iter().enumerate() {
+    for (position, header) in headers.iter().enumerate() {
         match header {
-            // Qualified header: names a glob-exported lvar by its FULL
-            // name — the qualifier must match the column's table/alias,
-            // never just the column half (a junk qualifier must refuse,
-            // not silently unify).
-            ast_unresolved::DomainExpression::Lvar {
-                name,
-                qualifier: Some(q),
-                ..
-            } => {
-                let matched = left_columns
-                    .iter()
-                    .any(|col| qualified_header_matches(col, name, q));
-                if matched {
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn {
+                    name,
+                    qualifier: Some(qualifier),
+                    ..
+                },
+            ))) => {
+                if left_columns.iter().any(|column| {
+                    qualified_header_matches(registry, *column, name.as_str(), qualifier)
+                }) {
                     using_columns.push(name.clone());
                 } else {
                     return Err(crate::error::DelightQLError::validation_error_categorized(
                         "resolution/anon/qualifier",
                         format!(
                             "anonymous-table header '{}.{}' names no column in scope",
-                            q, name
+                            qualifier, name
                         ),
-                        "the qualifier must be a relation or alias to the left, and the column must exist on it",
+                        "the qualifier must name a visible relation containing the column",
                     ));
                 }
             }
-            // Bare header: an lvar. Unification is by FULL-NAME identity,
-            // so it unifies only with a DECLARED bare lvar (positional
-            // binding, another anon header) — a glob column's full name
-            // is qualified and is no partner, and a column that answers
-            // to an ACCESS NAME (an aliased export) is not bare either.
-            // A bare header that merely COLLIDES with such a column
-            // refuses: silently unifying reads a name the user never
-            // declared, silently expanding would duplicate the heading.
-            ast_unresolved::DomainExpression::Lvar {
-                name,
-                qualifier: None,
-                ..
-            } => {
-                let declared = left_columns.iter().any(|col| {
-                    col.declared_bare()
-                        && col.access_name().is_none()
-                        && delightql_types::SqlIdentifier::str_eq(col.name(), name)
-                });
-                if declared {
-                    using_columns.push(name.clone());
-                } else if left_columns
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn {
+                    name,
+                    qualifier: None,
+                    ..
+                },
+            ))) => {
+                // A bare header unifies with a BARE lvar of the same name and
+                // with nothing else. Qualification is part of an lvar's
+                // complete name (A NAME IS NOT AN ADDRESS): `city` and
+                // `people.city` are two names, so they neither unify nor
+                // collide — the relations cross, and this header introduces
+                // a fresh lvar. Reading the shared final segment as a
+                // collision would refuse a legal query.
+                if left_columns
                     .iter()
-                    .any(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
+                    .any(|column| bare_header_matches(registry, *column, name.as_str()))
                 {
-                    return Err(crate::error::DelightQLError::validation_error_categorized(
-                        "resolution/anon/glob_collision",
-                        format!(
-                            "anonymous-table header '{}' collides with a wildcard column of the same name: globs and aliased exports address their lvars by QUALIFIED names, so bare '{}' is not it",
-                            name, name
-                        ),
-                        "qualify the header (table.column or alias.column) to unify with the exported column, or rename it to declare a fresh column",
-                    ));
-                }
-                // No name in scope at all: a fresh column — expansion.
-            }
-            // Handle function expressions like upper:(description)
-            ast_unresolved::DomainExpression::Function(func) => {
-                // Check if function contains column references that exist on left side
-                if let Some(on_cond) =
-                    extract_function_unification(func, left_columns, right_columns, idx)?
-                {
-                    on_conditions.push(on_cond);
+                    using_columns.push(name.clone());
                 }
             }
-            // Ground header: a membership probe (inverted In). It
-            // declares nothing and unifies with nothing — membership
-            // routing consumes it after this scan.
-            ast_unresolved::DomainExpression::Literal { .. } => {}
-            // Other expression types don't participate in unification
-            other => panic!(
-                "catch-all hit in join_resolver.rs extract_unification_columns: {:?}",
-                other
-            ),
+            ast_unresolved::DomainExpression::Application(function) => {
+                if let Some(condition) = extract_function_unification(
+                    function,
+                    left_columns,
+                    right_columns,
+                    position,
+                    registry,
+                )? {
+                    on_conditions.push(condition);
+                }
+            }
+            _ => return Ok(None),
         }
     }
 
-    // If we have function-based conditions, return ON clause
     if !on_conditions.is_empty() {
-        // Combine multiple conditions with AND
-        return Ok(Some(combine_conditions(on_conditions)));
+        return Ok(Some(ast_resolved::MemberCorrelation::Condition(
+            combine_conditions(on_conditions),
+        )));
     }
-
-    // Otherwise, if we have simple column matches, return USING clause
-    if !using_columns.is_empty() {
-        let using_cols: Vec<ast_resolved::UsingColumn> = using_columns
-            .into_iter()
-            .map(|name| {
-                ast_resolved::UsingColumn::Regular(ast_resolved::QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: name.into(),
-                    grounding: None,
-                })
-            })
-            .collect();
-
-        return Ok(Some(ast_resolved::BooleanExpression::Using {
-            columns: using_cols,
-        }));
+    if using_columns.is_empty() {
+        return Ok(None);
     }
-
-    Ok(None)
+    Ok(Some(correspond(&using_columns, registry)))
 }
 
-/// Probe unification for an ALIASED anonymous table, refusal-free.
-/// An alias closes the relation: its headers declare fresh columns
-/// under the alias (x.city), so they neither unify bare nor collide —
-/// the collision regime exists to disambiguate bare declarations, and
-/// an aliased header is not bare. The probe still computes would-be
-/// unification, because a table whose every header WOULD unify is
-/// membership shape, and membership refuses the alias rather than
-/// silently becoming a relational join.
+/// The correspondence a set of authored names asks for.
 ///
-/// Returns `Some(Using)` only when EVERY lvar header has a partner
-/// (bare-declared, or qualified full-name); anything less is `None` —
-/// a closed relation joins by explicit predicate, never partial USING.
+/// ONE ACT. Every road that names correspondence columns — the dequalifying
+/// access, the unifying anonymous header, the positional pattern, `.*` —
+/// reaches the member's correlation through here, so a strop is part of the
+/// name in every one of them.
+fn correspond(names: &[SqlIdentifier], registry: &Registry) -> ast_resolved::MemberCorrelation {
+    ast_resolved::MemberCorrelation::Correspond(ast_resolved::Correspondence::new(
+        names
+            .iter()
+            .map(|name| {
+                let spelling = registry.intern(name.as_str(), name.is_stropped());
+                registry.canonical(spelling)
+            })
+            .collect(),
+    ))
+}
+
 pub(super) fn aliased_anon_would_unify(
     headers: &[ast_unresolved::DomainExpression],
-    left_columns: &[ast_resolved::ColumnMetadata],
-) -> Option<ast_resolved::BooleanExpression> {
-    let mut using_columns = Vec::new();
+    left_columns: &[ColId],
+    registry: &Registry,
+) -> Option<ast_resolved::MemberCorrelation> {
+    let mut using = Vec::new();
     for header in headers {
         match header {
-            ast_unresolved::DomainExpression::Lvar {
-                name,
-                qualifier: Some(q),
-                ..
-            } => {
-                if left_columns
-                    .iter()
-                    .any(|col| qualified_header_matches(col, name, q))
-                {
-                    using_columns.push(name.clone());
-                } else {
-                    return None;
-                }
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn {
+                    name,
+                    qualifier: Some(qualifier),
+                    ..
+                },
+            ))) if left_columns.iter().any(|column| {
+                qualified_header_matches(registry, *column, name.as_str(), qualifier)
+            }) =>
+            {
+                using.push(name.clone())
             }
-            ast_unresolved::DomainExpression::Lvar {
-                name,
-                qualifier: None,
-                ..
-            } => {
-                let declared = left_columns.iter().any(|col| {
-                    col.declared_bare()
-                        && col.access_name().is_none()
-                        && delightql_types::SqlIdentifier::str_eq(col.name(), name)
-                });
-                if declared {
-                    using_columns.push(name.clone());
-                } else {
-                    return None;
-                }
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn {
+                    name,
+                    qualifier: None,
+                    ..
+                },
+            ))) if left_columns
+                .iter()
+                .any(|column| bare_header_matches(registry, *column, name.as_str())) =>
+            {
+                using.push(name.clone())
             }
-            // Ground headers are probes; they neither unify nor block.
-            ast_unresolved::DomainExpression::Literal { .. } => {}
-            // Function headers are relational — never membership shape.
+            ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Ground(_),
+            ) => {}
             _ => return None,
         }
     }
-    if using_columns.is_empty() {
-        return None;
-    }
-    let using_cols: Vec<ast_resolved::UsingColumn> = using_columns
-        .into_iter()
-        .map(|name| {
-            ast_resolved::UsingColumn::Regular(ast_resolved::QualifiedName {
-                namespace_path: NamespacePath::empty(),
-                name: name.into(),
-                grounding: None,
-            })
-        })
-        .collect();
-    Some(ast_resolved::BooleanExpression::Using {
-        columns: using_cols,
-    })
+    (!using.is_empty()).then(|| correspond(&using, registry))
 }
 
-/// Build the membership predicate for an anonymous table in join
-/// position, when it has membership shape — every header a probe:
-/// a ground literal, or an lvar unified with a column in scope.
-///
-/// Returns `Ok(None)` when the table is NOT a membership test (fresh
-/// columns, function headers) and must stay relational. Refuses when
-/// a witness marker, a ground header, or full unification demands
-/// membership shape that an alias or a contradicting header denies —
-/// membership exports no columns, so an alias never names one.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_anon_membership(
     headers: Option<&[ast_unresolved::DomainExpression]>,
-    join_condition: &Option<ast_resolved::BooleanExpression>,
-    left_columns: &[ast_resolved::ColumnMetadata],
-    resolved_right: &ast_resolved::RelationalExpression,
-    exists_mode: bool,
-    negated: bool,
+    correlation: &Option<ast_resolved::MemberCorrelation>,
+    left_columns: &[ColId],
+    resolved_right: &ast_resolved::Chain,
     alias: Option<&delightql_types::SqlIdentifier>,
-) -> Result<Option<ast_resolved::BooleanExpression>> {
+    registry: &Registry,
+) -> Result<Option<ast_resolved::TruthExpression>> {
     let headers = match headers {
-        Some(h) if !h.is_empty() => h,
-        _ => {
-            if exists_mode {
-                return Err(crate::error::DelightQLError::validation_error_categorized(
-                    "resolution/anon/witness_shape",
-                    "a witness anonymous table (+_ or \\+_) is a membership test and needs headers: the probe on the left of @, the candidates as rows".to_string(),
-                    "write +_(probe @ candidate; candidate) or drop the witness marker",
-                ));
-            }
-            return Ok(None);
-        }
+        Some(headers) if !headers.is_empty() => headers,
+        _ => return Ok(None),
     };
 
-    let mut lvar_count = 0usize;
-    let mut lit_count = 0usize;
+    let mut lvars = 0;
+    let mut literals = 0;
     for header in headers {
         match header {
-            ast_unresolved::DomainExpression::Lvar { .. } => lvar_count += 1,
-            ast_unresolved::DomainExpression::Literal { .. } => lit_count += 1,
-            _ => {
-                // Function headers unify by ON-condition — relational,
-                // never membership.
-                if exists_mode {
-                    return Err(crate::error::DelightQLError::validation_error_categorized(
-                        "resolution/anon/witness_shape",
-                        "a witness anonymous table (+_ or \\+_) is a membership test: every header must be a ground value or an lvar that unifies with a column in scope".to_string(),
-                        "function headers are relational; drop the witness marker",
-                    ));
-                }
-                return Ok(None);
-            }
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn { .. },
+            ))) => lvars += 1,
+            ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Ground(_),
+            ) => literals += 1,
+            _ => return Ok(None),
         }
     }
-
-    let unified_count = match join_condition {
-        Some(ast_resolved::BooleanExpression::Using { columns }) => columns.len(),
-        _ => 0,
-    };
-    let all_lvars_unified = unified_count == lvar_count;
-
-    if exists_mode {
-        if alias.is_some() {
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/anon/witness_alias",
-                "a witness anonymous table (+_ or \\+_) is a membership test and exports no columns: an alias names nothing".to_string(),
-                "drop the alias, or drop the witness marker to make it a relation",
-            ));
-        }
-        if !all_lvars_unified {
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/anon/witness_shape",
-                "a witness anonymous table (+_ or \\+_) is a membership test: every header must be a ground value or an lvar that unifies with a column in scope".to_string(),
-                "a header that unifies with nothing would declare a fresh column, and a membership test has no columns to declare",
-            ));
-        }
-    } else if lit_count > 0 {
-        if !all_lvars_unified {
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/anon/ground_mixed",
-                "a ground header makes the anonymous table a membership test, but another header declares a fresh column: a membership test has no columns to declare".to_string(),
-                "unify every lvar header with a column in scope, or remove the ground header",
-            ));
-        }
-        if alias.is_some() {
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/anon/witness_alias",
-                "a ground header makes the anonymous table a membership test, which exports no columns: an alias names nothing".to_string(),
-                "drop the alias, or remove the ground header to make it a relation",
-            ));
-        }
-    } else if !all_lvars_unified {
-        // Plain form with fresh columns: a real relation.
+    let unified = correlation
+        .as_ref()
+        .and_then(ast_resolved::MemberCorrelation::correspondence)
+        .map_or(0, |correspondence| correspondence.columns.len());
+    let membership = unified == lvars;
+    if literals > 0 && !membership {
+        return Err(crate::error::DelightQLError::validation_error_categorized(
+            "resolution/anon/ground_mixed",
+            "a ground membership header cannot be mixed with a fresh column",
+            "unify every lvar or remove the ground header",
+        ));
+    }
+    if literals == 0 && !membership {
         return Ok(None);
-    } else if alias.is_some() {
-        // Every header unifies: membership shape. Membership exports
-        // no columns, so an alias names nothing — and accepted, the
-        // alias would silently flip membership into a relational join
-        // whose duplicate rows multiply matching outer rows. Naming
-        // must never change cardinality.
+    }
+    if alias.is_some() {
         return Err(crate::error::DelightQLError::validation_error_categorized(
             "resolution/anon/membership_alias",
-            "an anonymous table whose every header unifies is a membership test, which exports no columns: an alias names nothing".to_string(),
-            "drop the alias, or add a fresh column to make the anonymous table a relation",
+            "a membership test exports no columns, so its alias names nothing",
+            "drop the alias or make the anonymous table relational",
         ));
     }
 
-    // Membership shape confirmed. Build probe tuple from the headers.
-    let mut probes: Vec<ast_resolved::DomainExpression> = Vec::with_capacity(headers.len());
+    let mut probes = Vec::with_capacity(headers.len());
     for header in headers {
         match header {
-            ast_unresolved::DomainExpression::Literal { value, alias } => {
-                probes.push(ast_resolved::DomainExpression::Literal {
-                    value: value.clone(),
-                    alias: alias.clone(),
-                });
+            ast_unresolved::DomainExpression::Application(
+                ast_unresolved::FunctionApplication::Ground(value),
+            ) => {
+                probes.push(ast_resolved::DomainExpression::Application(
+                    ast_resolved::FunctionApplication::Ground(value.clone()),
+                ));
             }
-            ast_unresolved::DomainExpression::Lvar {
-                name, qualifier, ..
-            } => {
-                let bound = left_columns.iter().find(|col| match qualifier {
-                    Some(q) => qualified_header_matches(col, name, q),
-                    None => {
-                        col.declared_bare()
-                            && delightql_types::SqlIdentifier::str_eq(col.name(), name)
-                    }
-                });
-                let Some(col) = bound else {
-                    unreachable!(
-                        "membership header '{}' passed unification but binds no left column",
-                        name
-                    );
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn {
+                    name, qualifier, ..
+                },
+            ))) => {
+                let matches: Vec<_> = left_columns
+                    .iter()
+                    .copied()
+                    .filter(|column| match qualifier {
+                        Some(qualifier) => {
+                            qualified_header_matches(registry, *column, name.as_str(), qualifier)
+                        }
+                        None => bare_header_matches(registry, *column, name.as_str()),
+                    })
+                    .collect();
+                let [column] = matches.as_slice() else {
+                    unreachable!("a unified membership header must have one structural binding")
                 };
-                probes.push(ast_resolved::DomainExpression::Lvar {
-                    name: col.name().into(),
-                    qualifier: match col.qualifier() {
-                        ast_resolved::TableName::Named(t) => Some(t.clone()),
-                        ast_resolved::TableName::Fresh => None,
-                    },
-                    namespace_path: NamespacePath::empty(),
-                    alias: None,
-                    provenance: ast_resolved::PhaseBox::phantom(),
-                });
+                probes.push(ast_resolved::DomainExpression::Reference(Reference::Named(
+                    NamedReference(ColumnOccurrence {
+                        column: *column,
+                        explicit_qualifier: false,
+                    }),
+                )));
             }
-            _ => unreachable!("non-probe header survived membership shape check"),
+            _ => unreachable!("membership shape admitted a non-probe header"),
         }
     }
 
-    // Candidate tuples from the resolved rows.
-    let rows = match resolved_right {
-        ast_resolved::RelationalExpression::Relation(ast_resolved::Relation::Anonymous {
-            rows,
-            ..
-        }) => rows,
+    let rows = match (
+        &resolved_right.head,
+        resolved_right.continuations.is_empty(),
+    ) {
+        (ast_resolved::Grelex::Literal(anon), true) => &anon.table.body.rows,
         _ => return Ok(None),
     };
-    for (i, row) in rows.iter().enumerate() {
-        if row.values.len() != probes.len() {
+    for (position, row) in rows.iter().enumerate() {
+        if row.len() != probes.len() {
             return Err(crate::error::DelightQLError::validation_error_categorized(
                 "resolution/anon/membership_arity",
                 format!(
                     "membership row {} has {} value(s) for {} header(s)",
-                    i + 1,
-                    row.values.len(),
+                    position + 1,
+                    row.len(),
                     probes.len()
                 ),
-                "every candidate row must match the probe's width",
+                "every candidate row must match the probe width",
             ));
         }
     }
-
-    let value = if probes.len() == 1 {
-        probes.pop().expect("one probe")
+    // The probe SAYS its width and each candidate keeps its own row, so the
+    // arity checked above is the arity the lowering reads.
+    let probe = if probes.len() == 1 {
+        Probe::Value(Box::new(probes.pop().expect("one probe")))
     } else {
-        ast_resolved::DomainExpression::Tuple {
-            elements: probes,
-            alias: None,
-        }
+        Probe::Row(
+            Vec2::try_from_vec(probes).expect("a multi-header probe has at least two values"),
+        )
     };
-    let set: Vec<ast_resolved::DomainExpression> = rows
-        .iter()
-        .map(|row| {
-            if row.values.len() == 1 {
-                row.values[0].clone()
-            } else {
-                ast_resolved::DomainExpression::Tuple {
-                    elements: row.values.clone(),
-                    alias: None,
-                }
-            }
-        })
-        .collect();
-
-    Ok(Some(ast_resolved::BooleanExpression::In {
-        value: Box::new(value),
-        set,
-        negated,
-    }))
+    // A membership tests at least one candidate. The grammar's `;`-separated
+    // grid supplies one, so this refusal names a state no author can write
+    // rather than assigning "membership in nothing" a truth value.
+    let rows = rows.clone().try_map(
+        |row| -> Result<ValueRow<crate::pipeline::asts::core::Resolved>> {
+            Ok(ValueRow((*row.0).map(ast_resolved::Datum::into_value)))
+        },
+    )?;
+    Ok(Some(ast_resolved::TruthExpression::Membership(
+        Membership {
+            probe,
+            rows,
+            negated: false,
+            source: crate::pipeline::asts::core::MembershipSource::In,
+        },
+    )))
 }
 
-/// Extract unification from function expressions like upper:(description)
 fn extract_function_unification(
-    func: &ast_unresolved::FunctionExpression,
-    left_columns: &[ast_resolved::ColumnMetadata],
-    right_columns: &[ast_resolved::ColumnMetadata],
-    column_index: usize,
-) -> Result<Option<ast_resolved::BooleanExpression>> {
-    // Handle both Regular and Curried functions
-    let (name, arguments) = match func {
-        ast_unresolved::FunctionExpression::Regular {
-            name, arguments, ..
-        } => (name, arguments),
-        ast_unresolved::FunctionExpression::Curried {
-            name, arguments, ..
-        } => (name, arguments),
+    function: &ast_unresolved::FunctionApplication,
+    left_columns: &[ColId],
+    right_columns: &[ColId],
+    position: usize,
+    registry: &Registry,
+) -> Result<Option<ast_resolved::TruthExpression>> {
+    // The unifying shape is a PLAIN application of one column. A guard or a
+    // window is scalar context this rewrite has no place to put, so an
+    // application carrying one is not this shape.
+    let (reference, arguments) = match function {
+        ast_unresolved::FunctionApplication::Standard(application)
+            if application.guard.is_none() && application.window.is_none() =>
+        {
+            (&application.call().callee, &application.call().arguments)
+        }
         _ => return Ok(None),
     };
-
-    // For functions like upper:(description) or upper(description)
-    // Check if the argument references a left-side column
-    if arguments.len() == 1 {
-        if let ast_unresolved::DomainExpression::Lvar {
-            name: col_name,
-            qualifier,
-            ..
-        } = &arguments[0]
-        {
-            // Check if this column exists on the left side
-            if let Some(_left_col) = left_columns
-                .iter()
-                .find(|col| delightql_types::SqlIdentifier::str_eq(col.name(), col_name))
-            {
-                // Get the actual column name from the right-side resolved schema
-                // The column at this index in the right table has already been resolved
-                let right_col_name = if column_index < right_columns.len() {
-                    right_columns[column_index].name().to_string()
-                } else {
-                    // Fallback if index out of bounds
-                    format!("column{}", column_index + 1)
-                };
-
-                // Create ON condition: function(left.column) = right.column
-                // Left side: function applied to left column
-                let left_func = ast_resolved::FunctionExpression::Regular {
-                    name: name.clone(),
-                    namespace: None,
-                    arguments: vec![ast_resolved::DomainExpression::Lvar {
-                        name: col_name.clone(),
-                        qualifier: qualifier.clone(),
-                        namespace_path: NamespacePath::empty(),
-                        alias: None,
-                        provenance: ast_resolved::PhaseBox::phantom(),
-                    }],
-                    alias: None,
-                    conditioned_on: None,
-                };
-
-                // Right side: anonymous table column (use actual resolved name)
-                let right_col = ast_resolved::DomainExpression::Lvar {
-                    name: right_col_name.into(),
-                    qualifier: None,
-                    namespace_path: NamespacePath::empty(),
-                    alias: None,
-                    provenance: ast_resolved::PhaseBox::phantom(),
-                };
-
-                return Ok(Some(ast_resolved::BooleanExpression::Comparison {
-                    operator: "traditional_eq".to_string(),
-                    left: Box::new(ast_resolved::DomainExpression::Function(left_func)),
-                    right: Box::new(right_col),
-                }));
+    let [ast_unresolved::ScalarArgument::Value(ArgumentValue::Domain {
+        value:
+            ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                AuthoredColumn {
+                    name: column_name,
+                    qualifier,
+                    ..
+                },
+            ))),
+        ..
+    })] = arguments.scalar_members()
+    else {
+        return Ok(None);
+    };
+    let matches: Vec<_> = left_columns
+        .iter()
+        .copied()
+        .filter(|column| match qualifier {
+            Some(qualifier) => {
+                qualified_header_matches(registry, *column, column_name.as_str(), qualifier)
             }
-        }
-    }
-
-    Ok(None)
-}
-
-/// Combine multiple boolean conditions with AND
-fn combine_conditions(
-    conditions: Vec<ast_resolved::BooleanExpression>,
-) -> ast_resolved::BooleanExpression {
-    if conditions.len() == 1 {
-        return conditions.into_iter().next().unwrap();
-    }
-
-    conditions
-        .into_iter()
-        .reduce(|acc, cond| ast_resolved::BooleanExpression::And {
-            left: Box::new(acc),
-            right: Box::new(cond),
-        })
-        .unwrap()
-}
-
-/// Create USING condition for JOIN from a list of column names
-pub(super) fn create_using_condition(
-    using_columns: Vec<String>,
-) -> Result<ast_resolved::BooleanExpression> {
-    // Convert to UsingColumn format
-    let using_cols: Vec<ast_resolved::UsingColumn> = using_columns
-        .into_iter()
-        .map(|name| {
-            ast_resolved::UsingColumn::Regular(ast_resolved::QualifiedName {
-                namespace_path: NamespacePath::empty(),
-                name: name.into(),
-                grounding: None,
-            })
+            None => named(registry, *column, column_name.as_str()),
         })
         .collect();
+    let [left] = matches.as_slice() else {
+        return Ok(None);
+    };
+    let Some(right) = right_columns.get(position).copied() else {
+        return Ok(None);
+    };
+    let left_function = ast_resolved::FunctionApplication::Standard(
+        crate::pipeline::asts::core::StandardApplication::plain(
+            crate::pipeline::asts::core::PureCall::from_inner(ast_resolved::FunctorCall {
+                callee: reference.written_call_identity(registry),
+                arguments: ast_resolved::CallArguments::Scalar(vec![
+                    ast_resolved::ScalarArgument::plain(
+                        ast_resolved::DomainExpression::Reference(Reference::Named(
+                            NamedReference(ColumnOccurrence {
+                                column: *left,
+                                explicit_qualifier: false,
+                            }),
+                        )),
+                    ),
+                ]),
+                marks: Default::default(),
+            }),
+        ),
+    );
+    Ok(Some(ast_resolved::TruthExpression::Comparison(
+        Comparison {
+            operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+            left: Box::new(ast_resolved::DomainExpression::Application(left_function)),
+            right: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
+                NamedReference(ColumnOccurrence {
+                    column: right,
+                    explicit_qualifier: false,
+                }),
+            ))),
+        },
+    )))
+}
 
-    Ok(ast_resolved::BooleanExpression::Using {
-        columns: using_cols,
-    })
+fn combine_conditions(
+    conditions: Vec<ast_resolved::TruthExpression>,
+) -> ast_resolved::TruthExpression {
+    ast_resolved::TruthExpression::all(conditions)
+        .expect("caller only combines a non-empty condition list")
+}
+
+pub(super) fn create_using_condition(
+    columns: &[SqlIdentifier],
+    registry: &Registry,
+) -> Result<ast_resolved::MemberCorrelation> {
+    Ok(correspond(columns, registry))
+}
+
+/// The join `.*` asks for: USING over every name both sides publish.
+///
+/// It answers with the same construct the spelled-out `.(a, b)` answers
+/// with, because they are one operator with two spellings. A conjunction of
+/// equalities would join the same rows and publish a DIFFERENT heading —
+/// USING merges the column it joined on, an ON does not — so the two
+/// spellings would disagree about what the join publishes.
+pub(super) fn create_using_all_condition(
+    left_columns: &[ColId],
+    right_columns: &[ColId],
+    registry: &Registry,
+) -> Result<ast_resolved::MemberCorrelation> {
+    let columns = shared_using_names(left_columns, right_columns, registry)?
+        .into_iter()
+        .map(|pair| pair.name)
+        .collect();
+    Ok(ast_resolved::MemberCorrelation::Correspond(
+        ast_resolved::Correspondence::new(columns),
+    ))
+}
+
+/// One name both sides publish, and the occurrence of it on each.
+pub(in crate::pipeline::resolver) struct SharedName {
+    pub name: crate::names::Sym,
+    pub left: ColId,
+    pub right: ColId,
+}
+
+/// THE NAMES `.*` ASKS FOR — the one computation, for every placement.
+///
+/// `.*` renames every name it can, so what it asks for is exactly the set
+/// both headings publish. The set is the same question at a join and inside
+/// a correlated interior, and answering it twice is how the two placements
+/// come to disagree about the same operator.
+///
+/// EMPTY IS NOT AN ANSWER. `.*` asks for every shared name; when there is
+/// none, the step it wrote cannot be performed. Returning zero of them would
+/// be read as a completed step — a cross join at one placement and an
+/// uncorrelated relation at the other, both silent, both wrong.
+pub(in crate::pipeline::resolver) fn shared_using_names(
+    left_columns: &[ColId],
+    right_columns: &[ColId],
+    registry: &Registry,
+) -> Result<Vec<SharedName>> {
+    let mut seen = Vec::new();
+    let mut shared: Vec<SharedName> = Vec::new();
+    for right in right_columns.iter().copied() {
+        let Some(name) = registry.published_sym(right) else {
+            continue;
+        };
+        if seen.contains(&name) {
+            return Err(crate::error::DelightQLError::validation_error_categorized(
+                "using/all/ambiguous-right",
+                "USING all found more than one right-side column with the same name",
+                "rename or project the right relation to a unique heading",
+            ));
+        }
+        seen.push(name);
+        let matches: Vec<_> = left_columns
+            .iter()
+            .copied()
+            .filter(|left| registry.published_sym(*left) == Some(name))
+            .collect();
+        let left = match matches.as_slice() {
+            [] => continue,
+            [left] => *left,
+            _ => {
+                return Err(crate::error::DelightQLError::validation_error_categorized(
+                    "using/all/ambiguous-left",
+                    "USING all found more than one left-side column with the same name",
+                    "rename or project the left relation to a unique heading",
+                ))
+            }
+        };
+        shared.push(SharedName { name, left, right });
+    }
+    if shared.is_empty() {
+        return Err(crate::error::DelightQLError::validation_error_categorized(
+            "using/all/no-shared-columns",
+            "No shared columns between left side and right side for .* (USING all)",
+            ".* requires at least one column name in common",
+        ));
+    }
+    Ok(shared)
 }

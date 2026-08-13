@@ -9,24 +9,21 @@
 //! checks in `transform_sigma` (resolver_fold.rs): `database.lookup_table`
 //! sees only the user connection's default schema, and
 //! `consult.lookup_enlisted_table` sees only DDL fact entities. The
-//! surviving SigmaCall became a `PredicateRewrite` and SQL generation died
+//! surviving sigma call became a `PredicateRewrite` and SQL generation died
 //! with "Unknown predicate rewrite: 'customers'". This hit BOTH the plain
 //! pipeline and effect-rule bodies compiled under
 //! `resolution_namespace = Some(<consulted ns>)` (the filing's plain-works
 //! claim held only for main-connection tables).
 //!
 //! Red-first: every affected-shape test in this file was observed failing
-//! against the pre-fix compiler ("Unknown predicate rewrite: 'customers'" /
+//! without the enlisted-guard probe ("Unknown predicate rewrite: 'customers'" /
 //! "'helper'"); the control was green before and after.
 
 use super::{resolve_query_inline, ResolutionConfig};
 use crate::bin_cartridge::prelude::consult::execute_consult;
 use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry};
 use crate::pipeline::effect_transformer::compile_namespace_main;
-use crate::pipeline::{
-    addresser, ast_unresolved, builder_v2, danger_gates, generator_v3, parser, refiner,
-    transformer_v4,
-};
+use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
 use crate::resolution::EntityRegistry;
 use crate::system::DelightQLSystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
@@ -83,10 +80,10 @@ fn enlisted_world() -> DelightQLSystem {
     let dir = MOUNT_DIR.get_or_init(|| {
         let dir = tempfile::tempdir().expect("mount tempdir");
         // mount_database is now attach-only and rejects 0-byte files
-        // (bugs/nullmount Phase 1); materialize a valid empty SQLite db
+        // (mount! is attach-only); materialize a valid empty SQLite db
         // (header forced out by PRAGMA user_version) rather than touch b"".
-        let conn = rusqlite::Connection::open(dir.path().join("maindb.sqlite"))
-            .expect("create mount db");
+        let conn =
+            rusqlite::Connection::open(dir.path().join("maindb.sqlite")).expect("create mount db");
         conn.execute_batch("PRAGMA user_version = 0;")
             .expect("materialize mount db header");
         dir
@@ -100,7 +97,6 @@ fn enlisted_world() -> DelightQLSystem {
     system
 }
 
-
 // ------------------------------------------------------------------
 // Plain-pipeline compile chain (the resolve_query_inline door + the
 // ordinary refine/address/transform/generate chain, as in
@@ -108,25 +104,30 @@ fn enlisted_world() -> DelightQLSystem {
 // ------------------------------------------------------------------
 
 fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result<String> {
-    let tree = parser::parse(source).expect("source should parse");
-    let (query, _features, _asserts, _dangers, _options, _ddl) =
-        builder_v2::parse_query(&tree, source).expect("source should build");
-    let query: ast_unresolved::Query = query;
+    let tree = crate::pipeline::parse::query_sequence(source).expect("source should parse");
+    let mut normalized =
+        crate::pipeline::parse::normalize_sequence(&tree).expect("source should normalize");
+    assert_eq!(normalized.queries.len(), 1, "one statement expected");
+    let query: ast_unresolved::Query = normalized.queries.remove(0).query;
     let schema = system.get_schema()?;
-    let mut registry = EntityRegistry::new_with_system(schema, system);
+    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
+    let mut registry =
+        EntityRegistry::new_with_system(schema, system, std::rc::Rc::clone(&identities));
     let config = ResolutionConfig::default();
     let (resolved, _bubbled) = resolve_query_inline(query, &mut registry, None, &config, None)?;
     let gates = danger_gates::DangerGateMap::with_defaults();
-    let refined = refiner::refine_query_with_gates(resolved, gates.clone())?;
-    let addressed = addresser::address_query(refined)?;
-    let ctx = transformer_v4::TransformCtx {
-        cfes: vec![],
-        names: transformer_v4::builder::NameGenerator::new(),
+    let refined =
+        refiner::refine_query_with_gates(resolved, gates.clone(), std::rc::Rc::clone(&identities))?;
+    let ctx = transformer::TransformCtx {
+        identities: std::rc::Rc::clone(&identities),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&identities)),
         outer_columns: vec![],
         danger_gates: gates,
     };
-    let sql_ast = transformer_v4::transform(addressed, &ctx)?;
-    generator_v3::SqlGenerator::new()
+    let sql_ast = transformer::transform(refined, &ctx)?.without_obligations()?;
+    let names = generator::baptise_statements(&identities, &[&sql_ast])
+        .map_err(|e| e.into_delightql_error("enlisted-guard SQL naming failed"))?;
+    generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
         .map_err(|e| {
             crate::error::DelightQLError::validation_error(
@@ -176,7 +177,8 @@ fn assert_correlated_exists(sql: &str, negated: bool) {
     // The semijoin fix's shape: the outer argument is stamped with its
     // outer qualifier, never the degenerate _fact self-comparison.
     assert!(
-        f.contains("orders.customer_id IS NOT DISTINCT FROM _fact."),
+        (f.contains("orders.customer_id IS NOT DISTINCT FROM _fact.")
+            || f.contains("orders_2.customer_id IS NOT DISTINCT FROM _fact.")),
         "guard should correlate the OUTER orders.customer_id into the subquery: {sql}"
     );
     assert!(
@@ -191,7 +193,7 @@ fn assert_correlated_exists(sql: &str, negated: bool) {
 
 /// The torture--99 blocker verbatim: `+customers(customer_id)` inside an
 /// effect-rule body, `customers` reachable only through the enlisted mount.
-/// Pre-fix: "effect plan SQL generation error: Unknown predicate rewrite:
+/// Without the probe: "effect plan SQL generation error: Unknown predicate rewrite:
 /// 'customers'". Post-fix: compiles, guard is a correlated EXISTS.
 #[test]
 fn effect_body_bare_enlisted_guard_compiles_to_correlated_exists() {
@@ -224,7 +226,7 @@ fn effect_body_bare_enlisted_antijoin_guard_compiles() {
     assert_correlated_exists(&plan_sql(&plan), true);
 }
 
-/// CONTROL (green pre-fix): a bare enlisted table in RELATION position
+/// CONTROL: a bare enlisted table in RELATION position
 /// inside an effect body resolves through the namespace-aware relation
 /// path. Pins that the fix's neighborhood keeps working.
 #[test]
@@ -232,7 +234,7 @@ fn effect_body_bare_enlisted_relation_read_still_resolves() {
     let mut system = enlisted_world();
     let plan = plan_for(
         "main!(*) :-\n\
-         \x20   customers(*) |> temp_table!(snap) : s!\n\
+         \x20   customers(*) |> temp_table!(snap(*))(*) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
         &mut system,
     )
@@ -264,7 +266,8 @@ fn effect_body_guard_on_same_file_pure_rule_compiles() {
         "the rule-guard renders as EXISTS: {f}"
     );
     assert!(
-        f.contains("orders.customer_id IS NOT DISTINCT FROM _fact."),
+        (f.contains("orders.customer_id IS NOT DISTINCT FROM _fact.")
+            || f.contains("orders_2.customer_id IS NOT DISTINCT FROM _fact.")),
         "the rule-guard correlates the outer argument: {f}"
     );
 }
@@ -276,7 +279,7 @@ fn effect_body_guard_on_same_file_pure_rule_compiles() {
 // ============================================================================
 
 /// Plain pipeline, no resolution namespace: same guard, same world.
-/// Pre-fix: "SQL generation error: Unknown predicate rewrite: 'customers'".
+/// Without the probe: "SQL generation error: Unknown predicate rewrite: 'customers'".
 #[test]
 fn plain_query_bare_enlisted_guard_compiles_to_correlated_exists() {
     let system = enlisted_world();
@@ -298,11 +301,11 @@ fn plain_query_bare_enlisted_antijoin_guard_compiles() {
 }
 
 /// Consulted VIEW bodies resolve under Some(<view ns>) — "the same
-/// mechanism qualified view bodies use" (REPORT-3.1 decision 14). A view
-/// whose body carries the bare enlisted guard must expand at its call site.
-/// The bug therefore predates effects; this pins the view-body shape.
-/// STRICT definition independence (Phase 7 stage 2, owner-ratified,
-/// refined): another file's DEFINITION never leaks into what this file
+/// mechanism qualified view bodies use". A view whose body carries the bare
+/// enlisted guard must expand at its call site; this pins the view-body
+/// shape.
+/// STRICT definition independence: another file's DEFINITION never leaks
+/// into what this file
 /// means — even when the CALLER's session has it enlisted. (Physical
 /// DATA tables are the ruled exception: the database is ambient — the
 /// five tests above pin that a session-enlisted data table resolves.)
@@ -317,8 +320,7 @@ fn definition_from_another_file_never_leaks_via_session() {
     let libpath = dir.path().join("libx.dql");
     std::fs::write(&libpath, "helper_rule(*) :- maindb.orders(*), amount > 0\n")
         .expect("write lib file");
-    execute_consult(&mut system, libpath.to_str().unwrap(), "libx", None)
-        .expect("lib consults");
+    execute_consult(&mut system, libpath.to_str().unwrap(), "libx", None).expect("lib consults");
     system
         .enlist_namespace("libx")
         .expect("session enlists libx into home");
@@ -345,8 +347,7 @@ fn consulted_view_body_with_bare_enlisted_guard_expands() {
         "valid(*) :- maindb.orders(*), +customers(customer_id), amount > 0\n",
     )
     .expect("write consult file");
-    execute_consult(&mut system, path.to_str().unwrap(), "vx", None)
-        .expect("view file consults");
+    execute_consult(&mut system, path.to_str().unwrap(), "vx", None).expect("view file consults");
     system.enlist_namespace("vx").expect("enlist vx into main");
 
     let sql = compile_plain("valid(*)", &system)

@@ -21,7 +21,7 @@ pub struct ConnectionComponents {
     /// Database type string (for bootstrap metadata)
     pub db_type: String,
     /// How DelightQL reaches the resource: "in-process" | "fatboy" | "siso"
-    /// (URI-DESIGN.md §4 — resource and mechanism are orthogonal facts).
+    /// (resource and mechanism are orthogonal facts).
     pub mechanism: String,
     /// What the resource asserts about itself, obtained at connect —
     /// method-prefixed so comparisons never cross tiers:
@@ -29,8 +29,7 @@ pub struct ConnectionComponents {
     /// the resource asserts nothing reachable (`:memory:`, siso pipes).
     pub identity: Option<String>,
     /// The engine SCHEMA this mount binds — the per-mount recorded fact
-    /// behind durable placement and cross-schema queries
-    /// (EFFECTS-ON-TARGETS-PLAN §4.1, schema-mount Phase A). `None` means
+    /// behind durable placement and cross-schema queries. `None` means
     /// "the engine's own default" (postgres `public`, duckdb `main`),
     /// resolved DOWNSTREAM at the lookup — never spelled at record time, so
     /// a bare `mount!` keeps its unqualified reads (behavior-identical to
@@ -43,7 +42,7 @@ pub struct ConnectionComponents {
 
 /// Factory that creates database connections from URIs.
 ///
-/// The CLI implements this — it knows about file paths, pipe:// URIs,
+/// The CLI implements this — it knows about file paths, delightql-siso:// URIs,
 /// DuckDB files, etc. Core defines the trait but never implements it.
 pub trait ConnectionFactory: Send + Sync {
     fn create(
@@ -51,8 +50,7 @@ pub trait ConnectionFactory: Send + Sync {
         uri: &str,
     ) -> std::result::Result<ConnectionComponents, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Enumerate the target's PERSISTENT schemas (EFFECTS-ON-TARGETS-PLAN
-    /// §4.3 / R-S2) and produce one `ConnectionComponents` per schema, ALL
+    /// Enumerate the target's PERSISTENT schemas (R-S2) and produce one `ConnectionComponents` per schema, ALL
     /// backed by ONE underlying connection (one child / one relay) so that
     /// `mount_tree!`'s sub-namespaces share a connection_id (R-S1: a
     /// cross-schema `run!` is one bracket). Each pair is

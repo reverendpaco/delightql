@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! `stdout!` console-sink integration (Epic 3.3 hook threading).
+//! `stdout!` console-sink integration.
 //!
 //! Why an integration test and not a ball: ball tests structurally CANNOT
 //! observe stdout! content — the server's stdout is discarded and the runner
-//! is a pure socket client (REPORT-3.2's investigation). Here we drive the
+//! is a pure socket client. Here we drive the
 //! real `dql` binary: the console sink installed by the CLI
 //! (`session_with_hooks` → `RelayHooks::on_ship`) prints each mid-run
 //! shipped set on the CLI process's own stdout, which the test captures.
@@ -66,7 +66,7 @@ fn fixture(dir: &Path) {
     .unwrap();
     write(
         &dir.join("ddl/script.dql"),
-        "main!(*) :- customers(*), region = \"EU\" |> stdout!(*) |> temp_table!(snap)\n",
+        "main!(*) :- customers(*), region = \"EU\" |> stdout!(*) |> temp_table!(snap(*))(*)\n",
     );
 }
 
@@ -82,7 +82,7 @@ fn stdout_ship_prints_on_the_cli_console() {
         tmp.path(),
         "w.sqlite",
         "results",
-        "consult!(\"ddl/script.dql\", \"fx\")\n\nrun_namespace!(fx)(*)\n",
+        "consult!(\"ddl/script.dql\", \"fx\")(*)\n\nrun_namespace!(fx)(*)\n",
     );
     assert!(ok, "run failed: {}", stderr);
 
@@ -124,7 +124,7 @@ fn stdout_ship_does_not_leak_into_hash_output() {
         tmp.path(),
         "w.sqlite",
         "hash",
-        "consult!(\"ddl/script.dql\", \"fx\")\n\nrun_namespace!(fx)(*)\n",
+        "consult!(\"ddl/script.dql\", \"fx\")(*)\n\nrun_namespace!(fx)(*)\n",
     );
     assert!(ok, "run failed: {}", stderr);
     let trimmed = stdout.trim();
@@ -146,10 +146,8 @@ fn stdout_ship_does_not_leak_into_hash_output() {
 fn run_twice_on_one_session_gets_fresh_scratch() {
     let tmp = tempfile::tempdir().unwrap();
     let conn = rusqlite::Connection::open(tmp.path().join("w.sqlite")).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT);",
-    )
-    .unwrap();
+    conn.execute_batch("CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT);")
+        .unwrap();
     drop(conn);
     write(
         &tmp.path().join("ddl/mark.dql"),
@@ -160,7 +158,7 @@ fn run_twice_on_one_session_gets_fresh_scratch() {
         tmp.path(),
         "w.sqlite",
         "results",
-        "consult!(\"ddl/mark.dql\", \"fx\")\n\n\
+        "consult!(\"ddl/mark.dql\", \"fx\")(*)\n\n\
          run_namespace!(fx)(*)\n\n\
          run_namespace!(fx)(*)\n\n\
          audit_log(*) ~> count:(*) as n\n",

@@ -15,6 +15,7 @@ pub use introspection::SqliteIntrospector;
 
 // Re-export the schema from the parent module (it was already here as the original mod.rs)
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
+use delightql_types::{DelightQLError, Result};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -34,8 +35,13 @@ impl DynamicSqliteSchema {
 }
 
 impl DatabaseSchema for DynamicSqliteSchema {
-    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Option<Vec<ColumnInfo>> {
-        let conn = self.connection.lock().ok()?;
+    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Result<Option<Vec<ColumnInfo>>> {
+        let conn = self.connection.lock().map_err(|error| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire SQLite schema connection",
+                error.to_string(),
+            )
+        })?;
 
         // For SQLite, schema refers to attached databases (main, temp, or attached name)
         // Use table_xinfo instead of table_info to include generated columns
@@ -45,7 +51,9 @@ impl DatabaseSchema for DynamicSqliteSchema {
             format!("PRAGMA table_xinfo('{}')", table_name)
         };
 
-        let mut stmt = conn.prepare(&query).ok()?;
+        let mut stmt = conn.prepare(&query).map_err(|error| {
+            DelightQLError::database_error("Failed to prepare SQLite schema query", error.to_string())
+        })?;
         let columns = stmt
             .query_map([], |row| {
                 let name: String = row.get(1)?;  // Column name is at index 1
@@ -60,22 +68,28 @@ impl DatabaseSchema for DynamicSqliteSchema {
                     declared_type: (!decltype.is_empty()).then_some(decltype),
                 })
             })
-            .ok()?
+            .map_err(|error| {
+                DelightQLError::database_error("Failed to query SQLite schema", error.to_string())
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .ok()?;
+            .map_err(|error| {
+                DelightQLError::database_error("Failed to read SQLite schema", error.to_string())
+            })?;
 
         if columns.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(columns)
+            Ok(Some(columns))
         }
     }
 
-    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> bool {
-        let conn = match self.connection.lock() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
+    fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool> {
+        let conn = self.connection.lock().map_err(|error| {
+            DelightQLError::connection_poison_error(
+                "Failed to acquire SQLite schema connection",
+                error.to_string(),
+            )
+        })?;
 
         // For SQLite, check if we can get table_xinfo successfully
         let query = if let Some(schema_name) = schema {
@@ -84,16 +98,19 @@ impl DatabaseSchema for DynamicSqliteSchema {
             format!("PRAGMA table_xinfo('{}')", table_name)
         };
 
-        let result = match conn.prepare(&query) {
-            Ok(mut stmt) => {
-                // If we can query and get at least one row, table exists
-                match stmt.query_map([], |_| Ok(())) {
-                    Ok(mut rows) => rows.next().is_some(),
-                    Err(_) => false,
-                }
-            }
-            Err(_) => false,
-        };
-        result
+        let mut stmt = conn.prepare(&query).map_err(|error| {
+            DelightQLError::database_error("Failed to prepare SQLite schema query", error.to_string())
+        })?;
+        let mut rows = stmt.query_map([], |_| Ok(())).map_err(|error| {
+            DelightQLError::database_error("Failed to query SQLite schema", error.to_string())
+        })?;
+        match rows.next() {
+            None => Ok(false),
+            Some(Ok(())) => Ok(true),
+            Some(Err(error)) => Err(DelightQLError::database_error(
+                "Failed to read SQLite schema",
+                error.to_string(),
+            )),
+        }
     }
 }

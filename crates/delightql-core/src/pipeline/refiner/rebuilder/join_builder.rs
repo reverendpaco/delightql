@@ -2,9 +2,9 @@
 // Copyright 2026 Daniel Eklund
 use super::schema_computation::compute_join_schema;
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::asts::refined::{self, JoinType, QualifiedName};
+use crate::pipeline::asts::core::Comparison;
+use crate::pipeline::asts::refined::{self, JoinType};
 use crate::pipeline::asts::resolved;
-use crate::pipeline::asts::unresolved::NamespacePath;
 use crate::pipeline::refiner::analyzer::AnalyzedSegment;
 use crate::pipeline::refiner::flattener;
 use crate::pipeline::refiner::rebuilder::{
@@ -12,13 +12,16 @@ use crate::pipeline::refiner::rebuilder::{
 };
 use crate::pipeline::refiner::types::*;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Rebuild a segment containing only joins
 pub(super) fn rebuild_join_segment(
     analyzed: AnalyzedSegment,
     mut op_predicates: HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
     is_top_level: bool,
-) -> Result<refined::RelationalExpression> {
+    danger_gates: &crate::pipeline::danger_gates::DangerGateMap,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<refined::Chain> {
     // Start with the first table
     if analyzed.tables.is_empty() {
         return Err(DelightQLError::parse_error("No tables in segment"));
@@ -38,65 +41,60 @@ pub(super) fn rebuild_join_segment(
         log::debug!("Skipping validation (inner context)");
     }
 
-    let mut result = table_to_refined(&analyzed.tables[0], &mut op_predicates)?;
+    let mut result = table_to_refined(
+        &analyzed.tables[0],
+        &mut op_predicates,
+        danger_gates,
+        identities,
+    )?;
     let mut table_idx = 1;
 
     // Process operators left to right (CPR-ltr semantics)
     for (op_idx, op) in analyzed.operators.iter().enumerate() {
-        match &op.kind {
-            flattener::FlatOperatorKind::Join { using_columns } => {
-                let (new_result, new_table_idx) = process_single_join(
-                    result,
-                    &analyzed,
-                    table_idx,
-                    op_idx,
-                    using_columns,
-                    &mut op_predicates,
-                )?;
-                result = new_result;
-                table_idx = new_table_idx;
-            }
-            _ => {
-                return Err(DelightQLError::parse_error(
-                    "Non-join operator in join segment",
-                ));
-            }
-        }
+        let flattener::FlatOperatorKind::Join { correspondence } = &op.kind;
+        // The one operator kind: `let` here is irrefutable by construction.
+        let (new_result, new_table_idx) = process_single_join(
+            result,
+            &analyzed,
+            table_idx,
+            op_idx,
+            correspondence,
+            &mut op_predicates,
+            danger_gates,
+            identities,
+        )?;
+        result = new_result;
+        table_idx = new_table_idx;
     }
 
     // Apply any top-level filters
-    result = apply_top_level_filters(result, &mut op_predicates)?;
+    result = apply_top_level_filters(result, &mut op_predicates, identities)?;
 
     Ok(result)
 }
 
 /// Process a single join operator
 pub(super) fn process_single_join(
-    result: refined::RelationalExpression,
+    result: refined::Chain,
     analyzed: &AnalyzedSegment,
     table_idx: usize,
     op_idx: usize,
-    using_columns: &Option<Vec<String>>,
+    correspondence: &Option<resolved::Correspondence>,
     op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
-) -> Result<(refined::RelationalExpression, usize)> {
+    danger_gates: &crate::pipeline::danger_gates::DangerGateMap,
+    identities: &Rc<crate::names::Registry>,
+) -> Result<(refined::Chain, usize)> {
     // Get the right table for this join
     if table_idx >= analyzed.tables.len() {
         return Err(DelightQLError::parse_error("Not enough tables for join"));
     }
 
-    // Witness anonymous tables (+_/\+_) never reach the refiner: the
-    // resolver routes membership shapes to a Filter and refuses the
-    // rest. An exists_mode anon table here is a pipeline invariant
-    // violation, not a case to lower.
-    let right_table_flat = &analyzed.tables[table_idx];
-    if let Some(ref anon_data) = right_table_flat.anonymous_data {
-        assert!(
-            !anon_data.exists_mode,
-            "witness anonymous table survived to the refiner: membership routing must consume it"
-        );
-    }
-
-    let right_table = table_to_refined(&analyzed.tables[table_idx], op_predicates)?;
+    let right_table = table_to_refined(
+        &analyzed.tables[table_idx],
+        op_predicates,
+        danger_gates,
+        identities,
+    )?;
     let new_table_idx = table_idx + 1;
 
     // Get FJC predicates for this join
@@ -104,8 +102,8 @@ pub(super) fn process_single_join(
     let join_predicates = op_predicates.remove(&op_ref).unwrap_or_default();
 
     // Build join condition
-    let (join_condition, leftover_conditions) =
-        build_join_condition(using_columns, join_predicates)?;
+    let (correlation, leftover_conditions) =
+        build_correlation(correspondence, join_predicates, identities)?;
 
     // Determine join type
     let join_type = determine_join_type(analyzed, table_idx);
@@ -122,25 +120,28 @@ predicates alongside the extra condition",
     }
 
     // Build the join with proper schema
-    let join_expr = create_join(result, right_table, join_condition, Some(join_type));
+    let join_expr = create_join(
+        result,
+        right_table,
+        correlation,
+        Some(join_type),
+        identities,
+    );
 
     // Inner join: the leftovers filter the joined rows — WHERE placement
     // is exactly equivalent to ON for an inner join.
     let join_expr = if leftover_conditions.is_empty() {
         join_expr
     } else {
-        let schema = match &join_expr {
-            refined::RelationalExpression::Join { cpr_schema, .. } => cpr_schema.get().clone(),
-            _ => unreachable!("create_join returns Join"),
+        let schema = match join_expr.continuations.last() {
+            Some(refined::Continuation::Member { cpr_schema, .. }) => *cpr_schema,
+            _ => unreachable!("create_join appends a member"),
         };
-        refined::RelationalExpression::Filter {
-            source: Box::new(join_expr),
-            condition: refined::SigmaCondition::Predicate(combine_predicates_with_and(
-                leftover_conditions,
-            )),
+        join_expr.then(refined::Continuation::Restrict {
+            condition: combine_predicates_with_and(leftover_conditions),
             origin: resolved::FilterOrigin::UserWritten,
-            cpr_schema: refined::PhaseBox::new(schema).into_refined(),
-        }
+            cpr_schema: schema,
+        })
     };
 
     Ok((join_expr, new_table_idx))
@@ -151,92 +152,74 @@ predicates alongside the extra condition",
 /// FJC predicates cannot ride the ON clause — they are RETURNED, never
 /// dropped: the caller places them as WHERE (inner join) or refuses
 /// (outer join, where placement changes match semantics).
-pub(super) fn build_join_condition(
-    using_columns: &Option<Vec<String>>,
+pub(super) fn build_correlation(
+    correspondence: &Option<resolved::Correspondence>,
     join_predicates: Vec<AnalyzedPredicate>,
-) -> Result<(Option<refined::BooleanExpression>, Vec<refined::BooleanExpression>)> {
-    let mut join_conditions = Vec::new();
-    let mut using_columns_collected = Vec::new();
+    identities: &Rc<crate::names::Registry>,
+) -> Result<(
+    Option<refined::MemberCorrelation>,
+    Vec<refined::TruthExpression>,
+)> {
+    let mut correlations = Vec::new();
 
-    log::debug!("build_join_condition: {} predicates", join_predicates.len());
-
-    if let Some(ref using_cols) = using_columns {
-        using_columns_collected.extend(using_cols.iter().cloned());
-    }
+    log::debug!("build_correlation: {} predicates", join_predicates.len());
 
     for p in join_predicates {
         log::debug!("Processing predicate: {:?}", p.expr);
-        match &p.expr {
-            resolved::BooleanExpression::Using { columns } => {
-                for col in columns {
-                    if let resolved::UsingColumn::Regular(qname) = col {
-                        let name_str = qname.name.to_string();
-                        if !using_columns_collected.contains(&name_str) {
-                            using_columns_collected.push(name_str);
-                        }
-                    }
-                }
-            }
-            _ if matches!(p.class, PredicateClass::FJC { .. }) => {
-                let refined = super::refine_predicate_boolean(p.expr)?;
-                join_conditions.push(downgrade_null_safe_eq(refined));
-            }
-            // Other predicates (FIC, etc.): not join conditions, skip here
-            // They'll be placed as WHERE filters by the predicate placement logic
-            _ => {}
+        if matches!(p.class, PredicateClass::FJC { .. }) {
+            let refined = super::refine_predicate_boolean(p.expr, identities)?;
+            correlations.push(downgrade_null_safe_eq(refined));
         }
+        // Other predicates (FIC, etc.): not join conditions, skip here.
+        // They'll be placed as WHERE filters by the predicate placement logic.
     }
 
-    let using_condition = if !using_columns_collected.is_empty() {
-        log::debug!(
-            "Creating combined USING with columns: {:?}",
-            using_columns_collected
-        );
-        Some(create_using_condition(&using_columns_collected))
-    } else {
-        None
-    };
-
-    Ok(if let Some(using) = using_condition {
-        (Some(using), join_conditions)
-    } else if !join_conditions.is_empty() {
-        (Some(combine_predicates_with_and(join_conditions)), Vec::new())
-    } else {
-        (None, Vec::new())
+    // The correspondence WINS the join slot. The FJC predicates it displaces
+    // are returned, never dropped: USING has no ON clause to carry them.
+    Ok(match correspondence {
+        Some(correspondence) if !correspondence.is_empty() => {
+            log::debug!("Join corresponds on: {:?}", correspondence.columns);
+            (
+                Some(refined::MemberCorrelation::Correspond(
+                    correspondence.clone(),
+                )),
+                correlations,
+            )
+        }
+        _ if !correlations.is_empty() => (
+            Some(refined::MemberCorrelation::Condition(
+                combine_predicates_with_and(correlations),
+            )),
+            Vec::new(),
+        ),
+        _ => (None, Vec::new()),
     })
 }
 
 pub(super) fn create_join(
-    left: refined::RelationalExpression,
-    right: refined::RelationalExpression,
-    join_condition: Option<refined::BooleanExpression>,
+    left: refined::Chain,
+    right: refined::Chain,
+    correlation: Option<refined::MemberCorrelation>,
     join_type: Option<JoinType>,
-) -> refined::RelationalExpression {
+    identities: &Rc<crate::names::Registry>,
+) -> refined::Chain {
     let jt = join_type.unwrap_or(JoinType::Inner);
-    refined::RelationalExpression::Join {
-        left: Box::new(left.clone()),
-        right: Box::new(right.clone()),
-        join_condition,
-        join_type: Some(jt.clone()), // Always set join_type - default to Inner if None
-        cpr_schema: compute_join_schema(&left, &right, jt),
-    }
+    let cpr_schema = compute_join_schema(&left, &right, jt.clone(), identities);
+    left.then(refined::Continuation::Member {
+        rhs: right,
+        correlation,
+        join_type: Some(jt),
+        cpr_schema,
+    })
 }
 
 pub(super) fn determine_join_type(analyzed: &AnalyzedSegment, table_idx: usize) -> JoinType {
     // Markedness, not comma position, determines join role: the unmarked
     // tables form the required core; each ?-marked table LEFT-joins onto
     // the tree; FULL OUTER happens only when EVERY join party is marked
-    // (left-fold in written order). EXISTS-mode anonymous tables lower as
-    // filters, not joins, so they carry no vote here.
-    let is_join_party =
-        |t: &flattener::FlatTable| t.anonymous_data.as_ref().is_none_or(|a| !a.exists_mode);
+    // (left-fold in written order).
 
-    if analyzed
-        .tables
-        .iter()
-        .filter(|t| is_join_party(t))
-        .all(|t| t.outer)
-    {
+    if analyzed.tables.iter().all(|t| t.outer) {
         return JoinType::FullOuter;
     }
     if analyzed.tables[table_idx].outer {
@@ -246,29 +229,10 @@ pub(super) fn determine_join_type(analyzed: &AnalyzedSegment, table_idx: usize) 
     // table anchors the tree and the accumulated optional cluster
     // preserves as a unit — RIGHT here; the transformer swaps operands
     // back to LEFT.
-    if (0..table_idx)
-        .filter(|&i| is_join_party(&analyzed.tables[i]))
-        .all(|i| analyzed.tables[i].outer)
-    {
+    if (0..table_idx).all(|i| analyzed.tables[i].outer) {
         JoinType::RightOuter
     } else {
         JoinType::Inner
-    }
-}
-
-pub(super) fn create_using_condition(using_cols: &[String]) -> refined::BooleanExpression {
-    let using_columns: Vec<refined::UsingColumn> = using_cols
-        .iter()
-        .map(|col_name| {
-            refined::UsingColumn::Regular(QualifiedName {
-                namespace_path: NamespacePath::empty(),
-                name: col_name.clone().into(),
-                grounding: None,
-            })
-        })
-        .collect();
-    refined::BooleanExpression::Using {
-        columns: using_columns,
     }
 }
 
@@ -300,15 +264,17 @@ fn validate_outer_join_markers(
 
     // Rule 1: Check for standalone table with outer marker
     if analyzed.tables.len() == 1 && analyzed.tables[0].outer {
-        let table_name = &analyzed.tables[0].identifier.name;
-        log::debug!("ERROR: Standalone table with outer marker: {}", table_name);
-        return Err(DelightQLError::parse_error(format!(
-            "Outer join marker on standalone table '{}'\n\n\
+        log::debug!(
+            "ERROR: Standalone relation with outer marker: {:?}",
+            analyzed.tables[0].identity
+        );
+        return Err(DelightQLError::parse_error(
+            "Outer join marker on standalone relation\n\n\
             The table has an outer join marker (?, <, or >) but there are no other tables\n\
             to join it to. Outer join markers require at least one join operation.\n\n\
-            Remove the marker:\n  {}(*)",
-            table_name, table_name
-        )));
+            Remove the marker from the relation."
+                .to_string(),
+        ));
     }
 
     // Rule 2: FULL OUTER — the all-marked case — requires a join
@@ -317,11 +283,7 @@ fn validate_outer_join_markers(
     // product. Only when EVERY relation is marked does the join become
     // FULL OUTER, whose two-part construction needs a condition to find
     // each side's unmatched rows.
-    let all_marked = analyzed
-        .tables
-        .iter()
-        .filter(|t| t.anonymous_data.as_ref().is_none_or(|a| !a.exists_mode))
-        .all(|t| t.outer);
+    let all_marked = analyzed.tables.iter().all(|t| t.outer);
     if !all_marked {
         return Ok(());
     }
@@ -335,32 +297,31 @@ fn validate_outer_join_markers(
         let right_table = &analyzed.tables[right_table_idx];
 
         let op_ref = OperatorRef::Join { position: join_idx };
-        let has_join_condition = op_predicates
+        let has_correlation = op_predicates
             .get(&op_ref)
             .map(|preds| !preds.is_empty())
             .unwrap_or(false)
             || matches!(
                 &analyzed.operators[join_idx].kind,
                 flattener::FlatOperatorKind::Join {
-                    using_columns: Some(_)
+                    correspondence: Some(_)
                 }
             );
 
-        if !has_join_condition {
+        if !has_correlation {
             return Err(DelightQLError::parse_error_categorized(
                 "general",
                 format!(
-                "FULL OUTER JOIN requires an explicit join condition\n\n\
+                    "FULL OUTER JOIN requires an explicit join condition\n\n\
                 Every relation in this chain is marked optional (?), which makes\n\
-                the join FULL OUTER — but the join between '{l}' and '{r}' has no\n\
+                the join FULL OUTER — but a pair of adjacent relations has no\n\
                 condition saying how the two sides align, so there is no way to\n\
                 tell which rows of each side are unmatched.\n\n\
-                Add a join condition:\n  {l}?(*), {r}?(*), {l}.id = {r}.{l}_id\n\n\
-                Or give the patterns a shared variable:\n  {l}?(id, x), {r}?(id, y)\n\n\
+                Add a join condition or give the patterns a shared variable.\n\n\
                 (One-sided ? marks do not need a condition: the marked relation\n\
-                LEFT-joins the rest.)",
-                    l = left_table.identifier.name,
-                    r = right_table.identifier.name,
+                LEFT-joins the rest.)\n\n\
+                Affected relation identities: {:?} and {:?}",
+                    left_table.identity, right_table.identity,
                 ),
             ));
         }
@@ -377,26 +338,26 @@ fn validate_outer_join_markers(
 /// INDF here — a null that is meant to match is a value wearing null's
 /// clothes; the spelling is a named key (coalesce into a marker), never a
 /// mode switch.
-fn downgrade_null_safe_eq(expr: refined::BooleanExpression) -> refined::BooleanExpression {
+fn downgrade_null_safe_eq(expr: refined::TruthExpression) -> refined::TruthExpression {
     match expr {
-        refined::BooleanExpression::Comparison {
+        refined::TruthExpression::Comparison(Comparison {
             operator,
             left,
             right,
-        } if operator == "null_safe_eq" => refined::BooleanExpression::Comparison {
-            operator: "traditional_eq".to_string(),
-            left,
-            right,
-        },
-        refined::BooleanExpression::And { left, right } => refined::BooleanExpression::And {
-            left: Box::new(downgrade_null_safe_eq(*left)),
-            right: Box::new(downgrade_null_safe_eq(*right)),
-        },
-        refined::BooleanExpression::Or { left, right } => refined::BooleanExpression::Or {
-            left: Box::new(downgrade_null_safe_eq(*left)),
-            right: Box::new(downgrade_null_safe_eq(*right)),
-        },
-        refined::BooleanExpression::Not { expr: inner } => refined::BooleanExpression::Not {
+        }) if operator == crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual => {
+            refined::TruthExpression::Comparison(Comparison {
+                operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                left,
+                right,
+            })
+        }
+        refined::TruthExpression::Conjunction(parts) => {
+            refined::TruthExpression::Conjunction(Box::new((*parts).map(downgrade_null_safe_eq)))
+        }
+        refined::TruthExpression::Disjunction(parts) => {
+            refined::TruthExpression::Disjunction(Box::new((*parts).map(downgrade_null_safe_eq)))
+        }
+        refined::TruthExpression::Not { expr: inner } => refined::TruthExpression::Not {
             expr: Box::new(downgrade_null_safe_eq(*inner)),
         },
         other => other,

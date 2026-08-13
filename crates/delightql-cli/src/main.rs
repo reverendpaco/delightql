@@ -18,16 +18,15 @@ thread_local! {
     static CLI_FLAGS: std::cell::RefCell<Option<CliFlags>> = const { std::cell::RefCell::new(None) };
 }
 
-/// --error-format json (R2.3): an AtomicBool, not a thread-local,
+/// --error-format json: an AtomicBool, not a thread-local,
 /// because the panic hook may fire on any thread (server workers).
-static ERROR_FORMAT_JSON: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ERROR_FORMAT_JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Emit one structured error record on stderr. Text mode: the classic
 /// `<prefix>[uri] message` / `<prefix>Error: message`. Json mode: with
 /// the default RS prefix this is exactly RFC 7464 (RS + JSON + LF, what
 /// `jq --seq` reads); `uri` is null for unbadged errors. Additive
-/// fields are legal later (VERSIONED plumbing, PORCELAIN-AND-PLUMBING.md).
+/// fields are legal later (the plumbing is VERSIONED).
 fn emit_error_record(prefix: &str, uri: Option<&str>, message: &str) {
     if ERROR_FORMAT_JSON.load(std::sync::atomic::Ordering::Relaxed) {
         use delightql_cli::output_format::json_escape;
@@ -67,9 +66,9 @@ fn main() {
 
     stacksafe::set_minimum_stack_size(512 * 1024);
 
-    // A panic must never reach the user as rc=101 + backtrace dump
-    // (CLI-SURFACE-RECOMMENDATIONS.md R4): the hook emits a structured
-    // internal/panic record on whatever thread panicked (so server
+    // A panic must never reach the user as rc=101 + backtrace dump:
+    // the hook emits a structured internal/panic record on whatever
+    // thread panicked (so server
     // workers are covered too), and RUST_BACKTRACE chains the default
     // hook for debugging. catch_unwind below converts the main-path
     // unwind to exit 1 — the record has already been printed.
@@ -139,7 +138,7 @@ fn run() -> Result<()> {
     // Parse command-line arguments
     let args = CliArgs::parse();
 
-    // --error-format json (R2.3): set the process-wide switch before
+    // --error-format json: set the process-wide switch before
     // anything can fail or panic.
     ERROR_FORMAT_JSON.store(
         args.error_format == args::ErrorFormat::Json,
@@ -154,7 +153,7 @@ fn run() -> Result<()> {
         panic!("deliberate test panic (DQL_TEST_PANIC)");
     }
 
-    // R6 (global-option hygiene): a global flag the chosen subcommand
+    // Global-option hygiene: a global flag the chosen subcommand
     // cannot consume is refused, not ignored — accepted-and-ignored
     // input is the silent-wrong of argument parsing (same family as
     // the old `--dialect oracle` warn-and-continue). Flags stay
@@ -173,6 +172,7 @@ fn run() -> Result<()> {
             Command::Target { .. } => ("target", false, false, false),
             Command::Man { .. } => ("man", false, false, false),
             Command::Book { .. } => ("book", true, false, false),
+            Command::Editor { .. } => ("editor", false, false, false),
             Command::Help { .. } => ("help", false, false, false),
             Command::Completions { .. } => ("completions", false, false, false),
             Command::Selftest { .. } => ("selftest", false, false, false),
@@ -272,7 +272,12 @@ fn run() -> Result<()> {
                 export_images.as_deref(),
                 args.database.as_deref(),
             ),
-            // R3.2: `dql help <cmd>` is the SAME projection as `dql man
+            Command::Editor { action } => match action {
+                delightql_cli::args::EditorCommand::ExportArtifacts { dir } => {
+                    delightql_cli::commands::editor::handle_export_artifacts(dir)
+                }
+            },
+            // `dql help <cmd>` is the SAME projection as `dql man
             // <cmd>` — one mechanism, not a clap essay and a man page
             // drifting apart. Bare `dql help` keeps the usage summary.
             Command::Help { name } => {
@@ -296,10 +301,7 @@ fn run() -> Result<()> {
                     delightql_cli::commands::target::handle_target_list()
                 }
                 delightql_cli::args::TargetCommand::Install { profile, from } => {
-                    delightql_cli::commands::target::handle_target_install(
-                        profile,
-                        from.as_deref(),
-                    )
+                    delightql_cli::commands::target::handle_target_install(profile, from.as_deref())
                 }
                 delightql_cli::args::TargetCommand::Verify => {
                     delightql_cli::commands::target::handle_target_verify()
@@ -383,9 +385,10 @@ fn run() -> Result<()> {
 
     // No subcommand: bare `dql` is sugar for `dql query` with no
     // arguments — one rule, one code path. On a terminal that means
-    // the REPL; with piped stdin it means read-and-execute (bare dql
-    // used to print the REPL banner, DISCARD piped input, and exit 0
-    // — the silent-wrong of entrances). Parsing the literal words
+    // the REPL; with piped stdin it means read-and-execute. The
+    // tempting regression: bare dql printing the REPL banner,
+    // DISCARDing piped input, and exiting 0 — the silent-wrong of
+    // entrances. Parsing the literal words
     // makes the equivalence true by construction rather than by a
     // hand-mirrored field list; the user's real global flags still
     // arrive via `args`.
@@ -550,7 +553,7 @@ mod tests {
                 .unwrap()
         };
 
-        // #1: --to <stage> -f raw prints the bare artifact; never panics.
+        // --to <stage> -f raw prints the bare artifact; never panics.
         for stage in ["sql", "cst", "ast-refined"] {
             let out = run(&["query", "--to", stage, "-f", "raw", "_(a @ 1)"]);
             assert!(
@@ -563,7 +566,7 @@ mod tests {
         let out = run(&["query", "--to", "sql", "-f", "raw", "_(a @ 1)"]);
         assert_eq!(String::from_utf8_lossy(&out.stdout), "SELECT 1 AS a\n");
 
-        // #2: --assert / --if-errors removed — loud clap refusal, never a
+        // --assert / --if-errors removed — loud clap refusal, never a
         // flag that promises a check and runs none.
         for flag in ["--assert", "--if-errors"] {
             let out = run(&["query", flag, "x", "_(a @ 1)"]);
@@ -574,12 +577,25 @@ mod tests {
             );
         }
 
-        // #4: --dialect refuses bogus values eagerly (clap usage error,
+        // --dialect refuses bogus values eagerly (clap usage error,
         // rc=2); the postgresql alias is accepted; a bogus DQL_DIALECT env
         // refuses at startup (rc=1) instead of warning-and-ignoring.
         let out = run(&["query", "--dialect", "oracle", "_(a @ 1)"]);
-        assert_eq!(out.status.code(), Some(2), "bogus --dialect must be a usage error");
-        let out = run(&["query", "--dialect", "postgresql", "--to", "sql", "-f", "raw", "_(a @ 1)"]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "bogus --dialect must be a usage error"
+        );
+        let out = run(&[
+            "query",
+            "--dialect",
+            "postgresql",
+            "--to",
+            "sql",
+            "-f",
+            "raw",
+            "_(a @ 1)",
+        ]);
         assert!(out.status.success(), "postgresql alias must be accepted");
         let out = std::process::Command::new(&cli_path)
             .env("DQL_DIALECT", "oracle")
@@ -589,13 +605,17 @@ mod tests {
         assert_eq!(out.status.code(), Some(1), "bogus DQL_DIALECT must refuse");
         assert!(String::from_utf8_lossy(&out.stderr).contains("unknown DQL_DIALECT"));
 
-        // #3A: "cannot determine" is loud and the CI gate cannot bless
+        // "cannot determine" is loud and the CI gate cannot bless
         // it (rc=2, distinct from rc=1 needs-formatting and rc=0
         // verified-formatted). Corpus coverage is total, so no fixture
-        // construct pass-throughs anymore; unparseable input exercises
+        // construct pass-throughs; unparseable input exercises
         // the same contract in both modes.
         let out = run(&["format", "users(("]);
-        assert_eq!(out.status.code(), Some(2), "parse error must exit 2 in plain mode");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "parse error must exit 2 in plain mode"
+        );
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("does not parse"),
             "pass-through must warn on stderr"
@@ -606,19 +626,27 @@ mod tests {
             "unparseable input passes through unchanged"
         );
         let out = run(&["format", "--fail-if-not-formatted", "users(("]);
-        assert_eq!(out.status.code(), Some(2), "gate must exit 2 on parse error");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "gate must exit 2 on parse error"
+        );
         let out = run(&["format", "--fail-if-not-formatted", "a(*),b(*),a.id=b.id"]);
         assert_eq!(out.status.code(), Some(1), "unformatted input exits 1");
-        let out = run(&["format", "--fail-if-not-formatted", "a(*), b(*), a.id = b.id"]);
+        let out = run(&[
+            "format",
+            "--fail-if-not-formatted",
+            "a(*), b(*), a.id = b.id",
+        ]);
         assert_eq!(out.status.code(), Some(0), "formatted input exits 0");
     }
 
-    /// CLI-SURFACE-RECOMMENDATIONS.md R4/R2.4/R2.6 — the small trio.
+    /// The panic-exit, `--file -`, and completions-generate trio.
     #[test]
     fn test_cli_surface_recommendations_trio() {
         let cli_path = get_cli_path();
 
-        // R4: a panic exits 1 with a structured internal/panic record —
+        // A panic exits 1 with a structured internal/panic record —
         // never rc=101 with a raw backtrace dump.
         let out = std::process::Command::new(&cli_path)
             .env("DQL_TEST_PANIC", "1")
@@ -637,7 +665,7 @@ mod tests {
             "raw panic output must not reach the user without RUST_BACKTRACE"
         );
 
-        // R2.4: --file - reads stdin.
+        // --file - reads stdin.
         use std::io::Write as _;
         let mut child = std::process::Command::new(&cli_path)
             .args(["query", "--file", "-"])
@@ -646,17 +674,12 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"_(a @ 42)")
-            .unwrap();
+        child.stdin.take().unwrap().write_all(b"_(a @ 42)").unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "--file - must read stdin");
         assert!(String::from_utf8_lossy(&out.stdout).contains("42"));
 
-        // R2.6: completions generate for every supported shell.
+        // completions generate for every supported shell.
         for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
             let out = std::process::Command::new(&cli_path)
                 .args(["completions", shell])
@@ -666,7 +689,7 @@ mod tests {
             assert!(!out.stdout.is_empty(), "completions {shell} empty");
         }
 
-        // #6 (help hygiene): dead flags removed — loud clap refusal, never
+        // Help hygiene: dead flags removed — loud clap refusal, never
         // a placebo. --quiet stays (REPL-only, documented).
         for flag in ["--strict", "--verbose", "--inline-ctes"] {
             let out = std::process::Command::new(&cli_path)
@@ -676,7 +699,7 @@ mod tests {
             assert!(!out.status.success(), "{flag} should be refused");
         }
 
-        // R2.5: NO_COLOR suppresses auto-detected color (trivially true
+        // NO_COLOR suppresses auto-detected color (trivially true
         // when piped, but pins that the variable is at least consulted
         // without erroring).
         let out = std::process::Command::new(&cli_path)
@@ -686,7 +709,7 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
 
-        // R2.3: --error-format json emits an RS-framed JSON record with
+        // --error-format json emits an RS-framed JSON record with
         // the identity URI as a field (RFC 7464 with the default prefix).
         let out = std::process::Command::new(&cli_path)
             .args(["query", "--error-format", "json", "nope(*)"])
@@ -703,7 +726,7 @@ mod tests {
             .starts_with("delightql-error://"));
         assert!(rec["message"].as_str().unwrap().contains("nope"));
 
-        // R6: a global flag the subcommand cannot consume refuses loudly;
+        // A global flag the subcommand cannot consume refuses loudly;
         // both argument orders keep working where it IS consumed.
         let out = std::process::Command::new(&cli_path)
             .args(["version", "--db", "x.db"])
@@ -748,6 +771,7 @@ mod tests {
                 "explain" => "dql-explain.1",
                 "jstruct" | "csvstruct" | "filemunge" | "tools" => "dql-tools.1",
                 "list" | "install" | "verify" | "target" => "dql-target.1",
+                "editor" | "export-artifacts" => "dql-editor.1",
                 // root globals + completions live in dql(1)
                 _ => "dql.1",
             }
@@ -777,8 +801,8 @@ mod tests {
     }
 
     /// The book pipeline, pinned WITHOUT any authored expectations
-    /// (BOOK-NEXT-GEN.md section 3: content is the author's — the test
-    /// suite guarantees nothing about its form or words). Every expected
+    /// (content is the author's — the test suite guarantees nothing
+    /// about its form or words). Every expected
     /// value is derived from the bundle at runtime; what is asserted is
     /// that the pipeline's STAGES AGREE: the listing agrees with
     /// book_meta, the emission head agrees with frontmatter, each spine
@@ -955,7 +979,9 @@ mod tests {
 
         assert!(run("cli::surface.command(*) |> (name)").status.success());
         assert!(run("cli::(*)").status.success());
-        assert!(run("sys::identifiers.identifier(*) |> (kind)").status.success());
+        assert!(run("sys::identifiers.identifier(*) |> (kind)")
+            .status
+            .success());
         assert!(!run("cli::book.book(*)").status.success());
         assert!(!run("cli::man.man_page(*)").status.success());
         assert!(!run("sys::help.identifier(*)").status.success());
@@ -994,10 +1020,9 @@ mod tests {
             .args(["man", "version"])
             .output()
             .unwrap();
-        let plain = delightql_cli::man_scrub::scrub(include_str!(
-            "../../../assets/man/man1/dql-version.1"
-        ))
-        .unwrap();
+        let plain =
+            delightql_cli::man_scrub::scrub(include_str!("../../../assets/man/man1/dql-version.1"))
+                .unwrap();
         assert!(piped.status.success());
         assert_eq!(
             piped.stdout,
@@ -1027,10 +1052,9 @@ mod tests {
         assert!(dumped >= 8, "expected all embedded pages, got {dumped}");
     }
 
-    /// R3.2 (CLI-SURFACE-RECOMMENDATIONS.md): `dql help <cmd>` is the
-    /// same projection as `dql man <cmd>` — one mechanism, so the clap
-    /// essay and the man page can never drift apart. Bare `dql help`
-    /// keeps the usage summary.
+    /// `dql help <cmd>` is the same projection as `dql man <cmd>` — one
+    /// mechanism, so the clap essay and the man page can never drift
+    /// apart. Bare `dql help` keeps the usage summary.
     #[test]
     fn test_dql_help_is_the_man_page() {
         let cli_path = get_cli_path();
@@ -1067,7 +1091,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stderr).contains("cli::man.man_page"));
     }
 
-    /// BYTES-SCHEME-DESIGN.md: the `delightql-bytes://` locator contract.
+    /// The `delightql-bytes://` locator contract.
     /// The embedded book/man images are BOUND by open_handle and mounted by
     /// locator — attach-class (joinable), read-only, closed-namespace (no
     /// ambient authority), zero temp files.
@@ -1099,17 +1123,18 @@ mod tests {
 
         // Closed namespace: an unbound name refuses and TEACHES — the sorted,
         // deliberately non-secret binding inventory.
-        let out = run_seq("mount!(\"delightql-bytes://nosuch\", \"x\")\n");
+        let out = run_seq("mount!(\"delightql-bytes://nosuch\", \"x\")(*)\n");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("no byte binding named 'nosuch'") && stderr.contains("book, man"),
+            stderr.contains("no byte binding named 'nosuch'")
+                && stderr.contains("book, editor, man, surface"),
             "miss must list the bound names, got: {stderr}"
         );
 
         // Attach-class: the mounted image is joinable with a main-side
         // relation in one query (the property the design pins).
         let out = run_with(
-            "mount!(\"delightql-bytes://man\", \"m\")\n\
+            "mount!(\"delightql-bytes://man\", \"m\")(*)\n\
              m.man_page(*), _(n @ \"dql-query\"), name = n ~> count:(*) as c |> (c)\n",
             &["-f", "raw"],
         );
@@ -1117,10 +1142,10 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
 
         // Full-citizen namespace: the `ns::(*)` listing construct resolves
-        // for a bytes mount exactly as for a file mount (regression: the
-        // first implementation skipped register_mounted_catalog_wrappers,
-        // so `m::(*)` was 'Table not found' — caught in code review).
-        let out = run_seq("mount!(\"delightql-bytes://man\", \"m\")\nm::(*)\n");
+        // for a bytes mount exactly as for a file mount (the tempting
+        // regression: skipping register_mounted_catalog_wrappers makes
+        // `m::(*)` 'Table not found').
+        let out = run_seq("mount!(\"delightql-bytes://man\", \"m\")(*)\nm::(*)\n");
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -1131,7 +1156,7 @@ mod tests {
         // Read-only: DML against the mounted image refuses at SQLite's
         // readonly enforcement.
         let out = run_seq(
-            "mount!(\"delightql-bytes://man\", \"m\")\n\
+            "mount!(\"delightql-bytes://man\", \"m\")(*)\n\
              _(name, section, troff, content_digest @ \"x\", 9, \"t\", \"d\") \
              |> insert!(m.man_page(*))(*)\n",
         );
@@ -1139,16 +1164,15 @@ mod tests {
 
         // Lifecycle: refresh! refuses (immutable image); mount_new! refuses
         // (attach-only locator); unmount! detaches cleanly.
-        let out = run_seq(
-            "mount!(\"delightql-bytes://man\", \"m\")\nrefresh!(\"m\")\n",
-        );
+        let out = run_seq("mount!(\"delightql-bytes://man\", \"m\")(*)\nrefresh!(\"m\")(*)\n");
         assert!(String::from_utf8_lossy(&out.stderr).contains("immutable"));
-        let out = run_seq("mount_new!(\"delightql-bytes://book\", \"x\")\n");
+        let out = run_seq("mount_new!(\"delightql-bytes://book\", \"x\")(*)\n");
         assert!(!out.status.success(), "mount_new! must refuse a locator");
-        let out = run_seq(
-            "mount!(\"delightql-bytes://man\", \"m\")\nunmount!(\"m\")\n",
+        let out = run_seq("mount!(\"delightql-bytes://man\", \"m\")(*)\nunmount!(\"m\")(*)\n");
+        assert!(
+            out.status.success(),
+            "unmount! of a bytes mount must succeed"
         );
-        assert!(out.status.success(), "unmount! of a bytes mount must succeed");
 
         // Zero temp files: dql book / dql man materialize nothing on disk.
         let tmp = std::env::temp_dir();
@@ -1180,7 +1204,7 @@ mod tests {
         );
     }
 
-    /// Seventh review, P1: `main`'s physical attachment identity is stored
+    /// `main`'s physical attachment identity is stored
     /// separately from its qualification policy (`cartridge.source_ns` is
     /// NULL for main by design, so it cannot carry the ATTACH alias).
     /// unmount!("main") DETACHes and EMPTIES the bootstrap fixture rather
@@ -1216,11 +1240,11 @@ mod tests {
             child.wait_with_output().unwrap()
         };
 
-        // unmount → remount → remount again → UNQUALIFIED read still works
-        // (pre-fix: '_imported_N is already in use' on the first remount —
-        // the alias was never DETACHed because source_ns is NULL for main).
+        // unmount → remount → remount again → UNQUALIFIED read still works.
+        // A schema alias left attached because source_ns is NULL for main
+        // answers '_imported_N is already in use' on the first remount.
         let out = run(&format!(
-            "unmount!(\"main\")\nmount!(\"{db}\", \"main\")\nunmount!(\"main\")\nmount!(\"{db}\", \"main\")\nt(*) |> (x)\n"
+            "unmount!(\"main\")(*)\nmount!(\"{db}\", \"main\")(*)\nunmount!(\"main\")(*)\nmount!(\"{db}\", \"main\")(*)\nt(*) |> (x)\n"
         ));
         assert!(
             out.status.success(),
@@ -1229,9 +1253,10 @@ mod tests {
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
 
-        // refresh!("main") introspects the ATTACHED database (pre-fix it
-        // introspected the hub via the namespace name, losing the catalog).
-        let out = run("refresh!(\"main\")\nt(*) |> (x)\n");
+        // refresh!("main") introspects the ATTACHED database. Resolving the
+        // namespace name to the hub instead introspects the hub and loses
+        // the catalog.
+        let out = run("refresh!(\"main\")(*)\nt(*) |> (x)\n");
         assert!(
             out.status.success(),
             "refresh of main must re-introspect the attached db: {}",
@@ -1240,12 +1265,12 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
     }
 
-    /// MOUNT-SPINE-PLAN.md Phase 1 (review R1): mount identity is
+    /// Mount identity is
     /// AUTHORITATIVE — a valid-but-EMPTY database mounts idempotently,
     /// conflicts correctly, and unmounts cleanly, even though it activates
-    /// zero entities. Before the spine, identity was discovered through
-    /// activated_entity joins, so an empty image had no identity: re-mounts
-    /// attached duplicate aliases and unmount could not find the alias to
+    /// zero entities. Deriving identity from activated_entity joins
+    /// instead leaves an empty image with no identity: re-mounts would
+    /// attach duplicate aliases and unmount could not find the alias to
     /// DETACH.
     #[test]
     fn test_mount_spine_empty_image_lifecycle() {
@@ -1256,7 +1281,8 @@ mod tests {
         let db = dir.path().join("empty.sqlite");
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch("CREATE TABLE t(x); DROP TABLE t;").unwrap();
+            conn.execute_batch("CREATE TABLE t(x); DROP TABLE t;")
+                .unwrap();
         }
         let db = db.to_string_lossy().to_string();
 
@@ -1280,9 +1306,9 @@ mod tests {
 
         // Idempotent re-mount, working namespace functor with ZERO entities,
         // authoritative refresh (re-introspects to zero entities rather than
-        // "no cartridge"; second review F2), clean unmount — one session.
+        // "no cartridge"), clean unmount — one session.
         let out = run_seq(&format!(
-            "mount!(\"{db}\", \"e\")\nmount!(\"{db}\", \"e\")\ne::(*)\nrefresh!(\"e\")\nunmount!(\"e\")\n"
+            "mount!(\"{db}\", \"e\")(*)\nmount!(\"{db}\", \"e\")(*)\ne::(*)\nrefresh!(\"e\")(*)\nunmount!(\"e\")(*)\n"
         ));
         assert!(
             out.status.success(),
@@ -1293,7 +1319,7 @@ mod tests {
         // Conflict detection still works without entities: a different
         // source over the same namespace refuses.
         let out = run_seq(&format!(
-            "mount!(\"{db}\", \"e\")\nmount!(\"delightql-bytes://man\", \"e\")\n"
+            "mount!(\"{db}\", \"e\")(*)\nmount!(\"delightql-bytes://man\", \"e\")(*)\n"
         ));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -1301,14 +1327,13 @@ mod tests {
             "different source over an empty-image namespace must conflict: {stderr}"
         );
 
-        // SIMULTANEOUS empty mounts of one source are LEGAL
-        // (NAMESPACE-CARTRIDGE-LINK-DESIGN.md: the stored link makes each
-        // namespace's cartridge distinguishable, repealing the interim
-        // refusal). Unmounting one detaches only its own alias — the other
+        // SIMULTANEOUS empty mounts of one source are LEGAL: the stored
+        // link makes each namespace's cartridge distinguishable.
+        // Unmounting one detaches only its own alias — the other
         // stays queryable — and the once-corrupting full sequence (mount
         // a+b, unmount both, mount c+d) runs clean with no leaked alias.
         let out = run_seq(&format!(
-            "mount!(\"{db}\", \"a\")\nmount!(\"{db}\", \"b\")\nunmount!(\"a\")\nb::(*)\nunmount!(\"b\")\nmount!(\"{db}\", \"c\")\nmount!(\"{db}\", \"d\")\nunmount!(\"c\")\nunmount!(\"d\")\n"
+            "mount!(\"{db}\", \"a\")(*)\nmount!(\"{db}\", \"b\")(*)\nunmount!(\"a\")(*)\nb::(*)\nunmount!(\"b\")(*)\nmount!(\"{db}\", \"c\")(*)\nmount!(\"{db}\", \"d\")(*)\nunmount!(\"c\")(*)\nunmount!(\"d\")(*)\n"
         ));
         assert!(
             out.status.success(),
@@ -1316,12 +1341,12 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        // Refreshing an EMPTY image must not duplicate its cartridge (third
-        // review, P1): a duplicate makes unmount sweep both rows but detach
+        // Refreshing an EMPTY image must not duplicate its cartridge: a
+        // duplicate makes unmount sweep both rows but detach
         // one alias, poisoning later mounts of the same source. Repeated
         // refresh + unmount + remount stays clean.
         let out = run_seq(&format!(
-            "mount!(\"{db}\", \"e\")\nrefresh!(\"e\")\nrefresh!(\"e\")\nunmount!(\"e\")\nmount!(\"{db}\", \"f\")\nunmount!(\"f\")\n"
+            "mount!(\"{db}\", \"e\")(*)\nrefresh!(\"e\")(*)\nrefresh!(\"e\")(*)\nunmount!(\"e\")(*)\nmount!(\"{db}\", \"f\")(*)\nunmount!(\"f\")(*)\n"
         ));
         assert!(
             out.status.success(),
@@ -1330,7 +1355,7 @@ mod tests {
         );
     }
 
-    /// ALPHA-CLI-UX-WORRIES.md #1 and #4: help must not teach flags a
+    /// Help must not teach flags a
     /// subcommand refuses (each global's one-liner names its
     /// consumers), and --to's compile failures must carry the full
     /// message, not a URI plus advice to re-run without --to.
@@ -1338,7 +1363,7 @@ mod tests {
     fn test_alpha_ux_worries_1_and_4() {
         let cli_path = get_cli_path();
 
-        // #1: tools --help shows propagated globals (clap has no
+        // tools --help shows propagated globals (clap has no
         // per-subcommand hiding), so the flag text itself must teach
         // where each one works.
         let out = std::process::Command::new(&cli_path)
@@ -1350,7 +1375,7 @@ mod tests {
         assert!(help.contains("(query only)"));
         assert!(help.contains("(query, tools, server)"));
 
-        // #4: a --to compile failure emits the SAME record shape as
+        // A --to compile failure emits the SAME record shape as
         // normal execution — URI and full prose, no withholding.
         let out = std::process::Command::new(&cli_path)
             .args(["query", "--to", "sql", "_(1,2) |> (id, nope)"])
@@ -1369,11 +1394,11 @@ mod tests {
         );
     }
 
-    /// ALPHA-CLI-UX-WORRIES.md #3: numeric values in anonymous tables,
+    /// Numeric values in anonymous tables,
     /// aggregates, and computed columns must emit as JSON numbers.
     /// sqlite declares no decl_type for expression columns, so the relay
     /// elects the engine's own storage class from the column's FIRST
-    /// NON-NULL value (bounded peek, Change 6 / M8) — a declaration by the
+    /// NON-NULL value (a bounded peek) — a declaration by the
     /// engine, not a parsing heuristic; the round-trip guard still demotes
     /// mismatched cells per-value.
     #[test]
@@ -1393,26 +1418,33 @@ mod tests {
         assert_eq!(v[0]["age"], serde_json::json!(36));
         assert_eq!(v[0]["name"], serde_json::json!("Ada"));
 
-        // Aggregates had the same disease over REAL tables too.
-        let v = json("_(1,2;3,4) ~> count:(*)");
-        assert_eq!(v[0]["count_1"], serde_json::json!(2));
+        // Aggregates carry the same requirement over REAL tables too. The
+        // column is ALIASED: an unaliased one carries an invented name, and
+        // invented names are output only and deliberately unstable, so
+        // keying a test on one would assert the opposite of the ruling.
+        let v = json("_(1,2;3,4) ~> count:(*) as n");
+        assert_eq!(v[0]["n"], serde_json::json!(2));
 
         // Text that merely looks numeric is still governed by its
         // declaration: TEXT storage class → string.
         let v = json("_(pad @ \"007\")");
         assert_eq!(v[0]["pad"], serde_json::json!("007"));
 
-        // M8 (Change 6): a NULL-leading column no longer types off row 0.
-        // It elects INTEGER from its first non-NULL value; the leading NULL
-        // stays null, the 5 emits as a number. Under the old first-row peek
-        // this whole column was stringly and `5` rendered as "5".
+        // A NULL-leading column does not type off row 0: it elects INTEGER
+        // from its first non-NULL value; the leading NULL stays null, the 5
+        // emits as a number. Typing off row 0 instead would make this whole
+        // column stringly, rendering `5` as "5".
         let v = json("_(x @ null; 5)");
         assert_eq!(v[0]["x"], serde_json::Value::Null);
-        assert_eq!(v[1]["x"], serde_json::json!(5), "null-leading elects INTEGER");
+        assert_eq!(
+            v[1]["x"],
+            serde_json::json!(5),
+            "null-leading elects INTEGER"
+        );
 
         // Row-order independence: reversing the rows yields identical JSON
-        // types (only the values swap). `5; null` and `null; 5` were the
-        // M8 asymmetry — same data, reversed rows, different JSON types.
+        // types (only the values swap) — `5; null` and `null; 5` must not
+        // diverge into different JSON types for the same data.
         let v = json("_(x @ 5; null)");
         assert_eq!(v[0]["x"], serde_json::json!(5));
         assert_eq!(v[1]["x"], serde_json::Value::Null);
@@ -1430,17 +1462,23 @@ mod tests {
     }
 
     /// Bare `dql` is sugar for `dql query` with no arguments — one
-    /// rule, one code path. The bug this pins against: bare dql with
-    /// piped stdin used to print the REPL banner, silently DISCARD
-    /// the piped input, and exit 0 (`dql < queries.dql` = success,
-    /// nothing executed).
+    /// rule, one code path. The tempting regression: bare dql with
+    /// piped stdin printing the REPL banner, silently DISCARDing
+    /// the piped input, and exiting 0 (`dql < queries.dql` reporting
+    /// success with nothing executed).
     #[test]
     fn test_bare_dql_is_sugar_for_query() {
         use std::io::Write;
         let cli_path = get_cli_path();
+        // Byte-equality is the claim, so the two runs must be comparable
+        // byte for byte: a heading nobody authored is DRAWN per compilation,
+        // and two processes are two draws. The canonical policy renders the
+        // same invented names as `<mint:N>`, which is what lets this test go
+        // on asserting the road rather than a spelling.
         let run_piped = |args: &[&str], stdin: &str| {
             let mut child = std::process::Command::new(&cli_path)
                 .args(args)
+                .env("DQL_NAME_POLICY", "canonical")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -1478,11 +1516,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fresh = dir.path().join("fresh.db");
         let bare = run_piped(
-            &[
-                "--db",
-                fresh.to_str().unwrap(),
-                "--make-new-db-if-missing",
-            ],
+            &["--db", fresh.to_str().unwrap(), "--make-new-db-if-missing"],
             "_(1)",
         );
         assert!(
@@ -1493,12 +1527,16 @@ mod tests {
         assert!(fresh.exists(), "database file must be created");
 
         // But alone it configures nothing (requires --db), and non-query
-        // subcommands refuse it per R6.
+        // subcommands refuse it (the global-option hygiene rule).
         let out = std::process::Command::new(&cli_path)
             .args(["--make-new-db-if-missing"])
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(2), "flag without --db is a usage error");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "flag without --db is a usage error"
+        );
         let out = std::process::Command::new(&cli_path)
             .args(["version", "--db", "x.db", "--make-new-db-if-missing"])
             .output()
@@ -1550,8 +1588,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).contains("Registered under this family"));
     }
 
-    /// PLAN.md #5 (ratified mandatory by PORCELAIN-AND-PLUMBING.md: a
-    /// machine format that lies about types is a contradiction): -f json
+    /// A machine format that lies about types is a contradiction: -f json
     /// and -f jsonl emit numbers for numerically-DECLARED columns whose
     /// text round-trips, null for NULL, strings for everything else,
     /// columns in relation order.
@@ -1599,9 +1636,8 @@ mod tests {
         assert_eq!(parsed[1]["pad"], serde_json::json!("42"));
     }
 
-    /// PORCELAIN-AND-PLUMBING.md §7 knob 4: raw is
-    /// byte-faithful single-column extraction. Verbatim-ness is FROZEN at
-    /// v0.1 — these assertions are that freeze.
+    /// Raw is byte-faithful single-column extraction. Verbatim-ness is
+    /// FROZEN at v0.1 — these assertions are that freeze.
     #[test]
     fn test_raw_is_byte_faithful_single_column() {
         let cli_path = get_cli_path();

@@ -147,7 +147,7 @@ pub unsafe extern "C" fn dql_open(
 
     // Send mount! to attach the user database.
     ensure_stacksafe();
-    let mount_query = format!("mount!(\"{}\", \"main\")", path.replace('"', "\\\""));
+    let mount_query = format!("mount!(\"{}\", \"main\")(*)", path.replace('"', "\\\""));
     let mount_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         with_stacksafe(|| cabi.session.query(&mount_query))
     }));
@@ -590,73 +590,12 @@ pub unsafe extern "C" fn dql_free_split_result(result: *mut DqlSplitResult) {
 // Tree-sitter query splitting (internal)
 // ---------------------------------------------------------------------------
 
+/// The ONE splitter, reached through the core's public API.
+///
+/// This crate had its own copy: a second tree-sitter parse and a second
+/// error-node walk. One split, stated once, over the shared entrance.
 fn split_queries_impl(source: &str) -> Result<Vec<String>, String> {
-    use tree_sitter::Language;
-
-    extern "C" {
-        fn tree_sitter_delightql_v2() -> Language;
-    }
-
-    let mut parser = tree_sitter::Parser::new();
-    let language = unsafe { tree_sitter_delightql_v2() };
-    parser
-        .set_language(&language)
-        .map_err(|e| format!("language: {e}"))?;
-
-    let tree = parser
-        .parse(source, None)
-        .ok_or("tree-sitter parse failed")?;
-    let root = tree.root_node();
-
-    if root.has_error() {
-        return Err(find_first_error(&root, source));
-    }
-
-    let mut cursor = root.walk();
-    let has_top_level_ddl = root
-        .children(&mut cursor)
-        .any(|c| c.kind() == "ddl_annotation");
-    if has_top_level_ddl {
-        return Err("contains top-level ddl_annotation (use CLI sequential mode)".into());
-    }
-
-    let mut cursor = root.walk();
-    let queries: Vec<String> = root
-        .children(&mut cursor)
-        .filter(|c| c.kind() == "query")
-        .map(|c| source[c.start_byte()..c.end_byte()].to_string())
-        .collect();
-
-    if queries.is_empty() {
-        return Err("no queries found in source".into());
-    }
-    Ok(queries)
-}
-
-fn find_first_error(node: &tree_sitter::Node, source: &str) -> String {
-    if node.kind() == "ERROR" || node.is_error() {
-        let start = node.start_position();
-        let snippet: String = source[node.start_byte()..node.end_byte()]
-            .chars()
-            .take(40)
-            .collect();
-        return format!(
-            "syntax error at line {}:{}: {}",
-            start.row + 1,
-            start.column + 1,
-            snippet
-        );
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.has_error() {
-            let msg = find_first_error(&child, source);
-            if !msg.is_empty() {
-                return msg;
-            }
-        }
-    }
-    "syntax error (unknown location)".into()
+    delightql_core::api::split_queries(source)
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +698,7 @@ mod tests {
     #[test]
     fn open_zero_byte_file_refuses() {
         // The nullmount ruling, pinned at the C-ABI boundary: a 0-byte
-        // file is not a database and mount! (via dql_open) refuses it.
+        // file is not a database and mount! (via dql_open)(*) refuses it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.db");
         rusqlite::Connection::open(&path).unwrap();

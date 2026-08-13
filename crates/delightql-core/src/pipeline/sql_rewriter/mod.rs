@@ -5,8 +5,7 @@
 // Runs AFTER the transformer and BEFORE the optimizer.
 // Rewrites SQL patterns that the target dialect cannot express natively.
 //
-// Two entry points, sandwiching the optimizer (the lowering sandwich,
-// ALL-SQL-TARGETING-DESIGN.md §2.D):
+// Two entry points, sandwiching the optimizer (the lowering sandwich):
 //
 //   rewrite()  — expansions, BEFORE the optimizer (their verbose output
 //                benefits from cleanup):
@@ -20,20 +19,26 @@
 //                - #<N in recursive members: total-cap LIMIT hoist
 //                  (sqlite, mysql) or diagnostic (postgres, duckdb,
 //                  sqlserver)
+//                - row bound → TOP / ORDER BY … OFFSET … FETCH (sqlserver)
 
 mod bare_join;
 mod full_outer;
 mod recursive_cte;
+mod row_clause;
 
 use crate::error::Result;
-use crate::pipeline::generator_v3::SqlDialect;
-use crate::pipeline::sql_ast_v3::SqlStatement;
+use crate::pipeline::generator::SqlDialect;
+use crate::pipeline::sql_ast::SqlStatement;
 
 /// Expand SQL patterns the target cannot express natively. Runs BEFORE
 /// the optimizer so cleanup can tidy the expansion's output.
-pub fn rewrite(statement: SqlStatement, dialect: SqlDialect) -> Result<SqlStatement> {
+pub fn rewrite(
+    statement: SqlStatement,
+    dialect: SqlDialect,
+    identities: &crate::names::Registry,
+) -> Result<SqlStatement> {
     let stmt = if full_outer::needs_expansion(dialect) {
-        full_outer::expand_full_outer_joins(statement)?
+        full_outer::expand_full_outer_joins(statement, identities)?
     } else {
         statement
     };
@@ -44,11 +49,7 @@ pub fn rewrite(statement: SqlStatement, dialect: SqlDialect) -> Result<SqlStatem
 /// The final legalization word. Runs AFTER the optimizer; nothing may
 /// rewrite the statement after this returns.
 pub fn legalize(statement: SqlStatement, dialect: SqlDialect) -> Result<SqlStatement> {
-    let mut stmt = statement;
-
-    // Structural recursion detection first — the limit legalization only
-    // inspects CTEs this pass has marked.
-    recursive_cte::mark_recursive_ctes(&mut stmt);
+    let stmt = statement;
 
     let mut stmt = if bare_join::needs_legalization(dialect) {
         bare_join::legalize_bare_joins(stmt)
@@ -56,11 +57,15 @@ pub fn legalize(statement: SqlStatement, dialect: SqlDialect) -> Result<SqlState
         stmt
     };
 
+    if row_clause::needs_legalization(dialect) {
+        row_clause::legalize_row_clauses(&mut stmt);
+    }
+
     recursive_cte::legalize_recursive_limits(&mut stmt, dialect)?;
 
-    // The recursion validator (RECURSION-CONTRACT.md N1/N3/N4) — after the
-    // limit legalization, so the one legal buried shape has already been
-    // unwrapped before burial is judged.
+    // The recursion validator (LINEARITY, STRATA ARE TEXTUAL, NO SUBQUERY
+    // AGAINST THE TARGET) — after the limit legalization, so the one legal
+    // buried shape has already been unwrapped before burial is judged.
     recursive_cte::validate_recursive_members(&mut stmt)?;
 
     Ok(stmt)

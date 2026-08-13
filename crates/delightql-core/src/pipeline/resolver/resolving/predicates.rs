@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-use crate::ddl::ddl_builder;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
-use crate::pipeline::asts::core::ProjectionExpr;
-use crate::pipeline::asts::ddl::DdlHead;
-use crate::pipeline::resolver::grounding::substitute_in_domain_expr;
+use crate::pipeline::asts::core::ProbeAddressing;
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::{Comparison, Existence};
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::asts::ddl::{DefKind, HoParam};
+use crate::pipeline::resolver::grounding::substitute_in_truth_expr;
+use delightql_types::SqlIdentifier;
 use std::collections::HashMap;
 
 // =============================================================================
@@ -17,71 +20,91 @@ use std::collections::HashMap;
 /// For `+orders(*.(status))`, this produces:
 ///   Filter(subquery, outer.status IS NOT DISTINCT FROM orders.status)
 pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
-    subquery: ast_resolved::RelationalExpression,
-    using_columns: &[String],
-    inner_identifier: &ast_resolved::QualifiedName,
-    outer_available: &[ast_resolved::ColumnMetadata],
-) -> ast_resolved::RelationalExpression {
-    use crate::pipeline::asts::core::metadata::TableName;
+    subquery: ast_resolved::Chain,
+    using_columns: &[SqlIdentifier],
+    outer_available: &[crate::names::ColId],
+    identities: &crate::names::Registry,
+) -> Result<ast_resolved::Chain> {
     use crate::pipeline::asts::core::FilterOrigin;
 
     if using_columns.is_empty() {
-        return subquery;
+        return Ok(subquery);
     }
 
-    let inner_table: delightql_types::SqlIdentifier = inner_identifier.name.clone();
+    let inner_schema =
+        crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&subquery);
+    let inner = identities.known_heading(inner_schema)?;
 
     // Build one comparison per USING column
-    let mut comparisons: Vec<ast_resolved::BooleanExpression> = Vec::new();
+    let mut comparisons: Vec<ast_resolved::TruthExpression> = Vec::new();
     for col_name in using_columns {
-        let col_id: delightql_types::SqlIdentifier = col_name.as_str().into();
-
-        // Find outer qualifier from the available schema
-        let outer_qualifier: Option<delightql_types::SqlIdentifier> = outer_available
+        // As written — a strop makes the name case-sensitive, and the lvar
+        // this step unifies with is the one the author spelled.
+        let spelling = identities.intern(col_name.as_str(), col_name.is_stropped());
+        let name = identities.canonical(spelling);
+        let outer_hits: Vec<_> = outer_available
             .iter()
-            .find(|cm| cm.info.name().map_or(false, |n| n == col_name))
-            .and_then(|cm| match cm.qualifier() {
-                TableName::Named(id) => Some(id.clone()),
-                TableName::Fresh => None,
-            });
+            .copied()
+            .filter(|column| identities.published_sym(*column) == Some(name))
+            .collect();
+        let inner_hits: Vec<_> = inner
+            .iter()
+            .copied()
+            .filter(|column| identities.published_sym(*column) == Some(name))
+            .collect();
+        let outer = unique_using_column(col_name, "outer", &outer_hits)?;
+        let inner = unique_using_column(col_name, "inner", &inner_hits)?;
+        let lhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence {
+                column: outer,
+                explicit_qualifier: false,
+            },
+        )));
+        let rhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence {
+                column: inner,
+                explicit_qualifier: false,
+            },
+        )));
 
-        let lhs = ast_resolved::DomainExpression::Lvar {
-            name: col_id.clone(),
-            qualifier: outer_qualifier,
-            namespace_path: ast_resolved::NamespacePath::empty(),
-            alias: None,
-            provenance: ast_resolved::PhaseBox::phantom(),
-        };
-        let rhs = ast_resolved::DomainExpression::Lvar {
-            name: col_id,
-            qualifier: Some(inner_table.clone()),
-            namespace_path: ast_resolved::NamespacePath::empty(),
-            alias: None,
-            provenance: ast_resolved::PhaseBox::phantom(),
-        };
-
-        comparisons.push(ast_resolved::BooleanExpression::Comparison {
-            operator: "null_safe_eq".to_string(),
+        comparisons.push(ast_resolved::TruthExpression::Comparison(Comparison {
+            operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
             left: Box::new(lhs),
             right: Box::new(rhs),
-        });
+        }));
     }
 
     // Combine with AND
-    let combined = comparisons
-        .into_iter()
-        .reduce(|acc, next| ast_resolved::BooleanExpression::And {
-            left: Box::new(acc),
-            right: Box::new(next),
-        })
-        .unwrap(); // safe: using_columns is non-empty
+    let combined = ast_resolved::TruthExpression::all(comparisons)
+        .expect("a non-empty USING list produces one comparison per column");
 
-    // Wrap subquery in Filter
-    ast_resolved::RelationalExpression::Filter {
-        source: Box::new(subquery),
-        condition: ast_resolved::SigmaCondition::Predicate(combined),
+    // Wrap subquery in Filter. A filter publishes its source's heading, and
+    // this one is built in the resolved phase, so it carries that heading
+    // rather than leaving a phantom for a later phase to fill: nothing runs
+    // between here and the refiner that would.
+    Ok(subquery.then(ast_resolved::Continuation::Restrict {
+        condition: combined,
         origin: FilterOrigin::Generated,
-        cpr_schema: ast_resolved::PhaseBox::phantom(),
+        cpr_schema: inner_schema,
+    }))
+}
+
+fn unique_using_column(
+    name: &SqlIdentifier,
+    side: &str,
+    hits: &[crate::names::ColId],
+) -> Result<crate::names::ColId> {
+    match hits {
+        [column] => Ok(*column),
+        [] => Err(DelightQLError::column_not_found_error(
+            name.as_str(),
+            format!("in {side} heading for USING correlation"),
+        )),
+        _ => Err(DelightQLError::validation_error_categorized(
+            "resolution/ambiguous",
+            format!("USING column '{name}' appears more than once in the {side} heading"),
+            "publish a unique name on each side before correlating",
+        )),
     }
 }
 
@@ -91,261 +114,162 @@ pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
 /// This matches the structure the explicit comma path produces, which the
 /// CDT-SJ classifier and hygienic injection mechanism expect.
 pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
-    using_columns: &[String],
-    inner_identifier: &ast_resolved::QualifiedName,
-    outer_available: &[ast_resolved::ColumnMetadata],
-) -> Vec<ast_resolved::SigmaCondition> {
-    use crate::pipeline::asts::core::metadata::TableName;
-
-    let inner_table: delightql_types::SqlIdentifier = inner_identifier.name.clone();
+    using_columns: &[SqlIdentifier],
+    outer_available: &[crate::names::ColId],
+    inner_expression: &ast_resolved::Chain,
+    identities: &crate::names::Registry,
+) -> Result<Vec<ast_resolved::TruthExpression>> {
+    let inner = identities.known_heading(
+        crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(inner_expression),
+    )?;
 
     using_columns
         .iter()
         .map(|col_name| {
-            let col_id: delightql_types::SqlIdentifier = col_name.as_str().into();
-
-            let outer_qualifier: Option<delightql_types::SqlIdentifier> = outer_available
+            let spelling = identities.intern(col_name.as_str(), col_name.is_stropped());
+            let name = identities.canonical(spelling);
+            let outer: Vec<_> = outer_available
                 .iter()
-                .find(|cm| cm.info.name().map_or(false, |n| n == col_name))
-                .and_then(|cm| match cm.qualifier() {
-                    TableName::Named(id) => Some(id.clone()),
-                    TableName::Fresh => None,
-                });
+                .copied()
+                .filter(|column| identities.published_sym(*column) == Some(name))
+                .collect();
+            let inner: Vec<_> = inner
+                .iter()
+                .copied()
+                .filter(|column| identities.published_sym(*column) == Some(name))
+                .collect();
+            let outer = unique_using_column(col_name, "outer", &outer)?;
+            let inner = unique_using_column(col_name, "inner", &inner)?;
+            let lhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                ColumnOccurrence {
+                    column: outer,
+                    explicit_qualifier: false,
+                },
+            )));
+            let rhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+                ColumnOccurrence {
+                    column: inner,
+                    explicit_qualifier: false,
+                },
+            )));
 
-            let lhs = ast_resolved::DomainExpression::Lvar {
-                name: col_id.clone(),
-                qualifier: outer_qualifier,
-                namespace_path: ast_resolved::NamespacePath::empty(),
-                alias: None,
-                provenance: ast_resolved::PhaseBox::phantom(),
-            };
-            let rhs = ast_resolved::DomainExpression::Lvar {
-                name: col_id,
-                qualifier: Some(inner_table.clone()),
-                namespace_path: ast_resolved::NamespacePath::empty(),
-                alias: None,
-                provenance: ast_resolved::PhaseBox::phantom(),
-            };
-
-            ast_resolved::SigmaCondition::Predicate(ast_resolved::BooleanExpression::Comparison {
-                operator: "null_safe_eq".to_string(),
+            Ok(ast_resolved::TruthExpression::Comparison(Comparison {
+                operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
                 left: Box::new(lhs),
                 right: Box::new(rhs),
-            })
+            }))
         })
         .collect()
+}
+
+/// The filters `.*` asks for: one per name BOTH sides publish.
+///
+/// The same question the join spelling asks, answered by the same
+/// computation — so a heading pair that refuses at a join refuses here, and
+/// neither placement can quietly perform a step the other rejects.
+pub(in crate::pipeline::resolver) fn build_using_all_correlation_filters(
+    outer_available: &[crate::names::ColId],
+    inner_expression: &ast_resolved::Chain,
+    identities: &crate::names::Registry,
+) -> Result<Vec<ast_resolved::TruthExpression>> {
+    let inner = identities.known_heading(
+        crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(inner_expression),
+    )?;
+
+    Ok(
+        crate::pipeline::resolver::join_resolver::shared_using_names(
+            outer_available,
+            &inner.to_vec(),
+            identities,
+        )?
+        .into_iter()
+        .map(|shared| {
+            ast_resolved::TruthExpression::Comparison(Comparison {
+                operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
+                left: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
+                    NamedReference(ColumnOccurrence {
+                        column: shared.left,
+                        explicit_qualifier: false,
+                    }),
+                ))),
+                right: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
+                    NamedReference(ColumnOccurrence {
+                        column: shared.right,
+                        explicit_qualifier: false,
+                    }),
+                ))),
+            })
+        })
+        .collect(),
+    )
 }
 
 // =============================================================================
 // Destructuring Pattern Helpers (Epoch 2)
 // =============================================================================
 
-/// Extract JSON key → column name mappings from an UNRESOLVED destructuring pattern
-/// This doesn't resolve identifiers - it treats them as literal output column names
+/// The JSON key → published-name mappings an UNRESOLVED pattern declares.
+///
+/// A pattern member says what it binds; nothing here re-derives that from a
+/// value's shape, because a pattern member holds no value.
 pub(in crate::pipeline::resolver) fn extract_key_mappings_from_unresolved_pattern(
-    pattern: &ast_unresolved::FunctionExpression,
-) -> Result<Vec<ast_resolved::DestructureMapping>> {
+    pattern: &ast_unresolved::TreePattern,
+) -> Result<Vec<(String, String)>> {
+    let mut mappings = Vec::new();
+    collect_key_mappings(pattern, &mut mappings)?;
+    Ok(mappings)
+}
+
+fn collect_key_mappings(
+    pattern: &ast_unresolved::TreePattern,
+    mappings: &mut Vec<(String, String)>,
+) -> Result<()> {
+    use crate::pipeline::asts::core::{PatternTarget, RecordPatternMember, TreePattern};
     match pattern {
-        // METADATA TG: country:~> {first_name, last_name}
-        // Creates column from JSON keys + recursively extract from constructor
-        ast_unresolved::FunctionExpression::MetadataTreeGroup {
-            key_column,
-            constructor,
-            ..
-        } => {
-            let mut mappings = Vec::new();
-
-            // The key_column captures JSON keys as data
-            mappings.push(ast_resolved::DestructureMapping {
-                json_key: key_column.to_string(),
-                column_name: key_column.to_string(),
-            });
-
-            // Recursively extract mappings from nested constructor
-            let nested_mappings =
-                extract_key_mappings_from_unresolved_pattern(constructor.as_ref())?;
-            mappings.extend(nested_mappings);
-
-            Ok(mappings)
-        }
-
-        ast_unresolved::FunctionExpression::Curly { members, .. } => {
-            let mut mappings = Vec::new();
-            for member in members {
+        TreePattern::Record(record) => {
+            for member in record.members.iter() {
                 match member {
-                    ast_unresolved::CurlyMember::Shorthand { column, .. } => {
-                        // Shorthand: {first_name}
-                        // JSON key = column name
-                        mappings.push(ast_resolved::DestructureMapping {
-                            json_key: column.to_string(),
-                            column_name: column.to_string(),
-                        });
+                    // A binder's key IS its name.
+                    RecordPatternMember::Binder(binder) => {
+                        mappings.push((binder.name.to_string(), binder.name.to_string()));
                     }
-                    ast_unresolved::CurlyMember::KeyValue {
-                        key,
-                        nested_reduction,
-                        value,
-                    } => {
-                        if *nested_reduction {
-                            // Nested: "key": ~> {pattern} OR Aggregate TVar: "key": ~> identifier
-                            match &**value {
-                                // Aggregate TVar: "users": ~> sub_users
-                                ast_unresolved::DomainExpression::Lvar { name, .. } => {
-                                    mappings.push(ast_resolved::DestructureMapping {
-                                        json_key: key.clone(),
-                                        column_name: name.to_string(),
-                                    });
-                                }
-
-                                // Nested explosion: "users": ~> {first_name}
-                                ast_unresolved::DomainExpression::Function(nested_func) => {
-                                    mappings.extend(extract_key_mappings_from_unresolved_pattern(
-                                        nested_func,
-                                    )?);
-                                }
-                                other => {
-                                    panic!("catch-all hit in predicates.rs extract_key_mappings_from_unresolved_pattern (nested_reduction value): {:?}", other);
-                                }
-                            }
-                        } else {
-                            // KeyValue without ~>: Either simple mapping OR nested object
-                            match &**value {
-                                // Simple mapping: "first_name": fname
-                                ast_unresolved::DomainExpression::Lvar { name, .. } => {
-                                    mappings.push(ast_resolved::DestructureMapping {
-                                        json_key: key.clone(),
-                                        column_name: name.to_string(),
-                                    });
-                                }
-
-                                // Nested object: "location": {country, city}
-                                // RECURSE into nested pattern
-                                ast_unresolved::DomainExpression::Function(
-                                    ast_unresolved::FunctionExpression::Curly { .. },
-                                ) => {
-                                    if let ast_unresolved::DomainExpression::Function(nested_func) =
-                                        &**value
-                                    {
-                                        let nested_mappings =
-                                            extract_key_mappings_from_unresolved_pattern(
-                                                nested_func,
-                                            )?;
-                                        mappings.extend(nested_mappings);
-                                    }
-                                }
-
-                                _ => {
-                                    return Err(DelightQLError::validation_error(
-                                        format!(
-                                            "Explicit key mapping requires simple identifier or nested object pattern as value.\n\
-                                             Found: {{\"{}\":  <complex expression>}}\n\
-                                             Expected: {{\"{}\":  column_name}} or {{\"{}\":  {{nested_pattern}}}}",
-                                            key, key, key
-                                        ),
-                                        "destructuring_pattern"
-                                    ));
-                                }
-                            }
+                    // A rename: the JSON key on the left, the published name
+                    // on the right.
+                    RecordPatternMember::Keyed { key, binder } => {
+                        mappings.push((key.clone(), binder.name.to_string()));
+                    }
+                    // A nested level binds nothing of its own; its members do.
+                    RecordPatternMember::Nested { pattern, .. } => {
+                        collect_key_mappings(pattern, mappings)?
+                    }
+                    RecordPatternMember::Path(binding) => {
+                        mappings.push((binding.path.mapping_key(), binding.published_name()));
+                    }
+                    // The KEYS become this column's values, and the target's
+                    // members bind under them.
+                    RecordPatternMember::Metadata { key, target } => {
+                        mappings.push((key.name.to_string(), key.name.to_string()));
+                        if let PatternTarget::Pattern(inner) = target {
+                            collect_key_mappings(inner, mappings)?;
                         }
                     }
-                    // PATH FIRST-CLASS: Epoch 5 - PathLiteral handling
-                    ast_unresolved::CurlyMember::PathLiteral { path, alias } => {
-                        // json_key is the dotted JSON path (e.g. "name_info.last_name")
-                        let json_key = extract_json_path_from_path_literal(path.as_ref())?;
-                        // column_name is the alias or inferred name
-                        let column_name: String = if let Some(alias_name) = alias {
-                            alias_name.to_string()
-                        } else {
-                            extract_column_name_from_path_literal(path.as_ref())?
-                        };
-
-                        mappings.push(ast_resolved::DestructureMapping {
-                            json_key,
-                            column_name,
-                        });
-                    }
-                    ast_unresolved::CurlyMember::Glob
-                    | ast_unresolved::CurlyMember::Pattern { .. }
-                    | ast_unresolved::CurlyMember::OrdinalRange { .. } => {
-                        return Err(DelightQLError::parse_error(
-                            "Ergonomic inductors (*,  /pattern/, |range|) not supported in destructuring patterns"
-                        ));
-                    }
-                    ast_unresolved::CurlyMember::Comparison { .. } => {
-                        return Err(DelightQLError::parse_error(
-                            "Comparison shorthand not supported in destructuring patterns",
-                        ));
-                    }
-                    // Placeholder {_} in destructuring means "explode but don't extract fields"
-                    // No mapping is created - just skip it
-                    ast_unresolved::CurlyMember::Placeholder => {
-                        // Skip - no mapping extracted for placeholder
-                    }
+                    // The anaphor iterates and binds nothing.
+                    RecordPatternMember::Disregarded => {}
                 }
             }
-            Ok(mappings)
         }
-        ast_unresolved::FunctionExpression::Array { members, .. } => {
-            // ARRAY DESTRUCTURING: Epoch 4 - Extract mappings from array pattern
-            let mut mappings = Vec::new();
-            for member in members {
-                match member {
-                    ast_unresolved::ArrayMember::Index { path, alias } => {
-                        let (json_key, column_name) = match path.as_ref() {
-                            ast_unresolved::DomainExpression::Projection(
-                                ProjectionExpr::JsonPathLiteral { segments, .. },
-                            ) => {
-                                if segments.is_empty() {
-                                    return Err(DelightQLError::parse_error(
-                                        "Array destructuring path cannot be empty",
-                                    ));
-                                }
-
-                                if !matches!(segments.first(), Some(crate::pipeline::asts::core::expressions::functions::PathSegment::ArrayIndex(_))) {
-                                    return Err(DelightQLError::parse_error(
-                                        "Array destructuring requires path starting with numeric index: [.0, .1, .2]"
-                                    ));
-                                }
-
-                                let json_key = segments_to_json_path(segments);
-
-                                let column_name: String = alias.as_ref().map(|s| s.to_string()).unwrap_or_else(|| {
-                                    segments.iter()
-                                        .map(|seg| match seg {
-                                            crate::pipeline::asts::core::expressions::functions::PathSegment::ObjectKey(key) => key.clone(),
-                                            crate::pipeline::asts::core::expressions::functions::PathSegment::ArrayIndex(idx) => idx.to_string(),
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("_")
-                                });
-
-                                (json_key, column_name)
-                            }
-                            _ => {
-                                return Err(DelightQLError::parse_error(
-                                    "Array destructuring members must be path literals",
-                                ));
-                            }
-                        };
-
-                        mappings.push(ast_resolved::DestructureMapping {
-                            json_key,
-                            column_name: column_name.to_string(),
-                        });
-                    }
-                }
+        TreePattern::Array(array) => {
+            for member in array.members.iter() {
+                mappings.push((member.path.mapping_key(), member.published_name()));
             }
-            Ok(mappings)
         }
-        _ => Err(DelightQLError::parse_error(
-            "Pattern must be a Curly function or Array pattern",
-        )),
     }
+    Ok(())
 }
 
 /// Validate UNRESOLVED pattern is appropriate for the destructuring mode
 pub(in crate::pipeline::resolver) fn validate_unresolved_pattern_for_mode(
-    _pattern: &ast_unresolved::FunctionExpression,
+    _pattern: &ast_unresolved::TreePattern,
     mode: &ast_unresolved::DestructureMode,
 ) -> Result<()> {
     use ast_unresolved::DestructureMode;
@@ -361,18 +285,15 @@ pub(in crate::pipeline::resolver) fn validate_unresolved_pattern_for_mode(
     Ok(())
 }
 
-/// EPOCH 5: Validate no sibling explosions (multiple ~> at same pattern level)
-/// Sibling explosions create ambiguous cartesian products
 /// Refuse a destructure pattern that binds the same column name more
 /// than once — at any level. The bindings share one flat output
 /// heading, so a duplicate is not two extractions: one silently
 /// overwrites the other and the loser's value is unobservable.
 pub(in crate::pipeline::resolver) fn validate_distinct_bindings(
-    pattern: &ast_unresolved::FunctionExpression,
+    pattern: &ast_unresolved::TreePattern,
 ) -> Result<()> {
     let mut bindings: Vec<delightql_types::SqlIdentifier> = Vec::new();
-    collect_pattern_bindings(pattern, &mut bindings)?;
-    Ok(())
+    collect_pattern_bindings(pattern, &mut bindings)
 }
 
 fn bind_pattern_name(
@@ -396,429 +317,214 @@ fn bind_pattern_name(
 }
 
 fn collect_pattern_bindings(
-    pattern: &ast_unresolved::FunctionExpression,
+    pattern: &ast_unresolved::TreePattern,
     seen: &mut Vec<delightql_types::SqlIdentifier>,
 ) -> Result<()> {
+    use crate::pipeline::asts::core::{PatternTarget, RecordPatternMember, TreePattern};
     match pattern {
-        ast_unresolved::FunctionExpression::MetadataTreeGroup {
-            key_column,
-            constructor,
-            ..
-        } => {
-            bind_pattern_name(key_column, seen)?;
-            collect_pattern_bindings(constructor, seen)
-        }
-        ast_unresolved::FunctionExpression::Curly { members, .. } => {
-            for member in members {
+        TreePattern::Record(record) => {
+            for member in record.members.iter() {
                 match member {
-                    ast_unresolved::CurlyMember::Shorthand { column, .. } => bind_pattern_name(column, seen)?,
-                    ast_unresolved::CurlyMember::KeyValue { value, .. } => match &**value {
-                        ast_unresolved::DomainExpression::Lvar { name, .. } => bind_pattern_name(name, seen)?,
-                        ast_unresolved::DomainExpression::Function(nested) => {
-                            collect_pattern_bindings(nested, seen)?
-                        }
-                        _ => {}
-                    },
-                    ast_unresolved::CurlyMember::PathLiteral { path, alias } => {
-                        if let Some(name) = path_binding_name(path, alias) {
+                    RecordPatternMember::Binder(binder) => bind_pattern_name(&binder.name, seen)?,
+                    RecordPatternMember::Keyed { binder, .. } => {
+                        bind_pattern_name(&binder.name, seen)?
+                    }
+                    RecordPatternMember::Nested { pattern, .. } => {
+                        collect_pattern_bindings(pattern, seen)?
+                    }
+                    RecordPatternMember::Path(binding) => {
+                        if let Some(name) = path_binding_name(&binding.path, &binding.naming) {
                             bind_pattern_name(&name, seen)?
                         }
                     }
-                    _ => {}
+                    RecordPatternMember::Metadata { key, target } => {
+                        bind_pattern_name(&key.name, seen)?;
+                        if let PatternTarget::Pattern(inner) = target {
+                            collect_pattern_bindings(inner, seen)?;
+                        }
+                    }
+                    RecordPatternMember::Disregarded => {}
                 }
             }
             Ok(())
         }
-        ast_unresolved::FunctionExpression::Array { members, .. } => {
-            for ast_unresolved::ArrayMember::Index { path, alias } in members {
-                if let Some(name) = path_binding_name(path, alias) {
+        TreePattern::Array(array) => {
+            for member in array.members.iter() {
+                if let Some(name) = path_binding_name(&member.path, &member.naming) {
                     bind_pattern_name(&name, seen)?
                 }
             }
             Ok(())
         }
-        _ => Ok(()),
     }
 }
 
-/// The output column a path-literal member binds: its alias, or the
-/// path's last object key. Index-terminated unaliased paths derive
-/// positional names elsewhere and cannot collide by spelling.
+/// The output column a reaching member binds: its name, or the path's last
+/// object key. Index-terminated unnamed paths derive positional names
+/// elsewhere and cannot collide by spelling.
 fn path_binding_name(
-    path: &ast_unresolved::DomainExpression,
-    alias: &Option<delightql_types::SqlIdentifier>,
+    path: &crate::pipeline::asts::core::Path,
+    naming: &Option<delightql_types::SqlIdentifier>,
 ) -> Option<delightql_types::SqlIdentifier> {
-    if let Some(a) = alias {
+    if let Some(a) = naming {
         return Some(a.clone());
     }
-    if let ast_unresolved::DomainExpression::Projection(ProjectionExpr::JsonPathLiteral {
-        segments,
-        ..
-    }) = path
-    {
-        if let Some(crate::pipeline::asts::core::expressions::functions::PathSegment::ObjectKey(
-            key,
-        )) = segments.last()
-        {
-            return Some(delightql_types::SqlIdentifier::from(key.as_str()));
-        }
-    }
-    None
+    path.last_key().map(delightql_types::SqlIdentifier::from)
 }
 
+/// Refuse sibling explosions: two `~>` at one pattern level would multiply
+/// against each other, and which product the author meant is unstated.
 pub(in crate::pipeline::resolver) fn validate_no_sibling_explosions(
-    pattern: &ast_unresolved::FunctionExpression,
+    pattern: &ast_unresolved::TreePattern,
 ) -> Result<()> {
-    match pattern {
-        ast_unresolved::FunctionExpression::MetadataTreeGroup { constructor, .. } => {
-            // Recurse into the nested constructor
-            validate_no_sibling_explosions(constructor.as_ref())?;
-            Ok(())
-        }
-
-        ast_unresolved::FunctionExpression::Curly { members, .. } => {
-            // Count how many members have nested_reduction: true at THIS level
-            let explosion_count = members
-                .iter()
-                .filter(|m| {
-                    matches!(
-                        m,
-                        ast_unresolved::CurlyMember::KeyValue {
-                            nested_reduction: true,
-                            ..
-                        }
-                    )
-                })
-                .count();
-
-            if explosion_count > 1 {
-                return Err(DelightQLError::validation_error(
-                    "Multiple array explosions (~>) at the same pattern level create ambiguous cartesian product.\n\
-                     Use sequential steps instead:\n\
-                     Example:\n\
-                     - Step 1: data ~= ~> {{\"users\": users_data, \"orders\": orders_data}}\n\
-                     - Step 2: users_data ~= ~> {{first_name}}",
-                    "destructuring"
-                ));
-            }
-
-            // Recurse into nested patterns to check all depths
-            for member in members {
-                match member {
-                    ast_unresolved::CurlyMember::KeyValue {
-                        value,
-                        nested_reduction,
-                        ..
-                    } => {
-                        if *nested_reduction {
-                            if let ast_unresolved::DomainExpression::Function(nested_func) =
-                                &**value
-                            {
-                                validate_no_sibling_explosions(nested_func)?;
-                            }
-                        } else {
-                            if let ast_unresolved::DomainExpression::Function(nested_func) =
-                                &**value
-                            {
-                                validate_no_sibling_explosions(nested_func)?;
-                            }
-                        }
-                    }
-                    ast_unresolved::CurlyMember::Shorthand { .. }
-                    | ast_unresolved::CurlyMember::Comparison { .. }
-                    | ast_unresolved::CurlyMember::Glob { .. }
-                    | ast_unresolved::CurlyMember::Pattern { .. }
-                    | ast_unresolved::CurlyMember::OrdinalRange { .. }
-                    | ast_unresolved::CurlyMember::Placeholder { .. }
-                    | ast_unresolved::CurlyMember::PathLiteral { .. } => {}
-                }
-            }
-
-            Ok(())
-        }
-
-        // Array destructuring: positional, no sibling explosion concept
-        ast_unresolved::FunctionExpression::Array { .. } => Ok(()),
-        // All other function types: not destructuring patterns, no explosion validation needed
-        ast_unresolved::FunctionExpression::Regular { .. }
-        | ast_unresolved::FunctionExpression::Curried { .. }
-        | ast_unresolved::FunctionExpression::Bracket { .. }
-        | ast_unresolved::FunctionExpression::Infix { .. }
-        | ast_unresolved::FunctionExpression::HigherOrder { .. }
-        | ast_unresolved::FunctionExpression::Lambda { .. }
-        | ast_unresolved::FunctionExpression::StringTemplate { .. }
-        | ast_unresolved::FunctionExpression::CaseExpression { .. }
-        | ast_unresolved::FunctionExpression::Window { .. }
-        | ast_unresolved::FunctionExpression::JsonPath { .. } => Ok(()),
+    use crate::pipeline::asts::core::{PatternTarget, RecordPatternMember, TreePattern};
+    let TreePattern::Record(record) = pattern else {
+        // A positional pattern binds indices; no member of one explodes.
+        return Ok(());
+    };
+    let explosion_count = record
+        .members
+        .iter()
+        .filter(|member| {
+            matches!(
+                member,
+                RecordPatternMember::Nested {
+                    iteration: true,
+                    ..
+                } | RecordPatternMember::Metadata { .. }
+            )
+        })
+        .count();
+    if explosion_count > 1 {
+        return Err(DelightQLError::validation_error(
+            "Multiple array explosions (~>) at the same pattern level create ambiguous cartesian product.\n\
+             Use sequential steps instead:\n\
+             Example:\n\
+             - Step 1: data ~= ~> {{\"users\": users_data, \"orders\": orders_data}}\n\
+             - Step 2: users_data ~= ~> {{first_name}}",
+            "destructuring"
+        ));
     }
+    for member in record.members.iter() {
+        match member {
+            RecordPatternMember::Nested { pattern, .. } => validate_no_sibling_explosions(pattern)?,
+            RecordPatternMember::Metadata {
+                target: PatternTarget::Pattern(inner),
+                ..
+            } => validate_no_sibling_explosions(inner)?,
+            RecordPatternMember::Binder(_)
+            | RecordPatternMember::Keyed { .. }
+            | RecordPatternMember::Path(_)
+            | RecordPatternMember::Metadata {
+                target: PatternTarget::Disregarded,
+                ..
+            }
+            | RecordPatternMember::Disregarded => {}
+        }
+    }
+    Ok(())
 }
 
-/// Convert unresolved destructuring pattern to resolved WITHOUT actually resolving
-/// This is just a structural type conversion for destructuring patterns
+/// Bind an unresolved pattern's binders to the occurrences the destructure
+/// minted for them. Keys, reaches and iteration marks are spec material and
+/// cross unchanged.
 pub(in crate::pipeline::resolver) fn convert_destructure_pattern_to_resolved(
-    pattern: ast_unresolved::FunctionExpression,
-) -> Result<ast_resolved::FunctionExpression> {
-    match pattern {
-        ast_unresolved::FunctionExpression::MetadataTreeGroup {
-            key_column,
-            key_qualifier,
-            key_schema,
-            constructor,
-            keys_only,
-            cte_requirements: _cte_requirements,
-            alias,
-        } => {
-            // Convert the nested constructor pattern
-            let resolved_constructor = convert_destructure_pattern_to_resolved(*constructor)?;
-
-            Ok(ast_resolved::FunctionExpression::MetadataTreeGroup {
-                key_column,
-                key_qualifier,
-                key_schema,
-                constructor: Box::new(resolved_constructor),
-                keys_only,
-                cte_requirements: None, // None for destructuring
-                alias,
-            })
-        }
-
-        ast_unresolved::FunctionExpression::Curly {
-            members,
-            inner_grouping_keys: _,
-            cte_requirements: _,
-            alias,
-        } => {
-            let resolved_members: Result<Vec<_>> = members
-                .into_iter()
-                .map(|member| match member {
-                    ast_unresolved::CurlyMember::Shorthand {
-                        column,
-                        qualifier,
-                        schema,
-                    } => Ok(ast_resolved::CurlyMember::Shorthand {
-                        column,
-                        qualifier,
-                        schema,
-                    }),
-                    ast_unresolved::CurlyMember::KeyValue {
+    pattern: ast_unresolved::TreePattern,
+    columns: &std::collections::HashMap<crate::names::Sym, crate::names::ColId>,
+    identities: &crate::names::Registry,
+) -> Result<ast_resolved::TreePattern> {
+    use crate::pipeline::asts::core::{PatternTarget, RecordPatternMember, TreePattern};
+    Ok(match pattern {
+        TreePattern::Record(record) => TreePattern::Record(ast_resolved::RecordPattern {
+            members: record.members.try_map(|member| -> Result<_> {
+                Ok(match member {
+                    RecordPatternMember::Binder(binder) => RecordPatternMember::Binder(
+                        destructure_column(binder.name.as_str(), columns, identities)?,
+                    ),
+                    RecordPatternMember::Keyed { key, binder } => RecordPatternMember::Keyed {
                         key,
-                        nested_reduction,
-                        value,
-                    } => {
-                        let resolved_value = convert_unresolved_domain_to_resolved(*value)?;
-                        Ok(ast_resolved::CurlyMember::KeyValue {
-                            key,
-                            nested_reduction,
-                            value: Box::new(resolved_value),
-                        })
+                        binder: destructure_column(binder.name.as_str(), columns, identities)?,
+                    },
+                    RecordPatternMember::Nested {
+                        key,
+                        iteration,
+                        pattern,
+                    } => RecordPatternMember::Nested {
+                        key,
+                        iteration,
+                        pattern: Box::new(convert_destructure_pattern_to_resolved(
+                            *pattern, columns, identities,
+                        )?),
+                    },
+                    RecordPatternMember::Path(binding) => RecordPatternMember::Path(binding),
+                    RecordPatternMember::Metadata { key, target } => {
+                        RecordPatternMember::Metadata {
+                            key: destructure_column(key.name.as_str(), columns, identities)?,
+                            target: match target {
+                                PatternTarget::Pattern(inner) => PatternTarget::Pattern(Box::new(
+                                    convert_destructure_pattern_to_resolved(
+                                        *inner, columns, identities,
+                                    )?,
+                                )),
+                                PatternTarget::Disregarded => PatternTarget::Disregarded,
+                            },
+                        }
                     }
-
-                    // Placeholder {_} in destructuring means "explode but don't extract fields"
-                    ast_unresolved::CurlyMember::Placeholder => {
-                        Ok(ast_resolved::CurlyMember::Placeholder)
-                    }
-
-                    // PATH FIRST-CLASS: Epoch 5 - PathLiteral in destructuring
-                    ast_unresolved::CurlyMember::PathLiteral { path, alias } => {
-                        let resolved_path = convert_unresolved_domain_to_resolved(*path)?;
-                        Ok(ast_resolved::CurlyMember::PathLiteral {
-                            path: Box::new(resolved_path),
-                            alias,
-                        })
-                    }
-
-                    _ => Err(DelightQLError::parse_error(
-                        "Only Shorthand, KeyValue, PathLiteral, and Placeholder allowed in destructuring patterns",
-                    )),
+                    RecordPatternMember::Disregarded => RecordPatternMember::Disregarded,
                 })
-                .collect();
-
-            Ok(ast_resolved::FunctionExpression::Curly {
-                members: resolved_members?,
-                inner_grouping_keys: vec![], // Empty for destructuring
-                cte_requirements: None,      // None for destructuring
-                alias,
-            })
-        }
-
-        ast_unresolved::FunctionExpression::Array { members, alias } => {
-            // ARRAY DESTRUCTURING: Epoch 4 - Convert array pattern to resolved
-            let resolved_members: Result<Vec<_>> = members
-                .into_iter()
-                .map(|member| match member {
-                    ast_unresolved::ArrayMember::Index { path, alias } => {
-                        let resolved_path = convert_unresolved_domain_to_resolved(*path)?;
-                        Ok(ast_resolved::ArrayMember::Index {
-                            path: Box::new(resolved_path),
-                            alias,
-                        })
-                    }
-                })
-                .collect();
-
-            Ok(ast_resolved::FunctionExpression::Array {
-                members: resolved_members?,
-                alias,
-            })
-        }
-
-        _ => Err(DelightQLError::parse_error(
-            "Destructuring pattern must be Curly or Array",
-        )),
-    }
+            })?,
+        }),
+        // Members are paths and names — resolution has nothing to decide
+        // about either.
+        TreePattern::Array(array) => TreePattern::Array(array),
+    })
 }
 
-/// Convert unresolved domain expression to resolved WITHOUT actually resolving
-/// This is just a structural type conversion for destructuring patterns
-fn convert_unresolved_domain_to_resolved(
-    expr: ast_unresolved::DomainExpression,
-) -> Result<ast_resolved::DomainExpression> {
-    match expr {
-        ast_unresolved::DomainExpression::Lvar {
-            name,
-            qualifier,
-            namespace_path,
-            alias,
-            provenance,
-        } => {
-            // In destructuring, this is just an output column name
-            Ok(ast_resolved::DomainExpression::Lvar {
-                name,
-                qualifier,
-                namespace_path,
-                alias,
-                provenance: provenance.into(), // Convert Unresolved PhaseBox to Resolved
-            })
-        }
-        ast_unresolved::DomainExpression::Function(f) => {
-            let resolved_func = convert_destructure_pattern_to_resolved(f)?;
-            Ok(ast_resolved::DomainExpression::Function(resolved_func))
-        }
-        // PATH FIRST-CLASS: Epoch 5 - JsonPathLiteral in destructuring
-        ast_unresolved::DomainExpression::Projection(ProjectionExpr::JsonPathLiteral {
-            segments,
-            root_is_array,
-            alias,
-        }) => Ok(ast_resolved::DomainExpression::Projection(
-            ProjectionExpr::JsonPathLiteral {
-                segments,
-                root_is_array,
-                alias,
-            },
-        )),
-        _ => Err(DelightQLError::parse_error(
-            "Only Lvar, Function, and JsonPathLiteral allowed in destructuring pattern values",
-        )),
-    }
+fn destructure_column(
+    name: &str,
+    columns: &std::collections::HashMap<crate::names::Sym, crate::names::ColId>,
+    identities: &crate::names::Registry,
+) -> Result<crate::names::ColId> {
+    let spelling = identities.intern(name, false);
+    columns
+        .get(&identities.canonical(spelling))
+        .copied()
+        .ok_or_else(|| {
+            DelightQLError::parse_error(
+                "destructuring pattern output has no structural column occurrence",
+            )
+        })
 }
 
-/// Extract column name from a path literal for destructuring
-/// Convert path segments to a JSON path string with proper syntax:
-/// ObjectKey → `.key`, ArrayIndex → `[N]`
-fn segments_to_json_path(
-    segments: &[crate::pipeline::asts::core::expressions::functions::PathSegment],
-) -> String {
-    use crate::pipeline::asts::core::expressions::functions::PathSegment;
-
-    let mut path = String::new();
-    for seg in segments {
-        match seg {
-            PathSegment::ObjectKey(key) => {
-                if !path.is_empty() {
-                    path.push('.');
-                }
-                path.push_str(key);
-            }
-            PathSegment::ArrayIndex(idx) => {
-                path.push_str(&format!("[{}]", idx));
-            }
-        }
-    }
-    path
-}
-
-fn extract_json_path_from_path_literal(
-    path_expr: &ast_unresolved::DomainExpression,
-) -> Result<String> {
-    match path_expr {
-        ast_unresolved::DomainExpression::Projection(ProjectionExpr::JsonPathLiteral {
-            segments,
-            ..
-        }) => {
-            let path = segments_to_json_path(segments);
-            if path.is_empty() {
-                return Err(DelightQLError::parse_error(
-                    "Path literal must have at least one segment",
-                ));
-            }
-            Ok(path)
-        }
-        _ => Err(DelightQLError::parse_error(
-            "PathLiteral in destructuring must contain a JsonPathLiteral expression",
-        )),
-    }
-}
-
-fn extract_column_name_from_path_literal(
-    path_expr: &ast_unresolved::DomainExpression,
-) -> Result<String> {
-    match path_expr {
-        ast_unresolved::DomainExpression::Projection(ProjectionExpr::JsonPathLiteral {
-            segments,
-            ..
-        }) => {
-            use crate::pipeline::asts::core::expressions::functions::PathSegment;
-
-            let column_name = segments
-                .iter()
-                .map(|seg| match seg {
-                    PathSegment::ObjectKey(key) => key.clone(),
-                    PathSegment::ArrayIndex(idx) => idx.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("_");
-
-            if column_name.is_empty() {
-                return Err(DelightQLError::parse_error(
-                    "Path literal must have at least one segment",
-                ));
-            }
-
-            Ok(column_name)
-        }
-        _ => Err(DelightQLError::parse_error(
-            "PathLiteral in destructuring must contain a JsonPathLiteral expression",
-        )),
-    }
-}
-
-/// Expand a consulted sigma predicate into an OR'd boolean expression.
+/// Expand a consulted sigma predicate into the OR'd body of its clauses.
+///
+/// The POLARITY is not applied here. It observes this body — `IS TRUE` or
+/// `IS NOT TRUE` — and that observation is a collapse with no expression in
+/// truth position, so it rides on the application until the lowering spells
+/// it. Wrapping the body in Kleene NOT here is what made `\+f(x)` and `+f(x)`
+/// both drop a row whose body is UNKNOWN.
 pub(in crate::pipeline::resolver) fn expand_consulted_sigma(
     definition: &str,
     functor: &str,
     arguments: Vec<ast_unresolved::DomainExpression>,
-    exists: bool,
-) -> Result<ast_unresolved::BooleanExpression> {
-    let ddl_defs = ddl_builder::build_ddl_file(definition)?;
-    if ddl_defs.is_empty() {
+) -> Result<ast_unresolved::TruthExpression> {
+    let group = crate::ddl::reconstruct::group(definition).map_err(|e| {
+        DelightQLError::parse_error(format!(
+            "No definitions found for sigma predicate '{functor}': {e}"
+        ))
+    })?;
+    if group.kind() != DefKind::Sigma {
         return Err(DelightQLError::parse_error(format!(
-            "No definitions found for sigma predicate '{}'",
-            functor
+            "Expected sigma predicate definition for '{}', got {:?}",
+            functor,
+            group.kind()
         )));
     }
 
-    let mut clause_booleans: Vec<ast_unresolved::BooleanExpression> = Vec::new();
+    let mut clause_booleans: Vec<ast_unresolved::TruthExpression> = Vec::new();
 
-    for clause in &ddl_defs {
-        let params = match &clause.head {
-            DdlHead::SigmaPredicate { params } => params,
-            _ => {
-                return Err(DelightQLError::parse_error(format!(
-                    "Expected sigma predicate definition for '{}', got {:?}",
-                    functor, clause.head
-                )));
-            }
-        };
+    for clause in group.clauses() {
+        let params = clause.params();
 
         // Validate arity
         if params.len() != arguments.len() {
@@ -833,10 +539,11 @@ pub(in crate::pipeline::resolver) fn expand_consulted_sigma(
             ));
         }
 
-        // Get body as DomainExpression::Predicate
-        let body = clause.as_domain_expr().ok_or_else(|| {
+        // A sigma rule's body is a TRUTH, and the parse-level category says
+        // so: `p(x) :- users` never becomes one of these.
+        let body = clause.as_truth_expr().ok_or_else(|| {
             DelightQLError::parse_error(format!(
-                "Sigma predicate '{}' clause has non-scalar body",
+                "Sigma predicate '{}' clause has no truth body",
                 functor
             ))
         })?;
@@ -844,127 +551,17 @@ pub(in crate::pipeline::resolver) fn expand_consulted_sigma(
         // Build param → argument substitution map
         let param_map: HashMap<&str, &ast_unresolved::DomainExpression> = params
             .iter()
-            .map(|p| p.as_str())
+            .map(HoParam::name)
+            .map(delightql_types::SqlIdentifier::as_str)
             .zip(arguments.iter())
             .collect();
 
-        // Substitute parameters in body
-        let substituted = substitute_in_domain_expr(body.clone(), &param_map);
-
-        // Extract the BooleanExpression from DomainExpression::Predicate
-        let bool_expr = match substituted {
-            ast_unresolved::DomainExpression::Predicate { expr, .. } => *expr,
-            other => {
-                return Err(DelightQLError::parse_error(format!(
-                    "Sigma predicate '{}' body must be a boolean expression, got: {:?}",
-                    functor, other
-                )));
-            }
-        };
-
-        clause_booleans.push(bool_expr);
+        clause_booleans.push(substitute_in_truth_expr(body.clone(), &param_map));
     }
 
-    // Combine all clause booleans with OR
-    let combined = clause_booleans
-        .into_iter()
-        .reduce(|acc, next| ast_unresolved::BooleanExpression::Or {
-            left: Box::new(acc),
-            right: Box::new(next),
-        })
-        .unwrap(); // Safe: we checked ddl_defs is non-empty
-
-    // Apply NOT for anti-join (\+)
-    if exists {
-        Ok(combined)
-    } else {
-        Ok(ast_unresolved::BooleanExpression::Not {
-            expr: Box::new(combined),
-        })
-    }
-}
-
-/// Stamp OUTER-scope qualifiers onto the unqualified lvars of a semi-join
-/// argument expression.
-///
-/// The arguments of an argumentative semi/anti-join (`+rel(col)`) are
-/// written in the OUTER clause: a shared lvar name correlates the outer
-/// row with the fact row (shared-name correlation, book/reference/dql/
-/// where.md). The expansion places the comparison INSIDE the EXISTS
-/// subquery, where an unqualified name legally binds to the innermost
-/// scope (`_fact`) — which turned the guard into a self-comparison. Qualifying the argument's
-/// lvars with their outer table here preserves the correlation through
-/// inner-first name binding.
-///
-/// Rules (mirroring `synthesize_using_correlation`, the USING-form twin
-/// that always did this correctly):
-/// - unqualified lvar whose name matches an outer column under a Named
-///   table → stamp that table/alias as qualifier (first match wins,
-///   same as the USING path);
-/// - matches only under Fresh (anonymous pipe-stage) scopes → left
-///   unqualified (no name to stamp; such scopes have no correlated
-///   semi-join spelling today);
-/// - no outer match, already-qualified refs, and non-lvar leaves →
-///   untouched.
-///
-/// Nested relational scopes (scalar subqueries etc.) are NOT descended
-/// into — their lvars belong to their own scope.
-///
-/// Pinned by `resolver::semijoin_correlation_tests` and the
-/// `new_test_suite/balls/correctness_bugs/*_lost_correlation.sef` data
-/// tests.
-struct OuterArgumentQualifier<'a> {
-    outer_columns: &'a [ast_resolved::ColumnMetadata],
-}
-
-impl crate::pipeline::ast_transform::AstTransform<
-        crate::pipeline::asts::core::Unresolved,
-        crate::pipeline::asts::core::Unresolved,
-    > for OuterArgumentQualifier<'_>
-{
-    fn transform_domain(
-        &mut self,
-        expr: ast_unresolved::DomainExpression,
-    ) -> Result<ast_unresolved::DomainExpression> {
-        use crate::pipeline::ast_transform::walk_transform_domain;
-        use crate::pipeline::asts::core::metadata::TableName;
-
-        match expr {
-            ast_unresolved::DomainExpression::Lvar {
-                name,
-                qualifier: None,
-                namespace_path,
-                alias,
-                provenance,
-            } => {
-                let outer_qualifier: Option<delightql_types::SqlIdentifier> = self
-                    .outer_columns
-                    .iter()
-                    .find(|cm| delightql_types::SqlIdentifier::str_eq(cm.name(), name.as_str()))
-                    .and_then(|cm| match cm.qualifier() {
-                        TableName::Named(id) => Some(id.clone()),
-                        TableName::Fresh => None,
-                    });
-                Ok(ast_unresolved::DomainExpression::Lvar {
-                    name,
-                    qualifier: outer_qualifier,
-                    namespace_path,
-                    alias,
-                    provenance,
-                })
-            }
-            other => walk_transform_domain(self, other),
-        }
-    }
-
-    fn transform_relational(
-        &mut self,
-        e: ast_unresolved::RelationalExpression,
-    ) -> Result<ast_unresolved::RelationalExpression> {
-        // Do not descend into nested relational scopes — their lvars
-        // resolve against their own columns, not the outer clause.
-        Ok(e)
-    }
+    // Every clause is an alternative: the predicate holds if any does.
+    Ok(ast_unresolved::TruthExpression::any(clause_booleans)
+        .expect("a sigma definition group has at least one clause"))
 }
 
 /// Expand a table (fact) used as a sigma predicate.
@@ -973,18 +570,17 @@ impl crate::pipeline::ast_transform::AstTransform<
 ///   EXISTS (SELECT * FROM no_data AS _fact WHERE x IS NOT DISTINCT FROM _fact.|1|)
 ///
 /// `outer_columns` is the scope of the CALLING clause; argument lvars are
-/// qualified against it (see `OuterArgumentQualifier`) so the correlation
-/// to the outer row survives resolution inside the EXISTS subquery.
+/// bound against it so the correlation survives resolution inside EXISTS.
 ///
 /// Constructs the AST directly without re-parsing.
 pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
+    fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold<'_, '_>,
     table_name: &str,
-    namespace: crate::pipeline::asts::core::metadata::NamespacePath,
+    namespace: Vec<String>,
     arguments: Vec<ast_unresolved::DomainExpression>,
-    exists: bool,
-    outer_columns: &[ast_resolved::ColumnMetadata],
-) -> Result<ast_unresolved::BooleanExpression> {
-    use crate::pipeline::asts::core::{FilterOrigin, NamespacePath, PhaseBox};
+    polarity: crate::pipeline::asts::core::Polarity,
+) -> Result<ast_resolved::TruthExpression> {
+    use crate::pipeline::ast_transform::AstTransform;
 
     if arguments.is_empty() {
         return Err(DelightQLError::parse_error(format!(
@@ -993,84 +589,243 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
         )));
     }
 
-    // Correlation arguments are outer-clause expressions: stamp outer
-    // qualifiers before they get resolved inside the inner scope.
-    let mut qualifier = OuterArgumentQualifier { outer_columns };
-    let arguments = arguments
+    // The arguments are written in the ENCLOSING clause, so they are resolved
+    // here, standing in it — before anything nests. Resolving them after the
+    // fact relation is in scope is how a shared name came to compare the fact
+    // row with itself, and pre-binding them into the authored tree was the
+    // workaround.
+    let resolved_arguments = arguments
         .into_iter()
-        .map(|arg| {
-            crate::pipeline::ast_transform::AstTransform::transform_domain(&mut qualifier, arg)
-        })
+        .map(|argument| fold.transform_domain(argument))
         .collect::<Result<Vec<_>>>()?;
 
     // A QUALIFIED citation (`+HL.h(v)`) stamps its qualifier here, so the
     // inner reference resolves through the qualified-relation machinery —
     // aliases (session or scope-local), exposure, and its refusals.
     let table_ident = ast_unresolved::QualifiedName {
-        namespace_path: namespace,
+        namespace_path: crate::pipeline::asts::core::metadata::NamespacePath::from_parts(namespace)
+            .expect("qualified sigma namespace is nonempty"),
         name: table_name.into(),
-        grounding: None,
     };
 
     let fact_alias = "_fact";
 
     // Build subquery: table_name(*) as _fact
-    let subquery =
-        ast_unresolved::RelationalExpression::Relation(ast_unresolved::Relation::Ground {
-            identifier: table_ident.clone(),
-            canonical_name: PhaseBox::phantom(),
-            backend_schema: PhaseBox::phantom(),
-            domain_spec: ast_unresolved::DomainSpec::Glob,
-            alias: Some(fact_alias.into()),
-            outer: false,
-            mutation_target: false,
-            passthrough: false,
-            cpr_schema: PhaseBox::phantom(),
-            hygienic_injections: vec![],
-        });
-
-    // Build correlation: arg IS NOT DISTINCT FROM _fact.|N| for each argument
-    let mut conditions: Vec<ast_unresolved::BooleanExpression> = Vec::new();
-    for (i, arg) in arguments.iter().enumerate() {
-        let ordinal = (i + 1) as u16;
-        let fact_col = ast_unresolved::DomainExpression::ColumnOrdinal(PhaseBox::new(
-            crate::pipeline::asts::core::ColumnOrdinal {
-                position: ordinal,
-                reverse: false,
-                qualifier: Some(fact_alias.into()),
-                alias: None,
-                glob: false,
-                namespace_path: NamespacePath::empty(),
+    let subquery = ast_unresolved::Chain::read(
+        ast_unresolved::Relation::Ground {
+            mention: ast_unresolved::GroundMention::Named {
+                identifier: table_ident.clone(),
+                alias: Some(fact_alias.into()),
+                mutation_target: false,
+                passthrough: false,
             },
+            outer: false,
+            cpr_schema: (),
+        },
+        ast_unresolved::Access::All,
+        (),
+    );
+
+    // The fact relation resolves on its own, through the ordinary
+    // qualified-relation machinery — aliases, exposure, and its refusals.
+    let resolved =
+        fold.transform_boolean(ast_unresolved::TruthExpression::Existence(Existence {
+            polarity,
+            relation: Box::new(subquery),
+            addressing: ProbeAddressing {
+                identifier: table_ident,
+                using_columns: vec![],
+            },
+        }))?;
+    let ast_resolved::TruthExpression::Existence(Existence {
+        polarity,
+        relation: subquery,
+        ..
+    }) = resolved
+    else {
+        return Err(DelightQLError::transformation_error(
+            "resolving a sigma predicate's fact relation did not produce a \
+             membership test",
+            "sigma_expansion",
         ));
-
-        conditions.push(ast_unresolved::BooleanExpression::Comparison {
-            operator: "null_safe_eq".to_string(),
-            left: Box::new(arg.clone()),
-            right: Box::new(fact_col),
-        });
-    }
-
-    let combined = conditions
-        .into_iter()
-        .reduce(|acc, next| ast_unresolved::BooleanExpression::And {
-            left: Box::new(acc),
-            right: Box::new(next),
-        })
-        .unwrap();
-
-    let filtered = ast_unresolved::RelationalExpression::Filter {
-        source: Box::new(subquery),
-        condition: ast_unresolved::SigmaCondition::Predicate(combined),
-        origin: FilterOrigin::Generated,
-        cpr_schema: PhaseBox::phantom(),
     };
 
-    Ok(ast_unresolved::BooleanExpression::InnerExists {
-        exists,
-        identifier: table_ident,
-        subquery: Box::new(filtered),
-        alias: Some(fact_alias.into()),
-        using_columns: vec![],
-    })
+    // The guard is synthesized AFTER both sides are resolved, so each side is
+    // an occurrence its own scope answered for. Argument `i` constrains
+    // dimension `i` of the fact relation: the correlation is positional, which
+    // is what a fact's argument list means.
+    let subquery =
+        synthesize_argument_correlation(*subquery, resolved_arguments, &fold.registry.identities)?;
+
+    Ok(ast_resolved::TruthExpression::Existence(Existence {
+        polarity,
+        relation: Box::new(subquery),
+        addressing: (),
+    }))
+}
+
+/// Constrain a fact relation's dimensions by the arguments the caller wrote.
+///
+/// Both sides arrive resolved: the arguments were answered by the enclosing
+/// clause and the dimensions by the fact relation. Nothing here addresses
+/// anything by characters, so a fact that publishes the same name as an
+/// argument cannot capture it.
+fn synthesize_argument_correlation(
+    subquery: ast_resolved::Chain,
+    arguments: Vec<ast_resolved::DomainExpression>,
+    identities: &crate::names::Registry,
+) -> Result<ast_resolved::Chain> {
+    use crate::pipeline::asts::core::FilterOrigin;
+
+    let fact_scope = crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&subquery);
+    let dimensions = identities.known_heading(fact_scope)?;
+    if dimensions.len() < arguments.len() {
+        return Err(DelightQLError::validation_error(
+            format!(
+                "a fact taking {} arguments has only {} dimensions",
+                arguments.len(),
+                dimensions.len()
+            ),
+            "in a sigma predicate",
+        ));
+    }
+
+    let combined = arguments
+        .into_iter()
+        .zip(dimensions.iter().copied())
+        .map(|(argument, dimension)| {
+            ast_resolved::TruthExpression::Comparison(Comparison {
+                operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
+                left: Box::new(argument),
+                right: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
+                    NamedReference(ColumnOccurrence {
+                        column: dimension,
+                        explicit_qualifier: true,
+                    }),
+                ))),
+            })
+        })
+        .collect::<Vec<_>>();
+    let combined = ast_resolved::TruthExpression::all(combined)
+        .expect("a sigma predicate refuses an empty argument list");
+
+    Ok(subquery.then(ast_resolved::Continuation::Restrict {
+        condition: combined,
+        origin: FilterOrigin::Generated,
+        cpr_schema: fact_scope,
+    }))
+}
+
+#[cfg(test)]
+mod sigma_argument_tests {
+    use super::*;
+    use crate::names::{Addressing, ColumnOrigin, Hint, Registry, ScopeOrigin, ValueFacts};
+    use crate::pipeline::asts::core::{Access, Relation};
+
+    fn fact_scope(registry: &Registry, name: &str, columns: &[&str]) -> crate::names::ScopeId {
+        let spelling = registry.intern(name, false);
+        let scope = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::User(spelling), None);
+        for (position, column) in columns.iter().enumerate() {
+            let published = registry.intern(column, false);
+            registry.mint_column(
+                scope,
+                ColumnOrigin::Bound {
+                    position: position as u32,
+                },
+                Some(published),
+                Addressing::Published,
+                ValueFacts::default(),
+            );
+        }
+        scope
+    }
+
+    fn fact_chain(scope: crate::names::ScopeId) -> ast_resolved::Chain {
+        Relation::ground_read(Access::All, false, scope)
+    }
+
+    fn outer_column(registry: &Registry, name: &str) -> crate::names::ColId {
+        let scope = fact_scope(registry, "outer", &[name]);
+        registry
+            .known_heading(scope)
+            .expect("a published heading")
+            .in_order()
+            .next()
+            .copied()
+            .expect("one published column")
+    }
+
+    fn argument(column: crate::names::ColId) -> ast_resolved::DomainExpression {
+        ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence {
+                column,
+                explicit_qualifier: false,
+            },
+        )))
+    }
+
+    /// The guard names the fact's OWN dimension, positionally — never a
+    /// column it found by matching the argument's name. A fact publishing
+    /// the same name as the argument is the case the old pre-binding pass
+    /// existed to survive.
+    #[test]
+    fn an_argument_constrains_the_dimension_at_its_position() {
+        let registry = Registry::new(&[]);
+        let scope = fact_scope(&registry, "no_data", &["x", "y"]);
+        let dimensions: Vec<_> = registry
+            .known_heading(scope)
+            .expect("a published heading")
+            .in_order()
+            .copied()
+            .collect();
+        let outer = outer_column(&registry, "x");
+
+        let guarded =
+            synthesize_argument_correlation(fact_chain(scope), vec![argument(outer)], &registry)
+                .expect("one argument, two dimensions");
+
+        let ast_resolved::Continuation::Restrict {
+            condition: predicate,
+            ..
+        } = guarded.continuations.last().expect("a guard was appended")
+        else {
+            panic!("expected a restriction carrying the guard");
+        };
+        let ast_resolved::TruthExpression::Comparison(Comparison { left, right, .. }) = predicate
+        else {
+            panic!("expected one comparison");
+        };
+        assert_eq!(**left, argument(outer), "the argument stays the caller's");
+        let ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence { column, .. },
+        ))) = &**right
+        else {
+            panic!("expected the fact's dimension");
+        };
+        assert_eq!(
+            *column, dimensions[0],
+            "argument 0 constrains dimension 0, by position"
+        );
+        assert_ne!(
+            *column, outer,
+            "the fact's `x` never captures the outer `x`"
+        );
+    }
+
+    /// A fact with fewer dimensions than the caller wrote arguments for is
+    /// refused, not silently truncated by the zip.
+    #[test]
+    fn more_arguments_than_dimensions_is_refused() {
+        let registry = Registry::new(&[]);
+        let scope = fact_scope(&registry, "no_data", &["x"]);
+        let first = outer_column(&registry, "a");
+        let second = outer_column(&registry, "b");
+
+        assert!(synthesize_argument_correlation(
+            fact_chain(scope),
+            vec![argument(first), argument(second)],
+            &registry,
+        )
+        .is_err());
+    }
 }

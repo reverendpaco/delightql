@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-pub mod uri_registry;
 pub mod api;
-pub mod diagnostics;
 pub(crate) mod bin_cartridge;
+pub(crate) mod compiler_limits;
+#[cfg(test)]
+mod construction_fence;
 pub(crate) mod ddl;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod ddl_pipeline;
+pub mod diagnostics;
 pub(crate) mod enums;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod external_effects;
 pub(crate) mod lispy;
+pub(crate) mod names;
 pub(crate) mod namespace;
 pub(crate) mod pipeline;
+pub(crate) mod probe;
+pub(crate) mod refinement_budget;
 pub(crate) mod resolution;
-pub mod session_cwd;
-pub mod term_spec;
 pub(crate) mod seed_manifest;
+pub mod session_cwd;
 pub(crate) mod sexp_formatter;
 pub(crate) mod stdlib_manifest;
+pub mod term_spec;
+pub mod uri_registry;
 
 // Modules that depend on rusqlite (native only)
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +41,9 @@ pub(crate) mod relay;
 // System module: full version for native, minimal version for WASM
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod system;
+
+#[cfg(test)]
+mod mount_lifecycle_tests;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod wasm_system;
 #[cfg(target_arch = "wasm32")]
@@ -48,9 +59,8 @@ pub use delightql_types::{DelightQLError, Result};
 /// behavior cannot drift — a function, not a type re-export, because
 /// `pipeline` stays pub(crate) (the decoupling boundary).
 pub fn is_known_dialect_family(name: &str) -> bool {
-    pipeline::generator_v3::SqlDialect::from_family_name(name).is_some()
+    pipeline::generator::SqlDialect::from_family_name(name).is_some()
 }
 
 // Re-export derive macros (crate-internal only — used by #[derive] on AST types)
-pub(crate) use delightql_macros::PhaseConvert;
 pub(crate) use delightql_macros::ToLispy;

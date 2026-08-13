@@ -3,10 +3,10 @@
 // Danger Gate System
 //
 // Named safety boundaries that are OFF by default. Each gate is identified
-// by a badge-form URI (e.g. "delightql-danger://cardinality/nulljoin",
-// URI-DESIGN.md §2) and controls whether the compiler uses a safe or
-// dangerous code path. Annotations and flags carry the bare hierarchy
-// (their sigil declares the kind); canonical_danger_uri() normalizes.
+// by a badge-form URI (e.g. "delightql-danger://cardinality/cartesian")
+// and controls whether the compiler uses a safe or dangerous code path.
+// Annotations and flags carry the bare hierarchy (their sigil declares
+// the kind); canonical_danger_uri() normalizes.
 
 use std::collections::HashMap;
 
@@ -18,12 +18,25 @@ use super::asts::core::{DangerSpec, DangerState};
 /// Guardrail dangers (execution policy) may be overridden from the CLI.
 const KNOWN_DANGERS: &[(&str, DangerState, bool)] = &[
     //                                          default           cli_overridable
-    ("delightql-danger://cardinality/cartesian", DangerState::Off, true),
-    ("delightql-danger://termination/unbounded", DangerState::Off, true),
-    ("delightql-danger://semantics/min_multiplicity", DangerState::Off, false), // semantic — inline-only
+    (
+        "delightql-danger://cardinality/cartesian",
+        DangerState::Off,
+        true,
+    ),
+    (
+        "delightql-danger://termination/unbounded",
+        DangerState::Off,
+        true,
+    ),
+    (
+        "delightql-danger://semantics/min_multiplicity",
+        DangerState::Off,
+        false,
+    ), // semantic — inline-only
 ];
 
-/// A map of danger URIs to their current states, supporting prefix matching.
+/// A map of danger URIs to their current states. A gate is named exactly:
+/// lookup is by canonical URI, so opening `cardinality/` opens nothing.
 #[derive(Debug, Clone)]
 pub struct DangerGateMap {
     gates: HashMap<String, DangerState>,
@@ -57,7 +70,7 @@ impl DangerGateMap {
     }
 }
 
-/// The danger badge scheme (URI-DESIGN.md §2).
+/// The danger badge scheme's URI prefix.
 pub const DANGER_URI_SCHEME: &str = "delightql-danger://";
 
 /// Canonicalize a danger URI: bare hierarchy (annotation/flag sugar)
@@ -67,20 +80,6 @@ pub fn canonical_danger_uri(input: &str) -> String {
         input.to_string()
     } else {
         format!("{DANGER_URI_SCHEME}{input}")
-    }
-}
-
-/// Gates REMOVED by ruling. Guessing one teaches the replacement —
-/// never a silent no-op, and never a bare "unknown".
-pub fn removed_danger_teaching(uri: &str) -> Option<&'static str> {
-    match uri.trim_start_matches(DANGER_URI_SCHEME) {
-        // Null never corresponds in a join: a null that is meant to
-        // match is a value wearing null's clothes. There is no gate
-        // back into null-matching ON clauses; name the value instead.
-        "cardinality/nulljoin" => Some(
-            "the cardinality/nulljoin gate was removed: null never corresponds in a join. A null that is meant to match is a value wearing null's clothes — name it and join on the named key, e.g. +(coalesce:(k, \"unassigned\") as k_key) on both sides, then k_key = k_key",
-        ),
-        _ => None,
     }
 }
 
@@ -117,12 +116,6 @@ pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
     })?;
     let uri = canonical_danger_uri(hierarchy.trim());
 
-    if let Some(teaching) = removed_danger_teaching(&uri) {
-        return Err(crate::error::DelightQLError::validation_error(
-            teaching.to_string(),
-            "parse_cli_danger_spec",
-        ));
-    }
     if !KNOWN_DANGERS.iter().any(|(known, _, _)| *known == uri) {
         return Err(crate::error::DelightQLError::validation_error(
             format!(
@@ -139,7 +132,7 @@ pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
             format!(
                 "danger '{}' cannot be opened from the CLI: it changes what the \
                  query MEANS, so it must be visible in the query text — spell it \
-                 inline: (~~danger://{} ON~~)",
+                 inline: (~~danger://{}~~)",
                 hierarchy.trim(),
                 hierarchy.trim(),
             ),
@@ -168,7 +161,6 @@ pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
     Ok(DangerSpec {
         uri,
         state,
-        source_location: None,
     })
 }
 
@@ -189,18 +181,14 @@ mod cli_danger_spec_tests {
     fn non_overridable_gate_refuses_with_inline_teaching() {
         let err = parse_cli_danger_spec("semantics/min_multiplicity=ON").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("inline"), "must teach the inline spelling: {msg}");
         assert!(
-            msg.contains("(~~danger://semantics/min_multiplicity ON~~)"),
+            msg.contains("inline"),
+            "must teach the inline spelling: {msg}"
+        );
+        assert!(
+            msg.contains("(~~danger://semantics/min_multiplicity~~)"),
             "{msg}"
         );
-    }
-
-    #[test]
-    fn removed_nulljoin_gate_teaches_the_named_value_pattern() {
-        let err = parse_cli_danger_spec("cardinality/nulljoin=ON").unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("null never corresponds in a join"), "{msg}");
     }
 
     #[test]

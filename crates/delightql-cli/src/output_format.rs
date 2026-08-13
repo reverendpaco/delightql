@@ -461,7 +461,7 @@ fn json_affinity(descriptor: &str) -> JsonAffinity {
 /// text round-trips exactly (parse-then-reprint equality) — a TEXT
 /// '007' stays "007", a REAL '3.50' stays "3.50". NULL is null.
 /// Emission never loses bytes; it only unquotes what is provably a
-/// number (PLAN.md #5: the JSON formatter must not lie about types).
+/// number — the JSON formatter must not lie about types.
 pub fn json_cell(descriptor: &str, cell: Option<&str>) -> String {
     let Some(s) = cell else {
         return "null".to_string();
@@ -507,7 +507,7 @@ pub fn json_object_row(
 
 /// JSON string escaping per RFC 8259: quotes, backslash, and all
 /// control chars (so terminal-injection sanitization is inherent).
-/// Also used by main's --error-format json records (R2.3).
+/// Also used by main's --error-format json records.
 pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -530,8 +530,8 @@ pub fn json_escape(s: &str) -> String {
 /// descriptors and no NULL fidelity — their cells arrive as the string
 /// "NULL"). Everything emits as strings, in relation order. The typed
 /// path is exec_ng's display_results_json, which reads nullable cells
-/// and descriptors; upgrading the tools paths to it is PLAN.md #5's
-/// recorded residue.
+/// and descriptors; upgrading the tools paths to it remains
+/// outstanding.
 fn format_as_json(columns: &[String], rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
         return "[]\n".to_string();

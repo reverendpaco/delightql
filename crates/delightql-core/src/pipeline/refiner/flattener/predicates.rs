@@ -1,344 +1,181 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-// predicates.rs - Predicate extraction and reference tracking
+//! Scope-local reference extraction for the refiner.
 
+use crate::names::ColId;
+use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::RelationalMembership;
+use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved;
-use crate::pipeline::asts::resolved::FunctionExpression;
 use std::collections::HashSet;
 
-/// Extract qualified and unqualified references from an expression
-pub(super) fn extract_references(
-    expr: &resolved::BooleanExpression,
-) -> (HashSet<String>, HashSet<String>) {
-    let mut qualified = HashSet::new();
-    let mut unqualified = HashSet::new();
-
-    match expr {
-        resolved::BooleanExpression::Comparison { left, right, .. } => {
-            extract_from_domain(left, &mut qualified, &mut unqualified);
-            extract_from_domain(right, &mut qualified, &mut unqualified);
-            log::debug!(
-                "Extracted refs from comparison: qualified={:?}, unqualified={:?}",
-                qualified,
-                unqualified
-            );
-        }
-        resolved::BooleanExpression::InnerExists { .. } => {
-            // Semi-join subquery is self-contained — inner table references
-            // (like anonymous table `_`) must not leak into the predicate's
-            // reference set. Only correlated outer refs matter, and those
-            // are already captured by the resolver on the outer expression.
-        }
-        resolved::BooleanExpression::And { left, right } => {
-            let (l_qual, l_unqual) = extract_references(left);
-            let (r_qual, r_unqual) = extract_references(right);
-            qualified.extend(l_qual);
-            qualified.extend(r_qual);
-            unqualified.extend(l_unqual);
-            unqualified.extend(r_unqual);
-        }
-        resolved::BooleanExpression::Or { left, right } => {
-            let (l_qual, l_unqual) = extract_references(left);
-            let (r_qual, r_unqual) = extract_references(right);
-            qualified.extend(l_qual);
-            qualified.extend(r_qual);
-            unqualified.extend(l_unqual);
-            unqualified.extend(r_unqual);
-        }
-        resolved::BooleanExpression::Using { columns } => {
-            for col in columns {
-                let name = match col {
-                    resolved::UsingColumn::Regular(qualified_name) => {
-                        qualified_name.name.to_string()
-                    }
-                    resolved::UsingColumn::Negated(qualified_name) => {
-                        qualified_name.name.to_string()
-                    }
-                };
-                unqualified.insert(name);
-            }
-        }
-        resolved::BooleanExpression::GlobCorrelation { left, right } => {
-            qualified.insert(left.to_string());
-            qualified.insert(right.to_string());
-        }
-        resolved::BooleanExpression::OrdinalGlobCorrelation { left, right } => {
-            qualified.insert(left.to_string());
-            qualified.insert(right.to_string());
-        }
-        // Remaining boolean expressions: no table references to extract at this level.
-        resolved::BooleanExpression::Not { expr } => {
-            let (q, u) = extract_references(expr);
-            qualified.extend(q);
-            unqualified.extend(u);
-        }
-        resolved::BooleanExpression::In { value, set, .. } => {
-            extract_from_domain(value, &mut qualified, &mut unqualified);
-            for expr in set {
-                extract_from_domain(expr, &mut qualified, &mut unqualified);
-            }
-        }
-        resolved::BooleanExpression::InRelational { value, .. } => {
-            extract_from_domain(value, &mut qualified, &mut unqualified);
-        }
-        resolved::BooleanExpression::BooleanLiteral { .. }
-        | resolved::BooleanExpression::Sigma { .. } => {}
-    }
-
-    (qualified, unqualified)
+pub(super) fn extract_references(expr: &resolved::TruthExpression) -> HashSet<ColId> {
+    let mut references = HashSet::new();
+    extract_from_boolean(expr, &mut references);
+    references
 }
 
-pub(super) fn extract_from_boolean(
-    expr: &resolved::BooleanExpression,
-    qualified: &mut HashSet<String>,
-    unqualified: &mut HashSet<String>,
-) {
+fn extract_from_boolean(expr: &resolved::TruthExpression, references: &mut HashSet<ColId>) {
     match expr {
-        resolved::BooleanExpression::Comparison { left, right, .. } => {
-            extract_from_domain(left, qualified, unqualified);
-            extract_from_domain(right, qualified, unqualified);
+        resolved::TruthExpression::Comparison(resolved::Comparison { left, right, .. }) => {
+            extract_from_domain(left, references);
+            extract_from_domain(right, references);
         }
-        resolved::BooleanExpression::And { left, right }
-        | resolved::BooleanExpression::Or { left, right } => {
-            extract_from_boolean(left, qualified, unqualified);
-            extract_from_boolean(right, qualified, unqualified);
-        }
-        resolved::BooleanExpression::Not { expr } => {
-            extract_from_boolean(expr, qualified, unqualified);
-        }
-        resolved::BooleanExpression::Using { .. } => {}
-        resolved::BooleanExpression::InnerExists { .. } => {}
-        resolved::BooleanExpression::In { value, set, .. } => {
-            extract_from_domain(value, qualified, unqualified);
-            for expr in set {
-                extract_from_domain(expr, qualified, unqualified);
+        resolved::TruthExpression::Conjunction(parts)
+        | resolved::TruthExpression::Disjunction(parts) => {
+            for part in parts.iter() {
+                extract_from_boolean(part, references);
             }
         }
-        resolved::BooleanExpression::InRelational { value, .. } => {
-            extract_from_domain(value, qualified, unqualified);
-            // Subquery references are internal — don't extract from them
+        resolved::TruthExpression::Not { expr } => {
+            extract_from_boolean(expr, references);
         }
-        resolved::BooleanExpression::BooleanLiteral { .. } => {}
-        resolved::BooleanExpression::Sigma { .. } => {}
-        resolved::BooleanExpression::GlobCorrelation { left, right } => {
-            qualified.insert(left.to_string());
-            qualified.insert(right.to_string());
+        resolved::TruthExpression::Membership(resolved::Membership { probe, rows, .. }) => {
+            for value in probe.values() {
+                extract_from_domain(value, references);
+            }
+            for row in rows {
+                for value in &row.0 {
+                    extract_from_domain(value, references);
+                }
+            }
         }
-        resolved::BooleanExpression::OrdinalGlobCorrelation { left, right } => {
-            qualified.insert(left.to_string());
-            qualified.insert(right.to_string());
+        resolved::TruthExpression::RelationalMembership(RelationalMembership { probe, .. }) => {
+            for value in probe.values() {
+                extract_from_domain(value, references);
+            }
+        }
+        resolved::TruthExpression::Existence(resolved::Existence { .. })
+        | resolved::TruthExpression::Sigma(resolved::SigmaApplication { .. }) => {}
+    }
+}
+
+fn extract_from_function(
+    function: &resolved::FunctionApplication,
+    references: &mut HashSet<ColId>,
+) {
+    match function {
+        resolved::FunctionApplication::Ground(_) | resolved::FunctionApplication::Open(_) => {}
+        // A scalarized relation is a self-contained nested scope; its
+        // interior's columns are not this predicate's references.
+        resolved::FunctionApplication::Scalarized(_) => {}
+        resolved::FunctionApplication::Standard(application) => {
+            for argument in application.call().arguments.value_domains() {
+                extract_from_domain(argument, references);
+            }
+        }
+        // The pick reads the columns its ARGUMENTS read; the arms are the
+        // callee's constants and reference nothing in this predicate.
+        resolved::FunctionApplication::FieldSelect(select) => {
+            for argument in select.application.call().arguments.value_domains() {
+                extract_from_domain(argument, references);
+            }
+        }
+        resolved::FunctionApplication::Infix(infix) => {
+            extract_from_domain(&infix.left, references);
+            extract_from_domain(&infix.right, references);
+        }
+        resolved::FunctionApplication::Template(template) => {
+            for part in template.parts() {
+                if let resolved::ValueTemplatePart::Interpolation(expression) = part {
+                    extract_from_domain(expression, references);
+                }
+            }
+        }
+        resolved::FunctionApplication::ClauseSelection(selection) => {
+            for arm in &selection.arms {
+                if let Some(guard) = &arm.guard {
+                    extract_from_boolean(guard, references);
+                }
+                extract_from_result(&arm.result, references);
+            }
+        }
+        resolved::FunctionApplication::Case(case) => {
+            let default = match case {
+                resolved::CaseExpression::Anchored {
+                    anchor,
+                    arms,
+                    default,
+                } => {
+                    extract_from_domain(anchor, references);
+                    for arm in arms.iter() {
+                        extract_from_domain(&arm.result, references);
+                    }
+                    default
+                }
+                resolved::CaseExpression::Searched { arms, default } => {
+                    for arm in arms.iter() {
+                        extract_from_boolean(&arm.condition, references);
+                        extract_from_domain(&arm.result, references);
+                    }
+                    default
+                }
+            };
+            if let Some(result) = default {
+                extract_from_domain(result, references);
+            }
+        }
+        resolved::FunctionApplication::JsonAccess(access) => {
+            extract_from_domain(&access.source, references);
+        }
+        resolved::FunctionApplication::Enclyph(enclyph) => {
+            extract_from_enclyph(enclyph, references);
         }
     }
 }
 
-pub(super) fn extract_from_domain(
-    expr: &resolved::DomainExpression,
-    qualified: &mut HashSet<String>,
-    unqualified: &mut HashSet<String>,
+fn extract_from_enclyph(
+    enclyph: &resolved::Enclyph,
+    references: &mut std::collections::HashSet<crate::names::ColId>,
 ) {
-    match expr {
-        resolved::DomainExpression::Lvar {
-            name, qualifier, ..
-        } => {
-            if let Some(qual) = qualifier {
-                qualified.insert(qual.to_string());
-            } else {
-                unqualified.insert(name.to_string());
-            }
-        }
-        resolved::DomainExpression::Parenthesized { inner, .. } => {
-            extract_from_domain(inner, qualified, unqualified);
-        }
-        resolved::DomainExpression::Function(func) => match func {
-            resolved::FunctionExpression::Infix { left, right, .. } => {
-                extract_from_domain(left, qualified, unqualified);
-                extract_from_domain(right, qualified, unqualified);
-            }
-            resolved::FunctionExpression::Regular { arguments, .. } => {
-                for arg in arguments {
-                    extract_from_domain(arg, qualified, unqualified);
-                }
-            }
-            resolved::FunctionExpression::Curried { arguments, .. } => {
-                for arg in arguments {
-                    extract_from_domain(arg, qualified, unqualified);
-                }
-            }
-            resolved::FunctionExpression::Bracket { arguments, .. } => {
-                for arg in arguments {
-                    extract_from_domain(arg, qualified, unqualified);
-                }
-            }
-            resolved::FunctionExpression::Lambda { body, .. } => {
-                extract_from_domain(body, qualified, unqualified);
-            }
-            resolved::FunctionExpression::StringTemplate { .. } => {}
-            resolved::FunctionExpression::CaseExpression { arms, .. } => {
-                // Extract from all CASE arms
-                for arm in arms {
-                    match arm {
-                        resolved::CaseArm::Simple {
-                            test_expr, result, ..
-                        } => {
-                            extract_from_domain(test_expr, qualified, unqualified);
-                            extract_from_domain(result, qualified, unqualified);
-                        }
-                        resolved::CaseArm::CurriedSimple { result, .. } => {
-                            extract_from_domain(result, qualified, unqualified);
-                        }
-                        resolved::CaseArm::Searched { condition, result } => {
-                            extract_from_boolean(condition, qualified, unqualified);
-                            extract_from_domain(result, qualified, unqualified);
-                        }
-                        resolved::CaseArm::Default { result } => {
-                            extract_from_domain(result, qualified, unqualified);
-                        }
+    use crate::pipeline::asts::core::{Enclyph, NamedReference, RecordMember};
+    match enclyph {
+        Enclyph::Record(record) => {
+            for member in record.members.iter() {
+                match member {
+                    RecordMember::Keyed { value, .. } => extract_from_domain(value, references),
+                    RecordMember::Induced { value, .. } => extract_from_enclyph(value, references),
+                    RecordMember::SelfKeyed(NamedReference(occurrence)) => {
+                        references.insert(occurrence.column);
                     }
-                }
-            }
-            resolved::FunctionExpression::HigherOrder {
-                curried_arguments,
-                regular_arguments,
-                ..
-            } => {
-                for arg in curried_arguments {
-                    extract_from_domain(arg, qualified, unqualified);
-                }
-                for arg in regular_arguments {
-                    extract_from_domain(arg, qualified, unqualified);
-                }
-            }
-            resolved::FunctionExpression::Curly { .. } => {}
-            resolved::FunctionExpression::Array { .. } => {}
-            resolved::FunctionExpression::MetadataTreeGroup { .. } => {}
-            resolved::FunctionExpression::Window {
-                arguments,
-                partition_by,
-                order_by,
-                ..
-            } => {
-                for arg in arguments {
-                    extract_from_domain(arg, qualified, unqualified);
-                }
-                for expr in partition_by {
-                    extract_from_domain(expr, qualified, unqualified);
-                }
-                for spec in order_by {
-                    extract_from_domain(&spec.column, qualified, unqualified);
-                }
-            }
-            FunctionExpression::JsonPath { source, .. } => {
-                // JsonPath: extract references from source expression
-                extract_from_domain(source, qualified, unqualified);
-            }
-        },
-        // Leaf domain expressions: no table references.
-        resolved::DomainExpression::Literal { .. }
-        | resolved::DomainExpression::Projection(_)
-        | resolved::DomainExpression::NonUnifiyingUnderscore
-        | resolved::DomainExpression::ValuePlaceholder { .. }
-        | resolved::DomainExpression::Substitution(_)
-        | resolved::DomainExpression::ColumnOrdinal(_)
-        | resolved::DomainExpression::PivotOf { .. } => {}
-        // Predicate used as value: extract from the inner boolean expression.
-        resolved::DomainExpression::Predicate { expr, .. } => {
-            extract_from_boolean(expr, qualified, unqualified);
-        }
-        // PipedExpression: extract from value and transforms.
-        resolved::DomainExpression::PipedExpression {
-            value, transforms, ..
-        } => {
-            extract_from_domain(value, qualified, unqualified);
-            for (_, func) in transforms {
-                match func {
-                    resolved::FunctionExpression::Regular { arguments, .. }
-                    | resolved::FunctionExpression::Curried { arguments, .. }
-                    | resolved::FunctionExpression::Bracket { arguments, .. } => {
-                        for arg in arguments {
-                            extract_from_domain(arg, qualified, unqualified);
-                        }
-                    }
-                    // Spelled per R-I3 (was a bare `_ => {}`): these transform
-                    // function variants DO carry recursive domain expressions
-                    // (Infix.left/right, Lambda.body, CaseExpression.arms,
-                    // HigherOrder/Window args, JsonPath.source, …), but this
-                    // scope-local ref-extractor deliberately does NOT descend them
-                    // in pipe-transform position (kept a no-op, byte-identical). A
-                    // newly-added function variant now forces a decision here.
-                    resolved::FunctionExpression::Infix { .. }
-                    | resolved::FunctionExpression::Lambda { .. }
-                    | resolved::FunctionExpression::HigherOrder { .. }
-                    | resolved::FunctionExpression::CaseExpression { .. }
-                    | resolved::FunctionExpression::Window { .. }
-                    | resolved::FunctionExpression::StringTemplate { .. }
-                    | resolved::FunctionExpression::Curly { .. }
-                    | resolved::FunctionExpression::Array { .. }
-                    | resolved::FunctionExpression::MetadataTreeGroup { .. }
-                    | resolved::FunctionExpression::JsonPath { .. } => {}
+                    // An authored spread is uninhabited after resolution.
+                    RecordMember::Spread(spread) => spread.expanded(),
                 }
             }
         }
-        // Tuple: extract from each element.
-        resolved::DomainExpression::Tuple { elements, .. } => {
-            for elem in elements {
-                extract_from_domain(elem, qualified, unqualified);
+        Enclyph::EmptyRecord(_) => {}
+        Enclyph::Tuple(tuple) => {
+            for element in tuple.elements.iter() {
+                extract_from_domain(element, references);
             }
         }
-        // ScalarSubquery: internal references are in a different scope.
-        // Don't extract — would incorrectly classify predicate as referencing inner tables.
-        resolved::DomainExpression::ScalarSubquery { .. } => {}
     }
 }
 
-/// Extract references from a RelationalExpression (for InnerExists).
-///
-/// SCOPE-LOCAL (INVENTORY L3): collects column/table refs for the flattener
-/// within the current scope only — `InRelational` value / `InnerExists` are NOT
-/// descended ("subquery references are internal"). The `_in_scope` name marks
-/// that deliberate stop at nested subquery scopes.
-#[stacksafe::stacksafe]
-pub(super) fn extract_refs_from_relational_in_scope(
-    expr: &resolved::RelationalExpression,
-    qualified: &mut HashSet<String>,
-    unqualified: &mut HashSet<String>,
+/// What an arm COMPUTES: a value, or the licensed crossing.
+fn extract_from_result(
+    result: &crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Resolved>,
+    references: &mut HashSet<ColId>,
 ) {
+    use crate::pipeline::asts::core::OutValue;
+    match result {
+        OutValue::Domain(value) => extract_from_domain(value, references),
+        OutValue::Truth(crossing) => extract_from_boolean(crossing.truth(), references),
+    }
+}
+
+fn extract_from_domain(expr: &resolved::DomainExpression, references: &mut HashSet<ColId>) {
     match expr {
-        resolved::RelationalExpression::Filter {
-            source, condition, ..
-        } => {
-            if let resolved::SigmaCondition::Predicate(pred) = condition {
-                let (q, u) = extract_references(pred);
-                qualified.extend(q);
-                unqualified.extend(u);
-            }
-            extract_refs_from_relational_in_scope(source, qualified, unqualified);
+        resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence { column, .. },
+        ))) => {
+            references.insert(*column);
         }
-        resolved::RelationalExpression::Join {
-            left,
-            right,
-            join_condition,
-            ..
-        } => {
-            if let Some(cond) = join_condition {
-                let (q, u) = extract_references(cond);
-                qualified.extend(q);
-                unqualified.extend(u);
-            }
-            extract_refs_from_relational_in_scope(left, qualified, unqualified);
-            extract_refs_from_relational_in_scope(right, qualified, unqualified);
+        resolved::DomainExpression::Application(function) => {
+            extract_from_function(function, references);
         }
-        // Leaf and compound nodes without boolean predicates at this level.
-        resolved::RelationalExpression::Relation(_)
-        | resolved::RelationalExpression::SetOperation { .. } => {}
-        resolved::RelationalExpression::Pipe(pipe) => {
-            extract_refs_from_relational_in_scope(&pipe.source, qualified, unqualified);
-        }
-        resolved::RelationalExpression::ErJoinChain { .. }
-        | resolved::RelationalExpression::ErTransitiveJoin { .. } => {
-            unreachable!("ER chains should be resolved before flattening")
-        }
-        resolved::RelationalExpression::IntersectCorresponding { .. } => {
-            unreachable!("IntersectCorresponding only exists in Refined/Addressed phases")
-        }
+        // Uninhabited after resolution, and still written: a match on a
+        // REFERENCE cannot omit an uninhabited variant's arm.
+        resolved::DomainExpression::Reference(Reference::Ordinal(_)) => {}
     }
 }

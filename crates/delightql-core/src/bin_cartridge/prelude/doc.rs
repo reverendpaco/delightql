@@ -49,7 +49,7 @@ impl BinEntity for DocPredicate {
                     _is_optional: false,
                 },
             ],
-            // EFFECT-ALGEBRA §3: the guaranteed core
+            // The guaranteed core
             // plus doc!'s one declared addition — the interior `input`
             // echo of the lifted argument table. doc! declares no payload.
             output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("doc")),
@@ -95,7 +95,7 @@ impl EffectExecutable for DocPredicate {
 
         let (target, doc) = system.set_entity_doc(&target, &doc)?;
 
-        // EFFECT-ALGEBRA §3 (amended): one receipt — the guaranteed core
+        // One receipt — the guaranteed core
         // plus the interior `input` echo of the (here one-row) lifted
         // argument table.
         Ok(EntityResult::Relation(super::input_receipt_result(
@@ -118,7 +118,7 @@ impl EffectExecutable for DocPredicate {
         alias: Option<String>,
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
-        // VALIDATE-FIRST (review hardening): the single setwise
+        // VALIDATE-FIRST: the single setwise
         // invocation is all-or-nothing — no row applies until every row
         // has parsed and validated, so an erroring invocation leaves
         // nothing half-documented.
@@ -144,17 +144,14 @@ impl EffectExecutable for DocPredicate {
             }
             validated.push((target, doc));
         }
-        // ALL-OR-NOTHING (review round 3): shape validation above cannot
+        // ALL-OR-NOTHING: shape validation above cannot
         // see target existence/ambiguity — those resolve inside
         // set_entity_doc — so the apply batch runs in ONE bootstrap
         // transaction: any failing element rolls back every earlier
         // update, keeping the single setwise invocation atomic. Pinned by
         // directive_contract 47 (a valid-then-invalid batch leaves the
         // valid target undocumented).
-        fn bootstrap_txn(
-            system: &crate::system::DelightQLSystem,
-            sql: &str,
-        ) -> Result<()> {
+        fn bootstrap_txn(system: &crate::system::DelightQLSystem, sql: &str) -> Result<()> {
             let conn = system.get_bootstrap_connection();
             let guard = conn.lock().map_err(|e| {
                 DelightQLError::connection_poison_error(
@@ -198,10 +195,7 @@ impl EffectExecutable for DocPredicate {
 /// Extract a string literal value from a DomainExpression
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
         _ => Err(DelightQLError::database_error(
             format!("doc!() {} must be a string literal", arg_name),
             "Invalid argument type",

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Imprint atomicity (review C1 + M6b): the genuine red→green pins for the
-//! transaction wrapped around `imprint_namespace`'s target-connection work.
+//! Imprint atomicity: the transaction wrapped around
+//! `imprint_namespace`'s target-connection work.
 //!
 //! Why an integration test and not a companion ball: the ball runner executes a
 //! test's DQL statements as a sequence and aborts on the first error (the
@@ -77,7 +77,7 @@ fn table_exists(db: &Path, name: &str) -> bool {
 /// Manifest of two entities. `kept` pre-exists in the target with distinctive
 /// rows, so replace-mode drops it up front. `broken` (listed first) creates
 /// fine but its CTAS INSERT violates a PRIMARY KEY — a failure at exec time,
-/// after `kept` is gone. Pre-fix: the drop was already committed → `kept`
+/// after `kept` is gone. If the drop commits first, `kept`
 /// destroyed. Post-fix: the whole target txn rolls back → `kept` intact,
 /// `broken` absent.
 #[test]
@@ -122,7 +122,7 @@ fn replace_partial_failure_preserves_survivor() {
     let (ok, _out, err) = run_dql(
         dir,
         "main.sqlite",
-        "consult!(\"ddl/lib.dql\", \"lib::a\")\nimprint_replace!(\"lib::a\", \"main\")\n",
+        "consult!(\"ddl/lib.dql\", \"lib::a\")(*)\nimprint_replace!(\"lib::a\", \"main\")(*)\n",
         true,
     );
     assert!(!ok, "imprint_replace! should fail; stderr:\n{err}");
@@ -190,7 +190,7 @@ fn strict_multi_entity_clash_leaves_target_untouched() {
     let (ok, _out, err) = run_dql(
         dir,
         "main.sqlite",
-        "consult!(\"ddl/lib.dql\", \"lib::a\")\nimprint!(\"lib::a\", \"main\")\n",
+        "consult!(\"ddl/lib.dql\", \"lib::a\")(*)\nimprint!(\"lib::a\", \"main\")(*)\n",
         true,
     );
     assert!(!ok, "strict imprint! over a clash should fail; stderr:\n{err}");

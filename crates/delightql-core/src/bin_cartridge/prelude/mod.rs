@@ -54,11 +54,12 @@ pub use unmount::UnmountPredicate;
 
 use super::{BinCartridge, BinCartridgeMetadata, BinEntity};
 use crate::enums::Language;
+use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::unresolved::*;
 use std::sync::Arc;
 
 /// The descriptor-declared receipt heading for a built-in directive
-/// (Phase 6 slice 2 — descriptor authority): entities' `output_schema`
+/// Descriptor authority: entities' `output_schema`
 /// calls THIS instead of hand-copying columns, so the descriptor is the
 /// source and there is no second authority to drift.
 pub(crate) fn descriptor_receipt_schema(bare_name: &str) -> Vec<(String, String)> {
@@ -67,7 +68,7 @@ pub(crate) fn descriptor_receipt_schema(bare_name: &str) -> Vec<(String, String)
         .receipt_columns()
 }
 
-/// Build a directive's CORE receipt FROM its descriptor (Phase 6 slice
+/// Build a directive's CORE receipt FROM its descriptor (slice
 /// 2): the echo column NAMES come from the descriptor's declared
 /// `receipt_echoes`; the caller supplies only the VALUES, in ledger
 /// order. An arity mismatch is an internal invariant violation — the
@@ -77,7 +78,7 @@ pub(crate) fn descriptor_core_receipt(
     bare_name: &str,
     values: &[Option<String>],
     alias: Option<String>,
-) -> Relation {
+) -> Grelex {
     let desc = crate::pipeline::asts::effects::descriptor(bare_name)
         .unwrap_or_else(|| panic!("no directive descriptor for '{bare_name}'"));
     assert_eq!(
@@ -103,7 +104,7 @@ fn core_receipt_result(
     operation: &str,
     echoes: &[(&str, Option<String>)],
     alias: Option<String>,
-) -> Relation {
+) -> Grelex {
     let mut headers = vec![
         DomainExpression::lvar_builder("success".to_string()).build(),
         DomainExpression::lvar_builder("operation".to_string()).build(),
@@ -114,32 +115,25 @@ fn core_receipt_result(
             .map(|(name, _)| DomainExpression::lvar_builder(name.to_string()).build()),
     );
     let mut values = vec![
-        DomainExpression::Literal {
-            value: LiteralValue::Number("1".to_string()),
-            alias: None,
-        },
-        DomainExpression::Literal {
-            value: LiteralValue::String(operation.to_string()),
-            alias: None,
-        },
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(
+            "1".to_string(),
+        ))),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(
+            operation.to_string(),
+        ))),
     ];
-    values.extend(echoes.iter().map(|(_, v)| DomainExpression::Literal {
-        value: match v {
+    values.extend(echoes.iter().map(|(_, v)| {
+        DomainExpression::Application(FunctionApplication::Ground(match v {
             Some(s) => LiteralValue::String(s.clone()),
             None => LiteralValue::Null,
-        },
-        alias: None,
+        }))
     }));
-    Relation::Anonymous {
-        column_headers: Some(headers),
-        rows: vec![Row { values }],
+    Grelex::Literal(AnonRelation {
+        table: AnonTable::from_values(Some(headers), vec![values], ())
+            .expect("an effect receipt has one nonempty row"),
         alias: alias.map(|s| s.into()),
         outer: false,
-        exists_mode: false,
-            negated: false,
-        qua_target: None,
-        cpr_schema: PhaseBox::phantom(),
-    }
+    })
 }
 
 /// A receipt with interior DECLARED ADDITIONS (EFFECT-ALGEBRA §3):
@@ -152,8 +146,8 @@ fn core_receipt_result(
 /// the guaranteed core, reordered — exactly what a programmer could
 /// write, so the resolver derives the interior schemas and
 /// drill/narrow/brace release work with no receipt-special machinery.
-/// The whole construction is wrapped in an aliased inner relation so it
-/// splices wherever a Relation sits (the Phase-1.X convention).
+/// The whole construction is wrapped in an inner relation so it splices
+/// wherever a Relation sits.
 pub(crate) fn interior_receipt_result(
     operation: &str,
     input_heading: &[&str],
@@ -161,7 +155,7 @@ pub(crate) fn interior_receipt_result(
     returned_heading: &[&str],
     returned_rows: &[Vec<Option<String>>],
     alias: Option<String>,
-) -> Relation {
+) -> Grelex {
     receipt_with_interiors(
         operation,
         &[],
@@ -174,7 +168,7 @@ pub(crate) fn interior_receipt_result(
 }
 
 /// A descriptor-driven receipt with flat echoes AND a `returned`
-/// tree-group payload (Phase 6 slice 3 — the tree directives): echo
+/// tree-group payload (the tree directives): echo
 /// NAMES come from the descriptor's declared `receipt_echoes`; the
 /// caller supplies echo VALUES in ledger order plus the payload's
 /// heading and rows (one interior row per member of the produced
@@ -185,7 +179,7 @@ pub(crate) fn descriptor_tree_receipt(
     returned_heading: &[&str],
     returned_rows: &[Vec<Option<String>>],
     alias: Option<String>,
-) -> Relation {
+) -> Grelex {
     let desc = crate::pipeline::asts::effects::descriptor(bare_name)
         .unwrap_or_else(|| panic!("no directive descriptor for '{bare_name}'"));
     assert!(
@@ -219,7 +213,7 @@ pub(crate) fn input_receipt_result(
     input_heading: &[&str],
     input_rows: &[Vec<Option<String>>],
     alias: Option<String>,
-) -> Relation {
+) -> Grelex {
     receipt_with_interiors(
         operation,
         &[],
@@ -233,76 +227,74 @@ fn receipt_with_interiors(
     echoes: &[(&str, Option<String>)],
     interiors: &[(&str, &[&str], &[Vec<Option<String>>])],
     alias: Option<String>,
-) -> Relation {
-    use crate::pipeline::asts::core::expressions::domain::ProjectionExpr;
-    use crate::pipeline::asts::core::expressions::functions::CurlyMember;
+) -> Grelex {
     use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
-    use crate::pipeline::asts::core::expressions::PipeExpression;
     use crate::pipeline::asts::core::metadata::NamespacePath;
-    use crate::pipeline::asts::core::specs::{ModuloSpec, OutputDomainExpression};
-    use crate::pipeline::asts::core::ContainmentSemantic;
-    use crate::pipeline::asts::core::FunctionExpression;
+    use crate::pipeline::asts::core::specs::{GroupSpec, OneOut, OutItem, ReductionItem};
+    use crate::pipeline::asts::core::FunctionApplication;
+    use crate::pipeline::asts::core::RecordMember;
+    use crate::pipeline::asts::core::{Glob, Spread};
 
     let anon = |heading: &[&str], rows: &[Vec<Option<String>>]| {
-        Relation::Anonymous {
-            column_headers: Some(
+        AnonTable::from_values(
+            Some(
                 heading
                     .iter()
                     .map(|h| DomainExpression::lvar_builder(h.to_string()).build())
                     .collect(),
             ),
-            rows: rows
-                .iter()
-                .map(|vals| Row {
-                    values: vals
-                        .iter()
-                        .map(|v| DomainExpression::Literal {
-                            value: match v {
+            rows.iter()
+                .map(|vals| {
+                    vals.iter()
+                        .map(|v| {
+                            DomainExpression::Application(FunctionApplication::Ground(match v {
                                 Some(s) => LiteralValue::String(s.clone()),
                                 // An all-NULL contributor row elides to the
                                 // empty interior `[]` (finding 1: an empty
                                 // lift still reaches the callee once).
                                 None => LiteralValue::Null,
-                            },
-                            alias: None,
+                            }))
                         })
-                        .collect(),
+                        .collect()
                 })
                 .collect(),
-            alias: None,
-            outer: false,
-            exists_mode: false,
-            negated: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        }
+            (),
+        )
+        .expect("an interior receipt has a nonempty heading and body")
     };
-    let pipe = |source: RelationalExpression, operator: UnaryRelationalOperator| {
-        RelationalExpression::Pipe(Box::new(stacksafe::StackSafe::new(PipeExpression {
-            source,
-            operator,
-            cpr_schema: PhaseBox::phantom(),
-        })))
+    let pipe = |source: Chain, operator: PipeOp| {
+        source.then(Continuation::Pipe {
+            operator: operator,
+            named: None,
+            cpr_schema: (),
+        })
     };
-    let grouped = |source: Relation, interior_name: &str| {
+    let grouped = |source: AnonTable, interior_name: &str| {
         pipe(
-            RelationalExpression::Relation(source),
-            UnaryRelationalOperator::Modulo {
-                containment_semantic: ContainmentSemantic::Parenthesis,
-                spec: ModuloSpec::GroupBy {
-                    reducing_by: Vec::new(),
-                    reducing_on: vec![OutputDomainExpression {
-                        expr: DomainExpression::Function(FunctionExpression::Curly {
-                            members: vec![CurlyMember::Glob],
-                            inner_grouping_keys: Vec::new(),
-                            cte_requirements: None,
-                            alias: Some(interior_name.into()),
-                        }),
-                        output: PhaseBox::phantom(),
-                    }],
-                    delegates: Vec::new(),
-                },
-            },
+            Chain::ground(Grelex::Literal(AnonRelation::plain(source))),
+            PipeOp::Group(GroupSpec::Reduce {
+                plan: ReductionPlan::empty(),
+                keys: Vec::new(),
+                reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(OutItem::One(
+                    OneOut {
+                        expr: OutValue::Domain(DomainExpression::Application(
+                            FunctionApplication::Enclyph(
+                                crate::pipeline::asts::core::Enclyph::Record(
+                                    crate::pipeline::asts::core::Record::plain(
+                                        crate::pipeline::asts::vocabulary::Vec1::new(RecordMember::Spread(
+                                            crate::pipeline::asts::core::Spread::Glob(
+                                                crate::pipeline::asts::core::Glob::whole(),
+                                            ),
+                                        )),
+                                    ),
+                                ),
+                            ),
+                        )),
+                        naming: Some(interior_name.into()),
+                        output: (),
+                    },
+                ))),
+            }),
         )
     };
 
@@ -312,45 +304,51 @@ fn receipt_with_interiors(
         .map(|(col, heading, rows)| grouped(anon(heading, rows), col));
     let mut joined = groups.next().expect("at least one declared interior");
     for right in groups {
-        joined = RelationalExpression::Join {
-            left: Box::new(joined),
-            right: Box::new(right),
-            join_condition: None,
+        joined = joined.then(Continuation::Member {
+            rhs: right,
+            correlation: None,
             join_type: None,
-            cpr_schema: PhaseBox::phantom(),
-        };
+            cpr_schema: (),
+        });
     }
+    let named = |expr, naming: delightql_types::SqlIdentifier| {
+        OutItem::One(OneOut {
+            expr: OutValue::Domain(expr),
+            naming: Some(naming),
+            output: (),
+        })
+    };
     let mut widening = vec![
-        DomainExpression::Projection(ProjectionExpr::Glob {
-            qualifier: None,
-            namespace_path: NamespacePath::empty(),
-        }),
-        DomainExpression::Literal {
-            value: LiteralValue::Number("1".to_string()),
-            alias: Some("success".into()),
-        },
-        DomainExpression::Literal {
-            value: LiteralValue::String(operation.to_string()),
-            alias: Some("operation".into()),
-        },
+        OutItem::Many(Spread::Glob(Glob::whole())),
+        named(
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(
+                "1".to_string(),
+            ))),
+            "success".into(),
+        ),
+        named(
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(
+                operation.to_string(),
+            ))),
+            "operation".into(),
+        ),
     ];
     // Flat echoes widen exactly like the core (an optional echo is a
     // NULL literal), so the ledger order below can place them between
     // the core and the interiors.
-    widening.extend(echoes.iter().map(|(name, v)| DomainExpression::Literal {
-        value: match v {
-            Some(s) => LiteralValue::String(s.clone()),
-            None => LiteralValue::Null,
-        },
-        alias: Some((*name).into()),
+    widening.extend(echoes.iter().map(|(name, v)| {
+        named(
+            DomainExpression::Application(FunctionApplication::Ground(match v {
+                Some(s) => LiteralValue::String(s.clone()),
+                None => LiteralValue::Null,
+            })),
+            (*name).into(),
+        )
     }));
-    let widened = pipe(
-        joined,
-        UnaryRelationalOperator::General {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            expressions: widening,
-        },
-    );
+    // The receipt projection always carries `success` and `operation`.
+    let widening = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(widening)
+        .expect("the receipt projection carries success and operation");
+    let widened = pipe(joined, PipeOp::Project(widening));
     let order: Vec<&str> = ["success", "operation"]
         .into_iter()
         .chain(echoes.iter().map(|(name, _)| *name))
@@ -358,31 +356,35 @@ fn receipt_with_interiors(
         .collect();
     let ordered = pipe(
         widened,
-        UnaryRelationalOperator::General {
-            containment_semantic: ContainmentSemantic::Parenthesis,
-            expressions: order
-                .iter()
-                .map(|n| DomainExpression::lvar_builder(n.to_string()).build())
-                .collect(),
-        },
+        PipeOp::Project(
+            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(
+                order
+                    .iter()
+                    .map(|n| {
+                        OutItem::plain(DomainExpression::lvar_builder(n.to_string()).build(), ())
+                    })
+                    .collect(),
+            )
+            .expect("the receipt ordering names success and operation"),
+        ),
     );
 
-    let wrapper = alias.unwrap_or_else(|| {
-        format!("__r_{}", operation.trim_end_matches('!'))
-    });
-    Relation::InnerRelation {
+    let identifier = alias
+        .as_deref()
+        .unwrap_or_else(|| operation.trim_end_matches('!'));
+    Grelex::Reference(Relation::InnerRelation {
         pattern: InnerRelationPattern::Indeterminate {
             identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
                 namespace_path: NamespacePath::empty(),
-                name: wrapper.clone().into(),
-                grounding: None,
+                name: identifier.into(),
             },
             subquery: Box::new(ordered),
         },
-        alias: Some(wrapper.into()),
+        preminted_scope: None,
+        alias: alias.map(Into::into),
         outer: false,
-        cpr_schema: PhaseBox::phantom(),
-    }
+        cpr_schema: (),
+    })
 }
 
 /// Prelude cartridge - provides core pseudo-predicates
@@ -400,30 +402,131 @@ impl BinCartridge for PreludeCartridge {
     }
 
     fn entities(&self) -> Vec<Arc<dyn BinEntity>> {
-        vec![
-            Arc::new(MountPredicate) as Arc<dyn BinEntity>,
-            Arc::new(MountNewPredicate) as Arc<dyn BinEntity>,
-            Arc::new(MountTreePredicate) as Arc<dyn BinEntity>,
-            Arc::new(EnlistPredicate) as Arc<dyn BinEntity>,
-            Arc::new(DelistPredicate) as Arc<dyn BinEntity>,
-            Arc::new(RunPredicate) as Arc<dyn BinEntity>,
-            Arc::new(RunNamespacePredicate) as Arc<dyn BinEntity>,
-            Arc::new(ConsultPredicate) as Arc<dyn BinEntity>,
-            Arc::new(ConsultConcatPredicate) as Arc<dyn BinEntity>,
-            Arc::new(ConsultTreePredicate) as Arc<dyn BinEntity>,
-            Arc::new(GroundPredicate) as Arc<dyn BinEntity>,
-            Arc::new(ImprintPredicate) as Arc<dyn BinEntity>,
-            Arc::new(ImprintReplacePredicate) as Arc<dyn BinEntity>,
-            Arc::new(AliasPredicate) as Arc<dyn BinEntity>,
-            Arc::new(UnmountPredicate) as Arc<dyn BinEntity>,
-            Arc::new(UnconsultPredicate) as Arc<dyn BinEntity>,
-            Arc::new(RefreshPredicate) as Arc<dyn BinEntity>,
-            Arc::new(ReconsultPredicate) as Arc<dyn BinEntity>,
-            Arc::new(CompilePredicate) as Arc<dyn BinEntity>,
-            Arc::new(ExplainRunPredicate) as Arc<dyn BinEntity>,
-            Arc::new(DocPredicate) as Arc<dyn BinEntity>,
-        ]
+        // REALIZATION CONSUMES THE CLOSED IDENTITY: the directive entities
+        // are derived from the one declaration, and construction asserts
+        // that each realization site agrees with its declared realization
+        // and its descriptor — drift is loud in every run, not in one test.
+        let mut entities: Vec<Arc<dyn BinEntity>> = Vec::new();
+        for kind in crate::pipeline::asts::effects::DirectiveKind::ALL {
+            let descriptor = kind.descriptor();
+            use crate::pipeline::asts::effects::DirectiveRealization;
+            match (directive_realization(*kind), descriptor.realization) {
+                (Some(entity), DirectiveRealization::Entity) => {
+                    assert_directive_entity_agrees(descriptor, entity.as_ref());
+                    entities.push(entity);
+                }
+                (
+                    None,
+                    DirectiveRealization::SyntaxPipeTerminal | DirectiveRealization::LiminalOnly,
+                ) => {}
+                (Some(_), realization) => panic!(
+                    "directive '{}' supplies an entity its declared realization \
+                     ({realization:?}) does not admit",
+                    descriptor.name
+                ),
+                (None, DirectiveRealization::Entity) => panic!(
+                    "directive '{}' declares Entity realization but supplies no entity",
+                    descriptor.name
+                ),
+            }
+        }
+        // The prelude's NON-directive entities: catalog identities of their
+        // own (`sys::execution`), never part of the directive universe.
+        entities.push(Arc::new(CompilePredicate) as Arc<dyn BinEntity>);
+        entities.push(Arc::new(ExplainRunPredicate) as Arc<dyn BinEntity>);
+        entities
     }
+}
+
+/// One realization site per declared directive, exhaustive over the closed
+/// kind: adding a declaration forces an answer HERE at compile time. `None`
+/// answers for the syntax-terminal and liminal-only realizations —
+/// `entities()` refuses a `None` whose declaration says Entity, so an
+/// unanswered realization cannot ship as an accidental absence.
+fn directive_realization(
+    kind: crate::pipeline::asts::effects::DirectiveKind,
+) -> Option<Arc<dyn BinEntity>> {
+    use crate::pipeline::asts::effects::DirectiveKind as K;
+    match kind {
+        K::Consult => Some(Arc::new(ConsultPredicate)),
+        K::ConsultConcatIntoNs => Some(Arc::new(ConsultConcatPredicate)),
+        K::ConsultTree => Some(Arc::new(ConsultTreePredicate)),
+        K::Reconsult => Some(Arc::new(ReconsultPredicate)),
+        K::Unconsult => Some(Arc::new(UnconsultPredicate)),
+        K::Mount => Some(Arc::new(MountPredicate)),
+        K::MountNew => Some(Arc::new(MountNewPredicate)),
+        K::MountTree => Some(Arc::new(MountTreePredicate)),
+        K::Unmount => Some(Arc::new(UnmountPredicate)),
+        K::Refresh => Some(Arc::new(RefreshPredicate)),
+        K::Ground => Some(Arc::new(GroundPredicate)),
+        K::Enlist => Some(Arc::new(EnlistPredicate)),
+        K::Delist => Some(Arc::new(DelistPredicate)),
+        K::Alias => Some(Arc::new(AliasPredicate)),
+        K::Doc => Some(Arc::new(DocPredicate)),
+        K::Imprint => Some(Arc::new(ImprintPredicate)),
+        K::ImprintReplace => Some(Arc::new(ImprintReplacePredicate)),
+        K::Run => Some(Arc::new(RunPredicate)),
+        K::RunNamespace => Some(Arc::new(RunNamespacePredicate)),
+        // Identity without an entity: the realization is a syntax terminal
+        // or the liminal space, and the declaration says which.
+        K::Expose
+        | K::TempTable
+        | K::Table
+        | K::TempView
+        | K::Insert
+        | K::Update
+        | K::Delete
+        | K::Exit
+        | K::Returning
+        | K::ReturningOther
+        | K::Stdout => None,
+    }
+}
+
+/// The construction-time agreement fence: an Entity-realized directive's
+/// entity must carry the declared identity — the bang name, the
+/// descriptor's parameters (names, arity, optionality), and the
+/// descriptor's receipt columns as its output schema. Disagreement is a
+/// construction bug and panics where the cartridge is built.
+fn assert_directive_entity_agrees(
+    descriptor: &crate::pipeline::asts::effects::DirectiveDescriptor,
+    entity: &dyn BinEntity,
+) {
+    let name = descriptor.name;
+    assert_eq!(
+        entity.name(),
+        format!("{name}!"),
+        "directive '{name}': entity name disagrees with the declaration"
+    );
+    assert_eq!(
+        entity.entity_type(),
+        crate::enums::EntityType::BinPseudoPredicate,
+        "directive '{name}': an Entity-realized directive is a BinPseudoPredicate"
+    );
+    let signature = entity.signature();
+    assert_eq!(
+        signature.parameters.len(),
+        descriptor.params.len(),
+        "directive '{name}': entity arity disagrees with the descriptor"
+    );
+    for (entity_param, declared) in signature.parameters.iter().zip(descriptor.params.iter()) {
+        assert_eq!(
+            entity_param.name, declared.name,
+            "directive '{name}': parameter name drift"
+        );
+        assert_eq!(
+            entity_param._is_optional, declared.optional,
+            "directive '{name}': parameter optionality drift"
+        );
+    }
+    let crate::bin_cartridge::OutputSchema::Relation(columns) = signature.output_schema else {
+        panic!("directive '{name}': directive entities declare Relation schemas");
+    };
+    assert_eq!(
+        columns,
+        descriptor.receipt_columns(),
+        "directive '{name}': the output schema must BE the descriptor's receipt columns"
+    );
 }
 
 /// Create a prelude cartridge instance
@@ -433,7 +536,7 @@ pub fn create_prelude_cartridge() -> Arc<dyn BinCartridge> {
 
 #[cfg(test)]
 mod descriptor_agreement {
-    //! The authoritative-descriptor pins (DIRECTIVE-CONVERGENCE-PLAN Phase 2).
+    //! The authoritative-descriptor pins.
     //! The descriptor table is the single authority; entity-local metadata
     //! must AGREE with it, and these tests are what makes drift impossible
     //! rather than merely discouraged.
@@ -446,24 +549,24 @@ mod descriptor_agreement {
     };
 
     #[test]
-    fn twenty_nine_unique_descriptors_with_ruled_category_counts() {
+    fn the_declaration_carries_the_ruled_category_counts() {
         assert_eq!(DIRECTIVE_DESCRIPTORS.len(), 30);
         let mut names: Vec<&str> = DIRECTIVE_DESCRIPTORS.iter().map(|d| d.name).collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), 30, "descriptor names must be unique");
 
-        let count = |c: DirectiveCategory| {
+        let count = |want: fn(&DirectiveCategory) -> bool| {
             DIRECTIVE_DESCRIPTORS
                 .iter()
-                .filter(|d| d.category == c)
+                .filter(|d| want(&d.category))
                 .count()
         };
-        assert_eq!(count(DirectiveCategory::Session), 16);
-        assert_eq!(count(DirectiveCategory::Ddl), 5);
-        assert_eq!(count(DirectiveCategory::Dml), 3);
-        assert_eq!(count(DirectiveCategory::Execution), 2);
-        assert_eq!(count(DirectiveCategory::Utility), 4);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Session)), 16);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Ddl)), 5);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Dml(_))), 3);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Execution)), 2);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Utility)), 4);
     }
 
     #[test]
@@ -481,96 +584,21 @@ mod descriptor_agreement {
     }
 
     #[test]
-    fn every_registered_directive_entity_agrees_with_its_descriptor() {
-        let cartridge = PreludeCartridge;
-        for entity in cartridge.entities() {
-            if entity.entity_type() != EntityType::BinPseudoPredicate {
-                continue; // compile is a BinRelation, not one of the 29
-            }
-            let name = entity.name();
-            let desc = descriptor(name).unwrap_or_else(|| {
-                panic!("registered directive entity '{name}' has no descriptor")
-            });
-            assert_eq!(
-                desc.realization,
-                DirectiveRealization::Entity,
-                "'{name}' is registered but its descriptor denies Entity realization"
-            );
-            let sig = entity.signature();
-            assert_eq!(
-                sig.parameters.len(),
-                desc.params.len(),
-                "'{name}': entity arity disagrees with descriptor"
-            );
-            for (ep, dp) in sig.parameters.iter().zip(desc.params.iter()) {
-                assert_eq!(ep.name, dp.name, "'{name}': parameter name drift");
-                assert_eq!(
-                    ep._is_optional, dp.optional,
-                    "'{name}': parameter optionality drift"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn every_entity_descriptor_has_a_registration_and_absences_are_policy() {
-        let cartridge = PreludeCartridge;
-        let registered: Vec<String> = cartridge
-            .entities()
+    fn construction_runs_the_agreement_fences() {
+        // entities() asserts entity/descriptor agreement at construction —
+        // name, type, arity, parameter names/optionality, output schema —
+        // so building the cartridge IS the check the old welding tests ran,
+        // in every run rather than in one test.
+        let built = PreludeCartridge.entities();
+        let directive_entities = built
             .iter()
             .filter(|e| e.entity_type() == EntityType::BinPseudoPredicate)
-            .map(|e| e.name().trim_end_matches('!').to_string())
-            .collect();
-        for d in DIRECTIVE_DESCRIPTORS {
-            match d.realization {
-                DirectiveRealization::Entity => assert!(
-                    registered.iter().any(|r| r == d.name),
-                    "descriptor '{}' claims Entity realization but no prelude entity registers it",
-                    d.name
-                ),
-                DirectiveRealization::SyntaxPipeTerminal | DirectiveRealization::LiminalOnly => {
-                    assert!(
-                        !registered.iter().any(|r| r == d.name),
-                        "descriptor '{}' declares a contextual absence but an entity IS registered",
-                        d.name
-                    )
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn entity_output_schemas_are_the_descriptor_receipt_columns() {
-        // Every pre-§3 legacy receipt has migrated (slices 1–6);
-        // the list stays for the NEXT holdout someone introduces.
-        const LEGACY: &[&str] = &[];
-        let cartridge = PreludeCartridge;
-        for entity in cartridge.entities() {
-            if entity.entity_type() != EntityType::BinPseudoPredicate {
-                continue;
-            }
-            let name = entity.name();
-            let desc = crate::pipeline::asts::effects::descriptor(name)
-                .unwrap_or_else(|| panic!("'{name}' has no descriptor"));
-            let crate::bin_cartridge::OutputSchema::Relation(cols) =
-                entity.signature().output_schema
-            else {
-                panic!("'{name}': directive entities declare Relation schemas");
-            };
-            if LEGACY.contains(&name) {
-                assert_ne!(
-                    cols,
-                    desc.receipt_columns(),
-                    "'{name}' now matches its descriptor — remove it from LEGACY"
-                );
-            } else {
-                assert_eq!(
-                    cols,
-                    desc.receipt_columns(),
-                    "'{name}': the output schema must BE the descriptor's receipt columns"
-                );
-            }
-        }
+            .count();
+        let declared_entities = DIRECTIVE_DESCRIPTORS
+            .iter()
+            .filter(|d| d.realization == DirectiveRealization::Entity)
+            .count();
+        assert_eq!(directive_entities, declared_entities);
     }
 
     #[test]

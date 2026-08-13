@@ -58,7 +58,7 @@ pub fn execute_query(
 
     // mount! the user database as "main" if specified
     if let Some(ref path) = db_path {
-        crate::exec_ng::run_dql_query(&format!("mount!(\"{}\", \"main\")", path), &mut *session)?;
+        crate::exec_ng::run_dql_query(&format!("mount!(\"{}\", \"main\")(*)", path), &mut *session)?;
     }
 
     crate::exec_ng::execute_query(

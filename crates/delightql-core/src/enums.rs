@@ -56,14 +56,6 @@ impl SourceType {
         self as i32
     }
 
-    /// Parse from integer (for reading from database)
-    pub fn from_i32(value: i32) -> Result<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|v| v.as_i32() == value)
-            .ok_or_else(|| anyhow!("Invalid source_type_enum value: {}", value))
-    }
 
     /// Get variant name for database
     pub fn variant_name(self) -> &'static str {
@@ -116,22 +108,18 @@ pub enum Language {
 
 impl Language {
     /// All language variants (for iteration during seeding)
-    pub const ALL: &'static [Self] =
-        &[Self::DqlStandard, Self::SqlPostgres, Self::SqlSqlite, Self::SqlDuckdb];
+    pub const ALL: &'static [Self] = &[
+        Self::DqlStandard,
+        Self::SqlPostgres,
+        Self::SqlSqlite,
+        Self::SqlDuckdb,
+    ];
 
     /// Convert to integer for database storage
     pub fn as_i32(self) -> i32 {
         self as i32
     }
 
-    /// Parse from integer (for reading from database)
-    pub fn from_i32(value: i32) -> Result<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|v| v.as_i32() == value)
-            .ok_or_else(|| anyhow!("Invalid language value: {}", value))
-    }
 
     /// Get base language name
     pub fn language(self) -> &'static str {
@@ -220,7 +208,7 @@ pub enum EntityType {
 
     /// Built-in pseudo-predicate (mount!, consult!, enlist!, etc.)
     /// Pseudo-predicates are state-mutating relations with `!` suffix
-    /// that execute at Phase 1.X and are compiled into the DelightQL engine
+    /// that execute in the effect executor and are compiled into the engine
     BinPseudoPredicate = 14,
 
     /// Built-in sigma predicate (like(), =(), <(), etc.)
@@ -237,20 +225,23 @@ pub enum EntityType {
     /// DelightQL ER-context rule (entity-relationship join rule)
     DqlErContextRule = 17,
 
-    /// Formerly: companion table definition. Retired — value 18 reserved.
-    DqlCompanionDefinition = 18,
-
     /// Built-in relation (non-mutating, no `!` suffix)
     /// System-namespace relations backed by Rust code
     /// Examples: sys::execution.compile
     BinRelation = 19,
 
     /// DelightQL effect rule — a user directive definition (EFFECT-ALGEBRA §1):
-    /// `name!(*) :- body`. Registered at consult time (IMPLEMENTATION-PLAN
-    /// §2.2 "effect rules as a new entity type"); demanded through the effect
-    /// transformer (Epic 3). The stored entity name carries the `!` suffix,
+    /// `name!(*) :- body`. Registered at consult time and demanded through
+    /// the effect transformer. The stored entity name carries the `!` suffix,
     /// matching the BinPseudoPredicate naming convention.
     DqlEffectRule = 20,
+
+    /// A built-in directive IDENTITY whose realization is a syntax terminal
+    /// or a liminal-only form. Reflected in the catalog — identity and
+    /// execution capability are separate — but never invocable as an
+    /// ordinary bin entity; its contextual policy refuses where the
+    /// realization does. The stored name carries the `!` suffix.
+    SyntaxDirective = 21,
 }
 
 impl EntityType {
@@ -273,9 +264,9 @@ impl EntityType {
         Self::BinSigmaPredicate,
         Self::DqlFactExpression,
         Self::DqlErContextRule,
-        Self::DqlCompanionDefinition,
         Self::BinRelation,
         Self::DqlEffectRule,
+        Self::SyntaxDirective,
     ];
 
     /// Convert to integer for database storage
@@ -303,9 +294,9 @@ impl EntityType {
             Self::BinSigmaPredicate => "BinSigmaPredicate",
             Self::DqlFactExpression => "DQLFactExpression",
             Self::DqlErContextRule => "DQLErContextRule",
-            Self::DqlCompanionDefinition => "DQLCompanionDefinition",
             Self::BinRelation => "BinRelation",
             Self::DqlEffectRule => "DQLEffectRule",
+            Self::SyntaxDirective => "SyntaxDirective",
         }
     }
 
@@ -347,9 +338,9 @@ impl EntityType {
             15 => Ok(Self::BinSigmaPredicate),
             16 => Ok(Self::DqlFactExpression),
             17 => Ok(Self::DqlErContextRule),
-            18 => Ok(Self::DqlCompanionDefinition),
             19 => Ok(Self::BinRelation),
             20 => Ok(Self::DqlEffectRule),
+            21 => Ok(Self::SyntaxDirective),
             _ => Err(anyhow!("Invalid entity_type_enum value: {}", value)),
         }
     }
@@ -402,14 +393,6 @@ impl ConnectionType {
         self as i32
     }
 
-    /// Parse from integer (for reading from database)
-    pub fn from_i32(value: i32) -> Result<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|v| v.as_i32() == value)
-            .ok_or_else(|| anyhow!("Invalid connection_type_enum value: {}", value))
-    }
 
     /// Get variant name for database
     pub fn variant_name(self) -> &'static str {
@@ -445,29 +428,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_type_roundtrip() {
-        for st in SourceType::ALL {
-            let id = st.as_i32();
-            let parsed = SourceType::from_i32(id).unwrap();
-            assert_eq!(*st, parsed);
-        }
-    }
-
-    #[test]
     fn source_type_names() {
         assert_eq!(SourceType::File.variant_name(), "file");
         assert_eq!(SourceType::FileBin.variant_name(), "filebin");
         assert_eq!(SourceType::Db.variant_name(), "db");
         assert_eq!(SourceType::Bin.variant_name(), "bin");
-    }
-
-    #[test]
-    fn language_roundtrip() {
-        for lang in Language::ALL {
-            let id = lang.as_i32();
-            let parsed = Language::from_i32(id).unwrap();
-            assert_eq!(*lang, parsed);
-        }
     }
 
     #[test]
@@ -500,15 +465,6 @@ mod tests {
         assert!(EntityType::DqlHoFunctionExpression.is_fn());
         assert!(EntityType::DqlContextAwareFunctionExpression.is_fn());
         assert!(!EntityType::DbPermanentTable.is_fn());
-    }
-
-    #[test]
-    fn connection_type_roundtrip() {
-        for ct in ConnectionType::ALL {
-            let id = ct.as_i32();
-            let parsed = ConnectionType::from_i32(id).unwrap();
-            assert_eq!(*ct, parsed);
-        }
     }
 
     #[test]

@@ -47,11 +47,9 @@ impl BinEntity for ConsultTreePredicate {
                 },
             ],
             // The receipt heading is the DESCRIPTOR's declaration
-            // (Phase 6 slice 3): core + `path, namespace` echoes +
+            // Core + `path, namespace` echoes +
             // the `returned` tree of consulted files.
-            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema(
-                "consult_tree",
-            )),
+            output_schema: OutputSchema::Relation(super::descriptor_receipt_schema("consult_tree")),
         }
     }
 

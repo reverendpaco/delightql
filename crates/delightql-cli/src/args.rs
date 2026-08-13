@@ -28,10 +28,10 @@ pub struct CliArgs {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    // Consumer lists in the doc one-liners below mirror the R6 matrix in
-    // main.rs: clap propagates global flags into every subcommand's
-    // --help, including subcommands that refuse them (ALPHA-CLI-UX-
-    // WORRIES #1) — so each flag's own text must say where it works.
+    // Consumer lists in the doc one-liners below mirror the refusal
+    // matrix in main.rs: clap propagates global flags into every
+    // subcommand's --help, including subcommands that refuse them —
+    // so each flag's own text must say where it works.
     /// SQLite database file (query, server, book; others refuse it)
     #[arg(long = "db", value_name = "DATABASE", global = true)]
     pub database: Option<PathBuf>,
@@ -186,6 +186,12 @@ pub enum Command {
         export_images: Option<PathBuf>,
     },
 
+    /// Editor support: export the embedded grammar, highlight queries, and compiled parser
+    Editor {
+        #[command(subcommand)]
+        action: EditorCommand,
+    },
+
     /// Show a command's manual page (`dql help query` = `dql man query`; bare = usage)
     Help {
         /// Command name tokens (same grammar as `dql man`)
@@ -199,7 +205,7 @@ pub enum Command {
         shell: clap_complete::Shell,
     },
 
-    /// Run self-diagnostics (checks dql's own health; see DIAGNOSTICS-DESIGN.md)
+    /// Run self-diagnostics (checks dql's own health)
     Selftest {
         /// Emit findings as a JSON array (machine-readable, for CI)
         #[arg(long)]
@@ -242,11 +248,23 @@ pub enum Command {
     },
 }
 
+/// Subcommands under `dql editor`
+#[derive(Subcommand)]
+pub enum EditorCommand {
+    /// Write the editor-support artifacts into DIR: parser/delightql.so +
+    /// queries/delightql/*.scm (an editor runtimepath) and grammar/
+    /// (a rebuildable tree-sitter project)
+    ExportArtifacts {
+        /// Output directory (created if absent; existing files overwritten)
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
 /// Subcommands under `dql target`
 ///
-/// `install` and `verify` (JOE-EVERYBODY-DISTRIBUTION.md §3.1) wait on
-/// the release pipeline: nothing published to fetch, no digests to
-/// check against yet.
+/// `install` and `verify` wait on the release pipeline: nothing
+/// published to fetch, no digests to check against yet.
 #[derive(Subcommand)]
 pub enum TargetCommand {
     /// Show each known adapter and where it resolves from
@@ -330,8 +348,8 @@ pub enum ToolCommand {
     },
 }
 
-/// Body format for structured error records (R2.3). With the default
-/// RS prefix, json mode is exactly RFC 7464 (JSON text sequences —
+/// Body format for structured error records. With the default RS
+/// prefix, json mode is exactly RFC 7464 (JSON text sequences —
 /// what `jq --seq` reads): RS + JSON + LF.
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum ErrorFormat {
@@ -381,9 +399,6 @@ pub enum Stage {
     /// Show just the total hash as plain text (includes column names)
     #[value(name = "totalhash")]
     TotalHash,
-    /// Deprecated: use sys::execution.stack(*) instead
-    #[value(name = "recursion-depth")]
-    RecursionDepth,
 }
 
 /// Eager --dialect validation, mirroring --format's contract: a bogus
@@ -446,7 +461,7 @@ mod tests {
 
     #[test]
     fn consult_flag_is_removed() {
-        // --consult was retired: consult!() in DQL source is the one
+        // --consult does not exist: consult!() in DQL source is the one
         // spelling. The flag must not quietly return as an alias.
         let parsed = CliArgs::try_parse_from(["dql", "query", "--consult", "x.dql", "users(*)"]);
         assert!(parsed.is_err(), "--consult must be an unknown flag");

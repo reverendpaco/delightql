@@ -219,8 +219,11 @@ pub fn handle_filemunge_command(
     let mut handle = connection::open_handle()?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // A higher-order directive writes both groups: `(arguments)(receipt
+    // access)`. A lone group is receipt access by position, so dropping the
+    // `(*)` binds zero arguments and the demand refuses on arity.
     crate::exec_ng::run_dql_query(
-        &format!("mount!(\"{}\", \"main\")", db_path_str),
+        &format!("mount!(\"{}\", \"main\")(*)", db_path_str),
         &mut *session,
     )?;
 

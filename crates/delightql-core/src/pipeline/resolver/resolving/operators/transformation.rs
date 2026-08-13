@@ -1,360 +1,427 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_transform::AstTransform;
 
+use crate::error::{DelightQLError, Result};
+use crate::names::{Addressing, ColId, ColumnOrigin, Computation, Republish, ValueFacts};
+use crate::pipeline::ast_transform::AstTransform;
+use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
-use super::super::helpers::{
-    build_concat_chain_with_placeholders, convert_column_alias, extract_column_name_from_expr,
-};
-use super::helpers::{emit_validation_warning, expand_column_template};
+use super::super::column_extraction::mint_projection_scope;
+use super::super::helpers::{build_concat_chain_with_placeholders, convert_column_alias};
+use super::helpers::emit_validation_warning;
+use crate::pipeline::asts::core::{NamedReference, Reference};
+use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
 
-/// Check if a column's table provenance matches a qualifier string
-fn matches_table_qualifier(col: &ast_resolved::ColumnMetadata, qualifier: &str) -> bool {
-    match col.qualifier() {
-        ast_resolved::TableName::Named(name) => name == qualifier,
-        ast_resolved::TableName::Fresh => false,
+fn expression_column(expression: &ast_resolved::DomainExpression) -> Option<ColId> {
+    match expression {
+        ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence { column, .. },
+        ))) => Some(*column),
+        _ => None,
     }
 }
 
-/// Resolve the MapCover operator via fold-based dispatch
+/// Whether a cover hands a slot back its own column.
 ///
-/// Same semantics as `resolve_map_cover`, but expression resolution
-/// goes through the fold's transform hooks instead of free functions + registry.
+/// The one shape that writes nothing: the same value, under the same name.
+/// Every other expression — a literal, another column, a computation — is a
+/// new value standing in the slot.
+fn gives_back_the_same_column(
+    expression: &ast_resolved::DomainExpression,
+    covered: ColId,
+    identities: &crate::names::Registry,
+) -> bool {
+    expression_column(expression).is_some_and(|column| identities.same_value(column, covered))
+}
+
 pub(super) fn resolve_map_cover_via_fold(
     fold: &mut ResolverFold,
-    function: ast_unresolved::FunctionExpression,
-    columns: Vec<ast_unresolved::DomainExpression>,
-    containment_semantic: ast_unresolved::ContainmentSemantic,
-    conditioned_on: Option<Box<ast_unresolved::BooleanExpression>>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Check if function is a StringTemplate and expand it to a Lambda
-    let resolved_function =
-        if let ast_unresolved::FunctionExpression::StringTemplate { parts, alias } = function {
-            // Build the concat expression from the template parts
-            // This time, we DON'T resolve @ placeholders - they stay as ValuePlaceholder
-            let concat_expr = build_concat_chain_with_placeholders(parts)?;
-
-            // Wrap in a Lambda since this is for MapCover
-            ast_resolved::FunctionExpression::Lambda {
-                body: Box::new(concat_expr),
-                alias,
-            }
-        } else {
-            // Regular function resolution — use fold's transform_function
-            fold.transform_function(function)?
-        };
-
-    // Resolve columns - allow zero matches for patterns (Transform is safe as no-op)
-    let resolved_columns =
-        super::super::domain_expressions::projection::resolve_expressions_via_fold(
+    function: ast_unresolved::Callable,
+    columns: Vec<ast_unresolved::SelectorItem>,
+    conditioned_on: Option<Box<ast_unresolved::TruthExpression>>,
+    available: &[ColId],
+) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    let (columns, covered) =
+        super::super::domain_expressions::projection::resolve_selector_via_fold(
             fold, columns, available, true,
         )?;
-
-    // Check if pattern matched zero columns (warning)
-    if resolved_columns.is_empty() && !available.is_empty() {
+    if columns.is_empty() && !available.is_empty() {
         emit_validation_warning("MapCover pattern matched no columns - no transformation applied");
     }
-
-    let resolved_condition = conditioned_on
-        .map(|cond| fold.transform_boolean(*cond).map(Box::new))
+    // THE COVER IS THE APPLYING POSITION, and it applies HERE: one closed
+    // resolved expression per covered cell. The callable is spent by that
+    // application — the resolved carrier holds cells, no callable at all.
+    let cells = covered
+        .iter()
+        .map(|column| {
+            Ok(crate::pipeline::asts::core::operators::AppliedCell {
+                column: *column,
+                expr: apply_callable_to_cell(fold, &function, *column)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // A map cover replaces each selected slot's value with the function
+    // applied to it — the same act `$$` performs, spelled over a selection.
+    for column in covered {
+        fold.registry.identities.mark_written_by_a_cover(column);
+    }
+    let conditioned_on = conditioned_on
+        .map(|condition| fold.transform_boolean(*condition).map(Box::new))
         .transpose()?;
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::MapCover {
-        function: resolved_function,
-        columns: resolved_columns,
-        containment_semantic:
-            super::super::super::helpers::converters::convert_containment_semantic(
-                containment_semantic,
-            ),
-        conditioned_on: resolved_condition,
-    };
-
-    // MapCover applies a function to columns - for now just preserve input
-    // TODO: Properly compute transformed columns
-    Ok((resolved_op, available.to_vec()))
+    Ok((
+        ast_resolved::PipeOp::MapCover(MapCover {
+            callable: (),
+            selector: columns,
+            guard: conditioned_on,
+            cells,
+        }),
+        available.to_vec(),
+    ))
 }
 
-/// Resolve the Transform operator via fold-based dispatch
-///
-/// Same semantics as `resolve_transform`, but expression resolution
-/// goes through the fold's transform hooks instead of free functions + registry.
-pub(super) fn resolve_transform_via_fold(
+/// THE COVER'S APPLYING POSITION, at resolution: apply the authored
+/// callable to one covered cell and answer the CLOSED resolved expression
+/// it produces. The open leaf is spent here — while the body resolves, the
+/// fold's cover cell IS the leaf's value — so no resolved tree carries an
+/// unapplied slot.
+fn apply_callable_to_cell(
     fold: &mut ResolverFold,
-    transformations: Vec<(ast_unresolved::DomainExpression, String, Option<String>)>,
-    conditioned_on: Option<Box<ast_unresolved::BooleanExpression>>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Resolve each transformation expression
-    let mut resolved_transformations = Vec::new();
-    for (expr, alias, qualifier) in transformations {
-        let resolved_expr =
-            super::super::domain_expressions::projection::resolve_expressions_via_fold(
+    callable: &ast_unresolved::Callable,
+    column: ColId,
+) -> Result<ast_resolved::DomainExpression> {
+    let cell = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+        ColumnOccurrence {
+            column,
+            explicit_qualifier: false,
+        },
+    )));
+    let with_cell = |fold: &mut ResolverFold,
+                     resolve: &mut dyn FnMut(&mut ResolverFold) -> Result<ast_resolved::DomainExpression>|
+     -> Result<ast_resolved::DomainExpression> {
+        let prior = fold.cover_cell.replace(cell.clone());
+        let resolved = resolve(fold);
+        fold.cover_cell = prior;
+        resolved
+    };
+    match callable {
+        // The slot is spent in the body, at every depth — a selection arm,
+        // a scalarized relation's interior.
+        ast_unresolved::Callable::Lambda(lambda) => with_cell(fold, &mut |fold| {
+            fold.transform_domain((*lambda.body).clone())
+        }),
+        // AN OPEN STRING IS THE CONCAT IT DENOTES; its interpolations
+        // resolve with the cell standing in their slots.
+        ast_unresolved::Callable::String(template) => with_cell(fold, &mut |fold| {
+            build_concat_chain_with_placeholders(fold, template.clone().into_parts())
+        }),
+        ast_unresolved::Callable::Functor(application) => {
+            // A mention of a value DEFINITION applies per cell: the cell
+            // lands in the definition's first parameter, exactly as an
+            // authored lambda's slot.
+            if let Some(applied) = crate::pipeline::resolver::grounding::cover_functor_apply_cell(
                 fold,
-                vec![expr],
-                available,
-                false,
-            )?
-            .into_iter()
-            .next()
-            .expect("resolve_expressions_via_fold returns same count as input");
-        resolved_transformations.push((resolved_expr, alias.clone(), qualifier));
-    }
-
-    // Validate: all aliases must match existing column names (with optional qualifier)
-    for (_, alias, qualifier) in &resolved_transformations {
-        let matches = available.iter().any(|col| {
-            if col.name() != alias {
-                return false;
+                application,
+                cell.clone(),
+            )? {
+                return Ok(applied);
             }
-            if let Some(ref q) = qualifier {
-                matches_table_qualifier(col, q)
-            } else {
-                true
+            // `@` anywhere in the call — arguments or window — is the slot,
+            // and the per-cell resolution spends it.
+            if functor_mentions_slot(application) {
+                return with_cell(fold, &mut |fold| {
+                    fold.transform_domain(ast_unresolved::DomainExpression::Application(
+                        ast_unresolved::FunctionApplication::Standard(application.clone()),
+                    ))
+                });
             }
-        });
-        if !matches {
-            let display = match qualifier {
-                Some(q) => format!("{}.{}", q, alias),
-                None => alias.clone(),
+            // No slot written: the cell lands as the IMPLICIT FIRST
+            // argument — for a window function only when no argument was
+            // written, since its own arguments already say what it reads.
+            // The landing is spelled as the slot itself, prepended on the
+            // AUTHORED call, so the one signature authority judges the
+            // rebuilt invocation exactly as it judges an authored spelling.
+            use crate::pipeline::asts::core::operators::{CallArguments, ScalarArgument};
+            let mut rebuilt = application.clone();
+            let prepend = match (&rebuilt.window, &rebuilt.call.call().arguments) {
+                (Some(_), CallArguments::Scalar(members)) => members.is_empty(),
+                (Some(_), CallArguments::None) => true,
+                (None, CallArguments::Scalar(_)) | (None, CallArguments::None) => true,
+                (_, CallArguments::HigherOrder(_)) => false,
             };
-            return Err(DelightQLError::ParseError {
-                message: format!(
-                    "Transform alias '{}' does not match any existing column",
-                    display
-                ),
-                source: None,
-                subcategory: None,
-            });
-        }
-    }
-
-    // Check for duplicate aliases (qualifier-aware)
-    let mut seen_aliases: std::collections::HashSet<(String, Option<String>)> =
-        std::collections::HashSet::new();
-    for (_, alias, qualifier) in &resolved_transformations {
-        if !seen_aliases.insert((alias.clone(), qualifier.clone())) {
-            let display = match qualifier {
-                Some(q) => format!("{}.{}", q, alias),
-                None => alias.clone(),
-            };
-            return Err(DelightQLError::ParseError {
-                message: format!("Duplicate transform alias '{}'", display),
-                source: None,
-                subcategory: None,
-            });
-        }
-    }
-
-    let resolved_condition = conditioned_on
-        .map(|cond| fold.transform_boolean(*cond).map(Box::new))
-        .transpose()?;
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::Transform {
-        transformations: resolved_transformations,
-        conditioned_on: resolved_condition,
-    };
-
-    // Output schema is same as input (transformations are in-place)
-    Ok((resolved_op, available.to_vec()))
-}
-
-/// Resolve the EmbedMapCover operator via fold-based dispatch
-///
-/// Same semantics as `resolve_embed_map_cover`, but expression resolution
-/// goes through the fold's transform hooks instead of free functions + registry.
-pub(super) fn resolve_embed_map_cover_via_fold(
-    fold: &mut ResolverFold,
-    function: ast_unresolved::FunctionExpression,
-    selector: ast_unresolved::ColumnSelector,
-    alias_template: Option<ast_unresolved::ColumnAlias>,
-    containment_semantic: ast_unresolved::ContainmentSemantic,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Resolve the function (similar to MapCover)
-    let resolved_function =
-        if let ast_unresolved::FunctionExpression::StringTemplate { parts, alias } = function {
-            // Build the concat expression from the template parts
-            let concat_expr = build_concat_chain_with_placeholders(parts)?;
-            // Wrap in a Lambda since this is for EmbedMapCover
-            ast_resolved::FunctionExpression::Lambda {
-                body: Box::new(concat_expr),
-                alias,
-            }
-        } else {
-            fold.transform_function(function)?
-        };
-
-    // For EmbedMapCover, we need to:
-    // 1. Keep all original columns
-    // 2. Add new columns for each transformation
-    let mut output_columns = available.to_vec();
-
-    // Resolve the column selector to actual column names AND create a Resolved variant
-    let (resolved_selector, selected_columns) = match &selector {
-        ast_unresolved::ColumnSelector::Explicit(exprs) => {
-            // For explicit columns, keep as explicit (no pattern resolution needed)
-            let resolved_exprs =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(
-                    fold,
-                    exprs.clone(),
-                    available,
-                    false,
-                )?;
-            let column_names = resolved_exprs
-                .iter()
-                .filter_map(extract_column_name_from_expr)
-                .collect::<Vec<_>>();
-            (
-                ast_resolved::ColumnSelector::Explicit(resolved_exprs),
-                column_names,
-            )
-        }
-        ast_unresolved::ColumnSelector::Regex(pattern) => {
-            // Convert BRE pattern to Rust regex and resolve to column list
-            use crate::pipeline::pattern::bre_to_rust_regex;
-            let regex_pattern = bre_to_rust_regex(pattern)?;
-            let regex = regex::Regex::new(&regex_pattern).map_err(|e| {
-                DelightQLError::parse_error(format!("Invalid regex pattern: {}", e))
-            })?;
-            let matched_columns: Vec<String> = available
-                .iter()
-                .filter(|col| regex.is_match(col.name()))
-                .map(|col| col.name().to_string())
-                .collect();
-            let original_selector =
-                Box::new(ast_unresolved::ColumnSelector::Regex(pattern.clone()));
-            (
-                ast_resolved::ColumnSelector::Resolved {
-                    columns: matched_columns.clone(),
-                    original_selector,
-                },
-                matched_columns,
-            )
-        }
-        ast_unresolved::ColumnSelector::All => {
-            // For All, resolve to all available columns
-            let all_columns: Vec<String> =
-                available.iter().map(|col| col.name().to_string()).collect();
-            let original_selector = Box::new(ast_unresolved::ColumnSelector::All);
-            (
-                ast_resolved::ColumnSelector::Resolved {
-                    columns: all_columns.clone(),
-                    original_selector,
-                },
-                all_columns,
-            )
-        }
-        ast_unresolved::ColumnSelector::Positional { start, end } => {
-            // For positional, resolve to specific columns
-            let positional_columns: Vec<String> = available
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| *idx >= (*start - 1) && *idx < *end)
-                .map(|(_, col)| col.name().to_string())
-                .collect();
-            let original_selector = Box::new(ast_unresolved::ColumnSelector::Positional {
-                start: *start,
-                end: *end,
-            });
-            (
-                ast_resolved::ColumnSelector::Resolved {
-                    columns: positional_columns.clone(),
-                    original_selector,
-                },
-                positional_columns,
-            )
-        }
-        ast_unresolved::ColumnSelector::MultipleRegex(patterns) => {
-            // Multiple regex patterns - union of matches, convert to Resolved
-            use crate::pipeline::pattern::bre_to_rust_regex;
-            let mut matched = Vec::new();
-            for pattern in patterns {
-                let regex_pattern = bre_to_rust_regex(pattern)?;
-                let regex = regex::Regex::new(&regex_pattern).map_err(|e| {
-                    DelightQLError::parse_error(format!("Invalid regex pattern: {}", e))
-                })?;
-                for col in available {
-                    if regex.is_match(col.name()) && !matched.contains(&col.name().to_string()) {
-                        matched.push(col.name().to_string());
+            if prepend {
+                let slot = ScalarArgument::plain(ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Open(
+                        crate::pipeline::asts::core::DomainHole::CompositionInput,
+                    ),
+                ));
+                let arguments = &mut rebuilt.call.call_mut().arguments;
+                match arguments {
+                    CallArguments::Scalar(members) => members.insert(0, slot),
+                    CallArguments::None => *arguments = CallArguments::Scalar(vec![slot]),
+                    CallArguments::HigherOrder(_) => {
+                        unreachable!("prepend is not chosen for a higher-order group")
                     }
                 }
             }
-            let original_selector = Box::new(ast_unresolved::ColumnSelector::MultipleRegex(
-                patterns.clone(),
+            with_cell(fold, &mut |fold| {
+                fold.transform_domain(ast_unresolved::DomainExpression::Application(
+                    ast_unresolved::FunctionApplication::Standard(rebuilt.clone()),
+                ))
+            })
+        }
+    }
+}
+
+/// Whether the authored functor writes the slot anywhere the application
+/// reads — its argument row or its window.
+fn functor_mentions_slot(application: &ast_unresolved::StandardApplication) -> bool {
+    fn in_expr(expr: &ast_unresolved::DomainExpression) -> bool {
+        use crate::pipeline::ast_visit::{AstVisit, Descent};
+        struct Finder(bool);
+        impl AstVisit<crate::pipeline::asts::core::Unresolved> for Finder {
+            fn enter_domain(
+                &mut self,
+                e: &ast_unresolved::DomainExpression,
+            ) -> crate::error::Result<Descent> {
+                if matches!(
+                    e,
+                    ast_unresolved::DomainExpression::Application(
+                        ast_unresolved::FunctionApplication::Open(
+                            crate::pipeline::asts::core::DomainHole::CompositionInput,
+                        ),
+                    )
+                ) {
+                    self.0 = true;
+                    return Ok(Descent::Break);
+                }
+                Ok(Descent::Continue)
+            }
+        }
+        let mut finder = Finder(false);
+        let _ = crate::pipeline::ast_visit::walk_visit_domain(&mut finder, expr);
+        finder.0
+    }
+    let args_mention = application
+        .call()
+        .arguments
+        .value_domains()
+        .any(in_expr);
+    let window_mentions = application.window.as_ref().is_some_and(|window| {
+        window.partition.iter().any(in_expr)
+            || window.ordering.iter().any(|spec| in_expr(&spec.column))
+    });
+    args_mention || window_mentions
+}
+
+
+pub(super) fn resolve_transform_via_fold(
+    fold: &mut ResolverFold,
+    transformations: crate::pipeline::asts::vocabulary::Vec1<ast_unresolved::NamedOutItem>,
+    conditioned_on: Option<Box<ast_unresolved::TruthExpression>>,
+    available: &[ColId],
+) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    let mut resolved = Vec::new();
+    let mut targets = Vec::new();
+    for item in transformations.into_vec() {
+        let ast_unresolved::NamedOutItem {
+            expr,
+            naming,
+            qualifier,
+            output: (),
+        } = item;
+        let expression = Some(
+            super::super::domain_expressions::projection::resolve_out_value_via_fold(
+                fold, expr, available,
+            )?,
+        )
+        .into_iter()
+        .next()
+        .expect("one transform expression resolves to one expression");
+        // AS WRITTEN, both halves: a strop is what makes an address
+        // case-sensitive, and a folded target addresses a column nobody named.
+        let alias_spelling = fold
+            .registry
+            .identities
+            .intern(naming.as_str(), naming.is_stropped());
+        let alias_sym = fold.registry.identities.canonical(alias_spelling);
+        let qualifier_sym = qualifier.as_ref().map(|qualifier| {
+            let spelling = fold
+                .registry
+                .identities
+                .intern(qualifier.as_str(), qualifier.is_stropped());
+            fold.registry.identities.canonical(spelling)
+        });
+        let by_name: Vec<_> = available
+            .iter()
+            .copied()
+            .filter(|column| fold.registry.identities.published_sym(*column) == Some(alias_sym))
+            .collect();
+        // A transform target is addressed, so it reaches under the tiers every
+        // qualified address uses — `u.email` here and `u.email` in a projection
+        // are the same two words and must find the same column. Asking only
+        // whether the owning scope answers to `u` is a reach of its own, and it
+        // finds nothing across a join: the columns stand in the join scope,
+        // which answers to no name.
+        let matches = match qualifier_sym {
+            Some(qualifier) => fold.registry.identities.qualified_glob(qualifier, &by_name),
+            None => crate::names::Candidates::from_vec(by_name),
+        };
+        // Two different failures wore one message, and neither of them was a
+        // parse failure. A target that reaches nothing is an unresolved
+        // column — under its WRITTEN spelling, qualifier included — and a
+        // target that reaches several is the ordinary ambiguity. Saying
+        // "does not name exactly one" reported the arithmetic instead of the
+        // fact, and dropped the qualifier the user wrote.
+        let spelled = match &qualifier {
+            Some(qualifier) => format!("{qualifier}.{naming}"),
+            None => naming.to_string(),
+        };
+        if matches.is_empty() {
+            return Err(DelightQLError::column_not_found_error(
+                spelled,
+                "as a transform target",
             ));
-            (
-                ast_resolved::ColumnSelector::Resolved {
-                    columns: matched.clone(),
-                    original_selector,
-                },
-                matched,
-            )
         }
-        ast_unresolved::ColumnSelector::Resolved { .. } => {
-            // This should never happen in unresolved phase
-            unreachable!("Resolved selector should not exist in unresolved phase")
+        if matches.len() > 1 {
+            return Err(DelightQLError::validation_error_categorized(
+                "resolution/ambiguous",
+                format!(
+                    "Ambiguous transform target '{spelled}': {} columns of the operand \
+                     publish that name. Qualify the target with the relation whose \
+                     column is being written.",
+                    matches.len()
+                ),
+                "as a transform target",
+            ));
         }
-    };
-
-    // Add new columns based on the transformation
-    for column_name in &selected_columns {
-        // Calculate the position for the NEW column being added
-        let new_column_position = output_columns.len() + 1;
-
-        // Expand the alias template if present
-        let new_column_name =
-            if let Some(ast_unresolved::ColumnAlias::Template(template)) = &alias_template {
-                // Use expand_column_template to handle both {@} and {#}
-                // For {#}, use the NEW column's position in the output, not the source column's position
-                expand_column_template(&template.template, column_name, Some(new_column_position))?
-            } else if let Some(ast_unresolved::ColumnAlias::Literal(name)) = &alias_template {
-                // Use literal alias
-                name.clone()
-            } else {
-                // Default: append "_transformed" or similar
-                format!("{}_transformed", column_name)
-            };
-
-        // Add the new column to the output
-        output_columns.push(ast_resolved::ColumnMetadata::new_with_name_flag(
-            ast_resolved::ColumnProvenance::from_table_column(
-                new_column_name.clone(),
-                ast_resolved::TableName::Fresh,
-                ast_resolved::QualificationSource::None,
-            ),
-            ast_resolved::TableName::Fresh,
-            Some(new_column_position),
-            true,
-        ));
+        if targets.contains(&(alias_sym, qualifier_sym)) {
+            return Err(DelightQLError::parse_error(format!(
+                "Duplicate transform target '{naming}'"
+            )));
+        }
+        targets.push((alias_sym, qualifier_sym));
+        // A cover keeps the slot's identity, so nothing downstream could tell
+        // from the value chain that what stands there is now a value being
+        // WRITTEN. That is recorded here, at the one place the cover is
+        // resolved, and travels with the value from then on.
+        //
+        // A cover that hands the slot back its own column writes nothing: it
+        // is the same value under the same name, and an update whose only
+        // cover is that one has nothing to change.
+        let covered = matches
+            .to_vec()
+            .first()
+            .copied()
+            .expect("exactly one match was just established");
+        // A crossing never gives back the column it writes into: it computes
+        // a new value, so the cover is always a write.
+        let unchanged = expression.domain().is_some_and(|value| {
+            gives_back_the_same_column(value, covered, &fold.registry.identities)
+        });
+        if !unchanged {
+            fold.registry.identities.mark_written_by_a_cover(covered);
+        }
+        // THE TARGET IS THE OUTPUT. Resolution found the one column this item
+        // writes; the lowering reads that decision instead of re-addressing
+        // the same two words against a later heading.
+        resolved.push(ast_resolved::NamedOutItem {
+            expr: expression,
+            naming,
+            qualifier,
+            output: Some(covered),
+        });
     }
 
-    // Warn if no columns matched (Embed is safe as no-op - originals preserved)
-    if selected_columns.is_empty() && !available.is_empty() {
+    let conditioned_on = conditioned_on
+        .map(|condition| fold.transform_boolean(*condition).map(Box::new))
+        .transpose()?;
+    Ok((
+        ast_resolved::PipeOp::Transform {
+            items: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(resolved)
+                .expect("one transform item resolves to one item"),
+            guard: conditioned_on,
+        },
+        available.to_vec(),
+    ))
+}
+
+pub(super) fn resolve_embed_map_cover_via_fold(
+    fold: &mut ResolverFold,
+    function: ast_unresolved::Callable,
+    selector: Vec<ast_unresolved::SelectorItem>,
+    alias_template: Option<ast_unresolved::ColumnAlias>,
+    available: &[ColId],
+) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    let (resolved_selector, selected) =
+        super::super::domain_expressions::projection::resolve_selector_via_fold(
+            fold, selector, available, true,
+        )?;
+
+    let output_scope = mint_projection_scope(&fold.registry.identities, available);
+    let mut output = available
+        .iter()
+        .map(|source| {
+            fold.registry.identities.republish_column(
+                *source,
+                output_scope,
+                Republish::Passthrough,
+                fold.registry.identities.published(*source),
+                fold.registry.identities.addressing(*source),
+                |_| {},
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (offset, source) in selected.iter().enumerate() {
+        let published = match &alias_template {
+            Some(ast_unresolved::ColumnAlias::Template(template)) => fold
+                .registry
+                .identities
+                .expand_template(*source, &template.template, available.len() + offset + 1),
+            Some(ast_unresolved::ColumnAlias::Literal(name)) => {
+                Some(fold.registry.identities.intern(name, false))
+            }
+            None => None,
+        };
+        output.push(fold.registry.identities.mint_column(
+            output_scope,
+            ColumnOrigin::Computed {
+                via: Computation::Function,
+            },
+            published,
+            if published.is_some() {
+                Addressing::Published
+            } else {
+                Addressing::Hygienic
+            },
+            ValueFacts::default(),
+        ));
+    }
+    if selected.is_empty() && !available.is_empty() {
         emit_validation_warning("EmbedMapCover pattern matched no columns - no columns added");
     }
 
-    let resolved_op = ast_resolved::UnaryRelationalOperator::EmbedMapCover {
-        function: resolved_function,
-        selector: resolved_selector,
-        alias_template: convert_column_alias(alias_template),
-        containment_semantic:
-            super::super::super::helpers::converters::convert_containment_semantic(
-                containment_semantic,
-            ),
-    };
-
-    Ok((resolved_op, output_columns))
+    // THE COVER IS THE APPLYING POSITION for the embed spelling too: one
+    // closed resolved expression per covered cell, appended beside the
+    // operand's heading under the resolved output identities minted above.
+    let cells = selected
+        .iter()
+        .map(|column| {
+            Ok(crate::pipeline::asts::core::operators::AppliedCell {
+                column: *column,
+                expr: apply_callable_to_cell(fold, &function, *column)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        ast_resolved::PipeOp::EmbedMapCover(EmbedMapCover {
+            callable: (),
+            naming: convert_column_alias(alias_template),
+            selector: resolved_selector,
+            cells,
+        }),
+        output,
+    ))
 }

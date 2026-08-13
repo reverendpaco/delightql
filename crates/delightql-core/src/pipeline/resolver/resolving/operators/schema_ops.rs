@@ -1,906 +1,729 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+
 use crate::error::{DelightQLError, Result};
+use crate::names::{
+    Addressing, ColId, ColumnOrigin, Computation, Hint, Registry, Republish, ScopeId, ScopeOrigin,
+    ValueFacts, WrapReason,
+};
+use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
+use delightql_types::SqlIdentifier;
 
 use super::super::domain_expressions::projection::resolve_expressions_via_fold;
-use super::helpers::{emit_validation_warning, expand_column_template};
+use super::helpers::emit_validation_warning;
+use crate::pipeline::asts::core::{NamedReference, Reference};
 
-/// Resolve the ProjectOut operator
-///
-/// This removes specified columns from the schema.
-/// Pattern matching can select zero columns (warning but valid - no-op).
+fn output_scope(identities: &Registry, available: &[ColId], why: WrapReason) -> ScopeId {
+    match identities.common_scope(available) {
+        Some(input) => identities.mint_derived_scope(ScopeOrigin::Wrap { input, why }, Hint::None),
+        None => identities.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None),
+    }
+}
+
+fn minted_column(identities: &Registry, scope: ScopeId, name: &str, origin: ColumnOrigin) -> ColId {
+    let spelling = identities.intern(name, false);
+    identities.mint_column(
+        scope,
+        origin,
+        Some(spelling),
+        Addressing::Published,
+        ValueFacts::default(),
+    )
+}
+
+fn resolved_column(expression: &ast_resolved::DomainExpression) -> Option<ColId> {
+    match expression {
+        ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence { column, .. },
+        ))) => Some(*column),
+        _ => None,
+    }
+}
+
+fn current_occurrence(identities: &Registry, available: &[ColId], source: ColId) -> Result<ColId> {
+    let matches: Vec<_> = available
+        .iter()
+        .copied()
+        .filter(|candidate| identities.republishes(*candidate, source))
+        .collect();
+    match matches.as_slice() {
+        [column] => Ok(*column),
+        [] => Err(DelightQLError::parse_error(
+            "A resolved rename source has no occurrence in the pipe heading",
+        )),
+        _ => Err(DelightQLError::validation_error_categorized(
+            "constraint",
+            "A rename source reaches more than one column in the pipe heading",
+            "in rename-cover operator",
+        )),
+    }
+}
+
+fn unique_named(identities: &Registry, available: &[ColId], name: &SqlIdentifier) -> Option<ColId> {
+    // As written: the strop is what makes the name case-sensitive, and a
+    // dequalifying step reaches the lvar the author spelled.
+    let spelling = identities.intern(name.as_str(), name.is_stropped());
+    let name = identities.canonical(spelling);
+    let matches: Vec<_> = available
+        .iter()
+        .copied()
+        .filter(|column| identities.published_sym(*column) == Some(name))
+        .collect();
+    match matches.as_slice() {
+        [column] => Some(*column),
+        _ => None,
+    }
+}
+
+fn republish_all(identities: &Registry, available: &[ColId], scope: ScopeId) -> Vec<ColId> {
+    available
+        .iter()
+        .map(|column| {
+            identities.republish_column(
+                *column,
+                scope,
+                Republish::Passthrough,
+                identities.published(*column),
+                identities.addressing(*column),
+                |_| {},
+            )
+        })
+        .collect()
+}
+
 pub(super) fn resolve_project_out(
     fold: &mut ResolverFold,
-    containment_semantic: ast_unresolved::ContainmentSemantic,
-    expressions: Vec<ast_unresolved::DomainExpression>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Resolve expressions to remove - allow zero matches for patterns
-    let resolved_expressions = resolve_expressions_via_fold(fold, expressions, available, true)?;
+    selector: Vec<ast_unresolved::SelectorItem>,
+    available: &[ColId],
+) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    let (resolved_selector, removed) =
+        super::super::domain_expressions::projection::resolve_selector_via_fold(
+            fold, selector, available, true,
+        )?;
+    let kept: Vec<_> = available
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !removed
+                .iter()
+                .any(|removed| fold.registry.identities.same_value(*candidate, *removed))
+        })
+        .collect();
 
-    // Compute output columns - remove specified columns from input
-    let mut output_columns = available.to_vec();
-    let removed_count = resolved_expressions.len();
-    let mut any_qualified = false;
-    for expr in &resolved_expressions {
-        if let ast_resolved::DomainExpression::Lvar {
-            name, qualifier, ..
-        } = expr
-        {
-            if qualifier.is_some() {
-                any_qualified = true;
-            }
-            output_columns.retain(|col| {
-                if !delightql_types::SqlIdentifier::str_eq(col.name(), name) {
-                    return true; // Different name, keep
-                }
-                // Same name — if qualifier specified, only remove from matching table
-                if let Some(qual) = qualifier {
-                    !matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
-                } else {
-                    false // No qualifier, remove all with this name
-                }
-            });
-        }
-    }
-    // If any spec used a qualifier, mark all output columns as resolver-qualified
-    // so LAW1 keeps joins flat and the transformer can emit qualified refs.
-    if any_qualified {
-        for col in &mut output_columns {
-            col.info = col.info.clone().with_updated_qualification(
-                crate::pipeline::asts::core::QualificationSource::Resolver,
-            );
-        }
-    }
-
-    // Validate we're not removing all columns
-    if output_columns.is_empty() {
+    if kept.is_empty() {
         return Err(DelightQLError::parse_error(
             "Cannot remove all columns - would create empty table",
         ));
     }
-
-    // Check if removal was pattern-based and matched nothing (no-op + warning)
-    if removed_count == 0 && !available.is_empty() {
-        // Pattern matched nothing - issue warning
+    if removed.is_empty() && !available.is_empty() {
         emit_validation_warning("ProjectOut pattern matched no columns - no changes made");
     }
 
-    let resolved_op = ast_resolved::UnaryRelationalOperator::ProjectOut {
-        containment_semantic:
-            super::super::super::helpers::converters::convert_containment_semantic(
-                containment_semantic,
-            ),
-        expressions: resolved_expressions,
-    };
-
-    Ok((resolved_op, output_columns))
+    let scope = output_scope(&fold.registry.identities, available, WrapReason::Projection);
+    let output = republish_all(&fold.registry.identities, &kept, scope);
+    Ok((
+        ast_resolved::PipeOp::ProjectOut(resolved_selector),
+        output,
+    ))
 }
 
-/// Resolve the RenameCover operator
-///
-/// This renames columns based on pattern matching and templates.
-/// Supports template expansion with {@} (column name) and {#} (position).
 pub(super) fn resolve_rename_cover(
     fold: &mut ResolverFold,
-    specs: Vec<ast_unresolved::RenameSpec>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Build rename map by resolving patterns and expanding templates
-    // Key is column position in available (to distinguish same-named columns from different tables)
-    let mut rename_map: std::collections::HashMap<usize, (String, String)> =
-        std::collections::HashMap::new();
-    // Track which positions were identified via qualified references (for LAW1)
-    let mut qualified_positions: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
-
-    for spec in specs {
-        // Resolve the 'from' expression (may be pattern, glob, or column name)
-        let resolved_columns =
-            resolve_expressions_via_fold(fold, vec![spec.from], available, false)?;
-
-        // For each matched column, compute its new name
-        for resolved_expr in &resolved_columns {
-            if let ast_resolved::DomainExpression::Lvar {
-                name, qualifier, ..
-            } = resolved_expr
-            {
-                // Find the column metadata for template expansion, respecting qualifier
-                let col_idx = if let Some(qual) = qualifier {
-                    available.iter().position(|col| {
-                        delightql_types::SqlIdentifier::str_eq(col.name(), name)
-                            && matches!(col.qualifier(), ast_resolved::TableName::Named(t) if t == qual)
-                    })
-                } else {
-                    available
-                        .iter()
-                        .position(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
-                };
-
-                let col_idx = col_idx.ok_or_else(|| {
-                    DelightQLError::column_not_found_error(
-                        name.as_str(),
-                        "in rename-cover operator",
-                    )
-                })?;
-                let col_meta = &available[col_idx];
-
-                // Compute new name based on RenameTarget
-                let new_name = match &spec.to {
-                    ast_unresolved::RenameTarget::Literal(lit) => lit.clone(),
-                    ast_unresolved::RenameTarget::Template(alias) => {
-                        // Expand template with column name and position
-                        match alias {
-                            ast_unresolved::ColumnAlias::Template(tpl) => expand_column_template(
-                                &tpl.template,
-                                name,
-                                col_meta.table_position,
-                            )?,
-                            ast_unresolved::ColumnAlias::Literal(lit) => lit.clone(),
-                        }
-                    }
-                };
-
-                rename_map.insert(col_idx, (name.to_string(), new_name));
-                if qualifier.is_some() {
-                    qualified_positions.insert(col_idx);
-                }
+    specs: crate::pipeline::asts::vocabulary::Vec1<ast_unresolved::RenameSpec>,
+    available: &[ColId],
+) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    let mut renames: Vec<(ColId, crate::names::Spelling)> = Vec::new();
+    for spec in specs.into_vec() {
+        // A RENAME SOURCE ADDRESSES COLUMNS: one reference, or the several a
+        // regex or glob covers. It reaches them through the one expansion
+        // authority every selector uses.
+        let resolved = match spec.from {
+            ast_unresolved::RenameSource::Reference(reference) => resolve_expressions_via_fold(
+                fold,
+                vec![ast_unresolved::DomainExpression::Reference(reference)],
+                available,
+            )?,
+            ast_unresolved::RenameSource::Regex(regex) => {
+                super::super::domain_expressions::projection::expand_spread(
+                    fold,
+                    &ast_unresolved::Spread::Regex(regex),
+                    available,
+                    false,
+                )?
             }
+            ast_unresolved::RenameSource::Glob(glob) => {
+                super::super::domain_expressions::projection::expand_spread(
+                    fold,
+                    &ast_unresolved::Spread::Glob(glob),
+                    available,
+                    false,
+                )?
+            }
+        };
+        for expression in resolved {
+            let Some(source) = resolved_column(&expression) else {
+                continue;
+            };
+            // A qualified reference names the occurrence at the relation it
+            // addresses, while a pipe operates on the occurrence exported by
+            // the current heading. Rename the unique descendant in that
+            // heading so an unrelated column with the same spelling remains
+            // untouched.
+            let column = current_occurrence(&fold.registry.identities, available, source)?;
+            let position = available
+                .iter()
+                .position(|candidate| *candidate == column)
+                .map(|position| position + 1);
+            let new_name = match &spec.to {
+                ast_unresolved::RenameTarget::Identifier(literal) => {
+                    fold.registry.identities.intern(literal, false)
+                }
+                ast_unresolved::RenameTarget::Template(alias) => match alias {
+                    ast_unresolved::ColumnAlias::Template(template) => fold
+                        .registry
+                        .identities
+                        .expand_template(
+                            column,
+                            &template.template,
+                            position.expect("resolved column has an input position"),
+                        )
+                        .ok_or_else(|| {
+                            DelightQLError::parse_error("Cannot expand {@} for an anonymous column")
+                        })?,
+                    ast_unresolved::ColumnAlias::Literal(literal) => {
+                        fold.registry.identities.intern(literal, false)
+                    }
+                },
+            };
+            renames.push((column, new_name));
         }
     }
 
-    // Check rename targets don't collide with passthrough columns
-    for (idx, (_, new_name)) in &rename_map {
-        // A passthrough column is one that isn't being renamed
-        let collides_with_passthrough = available.iter().enumerate().any(|(i, col)| {
-            i != *idx
-                && !rename_map.contains_key(&i)
-                && delightql_types::SqlIdentifier::str_eq(col.name(), new_name)
+    let target_names: Vec<_> = renames
+        .iter()
+        .map(|(_, name)| fold.registry.identities.canonical(*name))
+        .collect();
+    let duplicate_source = renames.iter().enumerate().any(|(index, (source, _))| {
+        renames
+            .iter()
+            .enumerate()
+            .any(|(other, (candidate, _))| other != index && candidate == source)
+    });
+    if duplicate_source {
+        return Err(DelightQLError::validation_error_categorized(
+            "constraint",
+            "Each rename source must be named once",
+            "in rename-cover operator",
+        ));
+    }
+    for (index, target) in target_names.iter().enumerate() {
+        let duplicate_target = target_names
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| other != index && candidate == target);
+        let passthrough_collision = available.iter().any(|column| {
+            !renames.iter().any(|(renamed, _)| renamed == column)
+                && fold.registry.identities.published_sym(*column) == Some(*target)
         });
-        if collides_with_passthrough {
+        if duplicate_target || passthrough_collision {
             return Err(DelightQLError::validation_error_categorized(
                 "constraint",
-                format!(
-                    "Rename target '{}' collides with an existing column that passes through unchanged. \
-                     Use a different target name to avoid ambiguity",
-                    new_name,
-                ),
+                "Rename targets must be unique and must not collide with passthrough columns",
                 "in rename-cover operator",
             ));
         }
     }
 
-    // Apply renames to output columns (using position-based map)
-    let mut output_columns = Vec::new();
-    for (idx, col) in available.iter().enumerate() {
-        let mut output_col = col.clone();
-        if let Some((_, new_name)) = rename_map.get(&idx) {
-            output_col.info = output_col.info.with_alias(new_name.clone());
-            // CRITICAL: When a column is renamed, it now has a user-provided name
-            output_col.has_user_name = true;
+    let scope = output_scope(&fold.registry.identities, available, WrapReason::Projection);
+    let mut output = Vec::with_capacity(available.len());
+    for column in available {
+        let replacement = renames
+            .iter()
+            .filter(|(source, _)| source == column)
+            .map(|(_, spelling)| *spelling)
+            .collect::<Vec<_>>();
+        if let [spelling] = replacement.as_slice() {
+            output.push(fold.registry.identities.republish_column(
+                *column,
+                scope,
+                Republish::Rename,
+                Some(*spelling),
+                Addressing::Published,
+                |_| {},
+            ));
+        } else {
+            output.push(fold.registry.identities.republish_column(
+                *column,
+                scope,
+                Republish::Passthrough,
+                fold.registry.identities.published(*column),
+                fold.registry.identities.addressing(*column),
+                |_| {},
+            ));
         }
-        // If this column was identified via a qualified reference, propagate
-        // as resolver-qualified so LAW1 keeps joins flat in the transformer.
-        if qualified_positions.contains(&idx) {
-            output_col.info = output_col.info.with_updated_qualification(
-                crate::pipeline::asts::core::QualificationSource::Resolver,
-            );
-        }
-        output_columns.push(output_col);
     }
 
-    // Create resolved specs for the AST (with literal names after expansion)
-    let resolved_specs: Vec<ast_resolved::RenameSpec> = rename_map
+    let resolved_specs: Vec<_> = renames
         .into_iter()
-        .map(|(_, (from_name, to_name))| ast_resolved::RenameSpec {
-            from: ast_resolved::DomainExpression::Lvar {
-                name: from_name.into(),
-                qualifier: None,
-                namespace_path: crate::pipeline::asts::resolved::NamespacePath::empty(),
-                alias: None,
-                provenance: ast_resolved::PhaseBox::phantom(),
-            },
-            to: ast_resolved::RenameTarget::Literal(to_name),
+        .map(|(column, to)| ast_resolved::RenameSpec {
+            from: crate::pipeline::asts::core::RenameSource::Reference(Reference::Named(
+                NamedReference(ColumnOccurrence {
+                    column,
+                    explicit_qualifier: false,
+                }),
+            )),
+            to,
         })
         .collect();
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::RenameCover {
-        specs: resolved_specs,
-    };
-
-    Ok((resolved_op, output_columns))
+    let resolved_specs = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(resolved_specs)
+        .expect("a rename source that matches nothing refused during resolution");
+    Ok((
+        ast_resolved::PipeOp::Rename(resolved_specs),
+        output,
+    ))
 }
 
-/// Resolve the Reposition operator
-///
-/// This reorders columns to specific positions.
-/// Supports both positive (1-based) and negative (from end) positioning.
-/// Critical for CPR Law 0 - returns REORDERED columns.
-pub(super) fn resolve_reposition(
+pub(in crate::pipeline::resolver) fn resolve_reposition(
     fold: &mut ResolverFold,
     moves: Vec<ast_unresolved::RepositionSpec>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Resolve each reposition spec and apply the reordering
+    available: &[ColId],
+) -> Result<(Vec<ast_resolved::RepositionSpec>, Vec<ColId>)> {
+    let count = available.len();
+    let mut result = vec![None; count];
+    let mut moved = Vec::new();
     let mut resolved_moves = Vec::new();
-    let num_columns = available.len();
-    let mut result = vec![None; num_columns];
-    let mut moved_indices = std::collections::HashSet::new();
 
     for spec in moves {
-        // Resolve the column reference
-        let resolved_column =
-            resolve_expressions_via_fold(fold, vec![spec.column.clone()], available, false)?
-                .into_iter()
-                .next()
-                .expect("resolve_expressions_via_fold returns same count as input");
-
-        // Find which column this refers to
-        let column_idx = match &spec.column {
-            ast_unresolved::DomainExpression::Lvar { name, .. } => available
-                .iter()
-                .position(|col| delightql_types::SqlIdentifier::str_eq(col.name(), name))
-                .ok_or_else(|| {
-                    crate::error::DelightQLError::column_not_found_error(
-                        name.as_str(),
-                        "in basic-cover operator",
-                    )
-                })?,
-            ast_unresolved::DomainExpression::ColumnOrdinal(ordinal_box) => {
-                // Handle column ordinals (|1|, |2|, |-1|, etc.)
-                let ordinal = ordinal_box.get();
-                let idx = if ordinal.reverse {
-                    // Negative indexing from the end
-                    let pos = (num_columns as i32) - (ordinal.position as i32);
-                    if pos < 0 {
-                        return Err(crate::error::DelightQLError::parse_error(format!(
-                            "Column ordinal -{} out of range",
-                            ordinal.position
-                        )));
-                    }
-                    pos as usize
-                } else {
-                    // 1-based to 0-based
-                    let pos = (ordinal.position as usize) - 1;
-                    if pos >= num_columns {
-                        return Err(crate::error::DelightQLError::parse_error(format!(
-                            "Column ordinal {} out of range (max {})",
-                            ordinal.position, num_columns
-                        )));
-                    }
-                    pos
-                };
-                idx
-            }
-            _ => {
-                return Err(crate::error::DelightQLError::parse_error(
-                    "Reposition only supports column names and ordinals",
-                ));
-            }
+        let resolved = resolve_expressions_via_fold(
+            fold,
+            vec![ast_unresolved::DomainExpression::Reference(spec.column)],
+            available,
+        )?
+        .into_iter()
+        .next()
+        .expect("one reposition reference resolves to one expression");
+        let column = resolved_column(&resolved).ok_or_else(|| {
+            DelightQLError::parse_error("Reposition only supports columns and ordinals")
+        })?;
+        let ast_resolved::DomainExpression::Reference(reference) = resolved else {
+            return Err(DelightQLError::parse_error(
+                "Reposition only supports columns and ordinals",
+            ));
         };
-
-        // Check for duplicate column
-        if moved_indices.contains(&column_idx) {
-            return Err(crate::error::DelightQLError::parse_error(format!(
-                "Column '{}' appears multiple times in reposition",
-                available[column_idx].name()
-            )));
+        let source = available
+            .iter()
+            .position(|candidate| *candidate == column)
+            .ok_or_else(|| DelightQLError::parse_error("Reposition column is not in the input"))?;
+        if moved.contains(&source) {
+            return Err(DelightQLError::parse_error(
+                "A column appears multiple times in reposition",
+            ));
         }
-
-        // Normalize negative positions
-        let mut target_pos = spec.position;
-        if target_pos < 0 {
-            target_pos = (num_columns as i32) + target_pos + 1;
-        }
-
-        // Validate position range
-        if target_pos < 1 || target_pos > num_columns as i32 {
-            return Err(crate::error::DelightQLError::parse_error(format!(
+        let target = if spec.position < 0 {
+            count as i32 + spec.position
+        } else {
+            spec.position - 1
+        };
+        if target < 0 || target >= count as i32 {
+            return Err(DelightQLError::parse_error(format!(
                 "Position {} is out of range for {} columns",
-                spec.position, num_columns
+                spec.position, count
             )));
         }
-
-        let target_idx = (target_pos - 1) as usize;
-
-        // Check for duplicate target position
-        if result[target_idx].is_some() {
-            return Err(crate::error::DelightQLError::parse_error(format!(
-                "Multiple columns cannot target position {}",
-                target_pos
-            )));
+        let target = target as usize;
+        if result[target].is_some() {
+            return Err(DelightQLError::parse_error(
+                "Multiple columns cannot target the same position",
+            ));
         }
-
-        result[target_idx] = Some(available[column_idx].clone());
-        moved_indices.insert(column_idx);
-
+        result[target] = Some(column);
+        moved.push(source);
         resolved_moves.push(ast_resolved::RepositionSpec {
-            column: resolved_column,
+            column: reference,
             position: spec.position,
         });
     }
 
-    // Fill remaining positions with unmoved columns in order
-    let mut remaining: Vec<ast_resolved::ColumnMetadata> = available
+    let remaining: Vec<_> = available
         .iter()
         .enumerate()
-        .filter(|(idx, _)| !moved_indices.contains(idx))
-        .map(|(_, col)| col.clone())
+        .filter(|(index, _)| !moved.contains(index))
+        .map(|(_, column)| *column)
         .collect();
-
-    for slot in result.iter_mut() {
-        if slot.is_none() && !remaining.is_empty() {
-            *slot = Some(remaining.remove(0));
+    let mut remaining = remaining.into_iter();
+    for slot in &mut result {
+        if slot.is_none() {
+            *slot = remaining.next();
         }
     }
-
-    // Build the reordered output columns
-    let output_columns: Vec<ast_resolved::ColumnMetadata> = result.into_iter().flatten().collect();
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::Reposition {
-        moves: resolved_moves,
-    };
-
-    // Return the REORDERED columns - this is critical for CPR Law 0!
-    Ok((resolved_op, output_columns))
-}
-
-/// Resolve the Witness operator (+ or \+)
-///
-/// Witness reifies the input relation's existence as a 1-row, 1-column relation.
-/// - `+` returns ExistsWitness: `met` = 1 if source has rows, 0 otherwise
-/// - `\+` returns DoesNotExistWitness: `met` = 1 if source is empty, 0 otherwise
-///
-/// The output is always a single column named "met" with a single row.
-pub(super) fn resolve_witness(
-    exists: bool,
-    _available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Helper to create a synthetic column for the witness relation
-    fn make_witness_column(name: &str, position: usize) -> ast_resolved::ColumnMetadata {
-        // Honest Fresh: "met" is a synthesized existence flag, not a table column.
-        ast_resolved::ColumnMetadata::new(
-            ast_resolved::ColumnProvenance::from_column(name.to_string()),
-            ast_resolved::TableName::Fresh,
-            Some(position),
-        )
-    }
-
-    // Output: single column "met"
-    let output_columns = vec![make_witness_column("met", 1)];
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::Witness { exists };
-
-    Ok((resolved_op, output_columns))
-}
-
-/// Resolve the SignedWitness operator (+-)
-///
-/// The signed witness keeps the source schema and appends `met` LAST —
-/// the operand keeps its shape and the witness annotates it
-/// (EFFECT-ALGEBRA §3; book/reference/dql/witness.md "Lowering").
-/// A colliding `met` takes the language's `_2` suffix convention,
-/// mirroring the effect transformer's `witness_wrap`. Pinned by the
-/// effects ball's compose--74 (plain ad-hoc `+-`).
-pub(super) fn resolve_signed_witness(
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    let met_name = {
-        let mut candidate = "met".to_string();
-        let mut n = 2;
-        while available.iter().any(|c| c.name() == candidate) {
-            candidate = format!("met_{}", n);
-            n += 1;
-        }
-        candidate
-    };
-
-    let mut output_columns = available.to_vec();
-    // Honest Fresh: "met" is the synthesized presence flag, not a table column.
-    output_columns.push(ast_resolved::ColumnMetadata::new(
-        ast_resolved::ColumnProvenance::from_column(met_name),
-        ast_resolved::TableName::Fresh,
-        Some(available.len() + 1),
-    ));
-
+    let reordered: Vec<_> = result.into_iter().flatten().collect();
+    let scope = output_scope(&fold.registry.identities, available, WrapReason::Projection);
     Ok((
-        ast_resolved::UnaryRelationalOperator::SignedWitness,
-        output_columns,
+        resolved_moves,
+        republish_all(&fold.registry.identities, &reordered, scope),
     ))
 }
 
-/// Resolve the MetaIze operator (^)
-///
-/// MetaIze reifies the input relation's schema as queryable data with
-/// the fixed heading (scope, column_name, ordinal). `^^` never reaches
-/// here as one operator: the builder stacks two applications.
-///
-/// The `scope` column shows which table owns each column:
-/// - `users(*), products(*) ^` → scope is "users" or "products"
-/// - `users(*) |> (*) ^` → scope is "_" (unqualified after projection)
-///
-/// This is compile-time schema synthesis - the output is a virtual relation
-/// containing one row per column of the input relation.
-pub(super) fn resolve_meta_ize(
-    _available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Helper to create a synthetic column for the meta relation
-    fn make_meta_column(name: &str, position: usize) -> ast_resolved::ColumnMetadata {
-        // Honest Fresh: meta columns (scope, column_name, ...) are a synthesized
-        // schema vocabulary, not columns of any source table.
-        ast_resolved::ColumnMetadata::new(
-            ast_resolved::ColumnProvenance::from_column(name.to_string()),
-            ast_resolved::TableName::Fresh,
-            Some(position),
-        )
-    }
-
-    // Build output schema - these are the columns of the meta relation
-    let output_columns = vec![
-        make_meta_column("scope", 1),
-        make_meta_column("column_name", 2),
-        make_meta_column("ordinal", 3),
-    ];
-
-    let resolved_op = ast_resolved::UnaryRelationalOperator::MetaIze;
-
-    Ok((resolved_op, output_columns))
+pub(in crate::pipeline::resolver) fn resolve_witness(
+    available: &[ColId],
+    identities: &Registry,
+) -> Result<Vec<ColId>> {
+    let scope = output_scope(identities, available, WrapReason::Witness);
+    let output = vec![minted_column(
+        identities,
+        scope,
+        "met",
+        ColumnOrigin::Computed {
+            via: Computation::Operator,
+        },
+    )];
+    Ok(output)
 }
 
-/// Resolve the Qualify operator: * - marks columns as qualified
-///
-/// This operator marks all columns as qualified (table-prefixed).
-/// Qualified columns don't unify implicitly with same-named columns from other tables.
-/// The output columns are identical to input, with user-qualified status.
-pub(super) fn resolve_qualify(
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Mark all columns as user-qualified (explicit operator request)
-    let output_columns: Vec<_> = available
-        .iter()
-        .map(|col| {
-            let mut new_col = col.clone();
-            new_col.info = new_col
-                .info
-                .with_updated_qualification(crate::pipeline::asts::core::QualificationSource::User);
-            new_col
+pub(in crate::pipeline::resolver) fn resolve_signed_witness(
+    available: &[ColId],
+    identities: &Registry,
+) -> Result<Vec<ColId>> {
+    let mut ordinal = 1;
+    let met_name = loop {
+        let candidate = if ordinal == 1 {
+            "met".to_string()
+        } else {
+            format!("met_{ordinal}")
+        };
+        let spelling = identities.intern(&candidate, false);
+        let name = identities.canonical(spelling);
+        if !available
+            .iter()
+            .any(|column| identities.published_sym(*column) == Some(name))
+        {
+            break candidate;
+        }
+        ordinal += 1;
+    };
+    let scope = output_scope(identities, available, WrapReason::Witness);
+    let mut output = republish_all(identities, available, scope);
+    output.push(minted_column(
+        identities,
+        scope,
+        &met_name,
+        ColumnOrigin::Computed {
+            via: Computation::Operator,
+        },
+    ));
+    Ok(output)
+}
+
+pub(in crate::pipeline::resolver) fn resolve_meta_ize(
+    available: &[ColId],
+    identities: &Registry,
+) -> Result<Vec<ColId>> {
+    let scope = output_scope(identities, available, WrapReason::Meta);
+    let output = ["scope", "column_name", "ordinal"]
+        .into_iter()
+        .map(|name| {
+            minted_column(
+                identities,
+                scope,
+                name,
+                ColumnOrigin::Computed {
+                    via: Computation::Operator,
+                },
+            )
         })
         .collect();
-
-    Ok((
-        ast_resolved::UnaryRelationalOperator::Qualify,
-        output_columns,
-    ))
+    Ok(output)
 }
 
-/// Resolve the Using operator: .(cols)
+/// The one access resolver: `*`, `.(a, b)`, and `.*`.
 ///
-/// The Using operator performs USING semantics on the specified columns.
-/// At resolution time, we just validate the columns exist and pass them through.
-/// The actual USING join semantics are handled in the refiner at join-building time.
-pub(super) fn resolve_using(
-    columns: Vec<String>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Validate all USING columns exist in available schema
-    for col_name in &columns {
-        let exists = available.iter().any(|c| {
-            c.info.name().map_or(false, |n| {
-                delightql_types::SqlIdentifier::str_eq(n, col_name)
-            })
-        });
-        if !exists {
-            let available_cols: Vec<_> = available.iter().filter_map(|c| c.info.name()).collect();
-            return Err(crate::error::DelightQLError::column_not_found_error(
-                col_name.clone(),
-                format!("available columns: {}", available_cols.join(", ")),
-            ));
+/// Every access is heading-PRESERVING here — it qualifies, dequalifies, or
+/// activates the heading it was handed, and publishes exactly those columns.
+/// Only the named form has anything to check, and it checks the one thing a
+/// name can be wrong about: that the heading answers to it, once.
+pub(in crate::pipeline::resolver) fn resolve_access(
+    access: ast_resolved::Access,
+    available: &[ColId],
+    identities: &Registry,
+) -> Result<(ast_resolved::Access, Vec<ColId>)> {
+    if let ast_resolved::Access::Dequalify(columns) = &access {
+        for name in columns {
+            if unique_named(identities, available, name).is_none() {
+                return Err(DelightQLError::column_not_found_error(
+                    name.as_str(),
+                    "in USING operator",
+                ));
+            }
         }
     }
-
-    // Output schema is same as input - USING deduplication happens at join time
-    Ok((
-        ast_resolved::UnaryRelationalOperator::Using { columns },
-        available.to_vec(),
-    ))
+    Ok((access, available.to_vec()))
 }
 
-/// Resolve the UsingAll operator: .*
-///
-/// At the pipe level, UsingAll is a pass-through — the actual shared-column
-/// computation happens at join time in the resolver's join handler.
-pub(super) fn resolve_using_all(
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    Ok((
-        ast_resolved::UnaryRelationalOperator::UsingAll,
-        available.to_vec(),
-    ))
-}
-
-/// Resolve the DmlTerminal operator via fold-based dispatch
-///
-/// Same semantics as `resolve_dml_terminal`, but accesses `fold.registry` for
-/// namespace lookups instead of taking a separate `registry` parameter.
-pub(super) fn resolve_dml_terminal_via_fold(
-    fold: &mut ResolverFold,
-    kind: crate::pipeline::asts::core::operators::DmlKind,
-    target: String,
-    target_namespace: Option<String>,
-    domain_spec: ast_unresolved::DomainSpec,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // Resolve DQL namespace → SQL schema (same path as SELECT table resolution)
-    // Also track the connection_id so the execution engine routes DML to the correct database
-    let resolved_namespace = if let Some(ref ns) = target_namespace {
-        if let Some(system) = fold.registry.database.system {
-            let parts: Vec<String> = ns.split("::").map(|s| s.to_string()).collect();
-            let ns_path = delightql_types::namespace::NamespacePath::from_parts(parts);
-            match system.resolve_namespace_path(&ns_path) {
-                Ok(Some((source_ns, connection_id))) => {
-                    fold.registry.track_connection_id(connection_id);
-                    source_ns
-                }
-                _ => target_namespace,
-            }
-        } else {
-            target_namespace
-        }
-    } else {
-        target_namespace
-    };
-
-    // Convert DomainSpec from Unresolved to Resolved phase
-    let resolved_domain_spec = match domain_spec {
-        ast_unresolved::DomainSpec::Glob => ast_resolved::DomainSpec::Glob,
-        ast_unresolved::DomainSpec::GlobWithUsing(cols) => {
-            ast_resolved::DomainSpec::GlobWithUsing(cols)
-        }
-        ast_unresolved::DomainSpec::GlobWithUsingAll => ast_resolved::DomainSpec::GlobWithUsingAll,
-        ast_unresolved::DomainSpec::Positional(exprs) => {
-            let resolved =
-                super::super::domain_expressions::projection::resolve_expressions_via_fold(
-                    fold, exprs, available, false,
-                )?;
-            ast_resolved::DomainSpec::Positional(resolved)
-        }
-        ast_unresolved::DomainSpec::Bare => ast_resolved::DomainSpec::Bare,
-    };
-
-    Ok((
-        ast_resolved::UnaryRelationalOperator::DmlTerminal {
-            kind,
-            target,
-            target_namespace: resolved_namespace,
-            domain_spec: resolved_domain_spec,
-        },
-        available.to_vec(),
-    ))
-}
-
-/// Resolve the InteriorDrillDown operator
-///
-/// Explodes an interior relation (tree group) column into rows.
-/// The column must exist in the input schema and have an interior_schema attached
-/// (from tree group resolution or sys table lookup).
-pub(super) fn resolve_interior_drill_down(
+pub(in crate::pipeline::resolver) fn resolve_interior_drill_down(
     column: String,
     glob: bool,
     columns: Vec<String>,
-    _interior_schema: Option<Vec<crate::pipeline::asts::core::operators::InteriorColumnDef>>,
     unresolved_groundings: Vec<(String, String)>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    use crate::pipeline::asts::core::operators::InteriorColumnDef;
-
-    // 1. Find the drilled column in the input schema
-    let drilled_col =
-        available
-            .iter()
-            .find(|col| delightql_types::SqlIdentifier::str_eq(col.name(), &column))
-            .ok_or_else(|| {
-                crate::error::DelightQLError::validation_error(
-                    format!(
-                    "Interior drill-down: column '{}' not found in input relation. Available: {}",
-                    column,
-                    available.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
-                ),
-                    "Check that the column name matches a tree group column in the input."
-                        .to_string(),
-                )
-            })?;
-
-    // 1b. TAGGED SUM (EFFECT-ALGEBRA §3): a ledger
-    // column whose arms declare DIFFERENT interior headings must not be
-    // released across arms — the first arm's heading would silently drop
-    // the other arms' rows. The union stays legal; the RELEASE teaches.
-    // Pinned by directive_contract 35_mixed_payload_release_refused.
-    if drilled_col.interior_schema_conflict {
-        return Err(crate::error::DelightQLError::validation_error_categorized(
-            "effect/ledger/mixed_release",
-            format!(
-                "releasing '{}' across ledger arms whose declared interior \
-                 headings DIFFER — narrow the ledger to arms that agree \
-                 before releasing, by operation (…, operation = \"run!\" \
-                 |> .{}(*)) or by arm label when one operation contributes \
-                 several headings (EFFECT-ALGEBRA §3)",
-                column, column
-            ),
-            "mixed payload release",
-        ));
-    }
-
-    // 2. Get the interior schema from the column metadata
-    let schema = drilled_col.interior_schema.clone().ok_or_else(|| {
-        crate::error::DelightQLError::validation_error(
-            format!(
-                "Interior drill-down: column '{}' does not have a known interior schema. \
-                 It may not be a tree group column, or its schema was not captured during resolution.",
-                column
-            ),
-            "Use ~= destructuring for columns without a statically known interior schema.".to_string(),
-        )
-    })?;
-
-    // 3. Build output columns
-    let mut output_columns = Vec::new();
-
-    // 3a. Add all input columns EXCEPT the drilled column (context carry-forward)
-    for col in available {
-        if !delightql_types::SqlIdentifier::str_eq(col.name(), &column) {
-            output_columns.push(col.clone());
-        }
-    }
-
-    // 3b. Add interior columns from the schema
-    //
-    // Three modes:
-    //   glob=true             → all interior columns, original names
-    //   named (all match)     → selected interior columns by name
-    //   positional (arity eq) → all interior columns, user-supplied aliases
-    //                           ("_" entries → skip that column from output)
-    let mut positional_aliases: Option<&Vec<String>> = None;
-    let interior_cols: Vec<&InteriorColumnDef> = if glob {
-        schema.iter().collect()
-    } else {
-        // ALL-OR-NOTHING mode selection: every name matches the interior
-        // schema → named selection; none match → positional rename; a
-        // MIX refuses — falling to positional on a partial match silently
-        // rebound a real interior name to different data (a typo in one
-        // name relabeled every column). A "_" is an EXPLICIT positional
-        // declaration (the language-wide pattern idiom `users(_, name)`),
-        // so underscore-bearing patterns are positional by intent and the
-        // mixed refusal applies only to underscore-free patterns.
-        let is_match = |c: &String| c != "_" && schema.iter().any(|d| d.name == *c);
-        let has_underscore = columns.iter().any(|c| c == "_");
-        let matched_count = columns.iter().filter(|c| is_match(c)).count();
-        let all_matched =
-            !has_underscore && matched_count == columns.len() && !columns.is_empty();
-        if !has_underscore && matched_count > 0 && !all_matched {
-            let (hits, misses): (Vec<&str>, Vec<&str>) = columns
-                .iter()
-                .map(|c| c.as_str())
-                .partition(|c| is_match(&c.to_string()));
-            return Err(crate::error::DelightQLError::validation_error(
-                format!(
-                    "Interior drill-down on '{}' mixes named and positional: \
-                     [{}] name interior columns but [{}] do not. Either ALL \
-                     names match the interior schema (named selection) or \
-                     NONE do (positional rename). Available: {}.",
-                    column,
-                    hits.join(", "),
-                    misses.join(", "),
-                    schema.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "),
-                ),
-                "Fix the typo for named selection, or choose fresh names for positional binding."
-                    .to_string(),
-            ));
-        }
-        if all_matched {
-            columns
-                .iter()
-                .map(|c| {
-                    schema
-                        .iter()
-                        .find(|d| d.name == *c)
-                        .expect("all_matched guarantees presence")
-                })
-                .collect()
-        } else if columns.len() == schema.len() {
-            // Positional binding: arity matches, names are fresh.
-            // Select all interior columns; alias with user-supplied names.
-            positional_aliases = Some(&columns);
-            schema.iter().collect()
-        } else {
-            // Neither named nor positional — report the first bad name
-            let bad = columns
-                .iter()
-                .find(|c| *c != "_" && !schema.iter().any(|d| d.name == **c))
-                .unwrap_or(&columns[0]);
-            return Err(crate::error::DelightQLError::validation_error(
-                format!(
-                    "Interior drill-down: column '{}' not found in interior schema of '{}'. \
-                     Available: {}. (Positional binding requires exactly {} columns, got {}.)",
-                    bad,
-                    column,
-                    schema.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "),
-                    schema.len(),
-                    columns.len(),
-                ),
-                "Check column names against the tree group definition, or provide exactly the right number of names for positional binding.".to_string(),
-            ));
-        }
-    };
-
-    // Build resolved columns and output schema.
-    // When positional aliases are present, "_" entries are skipped (not in output).
-    let resolved_columns: Vec<String>;
-    let mut resolved_col_list = Vec::new();
-    for (idx, def) in interior_cols.iter().enumerate() {
-        let output_name = if let Some(aliases) = positional_aliases {
-            &aliases[idx]
-        } else {
-            &def.name
-        };
-        // Skip placeholder positions — they don't appear in output
-        if output_name == "_" {
-            continue;
-        }
-        resolved_col_list.push(def.name.clone());
-        // The drilled column stands as the interior fields' source table.
-        let mut col = ast_resolved::ColumnMetadata::new(
-            ast_resolved::ColumnProvenance::from_table_column(
-                output_name.clone(),
-                ast_resolved::TableName::Named(column.clone().into()),
-                crate::pipeline::asts::core::QualificationSource::None,
-            ),
-            ast_resolved::TableName::Named(column.clone().into()),
-            Some(output_columns.len() + idx + 1),
-        );
-        // Argumentative drill binding DECLARES bare lvars, like every
-        // argumentative access — a positional alias here participates
-        // in full-name-identity unification.
-        if positional_aliases.is_some() {
-            col.declare_bare();
-        }
-        // If this interior column has its own nested interior, mark it
-        if def.child_interior.is_some() {
-            col.interior_schema = def.child_interior.clone();
-        }
-        output_columns.push(col);
-    }
-
-    // For the resolved operator, pass only the non-skipped schema column names
-    // so the transformer generates json_extract for the right subset.
-    resolved_columns = if positional_aliases.is_some() {
-        resolved_col_list
-    } else {
-        columns
-    };
-
-    // 4. Convert grounding positions to (schema_column_name, literal_value) pairs
-    let resolved_groundings: Vec<(String, String)> = unresolved_groundings
-        .iter()
-        .filter_map(|(pos_str, value)| {
-            let pos: usize = pos_str.parse().ok()?;
-            schema.get(pos).map(|def| (def.name.clone(), value.clone()))
-        })
-        .collect();
-
-    // 5. Build the resolved operator with the interior schema attached
-    let resolved_op = ast_resolved::UnaryRelationalOperator::InteriorDrillDown {
-        column: column.clone(),
-        glob,
-        columns: resolved_columns,
-        interior_schema: Some(schema),
-        groundings: resolved_groundings,
-    };
-
-    Ok((resolved_op, output_columns))
-}
-
-/// Resolve the NarrowingDestructure operator
-///
-/// Iterates a JSON array column via json_each, extracts named fields from
-/// each element via json_extract. No context carry-forward — the output
-/// schema contains only the named fields.
-pub(super) fn resolve_narrowing_destructure(
-    column: String,
-    fields: Vec<String>,
-    available: &[ast_resolved::ColumnMetadata],
-) -> Result<(
-    ast_resolved::UnaryRelationalOperator,
-    Vec<ast_resolved::ColumnMetadata>,
-)> {
-    // 1. Verify column exists in input schema
-    let col = available
-        .iter()
-        .find(|col| delightql_types::SqlIdentifier::str_eq(col.name(), &column))
+    available: &[ColId],
+    identities: &Registry,
+) -> Result<(crate::pipeline::asts::core::operators::BoundDrill, Vec<ColId>)> {
+    // The drill carrier still holds characters rather than a written name;
+    // reading it unstropped is what it has always meant.
+    let drilled = unique_named(identities, available, &SqlIdentifier::new(column.clone()))
         .ok_or_else(|| {
-            crate::error::DelightQLError::validation_error(
-                format!(
-                    "Narrowing destructure: column '{}' not found in input relation. Available: {}",
-                    column,
-                    available
-                        .iter()
-                        .map(|c| c.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                "Check that the column name matches a column in the input.".to_string(),
+            DelightQLError::validation_error(
+                format!("Interior drill-down: column '{column}' not found in input relation"),
+                "Check that the column names a single tree-group column",
             )
         })?;
+    let facts = identities.facts(drilled);
+    if facts.interior_conflict {
+        return Err(DelightQLError::validation_error_categorized(
+            "effect/ledger/mixed_release",
+            format!(
+                "releasing '{column}' across ledger arms whose declared interior headings differ"
+            ),
+            "narrow the ledger to arms with one interior heading before releasing",
+        ));
+    }
+    let interior = facts.interior.ok_or_else(|| {
+        DelightQLError::validation_error(
+            format!("Interior drill-down: column '{column}' has no known interior heading"),
+            "Use ~= destructuring for values without a statically known heading",
+        )
+    })?;
+    let interior_columns = identities.known_heading(interior)?;
+    let selected = if glob {
+        interior_columns
+            .iter()
+            .copied()
+            .map(|column| (column, None))
+            .collect::<Vec<_>>()
+    } else {
+        // An argumentative drill-down is an ARITY BINDER, never a projection
+        // list: it binds the interior's columns left to right, one name per
+        // column, exactly as `employees(id, name)` binds a base relation. A
+        // name here is the name being GIVEN to a position, so whether the
+        // interior already publishes that name decides nothing — to keep a
+        // subset of a wider interior, expand with `(*)` and project, or narrow
+        // with braces.
+        if columns.len() != interior_columns.len() {
+            return Err(DelightQLError::validation_error(
+                format!(
+                    "drill-down into '{column}' names {} columns; its interior has {}",
+                    columns.len(),
+                    interior_columns.len()
+                ),
+                "An argumentative drill-down binds the interior's columns by position, one \
+                 name each. Expand with (*) and project to keep a subset.",
+            ));
+        }
+        // The names bound here are programmer-authored and a heading, so they
+        // obey the uniqueness a projection's do — without this the second of
+        // two `d`s is silently published as `d_2`. `_` is exempt: it binds
+        // nothing, so any number of them collide over nothing.
+        let mut bound = Vec::new();
+        for name in columns.iter().filter(|name| *name != "_") {
+            let spelling = identities.canonical(identities.intern(name, false));
+            if bound.contains(&spelling) {
+                return Err(DelightQLError::validation_error(
+                    format!(
+                        "Duplicate column '{name}' in drill-down into '{column}': \
+                         programmer-authored names must be unique. Rename one to disambiguate"
+                    ),
+                    "in output schema",
+                ));
+            }
+            bound.push(spelling);
+        }
+        interior_columns
+            .iter()
+            .copied()
+            .zip(columns.iter())
+            .filter(|(_, alias)| *alias != "_")
+            .map(|(column, alias)| (column, Some(alias.as_str())))
+            .collect()
+    };
+    let selected_columns = selected
+        .iter()
+        .map(|(column, _)| *column)
+        .collect::<Vec<_>>();
 
-    // Wrong-aim check (interior-values matrix, task #22): narrowing iterates
-    // a TABLE-shaped value; a plainly-scalar column has nothing to iterate.
-    // Without this the machinery marches json_each over a number/date and
-    // returns silent NULL rows. TEXT stays permissive (documents live there).
-    if let Some(decl) = col.scalar_only_declaration() {
-        return Err(crate::error::DelightQLError::ValidationError {
+    let scope = output_scope(identities, available, WrapReason::Projection);
+    let mut output = available
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != drilled)
+        .map(|source| {
+            identities.republish_column(
+                source,
+                scope,
+                Republish::Passthrough,
+                identities.published(source),
+                identities.addressing(source),
+                |_| {},
+            )
+        })
+        .collect::<Vec<_>>();
+    // The interior is a relation the row carries, and it answers to the name
+    // of the column it was drilled out of: `t(*).items(*)` puts `items` in
+    // scope as a qualifier, so `items.x` names the interior's `x` and not an
+    // `x` the enclosing level also publishes. Without it an interior sharing
+    // a name with the level above it is unreachable, and `R |> .items(*)`
+    // does not resolve at all — that form normalizes to a qualified glob the
+    // compiler writes for itself.
+    //
+    // The qualifier rides the COLUMN, not a scope of its own: this operator
+    // republishes both halves into one output and the pipe stage republishes
+    // again, and a scope survives neither step where addressing survives
+    // both. The published name is untouched either way — a glob keeps the
+    // interior's own spelling, a binder keeps the one it bound.
+    let answers_under = identities.published_sym(drilled);
+    for (source, alias) in selected {
+        output.push(
+            identities.republish_column(
+                source,
+                scope,
+                if alias.is_some() {
+                    Republish::Rename
+                } else {
+                    Republish::Passthrough
+                },
+                alias
+                    .map(|name| identities.intern(name, false))
+                    .or_else(|| identities.published(source)),
+                answers_under.map_or(
+                    if alias.is_some() {
+                        Addressing::Bare
+                    } else {
+                        Addressing::Published
+                    },
+                    Addressing::BareAnswering,
+                ),
+                |_| {},
+            ),
+        );
+    }
+
+    let resolved_groundings = unresolved_groundings
+        .iter()
+        .filter_map(|(position, value)| {
+            let position: usize = position.parse().ok()?;
+            interior_columns.in_order().nth(position).map(|column| {
+                crate::pipeline::asts::core::operators::ResolvedInteriorGrounding {
+                    column: *column,
+                    value: value.clone(),
+                }
+            })
+        })
+        .collect();
+    Ok((
+        crate::pipeline::asts::core::operators::BoundDrill {
+            column: drilled,
+            columns: selected_columns,
+            groundings: resolved_groundings,
+        },
+        output,
+    ))
+}
+
+/// A narrowing, resolved: the bound nest, the pattern read through the
+/// shared path authorities, and the columns it publishes.
+pub(in crate::pipeline::resolver) struct ResolvedNarrowing {
+    pub nest: crate::pipeline::asts::core::Reference<crate::pipeline::asts::core::Resolved>,
+    pub pattern:
+        crate::pipeline::asts::core::RecordPattern<crate::pipeline::asts::core::Resolved>,
+    pub schema: Vec<crate::pipeline::asts::core::DestructureMapping>,
+}
+
+pub(in crate::pipeline::resolver) fn resolve_narrowing_destructure(
+    nest: ast_unresolved::Reference,
+    pattern: ast_unresolved::RecordPattern,
+    available: &[ColId],
+    identities: &Registry,
+) -> Result<(ResolvedNarrowing, Vec<ColId>)> {
+    use crate::pipeline::asts::core::{NamedReference, Reference, TreePattern};
+
+    let Reference::Named(NamedReference(authored)) = &nest else {
+        return Err(DelightQLError::validation_error(
+            "a narrowing addresses its nest by name".to_string(),
+            "write the column's name",
+        ));
+    };
+    let source = unique_named(identities, available, &authored.name).ok_or_else(|| {
+        DelightQLError::validation_error(
+            format!(
+                "Narrowing destructure: column '{}' not found in input relation",
+                authored.name
+            ),
+            "Check that the column name matches one input column",
+        )
+    })?;
+    if identities
+        .facts(source)
+        .declared_type
+        .as_deref()
+        .is_some_and(crate::pipeline::asts::core::metadata::is_plainly_scalar_declaration)
+    {
+        return Err(DelightQLError::ValidationError {
             message: format!(
-                "cannot narrow into column '{}': it is declared {} — a plain \
-                 scalar has no rows to iterate. Narrowing ('|> .col{{.field}}') \
-                 expects a table-shaped value: a tree-group you built, or a \
-                 document column (TEXT) holding an array of objects.",
-                column, decl
+                "cannot narrow into column '{}': a plain scalar has no rows to iterate",
+                authored.name
             ),
             context: "resolver::narrowing_destructure".to_string(),
             subcategory: Some(crate::uri_registry::subcat::COMPOUND_SCALAR_COLUMN),
         });
     }
 
-    // 2. Build output columns — just the named fields (no context carry-forward)
-    //    Output name is the last path segment: "name" → "name", "config.host" → "host"
-    let mut output_columns = Vec::new();
-    for (idx, field) in fields.iter().enumerate() {
-        let output_name = field.rsplit('.').next().unwrap_or(field).to_string();
-        // Honest Fresh: a destructured field is an extracted value with no context
-        // carry-forward (see above) — no source table.
-        let col = ast_resolved::ColumnMetadata::new(
-            ast_resolved::ColumnProvenance::from_column(output_name),
-            ast_resolved::TableName::Fresh,
-            Some(idx + 1),
+    // ONE MAPPING AUTHORITY. The keys a pattern reads and the names it
+    // publishes come from the pattern members themselves, exactly as an
+    // ordinary destructure's do — so a numeric step, a multi-step reach and
+    // a flattened name mean the same thing on both roads.
+    let declared = TreePattern::Record(pattern.clone());
+    let mappings =
+        crate::pipeline::resolver::resolving::predicates::extract_key_mappings_from_unresolved_pattern(
+            &declared,
+        )?;
+    let scope = output_scope(identities, available, WrapReason::Projection);
+    let mut output = Vec::with_capacity(mappings.len());
+    let mut columns = std::collections::HashMap::new();
+    let mut schema = Vec::with_capacity(mappings.len());
+    for (json_key, published) in mappings {
+        let column = minted_column(
+            identities,
+            scope,
+            &published,
+            ColumnOrigin::Computed {
+                via: Computation::Operator,
+            },
         );
-        output_columns.push(col);
+        columns.insert(
+            identities.canonical(identities.intern(&published, false)),
+            column,
+        );
+        output.push(column);
+        schema.push(crate::pipeline::asts::core::DestructureMapping { json_key, column });
     }
-
-    let resolved_op =
-        ast_resolved::UnaryRelationalOperator::NarrowingDestructure { column, fields };
-
-    Ok((resolved_op, output_columns))
+    let resolved =
+        crate::pipeline::resolver::resolving::predicates::convert_destructure_pattern_to_resolved(
+            declared, &columns, identities,
+        )?;
+    let TreePattern::Record(pattern) = resolved else {
+        unreachable!("a record pattern converts to a record pattern");
+    };
+    Ok((
+        ResolvedNarrowing {
+            nest: Reference::Named(NamedReference(
+                crate::pipeline::asts::core::ColumnOccurrence {
+                    column: source,
+                    explicit_qualifier: authored.qualifier.is_some(),
+                },
+            )),
+            pattern,
+            schema,
+        },
+        output,
+    ))
 }

@@ -56,6 +56,66 @@ impl DbValue {
     pub fn is_null(&self) -> bool {
         matches!(self, DbValue::Null)
     }
+
+    /// The bytes this value carries to a consumer that speaks bytes;
+    /// `None` is SQL NULL.
+    ///
+    /// Absence is the ONLY spelling of NULL. No byte string stands in for
+    /// it — a text value whose characters are `NULL` is `Some(b"NULL")`
+    /// and stays distinguishable from `DbValue::Null` for the whole
+    /// journey.
+    pub fn into_wire_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            DbValue::Null => None,
+            DbValue::Integer(i) => Some(i.to_string().into_bytes()),
+            DbValue::Real(f) => Some(f.to_string().into_bytes()),
+            DbValue::Text(s) => Some(s.into_bytes()),
+            DbValue::Blob(b) => Some(b),
+        }
+    }
+
+    /// A whole number of any width the engines carry.
+    ///
+    /// `Integer` is 64 bits and some engines are wider (DuckDB's HUGEINT
+    /// and UBIGINT, and every unsigned bigint). A value that fits becomes
+    /// `Integer`; one that does not keeps its EXACT decimal spelling
+    /// instead. Both reach the wire as the same digits, so nothing is lost
+    /// either way — whereas `as i64` answers a different number and says
+    /// nothing about having done so.
+    pub fn whole(value: i128) -> Self {
+        match i64::try_from(value) {
+            Ok(fits) => DbValue::Integer(fits),
+            Err(_) => DbValue::Text(value.to_string()),
+        }
+    }
+
+    /// An engine's EXACT numeric (`DECIMAL`/`NUMERIC`), as that engine
+    /// spells it.
+    ///
+    /// It stays text because `Real` is binary floating point and cannot
+    /// hold every decimal: `1234567890.1234567891` through an `f64` comes
+    /// back a different number, with no failure to notice. Rounding a
+    /// value quietly is the same defect as wrapping one quietly, and an
+    /// exact numeric already has a faithful representation — its own.
+    pub fn exact_numeric(spelling: impl Into<String>) -> Self {
+        DbValue::Text(spelling.into())
+    }
+
+    /// This value read as text, or `None` for SQL NULL. Numbers give their
+    /// decimal spelling and a blob its lossy UTF-8 reading.
+    ///
+    /// For catalog and metadata reads, whose columns are text by
+    /// construction. It has no text for NULL on purpose: a caller that
+    /// needs one is at a display boundary and chooses it there.
+    pub fn as_wire_text(&self) -> Option<String> {
+        match self {
+            DbValue::Null => None,
+            DbValue::Integer(i) => Some(i.to_string()),
+            DbValue::Real(f) => Some(f.to_string()),
+            DbValue::Text(s) => Some(s.clone()),
+            DbValue::Blob(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        }
+    }
 }
 
 /// Trait for accessing column values from a database row
@@ -96,40 +156,29 @@ pub trait DatabaseConnection: Send + Sync {
     /// Returns None if no rows match
     fn query_row_values(&self, sql: &str, params: &[DbValue]) -> Result<Option<Vec<DbValue>>>;
 
-    /// Query for all rows and return (column_names, rows) as string values.
+    /// Query for all rows and return (column_names, rows) as typed values.
     ///
-    /// Used by the execution engine to route queries to imported connections.
-    /// Default implementation returns an error; backends override as needed.
-    fn query_all_string_rows(
+    /// The one way to read a whole result set from a connection. It answers
+    /// in the engine's own value vocabulary, so NULL is `DbValue::Null` and
+    /// never a text spelling: text whose characters are `NULL` is an
+    /// ordinary `DbValue::Text` and stays distinct from it. A caller that
+    /// wants strings converts at its own boundary, where the choice is
+    /// visible.
+    ///
+    /// Default implementation returns an error; connections override.
+    fn query_all_rows(
         &self,
         _sql: &str,
         _params: &[DbValue],
-    ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    ) -> Result<(Vec<String>, Vec<Vec<DbValue>>)> {
         Err(DelightQLError::validation_error(
-            "query_all_string_rows not implemented for this connection type",
+            "query_all_rows not implemented for this connection type",
             "This connection does not support full result set queries",
         ))
     }
 
-    /// Query for all rows with NULL fidelity preserved.
-    ///
-    /// Returns (column_names, rows) where None = SQL NULL.
-    /// Default delegates to query_all_string_rows (no NULL distinction).
-    fn query_all_nullable_rows(
-        &self,
-        sql: &str,
-        params: &[DbValue],
-    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
-        let (cols, rows) = self.query_all_string_rows(sql, params)?;
-        let nullable_rows = rows
-            .into_iter()
-            .map(|row| row.into_iter().map(Some).collect())
-            .collect();
-        Ok((cols, nullable_rows))
-    }
-
     /// Attach a read-only in-memory schema deserialized from a static SQLite
-    /// image (`delightql-bytes://` mounts, BYTES-SCHEME-DESIGN.md). The
+    /// image (`delightql-bytes://` mounts). The
     /// default refusal IS the design's SQLite-primary-only rule: only the
     /// native SQLite adapter overrides this; pipe, fatboy, DuckDB, and WASM
     /// connections refuse with an actionable error.
@@ -148,7 +197,7 @@ pub trait DatabaseConnection: Send + Sync {
     /// `BEGIN IMMEDIATE` locks every attached database and a READONLY
     /// member would fail all such transactions session-wide (imprint!).
     /// Not-for-writing is the host's convention until the delightql-level
-    /// DML gate lands (MOUNT-SPINE-PLAN.md follow-up, with review R4).
+    /// DML gate lands.
     fn attach_bytes_copied(&self, _schema_alias: &str, _bytes: &[u8]) -> Result<()> {
         Err(DelightQLError::validation_error(
             "delightql-bytes:// mounts require a native SQLite primary connection",
@@ -351,5 +400,84 @@ impl<T: FromDbValue> FromDbValue for Option<T> {
             DbValue::Null => Ok(None),
             other => Ok(Some(T::from_db_value(other)?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DbValue;
+
+    /// A whole number wider than `Integer` keeps its exact digits rather
+    /// than becoming a different number. `i64::MAX + 1` is the first value
+    /// `as i64` would wrap — to `i64::MIN`.
+    #[test]
+    fn a_signed_whole_past_the_top_is_not_wrapped() {
+        let past_the_top = i128::from(i64::MAX) + 1;
+        assert_eq!(
+            DbValue::whole(past_the_top).into_wire_bytes(),
+            Some(b"9223372036854775808".to_vec())
+        );
+        assert_eq!(
+            DbValue::whole(i128::from(i64::MIN) - 1).into_wire_bytes(),
+            Some(b"-9223372036854775809".to_vec())
+        );
+        assert_eq!(
+            DbValue::whole(i128::MAX).into_wire_bytes(),
+            Some(i128::MAX.to_string().into_bytes())
+        );
+    }
+
+    /// The unsigned case: every `u64` above `i64::MAX` reads as a NEGATIVE
+    /// number through `as i64`, so this is the family where narrowing does
+    /// not merely lose magnitude — it loses the sign.
+    #[test]
+    fn an_unsigned_whole_past_the_top_is_not_wrapped() {
+        assert_eq!(
+            DbValue::whole(i128::from(u64::MAX)).into_wire_bytes(),
+            Some(b"18446744073709551615".to_vec())
+        );
+        // The wrap this replaces: u64::MAX `as i64` is -1.
+        assert_ne!(
+            DbValue::whole(i128::from(u64::MAX)).into_wire_bytes(),
+            DbValue::Integer(-1).into_wire_bytes()
+        );
+    }
+
+    /// A number that fits is still an `Integer`, and the two spellings put
+    /// the SAME digits on the wire — which is why widening the road costs
+    /// no reader anything.
+    #[test]
+    fn a_whole_that_fits_stays_an_integer() {
+        assert!(matches!(DbValue::whole(7), DbValue::Integer(7)));
+        assert!(matches!(
+            DbValue::whole(i128::from(i64::MAX)),
+            DbValue::Integer(i) if i == i64::MAX
+        ));
+        assert_eq!(
+            DbValue::whole(7).into_wire_bytes(),
+            DbValue::Text("7".to_string()).into_wire_bytes()
+        );
+    }
+
+    /// An exact numeric keeps its own spelling, scale included. The
+    /// comparison value is what an `f64` round trip does to it.
+    #[test]
+    fn an_exact_numeric_keeps_its_spelling() {
+        let spelled = "1234567890.1234567891";
+        assert_eq!(
+            DbValue::exact_numeric(spelled).into_wire_bytes(),
+            Some(spelled.as_bytes().to_vec())
+        );
+        let through_a_float = DbValue::Real(spelled.parse::<f64>().unwrap());
+        assert_ne!(
+            through_a_float.into_wire_bytes(),
+            Some(spelled.as_bytes().to_vec()),
+            "the f64 road loses digits here — that is why this one exists"
+        );
+        // Trailing scale is part of the value's own spelling.
+        assert_eq!(
+            DbValue::exact_numeric("1.10").into_wire_bytes(),
+            Some(b"1.10".to_vec())
+        );
     }
 }

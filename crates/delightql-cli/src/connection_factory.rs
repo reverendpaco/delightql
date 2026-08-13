@@ -4,7 +4,7 @@
 //!
 //! Bridges the ConnectionFactory trait with the CLI's ConnectionManager,
 //! which knows how to create connections for all supported backends
-//! (SQLite, pipe://, fatboy://).
+//! (SQLite, delightql-siso://, and the fatboy adapters).
 
 use delightql_core::api::{CreatedConnection, Handler};
 use delightql_sqlite_relay::siso::SisoParty;

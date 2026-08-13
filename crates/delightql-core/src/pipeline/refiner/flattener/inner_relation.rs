@@ -4,20 +4,17 @@
 
 use super::context::FlattenContext;
 use super::expression::add_predicate;
-use super::rewrite::{
-    collect_filter_qualifiers, could_be_inner_alias, rewrite_correlation_filter_with_scope,
-    rewrite_subquery_self_references, rewrite_with_hygienic_names,
-};
-use super::types::{FlatSegment, FlatTable, OperationContext};
+use super::rewrite::rewrite_with_hygienic_names;
+use super::types::{FlatSegment, FlatTable};
 use crate::error::Result;
-use crate::pipeline::asts::resolved::{self, CprSchema, InnerRelationPattern, PhaseBox};
+use crate::pipeline::asts::resolved::{self, InnerRelationPattern};
 
 /// Flatten an INNER-RELATION (correlated subquery)
 pub(super) fn flatten_inner_relation(
     pattern: InnerRelationPattern<resolved::Resolved>,
-    alias: Option<String>,
+    preminted_scope: Option<crate::names::ScopeId>,
     outer: bool,
-    cpr_schema: PhaseBox<CprSchema, resolved::Resolved>,
+    cpr_schema: crate::names::ScopeId,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
@@ -52,6 +49,7 @@ pub(super) fn flatten_inner_relation(
                 super::super::pattern_classifier::classify_inner_relation_pattern(
                     identifier.clone(),
                     *subquery.clone(),
+                    &ctx.identities,
                 )?
             }
             other => panic!(
@@ -63,37 +61,38 @@ pub(super) fn flatten_inner_relation(
         pattern.clone()
     };
 
-    let hygienic_injections = match &pattern {
-        resolved::InnerRelationPattern::CorrelatedScalarJoin {
-            hygienic_injections,
-            ..
+    crate::probe::probe!(
+        spec,
+        "flatten_inner_relation: {:?} -> FlatTable with a hardcoded Glob",
+        std::mem::discriminant(&pattern)
+    );
+    // What the subquery publishes for a stripped correlation column is a
+    // question its own heading answers. Asking it here, rather than reading a
+    // list the classifier attached, means the carriers a boundary republished
+    // and the carriers a hoisted condition names cannot come apart.
+    let carriers = match &pattern {
+        resolved::InnerRelationPattern::CorrelatedScalarJoin { subquery, .. }
+        | resolved::InnerRelationPattern::CorrelatedGroupJoin { subquery, .. } => {
+            super::super::pattern_classifier::correlation_carriers(subquery, &ctx.identities)?
         }
-        | resolved::InnerRelationPattern::CorrelatedGroupJoin {
-            hygienic_injections,
-            ..
-        } => hygienic_injections.clone(),
         resolved::InnerRelationPattern::UncorrelatedDerivedTable { .. }
         | resolved::InnerRelationPattern::Indeterminate { .. } => vec![],
     };
 
     match &pattern {
         resolved::InnerRelationPattern::CorrelatedScalarJoin {
-            identifier,
+            identifier: _,
             correlation_filters,
             subquery,
             ..
         }
         | resolved::InnerRelationPattern::CorrelatedGroupJoin {
-            identifier,
+            identifier: _,
             correlation_filters,
             aggregations: _,
             subquery,
             ..
         } => {
-            // Determine the derived table's actual alias
-            // If no explicit alias, use table name (schema shadowing)
-            let derived_table_alias = alias.clone().unwrap_or_else(|| identifier.name.to_string());
-
             // PHASE 3: RECURSIVELY FLATTEN THE SUBQUERY
             // CRITICAL: Remove correlation filters from the subquery AST BEFORE flattening
             // The filters have been extracted by pattern_classifier but are still in the AST
@@ -103,58 +102,16 @@ pub(super) fn flatten_inner_relation(
                 correlation_filters,
             );
 
-            // Rewrite self-reference qualifiers in non-correlation filters
-            // e.g., `o.status = "completed"` → `orders.status = "completed"`
-            let cleaned_subquery =
-                rewrite_subquery_self_references(cleaned_subquery, &identifier.name);
-
-            // INDUCTIVE STEP: Build scope map for recursion.
-            // Start with inherited scope_aliases from parent depths, then add
-            // self-reference aliases from THIS depth's correlation filters.
-            let mut new_scope = ctx.scope_aliases.clone();
-            for filter in correlation_filters.iter() {
-                for q in collect_filter_qualifiers(filter) {
-                    if could_be_inner_alias(&q, &identifier.name) {
-                        new_scope.insert(q, identifier.name.to_string());
-                    }
-                }
-            }
-            // Also add the exact table name so child depths can resolve it
-            new_scope.insert(identifier.name.to_string(), identifier.name.to_string());
-
-            log::debug!(
-                "[SCOPE-INDUCTIVE] table={}, parent_scope={:?}, new_scope={:?}, corr_filters={:?}",
-                identifier.name,
-                ctx.scope_aliases,
-                new_scope,
-                correlation_filters
-                    .iter()
-                    .map(|f| format!("{:?}", f))
-                    .collect::<Vec<_>>()
-            );
-
-            // Flatten the cleaned subquery recursively WITH scope context
-            let flattened_subquery = super::flatten_with_scope(cleaned_subquery, new_scope)?;
+            let flattened_subquery =
+                super::flatten(cleaned_subquery, std::rc::Rc::clone(&ctx.identities))?;
 
             // Extract correlation filters and add to PARENT segment predicates
             // This hoists them out of the subquery so they become JOIN ON clauses
-            // IMPORTANT: Use scope-aware rewriting so ancestor aliases (depth N-2+)
-            //            are resolved to their canonical table names.
             for filter in correlation_filters {
-                let mut rewritten_filter = rewrite_correlation_filter_with_scope(
-                    filter.clone(),
-                    &identifier.name,
-                    &derived_table_alias,
-                    &ctx.scope_aliases,
-                );
+                let mut rewritten_filter = filter.clone();
 
-                // Apply hygienic column name rewrites if injections exist
-                if !hygienic_injections.is_empty() {
-                    rewritten_filter = rewrite_with_hygienic_names(
-                        rewritten_filter,
-                        &derived_table_alias,
-                        &hygienic_injections,
-                    );
+                if !carriers.is_empty() {
+                    rewritten_filter = rewrite_with_hygienic_names(rewritten_filter, &carriers)?;
                 }
 
                 add_predicate(
@@ -165,22 +122,45 @@ pub(super) fn flatten_inner_relation(
                 );
             }
 
+            let identity = cpr_schema;
+            // An injected carrier RIDES this table's boundary: the hoisted
+            // filter above references the injection's occurrence, the
+            // rebuilder's join republishes THIS scope's heading, and the
+            // reference re-anchors along the republish chain — a carrier
+            // present only inside the subquery leaves the hoisted condition
+            // holding an occurrence no FROM entry publishes. The boundary
+            // was registered before the injection existed, so it is
+            // extended here, once (a reflatten finds the occurrence already
+            // riding).
+            for (_, carrier) in &carriers {
+                let riding = ctx
+                    .identities
+                    .known_heading(identity)?
+                    .iter()
+                    .any(|column| ctx.identities.republishes(*column, *carrier));
+                if !riding {
+                    ctx.identities.republish_column(
+                        *carrier,
+                        identity,
+                        crate::names::Republish::Correlation,
+                        None,
+                        crate::names::Addressing::Hygienic,
+                        |_| {},
+                    );
+                }
+            }
             // Add the table with BOTH the pattern AND the flattened subquery
             // The pattern is kept for metadata, the flattened subquery is used by rebuilder
             segment.tables.push(FlatTable {
-                identifier: identifier.clone(),
-                canonical_name: None,
-                backend_schema: None,
-                alias: alias.clone(),
+                identity,
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
-                domain_spec: resolved::DomainSpec::Glob,
-                operation_context: OperationContext::Direct,
-                schema: cpr_schema.get().clone(),
+                access: resolved::Access::All,
+                schema: cpr_schema,
                 outer,
                 anonymous_data: None,
-                correlation_refs: Vec::new(),
                 inner_relation_pattern: Some(pattern.clone()),
+                preminted_scope,
                 subquery_segment: Some(Box::new(flattened_subquery)), // PHASE 3: Store flattened subquery
                 pipe_expr: None,
                 consulted_view_query: None,
@@ -197,46 +177,36 @@ pub(super) fn flatten_inner_relation(
             // and hoist them out of the subquery, producing wrong results.
 
             // Default: UDT with no correlation, or Indeterminate
-            let (identifier, subquery_opt) = match &pattern {
-                resolved::InnerRelationPattern::Indeterminate { identifier, .. } => {
-                    (identifier.clone(), None)
+            let subquery_opt = match &pattern {
+                resolved::InnerRelationPattern::Indeterminate { .. } => None,
+                resolved::InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. } => {
+                    Some(subquery)
                 }
-                resolved::InnerRelationPattern::UncorrelatedDerivedTable {
-                    identifier,
-                    subquery,
-                    ..
-                } => (identifier.clone(), Some(subquery)),
                 // These shouldn't reach here (handled above), but for completeness
-                resolved::InnerRelationPattern::CorrelatedScalarJoin { identifier, .. }
-                | resolved::InnerRelationPattern::CorrelatedGroupJoin { identifier, .. } => {
-                    (identifier.clone(), None)
-                }
+                resolved::InnerRelationPattern::CorrelatedScalarJoin { .. }
+                | resolved::InnerRelationPattern::CorrelatedGroupJoin { .. } => None,
             };
 
             // Recursively flatten subquery if present, passing through inherited scope
             let flattened_subquery_opt = if let Some(subquery) = subquery_opt {
-                Some(Box::new(super::flatten_with_scope(
+                Some(Box::new(super::flatten(
                     (**subquery).clone(),
-                    ctx.scope_aliases.clone(),
+                    std::rc::Rc::clone(&ctx.identities),
                 )?))
             } else {
                 None
             };
 
             segment.tables.push(FlatTable {
-                identifier: identifier.clone(),
-                canonical_name: None,
-                backend_schema: None,
-                alias: alias.clone(),
+                identity: cpr_schema,
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
-                domain_spec: resolved::DomainSpec::Glob,
-                operation_context: OperationContext::Direct,
-                schema: cpr_schema.get().clone(),
+                access: resolved::Access::All,
+                schema: cpr_schema,
                 outer,
                 anonymous_data: None,
-                correlation_refs: Vec::new(),
                 inner_relation_pattern: Some(pattern.clone()),
+                preminted_scope,
                 subquery_segment: flattened_subquery_opt,
                 pipe_expr: None,
                 consulted_view_query: None,

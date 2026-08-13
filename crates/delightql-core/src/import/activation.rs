@@ -4,8 +4,6 @@
 //
 // This module handles activating entities within namespaces.
 // Activation makes entities available for querying via namespace.entity(*) syntax.
-//
-// See: documentation/design/ddl/SYS-NS-CARTRIDGE-ER-DESIGN.md
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -150,8 +148,8 @@ pub fn activate_entities_from_cartridge(
 ///            exposed_namespace, grounding, liminal_receipt (the curated
 ///            `namespace` entity is registered separately in system.rs,
 ///            public columns only — it carries an internal mount link)
-/// - sys::execution: compilation, stack, effect_plan, effect_guard,
-///                    effect_requirement, effect_run
+/// - sys::execution: compilation, stack, compiler_limit, effect_plan,
+///                    effect_guard, effect_requirement, effect_run
 /// - sys::targeting: dialect_render, dialect_form_rule, dialect_capability
 /// - sys::connections: connection_type_enum (the curated `connection` entity is
 ///                     registered separately in system.rs, safe columns only)
@@ -188,8 +186,12 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         // sys::execution (namespace_id = 10)
         ("compilation", 10),
         ("stack", 10),
+        // sys::execution — the resource policies a compilation runs under.
+        // Engine-written: the effective value is published at compilation
+        // entry, the rest is burned with the schema.
+        ("compiler_limit", 10),
         // sys::execution — the typed effect plan's observational
-        // projection (D4; engine-written, cleared at next compile).
+        // projection (engine-written, cleared at next compile).
         ("effect_plan", 10),
         ("effect_guard", 10),
         ("effect_requirement", 10),
@@ -197,13 +199,14 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         // sys::targeting (namespace_id = 12) — the data-driven multi-target
         // rule tables. Introspection already registers them as cartridge-1
         // entities; this is the missing activation that gives them a DQL
-        // address (ALL-SQL-TARGETING-PLAN.md §1 Track B).
+        // address.
         ("dialect_render", 12),
         ("dialect_form_rule", 12),
         ("dialect_capability", 12),
         // sys::entities (namespace_id = 4) — entity-detail that isn't ho/interior
         ("entity_clause", 4),
         ("join_edge", 4),
+        ("functional_dependency", 4),
         // sys::entities::ho (namespace_id = 15)
         ("ho_param", 15),
         ("ho_param_column", 15),
@@ -217,7 +220,7 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         ("namespace_local_enlist", 5),
         ("exposed_namespace", 5),
         ("grounding", 5),
-        // sys::ns — the liminal ledger storage (EFFECT-ALGEBRA §8); read by
+        // sys::ns — the liminal ledger storage (THE LIMINAL RELATION); read by
         // the catalog functor's synthesized `liminal` drill expansion
         // (resolver_fold::r_resolve_pipe). Pinned by effects/liminal--43/45.
         ("liminal_receipt", 5),

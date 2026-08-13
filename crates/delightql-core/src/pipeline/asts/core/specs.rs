@@ -2,107 +2,337 @@
 // Copyright 2026 Daniel Eklund
 //! Specification types for various operations
 
-use super::{Addressed, ColumnMetadata, DomainExpression, PhaseBox, Refined, Resolved, Unresolved};
-use crate::{lispy::ToLispy, PhaseConvert, ToLispy};
-use serde::{Deserialize, Serialize};
+use super::expressions::OutValue;
+use super::expressions::{RenameSource, Spread};
+use super::{DomainExpression, Phase, Unresolved};
+use crate::{lispy::ToLispy, ToLispy};
+use delightql_types::SqlIdentifier;
 
-/// Syntactic containment type
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-pub enum ContainmentSemantic {
-    #[lispy("containment_semantic:bracket")]
-    Bracket, // [...]
-    #[lispy("containment_semantic:parenthesis")]
-    Parenthesis, // (...)
+/// WHICH ROWS ARE EQUIVALENT, and what each equivalence class publishes.
+/// A group without reductions is a distinct — `~>` is what separates the
+/// two spellings, and normalization constructs the exact one it read.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum GroupSpec<P: Phase = Unresolved> {
+    /// `%(keys)` — each class publishes its keys, once. The grammar
+    /// refuses `%()`, and the carrier says it too.
+    #[lispy("group_spec:distinct")]
+    Distinct {
+        keys: crate::pipeline::asts::vocabulary::Vec1<OutItem<P>>,
+    },
+    /// `%(keys ~> reductions)` — each class publishes its keys and one
+    /// value per reduction. Zero keys is the singleton reduction: one
+    /// class holding every row. REDUCTION POSITION IS NONEMPTY: a
+    /// delegate is a reduction item like any other, so a delegate-only
+    /// reduce is one or more `ReductionItem::Delegate` members, and an
+    /// empty reduction is unspellable rather than checked.
+    #[lispy("group_spec:reduce")]
+    Reduce {
+        keys: Vec<OutItem<P>>,
+        reductions: crate::pipeline::asts::vocabulary::Vec1<ReductionItem<P>>,
+        /// Analysis owned by this reduction, empty before resolution.
+        plan: super::expressions::ReductionPlan<P>,
+    },
 }
 
-/// Modulo operator specifications
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-pub enum ModuloSpec<Phase = Unresolved> {
-    /// Simple column list for distinct/group
-    #[lispy("column_spec:reducing_by")]
-    Columns(Vec<DomainExpression<Phase>>),
-    /// Complex grouping with aggregations
-    #[lispy("modulo_spec:group_by")]
-    GroupBy {
-        reducing_by: Vec<OutputDomainExpression<Phase>>,
-        reducing_on: Vec<OutputDomainExpression<Phase>>,
-        /// Delegate selections: pull the reduction back to a representative row.
-        /// Each spec carries a payload (the columns surfaced) and an ordering
-        /// (empty == arbitrary delegate; non-empty == ordered delegate / DISTINCT ON).
-        delegates: Vec<DelegateSpec<Phase>>,
-    },
+/// WHAT STANDS IN REDUCTION POSITION.
+///
+/// A reduction publishes one column per item, and the two things that can
+/// publish one are not the same kind: an out item computes a VALUE, while a
+/// metadata group turns a column's values into an interior record's KEYS.
+/// The group is not an expression and cannot be read as one, which is why
+/// the position states both admissions in its own type. The delegate is a
+/// member too: it publishes its payload from a representative row, and
+/// carrying it here is what makes a delegate-only reduce nonempty by
+/// construction.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum ReductionItem<P: Phase = Unresolved> {
+    #[lispy("reduction_item:out")]
+    Out(OutItem<P>),
+    #[lispy("reduction_item:metadata")]
+    Metadata(MetadataOut<P>),
+    /// `(payload) <~ [#(order)]` — a delegate selection: pull the
+    /// reduction back to a representative row. A reduction item like any
+    /// other, so a delegate-only reduce is nonempty by construction.
+    #[lispy("reduction_item:delegate")]
+    Delegate(DelegateSpec<P>),
+    /// `score of subject` — REDUCTION POSITION ONLY. A pivot rotates one
+    /// column's values into columns of their own, so it is not one value and
+    /// never was: nothing outside a group can spell it, and no scalar walk
+    /// owes it an arm.
+    #[lispy("reduction_item:pivot")]
+    Pivot(PivotSpec<P>),
+}
+
+/// THE IN IS THE HEADING WITNESS.
+///
+/// A pivot publishes one column per value the key's authored membership
+/// predicate named, in the order the author wrote them, so `values` is the
+/// heading itself — resolution reads it off that predicate, and nothing
+/// about the data decides it. The item publishes no single output of its
+/// own, which is why there is no `output` beside `values`.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("pivot_spec")]
+pub struct PivotSpec<P: Phase = Unresolved> {
+    pub value_column: Box<DomainExpression<P>>,
+    pub pivot_key: Box<DomainExpression<P>>,
+    /// Empty as authored; resolution fills it from the IN predicate.
+    pub values: Vec<String>,
+}
+
+/// A metadata group standing in reduction position, with what it publishes.
+///
+/// Naming and the output occurrence belong to the POSITION, exactly as they
+/// do for an out item; the group itself carries only its key and its target.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("metadata_out")]
+pub struct MetadataOut<P: Phase = Unresolved> {
+    pub group: super::expressions::MetadataGroup<P>,
+    /// The `as` the author wrote. `None` is unnamed, not anonymous.
+    pub naming: Option<SqlIdentifier>,
+    pub output: P::Output,
+}
+
+impl<P: Phase> ReductionItem<P> {
+    /// The column this item publishes, once the resolver has decided.
+    pub fn output(&self) -> &P::Output {
+        match self {
+            Self::Out(OutItem::One(one)) => &one.output,
+            Self::Out(OutItem::Many(_)) | Self::Out(OutItem::Whole) => {
+                unreachable!("a spread and the whole publish no single output")
+            }
+            Self::Pivot(_) => {
+                unreachable!("a pivot publishes one column per value, not a single output")
+            }
+            Self::Delegate(_) => {
+                unreachable!("a delegate publishes one column per payload item, not a single output")
+            }
+            Self::Metadata(metadata) => &metadata.output,
+        }
+    }
+
+    /// The out item this is, when it is one. A metadata group is not one,
+    /// and a reader that needs an expression is told so rather than handed
+    /// something it would have to classify.
+    pub fn out_item(&self) -> Option<&OutItem<P>> {
+        match self {
+            Self::Out(item) => Some(item),
+            Self::Metadata(_) | Self::Pivot(_) | Self::Delegate(_) => None,
+        }
+    }
+
+    pub fn out_item_mut(&mut self) -> Option<&mut OutItem<P>> {
+        match self {
+            Self::Out(item) => Some(item),
+            Self::Metadata(_) | Self::Pivot(_) | Self::Delegate(_) => None,
+        }
+    }
+
+    /// The DOMAIN value this item computes, when it computes one.
+    pub fn domain_value(&self) -> Option<&DomainExpression<P>> {
+        self.out_item()?.domain_value()
+    }
+
+    pub fn domain_value_mut(&mut self) -> Option<&mut DomainExpression<P>> {
+        self.out_item_mut()?.domain_value_mut()
+    }
+
+    /// The `as` the author wrote at this position.
+    pub fn naming(&self) -> Option<&SqlIdentifier> {
+        match self {
+            Self::Out(OutItem::One(one)) => one.naming.as_ref(),
+            // A pivot's columns are named by the values the IN witnessed;
+            // a delegate's payload items carry their own namings.
+            Self::Out(_) | Self::Pivot(_) | Self::Delegate(_) => None,
+            Self::Metadata(metadata) => metadata.naming.as_ref(),
+        }
+    }
+}
+
+impl<P: Phase> From<OutItem<P>> for ReductionItem<P> {
+    fn from(item: OutItem<P>) -> Self {
+        Self::Out(item)
+    }
 }
 
 /// A delegate selection in reduction place: `(payload) <~ [#(order)]`.
 /// Surfaces values *selected* from a single row of the group (not synthesized).
 /// An empty `order` is the degenerate "choose by no order" case = arbitrary.
 /// Parenthesized multi-column payloads share one delegate row (coherent).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("delegate_spec")]
-pub struct DelegateSpec<Phase = Unresolved> {
-    pub payload: Vec<OutputDomainExpression<Phase>>,
-    pub order: Vec<OrderingSpec<Phase>>,
+pub struct DelegateSpec<P: Phase = Unresolved> {
+    pub payload: Vec<OutItem<P>>,
+    pub order: Vec<OrderingSpec<P>>,
 }
 
-/// An output-producing DOMAIN expression paired with the resolver's
-/// decision about the column it yields. Phantom before resolution.
-/// `None` after resolution = the resolver decided this expression
-/// contributes NO output column (today: a delegate payload that
-/// duplicates a group key, which is already emitted in group position).
-/// (Named to keep the domain/relational distinction loud: relational
-/// nodes advertise whole schemas; this pairs one scalar-level
-/// expression with its one output decision.)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-#[lispy("output_domain_expression")]
-pub struct OutputDomainExpression<Phase = Unresolved> {
-    pub expr: DomainExpression<Phase>,
-    pub output: PhaseBox<Option<ColumnMetadata>, Phase>,
+/// ONE PUBLISHED VALUE: what computes it, the name the author baptized it
+/// with, and the occurrence it publishes.
+///
+/// All three belong to the publication POSITION. The scalar expression
+/// underneath computes a value and says nothing about publication, so a
+/// value cannot carry a name into a position that publishes nothing, and
+/// two publication positions cannot disagree about what one expression is
+/// called.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("out_item:one")]
+pub struct OneOut<P: Phase = Unresolved> {
+    /// A domain value, or the licensed truth-to-value crossing. Publication
+    /// is one of the three positions that admit the crossing and says so in
+    /// its own type, rather than accepting a domain enum with a truth arm
+    /// every other position could have reached.
+    pub expr: OutValue<P>,
+    /// The `as` the author wrote, as written — strop and case included.
+    /// `None` is unnamed, not anonymous: a reference publishes its own
+    /// name and an application mints one.
+    pub naming: Option<SqlIdentifier>,
+    /// The column this item publishes, once the resolver has decided.
+    /// Phantom before resolution. `None` after resolution = the resolver
+    /// decided this item contributes NO output column (today: a delegate
+    /// payload duplicating a group key, already emitted in group position).
+    pub output: P::Output,
+}
+
+/// A publication item: one value, or a spread standing for the several it
+/// covers.
+///
+/// A NAMED SPREAD IS UNREPRESENTABLE. The `Many` arm has no naming field,
+/// and `One`'s value is a domain expression, which admits no enumerating
+/// form — so no road builds an item that publishes one name across several
+/// columns.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum OutItem<P: Phase = Unresolved> {
+    #[lispy("out_item:one")]
+    One(OneOut<P>),
+    #[lispy("out_item:many")]
+    Many(Spread<P>),
+    /// THE WHOLE OPERAND, named rather than addressed — the publication
+    /// twin of an argument row's star.
+    ///
+    /// A compiler-built projection that keeps everything its operand
+    /// publishes means exactly this, and it is NOT the expansion of an
+    /// authored glob: the operand's hygienic columns must ride through
+    /// such a projection, and a column named in a select list cannot be
+    /// hygienic. No authored surface builds one.
+    #[lispy("out_item:whole")]
+    Whole,
+}
+
+impl<P: Phase> OutItem<P> {
+    /// An unnamed one-value item — what a publication position builds when
+    /// the author wrote no `as`.
+    pub fn plain(expr: impl Into<OutValue<P>>, output: P::Output) -> Self {
+        Self::One(OneOut {
+            expr: expr.into(),
+            naming: None,
+            output,
+        })
+    }
+
+    /// The value a one-value item computes. Neither of the other two
+    /// computes one: a spread enumerates and the whole names, so there is
+    /// no expression to hand back.
+    pub fn value(&self) -> Option<&OutValue<P>> {
+        match self {
+            Self::One(one) => Some(&one.expr),
+            Self::Many(_) | Self::Whole => None,
+        }
+    }
+
+    /// The DOMAIN value this item computes. A published crossing answers
+    /// `None`: an analysis looking for a domain expression has not been
+    /// handed one, and a lowering reads the whole `OutValue` instead.
+    pub fn domain_value(&self) -> Option<&DomainExpression<P>> {
+        self.value()?.domain()
+    }
+
+    pub fn domain_value_mut(&mut self) -> Option<&mut DomainExpression<P>> {
+        self.value_mut()?.domain_mut()
+    }
+
+    pub fn value_mut(&mut self) -> Option<&mut OutValue<P>> {
+        match self {
+            Self::One(one) => Some(&mut one.expr),
+            Self::Many(_) | Self::Whole => None,
+        }
+    }
+}
+
+/// After resolution the stamp is there to read. A spread has none of its own:
+/// it published through its expansion, and the expansion is what carries the
+/// occurrences.
+impl<P: Phase<Output = Option<crate::names::ColId>>> OutItem<P> {
+    pub fn output(&self) -> Option<crate::names::ColId> {
+        match self {
+            Self::One(one) => one.output,
+            Self::Many(_) | Self::Whole => None,
+        }
+    }
+}
+
+/// A publication position whose name is MANDATORY.
+///
+/// The transform writes into a slot it names, so an unnamed item is not a
+/// diagnostic — it is unbuildable. The qualifier says which live scope holds
+/// the column being redefined; a self-join is where the bare name cannot say
+/// it.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("named_out_item")]
+pub struct NamedOutItem<P: Phase = Unresolved> {
+    pub expr: OutValue<P>,
+    pub naming: SqlIdentifier,
+    pub qualifier: Option<SqlIdentifier>,
+    /// The column this item writes into, once the resolver has found it.
+    pub output: P::Output,
 }
 
 /// Ordering direction for ORDER BY
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum OrderDirection {
     Ascending,
     Descending,
 }
 
 /// Ordering specification
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("order_spec")]
-pub struct OrderingSpec<Phase = Unresolved> {
-    pub column: DomainExpression<Phase>,
+pub struct OrderingSpec<P: Phase = Unresolved> {
+    pub column: DomainExpression<P>,
     pub direction: Option<OrderDirection>,
 }
 
-/// Target for renaming - either a literal name or a template
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
-pub enum RenameTarget {
+/// The name an AUTHORED rename asks for: a literal, or a template expanded
+/// once per matched column. Resolution spends it — a bound phase carries
+/// the minted spelling, so a template cannot survive into a closed query.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum NameTarget {
     /// Literal column name: "foo"
-    #[lispy("rename_target:literal")]
-    Literal(String),
+    #[lispy("name_target:identifier")]
+    Identifier(String),
     /// Column name template: :"{@}_{#}"
-    #[lispy("rename_target:template")]
+    #[lispy("name_target:template")]
     Template(super::operators::ColumnAlias),
 }
 
-/// Rename specification
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
+/// Rename specification. The source ADDRESSES columns — one reference, or
+/// the several a regex or glob covers — and computes nothing.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("rename")]
-pub struct RenameSpec<Phase = Unresolved> {
-    pub from: DomainExpression<Phase>,
-    pub to: RenameTarget,
+pub struct RenameSpec<P: Phase = Unresolved> {
+    pub from: RenameSource<P>,
+    pub to: P::RenameTarget,
 }
 
-/// Specification for repositioning a column
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, PhaseConvert)]
-pub struct RepositionSpec<Phase = Unresolved> {
-    pub column: DomainExpression<Phase>,
+/// Specification for repositioning a column. A reposition ADDRESSES a
+/// column — by name or by position — and computes nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositionSpec<P: Phase = Unresolved> {
+    pub column: super::expressions::Reference<P>,
     pub position: i32,
 }
 
-impl<Phase> ToLispy for RepositionSpec<Phase>
+impl<P: Phase> ToLispy for RepositionSpec<P>
 where
-    DomainExpression<Phase>: ToLispy,
+    super::expressions::Reference<P>: ToLispy,
 {
     fn to_lispy(&self) -> String {
         format!(
@@ -113,15 +343,8 @@ where
     }
 }
 
-/// Row in anonymous table
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy, PhaseConvert)]
-#[lispy("row")]
-pub struct Row<Phase = Unresolved> {
-    pub values: Vec<DomainExpression<Phase>>,
-}
-
 /// Tuple ordinal operators for LIMIT/OFFSET
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum TupleOrdinalOperator {
     LessThan,    // #<
     GreaterThan, // #>
@@ -129,7 +352,7 @@ pub enum TupleOrdinalOperator {
 }
 
 /// Tuple ordinal clause
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToLispy)]
+#[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("sigma_clause:tuple_ordinal")]
 pub struct TupleOrdinalClause {
     pub operator: TupleOrdinalOperator,

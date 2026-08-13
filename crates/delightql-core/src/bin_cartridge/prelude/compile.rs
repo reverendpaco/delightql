@@ -11,7 +11,7 @@
 //! and `error_message` are NULL. On failure, `representation` is NULL,
 //! `error` contains the error URI, and `error_message` the full prose —
 //! the inspection surface must never know less than the execution
-//! surface about why a compile failed (error_message added additively;
+//! surface about why a compile failed (`error_message` is additive;
 //! `error` stays URI-only for consumers that parse it).
 //!
 //! Stages: "cst", "ast-unresolved", "ast-resolved", "ast-refined", "sql"
@@ -22,6 +22,7 @@ use crate::bin_cartridge::{
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::literals::LiteralValue;
+use crate::pipeline::asts::core::Comparison;
 use crate::pipeline::asts::unresolved::*;
 use crate::pipeline::Pipeline;
 
@@ -33,9 +34,9 @@ impl BinEntity for CompilePredicate {
     }
 
     fn namespace_override(&self) -> Option<&str> {
-        // Deliberate catalog identity (Phase 2): compile lives under
-        // sys::execution, not std::prelude, and is therefore reachable
-        // ONLY qualified — never through universal unqualified visibility.
+        // Deliberate catalog identity: compile lives under sys::execution,
+        // not std::prelude, and is therefore reachable ONLY qualified —
+        // never through universal unqualified visibility.
         Some("sys::execution")
     }
 
@@ -105,7 +106,7 @@ impl EffectExecutable for CompilePredicate {
         Ok(EntityResult::Relation(relation))
     }
 
-    /// D3c: compile is a PURE elementwise inspection — receiving the
+    /// compile is a PURE elementwise inspection — receiving the
     /// lifted (stage, source) relation whole and mapping it row by row IS
     /// its setwise semantics (one call, one combined result relation; no
     /// effect executes, so per-element application raises no at-most-once
@@ -117,94 +118,80 @@ impl EffectExecutable for CompilePredicate {
         alias: Option<String>,
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
-        // Finding 1 (CODE-REVIEW-zzpmxuzp::otolxyzl): an EMPTY lift still
-        // reaches compile once — zero elements map to the empty result
-        // WITH the declared heading (a one-NULL-row source filtered
-        // false, the lowerable spelling of an empty relation).
+        // An EMPTY lift still reaches compile once — zero elements map to
+        // the empty result WITH the declared heading (a one-NULL-row
+        // source filtered false, the lowerable spelling of an empty
+        // relation).
         if rows.is_empty() {
             let headers: Vec<DomainExpression> =
                 ["stage", "query", "representation", "error", "error_message"]
                     .iter()
                     .map(|h| DomainExpression::lvar_builder(h.to_string()).build())
                     .collect();
-            let null_row = Row {
-                values: (0..5)
-                    .map(|_| DomainExpression::Literal {
-                        value: LiteralValue::Null,
-                        alias: None,
-                    })
-                    .collect(),
-            };
-            let source = Relation::Anonymous {
-                column_headers: Some(headers),
-                rows: vec![null_row],
-                alias: None,
-                outer: false,
-                exists_mode: false,
-            negated: false,
-                qua_target: None,
-                cpr_schema: PhaseBox::phantom(),
-            };
-            let lit = |n: &str| {
-                Box::new(DomainExpression::Literal {
-                    value: LiteralValue::Number(n.to_string()),
-                    alias: None,
+            let null_row = (0..5)
+                .map(|_| {
+                    DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null))
                 })
+                .collect();
+            let source = AnonRelation::plain(
+                AnonTable::from_values(Some(headers), vec![null_row], ())
+                    .expect("compile's empty relation has a heading and a row"),
+            );
+            let lit = |n: &str| {
+                Box::new(DomainExpression::Application(FunctionApplication::Ground(
+                    LiteralValue::Number(n.to_string()),
+                )))
             };
-            let empty = RelationalExpression::Filter {
-                source: Box::new(RelationalExpression::Relation(source)),
-                condition: SigmaCondition::Predicate(BooleanExpression::Comparison {
-                    operator: "=".to_string(),
+            let empty = Chain::ground(Grelex::Literal(source)).then(Continuation::Restrict {
+                condition: TruthExpression::Comparison(Comparison {
+                    operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
                     left: lit("1"),
                     right: lit("0"),
                 }),
                 origin: crate::pipeline::asts::core::FilterOrigin::default(),
-                cpr_schema: PhaseBox::phantom(),
-            };
-            let wrapper: String = alias.unwrap_or_else(|| "__compile_empty".to_string());
-            return Ok(EntityResult::Relation(Relation::InnerRelation {
+                cpr_schema: (),
+            });
+            let identifier = alias.as_deref().unwrap_or("compile");
+            return Ok(EntityResult::Relation(Grelex::Reference(Relation::InnerRelation {
                 pattern:
                     crate::pipeline::asts::core::expressions::relational::InnerRelationPattern::Indeterminate {
                         identifier:
                             crate::pipeline::asts::core::expressions::helpers::QualifiedName {
                                 namespace_path:
                                     crate::pipeline::asts::core::metadata::NamespacePath::empty(),
-                                name: wrapper.clone().into(),
-                                grounding: None,
+                                name: identifier.into(),
                             },
                         subquery: Box::new(empty),
                     },
-                alias: Some(wrapper.into()),
+                preminted_scope: None,
+                alias: alias.map(Into::into),
                 outer: false,
-                cpr_schema: PhaseBox::phantom(),
-            }));
+                cpr_schema: (),
+            })));
         }
         let mut all_rows = Vec::new();
         let mut headers = None;
         for row in rows {
-            let EntityResult::Relation(rel) = self.execute(row, alias.clone(), system)?;
-            if let Relation::Anonymous {
-                column_headers,
-                rows: result_rows,
-                ..
-            } = rel
-            {
+            let EntityResult::Relation(head) = self.execute(row, alias.clone(), system)?;
+            if let Grelex::Literal(AnonRelation { table, .. }) = head {
                 if headers.is_none() {
-                    headers = column_headers;
+                    headers = table.body.header;
                 }
-                all_rows.extend(result_rows);
+                all_rows.extend(table.body.rows.into_vec());
             }
         }
-        Ok(EntityResult::Relation(Relation::Anonymous {
-            column_headers: headers,
-            rows: all_rows,
+        Ok(EntityResult::Relation(Grelex::Literal(AnonRelation {
+            table: AnonTable {
+                body: TabularBody {
+                    header: headers,
+                    rows: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(all_rows)
+                        .expect("a nonempty lift produces a row per input"),
+                },
+                cpr_schema: (),
+            },
             alias: alias.map(|s| s.into()),
             outer: false,
-            exists_mode: false,
-            negated: false,
-            qua_target: None,
-            cpr_schema: PhaseBox::phantom(),
-        }))
+        })))
     }
 }
 
@@ -213,9 +200,9 @@ fn compile_to_stage(
     stage: &str,
     source: &str,
 ) -> Result<String> {
-    // Compile purity (DIRECTIVE-CONVERGENCE-PLAN Phase 1B): rendering "cst"
-    // or "ast-unresolved" never enters Phase 1.X, so any source may be
-    // inspected shallowly. Every deeper stage would run the effect executor
+    // Compile purity: rendering "cst" or "ast-unresolved" never enters
+    // the effect executor, so any source may be inspected shallowly. Every deeper
+    // stage would run the effect executor
     // (and inline-DDL processing) against the SHARED system — compiling a
     // consult!/run!/enlist! must not consult, run, or enlist. Walk the
     // unresolved AST first and refuse executing demands cleanly; the
@@ -249,10 +236,9 @@ fn compile_to_stage(
 
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Literal {
-            value: LiteralValue::String(s),
-            ..
-        } => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
+            Ok(s.clone())
+        }
         _ => Err(DelightQLError::database_error(
             format!(
                 "sys::execution.compile() {} must be a string literal",
@@ -264,17 +250,13 @@ fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<Str
 }
 
 fn string_literal(val: &str) -> DomainExpression {
-    DomainExpression::Literal {
-        value: LiteralValue::String(val.to_string()),
-        alias: None,
-    }
+    DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(
+        val.to_string(),
+    )))
 }
 
 fn null_literal() -> DomainExpression {
-    DomainExpression::Literal {
-        value: LiteralValue::Null,
-        alias: None,
-    }
+    DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null))
 }
 
 fn build_compile_result(
@@ -283,7 +265,7 @@ fn build_compile_result(
     representation: Option<String>,
     error: Option<(String, String)>,
     alias: Option<String>,
-) -> Relation {
+) -> Grelex {
     let headers = vec![
         DomainExpression::lvar_builder("stage".to_string()).build(),
         DomainExpression::lvar_builder("query".to_string()).build(),
@@ -291,43 +273,37 @@ fn build_compile_result(
         DomainExpression::lvar_builder("error".to_string()).build(),
         DomainExpression::lvar_builder("error_message".to_string()).build(),
     ];
-    let row = Row {
-        values: vec![
-            string_literal(stage),
-            string_literal(query),
-            match &representation {
-                Some(repr) => string_literal(repr),
-                None => null_literal(),
-            },
-            match &error {
-                Some((uri, _)) => string_literal(uri),
-                None => null_literal(),
-            },
-            match &error {
-                Some((_, message)) => string_literal(message),
-                None => null_literal(),
-            },
-        ],
-    };
-    Relation::Anonymous {
-        column_headers: Some(headers),
-        rows: vec![row],
+    let row = vec![
+        string_literal(stage),
+        string_literal(query),
+        match &representation {
+            Some(repr) => string_literal(repr),
+            None => null_literal(),
+        },
+        match &error {
+            Some((uri, _)) => string_literal(uri),
+            None => null_literal(),
+        },
+        match &error {
+            Some((_, message)) => string_literal(message),
+            None => null_literal(),
+        },
+    ];
+    Grelex::Literal(AnonRelation {
+        table: AnonTable::from_values(Some(headers), vec![row], ())
+            .expect("compile publishes one nonempty row"),
         alias: alias.map(|s| s.into()),
         outer: false,
-        exists_mode: false,
-            negated: false,
-        qua_target: None,
-        cpr_schema: PhaseBox::phantom(),
-    }
+    })
 }
 
 #[cfg(test)]
 mod purity_tests {
-    //! Compile purity (DIRECTIVE-CONVERGENCE-PLAN Phase 1B): inspecting
-    //! source must never enter Phase 1.X execution against the shared
-    //! system. Executing demands refuse cleanly at deep stages, stay
-    //! inspectable at shallow stages, and DML remains compilable because
-    //! it lowers to SQL without Phase 1.X execution.
+    //! Compile purity: inspecting source must never enter the effect executor
+    //! execution against the shared system. Executing demands refuse
+    //! cleanly at deep stages, stay inspectable at shallow stages, and
+    //! DML remains compilable because it lowers to SQL without effect
+    //! execution.
 
     use super::*;
     use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
@@ -375,7 +351,61 @@ mod purity_tests {
     fn shallow_stage_inspects_the_same_source() {
         let mut system = fresh_system();
         let repr = compile_to_stage(&mut system, "ast-unresolved", r#"enlist!("std::string")"#)
-            .expect("ast-unresolved never enters Phase 1.X");
+            .expect("ast-unresolved never enters the effect executor");
         assert!(repr.contains("enlist"), "{repr}");
+    }
+
+    /// EXECUTION IS JUDGED BY THE COMPILATION THAT CAUSED IT.
+    ///
+    /// Through the PRODUCTION road: a DQL query pipes a source into the
+    /// runtime-served relation, the effect executor reaches it, and the body
+    /// it is handed is compiled inside the outer compilation. Policy moves
+    /// after the outer arena is armed and before the query runs, so a nested
+    /// arena that re-read policy instead of inheriting would answer with the
+    /// moved number and this would see it.
+    ///
+    /// The probe is SHALLOW on purpose: the armed depth is small and the body
+    /// is just past it, so nothing here walks near either real ceiling.
+    #[test]
+    fn the_served_compilation_inherits_the_causing_one_s_budget() {
+        use crate::compiler_limits::{ProcessLimitLease, NESTING};
+
+        const ARMED: usize = 20;
+        const MOVED_TO: usize = 900;
+        let depth = ARMED * 2;
+
+        let _lease = ProcessLimitLease::take();
+        NESTING.set(ARMED);
+
+        let body = format!(
+            "_(x @ 1) |> ({}x{} as v)",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let query = format!(r#"_("sql", "{body}") |> sys::execution.compile(*)"#);
+
+        let mut system = fresh_system();
+        // ARMED here, by the pipeline the query belongs to.
+        let mut pipeline = Pipeline::new(&query, &mut system);
+        // The host moves policy while that compilation is in flight.
+        NESTING.set(MOVED_TO);
+
+        let sql = pipeline
+            .execute_to_sql()
+            .expect("compile reports the inner refusal in its own columns")
+            .to_string();
+
+        assert!(
+            sql.contains("operational/resource/nesting"),
+            "the served body must refuse on depth: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("budget is {ARMED}")),
+            "the served compilation must answer to its caller's arming: {sql}"
+        );
+        assert!(
+            !sql.contains(&format!("budget is {MOVED_TO}")),
+            "and not to the policy that moved under it: {sql}"
+        );
     }
 }

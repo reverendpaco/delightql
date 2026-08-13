@@ -19,7 +19,7 @@ use delightql_protocol::{
 use rusqlite;
 
 use crate::{
-    pipeline::{self, builder_v2, resolver::ResolutionConfig, verdict, Pipeline},
+    pipeline::{self, resolver::ResolutionConfig, verdict, Pipeline},
     system::DelightQLSystem,
 };
 
@@ -29,6 +29,17 @@ struct EagerBuffer {
     dimensions: Vec<Dimension>,
     rows: Vec<Vec<Cell>>,
     cursor: usize,
+}
+
+/// Compiler-created relations one statement's execution staged, and the
+/// statements that retire them.
+///
+/// Carried as a value so that no execution path can end without deciding
+/// what becomes of them.
+#[derive(Default)]
+struct Staged {
+    drops: Vec<String>,
+    connection_id: Option<i64>,
 }
 
 #[cfg(test)]
@@ -54,14 +65,56 @@ pub struct RelayHooks {
     pub on_error_hook: Option<Box<dyn FnMut(&verdict::Verdict)>>,
 
     /// Called by the pump for each NON-FINAL shipped result set (`stdout!`),
-    /// in execution order, as each entry executes (Epic 3 protocol ruling:
-    /// mid-run result sets ride the hook side channel; the FINAL shipped
+    /// in execution order, as each entry executes: mid-run result sets ride
+    /// the hook side channel; the FINAL shipped
     /// statement is the run's one wire response and never passes through
     /// here). Args: (columns, rows). If unset, non-final shipped sets are
     /// executed and discarded.
     /// Delivery order pinned by
     /// `pump_tests::non_final_shipped_deliver_via_on_ship_in_order`.
-    pub on_ship: Option<Box<dyn FnMut(&[String], &[Vec<String>])>>,
+    pub on_ship: Option<Box<dyn FnMut(&[String], &[Vec<Cell>])>>,
+}
+
+/// The engine's `rusqlite` vocabulary read into the shared one. The
+/// bootstrap store is a raw rusqlite connection rather than a
+/// `DatabaseConnection`, and core cannot reach `delightql-backends`, so
+/// this is where the bootstrap road joins the carrier every other road
+/// already speaks.
+#[cfg(not(target_arch = "wasm32"))]
+fn bootstrap_value(value: rusqlite::types::Value) -> delightql_types::DbValue {
+    use delightql_types::DbValue;
+    match value {
+        rusqlite::types::Value::Null => DbValue::Null,
+        rusqlite::types::Value::Integer(i) => DbValue::Integer(i),
+        rusqlite::types::Value::Real(f) => DbValue::Real(f),
+        rusqlite::types::Value::Text(s) => DbValue::Text(s),
+        rusqlite::types::Value::Blob(b) => DbValue::Blob(b),
+    }
+}
+
+/// Whether a check's one cell says yes. An absent cell is not a yes: a
+/// check that answered NULL did not hold.
+fn cell_says_yes(row: Option<&Vec<Cell>>) -> bool {
+    row.and_then(|r| r.first())
+        .and_then(|cell| cell.as_deref())
+        .map(|bytes| matches!(bytes, b"1" | b"true" | b"t"))
+        .unwrap_or(false)
+}
+
+/// The cardinality a `count(*)` probe reports, when it reports one.
+fn cell_count(row: Option<&Vec<Cell>>) -> Option<i64> {
+    let bytes = row.and_then(|r| r.first())?.as_deref()?;
+    std::str::from_utf8(bytes).ok()?.trim().parse::<i64>().ok()
+}
+
+/// How a failing assertion names itself. The author's name is the point
+/// of naming one; the ordinal is what to say when there is no name, not
+/// the answer to prefer.
+fn assertion_label(name: &Option<String>, index: usize) -> String {
+    match name {
+        Some(n) => format!("'{}'", n),
+        None => format!("{}", index + 1),
+    }
 }
 
 impl Default for RelayHooks {
@@ -81,16 +134,62 @@ pub struct RelayParty<'a, T: Transport> {
     sql_session: Session<T>,
     handles: HashMap<Handle, QueryHandle>, // frontend handle → backend QueryHandle
     eager_buffers: HashMap<Handle, EagerBuffer>, // frontend handle → eager results
+    /// What a live result still owes: the compiler-created relations its
+    /// statement staged, waiting for the rows to be done with.
+    staged_by_handle: HashMap<Handle, Staged>,
     next_handle_id: u64,
     danger_overrides: Vec<pipeline::ast_unresolved::DangerSpec>,
     option_overrides: Vec<pipeline::ast_unresolved::OptionSpec>,
-    is_repl: bool,
     sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel,
-    inline_ctes: bool,
     /// Whether the most recent typed-plan run took its exit! latch —
     /// read by the F5 receipt binder (a NO run ships the empty receipt).
     last_run_exited: bool,
     hooks: RelayHooks,
+}
+
+/// A refusal weighed against what the submission DECLARED it expects.
+///
+/// `None` means the submission declared nothing, so the refusal is the
+/// caller's ordinary business. The hook is read from the tree because the
+/// road that normally collects it is the road that just refused.
+fn judge_declared(
+    tree: &crate::pipeline::syntax::SyntaxTree,
+    owner: Option<&std::ops::Range<usize>>,
+    error: &crate::error::DelightQLError,
+) -> Option<GoalRefusal> {
+    // A HOOK BELONGS TO THE QUERY IT STANDS IN. A prompt carries one goal, so
+    // that goal's extent is the only place a declaration about it can be —
+    // and a text that shows no single goal shows no owner, which is the
+    // closed answer.
+    let expected = crate::pipeline::normalize::declared_error_within(tree, owner?)?;
+    let actual = error.error_uri();
+    if expected.matches(&actual) {
+        return Some(GoalRefusal::AsDeclared {
+            declared: expected.display_uri(),
+            detail: format!("{actual}: {error}"),
+        });
+    }
+    Some(GoalRefusal::Reported(ServerTerm::Error {
+        kind: ErrorKind::Constraint,
+        identity: actual.into_bytes(),
+        message: format!("expected error {} but got: {error}", expected.display_uri()).into_bytes(),
+    }))
+}
+
+/// What reading ONE goal can end in, short of the goal.
+///
+/// `Reported` is a term the caller sends on. `AsDeclared` is the submission
+/// getting exactly the refusal it declared — an outcome, not a failure, and
+/// the one the caller answers with an empty result.
+enum GoalRefusal {
+    Reported(ServerTerm),
+    /// The refusal the submission declared. The verdict is still OWED — a
+    /// judged outcome that reports nothing is indistinguishable from a
+    /// statement that simply ran.
+    AsDeclared {
+        declared: String,
+        detail: String,
+    },
 }
 
 impl<'a, T: Transport> RelayParty<'a, T> {
@@ -100,21 +199,20 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             sql_session,
             handles: HashMap::new(),
             eager_buffers: HashMap::new(),
+            staged_by_handle: HashMap::new(),
             next_handle_id: 1,
             danger_overrides: Vec::new(),
             option_overrides: Vec::new(),
-            is_repl: false,
             sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel::Basic,
-            inline_ctes: false,
             last_run_exited: false,
             hooks: RelayHooks::default(),
         }
     }
 
     /// Install the side-channel hooks (verdicts, shipped sets).
-    /// Production caller: `open.rs::session_with_hooks` (the Epic-3.3 hook
-    /// threading — the CLI's console sink for `stdout!` rides through it);
-    /// also exercised by `relay/pump_tests.rs`.
+    /// Production caller: `open.rs::session_with_hooks` — the CLI's console
+    /// sink for `stdout!` rides through it; also exercised by
+    /// `relay/pump_tests.rs`.
     pub fn set_hooks(&mut self, hooks: RelayHooks) {
         self.hooks = hooks;
     }
@@ -132,12 +230,87 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         for (_frontend, backend) in self.handles.drain() {
             let _ = self.sql_session.close(backend);
         }
+        for staged in std::mem::take(&mut self.staged_by_handle).into_values() {
+            self.retire_staged(staged);
+        }
         self.eager_buffers.clear();
         self.next_handle_id = 1;
         self.system.reinit_bootstrap()
     }
 
+    /// The ONE goal a protocol Query term carries.
+    ///
+    /// A term is one statement by contract, so an unmarked submission takes
+    /// the prompt entrance and a second statement has no derivation in it. When
+    /// that is why the parse failed, the sequence entrance is asked — not to
+    /// run the text, but so the refusal can say "send each query as its own
+    /// term" instead of pointing at a syntax error the author did not make.
+    fn read_one_goal(
+        &self,
+        dql: &str,
+        registry: &std::rc::Rc<crate::names::Registry>,
+    ) -> std::result::Result<crate::pipeline::normalize::Goal, GoalRefusal> {
+        let syntax_error = |error: crate::error::DelightQLError| ServerTerm::Error {
+            kind: ErrorKind::Syntax,
+            identity: error.error_uri().into_bytes(),
+            message: error.to_string().into_bytes(),
+        };
+        let tree = match pipeline::parse::submission_attributed(dql, registry.limits().nesting()) {
+            Ok(tree) => tree,
+            Err(refusal) => {
+                if let Some(count) = query_count_if_a_sequence(dql) {
+                    if count > 1 {
+                        return Err(GoalRefusal::Reported(ServerTerm::Error {
+                            kind: ErrorKind::Syntax,
+                            identity: b"delightql-error://parse/multi_query".to_vec(),
+                            message: format!(
+                                "multi-query input rejected: found {count} queries in a single \
+                                 Query term (send each query as a separate Query message)"
+                            )
+                            .into_bytes(),
+                        }));
+                    }
+                }
+                // A defective parse still carries the declaration: an error
+                // hook DECORATES a position, and the position it decorates is
+                // usually not the part that failed to read. The extent that
+                // chose the message is the extent that owns it — the entrance
+                // decided both at once.
+                if let Some(judgment) =
+                    judge_declared(&refusal.tree, refusal.query.as_ref(), &refusal.error)
+                {
+                    return Err(judgment);
+                }
+                return Err(GoalRefusal::Reported(syntax_error(refusal.error)));
+            }
+        };
+        // A REFUSAL THE SUBMISSION DECLARED IS THE SUBMISSION'S OWN OUTCOME.
+        // Normalization is where the error hook is ordinarily collected, so a
+        // refusal made DURING it would otherwise reach the caller with the
+        // declaration it was meant to be judged against still unread. The
+        // hook DECORATES a position and is never a step, so it is read from
+        // the tree and the refusal is weighed the way every other one is.
+        // A goal that PARSED shows its own extent; a normalization refusal
+        // inside it belongs to it and to nothing else.
+        let owner = pipeline::parse::submission_extent(&tree);
+        let judged = |error: crate::error::DelightQLError| {
+            judge_declared(&tree, owner.as_ref(), &error)
+                .unwrap_or_else(|| GoalRefusal::Reported(syntax_error(error)))
+        };
+        let normalized =
+            pipeline::normalize::submission(&tree, std::rc::Rc::clone(registry)).map_err(judged)?;
+        pipeline::one_goal(normalized).map_err(|error| GoalRefusal::Reported(syntax_error(error)))
+    }
+
     fn handle_query(&mut self, text: ByteSeq) -> ServerTerm {
+        if let Err(error) = self.system.require_healthy() {
+            return ServerTerm::Error {
+                kind: ErrorKind::Connection,
+                identity: error.error_uri().into_bytes(),
+                message: error.to_string().into_bytes(),
+            };
+        }
+
         let dql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(e) => {
@@ -149,67 +322,53 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             }
         };
 
-        // Parse CST once for multi-query check and error hook pre-scan.
-        // Also check for inline DDL blocks which require sequential mode.
-        let has_ddl = pipeline::sequential::has_inline_ddl(&dql);
-        let error_hook = if let Ok(tree) = crate::pipeline::parser::parse(&dql) {
-            let root = tree.root_node();
-            let mut cursor = root.walk();
-            let query_count = root
-                .children(&mut cursor)
-                .filter(|c| c.kind() == "query")
-                .count();
-            if query_count > 1 {
-                // Protocol violation: one Query term → one Header or one Error.
-                // Multi-query input must be sent as separate Query terms by the client.
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity: b"delightql-error://parse/multi_query".to_vec(),
-                    message: format!(
-                        "multi-query input rejected: found {} queries in a single Query term \
-                         (send each query as a separate Query message)",
-                        query_count
-                    )
-                    .into_bytes(),
-                };
+        // ONE reading of the submission. The error hook, the effect-entry
+        // classification and the compilation all ask questions about the same
+        // goal, and asking the parser three times is how they come to
+        // disagree.
+        let registry = std::rc::Rc::new(crate::names::Registry::new(&[]));
+        let goal = match self.read_one_goal(&dql, &registry) {
+            Ok(goal) => goal,
+            Err(GoalRefusal::Reported(term)) => return term,
+            Err(GoalRefusal::AsDeclared { declared, detail }) => {
+                if let Some(ref mut hook) = self.hooks.on_error_hook {
+                    hook(&verdict::Verdict {
+                        outcome: verdict::VerdictOutcome::Pass,
+                        identity: verdict::VerdictIdentity {
+                            name: None,
+                            body_text: declared,
+                        },
+                        detail: Some(detail),
+                    });
+                }
+                return self.empty_header_response();
             }
-            if has_ddl {
-                return self.handle_sequential_query(&dql);
-            }
-            // Pre-scan for error hook annotation
-            let mut cursor2 = root.walk();
-            let hook = root
-                .children(&mut cursor2)
-                .find(|c| c.kind() == "query")
-                .and_then(|qnode| builder_v2::pre_scan_error_hook(&qnode, &dql).ok().flatten());
-            hook
-        } else {
-            None // Parse error — Pipeline will catch it with a proper error message
         };
 
         // Error hook path: handle both compile-time and runtime error hooks
-        if let Some(expected) = error_hook {
-            return self.handle_error_hook_query(&dql, expected);
+        if let Some(expected) = goal.declared.expected_error.clone() {
+            return self.handle_error_hook_query(&dql, goal, expected, registry);
         }
 
-        // The Epic-3.3 entry points: run!/run_namespace!/query-position
-        // directives take the effect chain (transformer → pump). The
-        // classifier declines annotated statements, and DML/DDL statements
-        // under CLI danger/option overrides keep today's path (the plan
-        // compiler applies default gates only) — see relay/entry.rs.
+        // The effect-chain entry points: run!/run_namespace!/query-position
+        // directives take the transformer → pump road. The classifier
+        // declines annotated statements, and DML/DDL statements under CLI
+        // danger/option overrides keep the ordinary compilation path (the
+        // plan compiler applies default gates only) — see relay/entry.rs.
         let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
-        if let Some(effect_entry) = entry::classify_effect_entry(&dql, allow_adhoc) {
-            return self.handle_effect_entry(effect_entry);
-        }
+        let goal = match entry::classify_effect_entry(goal, allow_adhoc) {
+            Ok(effect_entry) => return self.handle_effect_entry(effect_entry),
+            Err(goal) => goal,
+        };
 
         // Normal single-query path: compile DQL → SQL via the pipeline
-        let mut pipeline = Pipeline::new_with_config(
+        let mut pipeline = Pipeline::from_goal(
+            goal,
             &dql,
             &mut *self.system,
             ResolutionConfig::default(),
             self.sql_optimization_level,
-            self.inline_ctes,
-            self.is_repl,
+            registry,
         );
 
         // Apply CLI-level overrides
@@ -233,23 +392,44 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             }
         };
 
-        // Capture assertion data and connection routing before evaluating
-        let assertion_sqls = compiled.assertion_sqls.clone();
-        let connection_id = compiled.connection_id;
-        let primary_sql = compiled.primary_sql.clone();
-
+        let compiled = compiled;
         // Drop pipeline to release borrow on self.system
         drop(pipeline);
 
+        let (term, staged) = self.execute_compiled(compiled);
+        self.settle_staged(term, staged)
+    }
+
+    /// Run one compiled statement: its authored preconditions, the staging
+    /// its source needs, the checks it may not run without, and the
+    /// statement itself — handing back whatever it staged so the caller can
+    /// settle it.
+    ///
+    /// The order is the plan's order. Authored assertions come FIRST: a
+    /// false precondition is the program's own answer, and it must be
+    /// reached before a volatile or external source has been evaluated or
+    /// any compiler state created.
+    fn execute_compiled(
+        &mut self,
+        compiled: crate::pipeline::compiled_query::CompiledQuery,
+    ) -> (ServerTerm, Staged) {
+        let assertion_sqls = compiled.assertion_sqls;
+        let obligations = compiled.obligations;
+        let prepare_sqls = compiled.prepare_sqls;
+        let connection_id = compiled.connection_id;
+        let primary_sql = compiled.primary_sql;
+        let compiled_cleanup = compiled.cleanup_sqls;
+        let mut staged = Staged {
+            drops: Vec::new(),
+            connection_id,
+        };
+
         // Evaluate assertions on the routed connection
-        for (i, (assertion_sql, _location)) in assertion_sqls.iter().enumerate() {
+        for (i, assertion) in assertion_sqls.iter().enumerate() {
+            let assertion_sql = &assertion.sql;
             match self.execute_sql_routed(assertion_sql, connection_id) {
                 Ok((_cols, rows)) => {
-                    let passed = rows
-                        .first()
-                        .and_then(|row| row.first())
-                        .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
-                        .unwrap_or(false);
+                    let passed = cell_says_yes(rows.first());
 
                     if let Some(ref mut hook) = self.hooks.on_verdict {
                         let v = verdict::Verdict {
@@ -259,8 +439,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 verdict::VerdictOutcome::Fail
                             },
                             identity: verdict::VerdictIdentity {
-                                _name: None,
-                                _source_location: None,
+                                name: assertion.name.clone(),
                                 body_text: assertion_sql.clone(),
                             },
                             detail: if passed {
@@ -268,42 +447,60 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                             } else {
                                 Some(format!(
                                     "Assertion {} failed\n  SQL: {}",
-                                    i + 1,
+                                    assertion_label(&assertion.name, i),
                                     assertion_sql
                                 ))
                             },
-                            _intent: None,
                         };
                         hook(&v);
                     }
 
                     if !passed {
-                        return ServerTerm::Error {
-                            kind: ErrorKind::Permission,
-                            identity: b"delightql-error://runtime/assertion".to_vec(),
-                            message: format!(
-                                "Assertion {} failed\n  SQL: {}",
-                                i + 1,
-                                assertion_sql
-                            )
-                            .into_bytes(),
-                        };
+                        return (
+                            ServerTerm::Error {
+                                kind: ErrorKind::Permission,
+                                identity: b"delightql-error://runtime/assertion".to_vec(),
+                                message: format!(
+                                    "Assertion {} failed\n  SQL: {}",
+                                    assertion_label(&assertion.name, i),
+                                    assertion_sql
+                                )
+                                .into_bytes(),
+                            },
+                            staged,
+                        );
                     }
                 }
                 Err(msg) => {
-                    return ServerTerm::Error {
-                        kind: ErrorKind::Permission,
-                        identity: b"delightql-error://runtime/assertion".to_vec(),
-                        message: format!("Assertion {} execution error: {}", i + 1, msg)
-                            .into_bytes(),
-                    };
+                    return (
+                        ServerTerm::Error {
+                            kind: ErrorKind::Permission,
+                            identity: b"delightql-error://runtime/assertion".to_vec(),
+                            message: format!("Assertion {} execution error: {}", i + 1, msg)
+                                .into_bytes(),
+                        },
+                        staged,
+                    );
                 }
             }
         }
 
+        // Only now is the source evaluated: staged once, so the check and
+        // the statement read one relation. Two evaluations of one source are
+        // two relations whenever it is volatile, reads outside this engine,
+        // or is written concurrently.
+        staged.drops = compiled_cleanup;
+        if let Err(refusal) = self.stage_source(&prepare_sqls, connection_id) {
+            return (refusal, staged);
+        }
+
+        if let Some(refusal) = self.unmet_obligation(&obligations, connection_id) {
+            return (refusal, staged);
+        }
+
         // Route primary SQL based on connection_id
         let cid = connection_id.unwrap_or(2);
-        if cid == 2 {
+        let term = if cid == 2 {
             // Streaming path: forward to sql_session
             let sql_bytes = primary_sql.as_bytes().to_vec();
             match self.sql_session.query(sql_bytes) {
@@ -337,13 +534,13 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             // Eager path: execute on bootstrap or imported connection, buffer results
             match self.execute_sql_routed(&primary_sql, connection_id) {
                 Ok((columns, rows)) => {
-                    let (dimensions, cells) = Self::strings_to_eager_buffer(&columns, &rows);
+                    let dimensions = Self::eager_dimensions(&columns);
                     let handle = self.next_handle();
                     self.eager_buffers.insert(
                         handle.clone(),
                         EagerBuffer {
                             dimensions: dimensions.clone(),
-                            rows: cells,
+                            rows,
                             cursor: 0,
                         },
                     );
@@ -355,338 +552,237 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     message: teach_runtime_message(msg).into_bytes(),
                 },
             }
+        };
+        (term, staged)
+    }
+
+    /// Stage what a statement reads. `Err` is the refusal to return.
+    fn stage_source(
+        &mut self,
+        prepare_sqls: &[String],
+        connection_id: Option<i64>,
+    ) -> std::result::Result<(), ServerTerm> {
+        for sql in prepare_sqls {
+            if let Err(msg) = self.execute_sql_routed(sql, connection_id) {
+                return Err(ServerTerm::Error {
+                    kind: ErrorKind::Permission,
+                    identity: b"delightql-error://runtime/execution".to_vec(),
+                    message: format!("staging the statement's source failed: {msg}").into_bytes(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Read what a statement may not run without. `Some` is the refusal.
+    ///
+    /// Nobody wrote these — the compiler attached them because the
+    /// statement's meaning depends on a fact about the data — so a false
+    /// verdict is the statement being REFUSED, under its own identifier,
+    /// before it runs.
+    fn unmet_obligation(
+        &mut self,
+        obligations: &[crate::pipeline::compiled_query::CompiledObligation],
+        connection_id: Option<i64>,
+    ) -> Option<ServerTerm> {
+        for obligation in obligations {
+            match self.execute_sql_routed(&obligation.sql, connection_id) {
+                Ok((_cols, rows)) => {
+                    let held = cell_says_yes(rows.first());
+                    if !held {
+                        return Some(ServerTerm::Error {
+                            kind: ErrorKind::Permission,
+                            identity: format!("delightql-error://{}", obligation.refusal.identity)
+                                .into_bytes(),
+                            message: obligation.refusal.message.clone().into_bytes(),
+                        });
+                    }
+                }
+                Err(msg) => {
+                    return Some(ServerTerm::Error {
+                        kind: ErrorKind::Permission,
+                        identity: b"delightql-error://runtime/execution".to_vec(),
+                        message: format!(
+                            "the check this statement may not run without could not be \
+                             evaluated: {msg}"
+                        )
+                        .into_bytes(),
+                    })
+                }
+            }
+        }
+        None
+    }
+
+    /// The compiler-created relations a statement's execution left behind,
+    /// and the statements that retire them.
+    ///
+    /// It travels WITH the outcome rather than beside it: `execute_compiled`
+    /// cannot return without handing this back, and one place decides its
+    /// fate — retired now, or owed by the result that is still reading it.
+    /// A new early return therefore cannot forget it by omission.
+    fn retire_staged(&mut self, staged: Staged) {
+        for sql in &staged.drops {
+            // A retirement that fails leaves a relation the next run of the
+            // same statement drops before it creates. Nothing the program
+            // asked for depends on it, so it is not an answer.
+            let _ = self.execute_sql_routed(sql, staged.connection_id);
         }
     }
 
-    /// Compile and execute a sequential (multi-statement) query, returning the
-    /// last statement's results through the protocol.
-    fn handle_sequential_query(&mut self, dql: &str) -> ServerTerm {
-        use pipeline::sequential::{compile_sequential, SequentialConfig, SingleQueryOutcome};
-
-        let config = SequentialConfig {
-            resolution_config: ResolutionConfig::default(),
-            sql_optimization_level: self.sql_optimization_level,
-            inline_ctes: self.inline_ctes,
-            danger_overrides: self.danger_overrides.clone(),
-            option_overrides: self.option_overrides.clone(),
-        };
-
-        let results = match compile_sequential(dql, self.system, &config) {
-            Ok(r) => r,
-            Err(e) => {
-                let identity = e
-                    .downcast_ref::<crate::error::DelightQLError>()
-                    .map(|de| de.error_uri().into_bytes())
-                    .unwrap_or_default();
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity,
-                    message: format!("{}", e).into_bytes(),
-                };
+    /// Settle what an outcome owes: a result still being read keeps its
+    /// staged relations until it is exhausted or closed; everything else —
+    /// success without a handle, a refusal, an error — retires them now.
+    fn settle_staged(&mut self, term: ServerTerm, staged: Staged) -> ServerTerm {
+        if staged.drops.is_empty() {
+            return term;
+        }
+        match &term {
+            ServerTerm::Header { handle, .. } => {
+                self.staged_by_handle.insert(handle.clone(), staged);
             }
+            _ => self.retire_staged(staged),
+        }
+        term
+    }
+
+    /// Judge an ordinary execution's outcome against an error hook.
+    ///
+    /// The hook judges; it does not execute. The statement has already run
+    /// exactly as an unannotated one does — authored assertions, staging,
+    /// the checks it may not run without, the statement, its handle and its
+    /// cleanup — and all that is left is to compare what came back with what
+    /// was expected. A second choreography here is how an annotation came to
+    /// change the way a statement executes.
+    ///
+    /// `Ok` is a matched expectation. `Err` carries the refusal to return.
+    fn judge_against_hook(
+        &mut self,
+        term: ServerTerm,
+        expected: &verdict::ExpectedError,
+        identity: verdict::VerdictIdentity,
+    ) -> std::result::Result<(), ServerTerm> {
+        // A streaming result reports its engine failures while it is being
+        // READ, not when it is opened. Judging the outcome therefore means
+        // reading it: an unannotated client would meet the same error on its
+        // first fetch, and a hook that judged the header alone would call a
+        // failing statement a success.
+        let term = match term {
+            ServerTerm::Header { handle, dimensions } => match self.drain_for_verdict(&handle) {
+                Some(failure) => {
+                    let _ = self.handle_close(handle);
+                    failure
+                }
+                None => ServerTerm::Header { handle, dimensions },
+            },
+            other => other,
         };
-
-        let total = results.len();
-
-        for pq in results {
-            let is_last = pq.index == total - 1;
-
-            match pq.outcome {
-                SingleQueryOutcome::ErrorVerdict(v) => {
-                    if let Some(ref mut hook) = self.hooks.on_error_hook {
-                        hook(&v);
-                    }
-                    if matches!(v.outcome, verdict::VerdictOutcome::Fail) {
-                        return ServerTerm::Error {
-                            kind: ErrorKind::Permission,
-                            identity: vec![],
-                            message: format!(
-                                "Error hook: {}",
-                                v.detail.as_deref().unwrap_or(&v.identity.body_text)
-                            )
-                            .into_bytes(),
-                        };
-                    }
-                    if is_last {
-                        return self.empty_header_response();
-                    }
+        let (outcome, detail) = match &term {
+            ServerTerm::Error {
+                identity: uri,
+                message,
+                ..
+            } => {
+                // An engine that refused and named nothing is the one
+                // failure this system has no minted identity for; it is
+                // reported as a bug in the statement rather than as an
+                // anonymous error, which is the name the hook road has
+                // always judged it under.
+                let actual = if uri.is_empty() {
+                    "delightql-error://runtime/bug".to_string()
+                } else {
+                    String::from_utf8_lossy(uri).to_string()
+                };
+                (
+                    expected.matches(&actual),
+                    format!("{}: {}", actual, String::from_utf8_lossy(message)),
+                )
+            }
+            _ => (false, "statement succeeded; expected an error".to_string()),
+        };
+        // A result nobody will read still owes what it staged, and closing
+        // it is what pays that.
+        if let ServerTerm::Header { handle, .. } = &term {
+            let handle = handle.clone();
+            let _ = self.handle_close(handle);
+        }
+        let v = verdict::Verdict {
+            outcome: if outcome {
+                verdict::VerdictOutcome::Pass
+            } else {
+                verdict::VerdictOutcome::Fail
+            },
+            identity,
+            detail: Some(detail.clone()),
+        };
+        if let Some(ref mut hook) = self.hooks.on_error_hook {
+            hook(&v);
+        }
+        if outcome {
+            return Ok(());
+        }
+        Err(ServerTerm::Error {
+            kind: ErrorKind::Constraint,
+            identity: expected.display_uri().into_bytes(),
+            message: match &term {
+                ServerTerm::Error { .. } => {
+                    format!(
+                        "expected error {} but got: {}",
+                        expected.display_uri(),
+                        detail
+                    )
                 }
+                _ => "statement succeeded; expected an error".to_string(),
+            }
+            .into_bytes(),
+        })
+    }
 
-                SingleQueryOutcome::PendingRuntimeErrorHook { compiled, expected } => {
-                    match self.execute_sql_routed(&compiled.primary_sql, compiled.connection_id) {
-                        Err(e) => {
-                            let actual_uri = "delightql-error://runtime/bug";
-                            let v = verdict::Verdict {
-                                outcome: if expected.matches(actual_uri) {
-                                    verdict::VerdictOutcome::Pass
-                                } else {
-                                    verdict::VerdictOutcome::Fail
-                                },
-                                identity: verdict::VerdictIdentity {
-                                    _name: None,
-                                    _source_location: None,
-                                    body_text: expected.display_uri(),
-                                },
-                                detail: Some(format!("{}: {}", actual_uri, e)),
-                                _intent: None,
-                            };
-                            if let Some(ref mut hook) = self.hooks.on_error_hook {
-                                hook(&v);
-                            }
-                            if matches!(v.outcome, verdict::VerdictOutcome::Fail) {
-                                return ServerTerm::Error {
-                                    kind: ErrorKind::Permission,
-                                    identity: vec![],
-                                    message: format!(
-                                        "Error hook: expected '{}' but got '{}': {}",
-                                        expected.display_uri(),
-                                        actual_uri,
-                                        e
-                                    )
-                                    .into_bytes(),
-                                };
-                            }
-                        }
-                        Ok(_) => {
-                            // SQL succeeded — check assertions for runtime error
-                            let mut assertion_matched = false;
-                            for (sql, _loc) in &compiled.assertion_sqls {
-                                match self.execute_sql_routed(sql, compiled.connection_id) {
-                                    Ok((_cols, rows)) => {
-                                        let passed = rows
-                                            .first()
-                                            .and_then(|r| r.first())
-                                            .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
-                                            .unwrap_or(false);
-                                        if !passed {
-                                            let actual_uri = "delightql-error://runtime/assertion";
-                                            let v = verdict::Verdict {
-                                                outcome: if expected.matches(actual_uri) {
-                                                    verdict::VerdictOutcome::Pass
-                                                } else {
-                                                    verdict::VerdictOutcome::Fail
-                                                },
-                                                identity: verdict::VerdictIdentity {
-                                                    _name: None,
-                                                    _source_location: None,
-                                                    body_text: expected.display_uri(),
-                                                },
-                                                detail: Some(
-                                                    "Runtime assertion failed".to_string(),
-                                                ),
-                                                _intent: None,
-                                            };
-                                            if let Some(ref mut hook) = self.hooks.on_error_hook {
-                                                hook(&v);
-                                            }
-                                            if matches!(v.outcome, verdict::VerdictOutcome::Fail) {
-                                                return ServerTerm::Error {
-                                                    kind: ErrorKind::Permission,
-                                                    identity: vec![],
-                                                    message: format!(
-                                                        "Error hook: expected '{}' but got '{}'",
-                                                        expected.display_uri(),
-                                                        actual_uri
-                                                    )
-                                                    .into_bytes(),
-                                                };
-                                            }
-                                            assertion_matched = true;
-                                            break;
-                                        }
-                                    }
-                                    Err(msg) => {
-                                        return ServerTerm::Error {
-                                            kind: ErrorKind::Permission,
-                                            identity: b"delightql-error://runtime/assertion".to_vec(),
-                                            message: format!("Assertion execution error: {}", msg)
-                                                .into_bytes(),
-                                        };
-                                    }
-                                }
-                            }
-                            if !assertion_matched {
-                                let v = verdict::Verdict {
-                                    outcome: verdict::VerdictOutcome::Fail,
-                                    identity: verdict::VerdictIdentity {
-                                        _name: None,
-                                        _source_location: None,
-                                        body_text: expected.display_uri(),
-                                    },
-                                    detail: Some(format!(
-                                        "Expected failure matching '{}' but query executed successfully",
-                                        expected.display_uri()
-                                    )),
-                                    _intent: None,
-                                };
-                                if let Some(ref mut hook) = self.hooks.on_error_hook {
-                                    hook(&v);
-                                }
-                                return ServerTerm::Error {
-                                    kind: ErrorKind::Permission,
-                                    identity: vec![],
-                                    message: format!(
-                                        "Error hook: Expected failure matching '{}' but query executed successfully",
-                                        expected.display_uri()
-                                    )
-                                    .into_bytes(),
-                                };
-                            }
-                        }
-                    }
-                    if is_last {
-                        return self.empty_header_response();
-                    }
+    /// Read a result to its end, reporting the first failure it meets.
+    ///
+    /// Only for judging an error hook. An eager result has already met any
+    /// failure at execution, so it has nothing left to report here.
+    fn drain_for_verdict(&mut self, handle: &Handle) -> Option<ServerTerm> {
+        if self.eager_buffers.contains_key(handle) {
+            return None;
+        }
+        let backend = self.handles.get(handle)?;
+        let agreed = self.sql_session.agreed_orientation(Orientation::Rows)?;
+        loop {
+            match self
+                .sql_session
+                .fetch(backend, Projection::All, u64::MAX, agreed)
+            {
+                Ok(FetchResponse::Data { .. }) => {}
+                Ok(FetchResponse::End) => return None,
+                Ok(FetchResponse::Error {
+                    kind,
+                    identity,
+                    message,
+                }) => {
+                    return Some(ServerTerm::Error {
+                        kind,
+                        identity,
+                        message,
+                    })
                 }
-
-                SingleQueryOutcome::Compiled(compiled) => {
-                    let connection_id = compiled.connection_id;
-
-                    // Evaluate assertions
-                    for (i, (sql, _loc)) in compiled.assertion_sqls.iter().enumerate() {
-                        match self.execute_sql_routed(sql, connection_id) {
-                            Ok((_cols, rows)) => {
-                                let passed = rows
-                                    .first()
-                                    .and_then(|r| r.first())
-                                    .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
-                                    .unwrap_or(false);
-
-                                if let Some(ref mut hook) = self.hooks.on_verdict {
-                                    let v = verdict::Verdict {
-                                        outcome: if passed {
-                                            verdict::VerdictOutcome::Pass
-                                        } else {
-                                            verdict::VerdictOutcome::Fail
-                                        },
-                                        identity: verdict::VerdictIdentity {
-                                            _name: None,
-                                            _source_location: None,
-                                            body_text: sql.clone(),
-                                        },
-                                        detail: if passed {
-                                            None
-                                        } else {
-                                            Some(format!(
-                                                "Assertion {} failed\n  SQL: {}",
-                                                i + 1,
-                                                sql
-                                            ))
-                                        },
-                                        _intent: None,
-                                    };
-                                    hook(&v);
-                                }
-
-                                if !passed {
-                                    return ServerTerm::Error {
-                                        kind: ErrorKind::Permission,
-                                        identity: b"delightql-error://runtime/assertion".to_vec(),
-                                        message: format!(
-                                            "Assertion {} failed\n  SQL: {}",
-                                            i + 1,
-                                            sql
-                                        )
-                                        .into_bytes(),
-                                    };
-                                }
-                            }
-                            Err(msg) => {
-                                return ServerTerm::Error {
-                                    kind: ErrorKind::Permission,
-                                    identity: b"delightql-error://runtime/assertion".to_vec(),
-                                    message: format!(
-                                        "Assertion {} execution error: {}",
-                                        i + 1,
-                                        msg
-                                    )
-                                    .into_bytes(),
-                                };
-                            }
-                        }
-                    }
-
-                    // Execute primary SQL
-                    if is_last {
-                        // Return last query's result as a protocol Header
-                        let cid = connection_id.unwrap_or(2);
-                        if cid == 2 {
-                            let sql_bytes = compiled.primary_sql.as_bytes().to_vec();
-                            match self.sql_session.query(sql_bytes) {
-                                Ok(QueryResponse::Header {
-                                    handle: backend_handle,
-                                    dimensions,
-                                }) => {
-                                    let frontend_handle = self.next_handle();
-                                    self.handles.insert(frontend_handle.clone(), backend_handle);
-                                    return ServerTerm::Header {
-                                        handle: frontend_handle,
-                                        dimensions,
-                                    };
-                                }
-                                Ok(QueryResponse::Error {
-                                    kind,
-                                    identity,
-                                    message,
-                                }) => {
-                                    return ServerTerm::Error {
-                                        kind,
-                                        identity,
-                                        message,
-                                    };
-                                }
-                                Err(e) => {
-                                    return ServerTerm::Error {
-                                        kind: ErrorKind::Connection,
-                                        identity: b"delightql-error://runtime/execution".to_vec(),
-                                        message: teach_runtime_message(e.message).into_bytes(),
-                                    };
-                                }
-                            }
-                        } else {
-                            match self.execute_sql_routed(&compiled.primary_sql, connection_id) {
-                                Ok((columns, rows)) => {
-                                    let (dimensions, cells) =
-                                        Self::strings_to_eager_buffer(&columns, &rows);
-                                    let handle = self.next_handle();
-                                    self.eager_buffers.insert(
-                                        handle.clone(),
-                                        EagerBuffer {
-                                            dimensions: dimensions.clone(),
-                                            rows: cells,
-                                            cursor: 0,
-                                        },
-                                    );
-                                    return ServerTerm::Header { handle, dimensions };
-                                }
-                                Err(msg) => {
-                                    return ServerTerm::Error {
-                                        kind: ErrorKind::Connection,
-                                        identity: b"delightql-error://runtime/execution".to_vec(),
-                                        message: teach_runtime_message(msg).into_bytes(),
-                                    };
-                                }
-                            }
-                        }
-                    } else {
-                        // Intermediate query: execute and discard results
-                        if let Err(msg) =
-                            self.execute_sql_routed(&compiled.primary_sql, connection_id)
-                        {
-                            return ServerTerm::Error {
-                                kind: ErrorKind::Connection,
-                                identity: b"delightql-error://runtime/execution".to_vec(),
-                                message: teach_runtime_message(msg).into_bytes(),
-                            };
-                        }
-                    }
+                Err(e) => {
+                    return Some(ServerTerm::Error {
+                        kind: ErrorKind::Connection,
+                        identity: b"delightql-error://runtime/execution".to_vec(),
+                        message: teach_runtime_message(e.message).into_bytes(),
+                    })
                 }
             }
         }
+    }
 
-        // Should not reach here (we return from the last query),
-        // but handle gracefully with an empty result set.
-        self.empty_header_response()
+    /// Retire what a handle owed, if anything. Called where a result stops
+    /// being read: exhaustion, close, and reset.
+    fn retire_handle_staging(&mut self, handle: &Handle) {
+        if let Some(staged) = self.staged_by_handle.remove(handle) {
+            self.retire_staged(staged);
+        }
     }
 
     /// Handle a single query with an error hook annotation.
@@ -696,90 +792,94 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     fn handle_error_hook_query(
         &mut self,
         dql: &str,
-        expected: builder_v2::ExpectedError,
+        goal: crate::pipeline::normalize::Goal,
+        expected: verdict::ExpectedError,
+        registry: std::rc::Rc<crate::names::Registry>,
     ) -> ServerTerm {
         let identity = verdict::VerdictIdentity {
-            _name: None,
-            _source_location: None,
+            name: None,
             body_text: expected.display_uri(),
         };
 
-        // ANNOTATION TRANSPARENCY (Phase 4c): an error hook must not change
+        // ANNOTATION TRANSPARENCY: an error hook must not change
         // how a statement EXECUTES — only how its outcome is judged. A
         // statement the effect chain would own (a directive tail) takes the
         // effect chain here too, so its diagnostic class is the same with
         // and without the annotation. Its error (or unexpected success) is
         // matched against the expected URI exactly like the pipeline path.
         let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
-        if let Some(effect_entry) = entry::classify_effect_entry(dql, allow_adhoc) {
-            let term = self.handle_effect_entry(effect_entry);
-            return match term {
-                ServerTerm::Error {
-                    identity: err_identity,
-                    message,
-                    ..
-                } => {
-                    let actual_uri = String::from_utf8_lossy(&err_identity).to_string();
-                    let v = verdict::Verdict {
-                        outcome: if expected.matches(&actual_uri) {
-                            verdict::VerdictOutcome::Pass
-                        } else {
-                            verdict::VerdictOutcome::Fail
-                        },
-                        identity,
-                        detail: Some(format!(
-                            "{}: {}",
-                            actual_uri,
-                            String::from_utf8_lossy(&message)
-                        )),
-                        _intent: None,
-                    };
-                    if let Some(ref mut hook) = self.hooks.on_error_hook {
-                        hook(&v);
-                    }
-                    match v.outcome {
-                        verdict::VerdictOutcome::Pass => self.empty_header_response(),
-                        _ => ServerTerm::Error {
-                            kind: ErrorKind::Constraint,
-                            identity: actual_uri.into_bytes(),
-                            message: format!(
-                                "expected error {} but got: {}",
-                                expected.display_uri(),
-                                String::from_utf8_lossy(&message)
-                            )
-                            .into_bytes(),
-                        },
-                    }
-                }
-                other => {
-                    // The statement succeeded where an error was expected.
-                    let v = verdict::Verdict {
-                        outcome: verdict::VerdictOutcome::Fail,
-                        identity,
-                        detail: Some("statement succeeded; expected an error".to_string()),
-                        _intent: None,
-                    };
-                    if let Some(ref mut hook) = self.hooks.on_error_hook {
-                        hook(&v);
-                    }
-                    let _ = other;
+        let goal = match entry::classify_effect_entry(goal, allow_adhoc) {
+            Err(goal) => goal,
+            Ok(effect_entry) => {
+                let term = self.handle_effect_entry(effect_entry);
+                return match term {
                     ServerTerm::Error {
-                        kind: ErrorKind::Constraint,
-                        identity: expected.display_uri().into_bytes(),
-                        message: "statement succeeded; expected an error".to_string().into_bytes(),
+                        identity: err_identity,
+                        message,
+                        ..
+                    } => {
+                        let actual_uri = String::from_utf8_lossy(&err_identity).to_string();
+                        let v = verdict::Verdict {
+                            outcome: if expected.matches(&actual_uri) {
+                                verdict::VerdictOutcome::Pass
+                            } else {
+                                verdict::VerdictOutcome::Fail
+                            },
+                            identity,
+                            detail: Some(format!(
+                                "{}: {}",
+                                actual_uri,
+                                String::from_utf8_lossy(&message)
+                            )),
+                        };
+                        if let Some(ref mut hook) = self.hooks.on_error_hook {
+                            hook(&v);
+                        }
+                        match v.outcome {
+                            verdict::VerdictOutcome::Pass => self.empty_header_response(),
+                            _ => ServerTerm::Error {
+                                kind: ErrorKind::Constraint,
+                                identity: actual_uri.into_bytes(),
+                                message: format!(
+                                    "expected error {} but got: {}",
+                                    expected.display_uri(),
+                                    String::from_utf8_lossy(&message)
+                                )
+                                .into_bytes(),
+                            },
+                        }
                     }
-                }
-            };
-        }
+                    other => {
+                        // The statement succeeded where an error was expected.
+                        let v = verdict::Verdict {
+                            outcome: verdict::VerdictOutcome::Fail,
+                            identity,
+                            detail: Some("statement succeeded; expected an error".to_string()),
+                        };
+                        if let Some(ref mut hook) = self.hooks.on_error_hook {
+                            hook(&v);
+                        }
+                        let _ = other;
+                        ServerTerm::Error {
+                            kind: ErrorKind::Constraint,
+                            identity: expected.display_uri().into_bytes(),
+                            message: "statement succeeded; expected an error"
+                                .to_string()
+                                .into_bytes(),
+                        }
+                    }
+                };
+            }
+        };
 
         // Try to compile the query
-        let mut pipeline = Pipeline::new_with_config(
+        let mut pipeline = Pipeline::from_goal(
+            goal,
             dql,
             &mut *self.system,
             ResolutionConfig::default(),
             self.sql_optimization_level,
-            self.inline_ctes,
-            self.is_repl,
+            registry,
         );
         if let Err(e) = pipeline.set_cli_danger_overrides(self.danger_overrides.clone()) {
             return ServerTerm::Error {
@@ -802,7 +902,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     },
                     identity,
                     detail: Some(format!("{}: {}", actual_uri, e)),
-                    _intent: None,
                 };
                 if let Some(ref mut hook) = self.hooks.on_error_hook {
                     hook(&v);
@@ -812,112 +911,14 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             Ok(c) => c,
         };
 
-        // Compilation succeeded. Check if we expect a runtime error.
-        // Hooks carry the bare hierarchy (kind declared by the sigil):
-        // a first segment of "runtime" marks a runtime-error hook.
-        let expects_runtime = expected
-            .uri_segments
-            .first()
-            .map(|s| s == "runtime")
-            .unwrap_or(false);
-
-        if !expects_runtime {
-            // Expected a compile error but query compiled successfully
-            let v = verdict::Verdict {
-                outcome: verdict::VerdictOutcome::Fail,
-                identity,
-                detail: Some(format!(
-                    "Expected failure matching '{}' but query compiled successfully",
-                    expected.display_uri()
-                )),
-                _intent: None,
-            };
-            if let Some(ref mut hook) = self.hooks.on_error_hook {
-                hook(&v);
-            }
-            return self.verdict_response(&v);
-        }
-
-        // Runtime error hook: compile succeeded, now execute and check for failure.
-        // Drop pipeline to release borrow on self.system.
-        let connection_id = compiled.connection_id;
-        let primary_sql = compiled.primary_sql.clone();
-        let assertion_sqls = compiled.assertion_sqls.clone();
-        drop(pipeline);
-
-        // Execute primary SQL
-        match self.execute_sql_routed(&primary_sql, connection_id) {
-            Err(e) => {
-                // SQL execution failed — match against expected
-                let actual_uri = "delightql-error://runtime/bug";
-                let v = verdict::Verdict {
-                    outcome: if expected.matches(actual_uri) {
-                        verdict::VerdictOutcome::Pass
-                    } else {
-                        verdict::VerdictOutcome::Fail
-                    },
-                    identity,
-                    detail: Some(format!("{}: {}", actual_uri, e)),
-                    _intent: None,
-                };
-                if let Some(ref mut hook) = self.hooks.on_error_hook {
-                    hook(&v);
-                }
-                return self.verdict_response(&v);
-            }
-            Ok(_) => {
-                // SQL succeeded — check assertions for runtime errors
-                for (sql, _loc) in &assertion_sqls {
-                    match self.execute_sql_routed(sql, connection_id) {
-                        Ok((_cols, rows)) => {
-                            let passed = rows
-                                .first()
-                                .and_then(|r| r.first())
-                                .map(|v| matches!(v.as_str(), "1" | "true" | "t"))
-                                .unwrap_or(false);
-                            if !passed {
-                                let actual_uri = "delightql-error://runtime/assertion";
-                                let v = verdict::Verdict {
-                                    outcome: if expected.matches(actual_uri) {
-                                        verdict::VerdictOutcome::Pass
-                                    } else {
-                                        verdict::VerdictOutcome::Fail
-                                    },
-                                    identity,
-                                    detail: Some("Runtime assertion failed".to_string()),
-                                    _intent: None,
-                                };
-                                if let Some(ref mut hook) = self.hooks.on_error_hook {
-                                    hook(&v);
-                                }
-                                return self.verdict_response(&v);
-                            }
-                        }
-                        Err(msg) => {
-                            return ServerTerm::Error {
-                                kind: ErrorKind::Permission,
-                                identity: b"delightql-error://runtime/assertion".to_vec(),
-                                message: format!("Assertion execution error: {}", msg).into_bytes(),
-                            };
-                        }
-                    }
-                }
-
-                // Everything succeeded but we expected failure
-                let v = verdict::Verdict {
-                    outcome: verdict::VerdictOutcome::Fail,
-                    identity,
-                    detail: Some(format!(
-                        "Expected failure matching '{}' but query executed successfully",
-                        expected.display_uri()
-                    )),
-                    _intent: None,
-                };
-                if let Some(ref mut hook) = self.hooks.on_error_hook {
-                    hook(&v);
-                }
-                self.verdict_response(&v)
-            }
+        // The annotation judges; it does not execute. The statement runs
+        // through the one execution authority, exactly as an unannotated one
+        // does, and the hook compares the outcome with what was expected.
+        let (term, staged) = self.execute_compiled(compiled);
+        let term = self.settle_staged(term, staged);
+        match self.judge_against_hook(term, &expected, identity) {
+            Ok(()) => self.empty_header_response(),
+            Err(refusal) => refusal,
         }
     }
 
@@ -931,6 +932,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // Check eager buffers first (bootstrap/imported connections)
         if let Some(buffer) = self.eager_buffers.get_mut(&handle) {
             if buffer.cursor >= buffer.rows.len() {
+                // The rows are done with; whatever the statement staged for
+                // them can go.
+                self.retire_handle_staging(&handle);
                 return ServerTerm::End;
             }
             let end = std::cmp::min(buffer.cursor + count as usize, buffer.rows.len());
@@ -962,10 +966,20 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             }
         };
 
-        match self
+        let fetched = self
             .sql_session
-            .fetch(backend_handle, projection, count, agreed)
-        {
+            .fetch(backend_handle, projection, count, agreed);
+        // Both endings are endings: no further row comes back from a fetch
+        // that returned End or reported an error, so what the statement
+        // staged for those rows can go. A later Close still arrives and
+        // finds nothing left to retire.
+        if matches!(
+            fetched,
+            Ok(FetchResponse::End) | Ok(FetchResponse::Error { .. }) | Err(_)
+        ) {
+            self.retire_handle_staging(&handle);
+        }
+        match fetched {
             Ok(FetchResponse::Data { cells }) => ServerTerm::Data { cells },
             Ok(FetchResponse::End) => ServerTerm::End,
             Ok(FetchResponse::Error {
@@ -1010,6 +1024,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     }
 
     fn handle_close(&mut self, handle: Handle) -> ServerTerm {
+        self.retire_handle_staging(&handle);
         // Check eager buffers first
         if self.eager_buffers.remove(&handle).is_some() {
             return ServerTerm::Ok { count_hint: 0 };
@@ -1088,7 +1103,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     fn execute_eager_on_bootstrap(
         &self,
         sql: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
         let conn = self.system.get_bootstrap_connection();
         let conn_guard = conn.lock().map_err(|e| format!("Bootstrap lock: {}", e))?;
         let mut stmt = conn_guard
@@ -1098,19 +1113,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let rows_result = stmt
             .query_map([], |row| {
-                let mut values = Vec::new();
+                let mut values = Vec::with_capacity(col_count);
                 for idx in 0..col_count {
-                    let val: rusqlite::types::Value = row.get(idx)?;
-                    let s = match val {
-                        rusqlite::types::Value::Null => "NULL".to_string(),
-                        rusqlite::types::Value::Integer(i) => i.to_string(),
-                        rusqlite::types::Value::Real(f) => f.to_string(),
-                        rusqlite::types::Value::Text(s) => s,
-                        rusqlite::types::Value::Blob(b) => {
-                            format!("<blob {} bytes>", b.len())
-                        }
-                    };
-                    values.push(s);
+                    values.push(bootstrap_value(row.get(idx)?).into_wire_bytes());
                 }
                 Ok(values)
             })
@@ -1127,7 +1132,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &self,
         sql: &str,
         connection_id: i64,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
         let conn_arc = self
             .system
             .get_connection(connection_id)
@@ -1135,9 +1140,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         let conn_guard = conn_arc
             .lock()
             .map_err(|e| format!("Connection {} lock: {}", connection_id, e))?;
-        conn_guard
-            .query_all_string_rows(sql, &[])
-            .map_err(|e| format!("{}", e))
+        let (columns, rows) = conn_guard
+            .query_all_rows(sql, &[])
+            .map_err(|e| format!("{}", e))?;
+        Ok((
+            columns,
+            rows.into_iter()
+                .map(|row| row.into_iter().map(|v| v.into_wire_bytes()).collect())
+                .collect(),
+        ))
     }
 
     /// Execute SQL on the appropriate connection based on connection_id.
@@ -1149,7 +1160,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &mut self,
         sql: &str,
         connection_id: Option<i64>,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
         match connection_id.unwrap_or(2) {
             2 => self.execute_eager_through_protocol(sql),
             1 => {
@@ -1167,12 +1178,12 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         }
     }
 
-    /// Convert string-based query results to protocol cell format.
-    fn strings_to_eager_buffer(
-        columns: &[String],
-        rows: &[Vec<String>],
-    ) -> (Vec<Dimension>, Vec<Vec<Cell>>) {
-        let dimensions: Vec<Dimension> = columns
+    /// The heading an eagerly-buffered result answers with.
+    ///
+    /// The cells are already the engine's own answer — an eager result is
+    /// buffered, never re-read — so only the heading is built here.
+    fn eager_dimensions(columns: &[String]) -> Vec<Dimension> {
+        columns
             .iter()
             .enumerate()
             .map(|(i, name)| Dimension {
@@ -1180,29 +1191,14 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 name: name.as_bytes().to_vec(),
                 descriptor: b"TEXT".to_vec(),
             })
-            .collect();
-        let cells: Vec<Vec<Cell>> = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|val| {
-                        if val == "NULL" {
-                            None
-                        } else {
-                            Some(val.as_bytes().to_vec())
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        (dimensions, cells)
+            .collect()
     }
 
     /// Execute SQL through the backend protocol and return (columns, rows).
     fn execute_eager_through_protocol(
         &mut self,
         sql: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
         let rows_orient = self
             .sql_session
             .agreed_orientation(Orientation::Rows)
@@ -1240,18 +1236,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 };
 
             match fetch_resp {
-                FetchResponse::Data { cells } => {
-                    for row in &cells {
-                        all_rows.push(
-                            row.iter()
-                                .map(|cell| match cell {
-                                    Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                                    None => "NULL".to_string(),
-                                })
-                                .collect(),
-                        );
-                    }
-                }
+                FetchResponse::Data { cells } => all_rows.extend(cells),
                 FetchResponse::End => break,
                 FetchResponse::Error { message, .. } => {
                     let _ = self.sql_session.close(handle);
@@ -1332,3 +1317,10 @@ impl<'a, T: Transport> Handler for RelayParty<'a, T> {
 
 pub(crate) use delightql_types::teach_runtime_message;
 
+/// How many statements the text holds when read as a SEQUENCE — `None` when
+/// it is not a well-formed one. A diagnostic only: it runs on the failure
+/// path, after the term's own entrance has already refused.
+fn query_count_if_a_sequence(dql: &str) -> Option<usize> {
+    let tree = pipeline::parse::query_sequence(dql).ok()?;
+    Some(pipeline::parse::query_spans(&tree).len())
+}
